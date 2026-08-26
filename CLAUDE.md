@@ -1,143 +1,69 @@
-# CLAUDE.md
+# Working in aj
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## Build/Test/Lint Commands
-
-- Build: `cargo check` or `cargo build`
-- Run all tests: `cargo test`
-- Run specific test: `cargo test --package package_name -- test_name`
-- Run CLI: `cargo run -p aj -- [args]` (e.g. `list-sessions`, `continue <id>`, `continue`)
-- Format code: `cargo fmt`
-- Lint: `cargo clippy --workspace --all-targets`
-- Scratch-space guard: `./scripts/check-test-scratch.sh` (runs the suite
-  under an empty `TMPDIR` and fails on residue)
-
-The workspace enables strict custom lints (see `[workspace.lints]` in
-`Cargo.toml`), so run `cargo fmt` and `cargo check` before reporting a
-change done, and `cargo clippy` for anything non-trivial.
+AJ is a software engineering agent built around a small agent loop and focused
+builtin tools. Preserve that simplicity. New behavior should fit the existing
+crate boundaries and avoid scaffolding that only works through coordination.
 
 ## Architecture
 
-AJ is an AI-driven agent for software engineering. The agent follows a
-minimal loop pattern, focusing on providing the right set of builtin tools
-rather than complex scaffolding.
+The workspace is split into focused crates under `src/`:
 
-The workspace splits into focused crates under `src/` (run
-`cargo tree` for the exact dependency edges):
+- `aj-models` owns provider adapters, unified messages, streaming types, and
+  the model registry.
+- `aj-agent` owns the agent runtime, event bus, tool contract, message queues,
+  and background task registry.
+- `aj-wire` owns remote-control models and compatibility codecs. It contains no
+  HTTP or other I/O types.
+- `aj-session` owns the on-disk session format, conversation log, and replay.
+- `aj-tools` owns builtin tool implementations.
+- `aj-app` owns frontend-independent application behavior, session composition,
+  the turn driver, state reduction, print mode, and settings. It has no TUI
+  dependency.
+- `aj-conf` owns configuration loading and path helpers.
+- `vaxis`, `vaxis-derive`, and `vaxis-ucd` form the terminal UI framework.
+- `aj` owns the binary, interactive UI, and wiring between `aj-app` and vaxis.
+- `anthropic-sdk` and `openai-sdk` are thin clients used by provider adapters.
 
-- `aj-models` — wire layer: provider SDKs, unified `Message` /
-  `AssistantMessage` / streaming types, model registry, the scripted
-  provider used by tests.
-- `aj-agent` — the `Agent` runtime, the typed `AgentEvent` bus, the
-  tool trait, `ToolDetails` for structured tool rendering, message
-  queues, and the `TaskRegistry` for background tasks (detached bash
-  commands and sub-agent runs that outlive their turn).
-- `aj-wire`: remote-control protocol models, frame and event
-  compatibility wrappers, and strict JSON codecs. It contains no I/O
-  or HTTP types.
-- `aj-session` — on-disk session format, `ConversationLog`, replay. The
-  user-facing surface (CLI, storage) says "session"; internally a
-  session's `ConversationLog` holds threads and branches, so both terms
-  are intentional.
-- `aj-tools` — the builtin tool implementations.
-- `aj-app` — frontend-agnostic application logic: CLI surface, session
-  composition (`SessionCore`), the turn driver, the `ChatState`
-  reducer, print mode, settings. CI (`scripts/check-no-tui-dep.sh`)
-  keeps it free of TUI dependencies.
-- `aj-conf` — `~/.aj/config.toml` loader and path helpers.
-- `vaxis` (+ `vaxis-derive`, `vaxis-ucd`) — the terminal-UI framework
-  (rendering, widgets, layout, input).
-- `aj` — the binary: interactive TUI, command palette, selectors,
-  overlays, wiring `aj-app` to `vaxis`.
-- `anthropic-sdk` / `openai-sdk` — thin async clients used by
-  `aj-models`'s provider adapters.
+Frontends subscribe to the typed `AgentEvent` bus. Persistence is another
+subscriber owned by the binary. The agent runtime does not own a
+`ConversationLog`.
 
-Frontends (TUI, print mode, tests) subscribe to the agent's `AgentEvent`
-bus via `Agent::subscribe(...)`. Persistence is just another subscriber.
-`Agent::prompt` does not take a `&ConversationLog`; the binary owns the
-log and registers a persistence listener.
+Keep behavior at its natural boundary. A library exposes a typed error when a
+caller branches on failure. Render-only seams use the named opaque `BoxError`.
+Public library signatures do not use `anyhow`, which is reserved for top-level
+application propagation.
 
-## Configuration & Runtime
+## Runtime contracts
 
-Persistent state lives under `~/.aj/`:
+Persistent state lives under `~/.aj/`. Secrets come from `.env` and are never
+committed. Configuration precedence is CLI flags, environment variables,
+`config.toml`, then builtin defaults. Skills are discovered from user and
+project `.aj`, `.agents`, and `.claude` skill directories up to the Git root.
 
-- `.env` — secrets (API keys); loaded before the project-local `.env`.
-- `config.toml` — defaults (model, thinking level, speed, theme,
-  disabled tools/skills).
-- `models.json` — model catalog; refresh with `aj update-models`.
-- `skills/` — user-level skills (SKILL.md directories); also discovered
-  from `~/.agents/skills/`, `~/.claude/skills/`, and project-level
-  `.aj/`/`.agents/`/`.claude/` `skills/` dirs up to the git root.
-- `themes/<name>.json` — optional user themes layered on top of the
-  bundled `dark` / `light` palettes. Hot-reloads on file changes.
-- `sessions/<project>/` — JSONL conversation logs, one file per session.
-- `gateway.toml` — `aj gateway`'s static host addresses (`--config` names
-  another file), and `gateway/` its own runtime state: its id and the
-  hosts enrolled over the wire.
+## Verification
 
-Model selection precedence (highest to lowest): CLI flags
-(`--model-api`, `--model-url`, `--model-name`) → env vars (`MODEL_API`,
-`MODEL_URL`, `MODEL_NAME`) → `config.toml` → built-in defaults. Never
-commit secrets.
+Use the repository's current CI-equivalent gate for review-ready work:
 
-## Code Style
+- `cargo fmt`
+- `cargo check`
+- `cargo clippy --workspace --all-targets`
+- `cargo test`
+- `scripts/check-no-tui-dep.sh`
+- `scripts/check-test-scratch.sh`
 
-- Import grouping: std → external crates (including aj_*) → crate imports.
-- Use absolute paths for crate imports (`crate::` not `super::`), except `use super::*;` in `#[cfg(test)]` modules.
-- Merge imports from same module, don't merge different modules.
-- Error handling: a library boundary exposes a typed error where callers branch on the failure (a `thiserror` enum, e.g. the SDK `ClientError` carrying status + `Retry-After`), and a named opaque error (`Box<dyn std::error::Error + Send + Sync>`, aliased `aj_agent::BoxError`) at render-only seams where the caller only ever displays the cause (tool execution, the event bus, `TurnError`'s `Recoverable`/`Fatal` payloads). Never put `anyhow` in a public library signature. `anyhow` is for top-level application error propagation in the `aj` binary only.
-- Follow clippy/rustfmt.
+Scale targeted checks while iterating, but verify the final range against the
+guarantees it claims. Important behavior is exercised through the real composed
+seam, not only through a helper that constructs one component. Assertions
+observe the boundary where harm lands, and fixtures assert the preconditions
+that make their measurement meaningful. When practical, break a claimed
+guarantee and confirm that the relevant check notices. A surviving break is a
+finding about the test or design, not a formality.
 
-## Testing
+Test helpers that create scratch state return owning guards so cleanup survives
+failed assertions and asynchronous lifetimes.
 
-- Unit tests live in the same module with `#[cfg(test)]`.
-- Integration tests go in `<crate>/tests/`.
-- Mutation-check tests that pin subtle properties: temporarily break
-  the behavior the test names (flip the rule, remove the guard,
-  reinstate the bug), verify exactly that test fails, then revert. A
-  test that stays green under the mutation is vacuous and must be
-  fixed. Assertions like `assert_ne!` on values that are almost never
-  equal, or events dispatched to a widget that does not handle them,
-  are the usual tells.
-- The strongest mutation is deleting the feature's wiring: leave the
-  widget out of the composed layout, drop the sync call from the
-  drive loop, and check the suite goes red. Tests that drive a
-  component directly through a helper prove the component, not the
-  feature. At least one test per feature must exercise the real
-  path end to end (real input bytes, the composed tree).
-- Assert at the boundary where the harm lands, and order assertions
-  so a failure names the harm. A traversal test reads the store, not
-  the response body: reading the response first can fail on a
-  decoding artifact of the very bug it caught, and a test that
-  catches the right bug for the wrong stated reason will be misread
-  under pressure.
-- A test that needs its fixture to reach a state (a full queue, a
-  stalled client, an armed mode) asserts that the state was reached,
-  with a message saying the test otherwise measures nothing, e.g.
-  "absorbed {stalled} of {deep} frames, the queue never hit the
-  bound". Environment differences (bigger socket buffers, faster
-  disks) must fail that assertion loudly, never pass the test
-  quietly.
-- A mutation that survives is a finding, not a formality. Expect the
-  check to change the work: the usual outcome is a test rewritten to
-  reach the real path, or a property nothing was pinning. Report every
-  mutation and its result, including the ones that survived and what
-  you did about them.
-- Test helpers return owning guards (`TempDir`), never bare paths, so
-  scratch-space lifetime is compiler-checked. State that must outlive
-  a test (leaked runtimes, async reaps) lives in a per-test
-  subdirectory under one named per-process root. No manual teardown,
-  a failing assertion skips it.
+## Commits
 
-## Commit Messages
-
-- Prefix the subject with a scope followed by a colon: `<scope>: <summary>`.
-  The scope is the affected crate or area (e.g. `aj`, `aj-models`,
-  `vaxis`, `workspace`, `docs`). Comma-separate multiple scopes:
-  `aj-app,aj: ...`.
-- A Conventional-Commits type may wrap the scope when it adds signal:
-  `feat(history): ...`, `perf(history): ...`. Plain `scope:` is fine for
-  everything else.
-- Write the summary in imperative mood, lower-case, with no trailing
-  period (e.g. `aj: rename the model switch command to model use`).
+Subjects use `<scope>: <lowercase imperative summary>` with no trailing period.
+Use the affected crate or area as the scope. A conventional-commit wrapper is
+optional when it adds signal.
