@@ -303,7 +303,7 @@ fn background_sub_turn() -> Vec<AssistantMessage> {
             "agent",
             serde_json::json!({"task": "look into it", "run_in_background": true}),
         ),
-        finalized_text_message("meanwhile, here is the answer"),
+        finalized_text_message(PARENT_ANSWER),
         finalized_text_message("the background sub is done"),
         // The background task's completion notice wakes the parent, which
         // runs one more inference to acknowledge it.
@@ -4932,6 +4932,619 @@ async fn cancelling_a_foreground_sub_cascades_to_main() {
     );
     assert!(finished, "and its runtime clock stopped");
     assert_no_dangling(&client.chat);
+    harness.host.shutdown().await;
+}
+
+/// A turn that spawns a background sub-agent whose run outlives it.
+///
+/// When the fixture streams one character at a time, the child's long answer
+/// keeps its run going both while the parent's turn streams its short answer
+/// and after that turn has ended. That lets one fixture serve both states a
+/// gesture can arrive in.
+///
+/// The trailing message is the parent acknowledging the task's completion
+/// notice: a `TaskEnd` wakes its owner whatever the task's status, so a
+/// killed run costs the same inferences a completed one does.
+fn detached_sub_turn() -> Vec<AssistantMessage> {
+    vec![
+        calling(
+            "kicking that off",
+            "call-bg",
+            "agent",
+            serde_json::json!({"task": "look into it", "run_in_background": true}),
+        ),
+        finalized_text_message(PARENT_ANSWER),
+        finalized_text_message(CHILD_ANSWER),
+        finalized_text_message("noted, thanks"),
+    ]
+}
+
+/// The parent's own answer, which the child's ending must never touch.
+const PARENT_ANSWER: &str = "meanwhile, here is the answer";
+
+/// The detached child's whole answer, long enough to outlast the parent's
+/// turn at one character per tick. A run nothing ends delivers it and an
+/// ended one does not, which is what makes it evidence either way.
+const CHILD_ANSWER: &str = "a child answer streamed one character at a time, at length, \
+                            so that the run it belongs to is still going when the parent \
+                            turn that spawned it has already finished its own";
+
+/// Which gesture ends the detached run.
+#[derive(Clone, Copy, Debug)]
+enum EndDetached {
+    /// `Command::Cancel` on the sub-agent, the client's Ctrl+C.
+    Cancel,
+    /// `Command::KillTask` on the task carrying its run.
+    KillTask,
+}
+
+/// The state of the run's parent turn when the gesture arrives.
+///
+/// Both are reachable and they are not the same test. Under `Ended`, no
+/// turn's token can reach the run. Under `Live`, a cascade would do
+/// collateral damage to a turn the user never aimed at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ParentTurn {
+    Live,
+    Ended,
+}
+
+/// Deterministic observations of how a detached run ended.
+///
+/// The equivalence test compares this value across two independent runs, so
+/// fields belong here only when their value does not depend on timing.
+#[derive(Debug, PartialEq)]
+struct DetachedEnding {
+    task: TaskStatus,
+    task_report: Option<String>,
+    box_status: aj_app::chat::SubAgentStatus,
+    box_report: Option<String>,
+    box_finished: bool,
+    parked_usage: Option<serde_json::Value>,
+    /// Completion notices, `(outcome, body)` in transcript order.
+    task_notices: Vec<(aj_agent::message::TaskOutcome, String)>,
+    /// Plain notices per agent. A conclusion invented for one of the two
+    /// gestures would land here.
+    notices: Vec<(AgentId, String)>,
+    /// Error events published while the run was ending. A parent wake that
+    /// panics, including from an exhausted script, must not pass for a clean
+    /// ending.
+    errors: Vec<String>,
+    child_answered_in_full: bool,
+    parent_answered_in_full: bool,
+}
+
+/// Run [`detached_sub_turn`] until the child's run is detached and live with
+/// its parent turn in state `parent`, end the run with `gesture`, and report
+/// the ending.
+async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedEnding {
+    let harness =
+        Harness::with_provider(scripted(detached_sub_turn(), 1, Duration::from_millis(20)));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness
+        .prompt(&session, "look into it in the background")
+        .await;
+    // Both facts matter to the route, so both are waited for: a run caught
+    // under a live parent turn can still be reached by the cascade, and one
+    // caught after that turn ended cannot. The wait gives up the moment the
+    // run is over, so a fixture that missed its window says so instead of
+    // quietly measuring the other state.
+    let live_task = bounded("the child's run to detach", async {
+        loop {
+            if let Some(id) = running_agent_task(&harness, &session).await {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let task = bounded("the child's run to reach the state under test", async {
+        loop {
+            let list = harness.host.sessions().await.expect("sessions");
+            let working = list
+                .sessions
+                .iter()
+                .find(|row| row.id == session)
+                .is_some_and(|row| row.working);
+            let reached = match parent {
+                ParentTurn::Live => working,
+                ParentTurn::Ended => !working,
+            };
+            if reached {
+                return Some(live_task);
+            }
+            if running_agent_task(&harness, &session).await.is_none() {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let task = task.unwrap_or_else(|| {
+        panic!(
+            "the child's run ended before its parent turn was {parent:?}, \
+             so this run measures the other state instead of the one it names",
+        )
+    });
+
+    let command = match gesture {
+        EndDetached::Cancel => Command::Cancel {
+            agent: AgentId::Sub(1),
+        },
+        EndDetached::KillTask => Command::KillTask { task },
+    };
+    let outcome = harness.host.command(&session, command).await;
+    assert!(
+        matches!(outcome, Ok(CommandOutcome::Accepted)),
+        "{gesture:?} was accepted: {outcome:?}",
+    );
+
+    let frames = settle(&harness, &session, &mut client.stream).await;
+    for frame in &frames {
+        let _ = client.client.apply(&mut client.chat, frame.clone());
+    }
+    let state = client.canonical();
+    let (box_status, box_finished) = sub_box(&state, 1);
+    let details = harness.host.task(&session, task).await.expect("task read");
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let ending = DetachedEnding {
+        task: details.status,
+        task_report: details.report,
+        box_status,
+        box_report: sub_report(&state, 1),
+        box_finished,
+        parked_usage: handles
+            .task_registry
+            .usage(task)
+            .map(|usage| serde_json::to_value(usage).expect("usage serializes")),
+        task_notices: task_notices(&state),
+        notices: all_notices(&state),
+        errors: errors(&only(frames, &session)),
+        child_answered_in_full: assistant_rows(&client.chat, AgentId::Sub(1))
+            .iter()
+            .any(|text| text.contains(CHILD_ANSWER)),
+        parent_answered_in_full: assistant_rows(&client.chat, AgentId::Main)
+            .iter()
+            .any(|text| text.contains(PARENT_ANSWER)),
+    };
+    assert_no_dangling(&client.chat);
+    harness.host.shutdown().await;
+    ending
+}
+
+/// The id of the session's live agent-kind task for `Sub(1)`, if it has one.
+async fn running_agent_task(harness: &Harness, session: &str) -> Option<aj_agent::tool::TaskId> {
+    harness
+        .host
+        .tasks(session)
+        .await
+        .expect("task table")
+        .tasks
+        .iter()
+        .find(|row| {
+            matches!(row.kind, TaskKind::Agent { agent_id: 1, .. })
+                && row.status == TaskStatus::Running
+        })
+        .map(|row| row.id)
+}
+
+/// The `(outcome, body)` of every completion notice the main transcript
+/// carries, in order.
+fn task_notices(state: &CanonicalState) -> Vec<(aj_agent::message::TaskOutcome, String)> {
+    state
+        .agent(AgentId::Main)
+        .expect("main transcript")
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            aj_app::test_support::CanonicalEntry::TaskNotification { outcome, body, .. } => {
+                Some((*outcome, body.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The text of every plain notice the transcript carries, per agent, in
+/// order. Both agents, because a notice is tagged with the agent it is
+/// about: one raised for the child would never show up in the parent's rows.
+fn all_notices(state: &CanonicalState) -> Vec<(AgentId, String)> {
+    state
+        .agents
+        .iter()
+        .flat_map(|agent| {
+            agent.entries.iter().filter_map(move |entry| match entry {
+                aj_app::test_support::CanonicalEntry::Notice { text, .. } => {
+                    Some((agent.agent, text.clone()))
+                }
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// Cancelling a detached background sub-agent whose parent turn is over ends
+/// its run.
+///
+/// Without the task route, the run is in no turn's cancel map and the main
+/// turn is idle. Every assertion below then reads the other way round: the
+/// child answers in full, its task exits 0 carrying a report, its box reads
+/// done, and the parent hears a completed run.
+#[tokio::test]
+async fn cancelling_a_detached_background_sub_ends_its_run() {
+    let ending = end_detached_sub(EndDetached::Cancel, ParentTurn::Ended).await;
+    assert!(
+        !ending.child_answered_in_full,
+        "the child's run was cut short: {ending:?}",
+    );
+    assert_eq!(
+        ending.task,
+        TaskStatus::Killed,
+        "the task carrying the run left Running: {ending:?}",
+    );
+    assert_ne!(
+        ending.box_status,
+        aj_app::chat::SubAgentStatus::Running,
+        "the child's box concluded: {ending:?}",
+    );
+    assert!(
+        ending.box_finished,
+        "and its runtime clock stopped: {ending:?}",
+    );
+    assert_eq!(
+        ending.box_report.as_deref(),
+        Some("sub-agent failed: turn aborted by client"),
+        "the box uses the same failed conclusion a task kill already shows: {ending:?}",
+    );
+    assert!(
+        ending.parked_usage.is_some(),
+        "the killed run parked its accumulated usage before concluding: {ending:?}",
+    );
+    assert_eq!(
+        ending.task_notices,
+        vec![(
+            aj_agent::message::TaskOutcome::Killed,
+            "Background task #1 finished: agent 1 — killed".to_string(),
+        )],
+        "the parent heard the run end, once, as a kill: {ending:?}",
+    );
+    assert!(
+        ending.notices.is_empty(),
+        "the cancel invented no conclusion beside the task kill's: {ending:?}",
+    );
+    assert_eq!(
+        ending.task_report, None,
+        "and a killed run stores no report, its status line says everything: {ending:?}",
+    );
+    assert!(
+        ending.errors.is_empty(),
+        "the ending was clean, no turn task died on the way: {ending:?}",
+    );
+}
+
+/// Cancelling a detached background sub-agent whose parent turn is still
+/// running ends that run and nothing else.
+///
+/// A detached run is reached through its task whatever the parent is doing,
+/// so the cascade must not fire here: the parent never aimed at its own turn,
+/// and cancelling it would cut the answer the user is reading. That is what
+/// the assertions below pin, and a cascade in the detached route fails them
+/// while leaving every other test in this file green.
+#[tokio::test]
+async fn cancelling_a_detached_sub_spares_its_parents_live_turn() {
+    let ending = end_detached_sub(EndDetached::Cancel, ParentTurn::Live).await;
+    assert!(
+        ending.parent_answered_in_full,
+        "the parent's own turn ran to the end of its answer: {ending:?}",
+    );
+    assert_eq!(
+        ending.task,
+        TaskStatus::Killed,
+        "the child's run ended without collateral damage: {ending:?}",
+    );
+    assert!(
+        !ending.notices.iter().any(|(_, text)| text == CANCELLED),
+        "and nothing reported a cancelled turn, because none was: {ending:?}",
+    );
+    assert!(
+        ending.errors.is_empty(),
+        "the ending was clean, no turn task died on the way: {ending:?}",
+    );
+}
+
+/// The cancel gesture and the task surface's kill are two gestures for one
+/// act, so they are indistinguishable in outcome.
+///
+/// This is what "the cancel delegates" means as opposed to "the cancel
+/// reimplements": one fixture, two paths, the whole observable ending
+/// compared, in both states the parent turn can be in. A second conclusion
+/// invented for a cancelled run, whether a status, a box report, a
+/// completion notice or a notice of its own, fails here.
+#[tokio::test]
+async fn a_cancelled_detached_sub_ends_exactly_as_a_killed_task_does() {
+    for parent in [ParentTurn::Ended, ParentTurn::Live] {
+        let cancelled = end_detached_sub(EndDetached::Cancel, parent).await;
+        let killed = end_detached_sub(EndDetached::KillTask, parent).await;
+        assert_eq!(
+            cancelled, killed,
+            "with the parent turn {parent:?}, the cancel gesture ended the run \
+             the way the task kill does",
+        );
+    }
+}
+
+/// A cancel of a sub-agent the host is driving cancels that turn, even while
+/// the sub also has a background task in flight.
+///
+/// The route reads the driven turn first for exactly this state, which is
+/// reachable in the window where a detached run has emitted its `AgentEnd`
+/// but its task has not yet flipped terminal: a queued follow-up wakes the
+/// sub there, and the registry still reports a `Running` task. Consulting the
+/// registry first would kill an all-but-finished run, leave the continuation
+/// going, and report `Accepted` for it.
+#[tokio::test]
+async fn a_cancel_of_a_driven_sub_takes_the_turn_not_its_task() {
+    let mut script = sub_agent_turn();
+    // The continuation, slow enough to be cancelled mid-stream.
+    script.push(finalized_text_message(
+        "a continuation the cancel is meant to cut short",
+    ));
+    let harness = Harness::with_provider(scripted(script, 1, Duration::from_millis(20)));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+
+    // The registry entry stands in for the window above, which no fixture
+    // can hold open: what matters to the route is that a `Running`
+    // agent-kind task for `Sub(1)` exists while its turn is driven.
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let (task, task_cancel) = handles.task_registry.register(
+        AgentId::Main,
+        "call-bg".into(),
+        TaskKind::Agent {
+            agent_id: 1,
+            task: "look into it".into(),
+        },
+        "agent 1".into(),
+        Arc::new(FixedTaskOutput),
+    );
+    harness
+        .host
+        .command(
+            &session,
+            Command::Prompt {
+                agent: AgentId::Sub(1),
+                content: vec![UserContent::text("carry on")],
+            },
+        )
+        .await
+        .expect("the retained sub takes a continuation");
+    frames_until(&mut client.stream, "the continuation to start", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+        )
+    })
+    .await
+    .into_iter()
+    .for_each(|frame| {
+        let _ = client.client.apply(&mut client.chat, frame);
+    });
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Cancel {
+                agent: AgentId::Sub(1),
+            },
+        )
+        .await
+        .expect("cancel the continuation");
+    // Waited for by draining rather than by an idle `state` frame:
+    // `working` tracks the main agent, and this session's main turn ended
+    // before the continuation ever started. Either outcome ends the wait, so
+    // the assertions below name the harm rather than timing out on it.
+    let mut frames = Vec::new();
+    bounded("the continuation to end", async {
+        loop {
+            frames.extend(client.drain_into_fold());
+            if task_cancel.is_cancelled() || notice(&frames, CANCELLED) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        !task_cancel.is_cancelled(),
+        "the cancel took the turn route and left the task's token alone",
+    );
+    assert!(
+        notice(&frames, CANCELLED),
+        "the driven continuation was cancelled: {:?}",
+        events(&frames)
+            .into_iter()
+            .map(event_kind)
+            .collect::<Vec<_>>(),
+    );
+    let replies = assistant_rows(&client.chat, AgentId::Sub(1));
+    assert!(
+        !replies
+            .iter()
+            .any(|text| text.contains("a continuation the cancel is meant to cut short")),
+        "its stream was cut short: {replies:?}",
+    );
+    assert_eq!(
+        handles.task_registry.status(task),
+        Some(TaskStatus::Running),
+        "and the sub's background task was left alone, being nobody's cancel target",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A terminal agent-task entry makes cancel an idempotent acceptance even
+/// while the lifecycle still carries an open `AgentStart` mark.
+///
+/// This is the completion boundary between the detached and idle cases. The
+/// task driver records its terminal status after emitting `AgentEnd`, and the
+/// driver's request path drains that queued event before judging a command.
+/// This test stages the stricter state directly, a terminal entry plus the
+/// still-open mark and no queued `AgentEnd`, to pin the registry fallback as
+/// well. Neither ordering can turn a normal completion into a conflict or
+/// fire the task token again.
+#[tokio::test]
+async fn a_terminal_agent_task_closes_the_completion_race() {
+    let harness = Harness::with_provider(scripted(sub_agent_turn(), 0, Duration::ZERO));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let (task, task_cancel) = handles.task_registry.register(
+        AgentId::Main,
+        "call-bg".into(),
+        TaskKind::Agent {
+            agent_id: 1,
+            task: "look into it".into(),
+        },
+        "agent 1".into(),
+        Arc::new(FixedTaskOutput),
+    );
+    handles
+        .task_registry
+        .set_status(task, TaskStatus::Exited(Some(0)));
+    let sub = handles
+        .registry
+        .get(1)
+        .expect("the finished sub's handle is retained");
+    sub.lock()
+        .await
+        .emit_event(AgentEvent::AgentStart {
+            agent_id: AgentId::Sub(1),
+        })
+        .await
+        .expect("the sub's bus takes the event");
+    frames_until(&mut client.stream, "the terminal run's start mark", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+        )
+    })
+    .await;
+
+    let outcome = harness
+        .host
+        .command(
+            &session,
+            Command::Cancel {
+                agent: AgentId::Sub(1),
+            },
+        )
+        .await;
+    assert!(
+        matches!(outcome, Ok(CommandOutcome::Accepted)),
+        "the terminal registry fact wins over a lifecycle mark still in flight: {outcome:?}",
+    );
+    assert!(
+        !task_cancel.is_cancelled(),
+        "an idempotent cancel does not fire the completed task's token",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A cancel the host cannot make true is refused, not accepted.
+///
+/// The state is a leaked running mark: the sub is marked running, no turn is
+/// driving it, and it has no background task, so nothing here can end what
+/// the mark claims is running. It should be unreachable, which is why it
+/// refuses out loud. Accepting would show a client success over a run the
+/// host never touched.
+#[tokio::test]
+async fn a_cancel_that_can_end_nothing_refuses_instead_of_accepting() {
+    let harness = Harness::with_provider(scripted(sub_agent_turn(), 0, Duration::ZERO));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let sub = handles
+        .registry
+        .get(1)
+        .expect("the finished sub's handle is retained");
+    // The mark is planted the way every running mark arrives: an
+    // `AgentStart` on the session's bus, folded by the driver's own event
+    // loop. This sub's run is over, so no turn and no task owns the mark.
+    sub.lock()
+        .await
+        .emit_event(AgentEvent::AgentStart {
+            agent_id: AgentId::Sub(1),
+        })
+        .await
+        .expect("the sub's bus takes the event");
+
+    let refusal = harness
+        .host
+        .command(
+            &session,
+            Command::Cancel {
+                agent: AgentId::Sub(1),
+            },
+        )
+        .await
+        .expect_err("a cancel with nothing to cancel is refused");
+    assert!(
+        matches!(&refusal, HostError::Conflict { reason } if reason.contains("sub-agent 1")),
+        "the refusal names the agent it could not stop: {refusal:?}",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A cancel of an agent that is not running is accepted: the post-state it
+/// names already holds, the same idempotency a kill of a finished task
+/// grants. Without this the refusal above would be free to creep over
+/// no-ops.
+#[tokio::test]
+async fn cancelling_an_idle_agent_is_accepted() {
+    let harness = Harness::with_provider(scripted(sub_agent_turn(), 0, Duration::ZERO));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+
+    for agent in [AgentId::Main, AgentId::Sub(1), AgentId::Sub(7)] {
+        let outcome = harness
+            .host
+            .command(&session, Command::Cancel { agent })
+            .await;
+        assert!(
+            matches!(outcome, Ok(CommandOutcome::Accepted)),
+            "cancelling idle {agent:?} is accepted: {outcome:?}",
+        );
+    }
     harness.host.shutdown().await;
 }
 
