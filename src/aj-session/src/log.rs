@@ -3081,6 +3081,38 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_line_carrying_usage_parses_the_recorded_spend() {
+        // The positive half, and the only test that pins the on-disk KEY.
+        // A round-trip cannot: serde renames serializing and deserializing
+        // together, so a renamed field still round-trips in one binary
+        // while orphaning the usage on every file already written. This
+        // line is the writer's own output with the ids and timestamp
+        // normalized, so the names below are the names on disk.
+        let line = r#"{"id":"00000001","parent_id":"00000000","timestamp":"2026-07-01T00:00:00Z","thread":"user","type":"compaction","summary":"older summary","first_kept_entry_id":"00000000","tokens_before":4321,"usage":{"input":40000,"output":900,"cache_read":1200,"cache_write":300,"total_tokens":42400,"cost":{"input":0.12,"output":0.0135,"cache_read":0.0004,"cache_write":0.001,"total":0.1349}}}"#;
+
+        let entry: ConversationEntry =
+            serde_json::from_str(line).expect("a compaction line with usage parses");
+        match entry.entry {
+            ConversationEntryKind::Compaction { usage, .. } => {
+                let usage = usage.expect("the usage key is read rather than orphaned");
+                // Each count by name: a rename inside `Usage` orphans the
+                // field it names just as silently as one on the outside.
+                assert_eq!(usage.input, 40_000);
+                assert_eq!(usage.output, 900);
+                assert_eq!(usage.cache_read, 1_200);
+                assert_eq!(usage.cache_write, 300);
+                assert_eq!(usage.total_tokens, 42_400);
+                assert!(
+                    (usage.cost.total - 0.1349).abs() < 1e-9,
+                    "the recorded dollars survive the read, got {}",
+                    usage.cost.total
+                );
+            }
+            other => panic!("expected a Compaction entry, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn append_compaction_flushes_and_round_trips() {
         // A `Compaction` entry is punctuation: appending it must
         // materialize the file immediately and survive a resume with
