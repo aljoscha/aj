@@ -1528,12 +1528,16 @@ impl StreamState {
                 api = %self.partial.api,
                 "stream ended before terminal frame; treating turn as truncated (retryable)"
             );
-            // `final_response` is only ever set alongside
-            // `finish_status`, so a stream that never saw a terminal
-            // frame has nothing to harvest and this seals a zero. It
-            // runs for the invariant, not for tokens. The converse does
-            // not hold: an in-stream `error` frame sets `finish_status`
-            // with no `final_response`, and that path goes to finalize.
+            // Normally there is nothing to harvest: a stream cut before
+            // its terminal frame carries no `final_response`, so the seal
+            // prices a zero and runs for the invariant rather than for
+            // tokens. It is not conditional on that, though, because
+            // `seal` reads `final_response` directly. A response that did
+            // land without a recognized status still gets its tokens
+            // priced here, which the codex legacy `done` path can
+            // produce. The converse goes to finalize: an in-stream
+            // `error` frame sets `finish_status` with no
+            // `final_response`.
             self.seal();
             AssistantMessageEvent::truncated(self.partial.clone())
         }
