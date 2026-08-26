@@ -1601,7 +1601,10 @@ mod tests {
         let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
             .await
             .expect("provider stream terminates");
-        server.await.expect("fixture server completes");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("fixture server receives the provider request")
+            .expect("fixture server completes");
 
         assert_eq!(terminal.account.as_deref(), Some("work"));
     }
@@ -1635,7 +1638,10 @@ mod tests {
         let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
             .await
             .expect("provider stream terminates at EOF");
-        server.await.expect("fixture server completes");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("fixture server receives the provider request")
+            .expect("fixture server completes");
 
         assert_eq!(
             terminal.stop_reason,

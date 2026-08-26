@@ -580,6 +580,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_stream_carries_oauth_tool_names_into_response_mapping() {
+        let body = reqwest::Body::from(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"input\":{},\"name\":\"Edit\"}}\n\n",
+        );
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(reqwest::StatusCode::OK)
+                .body(body)
+                .expect("build synthetic response"),
+        );
+        let client = Client::new(
+            Some("http://127.0.0.1:1".to_string()),
+            "sk-ant-oat-test".to_string(),
+        )
+        .with_stream_response(response);
+        let mut messages = Messages::default();
+        messages.tools.push(crate::messages::ToolUnion::Custom {
+            name: "edit".to_string(),
+            description: None,
+            input_schema: serde_json::json!({}),
+            cache_control: None,
+            allowed_callers: Vec::new(),
+            defer_loading: None,
+            eager_input_streaming: None,
+            input_examples: Vec::new(),
+            strict: None,
+        });
+
+        let mut stream = client
+            .messages_stream(messages)
+            .await
+            .expect("build messages stream");
+        match stream.next().await {
+            Some(ServerSentEvent::ContentBlockStart {
+                content_block: crate::messages::ContentBlock::ToolUseBlock { name, .. },
+                ..
+            }) => assert_eq!(name, "edit"),
+            other => panic!("expected a reverse-mapped tool-use start, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn messages_stream_terminates_on_its_response_source_error() {
         let polls = Arc::new(AtomicUsize::new(0));
         let body = reqwest::Body::wrap_stream(futures::stream::poll_fn({
