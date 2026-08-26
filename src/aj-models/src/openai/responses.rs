@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use crate::cancel::{SelectOutcome, select_cancel};
 use crate::errors::classify_openai_stream_failure;
-use crate::openai::errors::classify_client_error;
+use crate::openai::errors::{account_for_client_error, classify_client_error};
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{
@@ -277,7 +277,7 @@ async fn run_stream_inner(
                 producer.push(error_message(
                     API_NAME,
                     model,
-                    credential.account.as_deref(),
+                    account_for_client_error(&err, credential.account.as_deref()),
                     classify_client_error(&err),
                 ));
                 return Ok(());

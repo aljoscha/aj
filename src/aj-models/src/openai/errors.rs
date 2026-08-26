@@ -18,6 +18,19 @@ pub(super) fn classify_client_error(err: &ClientError) -> AssistantError {
     classify_client_error_with(err, |_code, _type, _status, message| message.to_string())
 }
 
+/// Keep attribution unless reqwest rejected the request locally before
+/// it could use the credential, for example for a malformed URL or
+/// header value.
+pub(super) fn account_for_client_error<'a>(
+    err: &ClientError,
+    account: Option<&'a str>,
+) -> Option<&'a str> {
+    match err {
+        ClientError::TransportError(err) if err.is_builder() => None,
+        _ => account,
+    }
+}
+
 /// Like [`classify_client_error`], but lets the caller rewrite the
 /// human-facing message of a typed `ApiError` before classification.
 ///

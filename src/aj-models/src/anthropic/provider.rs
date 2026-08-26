@@ -180,7 +180,7 @@ async fn run_stream_inner(
             SelectOutcome::Ready(Err(err)) => {
                 producer.push(error_before_state(
                     model,
-                    credential.account.as_deref(),
+                    account_for_client_error(&err, credential.account.as_deref()),
                     classify_client_error(&err),
                 ));
                 return Ok(());
@@ -339,6 +339,16 @@ fn classify_client_error(err: &ClientError) -> AssistantError {
         ClientError::TransportError(t) => transport_error(format!("transport: {t}")),
         ClientError::ParseError(s) => transport_error(format!("parse: {s}")),
         ClientError::InternalError(s) => transport_error(format!("internal: {s}")),
+    }
+}
+
+/// Keep attribution unless reqwest rejected the request locally before
+/// it could use the credential, for example for a malformed URL or
+/// header value.
+fn account_for_client_error<'a>(err: &ClientError, account: Option<&'a str>) -> Option<&'a str> {
+    match err {
+        ClientError::TransportError(err) if err.is_builder() => None,
+        _ => account,
     }
 }
 
@@ -1633,6 +1643,27 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Error);
         assert_eq!(terminal.account.as_deref(), Some("work"));
+    }
+
+    #[tokio::test]
+    async fn a_local_request_builder_error_records_that_nothing_served() {
+        let mut model = fake_model();
+        model.base_url = "not-a-url".to_string();
+        let stream =
+            AnthropicProvider.stream(&model, &Context::new("system"), &labeled_options(None));
+        let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
+            .await
+            .expect("provider stream terminates");
+
+        assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert!(
+            terminal.error.is_some(),
+            "the malformed URL must fail locally"
+        );
+        assert_eq!(
+            terminal.account, None,
+            "no request left the process, so no credential served"
+        );
     }
 
     #[tokio::test]

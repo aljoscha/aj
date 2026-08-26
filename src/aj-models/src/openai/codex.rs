@@ -58,7 +58,7 @@ use crate::types::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::types::ServiceTier;
 
-use super::errors::classify_client_error_with;
+use super::errors::{account_for_client_error, classify_client_error_with};
 use super::responses::{
     CostMultiplierFn, StreamState, convert_messages, empty_partial, error_message,
     map_service_tier, responses_reasoning_effort, verbosity_text_config,
@@ -239,7 +239,7 @@ async fn run_stream_inner(
             producer.push(error_message(
                 API_NAME,
                 model,
-                credential.account.as_deref(),
+                account_for_client_error(&err, credential.account.as_deref()),
                 classify_codex_client_error(&err),
             ));
             return Ok(());
