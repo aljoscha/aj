@@ -343,7 +343,8 @@ now, in order:
    (the TODO note it had planted went with it).
 2. The targeted vacuity sweep (below), rescheduled from
    before-deployment to before-daily-driving, same scope.
-3. The banked polish batch (`docs/banked-ux.md`).
+3. The banked polish batch (`docs/banked-ux.md`). Landed: the batch
+   merged, and the doc now records only that it is empty.
 4. Reference systemd unit and a short setup note for a long-running
    `aj serve` on a pet VM, pulled forward from phase 4's deliverables
    because it is the daily-drive setup. Docs and a unit file only, no
@@ -357,8 +358,13 @@ now, in order:
 
 Rough edges found while daily driving follow the standard loop:
 reported, ruled, turned into tasks with the working loop and review
-pipeline unchanged. The banked features (remote previews, cross-host
-prompt history, the render-loop cost, spec section 13) get
+pipeline unchanged. That loop has already run for the connect-mode
+gaps: daily driving surfaced the four refused gestures, and they are
+ruled to work over a connection, one host-side read per feature under
+the doctrine spec 9.1 states, queued behind the work in flight. Spec
+section 13's two banked entries (remote previews, cross-host prompt
+history) graduate to live design when that work starts, and 9.1's
+refusal list shrinks as each lands. The render-loop cost stays banked,
 re-prioritized by actual use.
 
 The `locked` row bit (spec 6.5, 6.8) is published and read: a refused
