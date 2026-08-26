@@ -1178,6 +1178,57 @@ mod tests {
         }
     }
 
+    /// The Codex pricing curve reaches the replay path, and not only its
+    /// own unit tests.
+    ///
+    /// Codex and Responses share one `StreamState`, and which curve a
+    /// stream prices against is an injected function pointer
+    /// ([`CODEX_COST_MULTIPLIER`]). The two curves differ in exactly one
+    /// cell: gpt-5.5 on priority is 2.5x here and 2.0x on the Responses
+    /// curve. So this fixture is the only shape that can tell a correct
+    /// injection from the wrong one, and the unit tests above cannot: they
+    /// call the function directly.
+    #[test]
+    fn a_replayed_codex_priority_turn_prices_on_the_codex_curve() {
+        let completed: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0.0,
+                "model": "gpt-5.5",
+                "output": [],
+                "parallel_tool_calls": true,
+                "tools": [],
+                "status": "completed",
+                // The tier the server echoes back, which is what the
+                // curve is resolved from.
+                "service_tier": "priority",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 2_000_000,
+                },
+            },
+            "sequence_number": 1,
+        }))
+        .expect("parse response.completed");
+
+        let msg = replay_sse_events(&fake_model("gpt-5.5", false), [completed], None);
+        assert_eq!(
+            msg.usage.total_tokens, 2_000_000,
+            "the fixture must carry the wire's counts or the price below is priced on nothing"
+        );
+        // 1.0 (input) + 2.0 (output) = $3.00 at full price. The Codex
+        // curve charges gpt-5.5 priority 2.5x, the Responses curve 2.0x,
+        // so $6.00 here means the wrong curve was injected.
+        assert!(
+            (msg.usage.cost.total - 7.5).abs() < 1e-9,
+            "a priority gpt-5.5 turn prices at 2.5x, got {} (6.0 is the Responses curve)",
+            msg.usage.cost.total
+        );
+    }
+
     #[test]
     fn normalize_codex_event_forwards_terminal_error_into_state_machine() {
         // `error` / `response.failed` are forwarded as terminal events
