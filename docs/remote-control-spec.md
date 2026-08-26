@@ -1003,10 +1003,13 @@ until an attempt refuses and sets the bit, the answer that was always
 the authority; the momentary shared probe can refuse one racing
 acquire; and a row a gateway relays for a host it cannot reach carries
 the bit as last known, with no writer to move it until that host is
-back, the row's `unreachable` mark being the disclosure. A host whose
-clock regressed across a restart can mint generations below a refusal
-the client still holds, reopening the strand only when that hold's rise
-was also coalesced away.
+back, the row's `unreachable` mark being the disclosure. A restart that
+seeds below a generation the client still holds, by a regressed
+clock or by acquisitions having outpaced elapsed milliseconds, reopens
+the strand only when that hold's rise was also coalesced away. Generation
+comparisons on direct connections assume the host identity behind a URL
+remains stable across recovery, while gateway session ids carry the host
+namespace by construction.
 What is bounded, and by the tick rather than by demand, is
 every way a hold ends. The bit is a hint and the attempt is the truth,
 which is what keeps this field from quietly becoming a gate.
