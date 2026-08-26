@@ -45,12 +45,14 @@ use crate::cancel::{SelectOutcome, select_cancel};
 use crate::oauth::openai::extract_account_id;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, validate_thinking_level};
-use crate::streaming::{AssistantMessageEvent, AssistantMessageEventStream, ErrorReason};
+use crate::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
 use crate::transform::transform_messages;
+#[cfg(test)]
+use crate::types::StopReason;
 use crate::types::{
     AssistantError, AssistantMessage, Context, ErrorCategory,
-    ReasoningSummary as UnifiedReasoningSummary, SimpleStreamOptions, StopReason, StreamOptions,
-    ThinkingLevel, ToolDefinition,
+    ReasoningSummary as UnifiedReasoningSummary, SimpleStreamOptions, StreamOptions, ThinkingLevel,
+    ToolDefinition,
 };
 // Used only by the `test-support` round-trip helpers below.
 #[cfg(any(test, feature = "test-support"))]
@@ -58,8 +60,8 @@ use crate::types::ServiceTier;
 
 use super::errors::classify_client_error_with;
 use super::responses::{
-    CostMultiplierFn, StreamState, convert_messages, empty_partial, map_service_tier,
-    responses_reasoning_effort, verbosity_text_config,
+    CostMultiplierFn, StreamState, convert_messages, empty_partial, error_message,
+    map_service_tier, responses_reasoning_effort, verbosity_text_config,
 };
 #[cfg(any(test, feature = "test-support"))]
 use super::responses::{append_assistant_message, parse_assistant_input_items_with_api};
@@ -147,16 +149,7 @@ async fn run_stream(
     reasoning: ThinkingLevel,
 ) {
     if let Err(err) = run_stream_inner(&producer, &model, &context, &options, &reasoning).await {
-        let mut error = AssistantMessage::empty();
-        error.api = API_NAME.to_string();
-        error.provider = model.provider.clone();
-        error.model = model.id.clone();
-        error.stop_reason = StopReason::Error;
-        error.error = Some(err);
-        producer.push(AssistantMessageEvent::Error {
-            reason: ErrorReason::Error,
-            error,
-        });
+        producer.push(error_message(API_NAME, &model, None, err));
     }
 }
 
@@ -241,7 +234,16 @@ async fn run_stream_inner(
     )
     .await
     {
-        SelectOutcome::Ready(res) => res.map_err(|err| classify_codex_client_error(&err))?,
+        SelectOutcome::Ready(Ok(sse)) => sse,
+        SelectOutcome::Ready(Err(err)) => {
+            producer.push(error_message(
+                API_NAME,
+                model,
+                credential.account.as_deref(),
+                classify_codex_client_error(&err),
+            ));
+            return Ok(());
+        }
         SelectOutcome::Cancelled => {
             producer.push(AssistantMessageEvent::aborted(empty_partial(
                 API_NAME,
@@ -279,7 +281,15 @@ async fn run_stream_inner(
                     break;
                 }
             },
-            SelectOutcome::Ready(Some(Err(err))) => return Err(classify_codex_client_error(&err)),
+            SelectOutcome::Ready(Some(Err(err))) => {
+                producer.push(error_message(
+                    API_NAME,
+                    model,
+                    credential.account.as_deref(),
+                    classify_codex_client_error(&err),
+                ));
+                return Ok(());
+            }
             SelectOutcome::Ready(None) => break,
             SelectOutcome::Cancelled => {
                 producer.push(state.cancelled());

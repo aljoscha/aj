@@ -121,16 +121,7 @@ async fn run_stream(
     reasoning: ThinkingLevel,
 ) {
     if let Err(err) = run_stream_inner(&producer, &model, &context, &options, &reasoning).await {
-        let mut error = AssistantMessage::empty();
-        error.api = API_NAME.to_string();
-        error.provider = model.provider.clone();
-        error.model = model.id.clone();
-        error.stop_reason = StopReason::Error;
-        error.error = Some(err);
-        producer.push(AssistantMessageEvent::Error {
-            reason: ErrorReason::Error,
-            error,
-        });
+        producer.push(error_message(&model, None, err));
     }
 }
 
@@ -189,7 +180,15 @@ async fn run_stream_inner(
     )
     .await
     {
-        SelectOutcome::Ready(res) => res.map_err(|err| classify_client_error(&err))?,
+        SelectOutcome::Ready(Ok(sse)) => sse,
+        SelectOutcome::Ready(Err(err)) => {
+            producer.push(error_message(
+                model,
+                credential.account.as_deref(),
+                classify_client_error(&err),
+            ));
+            return Ok(());
+        }
         SelectOutcome::Cancelled => {
             producer.push(AssistantMessageEvent::aborted(empty_partial(
                 model,
@@ -209,7 +208,12 @@ async fn run_stream_inner(
                 }
             }
             SelectOutcome::Ready(Some(Err(err))) => {
-                return Err(classify_client_error(&err));
+                producer.push(error_message(
+                    model,
+                    credential.account.as_deref(),
+                    classify_client_error(&err),
+                ));
+                return Ok(());
             }
             // The server closes the stream after the trailing
             // usage-only chunk (there is no protocol terminator to
@@ -249,6 +253,24 @@ fn empty_partial(model: &ModelInfo, account: Option<&str>) -> AssistantMessage {
     partial.model = model.id.clone();
     partial.account = account.map(str::to_string);
     partial
+}
+
+/// Build a terminal error when no provider terminal can be used.
+///
+/// `account` is present once an upstream request used the resolved
+/// credential. Local failures before that request leave it absent.
+fn error_message(
+    model: &ModelInfo,
+    account: Option<&str>,
+    error: AssistantError,
+) -> AssistantMessageEvent {
+    let mut partial = empty_partial(model, account);
+    partial.stop_reason = StopReason::Error;
+    partial.error = Some(error);
+    AssistantMessageEvent::Error {
+        reason: ErrorReason::Error,
+        error: partial,
+    }
 }
 
 // ---------------------------------------------------------------------------
