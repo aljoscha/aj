@@ -512,6 +512,9 @@ fn refusal(unresolvable: Unresolvable) -> Frame {
         epoch: None,
         code: UNKNOWN_SESSION.to_string(),
         message: unresolvable.message,
+        // A hold is a host's fact about a session it has, and this one resolved
+        // to no host at all.
+        lock_generation: None,
     }
 }
 

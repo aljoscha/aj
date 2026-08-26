@@ -1670,6 +1670,110 @@ async fn a_rival_writers_hold_reaches_the_row() {
     host.host.shutdown().await;
 }
 
+/// The host gives each rival hold one generation and says the same number on
+/// both wire surfaces a refused client compares (spec 6.5, 6.8).
+///
+/// Driven through real flocks and real attach streams. Reading the cache would
+/// prove the bookkeeping in isolation and not that the row and refusal a client
+/// receives agree. The second hold pins the increment too: a constant boot seed
+/// would let the first recovery work and strand the next refusal after the
+/// client had consumed that generation.
+#[tokio::test]
+async fn a_rival_hold_has_one_generation_on_its_row_and_refusal() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    let mut writer = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    writer.pump_until_idle().await;
+    drop(writer);
+    harness.host.shutdown().await;
+
+    let row = |list: aj_wire::SessionList| {
+        list.sessions
+            .into_iter()
+            .find(|row| row.id == session)
+            .expect("the session is in the directory")
+    };
+    let refusal_generation = |frames: &[Frame]| {
+        let Some(Frame::Error {
+            code,
+            message,
+            lock_generation,
+            ..
+        }) = frames.last()
+        else {
+            panic!("a locked session is refused on the stream: {frames:?}");
+        };
+        assert_eq!(code, "locked", "{message}");
+        lock_generation.expect("a locked refusal names the hold that refused it")
+    };
+
+    let first_hold = SessionLock::try_acquire(&harness.persistence, &session, "first-rival-writer")
+        .expect("try_acquire")
+        .expect("the first rival takes the free lock");
+    let host = harness.revive(vec![finalized_text_message("after the lock")]);
+    let mut first_attach = host
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("the stream opens");
+    let first_refusal = frames_until(&mut first_attach, "the first refusal", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    let first_generation = refusal_generation(&first_refusal);
+    let first_row = row(host.host.published_directory().await);
+    assert!(first_row.locked, "the row does not report the first hold");
+    assert_eq!(
+        first_row.lock_generation,
+        Some(first_generation),
+        "the row and refusal name different holds",
+    );
+
+    // The fall leaves the generation behind. That released row is the latest
+    // snapshot a client needs when the held one was coalesced away.
+    drop(first_hold);
+    let released = row(host.host.sessions().await.expect("sessions"));
+    assert!(!released.locked, "the released row still claims the hold");
+    assert_eq!(
+        released.lock_generation,
+        Some(first_generation),
+        "the hold's generation disappeared with its bit, so the release says \
+         nothing about which refusal it answers",
+    );
+
+    let second_hold =
+        SessionLock::try_acquire(&harness.persistence, &session, "second-rival-writer")
+            .expect("try_acquire")
+            .expect("the second rival takes the free lock");
+    let mut second_attach = host
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("the stream opens");
+    let second_refusal = frames_until(&mut second_attach, "the second refusal", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    let second_generation = refusal_generation(&second_refusal);
+    assert_eq!(
+        second_generation,
+        first_generation + 1,
+        "a second hold reused the generation a refused client has already \
+         consumed",
+    );
+    let second_row = row(host.host.published_directory().await);
+    assert!(second_row.locked, "the row does not report the second hold");
+    assert_eq!(
+        second_row.lock_generation,
+        Some(second_generation),
+        "the second row and refusal name different holds",
+    );
+
+    drop(second_hold);
+    host.host.shutdown().await;
+}
+
 /// The wire boundary's id grammar outlives the per-session refusal (spec
 /// 6.2): an id this store could never hold is now refused on the stream
 /// instead of as the request, and it still reaches no path and no store

@@ -404,6 +404,22 @@ pub struct SessionSummary {
     /// reader treats false and absent alike as no promise of anything.
     #[serde(default, skip_serializing_if = "unset")]
     pub locked: bool,
+    /// Which hold [`Self::locked`] is an answer about: a counter the publishing
+    /// host raises for every hold of this session it learns of (spec 6.8).
+    ///
+    /// What makes a refused client's recovery derivable from this row alone. A
+    /// `locked` refusal names the generation of the hold that refused it, so a
+    /// row reporting the lock free at that generation or beyond says that hold
+    /// is over, whether or not the client ever received the snapshot the rise
+    /// was published in (spec 6.5).
+    ///
+    /// Absent means no knowledge, the same rule the bit itself has: a host that
+    /// has never seen a hold of this session publishes none, and neither does an
+    /// older one. Comparable only against generations from the same host, and
+    /// only in the direction the rule reads them: it is a serial number, not a
+    /// count of anything a client should show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_generation: Option<u64>,
 }
 
 /// A bit whose false is its absence on the wire, so a row carries the key only
@@ -922,6 +938,14 @@ pub enum Frame {
         /// The human sentence, produced where the facts are and always
         /// sufficient on its own.
         message: String,
+        /// Which hold a `locked` refusal is about, in the vocabulary of
+        /// [`SessionSummary::lock_generation`] (spec 6.5).
+        ///
+        /// This is what makes the refusal name *which* true the bit is at, so a
+        /// client can read the hold's end off a later row instead of having to
+        /// have received the snapshot the rise was in. `None` from every other
+        /// code, and from a host that publishes no generations.
+        lock_generation: Option<u64>,
     },
     Reset {
         session: String,
@@ -1084,6 +1108,8 @@ enum FrameRef<'a> {
         epoch: Option<&'a str>,
         code: &'a str,
         message: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lock_generation: Option<u64>,
     },
     Reset {
         session: &'a str,
@@ -1140,11 +1166,13 @@ impl Serialize for Frame {
                 epoch,
                 code,
                 message,
+                lock_generation,
             } => FrameRef::Error {
                 session,
                 epoch: epoch.as_deref(),
                 code,
                 message,
+                lock_generation: *lock_generation,
             },
             Self::Reset { session } => FrameRef::Reset { session },
             Self::Heartbeat => FrameRef::Heartbeat,
@@ -1247,12 +1275,14 @@ impl<'de> Deserialize<'de> for Frame {
                     epoch,
                     code,
                     message,
+                    lock_generation,
                 } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
                 Ok(Self::Error {
                     session,
                     epoch,
                     code,
                     message,
+                    lock_generation,
                 })
             }
             "reset" => {
@@ -1312,6 +1342,8 @@ struct ErrorFrameFields {
     epoch: Option<String>,
     code: String,
     message: String,
+    #[serde(default)]
+    lock_generation: Option<u64>,
 }
 
 #[derive(Deserialize)]

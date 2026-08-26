@@ -156,6 +156,13 @@ pub enum HostError {
     Locked {
         session: String,
         holder: Option<LockHolder>,
+        /// Which hold this refusal is about, in the vocabulary of the row's
+        /// `lock_generation` (spec 6.8).
+        ///
+        /// Read where the refusal happens, so it names the hold the client was
+        /// actually turned away over rather than whatever the bit says by the
+        /// time the refusal is rendered.
+        generation: Option<u64>,
     },
     /// The request is well formed and conflicts with nothing, but this host
     /// cannot serve it: a model it has no credentials for, a settings
@@ -190,6 +197,21 @@ impl HostError {
             Self::Unsupported(_) => "unsupported",
             Self::Invalid(_) => "invalid_request",
             Self::Internal(_) => "internal",
+        }
+    }
+
+    /// The hold a `locked` refusal names, `None` from every other failure
+    /// (spec 6.5, 6.8).
+    ///
+    /// Beside [`Self::code`] for the same reason that one is here: the frame
+    /// that refuses one session's attach is assembled from this error, and the
+    /// generation is part of what the refusal says rather than something the
+    /// assembling code could look up. Asking the directory for it there would
+    /// read whatever the bit had moved to since.
+    pub fn lock_generation(&self) -> Option<u64> {
+        match self {
+            Self::Locked { generation, .. } => *generation,
+            _ => None,
         }
     }
 }
@@ -866,6 +888,9 @@ impl SessionHost {
                         epoch: None,
                         code: err.code().to_string(),
                         message: err.to_string(),
+                        // A locked refusal names the hold it was refused over,
+                        // and every other code carries none (spec 6.5).
+                        lock_generation: err.lock_generation(),
                     }));
                 }
             }
@@ -988,6 +1013,7 @@ impl SessionHost {
                         unreachable: false,
                         archived: session.archived,
                         locked: session.locked,
+                        lock_generation: session.lock_generation,
                     },
                 )
             })
@@ -996,7 +1022,14 @@ impl SessionHost {
         // row a session had before it was materialized, and of those two
         // answers only the host's own is current.
         for session in &live {
-            summaries.insert(session.id().to_string(), summarize(session));
+            let id = session.id();
+            // The one field a live row still takes from the cold cache. The
+            // generation describes the session's lock history, not who holds it
+            // now, so it survives this host taking the session: a client refused
+            // over the hold that ended is owed the same evidence either way
+            // (spec 6.8).
+            let generation = self.inner.cold.lock_generation(id);
+            summaries.insert(id.to_string(), summarize(session, generation));
         }
         // Latest first: session ids are minted as timestamps, so their
         // descending order is chronological.
@@ -1447,6 +1480,11 @@ impl SessionHost {
             // Read only on the refusal path, and the record is cleared on
             // release, so what it names is a holder that has the lock now.
             holder: SessionLock::holder(&self.inner.persistence, id),
+            // Read after the note above, which minted this generation if the
+            // refusal is this host's first sight of the hold. So the refusal
+            // and the rows name the same hold, which is what lets a client
+            // compare them (spec 6.5).
+            generation: self.inner.cold.lock_generation(id),
         })
     }
 
@@ -1979,7 +2017,10 @@ fn log_modified_at(log: &ConversationLog) -> Option<DateTime<Utc>> {
 }
 
 /// Project one live session onto its directory entry.
-fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
+///
+/// `lock_generation` comes from the host's lock bookkeeping rather than from the
+/// session, which knows nothing about the holds that preceded it.
+fn summarize(session: &Arc<LiveSession>, lock_generation: Option<u64>) -> SessionSummary {
     let (steering, follow_up) = session.core.message_queues.pending_counts();
     let tasks = session
         .core
@@ -2007,6 +2048,7 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
         // Never locked: the bit names a rival, and this host holds this
         // session's lock for as long as it is live (spec 6.8).
         locked: false,
+        lock_generation,
     }
 }
 

@@ -1743,6 +1743,7 @@ mod tests {
             unreachable,
             archived: false,
             locked: false,
+            lock_generation: None,
         }
     }
 

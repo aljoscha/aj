@@ -40,7 +40,19 @@ pub enum Refusal {
     /// then false, the rival letting go (spec 6.8). The absence edge is kept
     /// besides, because a row can leave and return anyway and comes back
     /// rebuilt with the bit already false.
-    Locked,
+    Locked {
+        /// Which hold refused this attach, as the peer named it. `None` from a
+        /// peer that publishes no generations.
+        ///
+        /// The transitions above are read out of `list`, which is
+        /// lossy-coalescible: the rise and the fall are seconds apart by
+        /// design, so a client that does not drain in between sees only the
+        /// fall's snapshot and has nothing to compare it against. This is what
+        /// makes the recovery derivable from that one snapshot instead (spec
+        /// 6.5): a row reporting the lock free at this generation or beyond says
+        /// this hold is over.
+        generation: Option<u64>,
+    },
     /// Every other code, the ones this build has never heard of included: the
     /// row's return to the list is the edge, and nothing else. An unknown
     /// refusal behaves like the refusals this build knows rather than like the
@@ -50,11 +62,22 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    fn from_code(code: &str) -> Self {
+    fn read(code: &str, lock_generation: Option<u64>) -> Self {
         if code == "locked" {
-            Self::Locked
+            Self::Locked {
+                generation: lock_generation,
+            }
         } else {
             Self::Other
+        }
+    }
+
+    /// The hold this refusal was issued over, `None` unless it is a `locked`
+    /// one from a peer that publishes generations.
+    pub fn generation(self) -> Option<u64> {
+        match self {
+            Self::Locked { generation } => generation,
+            Self::Other => None,
         }
     }
 }
@@ -319,6 +342,7 @@ impl SessionClient {
                 session,
                 code,
                 message,
+                lock_generation,
                 ..
             } => {
                 if !self.is_ours(&session) {
@@ -341,7 +365,7 @@ impl SessionClient {
                 // the day something does it arrives on the unknown-code path and
                 // tears the attachment down over a turn that failed. Telling
                 // that kind from a refusal is the branch this arm still owes.
-                self.drop_attachment(Refusal::from_code(&code));
+                self.drop_attachment(Refusal::read(&code, lock_generation));
                 // The message verbatim, which spec 6.6 makes sufficient on its
                 // own, so a code this build has never heard of still reads.
                 reduce(
@@ -829,6 +853,7 @@ mod tests {
             epoch: None,
             code: code.to_string(),
             message: message.to_string(),
+            lock_generation: None,
         }
     }
 

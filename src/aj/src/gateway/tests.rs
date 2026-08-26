@@ -4534,6 +4534,7 @@ async fn a_re_attach_after_a_withdrawal_is_refused_for_that_session_alone() {
         epoch,
         code,
         message,
+        ..
     }) = served
         .iter()
         .find(|frame| matches!(frame, Frame::Error { .. }))
@@ -5582,6 +5583,7 @@ fn fake_row(id: &str) -> SessionSummary {
         unreachable: false,
         archived: false,
         locked: false,
+        lock_generation: None,
     }
 }
 
@@ -5657,6 +5659,7 @@ fn error_frame(session: &str, code: &str, message: &str) -> String {
         epoch: None,
         code: code.to_string(),
         message: message.to_string(),
+        lock_generation: None,
     })
     .expect("an error frame")
 }

@@ -48,12 +48,14 @@ enum AttachState {
 struct Subscriber {
     live: LiveSender,
     attached: HashMap<String, AttachState>,
-    /// The directory this subscriber was last sent, if it has been sent one.
+    /// The latest directory this subscriber's queue accepted.
     ///
-    /// Per subscriber, because the claim it makes is about what this client has
-    /// seen: a subscriber that just registered has seen nothing, and one whose
-    /// queue dropped a snapshot has not seen that one.
-    sent_list: Option<Vec<SessionSummary>>,
+    /// Per subscriber, because queue admission is the comparison point. A
+    /// subscriber that just registered has accepted nothing, and a snapshot its
+    /// full queue dropped was not accepted. A queued snapshot stays the
+    /// comparison point when coalescing replaces it, so a later restore of an
+    /// older delivered value is still recognized as a change (spec 6.8).
+    accepted_list: Option<Vec<SessionSummary>>,
 }
 
 impl Subscriber {
@@ -72,7 +74,7 @@ impl Subscriber {
     /// information. Compared on the payload rather than on what produced it,
     /// because the payload is what a client sees.
     fn offer_list(&mut self, sessions: &[SessionSummary]) -> bool {
-        if self.sent_list.as_deref() == Some(sessions) {
+        if self.accepted_list.as_deref() == Some(sessions) {
             return true;
         }
         let frame = Frame::List {
@@ -83,10 +85,10 @@ impl Subscriber {
         };
         match self.deliver(&frame) {
             Offered::Queued => {
-                self.sent_list = Some(sessions.to_vec());
+                self.accepted_list = Some(sessions.to_vec());
                 true
             }
-            // Not delivered, so not remembered: the next refresh offers this
+            // Not accepted, so not remembered: the next refresh offers this
             // subscriber the directory again, unchanged or not.
             Offered::Dropped => true,
             Offered::Evicted => false,
@@ -350,7 +352,7 @@ impl Fanout {
             Subscriber {
                 live,
                 attached,
-                sent_list: None,
+                accepted_list: None,
             },
         );
         (id, receiver, cancelled)
@@ -698,6 +700,7 @@ mod tests {
             epoch: None,
             code: code.to_string(),
             message: format!("no {code} here"),
+            lock_generation: None,
         }
     }
 
@@ -800,6 +803,7 @@ mod tests {
             unreachable: false,
             archived: false,
             locked: false,
+            lock_generation: None,
         }]
     }
 
@@ -820,7 +824,7 @@ mod tests {
     }
 
     /// A directory a subscriber's full queue dropped is offered again, unchanged
-    /// or not. Suppression records what was delivered, so a lossy frame the
+    /// or not. Suppression records what the queue accepted, so a lossy frame the
     /// bound turned away does not count as sent.
     #[test]
     fn a_dropped_directory_is_offered_again() {
@@ -849,6 +853,46 @@ mod tests {
             drained(&mut rx),
             vec!["list"],
             "the subscriber is offered the directory it never got",
+        );
+    }
+
+    /// A snapshot that restores the last delivered value is still offered when
+    /// a different one was accepted in between (spec 6.8).
+    ///
+    /// `list` coalescing can replace a queued change with the restore before
+    /// either is drained. Comparing the restore against what was delivered says
+    /// "unchanged" and skips it, leaving the queued value as the newest answer.
+    /// Comparing against the latest accepted row says it changed back and
+    /// replaces the queued change with the restore, so the newest cumulative
+    /// answer still reaches the client.
+    #[test]
+    fn a_restore_is_compared_against_the_latest_accepted_directory() {
+        let fanout = Fanout::default();
+        let (_id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+
+        let free = directory(1);
+        let held = directory(2);
+        fanout.publish_list(free.clone());
+        let Some(Frame::List { sessions, .. }) = rx.try_recv() else {
+            panic!("the baseline directory was not queued");
+        };
+        assert_eq!(sessions, free, "the client did not receive the baseline");
+
+        // The subscriber stops draining. The rise is accepted, then the fall
+        // restores the baseline before the rise can be delivered.
+        fanout.publish_list(held);
+        fanout.publish_list(free.clone());
+
+        let Some(Frame::List { sessions, .. }) = rx.try_recv() else {
+            panic!("the restored directory was suppressed as already delivered");
+        };
+        assert_eq!(
+            sessions, free,
+            "coalescing did not leave the latest cumulative snapshot",
+        );
+        assert!(
+            rx.try_recv().is_none(),
+            "the superseded intermediate snapshot was delivered too",
         );
     }
 

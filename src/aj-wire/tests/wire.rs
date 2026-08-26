@@ -1844,6 +1844,7 @@ fn a_rows_tag_and_host_are_absent_rather_than_empty() {
         unreachable: false,
         archived: false,
         locked: false,
+        lock_generation: None,
     };
     let encoded = serde_json::to_value(&row).expect("the row serializes");
     assert!(
@@ -1912,6 +1913,49 @@ fn an_archived_row_says_so_and_an_unarchived_one_stays_silent() {
     assert_eq!(
         serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
         put_away,
+    );
+}
+
+/// A lock generation is additive knowledge: a row that has seen no rival hold
+/// carries no key, and one that has names the hold its `locked` answer is about
+/// (spec 6.8).
+///
+/// Orthogonal to the bit deliberately. The release snapshot is `locked: false`
+/// while retaining the generation of the hold that ended, which is the shape
+/// that lets a refused client recover when the rise was coalesced away (spec
+/// 6.5). So this pins a false bit with a present generation rather than the
+/// easier held row.
+#[test]
+fn a_lock_generation_is_optional_and_outlives_the_bit() {
+    let row = SessionSummary {
+        locked: false,
+        lock_generation: None,
+        ..pinned_row()
+    };
+    let encoded = serde_json::to_value(&row).expect("the row serializes");
+    assert!(
+        encoded.get("lock_generation").is_none(),
+        "a row with no knowledge emits no generation: {encoded}",
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
+        row,
+        "an older row lacking the key reads as no knowledge",
+    );
+
+    let released = SessionSummary {
+        lock_generation: Some(1_800_000_000_007),
+        ..row
+    };
+    let encoded = serde_json::to_value(&released).expect("the row serializes");
+    assert!(
+        encoded.get("locked").is_none(),
+        "the release still writes false as an absent bit: {encoded}",
+    );
+    assert_eq!(encoded["lock_generation"], json!(1_800_000_000_007_u64));
+    assert_eq!(
+        serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
+        released,
     );
 }
 
@@ -2102,6 +2146,7 @@ fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
         epoch: None,
         code: "unknown_session".to_string(),
         message: "unknown session session-1".to_string(),
+        lock_generation: None,
     };
     let encoded = serde_json::to_value(&refusal).expect("the frame serializes");
     assert_eq!(
@@ -2129,6 +2174,7 @@ fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
         epoch,
         code,
         message,
+        ..
     } = &scoped
     else {
         panic!("expected an error frame, got {scoped:?}");
@@ -2153,6 +2199,50 @@ fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
             "an error frame names a session, a code and a message: {missing}",
         );
     }
+}
+
+/// A locked refusal names which hold refused it, and every other error may omit
+/// that additive field (spec 6.5, 6.8).
+#[test]
+fn a_locked_error_frame_carries_the_holds_generation() {
+    let refusal = Frame::Error {
+        session: "session-1".to_string(),
+        epoch: None,
+        code: "locked".to_string(),
+        message: "session session-1 is held by another writer".to_string(),
+        lock_generation: Some(1_800_000_000_007),
+    };
+    let encoded = serde_json::to_value(&refusal).expect("the frame serializes");
+    assert_eq!(encoded["lock_generation"], json!(1_800_000_000_007_u64));
+    let decoded = serde_json::from_value::<Frame>(encoded).expect("it decodes again");
+    assert!(
+        matches!(
+            decoded,
+            Frame::Error {
+                lock_generation: Some(1_800_000_000_007),
+                ..
+            }
+        ),
+        "the generation did not survive the typed codec: {decoded:?}",
+    );
+
+    let old: Frame = serde_json::from_value(json!({
+        "kind": "error",
+        "session": "session-1",
+        "code": "locked",
+        "message": "session session-1 is held by another writer",
+    }))
+    .expect("an older peer's refusal decodes");
+    assert!(
+        matches!(
+            old,
+            Frame::Error {
+                lock_generation: None,
+                ..
+            }
+        ),
+        "an absent generation is no knowledge, not a made-up hold: {old:?}",
+    );
 }
 
 /// A cursor's `<epoch>:<seq>` encoding round-trips, and the shapes that
@@ -2306,6 +2396,7 @@ fn local_frames() -> Vec<Frame> {
             epoch: None,
             code: "unknown_session".to_string(),
             message: "unknown session old".to_string(),
+            lock_generation: None,
         },
         Frame::Reset {
             session: "old".to_string(),

@@ -650,11 +650,26 @@ Client application rules:
   absent-then-present edge besides, because a row can leave and
   return anyway (a host restart, a withdrawal), returning rebuilt
   with the bit already false and no transition left to see. Either
-  edge re-asks, whichever fires first. A re-ask that is refused
-  again re-enters the withheld state with its edges re-armed, the
-  refusal itself being fresh evidence the bit is true, so a race
-  against a release still in flight costs one refusal and keeps
-  watching rather than stranding. A client holding no rows yet
+  edge re-asks, whichever fires first.
+
+  There is a third clause for `locked`, derived from the latest row
+  alone. `list` is lossy-coalescible (section 6.4), and the rise and
+  fall are seconds apart by design, so the held snapshot can be
+  superseded before a client drains it. The host therefore publishes
+  a lock generation beside the bit (section 6.8), and the refusal
+  carries the generation of the hold that refused it. A folded row
+  with `locked` false and generation greater than or equal to the
+  refusal's re-asks, whether or not the client received the rise.
+  Greater than or equal is load-bearing: a smaller generation is a
+  snapshot from before the refusal and can never fire. A fire
+  consumes the row's generation, so a peer that keeps publishing the
+  same released generation is asked once rather than once per
+  `list`. A re-ask that is refused again re-enters the withheld state
+  with its edges re-armed, and a conforming host's refusal names the
+  generation of the hold now on. The refusal is fresh evidence the
+  bit is true and says which true, so a race against a release still
+  in flight costs one refusal and keeps watching rather than
+  stranding. A client holding no rows yet
   re-asks on the first list it folds, whatever the codes were: that
   is new information rather than a spin, and it can happen once.
   Both edges are transitions between the rows one folded list
@@ -663,11 +678,12 @@ Client application rules:
   it. Both edges are set-wide, every refused session
   whose edge fired re-asks, not only the one on screen. A code the
   client does not know keeps the absent-then-present edge, the
-  additive-codes rule (section 6.6) applied to rejoining. Against a
-  peer that never publishes `locked` the bit edge cannot fire,
-  and a locked refusal waits indefinitely: that is the degradation
-  this contract chooses, the gap an old peer always had, never a
-  retry loop.
+  additive-codes rule (section 6.6) applied to rejoining. Old peers
+  that publish no generation keep exactly the two landed edges.
+  Against one that publishes neither a usable bit nor a generation,
+  a locked refusal waits indefinitely: that is the degradation this
+  contract chooses, the gap an old peer always had, never a retry
+  loop.
 
 ### 6.6 Commands
 
@@ -832,7 +848,16 @@ Per-session status in `list` frames and `GET /v1/sessions`:
   rule, not a capability registry entry, and not one of the fields a
   gateway owns, so it passes through a merge raw. How the host keeps
   the bit current, and the residue it accepts, is with the
-  enumeration contract below.
+  enumeration contract below. Beside it, `lock_generation` is an
+  optional `u64` naming which hold the bit is an answer about. The
+  host seeds the per-session counter at boot from unix milliseconds
+  and raises it whenever it learns of a new hold. The generation
+  stays on the row when the bit falls: `locked: false` at generation
+  G says hold G is over, which is what makes recovery from a locked
+  refusal carrying G derivable from that latest snapshot alone
+  (section 6.5). Absent is no knowledge, the bit's own rule. Older
+  hosts publish none. A gateway owns neither field and relays both
+  untouched.
 - `host`: which enrolled host a row belongs to, filled by a gateway
   and absent from a plain host's rows. Clients group by it and must
   not derive it from the id, ids are opaque (section 6.2).
@@ -962,7 +987,10 @@ until an attempt refuses and sets the bit, the answer that was always
 the authority; the momentary shared probe can refuse one racing
 acquire; and a row a gateway relays for a host it cannot reach carries
 the bit as last known, with no writer to move it until that host is
-back, the row's `unreachable` mark being the disclosure.
+back, the row's `unreachable` mark being the disclosure. A host whose
+clock regressed across a restart can mint generations below a refusal
+the client still holds, reopening the strand only when that hold's rise
+was also coalesced away.
 What is bounded, and by the tick rather than by demand, is
 every way a hold ends. The bit is a hint and the attempt is the truth,
 which is what keeps this field from quietly becoming a gate.
@@ -974,15 +1002,19 @@ This contract has teeth on both fronts. The polling variant of this
 design read hundreds of gigabytes a day re-deriving an unchanged
 400-file directory, and deriving a cold `last_seq` once, at startup,
 still put the whole store's bytes in front of the first frame.
-A refresh whose payload a subscriber has already
-been sent is not sent to it again, `list` is cumulative and an
-unchanged snapshot carries no information. The comparison is per
-subscriber and against what was actually delivered: a freshly
-attached subscriber has been sent nothing, and a snapshot a client's
-bounded queue dropped was not delivered either. A single host-global
-"last published" memory could keep neither promise, it would starve
-a fresh subscriber on a quiet host and strand a client whose queue
-dropped a frame.
+A refresh whose payload a subscriber has already accepted is not
+sent to it again, `list` is cumulative and an unchanged snapshot
+carries no information. The comparison is per subscriber and
+against the latest snapshot accepted for it, queued or delivered.
+Queue admission is the comparison point: a freshly attached
+subscriber has accepted nothing, and a snapshot its bounded queue
+dropped was not accepted or remembered. Remembering a queued
+snapshot is load-bearing when a later one restores an older
+delivered value. The restore still has information because the
+queued value moved in between, even if coalescing replaces it before
+delivery. A single host-global "last published" memory could keep
+none of these promises: it would starve a fresh subscriber on a quiet
+host and strand a client whose queue dropped a frame.
 
 ### 6.9 Flow control
 

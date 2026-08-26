@@ -9211,6 +9211,7 @@ mod tests {
                 pid,
                 host_id: host_id.to_string(),
             }),
+            generation: None,
         })
     }
 
@@ -20678,6 +20679,7 @@ mod tests {
                 epoch: None,
                 code: "unknown_session".to_string(),
                 message: refusal.to_string(),
+                lock_generation: None,
             })
             .expect("an error frame"),
         ];
@@ -21253,6 +21255,7 @@ mod tests {
             unreachable: false,
             archived: false,
             locked: false,
+            lock_generation: None,
         }
     }
 
@@ -21295,6 +21298,21 @@ mod tests {
         .expect("a list frame")
     }
 
+    /// One row carrying the lock bit and generation, at a position that makes
+    /// repeated snapshots distinguishable to the test.
+    fn list_lock_at(session: &str, locked: bool, generation: u64, last_seq: u64) -> String {
+        serde_json::to_string(&aj_wire::Frame::List {
+            sessions: vec![aj_wire::SessionSummary {
+                locked,
+                lock_generation: Some(generation),
+                last_seq: Some(last_seq),
+                ..listed_row(session)
+            }],
+            hosts: Vec::new(),
+        })
+        .expect("a list frame")
+    }
+
     /// A per-session attach refusal carrying `code`, as a peer sends one.
     fn refusal_frame(session: &str, code: &str, message: &str) -> String {
         serde_json::to_string(&aj_wire::Frame::Error {
@@ -21302,6 +21320,19 @@ mod tests {
             epoch: None,
             code: code.to_string(),
             message: message.to_string(),
+            lock_generation: None,
+        })
+        .expect("an error frame")
+    }
+
+    /// A locked refusal naming which hold refused this attach (spec 6.5).
+    fn locked_refusal_at(session: &str, generation: u64, message: &str) -> String {
+        serde_json::to_string(&aj_wire::Frame::Error {
+            session: session.to_string(),
+            epoch: None,
+            code: "locked".to_string(),
+            message: message.to_string(),
+            lock_generation: Some(generation),
         })
         .expect("an error frame")
     }
@@ -21421,6 +21452,107 @@ mod tests {
         remote.shutdown().await;
     }
 
+    /// A release reconstructed from one folded snapshot re-asks once, and the
+    /// generation it fired on cannot turn unchanged snapshots into a retry loop.
+    ///
+    /// The first stream never carries the hold's rise. Its baseline says free at
+    /// generation 6, the refusal names hold 7, and its latest row says free at 7,
+    /// which is the coalescing trace this rule exists to recover from (spec 6.4,
+    /// 6.5). The second stream refuses again with 7 and keeps publishing that
+    /// same released generation. A client that does not consume the fire opens a
+    /// third stream, then more, one per list.
+    ///
+    /// Driven through the real connection loop and asserted at the peer. Folding
+    /// these frames into the directory by hand would prove the clause and not
+    /// that its re-attach obligation reaches the stream machinery, while reading
+    /// the client's bookkeeping would look right even if no request left it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_released_generation_rejoins_once_and_is_then_consumed() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let refusal = "another writer still claims this session";
+
+        let peer = WarmPeer::answering(
+            vec![
+                vec![
+                    // The last row received before hold 7. The rise at 7 was
+                    // superseded in the lossy queue and never reaches us.
+                    list_lock_at(&session, false, 6, 1),
+                    locked_refusal_at(&session, 7, refusal),
+                    // The release, legible from this snapshot alone.
+                    list_lock_at(&session, false, 7, 2),
+                ],
+                vec![
+                    // A contradictory peer reuses the generation it just
+                    // published as free. Consumption is what bounds this case,
+                    // not the comparison against the refusal.
+                    locked_refusal_at(&session, 7, refusal),
+                    list_lock_at(&session, false, 7, 8),
+                    list_lock_at(&session, false, 7, 9),
+                    list_lock_at(&session, false, 7, 10),
+                ],
+            ],
+            Duration::from_millis(30),
+            After::Warm,
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_millis(400));
+
+        let asked = Arc::clone(&peer.opens);
+        let chat = Rc::clone(&world.chat);
+        let (exit, settled_after_second) = crate::remote::tests::bounded(
+            "the release to rejoin once and consume its generation",
+            drive_until(&mut world, &shell, |writer| async move {
+                let settled_after_second = settled(Duration::from_secs(10), || {
+                    let refused_twice = notices_of(&chat.borrow())
+                        .iter()
+                        .filter(|text| text.as_str() == refusal)
+                        .count()
+                        >= 2;
+                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 2 && refused_twice)
+                        .then_some(())
+                })
+                .await;
+                if settled_after_second.is_some() {
+                    // Long enough for every repeated row above and several
+                    // heartbeats after it. A third open cannot hide behind the
+                    // loop ending as soon as the second refusal lands.
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                }
+                drop(writer);
+                settled_after_second
+            }),
+        )
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(
+            settled_after_second.is_some(),
+            "the client did not re-attach on the released generation and fold \
+             the second refusal: {:?}",
+            main_notices(&world),
+        );
+        assert_eq!(
+            peer.opens(),
+            2,
+            "the peer served {} streams: one initial attach and one release are \
+             two, so any more is the consumed generation firing again",
+            peer.opens(),
+        );
+        assert!(
+            world.directory.rows().iter().any(|row| row.id == session
+                && !row.locked
+                && row.lock_generation == Some(7)
+                && row.last_seq == Some(10)),
+            "the client did not fold all repeated released snapshots, so the \
+             spin pressure this test claims to apply never reached it: {:?}",
+            world.directory.rows(),
+        );
+        remote.shutdown().await;
+    }
+
     /// A refused session re-attaches by itself when its row returns to the
     /// peer's list, with no gesture from the user.
     ///
@@ -21453,6 +21585,7 @@ mod tests {
                         epoch: None,
                         code: "unknown_session".to_string(),
                         message: "no host serves this session any more".to_string(),
+                        lock_generation: None,
                     })
                     .expect("an error frame"),
                     list_of(&[]),
@@ -21543,6 +21676,7 @@ mod tests {
                 epoch: None,
                 code: "unknown_session".to_string(),
                 message: "no host serves this session any more".to_string(),
+                lock_generation: None,
             })
             .expect("an error frame")
         };

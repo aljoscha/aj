@@ -450,6 +450,7 @@ mod tests {
             epoch: None,
             code: "unknown_session".to_string(),
             message: format!("{SESSION} names no session here"),
+            lock_generation: None,
         })
     }
 

@@ -135,6 +135,9 @@ pub(crate) struct ColdSession {
     pub(crate) archived: bool,
     /// Whether a writer that is not this host holds the session's lock.
     pub(crate) locked: bool,
+    /// Which hold [`Self::locked`] answers about, `None` for a session no rival
+    /// has been seen holding (spec 6.8).
+    pub(crate) lock_generation: Option<u64>,
 }
 
 /// The store's sessions as the host last saw them. Both the row and the
@@ -143,6 +146,16 @@ pub(crate) struct ColdSession {
 pub(crate) struct ColdSessions<S> {
     store: S,
     cache: StdMutex<Cache>,
+    /// Where this host's lock generations start (spec 6.8).
+    ///
+    /// Read once, from the wall clock, because the counter has to keep rising
+    /// across a restart: the cache is in memory, so a host that started over at
+    /// zero would mint generations below the ones a client is still comparing
+    /// against, and a refusal held over the restart would read a fresh hold's
+    /// row as evidence that its own hold had ended. A clock that went backwards
+    /// over the restart is the one corner this does not cover, and spec 6.8
+    /// discloses it.
+    lock_seed: u64,
     directory_reads: AtomicU64,
     sidecar_directory_reads: AtomicU64,
     membership_lookups: AtomicU64,
@@ -265,6 +278,49 @@ struct Cache {
     /// read held, since `flock` belongs to the open file description, so the
     /// sweep skips them and a won acquire clears the entry a refusal left.
     locked: HashSet<String>,
+    /// One entry per session this host has seen a rival hold, holding the
+    /// generation of the latest of those holds (spec 6.8).
+    ///
+    /// Outlives the bit deliberately, where [`Self::locked`] empties as holds
+    /// end: a row saying the lock is free carries the generation of the hold
+    /// that just ended, and that is the whole of what tells a client refused
+    /// over that hold that it is over (spec 6.5). So the fall must leave the
+    /// entry standing, and an entry costs a session id per session a rival has
+    /// ever held rather than per lock file the store has minted.
+    generations: HashMap<String, u64>,
+}
+
+impl Cache {
+    /// Record what this host now knows about `session_id`'s lock, answering
+    /// whether the bit moved.
+    ///
+    /// The single writer of the bit and its generation, so that all three
+    /// sources of the bit (a refused acquire, the enumeration sweep, the probe
+    /// tick) mint on one rule. `seed` is [`ColdSessions::lock_seed`].
+    ///
+    /// A rise mints, and nothing else does: a rise is a hold this host had not
+    /// seen, which is what a generation names, while a fall is that same hold
+    /// ending and has to be publishable *with* its generation. The host cannot
+    /// see a rival's acquire, so the holds it can count are the ones it learns
+    /// of, and two holds it never saw a gap between are one generation. That
+    /// costs nothing the rule needs: the fall of the later one is still the
+    /// answer changing for a client refused over the earlier.
+    fn set_locked(&mut self, session_id: &str, held: bool, seed: u64) -> bool {
+        if !held {
+            return self.locked.remove(session_id);
+        }
+        if !self.locked.insert(session_id.to_string()) {
+            return false;
+        }
+        let generation = self
+            .generations
+            .get(session_id)
+            .copied()
+            .unwrap_or(seed)
+            .saturating_add(1);
+        self.generations.insert(session_id.to_string(), generation);
+        true
+    }
 }
 
 impl<S: SessionStore> ColdSessions<S> {
@@ -272,6 +328,7 @@ impl<S: SessionStore> ColdSessions<S> {
         Self {
             store,
             cache: StdMutex::new(Cache::default()),
+            lock_seed: lock_seed(),
             directory_reads: AtomicU64::new(0),
             sidecar_directory_reads: AtomicU64::new(0),
             membership_lookups: AtomicU64::new(0),
@@ -296,6 +353,7 @@ impl<S: SessionStore> ColdSessions<S> {
                 tag: cache.tags.get(id).and_then(|tagged| tagged.tag.clone()),
                 archived: cache.archived.get(id).copied().unwrap_or(false),
                 locked: cache.locked.contains(id),
+                lock_generation: cache.generations.get(id).copied(),
             })
             .collect()
     }
@@ -492,11 +550,7 @@ impl<S: SessionStore> ColdSessions<S> {
             if cache.locked.contains(session_id) != held_before.contains(session_id) {
                 continue;
             }
-            if *held {
-                cache.locked.insert(session_id.clone());
-            } else {
-                cache.locked.remove(session_id);
-            }
+            cache.set_locked(session_id, *held, self.lock_seed);
         }
     }
 
@@ -507,12 +561,20 @@ impl<S: SessionStore> ColdSessions<S> {
     /// stops the moment this host holds the session itself. Returns whether the
     /// bit moved, which is what a caller publishes on.
     pub(crate) fn note_locked(&self, session_id: &str, locked: bool) -> bool {
-        let mut cache = self.cache();
-        if locked {
-            cache.locked.insert(session_id.to_string())
-        } else {
-            cache.locked.remove(session_id)
-        }
+        self.cache().set_locked(session_id, locked, self.lock_seed)
+    }
+
+    /// The generation of the latest hold of `session_id` this host has seen,
+    /// `None` for a session it has seen none of (spec 6.8).
+    ///
+    /// Touches no filesystem. Read on two paths: every row this host publishes
+    /// for the session, live or cold, and the refusal that names the hold a
+    /// client was turned away over. A live row carries it too, because the
+    /// generation describes the session's lock history rather than who holds it
+    /// now, and a client refused over a hold that ended because *this* host took
+    /// the session needs the same evidence as one whose rival simply left.
+    pub(crate) fn lock_generation(&self, session_id: &str) -> Option<u64> {
+        self.cache().generations.get(session_id).copied()
     }
 
     /// The sessions this host currently publishes as locked.
@@ -921,6 +983,22 @@ impl<S: SessionStore> ColdSessions<S> {
 
 fn fingerprint(metadata: &SessionMetadata) -> Fingerprint {
     Fingerprint::of(metadata.modified_at, metadata.size_bytes)
+}
+
+/// Where a host's lock generations start: unix milliseconds at construction.
+///
+/// Milliseconds rather than a finer unit because the property wanted is only
+/// that a later run starts above an earlier run's highest generation, and a run
+/// mints one per hold it sees, which no store produces thousands of in a
+/// millisecond. A clock this cannot read reads as zero, which gives up
+/// cross-restart monotonicity and nothing else: within the run the counter still
+/// rises, so every comparison a live client makes still holds.
+fn lock_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX - 1)
+        })
 }
 
 #[cfg(test)]

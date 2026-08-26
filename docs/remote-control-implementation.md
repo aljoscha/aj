@@ -367,15 +367,18 @@ history) graduate to live design when that work starts, and 9.1's
 refusal list shrinks as each lands. The render-loop cost stays banked,
 re-prioritized by actual use.
 
-The `locked` row bit (spec 6.5, 6.8) is published and read: a refused
-acquire sets it, a won one clears it, an enumeration point sweeps the
-lock directory to find rivals' holds, and a probe tick clears it when a
-rival lets go, cleanly or by crashing. A client refused with `locked`
-waits for the bit to fall and re-attaches on its own when it does,
-keeping the absent-then-present edge every refusal has. Against a peer
-that never publishes the bit it is the bit's edge that cannot fire, and
-a locked refusal then waits on absence alone, the gap an old peer always
-had, and deliberately not a timer.
+The `locked` row bit and its generation (spec 6.5, 6.8) are published
+and read: a refused acquire sets the bit and names the hold, a won one
+clears the bit, an enumeration point sweeps the lock directory to find
+rivals' holds, and a probe tick clears the bit when a rival lets go,
+cleanly or by crashing. A client refused with `locked` keeps the
+absent-then-present edge every refusal has and re-attaches when either
+the bit falls or the latest row says that refusal's generation is free.
+The latter makes the answer derivable from one cumulative snapshot when
+the held snapshot was coalesced away. Firing consumes that generation,
+so an unchanged released row cannot become a retry loop. Against a peer
+that publishes neither usable field a locked refusal waits on absence
+alone, the gap an old peer always had, and deliberately not a timer.
 The bit is a hint either way, so the escape hatch is what it always
 was, attempting the session and reading the answer.
 
