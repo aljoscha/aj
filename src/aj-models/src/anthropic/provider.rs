@@ -223,22 +223,15 @@ async fn run_stream_inner(
     Ok(())
 }
 
-/// Build a structurally-complete empty partial for this model. Used
-/// as the abort payload when cancellation fires before the SSE
-/// state machine has accumulated anything.
-///
-/// No pricing step: there is no `StreamState` yet and the usage is all
-/// zeros, so sealing would compute `total_tokens = 0` and a zero cost.
-/// The invariant every other exit seals for holds here for free. The
-/// upstream may still have billed input processing for a request
-/// cancelled this late, but no count for it ever reached the client, and
-/// an estimate would put a guess where everything downstream reads
-/// measurement.
-/// The terminal partial for an exit that never built a [`StreamState`].
+/// Build a terminal partial for an exit before streaming state exists.
 ///
 /// `account` is what the credential resolution reported, and `None`
 /// covers the exit that happens BEFORE any resolution: nothing served,
-/// which is what an absent account means.
+/// which is what an absent account means. No pricing step is needed:
+/// usage is all zeros, so the invariant every other exit seals for
+/// holds here for free. The upstream may still have billed input
+/// processing for a late cancellation, but no count reached the client
+/// and an estimate would put a guess where downstream reads measurement.
 fn empty_partial(model: &ModelInfo, account: Option<&str>) -> AssistantMessage {
     let mut partial = AssistantMessage::empty();
     partial.api = API_NAME.to_string();

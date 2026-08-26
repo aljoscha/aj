@@ -330,21 +330,14 @@ async fn run_stream_inner(
     Ok(())
 }
 
-///
-/// Build a structurally-complete empty partial for `(api, model)`.
-/// Used as the abort payload when cancellation fires before the SSE
-/// state machine has accumulated anything. Shared between the
-/// Responses and Codex providers (the Codex provider's `API_NAME`
-/// differs from this module's, so callers pass it explicitly).
-///
-/// No pricing step: there is no stream state yet and the usage is all
-/// zeros, so sealing would compute a zero total and a zero cost, and the
-/// invariant every other exit seals for holds here for free.
-/// The terminal partial for an exit that never built a [`StreamState`].
+/// Build a terminal partial for an exit before streaming state exists.
 ///
 /// `account` is what the credential resolution reported. `None` is the
 /// exit that happens before any resolution: nothing served, which is
-/// what an absent account means.
+/// what an absent account means. Shared between Responses and Codex,
+/// whose API names differ. No pricing step is needed: usage is all
+/// zeros, so the invariant every other exit seals for holds here for
+/// free.
 pub(super) fn empty_partial(
     api: &str,
     model: &ModelInfo,
