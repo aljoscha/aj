@@ -1541,15 +1541,7 @@ mod tests {
         options
     }
 
-    #[test]
-    fn a_terminal_message_keeps_the_account_stamped_at_construction() {
-        let state = StreamState::new_with_account(&fake_model(), Some("work".to_string()));
-        let terminal = state.finalize_or_truncate();
-        assert_eq!(terminal.partial().account.as_deref(), Some("work"));
-    }
-
-    #[tokio::test]
-    async fn the_live_provider_carries_the_resolved_account_into_its_state() {
+    async fn sse_fixture(events: Vec<ServerSentEvent>) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1574,12 +1566,7 @@ mod tests {
                 )
                 .await
                 .expect("write response head");
-            for event in [
-                ServerSentEvent::MessageStart {
-                    message: empty_a_message(),
-                },
-                ServerSentEvent::MessageStop,
-            ] {
+            for event in events {
                 let data = serde_json::to_string(&event).expect("serialize SSE fixture");
                 socket
                     .write_all(format!("data: {data}\n\n").as_bytes())
@@ -1587,9 +1574,28 @@ mod tests {
                     .expect("write SSE event");
             }
         });
+        (format!("http://{address}"), server)
+    }
+
+    #[test]
+    fn a_terminal_message_keeps_the_account_stamped_at_construction() {
+        let state = StreamState::new_with_account(&fake_model(), Some("work".to_string()));
+        let terminal = state.finalize_or_truncate();
+        assert_eq!(terminal.partial().account.as_deref(), Some("work"));
+    }
+
+    #[tokio::test]
+    async fn the_live_provider_carries_the_resolved_account_into_its_state() {
+        let (base_url, server) = sse_fixture(vec![
+            ServerSentEvent::MessageStart {
+                message: empty_a_message(),
+            },
+            ServerSentEvent::MessageStop,
+        ])
+        .await;
 
         let mut model = fake_model();
-        model.base_url = format!("http://{address}");
+        model.base_url = base_url;
         let options = labeled_options(None);
         let stream = AnthropicProvider.stream(&model, &Context::new("system"), &options);
         let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
@@ -1598,6 +1604,68 @@ mod tests {
         server.await.expect("fixture server completes");
 
         assert_eq!(terminal.account.as_deref(), Some("work"));
+    }
+
+    #[tokio::test]
+    async fn live_eof_retains_and_prices_the_retryable_partial() {
+        let (base_url, server) = sse_fixture(vec![
+            ServerSentEvent::MessageStart {
+                message: empty_a_message(),
+            },
+            ServerSentEvent::ContentBlockStart {
+                index: 0,
+                content_block: AContentBlock::TextBlock {
+                    text: String::new(),
+                    citations: Vec::new(),
+                },
+            },
+            ServerSentEvent::ContentBlockDelta {
+                index: 0,
+                delta: AContentBlockDelta::TextDelta {
+                    text: "partial".into(),
+                },
+            },
+        ])
+        .await;
+
+        let mut model = fake_model();
+        model.base_url = base_url;
+        let stream =
+            AnthropicProvider.stream(&model, &Context::new("system"), &labeled_options(None));
+        let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
+            .await
+            .expect("provider stream terminates at EOF");
+        server.await.expect("fixture server completes");
+
+        assert_eq!(
+            terminal.stop_reason,
+            StopReason::Error,
+            "an EOF without message_stop must be truncated"
+        );
+        let error = terminal.error.as_ref().expect("truncation has an error");
+        assert_eq!(error.category, ErrorCategory::Transient);
+        assert!(error.category.is_retryable());
+        match terminal.content.first() {
+            Some(AssistantContent::Text(text)) => assert_eq!(text.text, "partial"),
+            other => panic!("expected retained partial text, got {other:?}"),
+        }
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(
+            (
+                terminal.usage.input,
+                terminal.usage.output,
+                terminal.usage.cache_read,
+                terminal.usage.cache_write,
+                terminal.usage.total_tokens,
+            ),
+            (12, 0, 4, 2, 18),
+        );
+        let expected_cost = 0.000_036 + 0.000_001_2 + 0.000_007_5;
+        assert!(
+            (terminal.usage.cost.total - expected_cost).abs() < 1e-12,
+            "the live truncated turn cost {} instead of {expected_cost}",
+            terminal.usage.cost.total
+        );
     }
 
     #[tokio::test]

@@ -42,6 +42,8 @@ pub struct Client {
     auth_mode: AuthMode,
     version: String,
     base_url: String,
+    #[cfg(test)]
+    stream_response_override: std::sync::Mutex<Option<reqwest::Response>>,
     /// Beta feature headers configured by the caller (e.g.
     /// `["mcp-client-2025-11-20"]`). The default
     /// `fine-grained-tool-streaming-2025-05-14` and the optional
@@ -69,6 +71,8 @@ impl Client {
             auth_mode,
             version: "2023-06-01".to_string(),
             base_url,
+            #[cfg(test)]
+            stream_response_override: std::sync::Mutex::new(None),
             beta_headers: Vec::new(),
             interleaved_thinking: false,
         }
@@ -208,6 +212,12 @@ impl Client {
         apply_request_transformations(messages);
         caller_tool_names
     }
+
+    #[cfg(test)]
+    fn with_stream_response(self, response: reqwest::Response) -> Self {
+        *self.stream_response_override.lock().unwrap() = Some(response);
+        self
+    }
 }
 
 impl Client {
@@ -244,11 +254,11 @@ impl Client {
 
     /// Stream the raw server-sent events from `POST /v1/messages`.
     ///
-    /// The returned stream yields one [`ServerSentEvent`] per parseable
-    /// SSE frame. Unparseable frames are logged at `warn` and dropped so
-    /// a future API version that adds new event types doesn't crash the
-    /// stream. OAuth stealth-mode reverse-mapping of tool names is applied
-    /// per-event before yielding.
+    /// The returned stream yields one [`ServerSentEvent`] per SSE frame
+    /// whose JSON payload parses. Unparseable JSON payloads are logged at
+    /// `warn` and dropped so a future API version that adds new event types
+    /// does not crash the stream. OAuth stealth-mode reverse-mapping of tool
+    /// names is applied per-event before yielding.
     ///
     /// A mid-stream transport error (a dropped connection, a read error
     /// from the event source) is logged at `error` and surfaced as
@@ -266,6 +276,14 @@ impl Client {
         self.debug_log_request(&messages);
         let request_builder = self.build_request().json(&messages);
 
+        #[cfg(test)]
+        let response = if let Some(response) = self.stream_response_override.lock().unwrap().take()
+        {
+            response
+        } else {
+            request_builder.send().await?
+        };
+        #[cfg(not(test))]
         let response = request_builder.send().await?;
 
         let status = response.status();
@@ -474,6 +492,8 @@ mod tests {
         }
     }
 
+    impl std::error::Error for SyntheticStreamError {}
+
     fn event(data: &str) -> Event {
         Event {
             data: data.to_string(),
@@ -505,21 +525,26 @@ mod tests {
 
     #[tokio::test]
     async fn source_error_hides_every_ready_item_after_it() {
-        let source =
-            futures::stream::iter([Err(SyntheticStreamError), Ok(event(r#"{"type":"ping"}"#))]);
+        let source = futures::stream::iter([
+            Err(SyntheticStreamError),
+            Ok(event(r#"{"type":"ping"}"#)),
+            Ok(event(r#"{"type":"ping"}"#)),
+        ]);
         let mut stream = Box::pin(adapt_sse_events(source, Vec::new()));
 
-        assert!(stream.next().await.is_none(), "the first error is terminal");
-        assert!(
-            stream.next().await.is_none(),
-            "a terminated adapter never resumes at later ready items"
-        );
+        for poll in 1..=3 {
+            assert!(
+                stream.next().await.is_none(),
+                "poll {poll} after the terminal error must not resume the adapter"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn unrecognized_json_is_skipped_without_ending_the_stream() {
+    async fn unparseable_json_payloads_are_skipped_without_ending_the_stream() {
         let source = futures::stream::iter([
             Ok::<_, SyntheticStreamError>(event(r#"{"type":"future_event"}"#)),
+            Ok(event(r#"{"type":"ping"#)),
             Ok(event(r#"{"type":"ping"}"#)),
         ]);
         let mut stream = Box::pin(adapt_sse_events(source, Vec::new()));
@@ -529,6 +554,56 @@ mod tests {
             "the valid event after unknown JSON must still be delivered"
         );
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn adapter_restores_the_callers_tool_name() {
+        let source = futures::stream::once(future::ready(Ok::<_, SyntheticStreamError>(event(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","input":{},"name":"Edit"}}"#,
+        ))));
+        let mut stream = Box::pin(adapt_sse_events(source, vec!["edit".to_string()]));
+
+        match stream.next().await {
+            Some(ServerSentEvent::ContentBlockStart {
+                content_block: crate::messages::ContentBlock::ToolUseBlock { name, .. },
+                ..
+            }) => assert_eq!(name, "edit"),
+            other => panic!("expected a tool-use start, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_stream_terminates_on_its_response_source_error() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let body = reqwest::Body::wrap_stream(futures::stream::poll_fn({
+            let polls = Arc::clone(&polls);
+            move |_| {
+                let previous = polls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(previous, 0, "the response body was polled after its error");
+                Poll::Ready(Some(Result::<Vec<u8>, SyntheticStreamError>::Err(
+                    SyntheticStreamError,
+                )))
+            }
+        }));
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(reqwest::StatusCode::OK)
+                .body(body)
+                .expect("build synthetic response"),
+        );
+        let client = Client::new(Some("http://127.0.0.1:1".to_string()), "key".to_string())
+            .with_stream_response(response);
+
+        let mut stream = client
+            .messages_stream(Messages::default())
+            .await
+            .expect("build messages stream");
+
+        assert!(
+            stream.next().await.is_none(),
+            "the response source error must terminate the public stream"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "exactly one body poll");
     }
 
     #[test]

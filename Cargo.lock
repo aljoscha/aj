@@ -290,6 +290,7 @@ dependencies = [
  "dotenv",
  "eventsource-stream",
  "futures",
+ "http",
  "reqwest",
  "serde",
  "serde_json",
