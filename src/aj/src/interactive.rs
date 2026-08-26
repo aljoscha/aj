@@ -1757,6 +1757,17 @@ fn fold_notice(world: &mut World, text: &str) {
     fold_event(world, notice_event(text));
 }
 
+/// Fold `text` as a notice in `agent`'s transcript.
+fn fold_agent_notice(world: &mut World, agent: AgentId, text: &str) {
+    fold_event(
+        world,
+        AgentEvent::Notice {
+            agent_id: agent,
+            text: text.to_string(),
+        },
+    );
+}
+
 /// Fold `text` into the chat model as a Main-agent warning row, for
 /// failures the user should notice (e.g. a login that errored out).
 fn fold_warning(world: &mut World, text: &str) {
@@ -2197,13 +2208,14 @@ async fn submit_launch(world: &mut World, launch: aj_app::cli::InitialInput) {
     auto_submit_launch(world, launch.into_content()).await;
 }
 
-/// Cancel the viewed agent's running turn. Returns whether anything was
-/// cancelled. Fired by the keymap's `CancelTurn` action, whose predicate
-/// keeps it off the dispatch path while nothing runs.
+/// Cancel the viewed agent's running turn and surface any host refusal.
+/// Returns whether the gesture was absorbed. Fired by the keymap's
+/// `CancelTurn` action, whose predicate keeps it off the dispatch path while
+/// nothing runs.
 ///
 /// The host owns the cascade: cancelling a sub-agent that runs inside its
 /// parent's turn fires the parent's token.
-async fn cancel_viewed_turn(world: &World) -> bool {
+async fn cancel_viewed_turn(world: &mut World) -> bool {
     let active = world.chat.borrow().active_view();
     if !view_busy(world, active) {
         return false;
@@ -2214,7 +2226,7 @@ async fn cancel_viewed_turn(world: &World) -> bool {
         .await
     {
         tracing::warn!("the host refused a cancel: {err}");
-        return false;
+        fold_agent_notice(world, active, &err.to_string());
     }
     true
 }
@@ -2374,8 +2386,8 @@ async fn handle_host_action(
             // cancel, because the host reaps the cancelled turn itself and its
             // post-turn wake delivers whatever is still queued when it does.
             let yanked = yank_pending_into_editor(world, shell).await;
-            cancel_viewed_turn(world).await;
-            yanked
+            let absorbed = cancel_viewed_turn(world).await;
+            yanked || absorbed
         }
         AjAction::Steer => {
             // Steering is incoherent with an armed branch anchor: it would
@@ -9483,7 +9495,7 @@ mod tests {
         assert_eq!(shell.borrow().editor.borrow().text(), "recall me");
 
         // Settle the turn so the teardown below is clean.
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         shut_down(&world).await;
     }
@@ -10322,7 +10334,7 @@ mod tests {
             Some("1 agent still running")
         );
 
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         assert_eq!(quit_arm_running_work(&world), None);
         shut_down(&world).await;
@@ -10540,7 +10552,7 @@ mod tests {
             main_notices(&world),
         );
 
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         let before = main_notices(&world).len();
         apply_command(&mut world, &shell, CommandAction::Compact).await;
@@ -11603,14 +11615,14 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         assert!(
-            !cancel_viewed_turn(&world).await,
+            !cancel_viewed_turn(&mut world).await,
             "idle: fall through to quit"
         );
 
         handle_submit(&mut world, "go".to_string()).await;
         fold_ready_frames(&mut world);
         assert!(
-            cancel_viewed_turn(&world).await,
+            cancel_viewed_turn(&mut world).await,
             "running turn is cancelled"
         );
 
@@ -11740,7 +11752,7 @@ mod tests {
         // Settle the turn so the teardown below is clean. Drop the queue
         // first so the host's post-turn wake has nothing to deliver.
         world.handles().queues.clear(AgentId::Main);
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         shut_down(&world).await;
     }
@@ -11834,7 +11846,7 @@ mod tests {
         );
 
         world.handles().queues.clear(AgentId::Main);
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         shut_down(&world).await;
     }
@@ -11925,7 +11937,7 @@ mod tests {
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
         assert!(!transcript.borrow().is_at_bottom(), "scroll is preserved");
 
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         shut_down(&world).await;
     }
@@ -11957,7 +11969,7 @@ mod tests {
         // Nothing pending: the withdrawal reports no change.
         assert!(!handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
 
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         shut_down(&world).await;
     }
@@ -14286,8 +14298,13 @@ mod tests {
     /// Takes the model rather than the world, so a test observing a drive loop
     /// that holds `&mut World` can read it through its own `Rc` handle.
     fn notices_of(chat: &ChatState) -> Vec<String> {
-        chat.transcript(AgentId::Main)
-            .expect("main transcript")
+        notices_for(chat, AgentId::Main)
+    }
+
+    /// Notice text in `agent`'s transcript, in row order.
+    fn notices_for(chat: &ChatState, agent: AgentId) -> Vec<String> {
+        chat.transcript(agent)
+            .unwrap_or_else(|| panic!("{agent:?} transcript"))
             .entries()
             .iter()
             .filter_map(|e| match &e.kind {
@@ -15185,7 +15202,7 @@ mod tests {
         );
 
         // Settle the turn so teardown is clean.
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         shut_down(&world).await;
     }
@@ -15244,7 +15261,7 @@ mod tests {
         );
 
         // Settle the turn so teardown is clean.
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         shut_down(&world).await;
     }
@@ -15856,7 +15873,7 @@ mod tests {
             crate::toasts::toast_texts(&shell.borrow().toasts),
         );
         // Settle the turn so the teardown below is clean.
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
         let prompts: Vec<String> = world
             .chat
@@ -16029,7 +16046,7 @@ mod tests {
             "a live turn refuses the branch switch: {:?}",
             toast_lines(&shell),
         );
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
 
         // A running background task refuses it too, even with no turn. The
@@ -22663,8 +22680,74 @@ mod tests {
             main_notices(&world)
         );
 
-        cancel_viewed_turn(&world).await;
+        cancel_viewed_turn(&mut world).await;
         settle(&mut world).await;
+        remote.shutdown().await;
+    }
+
+    /// A host refusal from the Ctrl+C action crosses the real HTTP control
+    /// seam and lands as a visible transcript notice.
+    #[tokio::test]
+    async fn connect_mode_ctrl_c_renders_a_cancel_refusal() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "parallel-agents").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        assert!(handle_submit(&mut world, "delegate it".to_string()).await);
+        settle(&mut world).await;
+
+        let handles = remote
+            .host
+            .local_handles(world.session())
+            .await
+            .expect("the host's own handles");
+        let sub = handles
+            .registry
+            .get(1)
+            .expect("the scripted turn retained a sub-agent");
+        // Stage the invariant tripwire through the same bus every real
+        // lifecycle mark uses: running, but owned by no turn or task.
+        sub.lock()
+            .await
+            .emit_event(AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            })
+            .await
+            .expect("the sub's bus takes the event");
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(&mut world);
+            if world.client().lifecycle().is_running(AgentId::Sub(1)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the client never saw the staged running mark",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        world.chat.borrow_mut().set_active_view(AgentId::Sub(1));
+        sync_keymap_ctx(&world, &shell);
+        let (mut app, mut writer, _root) = app_over(&shell).await;
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(!app.handle_input(event).quit, "Ctrl+C did not quit");
+        let action = shell
+            .borrow()
+            .take_host_action()
+            .expect("Ctrl+C parked a host action");
+        assert_eq!(action, AjAction::CancelTurn);
+
+        assert!(
+            handle_host_action(&mut world, &shell, action).await,
+            "Ctrl+C was absorbed rather than falling through to quit",
+        );
+        let visible = notices_for(&world.chat.borrow(), AgentId::Sub(1));
+        assert!(
+            visible.iter().any(|notice| {
+                notice.contains("sub-agent 1") && notice.contains("no turn or task owns it")
+            }),
+            "the host's Conflict reached the viewed transcript: {visible:?}",
+        );
         remote.shutdown().await;
     }
 

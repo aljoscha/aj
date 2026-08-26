@@ -140,7 +140,8 @@ pub enum HostError {
     #[error("unknown log entry {0}")]
     UnknownEntry(String),
     /// The request is well formed but conflicts with the session's current
-    /// state (a turn is running, background work is live).
+    /// state: a turn is running, background work is live, or a lifecycle mark
+    /// names work the host has no mechanism to mutate.
     #[error("{reason}")]
     Conflict { reason: String },
     /// Another writer holds the session's advisory lock, so this host

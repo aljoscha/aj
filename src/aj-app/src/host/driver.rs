@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId};
-use aj_agent::tool::TaskId;
+use aj_agent::tool::{TaskId, TaskStatus};
 use aj_models::types::UserContent;
 use aj_session::{
     EntryRef, SessionMetadata, TaggedEvent, ThreadFilter, repair_interrupted_tool_uses,
@@ -474,7 +474,7 @@ impl Driver {
         match command {
             Command::Prompt { agent, content } => self.prompt(agent, content),
             Command::Steer { agent, text } => self.steer(agent, text),
-            Command::Cancel { agent } => Ok(self.cancel(agent)),
+            Command::Cancel { agent } => self.cancel(agent),
             Command::Queue(op) => Ok(self.queue_op(op)),
             Command::Compact { instructions } => self.compact(instructions),
             Command::Settings(change) => self.settings(change).await,
@@ -542,16 +542,52 @@ impl Driver {
         self.spawn(agent, TurnStart::Prompt(text))
     }
 
-    fn cancel(&self, agent: AgentId) -> CommandOutcome {
+    /// Route a cancel to the mechanism that owns `agent`'s run.
+    ///
+    /// `Accepted` means the owner was signalled to end the run, or the run
+    /// had already ended. A running mark with no owner is refused and logged
+    /// so neither the wire answer nor the host's invariant tripwire claims a
+    /// cancellation happened when no mechanism could perform it.
+    fn cancel(&self, agent: AgentId) -> Result<CommandOutcome, HostError> {
+        // A driven turn first, so a sub-agent's independent continuation
+        // keeps its direct route.
         if self.turns.cancel(agent) {
-            return CommandOutcome::Accepted;
+            return Ok(CommandOutcome::Accepted);
+        }
+        // A detached background run belongs to the task registry, not to any
+        // turn. Delegating a Running entry to the kill path gives both
+        // gestures the same conclusion, notice, status, and parked usage. A
+        // terminal entry closes the completion race: its AgentEnd may still
+        // be queued, but the registry already says there is nothing to end.
+        if let AgentId::Sub(n) = agent
+            && let Some((task, status)) = self.session.core.task_registry.latest_agent_task(n)
+        {
+            return if status == TaskStatus::Running {
+                self.kill_task(task)
+            } else {
+                Ok(CommandOutcome::Accepted)
+            };
         }
         if self.lifecycle.is_running(agent) {
             // A sub running its initial spawn is owned by the main turn,
-            // so cancelling that token is what reaches the child.
-            self.turns.cancel(AgentId::Main);
+            // so cancelling that token is what reaches the child. For Main,
+            // the first route already tried this token and this call misses.
+            if self.turns.cancel(AgentId::Main) {
+                return Ok(CommandOutcome::Accepted);
+            }
+            // Running by the mark, owned by neither a turn nor a task: no
+            // mechanism here can end it. Reachable only through a leaked
+            // mark, which is why it refuses out loud instead of accepting.
+            // The refusal is logged as well as returned, so the invariant
+            // leaves a trace even if the client disconnects before rendering
+            // the reason.
+            let agent = agent_label(agent);
+            tracing::warn!("a cancel of {agent} found a running mark no turn or task owns");
+            return Err(HostError::Conflict {
+                reason: format!("{agent} is marked running but no turn or task owns it"),
+            });
         }
-        CommandOutcome::Accepted
+        Ok(CommandOutcome::Accepted)
     }
 
     fn queue_op(&self, op: QueueOp) -> CommandOutcome {
@@ -638,12 +674,11 @@ impl Driver {
     }
 
     fn kill_task(&self, task: TaskId) -> Result<CommandOutcome, HostError> {
-        if self.session.core.task_registry.status(task).is_none() {
+        if !self.session.core.task_registry.kill(task) {
             return Err(HostError::UnknownTask(task));
         }
-        // Idempotent for a task that already finished: the registry ignores
-        // a kill of a terminal entry.
-        self.session.core.task_registry.kill(task);
+        // Idempotent for a task that already finished: firing its completed
+        // driver's token has no remaining observer.
         self.shared.fanout.mark_list_dirty();
         Ok(CommandOutcome::Accepted)
     }
@@ -1194,6 +1229,14 @@ fn text_only(content: &[UserContent]) -> Option<String> {
         }
     }
     Some(text.trim().to_string())
+}
+
+/// Name an agent in a host refusal without exposing Rust's debug syntax.
+fn agent_label(agent: AgentId) -> String {
+    match agent {
+        AgentId::Main => "the main agent".to_string(),
+        AgentId::Sub(n) => format!("sub-agent {n}"),
+    }
 }
 
 fn internal(err: impl std::error::Error + Send + Sync + 'static) -> HostError {

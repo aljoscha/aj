@@ -2346,17 +2346,33 @@ impl TaskRegistry {
         inner.entries.get(&id).map(|entry| entry.status)
     }
 
+    /// Return the newest task entry for sub-agent `n`, with its status.
+    ///
+    /// The entry is the ownership record for a detached run: its lifetime
+    /// hangs off the task's token rather than off a turn. Task ids are
+    /// monotonic, so choosing the newest entry also defines the safe answer
+    /// if an agent id is ever reused. A terminal status remains observable
+    /// here after the run's `AgentEnd`, until the registry itself is cleared.
+    pub fn latest_agent_task(&self, n: usize) -> Option<(TaskId, TaskStatus)> {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner
+            .entries
+            .iter()
+            .rev()
+            .find(|(_, entry)| {
+                matches!(entry.kind, TaskKind::Agent { agent_id, .. } if agent_id == n)
+            })
+            .map(|(id, entry)| (*id, entry.status))
+    }
+
     /// Whether sub-agent `n` has a background run still `Running`.
     ///
     /// Lets a host tell a detached background sub-agent, which
     /// legitimately outlives the turn that spawned it, from a leaked
     /// foreground spawn whose `AgentEnd` never arrived.
     pub fn agent_task_running(&self, n: usize) -> bool {
-        let inner = self.inner.lock().expect("task registry mutex poisoned");
-        inner.entries.values().any(|entry| {
-            entry.status == TaskStatus::Running
-                && matches!(entry.kind, TaskKind::Agent { agent_id, .. } if agent_id == n)
-        })
+        self.latest_agent_task(n)
+            .is_some_and(|(_, status)| status == TaskStatus::Running)
     }
 
     /// Record the usage accumulated by task `id`'s agent run. No-op
@@ -2776,6 +2792,45 @@ mod task_registry_tests {
     }
 
     #[test]
+    fn latest_agent_task_picks_the_newest_incarnation_and_its_status() {
+        let registry = TaskRegistry::default();
+        let (old, _) = registry.register(
+            AgentId::Main,
+            "old-call".to_string(),
+            TaskKind::Agent {
+                agent_id: 7,
+                task: "old run".to_string(),
+            },
+            "old run".to_string(),
+            Arc::new(StubOutput),
+        );
+        let (new, _) = registry.register(
+            AgentId::Main,
+            "new-call".to_string(),
+            TaskKind::Agent {
+                agent_id: 7,
+                task: "new run".to_string(),
+            },
+            "new run".to_string(),
+            Arc::new(StubOutput),
+        );
+
+        assert_eq!(
+            registry.latest_agent_task(7),
+            Some((new, TaskStatus::Running)),
+            "the newest incarnation owns an agent id that was reused",
+        );
+        registry.set_status(new, TaskStatus::Exited(Some(0)));
+        assert_eq!(
+            registry.latest_agent_task(7),
+            Some((new, TaskStatus::Exited(Some(0)))),
+            "its terminal status stays authoritative over an older live entry",
+        );
+        assert!(!registry.agent_task_running(7));
+        assert_eq!(old, 1, "the fixture really staged an older entry");
+    }
+
+    #[test]
     fn shutdown_cancels_all_task_tokens() {
         let registry = TaskRegistry::default();
         let (_, cancel_a) = register(&registry, AgentId::Main, "a");
@@ -3130,9 +3185,9 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // per-sub-agent cancel stays possible). A background run
             // must outlive the parent's turn, so it hangs off the
             // background task's token instead: `task_stop`, the TUI's
-            // kill action, and shutdown all reach the run through it,
-            // while cancelling the parent's turn deliberately does
-            // not.
+            // kill action, cancellation aimed at this sub-agent, and
+            // shutdown all reach the run through it. Cancelling the
+            // parent's turn deliberately does not.
             let background = match mode {
                 SpawnMode::Blocking => {
                     sub_agent.set_cancellation(self.cancellation.child_token());
@@ -3423,14 +3478,14 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
 
     // Status mapping: agent runs have no process exit code, so we
     // borrow the process conventions the shared status rendering
-    // reads naturally — a completed run is `Exited(Some(0))`, a
+    // reads naturally. A completed run is `Exited(Some(0))`, a
     // failed one `Exited(Some(1))`, and a run cancelled through the
-    // task token (task_stop / TUI kill / shutdown) is `Killed`. A
-    // run that completed before a late cancel still counts as
-    // completed. Any *error* under a fired token classifies as
-    // `Killed` — a genuine run failure racing a concurrent kill
-    // loses its error text, which is acceptable: the kill was
-    // requested and the run is gone either way.
+    // task token (task_stop / TUI kill / targeted sub-agent cancel /
+    // shutdown) is `Killed`. A run that completed before a late
+    // cancel still counts as completed. Any *error* under a fired
+    // token classifies as `Killed`. A genuine run failure racing a
+    // concurrent kill loses its error text, which is acceptable: the
+    // kill was requested and the run is gone either way.
     let (status, report_text) = match &result {
         // A truncated background run still delivers its partial text, but
         // the completion notice flags it so the parent model does not take

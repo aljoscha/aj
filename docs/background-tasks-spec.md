@@ -171,7 +171,8 @@ at the end for orchestration.
    parameters, tracking its own position.
 8. **Tasks hang off a session-level cancellation root**, not the
    per-turn token. The registry owns the root; the binary cancels it
-   on shutdown. `task_stop` and the TUI cancel per-task child tokens.
+   on shutdown. `task_stop`, the task picker, and a cancel aimed at a
+   detached sub-agent cancel per-task child tokens.
 9. **Task lifecycle events** (`TaskStart` / `TaskOutput` / `TaskEnd`)
    are new bus variants, transient like `ToolExecutionUpdate` (not
    persisted). They carry the originating `call_id` so the TUI updates
@@ -456,8 +457,9 @@ and running inline:
 
 1. `start_background_task(TaskKind::Agent { .. })` — the task cancel
    token becomes the child's run cancellation (so `task_stop`, the
-   TUI, and shutdown reach the run; the parent's turn token explicitly
-   does **not**, because outliving the parent's turn is the point).
+   task picker, a cancel aimed at that detached sub-agent, and shutdown
+   reach the run. The parent's turn token explicitly does **not**,
+   because outliving the parent's turn is the point).
 2. `tokio::spawn` a driver that locks the `SharedAgent`, runs
    `run_single_turn(task)`, then emits `SubAgentEnd` (unchanged
    contract: emitted regardless of success) and
@@ -592,7 +594,7 @@ Token hierarchy:
 - `TaskRegistry.root_cancel` — session-scoped, cancelled by the binary
   on shutdown.
 - per-task child tokens — cancelled by `task_stop`, the picker's kill
-  action, or the root.
+  action, a cancel aimed at a detached sub-agent, or the root.
 - The per-turn token never reaches task drivers. Cancelling a turn
   cancels an in-flight blocking `task_output` (it selects on the turn
   token) but not the tasks themselves.
@@ -692,9 +694,10 @@ produces today, so renderers share one code path.
 - **Turn aborts mid-batch with notices pending** → the drain point is
   skipped with the rest of the loop; trigger 2 fires on the aborted
   turn's completion, so the notices still wake the owner. If the user
-  cancelled deliberately and also wants the tasks gone, that's
-  `task_stop` / the picker's kill — cancelling a turn has never
-  implied killing its children.
+  cancelled the owner turn deliberately and also wants its detached
+  tasks gone, that's `task_stop` / the picker's kill. Cancelling an
+  owner turn does not imply killing its detached children. Cancelling
+  the detached sub-agent itself reaches its agent task.
 - **User quits with notices queued** → the TUI already showed
   `TaskEnd`; shutdown kills the task tree; queued notices die with the
   process (they are only persisted once drained into a transcript).

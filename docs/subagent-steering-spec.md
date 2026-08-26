@@ -373,8 +373,10 @@ Ctrl+C arm (interactive.rs:809-822). Priority order:
    binary is driving it (`turn_cancels` contains the active view), fire
    that token. If instead the viewed agent is a sub-agent running its
    *initial* spawn (running per `pump.is_running` but not in
-   `turn_cancels`, because that run is owned by the main turn), fire the
-   main turn's token (`turn_cancels[Main]`); the child token cascades.
+   `turn_cancels`), route by ownership. A detached run is owned by its
+   background agent task, so cancel that task's token. A foreground spawn
+   is owned by the main turn, so fire `turn_cancels[Main]` and let the child
+   token cascade.
 4. **Viewed agent idle, but some other agent is running** → do **not**
    cancel anything. Show `N agent(s) still running — press Ctrl+C again
    to quit` and arm a transient `quit_armed` flag. A second Ctrl+C while
