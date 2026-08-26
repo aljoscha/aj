@@ -18966,13 +18966,31 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// The session-info page shows the label, which it can only get from the
-    /// peer's row: the digest reads a log, and a tag is not in one.
+    /// The session-info page shows the label from the peer's row and the usage
+    /// breakdown from the focused log, through the same composed fetch path.
     #[tokio::test]
-    async fn the_session_info_page_shows_the_label() {
+    async fn the_session_info_page_shows_the_label_and_usage_breakdown() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "a prompt").await;
         seed_tag(&mut world, &shell, "fix-auth").await;
+
+        let stats = world.handles().log.lock().await.stats();
+        assert!(
+            !stats.usage_breakdown.is_empty(),
+            "the scripted prompt records a usage bucket"
+        );
+        let bucket = &stats.usage_breakdown[0];
+        assert_eq!(
+            (bucket.provider.as_str(), bucket.model.as_str()),
+            ("scripted", "scripted"),
+            "the fixture records the scripted response identity"
+        );
+        let bucket_key = "scripted / scripted";
+        let bucket_value = format!(
+            "{} tokens · ${:.4}",
+            bucket.usage.total_tokens, bucket.usage.cost.total
+        );
 
         let (tx, mut rx) = unbounded_channel();
         let styles = ContentStyles::from_theme(&shell.borrow().theme.read());
@@ -18989,6 +19007,11 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(
+            page.lines()
+                .any(|line| line.contains(bucket_key) && line.contains(&bucket_value)),
+            "the page carries the scripted usage row {bucket_key:?} / {bucket_value:?}: {page}",
+        );
         assert!(
             page.lines()
                 .any(|line| line.trim_start().starts_with("tag") && line.contains("fix-auth")),

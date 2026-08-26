@@ -687,7 +687,7 @@ mod tests {
     use aj_app::keybindings::ACTION_PALETTE_OPEN;
     use aj_app::theme::ColorMode;
     use aj_models::types::{Usage, UsageCost};
-    use aj_session::SessionSettings;
+    use aj_session::{SessionSettings, UsageBucket};
     use vaxis::cell::Color;
 
     use super::*;
@@ -1183,6 +1183,27 @@ mod tests {
                     total: 0.33,
                 },
             },
+            usage_breakdown: vec![UsageBucket {
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-4-5".to_string(),
+                account: None,
+                usage: Usage {
+                    input: 1_000,
+                    output: 2_000,
+                    cache_read: 500,
+                    cache_write: 250,
+                    total_tokens: 3_750,
+                    cost: UsageCost {
+                        input: 0.10,
+                        output: 0.20,
+                        cache_read: 0.01,
+                        cache_write: 0.02,
+                        total: 0.33,
+                    },
+                },
+                responses: 18,
+                unpriced_responses: 0,
+            }],
             compaction_usage: Usage::default(),
             compactions_with_usage: 0,
             settings: SessionSettings {
@@ -1235,6 +1256,11 @@ mod tests {
         assert!(blob.contains("Tool calls (31)"), "{blob}");
         assert!(blob.contains("total tokens"), "{blob}");
         assert!(blob.contains("$0.3300"), "{blob}");
+        let breakdown = row_containing(&rows, "3750 tokens · $0.3300");
+        assert!(
+            breakdown.contains("anthropic / claude-sonnet-4-5"),
+            "the provider/model breakdown reached one rendered row: {breakdown}",
+        );
 
         // Section headers sit at column 0 and key/value rows indent to 2
         // columns.

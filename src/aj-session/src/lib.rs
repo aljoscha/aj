@@ -70,7 +70,7 @@ pub use repair::repair_interrupted_tool_uses;
 pub use replay::{
     Backfill, TaggedEvent, project_suffix, project_thread, replay, replay_deferring_subs,
 };
-pub use stats::SessionStats;
+pub use stats::{SessionStats, UsageBucket};
 pub use tag::{MAX_TAG_BYTES, TagError, normalize_tag};
 pub use tool_details::resolve_tool_details;
 pub use tree::{SessionTree, TreeSegment};

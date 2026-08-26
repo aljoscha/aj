@@ -2,11 +2,13 @@
 //!
 //! [`SessionStats`] is the read-only digest behind a "session info" view:
 //! identity (id, on-disk path), timing, message counts broken out by kind,
-//! a per-tool call breakdown, aggregate token usage and dollar cost, and
-//! the settings the session is running with. It is computed in one pass
-//! over every entry across all threads, so the message, tool-call, and
-//! usage totals include sub-agent activity.
+//! a per-tool call breakdown, aggregate token usage and dollar cost, a
+//! per-provider and per-model usage breakdown, and the settings the session
+//! is running with. It is computed in one pass over every entry across all
+//! threads, so the message, tool-call, and usage totals include sub-agent
+//! activity.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -15,6 +17,34 @@ use chrono::{DateTime, Utc};
 
 use crate::log::{ConversationEntryKind, ConversationLog, SessionSettings, ThreadFilter};
 use crate::persistence::parse_session_id_created_at;
+
+/// Usage and response counts for one provider, model, and account.
+#[derive(Debug, Clone)]
+pub struct UsageBucket {
+    /// Provider recorded on the responses.
+    pub provider: String,
+    /// Model recorded on the responses.
+    pub model: String,
+    /// Account label recorded on the responses, when available.
+    pub account: Option<String>,
+    /// Accumulated token usage and recorded cost for the responses.
+    pub usage: Usage,
+    /// Number of assistant responses in this bucket.
+    pub responses: usize,
+    /// Responses that carried tokens but no recorded cost.
+    pub unpriced_responses: usize,
+}
+
+fn compare_usage_buckets(a: &UsageBucket, b: &UsageBucket) -> Ordering {
+    b.usage
+        .cost
+        .total
+        .total_cmp(&a.usage.cost.total)
+        .then_with(|| b.usage.total_tokens.cmp(&a.usage.total_tokens))
+        .then_with(|| a.provider.cmp(&b.provider))
+        .then_with(|| a.model.cmp(&b.model))
+        .then_with(|| a.account.cmp(&b.account))
+}
 
 /// A read-only digest of a [`ConversationLog`].
 ///
@@ -68,6 +98,14 @@ pub struct SessionStats {
     /// contributes zero and a non-trivial token count can still report a
     /// zero cost.
     pub usage: Usage,
+    /// Assistant-response usage grouped by provider, model, and optional
+    /// account. Provider and model come from each response, while
+    /// [`ConversationLog::stats`] emits `None` for the account axis. Buckets
+    /// span every thread and branch, including sub-agent threads. Compaction
+    /// spend is excluded because its entries identify no provider or model.
+    /// Buckets are sorted by cost descending, then tokens descending, then the
+    /// full provider, model, and account key ascending.
+    pub usage_breakdown: Vec<UsageBucket>,
     /// The share of `usage` spent on compaction summaries rather than on
     /// the conversation itself, summed from the compaction entries that
     /// recorded any.
@@ -102,6 +140,8 @@ impl ConversationLog {
         let mut compactions = 0;
         let mut total_entries = 0;
         let mut usage = Usage::default();
+        let mut usage_buckets: HashMap<(String, String, Option<String>), UsageBucket> =
+            HashMap::new();
         let mut compaction_usage = Usage::default();
         let mut compactions_with_usage = 0;
         let mut last_activity: Option<DateTime<Utc>> = None;
@@ -119,6 +159,21 @@ impl ConversationLog {
                         Some(Message::Assistant(a)) => {
                             assistant_messages += 1;
                             usage.accumulate(&a.usage);
+                            let account = None;
+                            let key = (a.provider.clone(), a.model.clone(), account.clone());
+                            let bucket = usage_buckets.entry(key).or_insert_with(|| UsageBucket {
+                                provider: a.provider.clone(),
+                                model: a.model.clone(),
+                                account,
+                                usage: Usage::default(),
+                                responses: 0,
+                                unpriced_responses: 0,
+                            });
+                            bucket.usage.accumulate(&a.usage);
+                            bucket.responses += 1;
+                            if a.usage.total_tokens > 0 && a.usage.cost.total == 0.0 {
+                                bucket.unpriced_responses += 1;
+                            }
                             for content in &a.content {
                                 if let AssistantContent::ToolCall(call) = content {
                                     tool_calls += 1;
@@ -148,6 +203,9 @@ impl ConversationLog {
         let mut tool_call_counts: Vec<(String, usize)> = per_tool.into_iter().collect();
         tool_call_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+        let mut usage_breakdown: Vec<UsageBucket> = usage_buckets.into_values().collect();
+        usage_breakdown.sort_by(compare_usage_buckets);
+
         let settings = self
             .head()
             .map(|head| self.linearize(head, ThreadFilter::USER).settings())
@@ -168,6 +226,7 @@ impl ConversationLog {
             subagents,
             compactions,
             usage,
+            usage_breakdown,
             compaction_usage,
             compactions_with_usage,
             settings,
@@ -177,6 +236,7 @@ impl ConversationLog {
 
 #[cfg(test)]
 mod tests {
+    use aj_agent::events::AgentSettings;
     use aj_agent::message::AgentMessage;
     use aj_models::types::{
         AssistantContent, AssistantMessage, Message, StopReason, TextContent, ToolCall,
@@ -184,7 +244,9 @@ mod tests {
     };
     use serde_json::json;
 
-    use crate::log::{ConversationLog, ConversationView, ThreadFilter};
+    use crate::log::{
+        ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter, ThreadKind,
+    };
     use crate::persistence::ConversationPersistence;
 
     fn text(body: &str) -> TextContent {
@@ -300,11 +362,15 @@ mod tests {
             ..Usage::default()
         };
         usage.cost.total = cost_total;
+        assistant_for("anthropic", "claude-test", usage)
+    }
+
+    fn assistant_for(provider: &str, model: &str, usage: Usage) -> Message {
         Message::Assistant(AssistantMessage {
             content: vec![AssistantContent::Text(text("ok"))],
             api: "test".to_string(),
-            provider: "anthropic".to_string(),
-            model: "claude-test".to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
             account: None,
             response_id: None,
             usage,
@@ -312,6 +378,38 @@ mod tests {
             error: None,
             timestamp: 0,
         })
+    }
+
+    fn measured_usage(tokens: [u64; 4], costs: [f64; 5]) -> Usage {
+        measured_usage_with_total(tokens, tokens.iter().sum(), costs)
+    }
+
+    fn measured_usage_with_total(tokens: [u64; 4], total_tokens: u64, costs: [f64; 5]) -> Usage {
+        Usage {
+            input: tokens[0],
+            output: tokens[1],
+            cache_read: tokens[2],
+            cache_write: tokens[3],
+            total_tokens,
+            cost: aj_models::types::UsageCost {
+                input: costs[0],
+                output: costs[1],
+                cache_read: costs[2],
+                cache_write: costs[3],
+                total: costs[4],
+            },
+        }
+    }
+
+    fn spawn_settings() -> AgentSettings {
+        AgentSettings {
+            provider: "zeta".to_string(),
+            model_id: "tie-z".to_string(),
+            thinking: "off".to_string(),
+            thinking_display: String::new(),
+            speed: "standard".to_string(),
+            verbosity: "default".to_string(),
+        }
     }
 
     /// Build a log holding one assistant turn and one compaction
@@ -389,6 +487,24 @@ mod tests {
         );
         assert_eq!(stats.compaction_usage.total_tokens, 40_900);
         assert_eq!(stats.compactions_with_usage, 1, "its spend is known");
+        assert_eq!(
+            stats.usage_breakdown.len(),
+            1,
+            "compaction spend never creates a usage bucket"
+        );
+        let bucket = &stats.usage_breakdown[0];
+        assert_eq!(
+            (
+                bucket.provider.as_str(),
+                bucket.model.as_str(),
+                bucket.account.as_deref(),
+                bucket.usage.total_tokens,
+                bucket.usage.cost.total,
+                bucket.responses,
+            ),
+            ("anthropic", "claude-test", None, 150, 0.10, 1),
+            "the assistant response remains its own 150-token, $0.10 bucket"
+        );
     }
 
     /// A compaction written before the spend was recorded carries no
@@ -435,5 +551,242 @@ mod tests {
         assert_eq!(stats.usage.output, 130);
         assert_eq!(stats.usage.total_tokens, 430);
         assert!((stats.usage.cost.total - 0.35).abs() < 1e-9);
+    }
+
+    /// Usage buckets preserve each response's identity across user branches
+    /// and sub-agent threads, aggregate every usage dimension, count unpriced
+    /// responses, and follow the ruled stable order.
+    #[test]
+    fn stats_breaks_usage_down_by_the_response_model_across_the_whole_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).unwrap();
+
+        let root = log
+            .append(
+                None,
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Message {
+                    message: AgentMessage::wire(user("root")),
+                },
+            )
+            .unwrap()
+            .id;
+
+        // This branch is abandoned below. Its two responses must remain in
+        // the file-level buckets even though settings follows another head.
+        let abandoned_high = log
+            .append(
+                Some(root.clone()),
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Message {
+                    message: AgentMessage::wire(assistant_for(
+                        "anthropic",
+                        "high",
+                        measured_usage([0, 20, 30, 50], [0.0, 1.0, 1.0, 3.0, 5.0]),
+                    )),
+                },
+            )
+            .unwrap()
+            .id;
+        log.append(
+            Some(abandoned_high),
+            ThreadKind::User,
+            None,
+            ConversationEntryKind::Message {
+                message: AgentMessage::wire(assistant_for(
+                    "beta",
+                    "high",
+                    measured_usage([100, 100, 100, 100], [0.1, 0.2, 0.3, 1.4, 2.0]),
+                )),
+            },
+        )
+        .unwrap();
+
+        log.set_head(root.clone()).unwrap();
+        let active_high = log
+            .append(
+                Some(root),
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Message {
+                    message: AgentMessage::wire(assistant_for(
+                        "anthropic",
+                        "high",
+                        measured_usage_with_total([0, 0, 0, 0], 50, [1.0, 1.0, 1.0, 1.0, 0.0]),
+                    )),
+                },
+            )
+            .unwrap()
+            .id;
+        let zero_token = log
+            .append(
+                Some(active_high),
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Message {
+                    message: AgentMessage::wire(assistant_for(
+                        "anthropic",
+                        "high",
+                        Usage::default(),
+                    )),
+                },
+            )
+            .unwrap()
+            .id;
+        let active_head = log
+            .append(
+                Some(zero_token),
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Message {
+                    message: AgentMessage::wire(assistant_for(
+                        "alpha",
+                        "tie-a",
+                        measured_usage([75, 75, 75, 75], [0.2, 0.4, 0.6, 0.8, 2.0]),
+                    )),
+                },
+            )
+            .unwrap()
+            .id;
+
+        let spawn = log
+            .append_subagent_spawn(7, active_head, "measure", true, &spawn_settings())
+            .unwrap();
+        let subagent_tie = log
+            .append(
+                Some(spawn.id),
+                ThreadKind::Subagent,
+                Some(7),
+                ConversationEntryKind::Message {
+                    message: AgentMessage::wire(assistant_for(
+                        "alpha",
+                        "tie-z",
+                        measured_usage([60, 70, 80, 90], [0.5, 0.5, 0.5, 0.5, 2.0]),
+                    )),
+                },
+            )
+            .unwrap()
+            .id;
+        log.append(
+            Some(subagent_tie),
+            ThreadKind::Subagent,
+            Some(7),
+            ConversationEntryKind::Message {
+                message: AgentMessage::wire(assistant_for(
+                    "zeta",
+                    "tie-a",
+                    measured_usage([90, 80, 70, 60], [0.8, 0.6, 0.4, 0.2, 2.0]),
+                )),
+            },
+        )
+        .unwrap();
+
+        let stats = log.stats();
+        let actual: Vec<_> = stats
+            .usage_breakdown
+            .iter()
+            .map(|bucket| {
+                (
+                    bucket.provider.as_str(),
+                    bucket.model.as_str(),
+                    bucket.account.as_deref(),
+                    (
+                        bucket.usage.input,
+                        bucket.usage.output,
+                        bucket.usage.cache_read,
+                        bucket.usage.cache_write,
+                        bucket.usage.total_tokens,
+                    ),
+                    (
+                        bucket.usage.cost.input,
+                        bucket.usage.cost.output,
+                        bucket.usage.cost.cache_read,
+                        bucket.usage.cost.cache_write,
+                        bucket.usage.cost.total,
+                    ),
+                    bucket.responses,
+                    bucket.unpriced_responses,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "anthropic",
+                    "high",
+                    None,
+                    (0, 20, 30, 50, 150),
+                    (1.0, 2.0, 2.0, 4.0, 5.0),
+                    3,
+                    1,
+                ),
+                (
+                    "beta",
+                    "high",
+                    None,
+                    (100, 100, 100, 100, 400),
+                    (0.1, 0.2, 0.3, 1.4, 2.0),
+                    1,
+                    0,
+                ),
+                (
+                    "alpha",
+                    "tie-a",
+                    None,
+                    (75, 75, 75, 75, 300),
+                    (0.2, 0.4, 0.6, 0.8, 2.0),
+                    1,
+                    0,
+                ),
+                (
+                    "alpha",
+                    "tie-z",
+                    None,
+                    (60, 70, 80, 90, 300),
+                    (0.5, 0.5, 0.5, 0.5, 2.0),
+                    1,
+                    0,
+                ),
+                (
+                    "zeta",
+                    "tie-a",
+                    None,
+                    (90, 80, 70, 60, 300),
+                    (0.8, 0.6, 0.4, 0.2, 2.0),
+                    1,
+                    0,
+                ),
+            ],
+        );
+        assert_eq!(stats.assistant_messages, 7);
+        assert_eq!(stats.usage.total_tokens, 1_450);
+        assert!((stats.usage.cost.total - 13.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn usage_bucket_order_uses_the_optional_account_last() {
+        let bucket = |account: Option<&str>| super::UsageBucket {
+            provider: "same-provider".to_string(),
+            model: "same-model".to_string(),
+            account: account.map(str::to_string),
+            usage: measured_usage([25, 25, 25, 25], [0.0, 0.0, 0.0, 1.0, 1.0]),
+            responses: 1,
+            unpriced_responses: 0,
+        };
+        let mut buckets = [bucket(Some("zeta")), bucket(Some("alpha")), bucket(None)];
+
+        buckets.sort_by(super::compare_usage_buckets);
+
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|bucket| bucket.account.as_deref())
+                .collect::<Vec<_>>(),
+            vec![None, Some("alpha"), Some("zeta")],
+        );
     }
 }

@@ -5,7 +5,7 @@
 //! sections. The frontend renders these rows as styled spans; keeping
 //! the digest here keeps its content independent of how it is drawn.
 
-use aj_session::SessionStats;
+use aj_session::{SessionStats, UsageBucket};
 use chrono::{DateTime, Utc};
 
 /// One digest row: a section header, a key/value pair, or a blank
@@ -24,8 +24,9 @@ fn kv(key: &str, value: &str) -> InfoRow {
 }
 
 /// Build the session-info digest: identity, recorded settings, activity
-/// timing, message counts, aggregate usage, and the per-tool call
-/// breakdown, grouped into labelled sections separated by blank rows.
+/// timing, message counts, aggregate usage, its per-provider/model usage
+/// breakdown, and the per-tool call breakdown, grouped into labelled
+/// sections separated by blank rows.
 ///
 /// `tag` is the label the session carries, which lives beside the log rather
 /// than in it, so the caller supplies it.
@@ -76,9 +77,17 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
         kv("total tokens", &stats.usage.total_tokens.to_string()),
         kv("cost", &cost_label(stats.usage.cost.total)),
         kv("of which compaction", &compaction_label(stats)),
-        InfoRow::Blank,
-        InfoRow::Header(format!("Tool calls ({})", stats.tool_calls)),
     ];
+
+    for bucket in &stats.usage_breakdown {
+        rows.push(kv(&bucket_key(bucket), &bucket_value(bucket)));
+    }
+
+    rows.push(InfoRow::Blank);
+    rows.push(InfoRow::Header(format!(
+        "Tool calls ({})",
+        stats.tool_calls
+    )));
 
     if stats.tool_call_counts.is_empty() {
         rows.push(kv("(none)", ""));
@@ -127,11 +136,34 @@ fn size_label(bytes: Option<u64>) -> String {
     }
 }
 
-/// Format the aggregate session cost as a dollar figure. Four decimal
-/// places so a sub-cent session still shows a non-zero amount, matching
-/// the HTML export's cost line.
+/// Format a recorded dollar cost to four decimal places.
+///
+/// Four places keep a sub-cent amount visible, matching the HTML export's
+/// cost line.
 fn cost_label(total: f64) -> String {
     format!("${total:.4}")
+}
+
+fn bucket_key(bucket: &UsageBucket) -> String {
+    let provider = without_control_characters(&bucket.provider);
+    let model = without_control_characters(&bucket.model);
+    let key = format!("{provider} / {model}");
+    match &bucket.account {
+        Some(account) => format!("{key} ({})", without_control_characters(account)),
+        None => key,
+    }
+}
+
+fn without_control_characters(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn bucket_value(bucket: &UsageBucket) -> String {
+    format!(
+        "{} tokens · {}",
+        bucket.usage.total_tokens,
+        cost_label(bucket.usage.cost.total)
+    )
 }
 
 /// The compaction share of the session's spend, as runs, tokens and
@@ -203,6 +235,50 @@ mod tests {
                     total: 0.33,
                 },
             },
+            usage_breakdown: vec![
+                UsageBucket {
+                    provider: "anthropic".to_string(),
+                    model: "claude-sonnet-4-5".to_string(),
+                    account: None,
+                    usage: Usage {
+                        input: 700,
+                        output: 1_200,
+                        cache_read: 300,
+                        cache_write: 50,
+                        total_tokens: 2_250,
+                        cost: UsageCost {
+                            input: 0.08,
+                            output: 0.18,
+                            cache_read: 0.02,
+                            cache_write: 0.02,
+                            total: 0.30,
+                        },
+                    },
+                    responses: 12,
+                    unpriced_responses: 0,
+                },
+                UsageBucket {
+                    provider: "open\nai".to_string(),
+                    model: "gpt-\r5".to_string(),
+                    account: Some("wo\u{7}rk".to_string()),
+                    usage: Usage {
+                        input: 300,
+                        output: 800,
+                        cache_read: 200,
+                        cache_write: 200,
+                        total_tokens: 1_500,
+                        cost: UsageCost {
+                            input: 0.02,
+                            output: 0.005,
+                            cache_read: 0.003,
+                            cache_write: 0.002,
+                            total: 0.03,
+                        },
+                    },
+                    responses: 6,
+                    unpriced_responses: 0,
+                },
+            ],
             compaction_usage: Usage::default(),
             compactions_with_usage: 0,
             settings: SessionSettings {
@@ -283,6 +359,14 @@ mod tests {
             RowView::Kv(
                 "of which compaction".to_string(),
                 "1 run, not recorded".to_string(),
+            ),
+            RowView::Kv(
+                "anthropic / claude-sonnet-4-5".to_string(),
+                "2250 tokens · $0.3000".to_string(),
+            ),
+            RowView::Kv(
+                "openai / gpt-5 (work)".to_string(),
+                "1500 tokens · $0.0300".to_string(),
             ),
             RowView::Blank,
             RowView::Header("Tool calls (31)".to_string()),

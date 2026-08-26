@@ -161,6 +161,16 @@ fn a_mixed_model_session_totals_the_sum_of_its_per_response_costs() {
         "4810000",
         "1,310,000 tokens on the first response and 3,500,000 on the second"
     );
+    assert_eq!(
+        row(&rows, "anthropic / model-dear"),
+        "1310000 tokens · $5.0000",
+        "the first response keeps its own provider, model, usage, and price"
+    );
+    assert_eq!(
+        row(&rows, "openai / model-cheap"),
+        "3500000 tokens · $2.2000",
+        "the second response is a separate usage bucket"
+    );
 }
 
 /// Tokens and dollars have to agree about whether a session did any
