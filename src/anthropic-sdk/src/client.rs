@@ -215,7 +215,10 @@ impl Client {
 
     #[cfg(test)]
     fn with_stream_response(self, response: reqwest::Response) -> Self {
-        *self.stream_response_override.lock().unwrap() = Some(response);
+        *self
+            .stream_response_override
+            .lock()
+            .expect("stream response override mutex poisoned") = Some(response);
         self
     }
 }
@@ -277,7 +280,11 @@ impl Client {
         let request_builder = self.build_request().json(&messages);
 
         #[cfg(test)]
-        let response = if let Some(response) = self.stream_response_override.lock().unwrap().take()
+        let response = if let Some(response) = self
+            .stream_response_override
+            .lock()
+            .expect("stream response override mutex poisoned")
+            .take()
         {
             response
         } else {
@@ -551,7 +558,7 @@ mod tests {
 
         assert!(
             matches!(stream.next().await, Some(ServerSentEvent::Ping)),
-            "the valid event after unknown JSON must still be delivered"
+            "the valid event after unknown and malformed JSON must still be delivered"
         );
         assert!(stream.next().await.is_none());
     }
