@@ -249,12 +249,13 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
             aj_conf::ConfigSpeed::Standard => aj_models::types::Speed::Standard,
             aj_conf::ConfigSpeed::Fast => aj_models::types::Speed::Fast,
         });
+    let thinking = args.thinking.or(config.thinking);
     let settings = SessionSettings {
         model,
         // The effective config carries the value, the layers carry whether
         // anyone asked for it, so both are consulted per axis.
-        thinking: stated.has("thinking").then(|| {
-            let level = aj_app::model::default_thinking_from_config(config.thinking);
+        thinking: (args.thinking.is_some() || stated.has("thinking")).then(|| {
+            let level = aj_app::model::default_thinking_from_config(thinking);
             thinking_config_name(level.as_ref()).to_string()
         }),
         thinking_display: stated.has("thinking_display").then(|| {
@@ -356,6 +357,8 @@ mod tests {
                 "https://proxy.example/v1",
                 "--speed",
                 "fast",
+                "--thinking",
+                "off",
             ]),
             &config,
             &Stated::new(
@@ -373,7 +376,7 @@ mod tests {
             }),
         );
         assert_eq!(settings.speed.as_deref(), Some("fast"));
-        assert_eq!(settings.thinking.as_deref(), Some("high"));
+        assert_eq!(settings.thinking.as_deref(), Some("off"));
     }
 
     /// A real host behind a real loopback control port, with the [`Control`] a

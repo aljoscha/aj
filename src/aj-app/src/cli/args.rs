@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use aj_conf::ConfigThinkingLevel;
 use aj_session::{TagError, normalize_tag};
 use aj_wire::{HostNameError, normalize_host_name};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -45,6 +46,14 @@ pub struct Args {
     /// that don't support fast mode reject the request.
     #[arg(long, env = "AJ_SPEED")]
     pub speed: Option<String>,
+
+    /// Thinking effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+    /// or `max`.
+    ///
+    /// Global so a `connect --new` can state the new session's effort on
+    /// either side of the subcommand.
+    #[arg(long, global = true, env = "AJ_THINKING", value_name = "LEVEL")]
+    pub thinking: Option<ConfigThinkingLevel>,
 
     /// Run in non-interactive print mode: stream events to stdout
     /// and exit when the agent reports `AgentEnd`. The trailing
@@ -572,6 +581,39 @@ mod tests {
             );
         }
         assert_eq!(parse(&["aj"]).launch_tag(), Ok(None), "no flag, no label");
+    }
+
+    /// Thinking is stated for a session a connect run creates, so its global
+    /// spelling reads the same on either side of that subcommand.
+    #[test]
+    fn the_thinking_flag_parses_on_either_side_of_connect() {
+        for argv in [
+            ["aj", "--thinking", "high", "connect", "http://host:6161"],
+            ["aj", "connect", "http://host:6161", "--thinking", "high"],
+        ] {
+            let args = parse(&argv);
+            assert_eq!(args.thinking, Some(ConfigThinkingLevel::High), "{argv:?}");
+            assert!(
+                matches!(args.command, Some(Command::Connect { .. })),
+                "{argv:?}"
+            );
+        }
+
+        let error = Args::try_parse_from([
+            "aj",
+            "connect",
+            "http://host:6161",
+            "--thinking",
+            "ludicrous",
+        ])
+        .expect_err("an unknown thinking level must be refused");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            error.to_string().contains(
+                "invalid thinking level 'ludicrous': expected off, minimal, low, medium, high, xhigh, or max"
+            ),
+            "{error}"
+        );
     }
 
     /// A tag the store would not keep is refused where the user typed it, so

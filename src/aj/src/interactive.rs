@@ -22533,6 +22533,52 @@ mod tests {
         remote.shutdown().await;
     }
 
+    /// A thinking flag after `connect` crosses the real create request. The
+    /// scripted host supports no thinking effort, so its refusal proves the
+    /// CLI value reached the host rather than being accepted and dropped.
+    #[tokio::test]
+    async fn connect_new_carries_the_thinking_flag_to_the_host() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let before = remote
+            .host
+            .sessions()
+            .await
+            .expect("the host's initial rows")
+            .sessions
+            .len();
+        assert_eq!(before, 0, "the fixture host already holds a session");
+
+        let refused = dial(
+            &remote,
+            &client_config(),
+            &nothing_stated(),
+            &["--new", "--thinking", "xhigh"],
+        )
+        .await;
+        let error = match refused {
+            Err(error) => error,
+            Ok(_) => panic!("a CLI level the model cannot serve was dropped"),
+        };
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("does not support thinking level"),
+            "the host's reason reaches the CLI: {reported}"
+        );
+        assert_eq!(
+            remote
+                .host
+                .sessions()
+                .await
+                .expect("the host's rows after refusal")
+                .sessions
+                .len(),
+            before,
+            "a refused thinking level still created a session",
+        );
+        remote.shutdown().await;
+    }
+
     /// `--tag` rides the create request a `connect --new` sends, so the host's
     /// own row carries the label. The client validates it first, which is what
     /// makes an illegal one a CLI error rather than a round trip.
