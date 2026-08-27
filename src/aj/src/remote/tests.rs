@@ -1206,6 +1206,62 @@ async fn hello_reports_the_protocol_the_working_directory_and_the_name() {
     fixture.shutdown().await;
 }
 
+/// Shared headless/interactive teardown stops the listener before it waits on
+/// host work. A held final flush keeps that ordering observable instead of
+/// letting both phases finish in one scheduler tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_shutdown_stops_accepting_before_host_teardown_finishes() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+    let _attached = fixture.remote(&session).await;
+    let log = fixture
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session")
+        .log;
+    let held = log.lock().await;
+    assert!(
+        log.try_lock().is_err(),
+        "the fixture holds the final flush before shutdown"
+    );
+    let address = fixture.server.local_addr();
+    let Fixture {
+        _dir,
+        host,
+        server,
+        client: _,
+        config: _,
+        layers: _,
+    } = fixture;
+    let shutdown_host = host.clone();
+    let shutdown = tokio::spawn(async move {
+        crate::serve::shutdown_server(server, &shutdown_host).await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(stream) => drop(stream),
+                Err(_) => return,
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the listener stops while host teardown is still blocked");
+    assert!(
+        !shutdown.is_finished(),
+        "the held log keeps host teardown behind the listener stop"
+    );
+
+    drop(held);
+    bounded("frontend shutdown", shutdown)
+        .await
+        .expect("shutdown task");
+    drop(_dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn creation_applies_settings_and_runs_a_first_prompt() {
     let fixture = Fixture::new(vec![finalized_text_message("hello from the script")]).await;
