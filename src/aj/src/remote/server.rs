@@ -161,13 +161,18 @@ impl RemoteServer {
         format!("http://{}", self.addr)
     }
 
-    /// Stop accepting and let in-flight streams finish.
-    ///
-    /// Shut the host down first: an attached stream only ends when the host
-    /// closes it, so a stream still attached here is waited on until
-    /// [`SHUTDOWN_GRACE`] expires and then dropped.
-    pub(crate) async fn shutdown(self) {
+    /// Stop accepting new connections without waiting for open streams.
+    pub(crate) fn stop_accepting(&self) {
         self.shutdown.cancel();
+    }
+
+    /// Let in-flight streams finish after the host has closed attachments.
+    ///
+    /// Call [`Self::stop_accepting`] before host teardown, then call this after
+    /// the host closes its fanout. An attached stream ends on that close, so
+    /// healthy clients cost no server grace.
+    pub(crate) async fn shutdown(self) {
+        self.stop_accepting();
         let abort = self.serving.abort_handle();
         if tokio::time::timeout(SHUTDOWN_GRACE, self.serving)
             .await

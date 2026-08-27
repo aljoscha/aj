@@ -12,6 +12,7 @@
 //! against each other, see [`LiveSession::publish_state`].
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::time::Instant;
 
@@ -206,6 +207,9 @@ pub(crate) struct LiveSession {
     pub(crate) handoff: AppendHandoff,
     status: StdMutex<SessionStatus>,
     requests: UnboundedSender<Request>,
+    /// Set before shutdown is queued, so work becoming ready behind an
+    /// in-flight command cannot start another turn while the request waits.
+    draining: AtomicBool,
 }
 
 impl LiveSession {
@@ -220,6 +224,7 @@ impl LiveSession {
             handoff,
             status: StdMutex::new(status),
             requests,
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -272,6 +277,21 @@ impl LiveSession {
     /// already stopped.
     pub(crate) fn send(&self, request: Request) -> bool {
         self.requests.send(request).is_ok()
+    }
+
+    /// Enter terminal drain mode before asking the driver to wind down.
+    pub(crate) fn request_shutdown(&self) -> bool {
+        self.start_draining();
+        self.send(Request::Shutdown)
+    }
+
+    /// Suppress every wake path from this point through driver teardown.
+    pub(crate) fn start_draining(&self) {
+        self.draining.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
     }
 
     /// Whether the session has anything queued for `agent`.

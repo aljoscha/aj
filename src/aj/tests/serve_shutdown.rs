@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -83,14 +82,6 @@ impl ScratchServer {
             .expect("read server stderr");
         (status, stderr)
     }
-
-    fn address(&self) -> SocketAddr {
-        self.url
-            .strip_prefix("http://")
-            .expect("HTTP server URL")
-            .parse()
-            .expect("server socket address")
-    }
 }
 
 impl Drop for ScratchServer {
@@ -100,18 +91,14 @@ impl Drop for ScratchServer {
 }
 
 async fn assert_second_signal_exits(server: &mut ScratchServer) {
-    let stream = reqwest::get(format!("{}/v1/events", server.url))
-        .await
-        .expect("open a stream that holds server teardown in its grace");
-    assert!(
-        stream.status().is_success(),
-        "the stream must be open or the first signal may finish teardown"
-    );
-
+    // Queue two distinct stop signals while the child cannot tear down. This
+    // pins the persistent listeners without making the test depend on a slow
+    // shutdown phase that healthy production code should avoid.
+    server.signal(Signal::SIGSTOP);
     server.signal(Signal::SIGINT);
-    wait_until_listener_closes(server.address()).await;
-    let began = Instant::now();
     server.signal(Signal::SIGTERM);
+    let began = Instant::now();
+    server.signal(Signal::SIGCONT);
     let (status, stderr) = server.wait(ESCALATION_DEADLINE).await;
 
     assert!(
@@ -127,18 +114,6 @@ async fn assert_second_signal_exits(server: &mut ScratchServer) {
         vec!["aj: received a second shutdown signal; exiting immediately"],
         "escalation writes one diagnostic line"
     );
-    drop(stream);
-}
-
-async fn wait_until_listener_closes(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < deadline {
-        if tokio::net::TcpStream::connect(address).await.is_err() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the first signal never stopped the scratch listener");
 }
 
 #[tokio::test]
@@ -164,28 +139,43 @@ async fn a_gateway_inherits_second_signal_escalation() {
             .is_some_and(|hosts| hosts.is_empty()),
         "the isolated HOME starts with no ambient enrollment state: {enrollment}"
     );
-    // Queue both stop signals while the owned child is suspended. This makes
-    // the escalation independent of how quickly an empty gateway tears down.
-    gateway.signal(Signal::SIGSTOP);
-    gateway.signal(Signal::SIGINT);
-    gateway.signal(Signal::SIGTERM);
-    let began = Instant::now();
-    gateway.signal(Signal::SIGCONT);
-    let (status, stderr) = gateway.wait(ESCALATION_DEADLINE).await;
+    assert_second_signal_exits(&mut gateway).await;
+}
 
+#[tokio::test]
+async fn one_sigterm_closes_an_attached_stream_without_spending_the_server_grace() {
+    let mut serve = ScratchServer::start("serve", "aj serving ").await;
+    let mut stream = reqwest::get(format!("{}/v1/events", serve.url))
+        .await
+        .expect("open an event stream");
     assert!(
-        !status.success(),
-        "an escalated gateway shutdown has nonzero status"
+        stream.status().is_success(),
+        "the fixture has a live stream for server shutdown to join"
     );
+    let first = tokio::time::timeout(Duration::from_secs(1), stream.chunk())
+        .await
+        .expect("the event stream begins")
+        .expect("read the first event chunk")
+        .expect("the open event stream has a first chunk");
+    assert!(!first.is_empty(), "the first event chunk carries bytes");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), stream.chunk())
+            .await
+            .is_err(),
+        "the event stream remains open before shutdown"
+    );
+    let began = Instant::now();
+
+    serve.signal(Signal::SIGTERM);
+    let (status, stderr) = serve.wait(ESCALATION_DEADLINE).await;
+
+    assert!(status.success(), "one stop signal stays graceful: {stderr}");
     assert!(
         began.elapsed() < ESCALATION_DEADLINE,
-        "the queued second signal exits now rather than waiting for teardown"
+        "host fanout closure ends the stream without spending the five-second server grace"
     );
-    assert_eq!(
-        stderr.lines().collect::<Vec<_>>(),
-        vec!["aj: received a second shutdown signal; exiting immediately"],
-        "gateway escalation writes one diagnostic line"
-    );
+    assert!(stderr.is_empty(), "healthy shutdown is quiet: {stderr}");
+    drop(stream);
 }
 
 #[tokio::test]

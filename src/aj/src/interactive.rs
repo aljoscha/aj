@@ -5793,15 +5793,21 @@ pub async fn run(args: Args) -> Result<()> {
     // Read what the banner needs before the host tears its sessions down:
     // afterwards there is no live session to ask.
     let banner = ExitBanner::collect(&world, completed_sessions).await;
-    // Remote clients lose the connection when their host departs (spec
-    // section 5), so the port closes before the sessions behind it do.
+    // Stop accepting before host teardown, then let fanout closure end remote
+    // streams before their server join. With no control port, only the local
+    // host needs winding down. Connect mode has neither.
     if let Some(server) = server {
-        server.shutdown().await;
+        let host = world
+            .control
+            .host()
+            .expect("a local control port serves the in-process host");
+        crate::serve::shutdown_server(server, host).await;
+    } else {
+        // Cancels every turn through the graceful path, quiesces background
+        // tasks, flushes logs, and releases locks. Connect mode has no host:
+        // dropping its stream is what deregisters it.
+        shut_down_host(&world).await;
     }
-    // Cancels every turn through the graceful path, quiesces the background
-    // tasks, flushes the logs, and releases the session locks. Connect mode
-    // has no host to wind down: dropping its stream is what deregisters it.
-    shut_down_host(&world).await;
     app.shutdown().await;
 
     // The alt screen wiped the conversation from the terminal, so the

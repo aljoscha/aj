@@ -98,10 +98,8 @@ pub(crate) async fn start_server(args: &Args, host: &SessionHost) -> Result<Opti
 /// `aj serve`: hold this working directory's sessions and serve them until
 /// the process is asked to stop.
 ///
-/// Teardown order matters and is the reverse of startup: the server stops
-/// accepting and lets its streams close, then the host cancels turns through
-/// the graceful path, quiesces background tasks, flushes logs, and releases
-/// the session locks.
+/// Teardown stops accepting first, then the host cancels turns through the
+/// graceful path and closes attachments, then the server joins those streams.
 pub(crate) async fn run(mut args: Args) -> Result<()> {
     // A bare `aj serve` is expected to be reachable by `aj connect` on the
     // same machine, so the control port is the point of the mode rather than
@@ -140,13 +138,18 @@ pub(crate) async fn run(mut args: Args) -> Result<()> {
 
     let signals = ShutdownSignals::new();
     println!("{}", banner(&host.hello(), &server.url()));
-    signals
-        .shutdown(async move {
-            server.shutdown().await;
-            host.shutdown().await;
-        })
-        .await;
+    signals.shutdown(shutdown_server(server, &host)).await;
     Ok(())
+}
+
+/// Stop a control port, wind down the host it serves, then join its streams.
+///
+/// Shared by headless and interactive local mode so attached clients cannot
+/// make either frontend spend the server grace before host fanout closes.
+pub(crate) async fn shutdown_server(server: RemoteServer, host: &SessionHost) {
+    server.stop_accepting();
+    host.shutdown().await;
+    server.shutdown().await;
 }
 
 /// What a `serve` run prints once it is up.

@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
 use aj_agent::events::{AgentEvent, AgentId};
@@ -172,6 +172,9 @@ struct LiveQueue {
     capacity: NonZeroUsize,
     state: StdMutex<LiveQueueState>,
     ready: Notify,
+    /// Stops attach-block production without discarding a completed block's
+    /// queued live frames.
+    block_stop: CancellationToken,
     cancelled: CancellationToken,
 }
 
@@ -181,6 +184,7 @@ struct LiveSender(Arc<LiveQueue>);
 pub(crate) struct LiveReceiver(Arc<LiveQueue>);
 
 fn live_channel(capacity: NonZeroUsize) -> (LiveSender, LiveReceiver, CancellationToken) {
+    let block_stop = CancellationToken::new();
     let cancelled = CancellationToken::new();
     let queue = Arc::new(LiveQueue {
         capacity,
@@ -189,6 +193,7 @@ fn live_channel(capacity: NonZeroUsize) -> (LiveSender, LiveReceiver, Cancellati
             closed: false,
         }),
         ready: Notify::new(),
+        block_stop,
         cancelled: cancelled.clone(),
     });
     (
@@ -234,6 +239,7 @@ impl LiveSender {
             state.frames.clear();
             state.closed = true;
             drop(state);
+            self.0.block_stop.cancel();
             self.0.cancelled.cancel();
             self.0.ready.notify_waiters();
             return Offered::Evicted;
@@ -257,7 +263,12 @@ impl LiveSender {
         let mut state = self.0.state.lock().expect("live queue mutex poisoned");
         state.closed = true;
         drop(state);
+        self.0.block_stop.cancel();
         self.0.ready.notify_waiters();
+    }
+
+    fn stop_block(&self) {
+        self.0.block_stop.cancel();
     }
 
     fn evict(&self) {
@@ -265,6 +276,7 @@ impl LiveSender {
         state.frames.clear();
         state.closed = true;
         drop(state);
+        self.0.block_stop.cancel();
         self.0.cancelled.cancel();
         self.0.ready.notify_waiters();
     }
@@ -276,6 +288,10 @@ impl LiveSender {
 // they arrive in order.
 #[allow(clippy::needless_pass_by_ref_mut)]
 impl LiveReceiver {
+    pub(crate) fn block_stop_token(&self) -> CancellationToken {
+        self.0.block_stop.clone()
+    }
+
     async fn recv(&mut self) -> Option<Frame> {
         loop {
             let ready = self.0.ready.notified();
@@ -432,6 +448,15 @@ impl Fanout {
             .insert(session.to_string(), AttachState::Live { boundary });
     }
 
+    /// Ask every attach-block producer to stop before session teardown begins.
+    /// A fully completed block sequence remains readable and continues into
+    /// its live queue; an aborted partial sequence ends at its channel close.
+    pub(crate) fn stop_blocks(&self) {
+        for subscriber in self.lock().subscribers.values() {
+            subscriber.live.stop_block();
+        }
+    }
+
     /// Drop every subscriber, closing its stream.
     pub(crate) fn close(&self) {
         let mut state = self.lock();
@@ -476,9 +501,29 @@ pub struct Attachment {
     block: Receiver<Frame>,
     block_done: bool,
     live: LiveReceiver,
+    block_complete: AttachBlockCompletion,
     cancelled: CancellationToken,
     attached: Vec<String>,
     fanout: Arc<Fanout>,
+}
+
+/// Shared producer result for deciding whether a closed block channel is a
+/// complete prefix or an aborted partial block.
+#[derive(Clone)]
+pub(crate) struct AttachBlockCompletion(Arc<AtomicBool>);
+
+impl AttachBlockCompletion {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub(crate) fn finish(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 impl Attachment {
@@ -496,18 +541,20 @@ impl Attachment {
         cancelled: CancellationToken,
         attached: Vec<String>,
         fanout: Arc<Fanout>,
-    ) -> (Self, Sender<Frame>) {
+    ) -> (Self, Sender<Frame>, AttachBlockCompletion) {
         let (block_tx, block) = channel(1);
+        let block_complete = AttachBlockCompletion::new();
         let attachment = Self {
             id,
             block,
             block_done: false,
             live,
+            block_complete: block_complete.clone(),
             cancelled,
             attached,
             fanout,
         };
-        (attachment, block_tx)
+        (attachment, block_tx, block_complete)
     }
 
     /// The sessions this stream was served an attach block for.
@@ -534,6 +581,9 @@ impl Attachment {
             if next.is_some() {
                 return next;
             }
+            if !self.block_complete.is_finished() {
+                return None;
+            }
             self.block_done = true;
         }
         tokio::select! {
@@ -554,7 +604,12 @@ impl Attachment {
             match self.block.try_recv() {
                 Ok(frame) => return Some(frame),
                 Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => self.block_done = true,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.block_complete.is_finished() {
+                        return None;
+                    }
+                    self.block_done = true;
+                }
             }
         }
         self.live.try_recv()
@@ -1224,7 +1279,7 @@ mod tests {
     fn attachment_is_producer_paced_and_reads_the_block_before_live() {
         let fanout = Arc::new(Fanout::default());
         let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
-        let (mut attachment, block_tx) = Attachment::new(
+        let (mut attachment, block_tx, block_complete) = Attachment::new(
             id,
             live,
             cancelled,
@@ -1245,6 +1300,7 @@ mod tests {
             attachment.try_recv().is_none(),
             "live frames stay behind an unfinished block",
         );
+        block_complete.finish();
         drop(block_tx);
         assert!(matches!(attachment.try_recv(), Some(Frame::Event { .. })));
     }
@@ -1318,7 +1374,7 @@ mod tests {
     fn dropping_an_attachment_deregisters_it() {
         let fanout = Arc::new(Fanout::default());
         let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
-        let (attachment, _block_tx) = Attachment::new(
+        let (attachment, _block_tx, _block_complete) = Attachment::new(
             id,
             live,
             cancelled,

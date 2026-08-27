@@ -904,6 +904,7 @@ impl SessionHost {
         // Materializing first would leave a window where an idle session could
         // be released out from under a block about to be served from it.
         let (id, live_frames, cancelled) = self.inner.shared.fanout.register(&names);
+        let stopped = live_frames.block_stop_token();
         // Resolved up front, so that returning means every block this stream
         // owes can be written.
         let mut serving = Vec::with_capacity(requests.len());
@@ -940,7 +941,7 @@ impl SessionHost {
         if let Err(err) = self.enumerate().await {
             tracing::warn!("could not re-read the session store for an attach: {err}");
         }
-        let (attachment, block_tx) = Attachment::new(
+        let (attachment, block_tx, block_complete) = Attachment::new(
             id,
             live_frames,
             cancelled.clone(),
@@ -952,17 +953,22 @@ impl SessionHost {
         // against its boundary, which is the atomicity the doc promises.
         let host = self.clone();
         tokio::spawn(async move {
+            let mut completed = true;
             for item in serving {
                 let served = match item {
                     Serving::Block(request, session) => {
-                        host.serve_block(id, &request, &session, &block_tx, &cancelled)
+                        host.serve_block(id, &request, &session, &block_tx, &stopped)
                             .await
                     }
-                    Serving::Refusal(frame) => send_block_frame(&block_tx, &cancelled, frame).await,
+                    Serving::Refusal(frame) => send_block_frame(&block_tx, &stopped, frame).await,
                 };
                 if !served {
+                    completed = false;
                     break;
                 }
+            }
+            if completed {
+                block_complete.finish();
             }
         });
         Ok(attachment)
@@ -1355,6 +1361,11 @@ impl SessionHost {
             return;
         }
         let _finish = ShutdownFinish(&self.inner);
+        // Cancel before a driver's advisory lock can be released. The producer
+        // may finish computation over a snapshot it already owns, but every
+        // later log acquisition and send prefers cancellation, so it cannot
+        // read from or emit through a rival writer.
+        self.inner.shared.fanout.stop_blocks();
         let deadline = tokio::time::Instant::now() + HOST_SHUTDOWN_GRACE;
         let graceful_deadline = deadline - HOST_ABORT_GRACE;
         let mut aborts = ShutdownAborts(
@@ -1406,7 +1417,7 @@ impl SessionHost {
         for entry in entries {
             let LiveEntry { session, driver } = entry;
             let id = session.id().to_string();
-            session.send(Request::Shutdown);
+            session.request_shutdown();
             // The driver holds the session lock, so joining it is what
             // releases it. Dropping our own handle first keeps the session
             // from outliving the task.
@@ -1894,13 +1905,17 @@ impl SessionHost {
         request: &AttachRequest,
         session: &Arc<LiveSession>,
         block: &Sender<Frame>,
-        cancelled: &CancellationToken,
+        stopped: &CancellationToken,
     ) -> bool {
         // The snapshot and the epoch are read under the log lock, because a
         // head switch moves both under it: reading them separately could
         // pair the old projection with the new epoch.
         let (snapshot, epoch, working_seen, settings_seen, finished_subs, driven_subs) = {
-            let log = session.core.log.lock().await;
+            let log = tokio::select! {
+                biased;
+                _ = stopped.cancelled() => return false,
+                log = session.core.log.lock() => log,
+            };
             let status = session.status();
             (
                 log.snapshot(),
@@ -1941,7 +1956,7 @@ impl SessionHost {
 
         if !send_block_frame(
             block,
-            cancelled,
+            stopped,
             Frame::State {
                 session: session.id().to_string(),
                 epoch: epoch.clone(),
@@ -1957,7 +1972,7 @@ impl SessionHost {
         for tagged in backfill.events {
             if !send_block_frame(
                 block,
-                cancelled,
+                stopped,
                 Frame::Event {
                     session: session.id().to_string(),
                     epoch: epoch.clone(),
@@ -1988,7 +2003,7 @@ impl SessionHost {
         for child in &backfill.open_subs {
             if !send_block_frame(
                 block,
-                cancelled,
+                stopped,
                 Frame::Event {
                     session: session.id().to_string(),
                     epoch: epoch.clone(),
@@ -2009,7 +2024,7 @@ impl SessionHost {
         }
         if !send_block_frame(
             block,
-            cancelled,
+            stopped,
             Frame::CaughtUp {
                 session: session.id().to_string(),
                 epoch: epoch.clone(),
@@ -2035,7 +2050,7 @@ impl SessionHost {
         for child in backfill.subs.difference(&backfill.open_subs) {
             if !send_block_frame(
                 block,
-                cancelled,
+                stopped,
                 Frame::Event {
                     session: session.id().to_string(),
                     epoch: epoch.clone(),
@@ -2099,12 +2114,12 @@ fn warn_driver_join(
 /// Sends one attach-block frame under receiver backpressure.
 async fn send_block_frame(
     sender: &Sender<Frame>,
-    cancelled: &CancellationToken,
+    stopped: &CancellationToken,
     frame: Frame,
 ) -> bool {
     tokio::select! {
         biased;
-        _ = cancelled.cancelled() => false,
+        _ = stopped.cancelled() => false,
         result = sender.send(frame) => result.is_ok(),
     }
 }

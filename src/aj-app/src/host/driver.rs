@@ -97,9 +97,6 @@ pub(crate) struct Driver {
     lifecycle: AgentLifecycle,
     events: UnboundedReceiver<TaggedEvent>,
     requests: UnboundedReceiver<Request>,
-    /// Set while winding down, so a reaped turn does not start a wake and
-    /// keep the session alive forever.
-    draining: bool,
 }
 
 impl Driver {
@@ -117,7 +114,6 @@ impl Driver {
             lifecycle: AgentLifecycle::default(),
             events,
             requests,
-            draining: false,
         }
     }
 
@@ -130,6 +126,9 @@ impl Driver {
                 // state as of now, and the event arm can be arbitrarily
                 // busy during a streaming turn.
                 request = self.requests.recv() => {
+                    if matches!(&request, Some(Request::Shutdown) | None) {
+                        self.session.start_draining();
+                    }
                     // A client that keeps commands in flight would
                     // otherwise starve the two arms below for as long as it
                     // keeps going: no frame would reach any client and no
@@ -213,7 +212,7 @@ impl Driver {
         self.publish_event(entry, event);
         self.refresh_state();
         self.shared.fanout.mark_list_dirty();
-        if !self.draining
+        if !self.session.is_draining()
             && let Some((owner, conditional)) = trigger
             && (!conditional
                 || self.session.core.task_registry.has_notices(owner)
@@ -314,7 +313,7 @@ impl Driver {
                 return;
             }
         };
-        if !self.draining
+        if !self.session.is_draining()
             && (self.session.core.task_registry.has_notices(agent)
                 || self.session.has_queued(agent))
         {
@@ -1118,7 +1117,7 @@ impl Driver {
     /// pending. It still takes the log lock, which a long-running reader can
     /// hold, and a release is waited on with the host's session map held.
     async fn wind_down(&mut self) {
-        self.draining = true;
+        self.session.start_draining();
         self.turns.cancel_all();
         let grace = tokio::time::sleep(TURN_DRAIN_GRACE);
         tokio::pin!(grace);

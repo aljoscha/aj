@@ -9522,6 +9522,210 @@ async fn shutdown_publishes_a_detached_sub_agents_terminal_events_before_eof() {
     );
 }
 
+/// A producer can finish the attach block before the client performs the extra
+/// receive that observes its channel disconnect. Final fanout close still
+/// drains live terminal frames in that state instead of mistaking the block for
+/// an aborted partial one.
+#[tokio::test]
+async fn shutdown_preserves_terminal_frames_when_block_completion_is_not_yet_observed() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message(
+            "an answer long enough to keep the turn visibly running",
+        )],
+        1,
+        Duration::from_millis(10),
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    // Do not receive again. The producer closes the block channel after this
+    // task consumed CaughtUp, but Attachment has not observed that close.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    harness.prompt(&session, "answer this").await;
+    let running = harness.host.sessions().await.expect("session directory");
+    assert!(
+        running
+            .sessions
+            .iter()
+            .any(|row| row.id == session && row.working),
+        "the fixture reached a live turn after block production completed: {running:?}"
+    );
+    bounded("the turn to finish without draining its stream", async {
+        loop {
+            let directory = harness.host.sessions().await.expect("session directory");
+            if directory
+                .sessions
+                .iter()
+                .any(|row| row.id == session && !row.working)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    harness.host.shutdown().await;
+
+    let mut queued = Vec::new();
+    while let Some(frame) = bounded("the completed attachment to reach EOF", stream.recv()).await {
+        queued.push(frame);
+    }
+    assert!(
+        queued.iter().any(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::MessageEnd { agent_id: AgentId::Main, .. }))
+        )),
+        "the completed block continues into its queued terminal frames: {queued:?}"
+    );
+}
+
+/// Drain mode begins when shutdown is queued, not only when the driver reaches
+/// that request. A task ending behind an in-flight command must not start a
+/// wake that consumes its notice before teardown.
+#[tokio::test]
+async fn shutdown_suppresses_a_task_wake_queued_behind_an_in_flight_command() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "starting it",
+                "call-bash",
+                "bash",
+                serde_json::json!({
+                    "command": "sleep 30",
+                    "run_in_background": true,
+                    "description": "sleep"
+                }),
+            ),
+            finalized_text_message("the task is running"),
+            finalized_text_message("shutdown must not start this wake"),
+        ],
+        0,
+        Duration::ZERO,
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "start background work").await;
+    client.pump_until_idle().await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let task = handles
+        .task_registry
+        .snapshot()
+        .into_iter()
+        .find(|task| {
+            matches!(task.kind, TaskKind::Bash { .. }) && task.status == TaskStatus::Running
+        })
+        .expect("the fixture has a live detached bash task")
+        .id;
+    let held = handles.log.lock().await;
+    assert!(
+        handles.log.try_lock().is_err(),
+        "the fixture holds the settings command behind the log lock"
+    );
+    let command_host = harness.host.clone();
+    let command_session = session.clone();
+    let command = tokio::spawn(async move {
+        command_host
+            .command(
+                &command_session,
+                Command::Settings(SettingsChange {
+                    agent: AgentId::Main,
+                    persist: PersistAction::None,
+                    axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+                }),
+            )
+            .await
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !command.is_finished(),
+        "the command must be in flight or the task end cannot queue behind it"
+    );
+
+    assert!(handles.task_registry.kill(task), "kill the live task");
+    assert!(
+        handles.task_registry.quiesce(Duration::from_secs(2)).await,
+        "the killed task driver emitted its TaskEnd before shutdown"
+    );
+    assert!(
+        handles.task_registry.has_notices(AgentId::Main),
+        "the completion notice is ready for the wake this test must suppress"
+    );
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    bounded("shutdown to own the session", async {
+        loop {
+            if harness
+                .host
+                .published_directory()
+                .await
+                .sessions
+                .iter()
+                .all(|row| !row.live)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !command.is_finished() && !shutdown.is_finished(),
+        "the command still stands ahead of the queued shutdown request"
+    );
+
+    drop(held);
+    bounded("the in-flight command to finish", command)
+        .await
+        .expect("command task")
+        .expect("command completed before shutdown");
+    bounded("host shutdown", shutdown)
+        .await
+        .expect("shutdown task");
+    let mut teardown = Vec::new();
+    while let Some(frame) = bounded("the shutdown stream to close", client.stream.recv()).await {
+        teardown.push(frame);
+    }
+    let task_end = teardown
+        .iter()
+        .position(|frame| matches!(frame, Frame::Event { event, .. }
+            if matches!(event.known(), Some(AgentEvent::TaskEnd { task_id, .. }) if *task_id == task)))
+        .unwrap_or_else(|| panic!("the staged TaskEnd reached the client: {teardown:?}"));
+    assert!(
+        teardown[task_end + 1..].iter().all(|frame| !matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Main }))
+        )),
+        "shutdown did not start a wake from the queued TaskEnd: {:?}",
+        &teardown[task_end..]
+    );
+    assert!(
+        handles.task_registry.has_notices(AgentId::Main),
+        "no shutdown wake consumed the task notice"
+    );
+}
+
 /// A later shutdown caller cannot interfere with the owner already winding
 /// drivers down or close attachment streams before that work completes.
 #[tokio::test]
@@ -9677,6 +9881,82 @@ async fn cancelling_the_shutdown_owner_aborts_its_drivers_and_closes_fanout() {
     })
     .await;
     drop(held);
+}
+
+/// Terminal fanout closure reaches the composed attachment even while its
+/// attach block is waiting on the log. The producer stops while the driver
+/// still owns the session, before a rival can acquire it and change the file.
+#[tokio::test]
+async fn shutdown_closes_an_attach_block_waiting_on_the_log() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let log = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session")
+        .log;
+    let held = log.lock().await;
+    assert!(
+        log.try_lock().is_err(),
+        "the fixture holds the log before block production starts"
+    );
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach while the log is held");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), stream.recv())
+            .await
+            .is_err(),
+        "the attach producer is parked on the held log before shutdown"
+    );
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    bounded("shutdown to own the session", async {
+        loop {
+            if harness
+                .host
+                .published_directory()
+                .await
+                .sessions
+                .iter()
+                .all(|row| !row.live)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    let ended = tokio::time::timeout(Duration::from_millis(100), stream.recv())
+        .await
+        .expect("shutdown stops the blocked producer before winding the driver down");
+    assert!(
+        ended.is_none(),
+        "an aborted partial attach block ends at EOF"
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "the attachment stopped before the held log let driver teardown finish"
+    );
+    assert!(
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "the driver still owns the advisory lock when block production stops"
+    );
+
+    drop(held);
+    bounded("host shutdown", shutdown)
+        .await
+        .expect("shutdown task");
+    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("shutdown released the advisory lock after stopping the block");
+    drop(rival);
 }
 
 /// A held log cannot pin a driver's final flush forever, and the warning says
