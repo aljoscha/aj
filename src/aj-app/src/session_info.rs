@@ -24,8 +24,8 @@ fn kv(key: &str, value: &str) -> InfoRow {
 }
 
 /// Build the session-info digest: identity, recorded settings, activity
-/// timing, message counts, aggregate usage, its per-provider/model usage
-/// breakdown, and the per-tool call breakdown, grouped into labelled
+/// timing, message counts, aggregate usage, its per-provider/model/account
+/// usage breakdown, and the per-tool call breakdown, grouped into labelled
 /// sections separated by blank rows.
 ///
 /// `tag` is the label the session carries, which lives beside the log rather

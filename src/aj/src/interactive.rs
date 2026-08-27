@@ -18973,6 +18973,17 @@ mod tests {
     async fn the_session_info_page_shows_the_label_and_usage_breakdown() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let script = aj_models::scripted::ScriptBuilder::new("scripted", "scripted", "scripted")
+            .account("work")
+            .start()
+            .text_block("a labeled response")
+            .done(aj_models::streaming::DoneReason::Stop);
+        world
+            .handles()
+            .run_config
+            .lock()
+            .expect("run config")
+            .provider = Arc::new(aj_models::scripted::ScriptedProvider::new(vec![script]));
         run_prompt(&mut world, "a prompt").await;
         seed_tag(&mut world, &shell, "fix-auth").await;
 
@@ -18987,7 +18998,12 @@ mod tests {
             ("scripted", "scripted"),
             "the fixture records the scripted response identity"
         );
-        let bucket_key = "scripted / scripted";
+        assert_eq!(
+            bucket.account.as_deref(),
+            Some("work"),
+            "the scripted response must carry a label or this test measures nothing"
+        );
+        let bucket_key = "scripted / scripted (work)";
         let bucket_value = format!(
             "{} tokens · ${:.4}",
             bucket.usage.total_tokens, bucket.usage.cost.total

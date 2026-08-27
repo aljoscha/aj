@@ -3,7 +3,7 @@
 //! [`SessionStats`] is the read-only digest behind a "session info" view:
 //! identity (id, on-disk path), timing, message counts broken out by kind,
 //! a per-tool call breakdown, aggregate token usage and dollar cost, a
-//! per-provider and per-model usage breakdown, and the settings the session
+//! per-provider/model/account usage breakdown, and the settings the session
 //! is running with. It is computed in one pass over every entry across all
 //! threads, so the message, tool-call, and usage totals include sub-agent
 //! activity.
@@ -99,12 +99,12 @@ pub struct SessionStats {
     /// zero cost.
     pub usage: Usage,
     /// Assistant-response usage grouped by provider, model, and optional
-    /// account. Provider and model come from each response, while
-    /// [`ConversationLog::stats`] emits `None` for the account axis. Buckets
-    /// span every thread and branch, including sub-agent threads. Compaction
-    /// spend is excluded because its entries identify no provider or model.
-    /// Buckets are sorted by cost descending, then tokens descending, then the
-    /// full provider, model, and account key ascending.
+    /// account recorded on each response. Buckets span every thread and
+    /// branch, including sub-agent threads. Compaction spend is excluded
+    /// because its entries identify no provider or model. Responses without
+    /// a label remain in a distinct `None` bucket. Buckets are sorted by cost
+    /// descending, then tokens descending, then the full provider, model, and
+    /// account key ascending.
     pub usage_breakdown: Vec<UsageBucket>,
     /// The share of `usage` spent on compaction summaries rather than on
     /// the conversation itself, summed from the compaction entries that
@@ -159,7 +159,7 @@ impl ConversationLog {
                         Some(Message::Assistant(a)) => {
                             assistant_messages += 1;
                             usage.accumulate(&a.usage);
-                            let account = None;
+                            let account = a.account.clone();
                             let key = (a.provider.clone(), a.model.clone(), account.clone());
                             let bucket = usage_buckets.entry(key).or_insert_with(|| UsageBucket {
                                 provider: a.provider.clone(),
@@ -366,12 +366,21 @@ mod tests {
     }
 
     fn assistant_for(provider: &str, model: &str, usage: Usage) -> Message {
+        assistant_for_account(provider, model, None, usage)
+    }
+
+    fn assistant_for_account(
+        provider: &str,
+        model: &str,
+        account: Option<&str>,
+        usage: Usage,
+    ) -> Message {
         Message::Assistant(AssistantMessage {
             content: vec![AssistantContent::Text(text("ok"))],
             api: "test".to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
-            account: None,
+            account: account.map(str::to_string),
             response_id: None,
             usage,
             stop_reason: StopReason::Stop,
@@ -557,7 +566,7 @@ mod tests {
     /// and sub-agent threads, aggregate every usage dimension, count unpriced
     /// responses, and follow the ruled stable order.
     #[test]
-    fn stats_breaks_usage_down_by_the_response_model_across_the_whole_log() {
+    fn stats_breaks_usage_down_by_recorded_response_identity_across_the_whole_log() {
         let dir = tempfile::tempdir().unwrap();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).unwrap();
@@ -636,9 +645,41 @@ mod tests {
             )
             .unwrap()
             .id;
-        let active_head = log
+        let personal = log
             .append(
                 Some(zero_token),
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Message {
+                    message: AgentMessage::wire(assistant_for_account(
+                        "anthropic",
+                        "high",
+                        Some("personal"),
+                        measured_usage([10, 20, 30, 40], [0.4, 0.6, 1.0, 2.0, 4.0]),
+                    )),
+                },
+            )
+            .unwrap()
+            .id;
+        let work = log
+            .append(
+                Some(personal),
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Message {
+                    message: AgentMessage::wire(assistant_for_account(
+                        "anthropic",
+                        "high",
+                        Some("work"),
+                        measured_usage([20, 20, 20, 20], [0.3, 0.5, 0.7, 1.5, 3.0]),
+                    )),
+                },
+            )
+            .unwrap()
+            .id;
+        let active_head = log
+            .append(
+                Some(work),
                 ThreadKind::User,
                 None,
                 ConversationEntryKind::Message {
@@ -685,6 +726,11 @@ mod tests {
         .unwrap();
 
         let stats = log.stats();
+        assert_eq!(
+            stats.usage_breakdown.len(),
+            7,
+            "account labels must keep one provider/model pair in distinct usage rows"
+        );
         let actual: Vec<_> = stats
             .usage_breakdown
             .iter()
@@ -725,6 +771,24 @@ mod tests {
                     1,
                 ),
                 (
+                    "anthropic",
+                    "high",
+                    Some("personal"),
+                    (10, 20, 30, 40, 100),
+                    (0.4, 0.6, 1.0, 2.0, 4.0),
+                    1,
+                    0,
+                ),
+                (
+                    "anthropic",
+                    "high",
+                    Some("work"),
+                    (20, 20, 20, 20, 80),
+                    (0.3, 0.5, 0.7, 1.5, 3.0),
+                    1,
+                    0,
+                ),
+                (
                     "beta",
                     "high",
                     None,
@@ -762,9 +826,9 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(stats.assistant_messages, 7);
-        assert_eq!(stats.usage.total_tokens, 1_450);
-        assert!((stats.usage.cost.total - 13.0).abs() < f64::EPSILON);
+        assert_eq!(stats.assistant_messages, 9);
+        assert_eq!(stats.usage.total_tokens, 1_630);
+        assert!((stats.usage.cost.total - 20.0).abs() < f64::EPSILON);
     }
 
     #[test]
