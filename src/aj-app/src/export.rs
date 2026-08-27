@@ -9,8 +9,9 @@
 //! transcript and the source data used by the page.
 //!
 //! What gets embedded:
-//! - the on-disk entries (`ConversationEntry`), with valid diff details
-//!   normalized and valid text body references expanded one entry at a time,
+//! - the on-disk entries (`ConversationEntry`), with session environment
+//!   values redacted, valid diff details normalized, and valid text body
+//!   references expanded one entry at a time,
 //! - the page renderer (`template.js`),
 //! - `marked` (markdown), vendored under `assets/export/vendor` (see its
 //!   `PROVENANCE.md`).
@@ -45,15 +46,16 @@ const TEMPLATE: &str = include_str!("../assets/export/template.html");
 const CSS: &str = include_str!("../assets/export/template.css");
 const APP_JS: &str = include_str!("../assets/export/template.js");
 const MARKED_JS: &str = include_str!("../assets/export/vendor/marked.min.js");
+const REDACTED_ENV_VALUE: &str = "[redacted]";
 
 /// Full license text for the vendored library, embedded in the export so
 /// every shared copy carries the notice the MIT license requires to
 /// travel with a redistribution.
 const MARKED_LICENSE: &str = include_str!("../assets/export/vendor/marked.LICENSE");
 
-/// The embedded session envelope. Valid diff details are canonicalized and
-/// valid text body references are expanded during serialization. All other
-/// entry data keeps its on-disk shape.
+/// The embedded session envelope. Environment values are redacted, valid diff
+/// details are canonicalized, and valid text body references are expanded
+/// during serialization. All other entry data keeps its on-disk shape.
 #[derive(Serialize)]
 struct ExportData<'a> {
     session_id: &'a str,
@@ -83,6 +85,16 @@ impl Serialize for ExportEntry<'_> {
         S: Serializer,
     {
         let entry = self.0;
+        if matches!(entry.entry, ConversationEntryKind::EnvChange { .. }) {
+            let mut redacted = entry.clone();
+            let ConversationEntryKind::EnvChange { env } = &mut redacted.entry else {
+                unreachable!("entry kind was checked above");
+            };
+            for value in env.values_mut() {
+                *value = REDACTED_ENV_VALUE.to_string();
+            }
+            return redacted.serialize(serializer);
+        }
         let ConversationEntryKind::Message { message } = &entry.entry else {
             return entry.serialize(serializer);
         };
@@ -450,6 +462,78 @@ mod tests {
         assert!(
             data.contains("read_file /tmp/x"),
             "entry content not embedded"
+        );
+    }
+
+    #[test]
+    fn export_redacts_env_values_in_the_embedded_entries_without_mutating_the_log() {
+        let env = r#"{"id":"e0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:00Z","thread":"user","type":"env_change","env":{"BEADS_ACTOR":"azurite","SECRET_TOKEN":"hunter2"}}"#;
+        let user = r#"{"id":"u0000001","parent_id":"e0000001","timestamp":"2024-01-01T00:00:01Z","thread":"user","type":"message","message":{"role":"user","content":[{"type":"text","text":"Hello"}],"timestamp":1704067201000}}"#;
+        let (dir, log) = log_from_jsonl(&[SYSTEM, env, user]);
+        let source_path = dir.path().join("test-session.jsonl");
+        let source_bytes = fs::read(&source_path).expect("read source log before export");
+        let source_entry = serde_json::to_value(log.entries_in_order()[1])
+            .expect("serialize in-memory source entry before export");
+
+        let html = render_session_html(&log);
+        let decoded = decoded_island(&html);
+        let data: serde_json::Value =
+            serde_json::from_str(&decoded).expect("embedded export data parses");
+        let mut expected_entry: serde_json::Value =
+            serde_json::from_str(env).expect("source env fixture parses");
+        for value in expected_entry["env"]
+            .as_object_mut()
+            .expect("source env is an object")
+            .values_mut()
+        {
+            *value = serde_json::json!(REDACTED_ENV_VALUE);
+        }
+        assert_eq!(
+            data["entries"][1], expected_entry,
+            "the decoded embedded entry must preserve all framing and redact only env values",
+        );
+        assert!(
+            decoded.contains("BEADS_ACTOR"),
+            "the decoded entry lost its key"
+        );
+        assert!(
+            decoded.contains(REDACTED_ENV_VALUE),
+            "the decoded entry lost the redaction marker"
+        );
+        assert!(
+            !decoded.contains("hunter2"),
+            "the env value leaked into the decoded embedded entries"
+        );
+        assert!(
+            !html.contains("hunter2"),
+            "the env value leaked into the raw HTML artifact"
+        );
+        assert_eq!(
+            serde_json::to_value(log.entries_in_order()[1])
+                .expect("serialize in-memory source entry after export"),
+            source_entry,
+            "export redaction mutated the in-memory log entry",
+        );
+        assert_eq!(
+            fs::read(&source_path).expect("read source log after export"),
+            source_bytes,
+            "export changed the source log bytes",
+        );
+
+        drop(log);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let reread = ConversationLog::resume(&persistence, "test-session")
+            .expect("re-read source log after export");
+        let ConversationEntryKind::EnvChange { env } = &reread.entries_in_order()[1].entry else {
+            panic!("source log lost its env entry");
+        };
+        assert_eq!(
+            env,
+            &std::collections::BTreeMap::from([
+                ("BEADS_ACTOR".to_string(), "azurite".to_string()),
+                ("SECRET_TOKEN".to_string(), "hunter2".to_string()),
+            ]),
+            "export redaction wrote back into the source log",
         );
     }
 

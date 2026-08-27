@@ -48,7 +48,9 @@
 //!   replaying the stream see the same shape live runs produce.
 //! - [`ConversationEntryKind::ModelChange`] /
 //!   [`ConversationEntryKind::ThinkingChange`] /
-//!   [`ConversationEntryKind::SpeedChange`]: one
+//!   [`ConversationEntryKind::SpeedChange`] /
+//!   [`ConversationEntryKind::VerbosityChange`] /
+//!   [`ConversationEntryKind::EnvChange`]: one
 //!   [`AgentEvent::Notice`] (`Model set to <provider>/<id>.`, etc.),
 //!   but only when at least one `Message` entry precedes the entry
 //!   on the same thread. This renders mid-session switches in
@@ -750,6 +752,7 @@ impl ReplayState {
             | ConversationEntryKind::ThinkingChange { .. }
             | ConversationEntryKind::SpeedChange { .. }
             | ConversationEntryKind::VerbosityChange { .. }
+            | ConversationEntryKind::EnvChange { .. }
             | ConversationEntryKind::SystemPrompt { .. }
             | ConversationEntryKind::Compaction { .. } => {}
         }
@@ -893,6 +896,19 @@ impl ReplayState {
                     agent_id,
                     at,
                     format!("Output verbosity set to {verbosity}."),
+                    out,
+                );
+            }
+            ConversationEntryKind::EnvChange { env } => {
+                let keys = if env.is_empty() {
+                    "none".to_string()
+                } else {
+                    env.keys().cloned().collect::<Vec<_>>().join(", ")
+                };
+                self.settings_notice(
+                    agent_id,
+                    at,
+                    format!("Session environment keys: {keys}."),
                     out,
                 );
             }
@@ -2634,6 +2650,108 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::Notice { .. })),
             "seed settings entries must be silent, got {events:#?}"
         );
+    }
+
+    #[test]
+    fn replay_keeps_a_resumed_env_seed_silent_and_never_projects_its_value() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let session_id = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("p".into()).expect("sp");
+            log.append_env_change(BTreeMap::from([
+                ("BEADS_ACTOR".to_string(), "azurite".to_string()),
+                ("SECRET_TOKEN".to_string(), "hunter2".to_string()),
+            ]))
+            .expect("env seed");
+            {
+                let mut view = ConversationView::user(&mut log);
+                view.add_message(user_msg("hi")).expect("flush seed");
+            }
+            log.session_id().to_string()
+        };
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+
+        let events: Vec<AgentEvent> = replay(&resumed).collect();
+        assert_eq!(
+            events.len(),
+            2,
+            "the env seed projected an event of its own: {events:#?}"
+        );
+        assert!(matches!(events[0], AgentEvent::MessageStart { .. }));
+        assert!(matches!(events[1], AgentEvent::MessageEnd { .. }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Notice { .. })),
+            "the resumed env seed painted a notice: {events:#?}"
+        );
+        let stream = serde_json::to_string(&events).expect("replay events serialize");
+        for value in ["azurite", "hunter2"] {
+            assert!(
+                !stream.contains(value),
+                "env value {value:?} leaked into the replay event stream: {stream}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_emits_one_keys_only_notice_for_a_post_message_env_change() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let session_id = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("p".into()).expect("sp");
+            {
+                let mut view = ConversationView::user(&mut log);
+                view.add_message(user_msg("before")).expect("first message");
+            }
+            log.append_env_change(BTreeMap::from([
+                ("BEADS_ACTOR".to_string(), "azurite".to_string()),
+                ("SECRET_TOKEN".to_string(), "hunter2".to_string()),
+            ]))
+            .expect("mid-session env");
+            {
+                let mut view = ConversationView::user(&mut log);
+                view.add_message(user_msg("after"))
+                    .expect("flush env entry");
+            }
+            log.session_id().to_string()
+        };
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+
+        let events: Vec<AgentEvent> = replay(&resumed).collect();
+        let notices: Vec<(usize, &str)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                AgentEvent::Notice { agent_id, text } => {
+                    assert_eq!(*agent_id, AgentId::Main);
+                    Some((index, text.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            vec![(2, "Session environment keys: BEADS_ACTOR, SECRET_TOKEN.")],
+            "EnvChange must project exactly one notice between the two messages"
+        );
+        assert!(
+            matches!(events[1], AgentEvent::MessageEnd { .. }),
+            "the notice did not follow the preceding message: {events:#?}"
+        );
+        assert!(
+            matches!(events[3], AgentEvent::MessageStart { .. }),
+            "the notice did not precede the following message: {events:#?}"
+        );
+        let stream = serde_json::to_string(&events).expect("replay events serialize");
+        for value in ["azurite", "hunter2"] {
+            assert!(
+                !stream.contains(value),
+                "env value {value:?} leaked into the replay event stream: {stream}"
+            );
+        }
     }
 
     /// A settings entry recorded after a message on the same thread

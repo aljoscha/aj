@@ -8,8 +8,9 @@
   // The session is embedded in a <script> island as gzip-compressed,
   // base64-encoded JSON:
   //   { session_id, leaf_id, entries: [ConversationEntry, ...] }
-  // Entries keep their on-disk shape except that valid diff details are
-  // canonicalized by the Rust exporter before embedding.
+  // Entries keep their on-disk shape except that session environment values
+  // are redacted and valid diff details are canonicalized by the Rust exporter
+  // before embedding.
   //
   // The load is async (inflate is stream-based) and fails on a browser
   // without DecompressionStream, so we bail with a visible message

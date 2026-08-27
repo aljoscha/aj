@@ -21,7 +21,7 @@
 //! helpers (`last_message`, `messages`, etc.) the binary uses to
 //! decide thinking efforts and resume state.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
@@ -170,6 +170,12 @@ pub enum ConversationEntryKind {
     /// speed. `thinking_display` also affects inference, but remains a
     /// live-only session setting and is deliberately not recorded.
     VerbosityChange { verbosity: String },
+    /// The session's complete environment map from this point on the path.
+    ///
+    /// Whole-map semantics: extraction keeps the last entry seen and never
+    /// merges maps. An empty map is an explicit recording, distinct from no
+    /// entry. Values remain on disk for restore but are redacted from export.
+    EnvChange { env: BTreeMap<String, String> },
     /// The structural root of a sub-agent thread, written when the
     /// sub-agent is spawned and anchored at the parent thread's head
     /// (the assistant message carrying the spawning tool call). It
@@ -250,6 +256,7 @@ impl ConversationEntryKind {
             | Self::ThinkingChange { .. }
             | Self::SpeedChange { .. }
             | Self::VerbosityChange { .. }
+            | Self::EnvChange { .. }
             | Self::SubAgentSpawn { .. } => false,
         }
     }
@@ -314,6 +321,10 @@ pub struct SessionSettings {
     /// "nothing recorded" (inherit the current default) — distinct
     /// from `Some("default")`, which pins the server default.
     pub verbosity: Option<String>,
+    /// Last complete session environment map recorded on this path.
+    /// `None` means no entry exists, which is distinct from an explicitly
+    /// recorded empty map.
+    pub env: Option<BTreeMap<String, String>>,
 }
 
 /// A linearized, read-only view of (a slice of) a conversation log. Produced
@@ -440,14 +451,15 @@ impl Conversation {
     /// forward scan over [`Self::entries`], keeping the last value
     /// seen per axis. `ModelChange` entries and assistant-role
     /// messages both update the model; a `SubAgentSpawn` snapshot
-    /// updates all three axes; whichever comes later on the path
-    /// wins.
+    /// updates the inference axes but never the session environment;
+    /// whichever entry comes later on the path wins.
     pub fn settings(&self) -> SessionSettings {
         let mut settings = SessionSettings {
             model: None,
             thinking: None,
             speed: None,
             verbosity: None,
+            env: None,
         };
         for entry in &self.entries {
             match &entry.entry {
@@ -462,6 +474,9 @@ impl Conversation {
                 }
                 ConversationEntryKind::VerbosityChange { verbosity } => {
                     settings.verbosity = Some(verbosity.clone());
+                }
+                ConversationEntryKind::EnvChange { env } => {
+                    settings.env = Some(env.clone());
                 }
                 ConversationEntryKind::SubAgentSpawn { settings: snap, .. } => {
                     settings.model = Some((snap.provider.clone(), snap.model_id.clone()));
@@ -1442,6 +1457,18 @@ impl ConversationLog {
         )
     }
 
+    /// Record the complete session environment map on the active user path.
+    ///
+    /// The entry replaces any earlier map during extraction. It is
+    /// non-punctuation, so a brand-new session seeded with env but no message
+    /// still leaves no conversation file behind.
+    pub fn append_env_change(
+        &mut self,
+        env: BTreeMap<String, String>,
+    ) -> Result<EntryRef, ConversationError> {
+        self.append_settings_entry(ThreadFilter::USER, ConversationEntryKind::EnvChange { env })
+    }
+
     /// Record a compaction checkpoint on `filter`'s thread, anchored at
     /// the thread's current leaf. Punctuation: flushes immediately (see
     /// [`ConversationEntryKind::is_punctuation`]). `first_kept_entry_id`
@@ -1623,6 +1650,13 @@ mod tests {
     /// use the directory.
     fn fresh_sessions_dir() -> TempDir {
         TempDir::new().expect("create temp dir")
+    }
+
+    fn env_map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
     }
 
     fn user_text(text: &str) -> AgentMessage {
@@ -2695,6 +2729,230 @@ mod tests {
             entries[3].entry,
             ConversationEntryKind::Message { .. }
         ));
+    }
+
+    #[test]
+    fn env_change_round_trips_with_its_stable_tag_and_is_not_punctuation() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let expected = env_map(&[("BEADS_ACTOR", "azurite"), ("SECRET_TOKEN", "hunter2")]);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        let env_ref = log
+            .append_env_change(expected.clone())
+            .expect("append env seed");
+        let path = persistence.session_path(log.session_id());
+        assert!(
+            !path.exists(),
+            "an env seed with no message must not materialize a conversation file"
+        );
+        let stored = log.core().get(&env_ref.id).expect("env entry in memory");
+        assert!(
+            !stored.entry.is_punctuation(),
+            "EnvChange must buffer like the other creation seeds"
+        );
+
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("hi")).expect("punctuation");
+        }
+        let session_id = log.session_id().to_string();
+        let lines = std::fs::read_to_string(&path).expect("read materialized log");
+        let encoded = lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("entry JSON"))
+            .find(|entry| entry["id"] == env_ref.id)
+            .expect("env line on disk");
+        assert_eq!(encoded["type"], "env_change");
+        assert_eq!(
+            encoded["env"],
+            serde_json::to_value(&expected).expect("expected env serializes")
+        );
+
+        drop(log);
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        let ConversationEntryKind::EnvChange { env } = &resumed
+            .entries_in_order()
+            .into_iter()
+            .find(|entry| entry.id == env_ref.id)
+            .expect("resumed env entry")
+            .entry
+        else {
+            panic!("env_change tag did not deserialize as EnvChange");
+        };
+        assert_eq!(env, &expected);
+    }
+
+    #[test]
+    fn env_extraction_distinguishes_absent_from_explicitly_empty() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+
+        let mut absent = ConversationLog::create(&persistence).expect("create absent log");
+        absent.set_system_prompt("p".into()).expect("set sp");
+        let absent_head = {
+            let mut view = ConversationView::user(&mut absent);
+            view.add_message(user_text("no env")).expect("user").id
+        };
+        let absent_settings = absent
+            .linearize(&absent_head, ThreadFilter::USER)
+            .settings();
+        assert_eq!(
+            absent_settings.env, None,
+            "a log with no EnvChange must extract None"
+        );
+
+        let mut empty = ConversationLog::create(&persistence).expect("create empty log");
+        empty.set_system_prompt("p".into()).expect("set sp");
+        empty
+            .append_env_change(BTreeMap::new())
+            .expect("append explicit empty env");
+        let empty_head = {
+            let mut view = ConversationView::user(&mut empty);
+            view.add_message(user_text("empty env")).expect("user").id
+        };
+        let empty_settings = empty.linearize(&empty_head, ThreadFilter::USER).settings();
+        assert_eq!(
+            empty_settings.env,
+            Some(BTreeMap::new()),
+            "a recorded empty EnvChange must extract Some(empty)"
+        );
+    }
+
+    #[test]
+    fn env_extraction_replaces_the_whole_map_when_a_later_entry_drops_a_key() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        log.append_env_change(env_map(&[
+            ("BEADS_ACTOR", "azurite"),
+            ("DROPPED_KEY", "old"),
+        ]))
+        .expect("first env map");
+        let replacement = env_map(&[("BEADS_ACTOR", "cerulean")]);
+        log.append_env_change(replacement.clone())
+            .expect("replacement env map");
+        let head = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("hi")).expect("user").id
+        };
+
+        let extracted = log.linearize(&head, ThreadFilter::USER).settings().env;
+        assert_eq!(
+            extracted,
+            Some(replacement),
+            "the last EnvChange replaces rather than merges the earlier map"
+        );
+        assert!(
+            !extracted
+                .as_ref()
+                .is_some_and(|env| env.contains_key("DROPPED_KEY")),
+            "the key omitted by the replacement survived a merge fold"
+        );
+    }
+
+    #[test]
+    fn env_extraction_carries_the_seed_past_a_real_compaction_boundary() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let expected = env_map(&[("BEADS_ACTOR", "azurite")]);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        let seed = log
+            .append_env_change(expected.clone())
+            .expect("append env seed");
+        let first_kept = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("summarized question"))
+                .expect("old user");
+            view.add_message(assistant_text("summarized answer"))
+                .expect("old assistant");
+            view.add_message(user_text("retained question"))
+                .expect("first retained entry")
+        };
+        assert!(
+            seed.seq < first_kept.seq,
+            "env seed {} is not strictly before first_kept_entry_id {}; the fixture measures no compaction carry",
+            seed.id,
+            first_kept.id,
+        );
+        log.append_compaction(
+            ThreadFilter::USER,
+            "SUMMARY".into(),
+            first_kept.id,
+            1_000,
+            None,
+            None,
+        )
+        .expect("append compaction");
+
+        let head = log
+            .latest_leaf(ThreadFilter::USER)
+            .expect("post-compaction head");
+        assert_eq!(
+            log.linearize(&head, ThreadFilter::USER).settings().env,
+            Some(expected),
+            "the post-compaction path lost the pre-boundary env seed"
+        );
+    }
+
+    #[test]
+    fn env_seed_is_shared_by_a_branch_forked_after_it() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let expected = env_map(&[("BEADS_ACTOR", "azurite")]);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+        let seed = log
+            .append_env_change(expected.clone())
+            .expect("append env seed");
+        let common = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("common root")).expect("common")
+        };
+        assert!(
+            seed.seq < common.seq,
+            "the branch point does not follow the env seed"
+        );
+        let original_tail = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_text("original tail"))
+                .expect("original")
+                .id
+        };
+
+        log.set_head(common.id.clone())
+            .expect("switch back to fork point");
+        let branch_head = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("other branch"))
+                .expect("branch")
+                .id
+        };
+        assert_ne!(branch_head, original_tail, "the fixture did not fork");
+        assert_eq!(
+            log.parent_of(&original_tail),
+            Some(&common.id),
+            "the original tail does not descend from the fork point"
+        );
+        assert_eq!(
+            log.parent_of(&branch_head),
+            Some(&common.id),
+            "the new tail extended the original branch instead of forming a sibling"
+        );
+        assert_eq!(
+            log.head(),
+            Some(&branch_head),
+            "the new branch is not active"
+        );
+        assert_eq!(
+            log.linearize(&branch_head, ThreadFilter::USER)
+                .settings()
+                .env,
+            Some(expected),
+            "the new branch did not inherit its ancestor env seed"
+        );
     }
 
     #[test]

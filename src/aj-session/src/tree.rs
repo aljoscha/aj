@@ -272,6 +272,7 @@ fn kind_placeholder(kind: &ConversationEntryKind) -> &'static str {
         | ConversationEntryKind::ThinkingChange { .. }
         | ConversationEntryKind::SpeedChange { .. }
         | ConversationEntryKind::VerbosityChange { .. } => "(settings)",
+        ConversationEntryKind::EnvChange { .. } => "(environment)",
         ConversationEntryKind::SubAgentSpawn { .. } => "(subagent)",
         ConversationEntryKind::Compaction { .. } => "(compaction)",
     }
