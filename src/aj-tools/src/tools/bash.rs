@@ -352,12 +352,16 @@ impl ToolDefinition for BashTool {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // `Command` inherits the process environment by default. Apply the
+        // session map afterward so it shadows inherited values, then apply
+        // the fixed overrides below so deterministic output still wins.
+        cmd.envs(ctx.session_env());
         // Overlay a fixed set of environment overrides on top of the
-        // inherited parent environment. We capture output rather than
+        // inherited and session environment. We capture output rather than
         // attach a terminal, so we force programs into a deterministic,
-        // uncolored, non-interactive mode: unstable output (colors,
-        // spinners, prompts) is noise the model has to parse, and a
-        // prompt with no attached tty would hang until timeout.
+        // uncolored, non-interactive mode: unstable output (colors, spinners,
+        // prompts) is noise the model has to parse, and a prompt with no
+        // attached tty would hang until timeout.
         // `GIT_OPTIONAL_LOCKS=0` keeps the agent's read-only git calls
         // from contending with the user's concurrent git over the index
         // lock. Non-git processes ignore it, so we set it unconditionally.

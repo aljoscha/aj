@@ -432,6 +432,14 @@ impl Agent {
         self.stream_retry_limit = limit;
     }
 
+    /// Replace the environment overlay for this session's tool subshells.
+    ///
+    /// An empty map means no overlay. Sub-agents copy the current map when
+    /// they spawn, so callers must set it before driving a turn.
+    pub fn set_session_env(&mut self, session_env: BTreeMap<String, String>) {
+        self.session_state.set_session_env(session_env);
+    }
+
     /// Toggle the defense-in-depth `image_block` gate.
     ///
     /// When `true`, [`aj_models::transform::block_user_images`] is
@@ -2576,6 +2584,7 @@ pub(crate) struct SessionState {
 #[derive(Debug)]
 struct SessionStateInner {
     working_directory: PathBuf,
+    session_env: BTreeMap<String, String>,
     todo_list: Vec<TodoItem>,
     turn_counter: usize,
     accumulated_usage: Usage,
@@ -2588,6 +2597,7 @@ impl SessionState {
         Self {
             inner: Arc::new(StdMutex::new(SessionStateInner {
                 working_directory,
+                session_env: BTreeMap::new(),
                 todo_list: Vec::new(),
                 turn_counter: 0,
                 accumulated_usage: Usage::default(),
@@ -2603,6 +2613,14 @@ impl SessionState {
 
     fn working_directory(&self) -> PathBuf {
         self.lock().working_directory.clone()
+    }
+
+    fn session_env(&self) -> BTreeMap<String, String> {
+        self.lock().session_env.clone()
+    }
+
+    fn set_session_env(&self, session_env: BTreeMap<String, String>) {
+        self.lock().session_env = session_env;
     }
 
     fn get_todo_list(&self) -> Vec<TodoItem> {
@@ -3057,6 +3075,10 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
         self.session_state.working_directory()
     }
 
+    fn session_env(&self) -> BTreeMap<String, String> {
+        self.session_state.session_env()
+    }
+
     fn get_todo_list(&self) -> Vec<TodoItem> {
         self.session_state.get_todo_list()
     }
@@ -3165,6 +3187,9 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // so the defense-in-depth gate stays uniform across the
             // hierarchy.
             sub_agent.set_block_images(self.block_images);
+            // Tool subshells inherit the session overlay through the child's
+            // own context rather than through its shared tool instances.
+            sub_agent.set_session_env(self.session_state.session_env());
             // Sub-agents inherit the parent's thinking level so they
             // reason at the same effort and so a `None` default never
             // gets serialized as an explicit `disabled` for models

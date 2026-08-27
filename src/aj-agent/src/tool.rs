@@ -6,7 +6,7 @@
 //! [`ToolOutcome`] into both the wire transcript and the typed event
 //! stream.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -1213,6 +1213,12 @@ where
 pub trait ToolContext: Send {
     /// Current working directory for the session.
     fn working_directory(&self) -> PathBuf;
+
+    /// Snapshot of environment entries applied to this session's tool
+    /// subshells. Contexts with no session state have an empty overlay.
+    fn session_env(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
 
     /// Current todo list snapshot.
     fn get_todo_list(&self) -> Vec<TodoItem>;
