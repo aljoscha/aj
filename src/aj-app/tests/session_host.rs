@@ -9959,6 +9959,44 @@ async fn shutdown_closes_an_attach_block_waiting_on_the_log() {
     drop(rival);
 }
 
+/// The capacity-one block channel can park a producer behind a client that has
+/// not read its first frame. Shutdown cancels that send rather than letting the
+/// producer resume and finish a stale block after host teardown.
+#[tokio::test]
+async fn shutdown_cancels_an_attach_block_parked_on_client_backpressure() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    // Let the producer fill the channel with State and park while sending
+    // CaughtUp. Reading here would release the backpressure this test needs.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    harness.host.shutdown().await;
+
+    let mut partial = Vec::new();
+    while let Some(frame) = bounded("the partial block to end", stream.recv()).await {
+        partial.push(frame);
+    }
+    assert!(
+        partial
+            .iter()
+            .any(|frame| matches!(frame, Frame::State { .. })),
+        "the fixture filled the capacity-one block channel before shutdown: {partial:?}"
+    );
+    assert!(
+        partial
+            .iter()
+            .all(|frame| !matches!(frame, Frame::CaughtUp { .. })),
+        "the cancelled producer did not resume through client backpressure: {partial:?}"
+    );
+}
+
 /// A held log cannot pin a driver's final flush forever, and the warning says
 /// which session and phase gave up its pending entries.
 #[tokio::test(start_paused = true)]
