@@ -122,7 +122,8 @@ pub async fn run(args: Args) -> Result<()> {
         cwd,
         Arc::new(Mutex::new(io::stdout())),
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Drive a single print-mode run against injected dependencies.
@@ -156,7 +157,7 @@ async fn run_inner<W: Write + Send + 'static>(
     conversation_persistence: ConversationPersistence,
     cwd: PathBuf,
     out: Arc<Mutex<W>>,
-) -> Result<()> {
+) -> Result<Agent> {
     // Validate dispatch shape early so the user sees a clear error
     // instead of a confusing failure later. `Continue` resolves to
     // either a specific session id or "latest for this project";
@@ -447,7 +448,7 @@ async fn run_inner<W: Write + Send + 'static>(
     // Make sure the sink is flushed before exit so callers piping into
     // another process don't lose buffered bytes.
     flush_output(&out)?;
-    Ok(())
+    Ok(agent)
 }
 
 fn flush_output<W: Write>(out: &Arc<Mutex<W>>) -> Result<()> {
@@ -693,17 +694,23 @@ mod tests {
     const DEMO_REPLY_FRAGMENT: &str = "plain text-only demo";
 
     /// Drive `run_inner` for `cli` (which must select the scripted
-    /// demo) against `persistence` and fresh tempdir auth / cwd,
-    /// returning the captured output sink as a string.
-    async fn run_capture(persistence: &ConversationPersistence, cli: &[&str]) -> String {
+    /// demo) against injected config plus fresh tempdir auth / cwd,
+    /// returning both the captured output and the completed agent. The agent
+    /// is the execution boundary for assertions about what print actually ran,
+    /// rather than what it independently wrote to the session log.
+    async fn run_capture_with_config(
+        persistence: &ConversationPersistence,
+        cli: &[&str],
+        config: Config,
+    ) -> (String, Agent) {
         let auth_dir = TempDir::new().expect("auth tempdir");
         let cwd = TempDir::new().expect("cwd tempdir");
         let auth = AuthStorage::new(auth_dir.path().join("auth.json"));
         let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
 
-        run_inner(
+        let agent = run_inner(
             parse(cli),
-            Config::default(),
+            config,
             auth,
             persistence.clone(),
             cwd.path().to_path_buf(),
@@ -712,8 +719,16 @@ mod tests {
         .await
         .expect("print run completes");
 
-        String::from_utf8(sink.lock().expect("sink poisoned").clone())
-            .expect("sink holds valid utf-8")
+        let output = String::from_utf8(sink.lock().expect("sink poisoned").clone())
+            .expect("sink holds valid utf-8");
+        (output, agent)
+    }
+
+    /// The default-config form used by tests that only need print output.
+    async fn run_capture(persistence: &ConversationPersistence, cli: &[&str]) -> String {
+        run_capture_with_config(persistence, cli, Config::default())
+            .await
+            .0
     }
 
     /// Drive `run_inner` against a fresh session store, returning the
@@ -725,6 +740,18 @@ mod tests {
         let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
         let out = run_capture(&persistence, cli).await;
         (out, persistence, sessions)
+    }
+
+    /// The completed-agent form used when a test must observe the inference
+    /// configuration as well as durable metadata.
+    async fn drive_with_config(
+        cli: &[&str],
+        config: Config,
+    ) -> (String, Agent, ConversationPersistence, TempDir) {
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let (out, agent) = run_capture_with_config(&persistence, cli, config).await;
+        (out, agent, persistence, sessions)
     }
 
     #[tokio::test(start_paused = true)]
@@ -810,6 +837,43 @@ mod tests {
         );
     }
 
+    /// With no flag, print carries the effective config through its production
+    /// resolver into both the agent and the fresh session record.
+    #[tokio::test(start_paused = true)]
+    async fn configured_thinking_reaches_a_fresh_print_run_without_a_flag() {
+        let cli = ["--print", "--scripted", "streaming-text", "hello"];
+        let parsed = parse(&cli);
+        assert!(
+            parsed.thinking.is_none(),
+            "the no-flag fixture inherited AJ_THINKING and measures no config fallback",
+        );
+        let config = Config {
+            thinking: Some(aj_conf::ConfigThinkingLevel::Low),
+            ..Config::default()
+        };
+        let (_out, agent, persistence, _sessions) = drive_with_config(&cli, config).await;
+
+        assert_eq!(
+            agent.default_thinking(),
+            Some(aj_models::ThinkingConfig::Low),
+            "print dropped the configured level before building the agent",
+        );
+        let id = persistence
+            .get_latest_session_id()
+            .expect("read latest session")
+            .expect("a session was written");
+        let log = ConversationLog::resume(&persistence, &id).expect("resume the written log");
+        let head = log.head().expect("the print turn wrote a head");
+        assert_eq!(
+            log.linearize(head, ThreadFilter::USER)
+                .settings()
+                .thinking
+                .as_deref(),
+            Some("low"),
+            "print dropped the config fallback before building the run config",
+        );
+    }
+
     /// An illegal label refuses the run before a log is minted.
     #[tokio::test(start_paused = true)]
     async fn an_illegal_tag_refuses_a_print_run_and_creates_nothing() {
@@ -834,7 +898,8 @@ mod tests {
             Arc::new(Mutex::new(Vec::<u8>::new())),
         )
         .await
-        .expect_err("an illegal tag refuses the run");
+        .err()
+        .expect("an illegal tag refuses the run");
 
         let message = format!("{error:#}");
         assert!(message.contains("--tag"), "names the flag: {message}");

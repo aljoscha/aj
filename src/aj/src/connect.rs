@@ -379,6 +379,54 @@ mod tests {
         assert_eq!(settings.thinking.as_deref(), Some("off"));
     }
 
+    /// Clap reads `AJ_THINKING` in an isolated child process so no environment
+    /// mutation can race this test binary's parallel argument parsing. The
+    /// child then crosses the connect create boundary, where an environment
+    /// value must count as creator-stated rather than as a config fallback.
+    #[test]
+    fn aj_thinking_environment_is_creator_stated_on_connect() {
+        const CHILD_SENTINEL: &str = "AJ_TEST_CONNECT_THINKING_CHILD_SENTINEL";
+
+        if let Some(sentinel) = std::env::var_os(CHILD_SENTINEL) {
+            let parsed = args(&["aj", "connect", "http://host:6161", "--new"]);
+            assert_eq!(
+                parsed.thinking,
+                Some(aj_conf::ConfigThinkingLevel::Low),
+                "clap did not read AJ_THINKING",
+            );
+            let settings = creator_settings(&parsed, &Config::default(), &nothing_stated())
+                .expect("the environment value is creator-stated");
+            assert_eq!(settings.thinking.as_deref(), Some("low"));
+            std::fs::write(sentinel, "observed").expect("write the child sentinel");
+            return;
+        }
+
+        let dir = TempDir::new().expect("sentinel tempdir");
+        let sentinel = dir.path().join("observed");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("locate this test binary"))
+                .args([
+                    "--exact",
+                    "connect::tests::aj_thinking_environment_is_creator_stated_on_connect",
+                    "--nocapture",
+                ])
+                .env("AJ_THINKING", "low")
+                .env(CHILD_SENTINEL, &sentinel)
+                .output()
+                .expect("run the isolated parser child");
+
+        assert!(
+            output.status.success(),
+            "isolated parser child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            std::fs::read_to_string(sentinel).expect("the exact child test ran"),
+            "observed",
+        );
+    }
+
     /// A real host behind a real loopback control port, with the [`Control`] a
     /// client drives it through.
     ///

@@ -8830,6 +8830,56 @@ mod tests {
         shut_down(&world).await;
     }
 
+    /// With no flag, the shared local/serve composition carries the effective
+    /// config fallback through the registry-backed run-config arm. Provider
+    /// construction is lazy, so no API request is needed.
+    #[tokio::test]
+    async fn configured_thinking_reaches_the_composed_registry_run_without_a_flag() {
+        let dir = TempDir::new().expect("tempdir");
+        let argv = [
+            "aj",
+            "--model-api",
+            "openai-codex",
+            "--model-name",
+            "gpt-5.2",
+        ];
+        let parsed = Args::parse_from(argv);
+        assert!(
+            parsed.scripted.is_none(),
+            "the fixture selected scripted mode"
+        );
+        assert!(
+            parsed.thinking.is_none(),
+            "the no-flag fixture inherited AJ_THINKING and measures no config fallback",
+        );
+        assert_eq!(
+            layers_spilling_into(&dir).effective().thinking,
+            Some(aj_conf::ConfigThinkingLevel::XHigh),
+            "the fixture config has no meaningful thinking fallback",
+        );
+
+        let world = world_from_argv(&dir, &argv).await.expect("build world");
+        {
+            let run_config = world
+                .handles()
+                .run_config
+                .lock()
+                .expect("run config mutex poisoned");
+            assert_eq!(
+                run_config.model_key,
+                ("openai-codex".to_string(), "gpt-5.2".to_string()),
+                "the fixture did not cross the requested registry arm",
+            );
+            assert_eq!(run_config.model_info.api, "openai-codex-responses");
+            assert_eq!(
+                run_config.thinking,
+                Some(aj_models::ThinkingConfig::XHigh),
+                "the composed registry run dropped the config fallback",
+            );
+        }
+        shut_down(&world).await;
+    }
+
     /// A label the store cannot write does not stop the run. The session was
     /// minted and is durable user state, so the shell opens on it and says the
     /// label did not land, leaving the user to retag rather than re-create.
