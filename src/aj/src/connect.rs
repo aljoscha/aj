@@ -129,9 +129,9 @@ async fn resolve_named_host(
 /// selection rule says.
 ///
 /// The default attach passes over archived rows, so a host whose sessions are
-/// all archived creates one exactly as an empty host does. An explicit id is
-/// answered whatever its bit says: archiving puts a session away, it does not
-/// close it, so naming one always works.
+/// all archived creates one exactly as an empty host does. An explicit id in
+/// the host's directory is answered whatever its bit says: archiving puts a
+/// session away, it does not close it.
 async fn resolve_session(
     control: &Control,
     session: ConnectSession<'_>,
@@ -141,7 +141,17 @@ async fn resolve_session(
     session_env: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<(String, bool)> {
     match session {
-        ConnectSession::Named(id) => Ok((id.to_string(), false)),
+        ConnectSession::Named(id) => {
+            let list = control
+                .sessions()
+                .await
+                .context("could not read the host's session list")?;
+            if list.sessions.iter().any(|summary| summary.id == id) {
+                Ok((id.to_string(), false))
+            } else {
+                Err(anyhow!("unknown session {id:?}"))
+            }
+        }
         ConnectSession::Fresh => Ok((
             create(control, host, settings, tag, session_env).await?,
             true,
@@ -536,6 +546,12 @@ mod tests {
         /// Dial this peer the way `aj connect <url> [argv...]` does, from argv
         /// through the handshake to the session it opens with.
         async fn dial(&self, argv: &[&str]) -> Connected {
+            self.try_dial(argv).await.expect("connect to the host")
+        }
+
+        /// [`Self::dial`] with the refusal kept, for the argv `connect` turns
+        /// down.
+        async fn try_dial(&self, argv: &[&str]) -> Result<Connected> {
             let url = self.server.url();
             let mut line = vec!["aj", "connect", &url];
             line.extend_from_slice(argv);
@@ -548,7 +564,6 @@ mod tests {
                 connect(&args, &Config::default(), &nothing_stated(), &launch),
             )
             .await
-            .expect("connect to the host")
         }
 
         async fn shutdown(self) {
@@ -724,6 +739,33 @@ mod tests {
         assert!(
             !connected.created,
             "an explicit id created a session instead of attaching the one it named"
+        );
+        peer.shutdown().await;
+    }
+
+    /// An explicit id the host does not list is refused here, before any
+    /// terminal work, so the failure is an ordinary CLI error naming the id
+    /// rather than a TUI that opens on nothing. The id is quoted, so an empty
+    /// or control-laden one still reads on the terminal.
+    #[tokio::test]
+    async fn an_unlisted_explicit_id_is_refused_before_the_terminal() {
+        let peer = Peer::start().await;
+        peer.create().await;
+
+        for id in ["nosuchsession", "", "bad\x1b[2Jid"] {
+            let err = match peer.try_dial(&[id]).await {
+                Ok(connected) => panic!("{id:?} attached {}", connected.session),
+                Err(err) => format!("{err:#}"),
+            };
+            assert!(
+                err.contains(&format!("unknown session {id:?}")),
+                "the refusal does not name the id it turned down: {err}"
+            );
+        }
+        assert_eq!(
+            peer.rows().await.len(),
+            1,
+            "a refused id left a session behind on the host"
         );
         peer.shutdown().await;
     }
