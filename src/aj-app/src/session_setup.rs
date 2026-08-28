@@ -168,6 +168,7 @@ fn build_run_config(
     model_info: Arc<ModelInfo>,
     mut stream_options: StreamOptions,
     model_key: (String, String),
+    thinking: Option<ThinkingConfig>,
     speed: Option<Speed>,
 ) -> RunConfigSnapshot {
     crate::model::apply_thinking_display(&mut stream_options, config.thinking_display);
@@ -176,7 +177,7 @@ fn build_run_config(
         provider,
         model_info,
         stream_options,
-        thinking: crate::model::default_thinking_from_config(config.thinking),
+        thinking,
         thinking_display: config.thinking_display,
         speed,
         model_key,
@@ -199,6 +200,7 @@ pub fn build_initial_run_config(
     args: &Args,
     config: &Config,
     auth: &AuthStorage,
+    thinking: Option<ThinkingConfig>,
     speed: Option<Speed>,
 ) -> Result<(RunConfigSnapshot, Option<RestoreContext>)> {
     let selection = ModelSelection::merge(args, config);
@@ -214,6 +216,7 @@ pub fn build_initial_run_config(
             model_info,
             StreamOptions::default(),
             model_key,
+            thinking,
             speed,
         );
         Ok((run_config, None))
@@ -232,6 +235,7 @@ pub fn build_initial_run_config(
             model_info,
             stream_options,
             model_key,
+            thinking,
             speed,
         );
         let restore = RestoreContext {
@@ -674,7 +678,7 @@ mod tests {
             "openai",
         ]);
         let (run_config, restore) =
-            build_initial_run_config(&args, &Config::default(), &empty_auth(&dir), None)
+            build_initial_run_config(&args, &Config::default(), &empty_auth(&dir), None, None)
                 .expect("scripted run config");
         assert!(restore.is_none(), "scripted path never restores settings");
         assert_eq!(run_config.model_key.0, "openai");
@@ -686,7 +690,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
         let (run_config, _restore) =
-            build_initial_run_config(&args, &Config::default(), &empty_auth(&dir), None)
+            build_initial_run_config(&args, &Config::default(), &empty_auth(&dir), None, None)
                 .expect("scripted run config");
         assert_eq!(run_config.model_key.0, crate::model::DEFAULT_PROVIDER_ID);
     }
@@ -702,7 +706,7 @@ mod tests {
         let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
         let config = Config::default();
         let (run_config, _restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), None)
+            build_initial_run_config(&args, &config, &empty_auth(&dir), None, None)
                 .expect("scripted run config");
         assert!(run_config.session_id.is_none());
         assert!(run_config.stream_options.session_id.is_none());
@@ -726,6 +730,31 @@ mod tests {
             Some(session_id.as_str())
         );
     }
+
+    /// The CLI value outranks config and `off` means no reasoning request,
+    /// rather than a synthetic thinking configuration.
+    #[test]
+    fn thinking_resolution_prefers_the_cli_and_collapses_off_to_none() {
+        let config = Config {
+            thinking: Some(aj_conf::ConfigThinkingLevel::High),
+            ..Config::default()
+        };
+        let overridden = Args::parse_from(["aj", "--thinking", "off"]);
+        assert_eq!(
+            resolve_thinking(&overridden, &config).expect("resolve thinking"),
+            None,
+        );
+
+        let inherited = Args::parse_from(["aj"]);
+        assert!(
+            inherited.thinking.is_none(),
+            "the config-fallback fixture inherited AJ_THINKING and measures nothing",
+        );
+        assert_eq!(
+            resolve_thinking(&inherited, &config).expect("resolve thinking"),
+            Some(ThinkingConfig::High),
+        );
+    }
 }
 
 /// A composed session host plus the shared handles a frontend's settings
@@ -745,6 +774,14 @@ pub struct ComposedHost {
     /// windows edit and persist.
     pub layers: Arc<StdMutex<ConfigLayers>>,
     pub catalog: Arc<Vec<ModelInfo>>,
+}
+
+/// Resolve the thinking effort this run starts at: the CLI flag (including its
+/// environment backing), else the effective config. `off` becomes `None`.
+pub fn resolve_thinking(args: &Args, config: &Config) -> Result<Option<ThinkingConfig>> {
+    Ok(crate::model::default_thinking_from_config(
+        args.thinking.or(config.thinking),
+    ))
 }
 
 /// Resolve the inference speed this run starts at: the CLI flag, else the
@@ -773,11 +810,12 @@ pub fn compose_host(
     idle_grace: Option<std::time::Duration>,
 ) -> Result<ComposedHost> {
     let config = layers.effective();
+    let thinking = resolve_thinking(args, &config)?;
     let speed = resolve_speed(args, &config)?;
     let name = args
         .host_name()
         .map_err(|err| anyhow::anyhow!("--name: {err}"))?;
-    let (run_config, restore) = build_initial_run_config(args, &config, auth, speed)?;
+    let (run_config, restore) = build_initial_run_config(args, &config, auth, thinking, speed)?;
     let catalog = crate::commands::load_model_catalog();
     let config = Arc::new(StdMutex::new(config));
     let layers = Arc::new(StdMutex::new(layers));

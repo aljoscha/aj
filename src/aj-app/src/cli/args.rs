@@ -50,8 +50,9 @@ pub struct Args {
     /// Thinking effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
     /// or `max`.
     ///
-    /// Global so a `connect --new` can state the new session's effort on
-    /// either side of the subcommand.
+    /// Global so local, print, and `connect --new` runs share one spelling and
+    /// the same CLI > env > config precedence. A connect run that attaches an
+    /// existing session reports that the flag could not be applied.
     #[arg(long, global = true, env = "AJ_THINKING", value_name = "LEVEL")]
     pub thinking: Option<ConfigThinkingLevel>,
 
@@ -333,6 +334,14 @@ pub const TAG_WITHOUT_A_CREATE: &str = "--tag has nothing to name: this run resu
 pub const HOST_WITHOUT_A_CREATE: &str = "--host has nothing to point at: this run attached an existing session rather than \
      creating one, and a session stays on the host that holds it.";
 
+/// What a connect run says when `--thinking` had no created session to set.
+///
+/// Attaching observes an existing session. Applying a launch-time setting to
+/// it would silently turn attach into a mutation, so the run reports the flag
+/// instead.
+pub const THINKING_WITHOUT_A_CREATE: &str = "--thinking has nothing to set: this run attached an existing session rather than \
+     creating one, and attaching does not change that session's thinking level.";
+
 /// Control-port address a bare `--listen` binds: loopback, because the
 /// port is remote code execution and the identity gate's default mode
 /// trusts nothing else.
@@ -583,8 +592,8 @@ mod tests {
         assert_eq!(parse(&["aj"]).launch_tag(), Ok(None), "no flag, no label");
     }
 
-    /// Thinking is stated for a session a connect run creates, so its global
-    /// spelling reads the same on either side of that subcommand.
+    /// Thinking is global, so its spelling reads the same on either side of a
+    /// subcommand.
     #[test]
     fn the_thinking_flag_parses_on_either_side_of_connect() {
         for argv in [
@@ -598,22 +607,35 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
 
-        let error = Args::try_parse_from([
-            "aj",
-            "connect",
-            "http://host:6161",
-            "--thinking",
-            "ludicrous",
-        ])
-        .expect_err("an unknown thinking level must be refused");
-        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-        assert!(
-            error.to_string().contains(
-                "invalid thinking level 'ludicrous': expected off, minimal, low, medium, high, xhigh, or max"
-            ),
-            "{error}"
-        );
+    /// The typed CLI boundary rejects an illegal level before any frontend can
+    /// acquire a terminal or dial a host.
+    #[test]
+    fn an_unknown_thinking_level_is_refused_before_frontend_dispatch() {
+        let invocations: [&[&str]; 3] = [
+            &["aj", "--thinking", "ludicrous"],
+            &["aj", "--print", "--thinking", "ludicrous", "hello"],
+            &[
+                "aj",
+                "connect",
+                "http://host:6161",
+                "--thinking",
+                "ludicrous",
+            ],
+        ];
+
+        for argv in invocations {
+            let error = Args::try_parse_from(argv)
+                .expect_err("an unknown thinking level must be refused by clap");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(
+                error.to_string().contains(
+                    "invalid thinking level 'ludicrous': expected off, minimal, low, medium, high, xhigh, or max"
+                ),
+                "{argv:?}: {error}"
+            );
+        }
     }
 
     /// A tag the store would not keep is refused where the user typed it, so

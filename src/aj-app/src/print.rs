@@ -66,7 +66,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::args::{Args, Command, PrintFormat, TAG_WITHOUT_A_CREATE};
 use crate::session_setup::{
     BuiltAgent, PreparedLog, SessionSource, build_agent, build_initial_run_config, freeze_and_seed,
-    prepare_log,
+    prepare_log, resolve_thinking,
 };
 
 /// Drive a single print-mode run from `args`.
@@ -194,6 +194,8 @@ async fn run_inner<W: Write + Send + 'static>(
     // costs no session.
     let launch_tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
 
+    let thinking = resolve_thinking(&args, &config)?;
+
     // Speed selection follows the same precedence as the model:
     // CLI flag > config.toml > default. `--speed` is parsed here; the
     // model bundle itself is resolved in `build_initial_run_config`
@@ -213,7 +215,8 @@ async fn run_inner<W: Write + Send + 'static>(
     // loop, so the snapshot is built, optionally overwritten by the
     // resumed log's recorded settings (inside `prepare_log`), and read
     // once to build the agent.
-    let (run_config, restore_context) = build_initial_run_config(&args, &config, &auth, speed)?;
+    let (run_config, restore_context) =
+        build_initial_run_config(&args, &config, &auth, thinking, speed)?;
     let run_config = Arc::new(std::sync::Mutex::new(run_config));
 
     // Apply a `--api-key` runtime override to the resolved provider.
@@ -768,6 +771,42 @@ mod tests {
         assert_eq!(
             persistence.read_tag(&id).expect("read the sidecar"),
             Some("fix-auth".to_string()),
+        );
+    }
+
+    /// A fresh print run records the CLI thinking level it actually gave the
+    /// agent. Driving `run_inner` pins print's own call site rather than the
+    /// shared resolver in isolation.
+    #[tokio::test(start_paused = true)]
+    async fn the_thinking_flag_sets_a_fresh_print_runs_recorded_level() {
+        assert_ne!(
+            Config::default().thinking,
+            Some(aj_conf::ConfigThinkingLevel::High),
+            "the config fallback equals the CLI fixture, so dropping print's caller would be invisible",
+        );
+        let (_out, persistence, _sessions) = drive(&[
+            "--print",
+            "--scripted",
+            "streaming-text",
+            "--thinking",
+            "high",
+            "hello",
+        ])
+        .await;
+
+        let id = persistence
+            .get_latest_session_id()
+            .expect("read latest session")
+            .expect("a session was written");
+        let log = ConversationLog::resume(&persistence, &id).expect("resume the written log");
+        let head = log.head().expect("the print turn wrote a head");
+        assert_eq!(
+            log.linearize(head, ThreadFilter::USER)
+                .settings()
+                .thinking
+                .as_deref(),
+            Some("high"),
+            "the print caller dropped the CLI thinking level before the run config",
         );
     }
 
