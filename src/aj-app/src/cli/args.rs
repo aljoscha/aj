@@ -606,7 +606,8 @@ pub enum Command {
         /// `http://100.64.0.2:6161`).
         url: String,
         /// Session to attach. Omit to take the host's latest session that is
-        /// not archived. Naming one works whatever its archived bit says.
+        /// not archived. Naming a listed one works whatever its archived bit
+        /// says.
         ///
         /// Under `--new` this is launch input rather than an id, because a run
         /// that creates its session has none to name.

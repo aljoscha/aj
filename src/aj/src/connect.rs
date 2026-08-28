@@ -129,9 +129,9 @@ async fn resolve_named_host(
 /// the rule says.
 ///
 /// The default attach passes over archived rows, so a host whose sessions are
-/// all archived creates one exactly as an empty host does. An explicit id is
-/// answered whatever its bit says: archiving puts a session away, it does not
-/// close it, so naming one always works.
+/// all archived creates one exactly as an empty host does. An explicit id in
+/// the host's directory is answered whatever its bit says: archiving puts a
+/// session away, it does not close it.
 async fn resolve_session(
     control: &Control,
     session: ConnectSession<'_>,
@@ -141,7 +141,17 @@ async fn resolve_session(
     session_env: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<(String, bool)> {
     match session {
-        ConnectSession::Named(id) => Ok((id.to_string(), false)),
+        ConnectSession::Named(id) => {
+            let list = control
+                .sessions()
+                .await
+                .context("could not read the host's session list")?;
+            if list.sessions.iter().any(|summary| summary.id == id) {
+                Ok((id.to_string(), false))
+            } else {
+                Err(anyhow!("unknown session {id:?}"))
+            }
+        }
         ConnectSession::Fresh => Ok((
             create(control, host, settings, tag, session_env).await?,
             true,
