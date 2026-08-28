@@ -1723,16 +1723,21 @@ without one keeps the head its author chose first.
 - **`aj-app`**: gains the session-host layer (section 5), the reducer
   hardening (idempotent application, quiesce, canonical form for
   tests, section 11), and the client-side session directory / cursor
-  bookkeeping. Stays free of TUI and HTTP dependencies.
+  bookkeeping. Stays free of TUI dependencies and direct HTTP
+  transport dependencies.
 - **`aj`** (binary): the HTTP server (axum or similar) over the host
   layer, the HTTP client, the `serve` / `connect` / `gateway`
   subcommands and `--listen` flag, the sidebar and connect-mode TUI.
   The gateway's aggregation and provisioning logic may start here and
   move to its own crate if it grows past taste.
 
-The HTTP dependency stays out of `aj-app` for the same reason vaxis
-does: the app layer is transport-agnostic, servers and clients are
-frontends.
+Direct HTTP dependencies stay out of `aj-app` for the same reason
+vaxis does: the app layer is transport-agnostic, servers and clients
+are frontends. Provider networking remains encapsulated by
+`aj-models`. Test-only dependencies do not enter a consuming binary
+and are outside this runtime boundary. CI enforces the runtime edge
+with a fail-closed allowlist of `aj-app`'s direct normal packages, so
+every new direct dependency requires an explicit architecture review.
 
 ## 11. Testing strategy
 

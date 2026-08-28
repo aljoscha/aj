@@ -7,9 +7,10 @@
 //! non-interactive (print / subcommand) entry points. The binary supplies the
 //! rendering.
 //!
-//! Invariant: `aj-app` must never depend on the `vaxis` TUI backend. That is
-//! what keeps the core independent of the frontend, and it is enforced in CI
-//! (see `scripts/check-no-tui-dep.sh`).
+//! Invariant: `aj-app` must never depend on the `vaxis` TUI backend or directly
+//! own an HTTP transport dependency. Those constraints keep the core independent
+//! of its frontends. CI enforces them with `scripts/check-no-tui-dep.sh` and
+//! `scripts/check-no-http-dep.sh`.
 
 use std::collections::HashSet;
 use std::time::Duration;

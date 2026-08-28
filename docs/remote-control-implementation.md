@@ -182,9 +182,11 @@ Verified starting points (line references drift, re-check):
   touching anything.
 - `src/aj/src/session_selector.rs` — renders a session list already,
   reference for the sidebar's data needs.
-- `scripts/check-no-tui-dep.sh` — the CI rule keeping `aj-app` free
-  of vaxis. `aj-app` must also stay free of HTTP dependencies, wire
-  types go in the new `aj-wire` crate.
+- `scripts/check-no-tui-dep.sh` and `scripts/check-no-http-dep.sh`:
+  the CI rules keeping `aj-app` free of vaxis and direct HTTP
+  transport dependencies. The HTTP guard allowlists approved direct
+  normal packages, so a new dependency fails until it is reviewed.
+  Wire types go in the new `aj-wire` crate.
 
 Ember integration (phase 4): ember is driven via its CLI,
 `ember vm cp` (fork), `ember vm inspect --format json`

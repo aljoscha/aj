@@ -20,7 +20,7 @@ The workspace is split into focused crates under `src/`:
 - `aj-tools` owns builtin tool implementations.
 - `aj-app` owns frontend-independent application behavior, session composition,
   the turn driver, state reduction, print mode, and settings. It has no TUI
-  dependency.
+  dependency or direct HTTP transport dependency.
 - `aj-conf` owns configuration loading and path helpers.
 - `vaxis`, `vaxis-derive`, and `vaxis-ucd` form the terminal UI framework.
 - `aj` owns the binary, interactive UI, and wiring between `aj-app` and vaxis.
@@ -53,6 +53,7 @@ The current CI gate for review-ready work is:
 - `cargo test`
 - `cargo build --all-targets`
 - `./scripts/check-no-tui-dep.sh`
+- `./scripts/check-no-http-dep.sh`
 - `./scripts/check-test-scratch.sh`
 
 Scale targeted checks while iterating, but verify the final range against the
