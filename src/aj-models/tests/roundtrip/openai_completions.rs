@@ -368,12 +368,12 @@ fn semantic_roundtrip_reasoning_text() {
 }
 
 // ---------------------------------------------------------------------------
-// Error / truncation scenarios
+// Error, truncation, and usage exit scenarios
 //
 // An errored or truncated turn is never serialized back into a request
-// item, so these scenarios only assert the terminal classification
-// (`stop_reason` + `error.category`) and that partial content survives.
-// They pin the error legs against captured wire fixtures.
+// item. Those scenarios pin classification and preserved partial content.
+// The usage scenario replays complete and prefix forms of the captured
+// stream to pin the ordering, harvesting, and pricing at stream exit.
 // ---------------------------------------------------------------------------
 
 /// Replay an SSE fixture and return the finalized message.
@@ -391,8 +391,8 @@ fn first_text(msg: &AssistantMessage) -> &str {
 #[test]
 fn truncated_stream_is_transient_error() {
     // A stream that ends with no `finish_reason` chunk (and no `[DONE]`)
-    // is a mid-flight drop: a retryable transient error, not a `Done`,
-    // with the partial deltas preserved.
+    // is a mid-flight drop. The usage-only chunk comes after the finish
+    // chunk, so this prefix cannot have usage to harvest.
     let parsed = replay_fixture("truncated");
     assert_eq!(parsed.stop_reason, StopReason::Error);
     assert_eq!(
@@ -400,6 +400,63 @@ fn truncated_stream_is_transient_error() {
         Some(ErrorCategory::Transient)
     );
     assert_eq!(first_text(&parsed), "This answer was cut o");
+    assert_eq!(parsed.usage.input, 0);
+    assert_eq!(parsed.usage.output, 0);
+    assert_eq!(parsed.usage.cache_read, 0);
+    assert_eq!(parsed.usage.cache_write, 0);
+    assert_eq!(parsed.usage.total_tokens, 0);
+    assert_eq!(
+        parsed.usage.total_tokens,
+        parsed.usage.input
+            + parsed.usage.output
+            + parsed.usage.cache_read
+            + parsed.usage.cache_write
+    );
+    assert_eq!(parsed.usage.cost.total, 0.0);
+}
+
+#[test]
+fn usage_arrives_only_after_the_finish_chunk() {
+    let mut before_usage = load_sse("text_only");
+    let usage = before_usage.pop().expect("text fixture has a usage chunk");
+    assert!(
+        usage.choices.is_empty() && usage.usage.is_some(),
+        "the final decoded frame must be the usage-only chunk"
+    );
+    assert!(
+        before_usage.last().is_some_and(|chunk| chunk
+            .choices
+            .iter()
+            .any(|choice| choice.finish_reason.is_some())),
+        "the usage-only chunk must follow the finish_reason chunk"
+    );
+
+    let finished = replay_sse_events(&fixture_model(), before_usage);
+    assert_eq!(finished.stop_reason, StopReason::Stop);
+    assert_eq!(
+        (
+            finished.usage.input,
+            finished.usage.output,
+            finished.usage.cache_read,
+            finished.usage.cache_write,
+            finished.usage.total_tokens,
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    assert_eq!(finished.usage.cost.total, 0.0);
+
+    let complete = replay_fixture("text_only");
+    assert_eq!(complete.usage.input, 12);
+    assert_eq!(complete.usage.output, 5);
+    assert_eq!(complete.usage.cache_read, 0);
+    assert_eq!(complete.usage.cache_write, 0);
+    assert_eq!(complete.usage.total_tokens, 17);
+    let expected = 12.0 * 2.5 / 1_000_000.0 + 5.0 * 10.0 / 1_000_000.0;
+    assert!(
+        (complete.usage.cost.total - expected).abs() < 1e-12,
+        "the completed stream is priced from trailing wire usage: got {}, expected {expected}",
+        complete.usage.cost.total
+    );
 }
 
 #[test]

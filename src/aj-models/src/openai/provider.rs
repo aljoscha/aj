@@ -1215,6 +1215,9 @@ impl StreamState {
                 api = %self.partial.api,
                 "stream ended before terminal frame; treating turn as truncated (retryable)"
             );
+            // OpenAI sends usage after `finish_reason`, so this is a no-op
+            // for its truncations. Keep the harvest defensive for compatible
+            // endpoints that disclose usage earlier.
             self.seal();
             AssistantMessageEvent::truncated(self.partial.clone())
         }
@@ -1954,36 +1957,6 @@ mod tests {
             state.finalize_or_truncate(),
             AssistantMessageEvent::Done { .. }
         ));
-    }
-
-    /// This API keeps the wire's usage in a side field until a terminal
-    /// event is built, so an exit that only prices `partial.usage`
-    /// prices zeros and drops what the provider reported. Both exits
-    /// that skip `finalize` have to harvest first.
-    ///
-    /// The counts are the ones
-    /// `streamstate_usage_subtracts_cache_write_from_cached` pins:
-    /// input 60, output 20, cache read 25, cache write 15.
-    #[test]
-    fn a_truncated_stream_harvests_and_prices_the_usage_it_saw() {
-        let mut state = StreamState::new(&fake_model());
-        let _ = state.process(delta_chunk(text_delta("partial")));
-        let _ = state.process(usage_chunk());
-        // No finish_reason ever arrives, so this is the truncation arm.
-        assert!(
-            !state.saw_terminal(),
-            "the fixture must reach the truncation arm or this test measures nothing"
-        );
-
-        let message = state.finalize_or_truncate().partial().clone();
-        assert_eq!(message.usage.total_tokens, 120);
-        // 60 * 1.25/1e6 + 20 * 10.0/1e6 + 25 * 0.125/1e6
-        let expected = 0.000_075 + 0.000_2 + 0.000_003_125;
-        assert!(
-            (message.usage.cost.total - expected).abs() < 1e-12,
-            "a truncated turn is priced from the harvested usage: got {} expected {expected}",
-            message.usage.cost.total
-        );
     }
 
     #[test]

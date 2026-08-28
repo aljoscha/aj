@@ -1793,6 +1793,29 @@ mod tests {
         options
     }
 
+    fn priced_flex_completed_response() -> serde_json::Value {
+        serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0.0,
+                "model": "gpt-5",
+                "output": [],
+                "parallel_tool_calls": true,
+                "tools": [],
+                "status": "completed",
+                "service_tier": "flex",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 2_000_000
+                }
+            }
+        })
+    }
+
     #[test]
     fn a_terminal_message_keeps_the_account_stamped_at_construction() {
         let state =
@@ -2260,55 +2283,41 @@ mod tests {
         assert!((msg.usage.cost.total - 5.625).abs() < 1e-9);
     }
 
-    /// A cancel that fires after `response.completed` was processed
-    /// still has the tier multiplier to apply. Sealing must resolve it
-    /// the same way `finalize` does, or a flex turn is billed at full
-    /// price on the one exit that skips finalize.
     #[test]
-    fn a_cancelled_stream_keeps_the_service_tier_multiplier() {
-        let mut state = StreamState::new(&fake_model(false), Some(ServiceTier::Flex));
-        state.partial.usage.input = 1_000_000;
-        state.partial.usage.output = 1_000_000;
-        let event = state.cancelled();
-        let msg = match event {
-            AssistantMessageEvent::Error { error, .. } => error,
-            other => panic!("expected an aborted Error event, got {other:?}"),
-        };
+    fn a_replayed_flex_response_harvests_and_prices_its_usage() {
+        let completed = serde_json::from_value(priced_flex_completed_response())
+            .expect("valid response.completed event");
+        let msg = replay_sse_events(&fake_model(false), [completed], None);
         assert_eq!(
-            msg.usage.total_tokens, 2_000_000,
-            "a cancelled turn totals the tokens it holds"
+            msg.stop_reason,
+            StopReason::Stop,
+            "response.completed must take the finalized adapter exit"
         );
-        // 1.25 (input) + 10.0 (output) = 11.25 at full price; flex halves it.
+        assert_eq!(
+            (
+                msg.usage.input,
+                msg.usage.output,
+                msg.usage.cache_read,
+                msg.usage.cache_write,
+            ),
+            (1_000_000, 1_000_000, 0, 0),
+            "the replay must harvest wire usage before pricing it"
+        );
+        assert_eq!(msg.usage.total_tokens, 2_000_000);
+        assert!((msg.usage.cost.input - 0.625).abs() < 1e-9);
+        assert!((msg.usage.cost.output - 5.0).abs() < 1e-9);
+        assert_eq!(msg.usage.cost.cache_read, 0.0);
+        assert_eq!(msg.usage.cost.cache_write, 0.0);
         assert!(
             (msg.usage.cost.total - 5.625).abs() < 1e-9,
-            "a cancelled flex turn is priced at the flex rate: got {}",
+            "a replayed flex response costs $5.625 rather than the $11.25 full-price total: got {}",
             msg.usage.cost.total
         );
     }
 
     #[tokio::test]
     async fn the_live_mid_stream_cancel_harvests_the_completed_response() {
-        let completed = serde_json::json!({
-            "type": "response.completed",
-            "sequence_number": 1,
-            "response": {
-                "id": "resp_1",
-                "object": "response",
-                "created_at": 0.0,
-                "model": "gpt-5",
-                "output": [],
-                "parallel_tool_calls": true,
-                "tools": [],
-                "status": "completed",
-                "service_tier": "flex",
-                "usage": {
-                    "input_tokens": 1_000_000,
-                    "output_tokens": 1_000_000,
-                    "total_tokens": 2_000_000
-                }
-            }
-        })
-        .to_string();
+        let completed = priced_flex_completed_response().to_string();
         let server =
             crate::provider_test_support::held_sse_server("POST /v1/responses", vec![completed])
                 .await;
