@@ -2,8 +2,8 @@
 //!
 //! A [`UsageSource`] knows how to fetch account-level usage numbers
 //! (rate-limit windows like "current session" or "current week") for
-//! one provider, resolving its own credentials through
-//! [`AuthStorage`]. The binary's `/usage` page walks
+//! one provider and one optional labeled account, resolving credentials
+//! through [`AuthStorage`]. The binary's `/usage` page walks
 //! [`default_usage_sources`] and renders every report on one page, so
 //! adding usage display for a new provider means implementing the
 //! trait and appending it to the default list — no UI changes.
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::auth::{AuthError, AuthStorage};
+use crate::auth::{AuthCredential, AuthError, AuthStorage};
 
 /// One rate-limit window, ready to render.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +47,10 @@ pub struct ProviderUsage {
     /// the count with a matching [`RateLimitResetSource`] by provider id
     /// before offering the action.
     pub reset_credits: Option<u32>,
+    /// Provider-defined stable identity for the credential whose reset
+    /// credits were reported. Passed back on reset so a label rebound after
+    /// fetch cannot spend a different subscription's credit. Never rendered.
+    pub reset_identity: Option<String>,
 }
 
 /// Outcome of asking one source for usage numbers.
@@ -75,6 +79,49 @@ pub enum UsageError {
     Fetch(String),
 }
 
+/// One labeled account from the credential-store snapshot taken when the
+/// usage page opened.
+///
+/// The snapshot lets a fresh sibling resolve without waiting behind another
+/// account's stalled OAuth refresh. Expired OAuth credentials still re-enter
+/// the store's locked exact-account refresh path.
+#[derive(Clone, Copy)]
+pub struct UsageAccount<'a> {
+    /// User-typed label that identifies the stored slot and rendered row.
+    label: &'a str,
+    /// Credential captured beside `label` in the same locked store read.
+    credential: &'a AuthCredential,
+}
+
+impl<'a> UsageAccount<'a> {
+    /// Build the account view from one `(label, credential)` pair returned by
+    /// [`AuthStorage::accounts`]. Collection lives in `aj-app`, so this is
+    /// public across the crate boundary while the credential stays opaque to
+    /// usage-source implementations.
+    #[doc(hidden)]
+    pub fn from_store_snapshot(label: &'a str, credential: &'a AuthCredential) -> Self {
+        Self { label, credential }
+    }
+
+    /// User-typed account label carried into the rendered status row.
+    pub fn label(self) -> &'a str {
+        self.label
+    }
+
+    /// Resolve this exact snapshot account to the bearer token a usage source
+    /// should send. The token is secret and must never be logged or rendered.
+    pub async fn resolve_key(
+        self,
+        auth: &AuthStorage,
+        provider_id: &str,
+    ) -> Result<Option<String>, UsageError> {
+        Ok(auth
+            .get_account_api_key_from_snapshot(provider_id, self.label, self.credential)
+            .await?
+            .map(|resolved| resolved.key))
+    }
+}
+
 /// A per-provider usage fetcher.
 #[async_trait]
 pub trait UsageSource: Send + Sync {
@@ -82,9 +129,17 @@ pub trait UsageSource: Send + Sync {
     /// [`AuthStorage`] (e.g. `"anthropic"`).
     fn provider_id(&self) -> &str;
 
-    /// Fetch the current usage report, resolving credentials through
-    /// `auth` (including OAuth refresh, same as the messages path).
-    async fn fetch(&self, auth: &AuthStorage) -> Result<UsageReport, UsageError>;
+    /// Fetch the current usage report for `account`, resolving credentials
+    /// through `auth` including OAuth refresh. `None` preserves the bare,
+    /// store-default, runtime-override, and environment behavior used before
+    /// labeled account sets existed. `Some` resolves exactly that account
+    /// from the page-opening store snapshot and cannot be shadowed by
+    /// process-level credential sources.
+    async fn fetch(
+        &self,
+        auth: &AuthStorage,
+        account: Option<UsageAccount<'_>>,
+    ) -> Result<UsageReport, UsageError>;
 }
 
 /// Outcome of spending one earned rate-limit reset credit.
@@ -115,8 +170,10 @@ pub trait RateLimitResetSource: Send + Sync {
     /// [`AuthStorage`] and [`UsageSource::provider_id`].
     fn provider_id(&self) -> &str;
 
-    /// Spend one earned reset credit, resolving credentials through
-    /// `auth`.
+    /// Spend one earned reset credit for `account`, resolving credentials
+    /// with the same account semantics as [`UsageSource::fetch`]. When
+    /// `reset_identity` is present, the source verifies that the label still
+    /// resolves to the subscription whose report offered the credit.
     ///
     /// `idempotency_key` de-duplicates retries of one logical attempt:
     /// callers pass a fresh key per attempt and reuse it when retrying
@@ -124,8 +181,45 @@ pub trait RateLimitResetSource: Send + Sync {
     async fn consume_reset_credit(
         &self,
         auth: &AuthStorage,
+        account: Option<&str>,
+        reset_identity: Option<&str>,
         idempotency_key: &str,
     ) -> Result<ResetOutcome, UsageError>;
+}
+
+/// Resolve the credential one usage row must query.
+///
+/// A labeled row is an inventory view over `auth.json`, so a runtime
+/// `--api-key` or environment variable must not make several account rows
+/// query one unrelated credential. Bare and unconfigured providers retain
+/// the ordinary resolution chain.
+async fn resolve_usage_key(
+    auth: &AuthStorage,
+    provider_id: &str,
+    account: Option<UsageAccount<'_>>,
+) -> Result<Option<String>, UsageError> {
+    match account {
+        Some(account) => account.resolve_key(auth, provider_id).await,
+        None => Ok(auth
+            .get_api_key(provider_id, None)
+            .await?
+            .map(|resolved| resolved.key)),
+    }
+}
+
+/// Resolve a reset action's selected account from current store state. Reset
+/// happens after the usage snapshot was rendered, so it deliberately re-reads
+/// the selected slot rather than spending against a stale credential.
+async fn resolve_selected_usage_key(
+    auth: &AuthStorage,
+    provider_id: &str,
+    account: Option<&str>,
+) -> Result<Option<String>, UsageError> {
+    let resolved = match account {
+        Some(account) => auth.get_account_api_key(provider_id, account).await?,
+        None => auth.get_api_key(provider_id, None).await?,
+    };
+    Ok(resolved.map(|resolved| resolved.key))
 }
 
 /// Usage sources shipped out of the box: Anthropic (Claude
@@ -205,11 +299,12 @@ pub mod anthropic {
             "anthropic"
         }
 
-        async fn fetch(&self, auth: &AuthStorage) -> Result<UsageReport, UsageError> {
-            let Some(key) = auth
-                .get_api_key(self.provider_id(), None)
-                .await?
-                .map(|resolved| resolved.key)
+        async fn fetch(
+            &self,
+            auth: &AuthStorage,
+            account: Option<super::UsageAccount<'_>>,
+        ) -> Result<UsageReport, UsageError> {
+            let Some(key) = super::resolve_usage_key(auth, self.provider_id(), account).await?
             else {
                 return Ok(UsageReport::NotConfigured);
             };
@@ -260,6 +355,7 @@ pub mod anthropic {
             notes,
             // Anthropic has no rate-limit reset-credit mechanism.
             reset_credits: None,
+            reset_identity: None,
         }
     }
 
@@ -723,8 +819,13 @@ pub mod codex {
             PROVIDER_ID
         }
 
-        async fn fetch(&self, auth: &AuthStorage) -> Result<UsageReport, UsageError> {
-            let (client, token, account_id) = match resolve(auth).await? {
+        async fn fetch(
+            &self,
+            auth: &AuthStorage,
+            account: Option<super::UsageAccount<'_>>,
+        ) -> Result<UsageReport, UsageError> {
+            let token = super::resolve_usage_key(auth, PROVIDER_ID, account).await?;
+            let (client, token, account_id) = match resolve(token)? {
                 Resolved::Ready(client, token, account_id) => (client, token, account_id),
                 Resolved::NotConfigured => return Ok(UsageReport::NotConfigured),
                 Resolved::Unsupported => {
@@ -754,7 +855,9 @@ pub mod codex {
             let payload: UsagePayload = serde_json::from_str(&body).map_err(|err| {
                 UsageError::Fetch(format!("could not parse usage response: {err}"))
             })?;
-            Ok(UsageReport::Usage(map_usage(&payload)))
+            let mut usage = map_usage(&payload);
+            usage.reset_identity = Some(account_id);
+            Ok(UsageReport::Usage(usage))
         }
     }
 
@@ -767,12 +870,15 @@ pub mod codex {
         async fn consume_reset_credit(
             &self,
             auth: &AuthStorage,
+            account: Option<&str>,
+            reset_identity: Option<&str>,
             idempotency_key: &str,
         ) -> Result<ResetOutcome, UsageError> {
             // These credential errors are defensive: the UI only offers
             // the action for a provider whose usage report came back with
             // credits available, which already required a usable login.
-            let (client, token, account_id) = match resolve(auth).await? {
+            let token = super::resolve_selected_usage_key(auth, PROVIDER_ID, account).await?;
+            let (client, token, account_id) = match resolve(token)? {
                 Resolved::Ready(client, token, account_id) => (client, token, account_id),
                 Resolved::NotConfigured => {
                     return Err(UsageError::Fetch(
@@ -785,6 +891,7 @@ pub mod codex {
                     ));
                 }
             };
+            validate_reset_identity(reset_identity, &account_id)?;
 
             let request = ConsumeRequest {
                 redeem_request_id: idempotency_key,
@@ -831,12 +938,8 @@ pub mod codex {
 
     /// Resolve the Codex OAuth token, its account id, and a built HTTP
     /// client, shared by the usage read and the reset-credit consume.
-    async fn resolve(auth: &AuthStorage) -> Result<Resolved, UsageError> {
-        let Some(token) = auth
-            .get_api_key(PROVIDER_ID, None)
-            .await?
-            .map(|resolved| resolved.key)
-        else {
+    fn resolve(token: Option<String>) -> Result<Resolved, UsageError> {
+        let Some(token) = token else {
             return Ok(Resolved::NotConfigured);
         };
         // Both endpoints authenticate the account via the
@@ -850,6 +953,18 @@ pub mod codex {
             .build()
             .map_err(|err| UsageError::Fetch(err.to_string()))?;
         Ok(Resolved::Ready(client, token, account_id))
+    }
+
+    /// Refuse a destructive reset when the selected label now resolves to a
+    /// different upstream subscription than the usage report named. A token
+    /// refresh for the same account keeps the account id and remains valid.
+    fn validate_reset_identity(expected: Option<&str>, current: &str) -> Result<(), UsageError> {
+        if expected.is_some_and(|expected| expected != current) {
+            return Err(UsageError::Fetch(
+                "the account changed since usage was fetched; refresh before resetting".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Attach the shared auth headers (bearer token, account id,
@@ -948,6 +1063,7 @@ pub mod codex {
             windows,
             notes,
             reset_credits,
+            reset_identity: None,
         }
     }
 
@@ -1220,6 +1336,17 @@ pub mod codex {
         }
 
         #[test]
+        fn stale_reset_identity_is_rejected_before_a_request() {
+            assert!(validate_reset_identity(None, "current").is_ok());
+            assert!(validate_reset_identity(Some("current"), "current").is_ok());
+            let err = validate_reset_identity(Some("previous"), "current").unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "the account changed since usage was fetched; refresh before resetting"
+            );
+        }
+
+        #[test]
         fn consume_response_maps_every_known_code() {
             let cases = [
                 ("reset", Some(ResetOutcome::Reset)),
@@ -1266,10 +1393,80 @@ pub mod codex {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
+    use async_trait::async_trait;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
+
+    struct StallingRefreshProvider {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl OAuthProvider for StallingRefreshProvider {
+        fn id(&self) -> &str {
+            "anthropic"
+        }
+
+        fn name(&self) -> &str {
+            "Stalling refresh"
+        }
+
+        async fn login(
+            &self,
+            _callbacks: &dyn OAuthCallbacks,
+        ) -> Result<OAuthCredentials, OAuthError> {
+            unreachable!("the fixture never logs in")
+        }
+
+        async fn refresh_token(
+            &self,
+            _credentials: &OAuthCredentials,
+        ) -> Result<OAuthCredentials, OAuthError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            // Deliberately not an Anthropic OAuth prefix, so the concrete
+            // source returns Unsupported after refresh without network I/O.
+            Ok(OAuthCredentials::new(
+                "refreshed-r",
+                "refreshed-api-key",
+                i64::MAX,
+            ))
+        }
+    }
+
+    struct FailingRefreshProvider {
+        id: String,
+    }
+
+    #[async_trait]
+    impl OAuthProvider for FailingRefreshProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "Failing refresh"
+        }
+
+        async fn login(
+            &self,
+            _callbacks: &dyn OAuthCallbacks,
+        ) -> Result<OAuthCredentials, OAuthError> {
+            unreachable!("the fixture never logs in")
+        }
+
+        async fn refresh_token(
+            &self,
+            _credentials: &OAuthCredentials,
+        ) -> Result<OAuthCredentials, OAuthError> {
+            Err(OAuthError::Other("scripted refresh failure".to_string()))
+        }
+    }
 
     /// An empty credential store in a scratch directory, plus the guard that
     /// removes it. The storage reads and writes under that directory, so the
@@ -1278,6 +1475,43 @@ mod tests {
         let dir = TempDir::with_prefix(format!("aj-usage-test-{tag}-")).expect("create temp dir");
         let storage = AuthStorage::with_providers(dir.path().join("auth.json"), HashMap::new());
         (dir, storage)
+    }
+
+    async fn two_account_storage(tag: &str, provider_id: &str) -> (TempDir, AuthStorage) {
+        let dir = TempDir::with_prefix(format!("aj-usage-test-{tag}-")).expect("create temp dir");
+        let provider: Arc<dyn OAuthProvider> = Arc::new(FailingRefreshProvider {
+            id: provider_id.to_string(),
+        });
+        let auth = AuthStorage::with_providers(
+            dir.path().join("auth.json"),
+            HashMap::from([(provider_id.to_string(), provider)]),
+        );
+        auth.set_account(
+            provider_id,
+            "personal",
+            crate::auth::AuthCredential::ApiKey {
+                key: "personal-key".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        auth.set_account(
+            provider_id,
+            "work",
+            crate::auth::AuthCredential::OAuth(OAuthCredentials::new("old-r", "old-a", 1)),
+        )
+        .await
+        .unwrap();
+        (dir, auth)
+    }
+
+    fn snapshot<'a>(accounts: &'a crate::auth::ProviderAccounts, label: &str) -> UsageAccount<'a> {
+        let (label, credential) = accounts
+            .accounts
+            .iter()
+            .find(|(candidate, _)| candidate == label)
+            .expect("snapshot contains the account");
+        UsageAccount::from_store_snapshot(label, credential)
     }
 
     /// No credential at all → `NotConfigured`, no network involved.
@@ -1292,7 +1526,7 @@ mod tests {
         {
             return;
         }
-        let report = source.fetch(&auth).await.unwrap();
+        let report = source.fetch(&auth, None).await.unwrap();
         assert_eq!(report, UsageReport::NotConfigured);
     }
 
@@ -1312,11 +1546,188 @@ mod tests {
         auth.set_runtime_api_key("anthropic", "sk-ant-api-key".into())
             .await;
         let source = anthropic::AnthropicUsageSource;
-        match source.fetch(&auth).await.unwrap() {
+        match source.fetch(&auth, None).await.unwrap() {
             UsageReport::Unsupported { reason } => {
                 assert!(reason.contains("subscription"), "{reason}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn labeled_usage_resolution_reads_each_store_account_despite_an_override() {
+        let (_dir, auth) = scratch_storage("account-keys");
+        for (label, key) in [("personal", "personal-key"), ("work", "work-key")] {
+            auth.set_account(
+                "anthropic",
+                label,
+                crate::auth::AuthCredential::ApiKey {
+                    key: key.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        auth.set_runtime_api_key("anthropic", "override-key".to_string())
+            .await;
+        assert_eq!(
+            auth.get_api_key("anthropic", Some("work"))
+                .await
+                .unwrap()
+                .map(|resolved| resolved.key)
+                .as_deref(),
+            Some("override-key"),
+            "the inference resolver still honors the process override"
+        );
+        let accounts = auth
+            .accounts("anthropic")
+            .await
+            .unwrap()
+            .expect("a labeled set");
+        let snapshot = |label: &str| {
+            let (label, credential) = accounts
+                .accounts
+                .iter()
+                .find(|(candidate, _)| candidate == label)
+                .expect("snapshot contains the account");
+            UsageAccount::from_store_snapshot(label, credential)
+        };
+
+        assert_eq!(
+            resolve_usage_key(&auth, "anthropic", Some(snapshot("personal")))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("personal-key"),
+            "the personal usage row resolves its stored account"
+        );
+        assert_eq!(
+            resolve_usage_key(&auth, "anthropic", Some(snapshot("work")))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("work-key"),
+            "each usage row resolves the stored account it names"
+        );
+        assert_eq!(
+            resolve_selected_usage_key(&auth, "anthropic", Some("work"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("work-key"),
+            "a later account action re-reads the selected store slot without the override"
+        );
+    }
+
+    #[tokio::test]
+    async fn concrete_sources_route_each_account_before_any_usage_request() {
+        let cases: [(&str, Box<dyn UsageSource>); 2] = [
+            ("anthropic", Box::new(anthropic::AnthropicUsageSource)),
+            ("openai-codex", Box::new(codex::OpenAICodexUsageSource)),
+        ];
+        for (provider_id, source) in cases {
+            let (_dir, auth) = two_account_storage("source-routing", provider_id).await;
+            let accounts = auth.accounts(provider_id).await.unwrap().expect("a set");
+
+            let personal = source
+                .fetch(&auth, Some(snapshot(&accounts, "personal")))
+                .await
+                .expect("the API-key account resolves without a network request");
+            assert!(
+                matches!(personal, UsageReport::Unsupported { .. }),
+                "{provider_id}'s personal API-key row is unsupported"
+            );
+            let work = source.fetch(&auth, Some(snapshot(&accounts, "work"))).await;
+            assert!(
+                matches!(work, Err(UsageError::Auth(AuthError::OAuth(_)))),
+                "{provider_id}'s work row must reach its own failing OAuth refresh, got {work:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concrete_source_keeps_a_fresh_sibling_out_of_a_stalled_refresh_lock() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider: Arc<dyn OAuthProvider> = Arc::new(StallingRefreshProvider {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        let dir = TempDir::with_prefix("aj-usage-test-stalled-source-").expect("create temp dir");
+        let auth = AuthStorage::with_providers(
+            dir.path().join("auth.json"),
+            HashMap::from([("anthropic".to_string(), provider)]),
+        );
+        auth.set_account(
+            "anthropic",
+            "expired",
+            crate::auth::AuthCredential::OAuth(OAuthCredentials::new("old-r", "old-a", 1)),
+        )
+        .await
+        .unwrap();
+        auth.set_account(
+            "anthropic",
+            "fresh",
+            crate::auth::AuthCredential::ApiKey {
+                key: "fresh-api-key".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let accounts = auth.accounts("anthropic").await.unwrap().expect("a set");
+        let credential = |label: &str| {
+            accounts
+                .accounts
+                .iter()
+                .find(|(candidate, _)| candidate == label)
+                .expect("snapshot contains the account")
+                .clone()
+        };
+        let expired = credential("expired");
+        let fresh = credential("fresh");
+
+        let refresh_started = started.notified();
+        let refresh_auth = auth.clone();
+        let refreshing = tokio::spawn(async move {
+            let (label, credential) = expired;
+            anthropic::AnthropicUsageSource
+                .fetch(
+                    &refresh_auth,
+                    Some(UsageAccount::from_store_snapshot(&label, &credential)),
+                )
+                .await
+        });
+        refresh_started.await;
+
+        let (label, credential) = fresh;
+        let sibling = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            anthropic::AnthropicUsageSource.fetch(
+                &auth,
+                Some(UsageAccount::from_store_snapshot(&label, &credential)),
+            ),
+        )
+        .await
+        .expect("the concrete fresh sibling must bypass another account's refresh lock")
+        .unwrap();
+        assert!(matches!(sibling, UsageReport::Unsupported { .. }));
+
+        release.notify_one();
+        let refreshed = refreshing.await.unwrap().unwrap();
+        assert!(matches!(refreshed, UsageReport::Unsupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn concrete_codex_reset_routes_the_selected_account_before_any_request() {
+        let (_dir, auth) = two_account_storage("reset-routing", "openai-codex").await;
+        let source = codex::OpenAICodexUsageSource;
+
+        let result = source
+            .consume_reset_credit(&auth, Some("work"), None, "idempotency-key")
+            .await;
+        assert!(
+            matches!(result, Err(UsageError::Auth(AuthError::OAuth(_)))),
+            "the reset must reach work's failing OAuth refresh rather than the default API key: {result:?}"
+        );
     }
 }

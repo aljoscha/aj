@@ -14,22 +14,27 @@ use std::sync::Arc;
 use chrono::{Datelike, Local, TimeZone, Utc};
 
 use aj_models::auth::AuthStorage;
-use aj_models::usage::{ProviderUsage, UsageReport, default_usage_sources};
+use aj_models::usage::{
+    ProviderUsage, UsageAccount, UsageReport, UsageSource, default_usage_sources,
+};
 
-/// Per-source timeout. The Anthropic source's HTTP request already
+/// Per-account timeout. The Anthropic source's HTTP request already
 /// caps itself at 5 s; this outer bound also covers credential
-/// resolution (an OAuth refresh round-trip) so one stuck source can't
-/// hold the whole page in its loading state.
+/// resolution (an OAuth refresh round-trip) so one stuck account can't
+/// hold the whole page in its loading state indefinitely.
 const SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// One provider's resolved usage status, ready to render.
+/// One provider account's resolved usage status, ready to render.
 #[derive(Debug, Clone)]
 pub struct ProviderUsageStatus {
     pub provider_id: String,
+    /// The labeled stored account this row reports. `None` retains the
+    /// pre-accounts row for a bare, unconfigured, or source-less provider.
+    pub account: Option<String>,
     pub outcome: UsageOutcome,
 }
 
-/// What the `/usage` page shows for one provider.
+/// What the `/usage` page shows for one provider account.
 #[derive(Debug, Clone)]
 pub enum UsageOutcome {
     /// Usage numbers were fetched; render one row per window.
@@ -50,32 +55,94 @@ pub enum UsageOutcome {
 /// and not just Anthropic. Mirrors the `/auth` page's known set.
 const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openrouter"];
 
-/// Fetch usage from every registered source concurrently and append
-/// "no usage source" rows for the remaining known providers. Rows
-/// are sorted by provider id for a stable display order.
+/// Fetch usage from every registered source and every labeled account,
+/// concurrently, then append "no usage source" rows for the remaining
+/// known providers. Rows are sorted by provider id and account label for
+/// a stable display order.
 pub async fn collect_usage(auth: &AuthStorage) -> Vec<ProviderUsageStatus> {
-    let sources = default_usage_sources();
+    collect_usage_from_sources(auth, default_usage_sources()).await
+}
 
-    let mut tasks = tokio::task::JoinSet::new();
-    for source in &sources {
-        let source = Arc::clone(source);
+async fn collect_usage_from_sources(
+    auth: &AuthStorage,
+    sources: Vec<Arc<dyn UsageSource>>,
+) -> Vec<ProviderUsageStatus> {
+    let mut discoveries = tokio::task::JoinSet::new();
+    for source in sources {
         let auth = auth.clone();
-        tasks.spawn(async move {
-            let outcome = match tokio::time::timeout(SOURCE_TIMEOUT, source.fetch(&auth)).await {
-                Ok(Ok(UsageReport::Usage(usage))) => UsageOutcome::Usage(usage),
-                Ok(Ok(UsageReport::Unsupported { reason })) => UsageOutcome::Unsupported { reason },
-                Ok(Ok(UsageReport::NotConfigured)) => UsageOutcome::NotConfigured,
-                Ok(Err(err)) => UsageOutcome::Error(err.to_string()),
-                Err(_) => UsageOutcome::Error("timed out".to_string()),
-            };
-            ProviderUsageStatus {
-                provider_id: source.provider_id().to_string(),
-                outcome,
-            }
+        let provider_id = source.provider_id().to_string();
+        discoveries.spawn(async move {
+            let accounts = tokio::time::timeout(SOURCE_TIMEOUT, auth.accounts(&provider_id)).await;
+            (source, accounts)
         });
     }
 
-    let mut statuses: Vec<ProviderUsageStatus> = Vec::new();
+    let mut statuses = Vec::new();
+    let mut discovered_accounts = Vec::new();
+    while let Some(discovered) = discoveries.join_next().await {
+        let Ok((source, result)) = discovered else {
+            tracing::warn!("usage account discovery task panicked");
+            continue;
+        };
+        let accounts = match result {
+            Ok(Ok(Some(accounts))) if accounts.accounts.is_empty() => vec![None],
+            Ok(Ok(Some(accounts))) => accounts.accounts.into_iter().map(Some).collect(),
+            Ok(Ok(None)) => vec![None],
+            Ok(Err(err)) => {
+                statuses.push(ProviderUsageStatus {
+                    provider_id: source.provider_id().to_string(),
+                    account: None,
+                    outcome: UsageOutcome::Error(err.to_string()),
+                });
+                continue;
+            }
+            Err(_) => {
+                statuses.push(ProviderUsageStatus {
+                    provider_id: source.provider_id().to_string(),
+                    account: None,
+                    outcome: UsageOutcome::Error("timed out".to_string()),
+                });
+                continue;
+            }
+        };
+        discovered_accounts.push((source, accounts));
+    }
+
+    // Complete the page-wide store snapshot before any source can begin an
+    // OAuth refresh under the shared auth-file lock. A stalled refresh for
+    // one provider must not prevent a later provider from discovering its
+    // already-fresh accounts.
+    let mut tasks = tokio::task::JoinSet::new();
+    for (source, accounts) in discovered_accounts {
+        for account in accounts {
+            let source = Arc::clone(&source);
+            let auth = auth.clone();
+            tasks.spawn(async move {
+                let account_label = account.as_ref().map(|(label, _)| label.clone());
+                let usage_account = account.as_ref().map(|(label, credential)| {
+                    UsageAccount::from_store_snapshot(label, credential)
+                });
+                let outcome =
+                    match tokio::time::timeout(SOURCE_TIMEOUT, source.fetch(&auth, usage_account))
+                        .await
+                    {
+                        Ok(Ok(UsageReport::Usage(usage))) => UsageOutcome::Usage(usage),
+                        Ok(Ok(UsageReport::Unsupported { reason })) => {
+                            UsageOutcome::Unsupported { reason }
+                        }
+                        Ok(Ok(UsageReport::NotConfigured)) => UsageOutcome::NotConfigured,
+                        Ok(Err(err)) => UsageOutcome::Error(err.to_string()),
+                        Err(_) => UsageOutcome::Error("timed out".to_string()),
+                    };
+                ProviderUsageStatus {
+                    provider_id: source.provider_id().to_string(),
+                    account: account_label,
+                    outcome,
+                }
+            });
+        }
+    }
+
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok(status) => statuses.push(status),
@@ -87,12 +154,17 @@ pub async fn collect_usage(auth: &AuthStorage) -> Vec<ProviderUsageStatus> {
         if !statuses.iter().any(|s| s.provider_id == *id) {
             statuses.push(ProviderUsageStatus {
                 provider_id: id.to_string(),
+                account: None,
                 outcome: UsageOutcome::NoSource,
             });
         }
     }
 
-    statuses.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+    statuses.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then_with(|| a.account.cmp(&b.account))
+    });
     statuses
 }
 
@@ -187,10 +259,109 @@ pub fn now_unix_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use aj_models::auth::AuthCredential;
+    use aj_models::usage::{UsageError, UsageWindow};
+    use async_trait::async_trait;
     use chrono::DateTime;
     use tempfile::TempDir;
 
     use super::*;
+
+    struct FakeUsageSource {
+        calls: Arc<Mutex<Vec<Option<String>>>>,
+        fail_account: Option<String>,
+        delays: Option<(u64, u64)>,
+    }
+
+    #[async_trait]
+    impl UsageSource for FakeUsageSource {
+        fn provider_id(&self) -> &str {
+            "anthropic"
+        }
+
+        async fn fetch(
+            &self,
+            _auth: &AuthStorage,
+            account: Option<UsageAccount<'_>>,
+        ) -> Result<UsageReport, UsageError> {
+            let account = account.map(UsageAccount::label);
+            self.calls
+                .lock()
+                .expect("calls mutex")
+                .push(account.map(str::to_string));
+            if let Some((personal, work)) = self.delays {
+                let delay = match account {
+                    Some("personal") => personal,
+                    Some("work") => work,
+                    _ => 0,
+                };
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+            if self
+                .fail_account
+                .as_deref()
+                .is_some_and(|failed| Some(failed) == account)
+            {
+                return Err(UsageError::Fetch(format!(
+                    "{} failed",
+                    account.unwrap_or("bare")
+                )));
+            }
+            let (used, note, reset_credits) = match account {
+                Some("personal") => (0.25, "personal note", Some(1)),
+                Some("work") => (0.75, "work note", Some(2)),
+                _ => (0.5, "bare note", None),
+            };
+            Ok(UsageReport::Usage(ProviderUsage {
+                windows: vec![UsageWindow {
+                    label: "5h limit".to_string(),
+                    used,
+                    resets_at: None,
+                }],
+                notes: vec![note.to_string()],
+                reset_credits,
+                reset_identity: account.map(|account| format!("identity-{account}")),
+            }))
+        }
+    }
+
+    async fn two_account_auth(tag: &str) -> (TempDir, AuthStorage) {
+        let dir = TempDir::with_prefix(format!("aj-usage-{tag}-")).expect("create temp dir");
+        let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
+        for (label, key) in [("personal", "personal-key"), ("work", "work-key")] {
+            auth.set_account(
+                "anthropic",
+                label,
+                AuthCredential::ApiKey {
+                    key: key.to_string(),
+                },
+            )
+            .await
+            .expect("seed account");
+        }
+        (dir, auth)
+    }
+
+    fn fake_source(
+        calls: Arc<Mutex<Vec<Option<String>>>>,
+        fail_account: Option<&str>,
+        delays: Option<(u64, u64)>,
+    ) -> Arc<dyn UsageSource> {
+        Arc::new(FakeUsageSource {
+            calls,
+            fail_account: fail_account.map(str::to_string),
+            delays,
+        })
+    }
+
+    fn account_statuses(statuses: &[ProviderUsageStatus]) -> Vec<&ProviderUsageStatus> {
+        statuses
+            .iter()
+            .filter(|status| status.provider_id == "anthropic")
+            .collect()
+    }
 
     fn ms(dt: DateTime<Local>) -> i64 {
         dt.timestamp_millis()
@@ -263,6 +434,147 @@ mod tests {
         assert_eq!(
             ids,
             vec!["anthropic", "openai", "openai-codex", "openrouter"]
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_fetches_every_labeled_account_independently() {
+        let (_dir, auth) = two_account_auth("two-accounts").await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let statuses =
+            collect_usage_from_sources(&auth, vec![fake_source(Arc::clone(&calls), None, None)])
+                .await;
+
+        let rows = account_statuses(&statuses);
+        assert_eq!(
+            rows.iter()
+                .filter_map(|status| status.account.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["personal", "work"],
+            "a labeled set contributes one stable row per account"
+        );
+        let reports: Vec<(f64, &str, Option<u32>, Option<&str>)> = rows
+            .iter()
+            .map(|status| match &status.outcome {
+                UsageOutcome::Usage(usage) => (
+                    usage.windows[0].used,
+                    usage.notes[0].as_str(),
+                    usage.reset_credits,
+                    usage.reset_identity.as_deref(),
+                ),
+                other => panic!("expected per-account usage, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            vec![
+                (0.25, "personal note", Some(1), Some("identity-personal")),
+                (0.75, "work note", Some(2), Some("identity-work"))
+            ],
+            "each account retains its complete windows, notes, reset credits, and action identity"
+        );
+        let mut fetched = calls.lock().expect("calls mutex").clone();
+        fetched.sort();
+        assert_eq!(
+            fetched,
+            vec![Some("personal".to_string()), Some("work".to_string())],
+            "the source receives each account label rather than only the store default"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_account_error_preserves_its_siblings_usage_row() {
+        let (_dir, auth) = two_account_auth("sibling-error").await;
+        let statuses = collect_usage_from_sources(
+            &auth,
+            vec![fake_source(
+                Arc::new(Mutex::new(Vec::new())),
+                Some("work"),
+                None,
+            )],
+        )
+        .await;
+        let rows = account_statuses(&statuses);
+
+        let personal = rows
+            .iter()
+            .find(|status| status.account.as_deref() == Some("personal"))
+            .expect("one account's error must not blank its sibling row");
+        assert!(
+            matches!(&personal.outcome, UsageOutcome::Usage(usage) if usage.windows[0].used == 0.25),
+            "the sibling account's usage numbers survive: {:?}",
+            personal.outcome
+        );
+        let work = rows
+            .iter()
+            .find(|status| status.account.as_deref() == Some("work"))
+            .expect("the failing account keeps its own row");
+        assert!(
+            matches!(&work.outcome, UsageOutcome::Error(message) if message == "work failed"),
+            "the error belongs only to the account that failed: {:?}",
+            work.outcome
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn labeled_account_fetches_run_concurrently() {
+        let (_dir, auth) = two_account_auth("concurrent").await;
+        let started = tokio::time::Instant::now();
+        let statuses = collect_usage_from_sources(
+            &auth,
+            vec![fake_source(
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+                Some((1, 2)),
+            )],
+        )
+        .await;
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            std::time::Duration::from_secs(2),
+            "two account fetches take the slower fetch, not their sum"
+        );
+        assert_eq!(
+            account_statuses(&statuses).len(),
+            2,
+            "both delayed account fetches completed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_account_fetch_has_its_own_timeout_and_row() {
+        let (_dir, auth) = two_account_auth("timeout").await;
+        let started = tokio::time::Instant::now();
+        let statuses = collect_usage_from_sources(
+            &auth,
+            vec![fake_source(
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+                Some((1, 20)),
+            )],
+        )
+        .await;
+        let rows = account_statuses(&statuses);
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            SOURCE_TIMEOUT,
+            "the slow account is capped by its own timeout"
+        );
+        let personal = rows
+            .iter()
+            .find(|status| status.account.as_deref() == Some("personal"))
+            .expect("the fast sibling keeps its row");
+        assert!(matches!(&personal.outcome, UsageOutcome::Usage(_)));
+        let work = rows
+            .iter()
+            .find(|status| status.account.as_deref() == Some("work"))
+            .expect("the timed-out account keeps its row");
+        assert!(
+            matches!(&work.outcome, UsageOutcome::Error(message) if message == "timed out"),
+            "the timeout belongs to the slow account: {:?}",
+            work.outcome
         );
     }
 }

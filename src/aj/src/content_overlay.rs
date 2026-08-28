@@ -47,6 +47,7 @@ use vaxis::vxfw::{
 use crate::overlay::{
     OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_close,
 };
+use crate::text::one_line;
 use crate::transcript::vaxis_color;
 
 /// A single content-overlay row: styled spans laid out as one line.
@@ -707,49 +708,67 @@ fn usage_status_rows(status: &ProviderUsageStatus, now_ms: i64) -> Vec<(String, 
     out
 }
 
-/// Usage rows: one group per provider. Only a provider's first row
-/// carries its id, continuation rows leave it blank so the id column
-/// groups the windows visually (matching `aj`'s usage page).
+/// Usage rows: one group per provider account. Only the group's first row
+/// carries its provider and optional account identity; continuation rows
+/// leave those columns blank so the windows stay grouped visually. When no
+/// labeled account exists, the account column is omitted and the pre-account
+/// three-column layout stays exact.
 ///
-/// Each row is up to three columns, tinted like [`auth_rows`]: the
-/// right-aligned provider-id column in `styles.muted` (blank but still
-/// `id_w` wide on continuation rows), the window/status label in the
-/// default style, and the per-window status detail in `styles.muted`.
+/// Each row is up to four columns, tinted like [`auth_rows`]: the
+/// right-aligned provider-id column in `styles.muted`, an optional account
+/// column in the same tint, the window/status label in the default style,
+/// and the per-window status detail in `styles.muted`.
 /// The label is padded to a shared width on rows that carry a detail, so
 /// every detail value starts at the same column and lines up.
 pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyles) -> Vec<Row> {
     let now_ms = now_unix_ms();
-    // Materialize each provider's rows first so we can size the id and
-    // detail columns to the whole set before emitting spans.
-    let groups: Vec<(&str, Vec<(String, Option<String>)>)> = statuses
+    // Materialize each account's rows first so we can sanitize free-text
+    // labels and size every column before emitting spans.
+    let groups: Vec<(&str, Option<String>, Vec<(String, Option<String>)>)> = statuses
         .iter()
         .map(|status| {
             (
                 status.provider_id.as_str(),
+                status.account.as_deref().map(one_line),
                 usage_status_rows(status, now_ms),
             )
         })
         .collect();
+    let has_accounts = groups.iter().any(|(_, account, _)| account.is_some());
     let id_w = groups
         .iter()
-        .map(|(id, _)| id.chars().count())
+        .map(|(id, _, _)| id.chars().count())
+        .max()
+        .unwrap_or(0);
+    let account_w = groups
+        .iter()
+        .filter_map(|(_, account, _)| account.as_deref())
+        .map(|account| account.chars().count())
         .max()
         .unwrap_or(0);
     let label_w = groups
         .iter()
-        .flat_map(|(_, group)| group.iter())
+        .flat_map(|(_, _, group)| group.iter())
         .filter(|(_, detail)| detail.is_some())
         .map(|(label, _)| label.chars().count())
         .max()
         .unwrap_or(0);
 
     let mut rows = Vec::new();
-    for (id, group) in &groups {
+    for (id, account, group) in &groups {
         for (i, (label, detail)) in group.iter().enumerate() {
-            // The id shows only on a provider's first row. Continuation
-            // rows keep the column width so the label column stays put.
+            // Identity shows only on an account's first row. Continuation
+            // rows keep both widths so the window label does not shift.
             let prefix = if i == 0 { *id } else { "" };
             let mut row = vec![span(format!("{prefix:>id_w$}"), styles.muted)];
+            if has_accounts {
+                let account = if i == 0 {
+                    account.as_deref().unwrap_or("")
+                } else {
+                    ""
+                };
+                row.push(span(format!("  {account:<account_w$}"), styles.muted));
+            }
             match detail {
                 Some(detail) => {
                     row.push(span(format!("  {label:<label_w$}"), Style::default()));
@@ -1464,6 +1483,7 @@ mod tests {
             &[
                 ProviderUsageStatus {
                     provider_id: "anthropic".into(),
+                    account: None,
                     outcome: UsageOutcome::Usage(ProviderUsage {
                         windows: vec![UsageWindow {
                             label: "5-hour".into(),
@@ -1472,10 +1492,12 @@ mod tests {
                         }],
                         notes: Vec::new(),
                         reset_credits: None,
+                        reset_identity: None,
                     }),
                 },
                 ProviderUsageStatus {
                     provider_id: "openai".into(),
+                    account: None,
                     outcome: UsageOutcome::NotConfigured,
                 },
             ],
@@ -1485,6 +1507,90 @@ mod tests {
         assert!(rows.contains("5-hour"), "{rows}");
         assert!(rows.contains("50% used"), "{rows}");
         assert!(rows.contains("not configured"), "{rows}");
+    }
+
+    #[test]
+    fn usage_rows_render_one_sanitized_group_per_account() {
+        use aj_models::usage::{ProviderUsage, UsageWindow};
+
+        let styles = test_styles();
+        let rows = usage_rows(
+            &[
+                ProviderUsageStatus {
+                    provider_id: "anthropic".into(),
+                    account: Some("personal".into()),
+                    outcome: UsageOutcome::Usage(ProviderUsage {
+                        windows: vec![
+                            UsageWindow {
+                                label: "5-hour".into(),
+                                used: 0.5,
+                                resets_at: None,
+                            },
+                            UsageWindow {
+                                label: "weekly".into(),
+                                used: 0.25,
+                                resets_at: None,
+                            },
+                        ],
+                        notes: vec!["Personal usage credits".into()],
+                        reset_credits: Some(1),
+                        reset_identity: Some("personal-upstream".into()),
+                    }),
+                },
+                ProviderUsageStatus {
+                    provider_id: "anthropic".into(),
+                    account: Some("wo\nrk".into()),
+                    outcome: UsageOutcome::Error("limit fetch failed".into()),
+                },
+            ],
+            &styles,
+        );
+
+        assert_eq!(
+            rows.len(),
+            5,
+            "two windows, one note, one reset-credit row, and one work error"
+        );
+        assert_eq!(rows[0][0].text.trim(), "anthropic");
+        assert_eq!(
+            rows[0][1].text.trim(),
+            "personal",
+            "the account label has its own rendered identity column"
+        );
+        assert_eq!(rows[0][0].style, styles.muted);
+        assert_eq!(rows[0][1].style, styles.muted);
+        assert!(rows[0][2].text.contains("5-hour"), "{:?}", rows[0]);
+        assert_eq!(rows[0][2].style, Style::default());
+        assert!(rows[0][3].text.contains("50% used"), "{:?}", rows[0]);
+        assert_eq!(rows[0][3].style, styles.muted);
+        assert!(rows[1][0].text.trim().is_empty(), "{:?}", rows[1]);
+        assert!(rows[1][1].text.trim().is_empty(), "{:?}", rows[1]);
+        assert!(
+            row_text(&rows[2]).contains("Personal usage credits"),
+            "{:?}",
+            rows[2]
+        );
+        assert!(
+            row_text(&rows[3]).contains("Rate-limit resets")
+                && row_text(&rows[3]).contains("1 available"),
+            "{:?}",
+            rows[3]
+        );
+        for continuation in &rows[1..4] {
+            assert!(continuation[0].text.trim().is_empty(), "{continuation:?}");
+            assert!(continuation[1].text.trim().is_empty(), "{continuation:?}");
+        }
+        assert_eq!(rows[4][0].text.trim(), "anthropic");
+        assert_eq!(rows[4][1].text.trim(), "work");
+        assert!(
+            row_text(&rows[4]).contains("error: limit fetch failed"),
+            "{:?}",
+            rows[4]
+        );
+        assert!(
+            rows.iter().all(|row| !row_text(row).contains(['\n', '\r'])),
+            "free-text labels stay on one drawable line: {rows:?}"
+        );
     }
 
     /// The usage page tints its columns like the auth page: the provider
@@ -1499,6 +1605,7 @@ mod tests {
         let rows = usage_rows(
             &[ProviderUsageStatus {
                 provider_id: "anthropic".into(),
+                account: None,
                 outcome: UsageOutcome::Usage(ProviderUsage {
                     // Labels of different widths (6 vs 5) so the
                     // detail-column alignment below genuinely exercises
@@ -1517,6 +1624,7 @@ mod tests {
                     ],
                     notes: Vec::new(),
                     reset_credits: None,
+                    reset_identity: None,
                 }),
             }],
             &styles,
@@ -1580,6 +1688,7 @@ mod tests {
             &[
                 ProviderUsageStatus {
                     provider_id: "anthropic".into(), // widest id (9)
+                    account: None,
                     outcome: UsageOutcome::Usage(ProviderUsage {
                         windows: vec![UsageWindow {
                             label: "5-hour".into(),
@@ -1588,10 +1697,12 @@ mod tests {
                         }],
                         notes: Vec::new(),
                         reset_credits: None,
+                        reset_identity: None,
                     }),
                 },
                 ProviderUsageStatus {
                     provider_id: "openai".into(), // shorter id (6)
+                    account: None,
                     outcome: UsageOutcome::NotConfigured,
                 },
             ],

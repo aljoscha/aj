@@ -381,6 +381,18 @@ struct State {
     oauth_providers: HashMap<String, Arc<dyn OAuthProvider>>,
 }
 
+/// Result of looking only in `auth.json` for one credential slot.
+///
+/// `Absent` permits the ordinary resolver to continue to environment
+/// fallback. `Missing` means the provider entry existed but could not
+/// answer the requested slot, which must stop resolution rather than
+/// silently serving a different credential.
+enum StoredLookup {
+    Resolved(ResolvedCredential),
+    Missing,
+    Absent,
+}
+
 /// Credential storage backed by `auth.json`.
 ///
 /// Cheap to clone — internally an `Arc`, so all clones share one
@@ -873,61 +885,11 @@ impl AuthStorage {
 
         // 2. Stored credential, checked before the environment so a
         //    deliberate login stays authoritative (see the doc
-        //    comment). Each arm that yields a usable key returns
-        //    here.
-        let entry = {
-            let _lock = FileLock::acquire(&self.path).await?;
-            self.read_credentials()?.remove(provider_id)
-        };
-        if let Some(entry) = entry {
-            // The slot is fixed from this read: a refresh writes back to
-            // the slot it read, whatever the default points at by then.
-            // It is also what the resolved credential reports as its
-            // source, which is the only place an unlabeled ask can learn
-            // which label the store's default pointed at.
-            let slot = entry.slot(account);
-            match entry.resolve(account) {
-                Some(AuthCredential::ApiKey { key }) => {
-                    return Ok(Some(ResolvedCredential {
-                        key,
-                        source: slot.source(),
-                    }));
-                }
-                Some(AuthCredential::OAuth(creds)) => {
-                    // A stored OAuth credential under a provider id we have
-                    // no flow for (a hand-edited or renamed id) can be
-                    // neither validated nor refreshed. Treat it as
-                    // unconfigured and let the caller prompt a fresh login
-                    // rather than hard-erroring on what is effectively a typo.
-                    let Ok(provider) = self.lookup_oauth_provider(provider_id).await else {
-                        return Ok(None);
-                    };
-                    let now = now_unix_ms();
-                    if !creds.is_expired_at(now) {
-                        return Ok(Some(ResolvedCredential {
-                            key: provider.get_api_key(&creds),
-                            source: slot.source(),
-                        }));
-                    }
-                    // A refresh failure bubbles as `AuthError::OAuth`. An
-                    // `Ok(None)` means a sibling process cleared or replaced
-                    // the slot while we held the lock, so we fall through
-                    // rather than inventing a credential.
-                    if let Some(key) = self
-                        .refresh_oauth_with_lock(provider_id, &slot, &*provider)
-                        .await?
-                    {
-                        return Ok(Some(ResolvedCredential {
-                            key,
-                            source: slot.source(),
-                        }));
-                    }
-                }
-                // The entry exists but the asked slot does not (a missing
-                // label, a label against a bare entry, a dangling
-                // default). Unconfigured, never a different credential.
-                None => return Ok(None),
-            }
+        //    comment).
+        match self.stored_api_key(provider_id, account).await? {
+            StoredLookup::Resolved(resolved) => return Ok(Some(resolved)),
+            StoredLookup::Missing => return Ok(None),
+            StoredLookup::Absent => {}
         }
 
         // 3. Environment variables, the lowest-priority fallback, and
@@ -939,6 +901,125 @@ impl AuthStorage {
             key,
             source: CredentialSource::Environment,
         }))
+    }
+
+    /// Resolve exactly one labeled account from `auth.json`, refreshing
+    /// stored OAuth credentials as needed.
+    ///
+    /// Unlike [`AuthStorage::get_api_key`], this deliberately bypasses
+    /// runtime overrides and environment variables. Inventory surfaces
+    /// such as `/usage` ask about every stored account independently; a
+    /// process-wide override must not make several labeled rows query the
+    /// same unrelated credential.
+    pub(crate) async fn get_account_api_key(
+        &self,
+        provider_id: &str,
+        account: &str,
+    ) -> Result<Option<ResolvedCredential>, AuthError> {
+        Ok(
+            match self.stored_api_key(provider_id, Some(account)).await? {
+                StoredLookup::Resolved(resolved) => Some(resolved),
+                StoredLookup::Missing | StoredLookup::Absent => None,
+            },
+        )
+    }
+
+    /// Resolve one account from a credential snapshot returned by
+    /// [`AuthStorage::accounts`]. Fresh tokens and API keys need no second
+    /// file-lock acquisition; an expired OAuth token still enters the exact
+    /// account refresh path and preserves its cross-process serialization.
+    ///
+    /// This is restricted to the model layer because snapshots deliberately
+    /// trade a second disk read for independence between usage rows opened
+    /// from one store snapshot. General inference must use
+    /// [`AuthStorage::get_api_key`] and re-read current state.
+    pub(crate) async fn get_account_api_key_from_snapshot(
+        &self,
+        provider_id: &str,
+        account: &str,
+        credential: &AuthCredential,
+    ) -> Result<Option<ResolvedCredential>, AuthError> {
+        let key = match credential {
+            AuthCredential::ApiKey { key } => key.clone(),
+            AuthCredential::OAuth(creds) => {
+                let Ok(provider) = self.lookup_oauth_provider(provider_id).await else {
+                    return Ok(None);
+                };
+                if creds.is_expired_at(now_unix_ms()) {
+                    return self.get_account_api_key(provider_id, account).await;
+                }
+                provider.get_api_key(creds)
+            }
+        };
+        Ok(Some(ResolvedCredential {
+            key,
+            source: CredentialSource::Account(account.to_string()),
+        }))
+    }
+
+    /// Resolve only from the persisted credential store. The return shape
+    /// preserves the ordinary chain's distinction between an absent entry,
+    /// which may fall through to the environment, and a present entry that
+    /// cannot answer the requested slot, which may not.
+    async fn stored_api_key(
+        &self,
+        provider_id: &str,
+        account: Option<&str>,
+    ) -> Result<StoredLookup, AuthError> {
+        let entry = {
+            let _lock = FileLock::acquire(&self.path).await?;
+            self.read_credentials()?.remove(provider_id)
+        };
+        let Some(entry) = entry else {
+            return Ok(StoredLookup::Absent);
+        };
+
+        // The slot is fixed from this read: a refresh writes back to the
+        // slot it read, whatever the default points at by then. It is also
+        // what the resolved credential reports as its source, which is the
+        // only place an unlabeled ask can learn which label the store's
+        // default pointed at.
+        let slot = entry.slot(account);
+        match entry.resolve(account) {
+            Some(AuthCredential::ApiKey { key }) => {
+                Ok(StoredLookup::Resolved(ResolvedCredential {
+                    key,
+                    source: slot.source(),
+                }))
+            }
+            Some(AuthCredential::OAuth(creds)) => {
+                // A stored OAuth credential under a provider id we have no
+                // flow for can be neither validated nor refreshed. Treat it
+                // as a present-but-unusable entry rather than falling through
+                // to a different source.
+                let Ok(provider) = self.lookup_oauth_provider(provider_id).await else {
+                    return Ok(StoredLookup::Missing);
+                };
+                if !creds.is_expired_at(now_unix_ms()) {
+                    return Ok(StoredLookup::Resolved(ResolvedCredential {
+                        key: provider.get_api_key(&creds),
+                        source: slot.source(),
+                    }));
+                }
+                // `None` means a sibling process cleared or replaced the
+                // slot while the refresh waited for the lock. The ordinary
+                // unlabeled chain may then use its environment fallback.
+                match self
+                    .refresh_oauth_with_lock(provider_id, &slot, &*provider)
+                    .await?
+                {
+                    Some(key) => Ok(StoredLookup::Resolved(ResolvedCredential {
+                        key,
+                        source: slot.source(),
+                    })),
+                    None => Ok(StoredLookup::Absent),
+                }
+            }
+            // The entry exists but the asked slot does not (a missing label,
+            // a label against a bare entry, or a dangling default). Never
+            // answer from another credential.
+            None => Ok(StoredLookup::Missing),
+        }
     }
 
     /// Run the first OAuth login for an unconfigured provider.
@@ -3896,6 +3977,158 @@ mod tests {
             CredentialSource::Override,
             "a turn the override served is not a turn on the account that was asked for"
         );
+    }
+
+    /// Inventory surfaces resolve each stored account itself even when the
+    /// running session has a louder override. Otherwise `/usage` would show
+    /// several account labels backed by duplicate results from one unrelated
+    /// process credential.
+    #[tokio::test]
+    async fn account_inventory_resolution_bypasses_the_runtime_override() {
+        let (_dir, path) = scratch_path("inventory-vs-override");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .set_account("prov-x", "work", api_key("stored"))
+            .await
+            .unwrap();
+        storage
+            .set_runtime_api_key("prov-x", "override".into())
+            .await;
+        assert_eq!(
+            storage
+                .get_api_key("prov-x", Some("work"))
+                .await
+                .unwrap()
+                .map(|resolved| resolved.key)
+                .as_deref(),
+            Some("override"),
+            "the ordinary inference chain still gives the runtime override precedence"
+        );
+
+        let resolved = storage
+            .get_account_api_key("prov-x", "work")
+            .await
+            .unwrap()
+            .expect("the stored account resolves independently");
+        assert_eq!(resolved.key, "stored");
+        assert_eq!(
+            resolved.source,
+            CredentialSource::Account("work".to_string())
+        );
+    }
+
+    /// A usage page opens from one credential snapshot. If one expired
+    /// account stalls while refreshing under the store's cross-process lock,
+    /// a fresh sibling from that snapshot must still be usable immediately.
+    #[tokio::test]
+    async fn stalled_account_refresh_does_not_block_a_fresh_snapshot_sibling() {
+        use tokio::sync::Notify;
+
+        struct StallingProvider {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl OAuthProvider for StallingProvider {
+            fn id(&self) -> &str {
+                "stub"
+            }
+
+            fn name(&self) -> &str {
+                "Stub"
+            }
+
+            async fn login(
+                &self,
+                _callbacks: &dyn OAuthCallbacks,
+            ) -> Result<OAuthCredentials, OAuthError> {
+                unreachable!("the fixture never logs in")
+            }
+
+            async fn refresh_token(
+                &self,
+                _credentials: &OAuthCredentials,
+            ) -> Result<OAuthCredentials, OAuthError> {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(OAuthCredentials::new(
+                    "refreshed-r",
+                    "refreshed-a",
+                    i64::MAX,
+                ))
+            }
+        }
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let provider = StallingProvider {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        };
+        let provider: Arc<dyn OAuthProvider> = Arc::new(provider);
+        let (_dir, path) = scratch_path("refresh-sibling");
+        let storage =
+            AuthStorage::with_providers(path, HashMap::from([("stub".to_string(), provider)]));
+        storage
+            .set_account(
+                "stub",
+                "expired",
+                AuthCredential::OAuth(OAuthCredentials::new("old-r", "old-a", 1)),
+            )
+            .await
+            .unwrap();
+        storage
+            .set_account(
+                "stub",
+                "fresh",
+                AuthCredential::OAuth(OAuthCredentials::new("fresh-r", "fresh-a", i64::MAX)),
+            )
+            .await
+            .unwrap();
+        let accounts = storage.accounts("stub").await.unwrap().expect("a set");
+        let credential = |label: &str| {
+            accounts
+                .accounts
+                .iter()
+                .find(|(candidate, _)| candidate == label)
+                .expect("snapshot contains the account")
+                .1
+                .clone()
+        };
+        let expired = credential("expired");
+        let fresh = credential("fresh");
+
+        let refresh_started = started.notified();
+        let refresh_storage = storage.clone();
+        let refreshing = tokio::spawn(async move {
+            refresh_storage
+                .get_account_api_key_from_snapshot("stub", "expired", &expired)
+                .await
+        });
+        refresh_started.await;
+
+        let sibling = tokio::time::timeout(
+            Duration::from_secs(1),
+            storage.get_account_api_key_from_snapshot("stub", "fresh", &fresh),
+        )
+        .await
+        .expect("a fresh sibling must not wait behind another account's stalled refresh")
+        .unwrap()
+        .expect("the fresh snapshot resolves");
+        assert_eq!(sibling.key, "fresh-a");
+        assert_eq!(
+            sibling.source,
+            CredentialSource::Account("fresh".to_string())
+        );
+
+        release.notify_one();
+        let refreshed = refreshing
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("refresh resolves");
+        assert_eq!(refreshed.key, "refreshed-a");
     }
 
     /// An env-served turn is not the unnamed stored credential either,
