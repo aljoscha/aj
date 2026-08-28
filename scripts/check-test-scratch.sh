@@ -28,7 +28,14 @@ scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
 cargo test --workspace --no-run --quiet
-TMPDIR="$scratch" cargo test --workspace --quiet
+# Gateway integration tests each own a multi-thread Tokio runtime. Letting
+# libtest run several of them together can starve their real loopback requests
+# on a small runner. Run every other target normally, then this module alone.
+# The guard still covers the whole suite, and the ordinary Test job retains the
+# parallel execution coverage.
+TMPDIR="$scratch" cargo test --workspace --exclude aj --quiet
+TMPDIR="$scratch" cargo test -p aj --quiet -- --skip gateway::tests
+TMPDIR="$scratch" cargo test -p aj --quiet gateway::tests -- --test-threads=1
 
 residue=()
 while IFS= read -r -d '' entry; do

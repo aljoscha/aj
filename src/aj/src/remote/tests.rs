@@ -71,7 +71,10 @@ const QUIET: Duration = Duration::from_millis(300);
 pub(crate) async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
     match tokio::time::timeout(DEADLINE, future).await {
         Ok(value) => value,
-        Err(_) => panic!("timed out waiting for {what}"),
+        Err(_) => panic!(
+            "timed out after {DEADLINE:?} of real time waiting for {what}. This load-sensitive \
+             integration phase may reflect scheduler starvation as well as a protocol stall"
+        ),
     }
 }
 
@@ -978,8 +981,9 @@ impl Attached {
         .await;
         assert!(
             caught_up.is_ok(),
-            "timed out waiting for {waiting_for}: the host and this client \
-             never agreed the turn was over",
+            "timed out after {DEADLINE:?} of real time waiting for {waiting_for}: the host and \
+             this client never agreed the turn was over. This load-sensitive integration phase \
+             may reflect scheduler starvation as well as a protocol stall",
         );
 
         let tail = tokio::time::timeout(DEADLINE, async {
@@ -988,7 +992,9 @@ impl Attached {
         .await;
         assert!(
             tail.is_ok(),
-            "timed out waiting for the stream to go quiet after the turn",
+            "timed out after {DEADLINE:?} of real time waiting for the stream to go quiet after \
+             the turn. This load-sensitive integration phase may reflect scheduler starvation \
+             as well as a protocol stall",
         );
     }
 

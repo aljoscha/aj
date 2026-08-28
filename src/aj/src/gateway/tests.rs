@@ -3647,7 +3647,12 @@ async fn a_stream_refuses_the_ids_it_cannot_resolve_and_serves_both_hosts() {
             .client
             .command(id, &prompt("go"))
             .await
-            .expect("the prompt is accepted");
+            .unwrap_or_else(|err| {
+                panic!(
+                    "the post-attach prompt for {id} failed before waiting for its assistant \
+                     answer. Request timeouts here are real-time and load-sensitive: {err}"
+                )
+            });
         let turn = frames_until(&mut events, "the answer", |frame| {
             !assistant_text(std::slice::from_ref(frame)).is_empty()
         })
@@ -4194,7 +4199,13 @@ async fn a_reattach_after_a_reset_resumes_incrementally_when_the_epoch_survived(
 
     drop(events);
     let mut events = fixture.attach(&[attach_at(&id, cursor.clone())]).await;
-    let resumed = frames_until(&mut events, "the resumed attach block", is_caught_up).await;
+    let resumed = frames_until(
+        &mut events,
+        "the resumed attach body to reach caught_up after the healed host reconnected and the \
+         response head opened",
+        is_caught_up,
+    )
+    .await;
 
     assert_eq!(
         epoch_of(&resumed),
