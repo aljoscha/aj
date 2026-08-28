@@ -513,7 +513,7 @@ mod tests {
             ..TaskRead::default()
         };
         let registry = TaskRegistry::default();
-        let (id, _cancel) = registry.register(
+        let (id, _cancel) = registry.register_unowned_for_test(
             AgentId::Main,
             "test-call".to_string(),
             TaskKind::Bash {

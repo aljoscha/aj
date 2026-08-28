@@ -14312,7 +14312,7 @@ mod tests {
     /// about a task it did not see start, and it is what the frontend's task
     /// table is built from.
     async fn register_bash_task(world: &mut World, command: &str) -> aj_agent::tool::TaskId {
-        let (id, _cancel) = world.handles().task_registry.register(
+        let (id, _cancel) = world.handles().task_registry.register_unowned_for_test(
             AgentId::Main,
             "test-call".to_string(),
             aj_agent::tool::TaskKind::Bash {

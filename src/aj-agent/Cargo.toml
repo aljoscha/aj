@@ -3,6 +3,11 @@ name = "aj-agent"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Exposes synthetic task-entry construction to tests in downstream crates.
+# Production task creation always carries a tracked driver registration.
+test-support = []
+
 [dependencies]
 aj-models = { path = "../aj-models" }
 chrono = { workspace = true, features = ["serde"] }

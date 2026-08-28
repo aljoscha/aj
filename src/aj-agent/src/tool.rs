@@ -940,6 +940,11 @@ pub struct StartedTask {
     pub cancel: CancellationToken,
     /// Event sink the driver reports through.
     pub events: TaskEventSink,
+    /// Ownership registration that spawns the detached driver under the
+    /// session task registry. Consuming this, rather than calling
+    /// `tokio::spawn` directly, lets session teardown abort and await the real
+    /// driver after its displayed status has turned terminal.
+    pub driver: crate::TaskDriverRegistration,
 }
 
 /// Opening tag wrapping a harness-injected task-completion notice when
@@ -1275,12 +1280,11 @@ pub trait ToolContext: Send {
     /// driver needs: the task id, a cancel token (child of the
     /// registry root, NOT of the per-turn token), and an event sink.
     ///
-    /// Caller contract: registration is synchronous, and the caller
-    /// must spawn the driver with no await point in between. Tool
-    /// futures are cancelled by drop, and a drop in that window would
-    /// leave a phantom `Running` registry entry with no driver to
-    /// ever flip it. The driver must emit [`TaskEventSink::started`]
-    /// before any other task event.
+    /// Caller contract: consume the returned driver registration before
+    /// reporting that background work started. Dropping it unspawned settles
+    /// the task as killed, while spawning transfers completion ownership to the
+    /// registry. The driver must emit [`TaskEventSink::started`] before any
+    /// other task event.
     ///
     /// The task is recorded as owned by [`ToolContext::agent_id`],
     /// which is also the identity the `task_*` tools authorize

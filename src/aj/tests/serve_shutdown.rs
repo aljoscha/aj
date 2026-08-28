@@ -8,7 +8,8 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
 const START_DEADLINE: Duration = Duration::from_secs(20);
@@ -68,6 +69,62 @@ impl ScratchServer {
         kill(Pid::from_raw(pid), signal).expect("signal the scratch server process");
     }
 
+    /// Start a real request whose JSON body never finishes. Graceful HTTP
+    /// shutdown stops the listener but retains this admitted connection, which
+    /// gives the process test an observable pending teardown phase without a
+    /// production-only delay hook.
+    async fn hold_incomplete_request(&self) -> TcpStream {
+        let url = reqwest::Url::parse(&self.url).expect("scratch URL");
+        let host = url.host_str().expect("scratch URL host");
+        let port = url.port_or_known_default().expect("scratch URL port");
+        let mut stream = TcpStream::connect((host, port))
+            .await
+            .expect("connect an incomplete request");
+        let request = format!(
+            "POST /v1/sessions HTTP/1.1\r\n\
+             Host: {host}:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 1048576\r\n\
+             Expect: 100-continue\r\n\
+             Connection: close\r\n\
+             \r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write the incomplete request");
+        let mut interim = [0_u8; 128];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut interim))
+            .await
+            .expect("the server admitted the request and answered Expect")
+            .expect("read the interim response");
+        assert!(
+            String::from_utf8_lossy(&interim[..read]).starts_with("HTTP/1.1 100 Continue"),
+            "the body extractor admitted the held request before shutdown"
+        );
+        stream
+            .write_all(b"{")
+            .await
+            .expect("start but do not finish the JSON body");
+        stream
+    }
+
+    async fn wait_until_not_accepting(&self) {
+        let url = reqwest::Url::parse(&self.url).expect("scratch URL");
+        let host = url.host_str().expect("scratch URL host");
+        let port = url.port_or_known_default().expect("scratch URL port");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if TcpStream::connect((host, port)).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first signal began teardown and stopped the listener");
+    }
+
     async fn wait(&mut self, deadline: Duration) -> (std::process::ExitStatus, String) {
         let status = tokio::time::timeout(deadline, self.child.wait())
             .await
@@ -91,14 +148,26 @@ impl Drop for ScratchServer {
 }
 
 async fn assert_second_signal_exits(server: &mut ScratchServer) {
-    // Queue two distinct stop signals while the child cannot tear down. This
-    // pins the persistent listeners without making the test depend on a slow
-    // shutdown phase that healthy production code should avoid.
-    server.signal(Signal::SIGSTOP);
+    let mut held_request = server.hold_incomplete_request().await;
     server.signal(Signal::SIGINT);
-    server.signal(Signal::SIGTERM);
+    server.wait_until_not_accepting().await;
+    let mut response = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), held_request.read(&mut response))
+            .await
+            .is_err(),
+        "the admitted request remains pending inside real teardown"
+    );
+    assert!(
+        server
+            .child
+            .try_wait()
+            .expect("inspect scratch child")
+            .is_none(),
+        "the admitted incomplete request keeps real teardown pending after the first signal"
+    );
     let began = Instant::now();
-    server.signal(Signal::SIGCONT);
+    server.signal(Signal::SIGTERM);
     let (status, stderr) = server.wait(ESCALATION_DEADLINE).await;
 
     assert!(

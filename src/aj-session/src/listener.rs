@@ -47,6 +47,80 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::log::{ConversationLog, ConversationView, EntryRef, ThreadFilter};
 use crate::replay::TaggedEvent;
 
+#[derive(Default)]
+struct PersistenceFenceState {
+    closed: bool,
+    active: usize,
+}
+
+/// Session-lifetime fence for persistence listeners.
+///
+/// Event-bus emission snapshots its listeners before awaiting them, so dropping
+/// a subscription cannot revoke a listener already in flight. Closing this
+/// fence rejects every later invocation and [`Self::close`] waits for every
+/// invocation admitted earlier. A session owner uses that barrier before
+/// releasing its advisory lock, which prevents a detached task from appending
+/// through an old listener after a rival writer acquires the session.
+#[derive(Clone, Default)]
+pub struct PersistenceFence {
+    state: Arc<StdMutex<PersistenceFenceState>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl PersistenceFence {
+    fn enter(&self) -> Option<PersistencePermit> {
+        let mut state = self.state.lock().expect("persistence fence mutex poisoned");
+        if state.closed {
+            return None;
+        }
+        state.active += 1;
+        Some(PersistencePermit(self.clone()))
+    }
+
+    /// Reject new listener invocations and wait until every invocation admitted
+    /// before the close has returned.
+    pub async fn close(&self) {
+        loop {
+            let changed = self.changed.notified();
+            {
+                let mut state = self.state.lock().expect("persistence fence mutex poisoned");
+                state.closed = true;
+                if state.active == 0 {
+                    return;
+                }
+            }
+            changed.await;
+        }
+    }
+
+    /// Whether this fence rejects new listener invocations.
+    pub fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("persistence fence mutex poisoned")
+            .closed
+    }
+}
+
+struct PersistencePermit(PersistenceFence);
+
+impl Drop for PersistencePermit {
+    fn drop(&mut self) {
+        let notify = {
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .expect("persistence fence mutex poisoned");
+            state.active -= 1;
+            state.closed && state.active == 0
+        };
+        if notify {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+
 /// Log identity of an entry whose event has not been emitted yet.
 ///
 /// Compaction appends its checkpoint and then emits `CompactionEnd` for
@@ -133,12 +207,40 @@ pub fn persisting_forwarder(
     handoff: AppendHandoff,
     sink: UnboundedSender<TaggedEvent>,
 ) -> Listener {
+    persisting_forwarder_inner(log, handoff, sink, None)
+}
+
+/// Build a persisting forwarder whose in-flight writes can be fenced before a
+/// session releases its advisory lock.
+pub fn fenced_persisting_forwarder(
+    log: Arc<TokioMutex<ConversationLog>>,
+    handoff: AppendHandoff,
+    sink: UnboundedSender<TaggedEvent>,
+    fence: PersistenceFence,
+) -> Listener {
+    persisting_forwarder_inner(log, handoff, sink, Some(fence))
+}
+
+fn persisting_forwarder_inner(
+    log: Arc<TokioMutex<ConversationLog>>,
+    handoff: AppendHandoff,
+    sink: UnboundedSender<TaggedEvent>,
+    fence: Option<PersistenceFence>,
+) -> Listener {
     Arc::new(move |event: &AgentEvent| {
         let log = Arc::clone(&log);
         let handoff = handoff.clone();
         let sink = sink.clone();
+        let fence = fence.clone();
         let event = event.clone();
         Box::pin(async move {
+            let _permit = match fence {
+                Some(fence) => match fence.enter() {
+                    Some(permit) => Some(permit),
+                    None => return Ok(()),
+                },
+                None => None,
+            };
             if appends(&event) {
                 // The send happens under the guard that did the append, so
                 // the sink's order is the log's order. If we released the
@@ -259,7 +361,10 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
 
-    use super::{AppendHandoff, persistence_listener, persisting_forwarder};
+    use super::{
+        AppendHandoff, PersistenceFence, fenced_persisting_forwarder, persistence_listener,
+        persisting_forwarder,
+    };
     use crate::log::{
         ConversationEntry, ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter,
     };
@@ -295,6 +400,70 @@ mod tests {
         AgentMessage::wire(Message::ToolResult(ToolResultMessage::text(
             id, name, body, false,
         )))
+    }
+
+    #[tokio::test]
+    async fn closing_a_persistence_fence_drains_admitted_writers_and_rejects_late_snapshots() {
+        let (_dir, log) = fresh_log();
+        let fence = PersistenceFence::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = fenced_persisting_forwarder(
+            Arc::clone(&log),
+            AppendHandoff::default(),
+            tx,
+            fence.clone(),
+        );
+        let held = log.lock().await;
+        let initial_len = held.len();
+        let admitted_listener = Arc::clone(&listener);
+        let admitted = tokio::spawn(async move {
+            admitted_listener(&AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: user_msg("admitted before close"),
+            })
+            .await
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !admitted.is_finished(),
+            "the admitted listener is parked on the held log"
+        );
+
+        let closing_fence = fence.clone();
+        let closing = tokio::spawn(async move { closing_fence.close().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), async {
+                while !closing.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "close waits for the listener invocation admitted before it"
+        );
+
+        drop(held);
+        admitted
+            .await
+            .expect("admitted listener task")
+            .expect("admitted append");
+        closing.await.expect("fence close task");
+        let after_admitted = log.lock().await.len();
+        assert_eq!(after_admitted, initial_len + 1, "the admitted write landed");
+
+        listener(&AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: user_msg("snapshotted before close, invoked after"),
+        })
+        .await
+        .expect("closed listener is a no-op");
+        assert_eq!(
+            log.lock().await.len(),
+            after_admitted,
+            "a listener invocation beginning after close cannot append"
+        );
     }
 
     fn count_string(value: &serde_json::Value, target: &str) -> usize {

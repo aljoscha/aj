@@ -58,14 +58,14 @@ pub use system_prompt::SYSTEM_PROMPT;
 /// cancel, kill their process groups, and reap before teardown
 /// proceeds. Drivers respond promptly (SIGKILL + reap, or a cancelled
 /// child run), so this only guards against a wedged driver.
-const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Kill the background-task tree and await driver quiescence with a bounded grace.
 pub async fn shutdown_background_tasks(registry: &TaskRegistry) {
     if !shutdown_background_tasks_quietly(registry).await {
         tracing::warn!(
             phase = "background task quiesce",
-            "background tasks still running after the shutdown grace; proceeding"
+            "background tasks still running after the shutdown grace; forced abortable drivers and stopped waiting"
         );
     }
 }
@@ -73,7 +73,26 @@ pub async fn shutdown_background_tasks(registry: &TaskRegistry) {
 /// Kill the background-task tree and report whether every driver quiesced.
 pub(crate) async fn shutdown_background_tasks_quietly(registry: &TaskRegistry) -> bool {
     registry.shutdown();
-    registry.quiesce(TASK_SHUTDOWN_GRACE).await
+    let graceful = registry.quiesce(TASK_SHUTDOWN_GRACE).await;
+    if !graceful {
+        registry.abort_drivers();
+    }
+    graceful
+}
+
+/// Cancel background work and retain ownership until every detached driver has
+/// returned.
+///
+/// Session supervisors use this before releasing an advisory lock. Unlike the
+/// frontend helper above, it has no second deadline after the forced cutoff:
+/// an uncooperative process keeps the supervisor and lock alive rather than
+/// becoming work owned by nobody.
+pub(crate) async fn shutdown_background_tasks_owned(registry: &TaskRegistry) -> bool {
+    let graceful = shutdown_background_tasks_quietly(registry).await;
+    if !graceful {
+        registry.wait_for_quiescence().await;
+    }
+    graceful
 }
 
 /// `aj list-sessions`: list existing conversation sessions

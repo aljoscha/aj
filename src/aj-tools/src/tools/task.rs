@@ -691,7 +691,7 @@ mod tests {
         let output: Arc<dyn aj_agent::tool::TaskOutputSource> = Arc::new(StubAgentOutput {
             report: std::sync::Mutex::new(None),
         });
-        registry.register(
+        registry.register_unowned_for_test(
             owner,
             "test-call".to_string(),
             TaskKind::Agent {
@@ -875,7 +875,7 @@ mod tests {
         });
         let output_dyn: Arc<dyn aj_agent::tool::TaskOutputSource> =
             Arc::<StubAgentOutput>::clone(&output);
-        let (id, _cancel) = registry.register(
+        let (id, _cancel) = registry.register_unowned_for_test(
             AgentId::Main,
             "test-call".to_string(),
             TaskKind::Agent {
@@ -1040,7 +1040,7 @@ mod production_identity_tests {
         let registry = TaskRegistry::default();
         // Main's task takes id #1; the child's backgrounded command
         // takes #2, so the scripted calls can name both up front.
-        let (main_task, _cancel) = registry.register(
+        let (main_task, _cancel) = registry.register_unowned_for_test(
             AgentId::Main,
             "test-call".to_string(),
             TaskKind::Bash {

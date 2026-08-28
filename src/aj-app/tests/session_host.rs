@@ -29,7 +29,7 @@ use aj_conf::{Config, ConfigLayer, ConfigThinkingDisplay};
 use aj_models::auth::AuthStorage;
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::types::{AssistantContent, AssistantMessage, StopReason, ToolCall, UserContent};
-use aj_session::{ConversationPersistence, SessionLock, ThreadFilter};
+use aj_session::{ConversationLog, ConversationPersistence, SessionLock, ThreadFilter};
 use aj_wire::{Frame, ModelSelection, SessionSettings, SessionSummary};
 use tempfile::TempDir;
 use tracing_subscriber::fmt::MakeWriter;
@@ -3394,7 +3394,7 @@ async fn live_work_and_queued_messages_hold_a_session_live() {
     harness.prompt(&session, "hi").await;
     client.pump_until_idle().await;
     let handles = harness.host.local_handles(&session).await.expect("handles");
-    let (task, _cancel) = handles.task_registry.register(
+    let (task, _cancel) = handles.task_registry.register_unowned_for_test(
         AgentId::Main,
         "call-1".into(),
         TaskKind::Bash {
@@ -3576,7 +3576,7 @@ async fn an_undelivered_task_notice_holds_a_session_live() {
     harness.prompt(&session, "punctuate").await;
     client.pump_until_idle().await;
     let handles = harness.host.local_handles(&session).await.expect("handles");
-    let (task, _cancel) = handles.task_registry.register(
+    let (task, _cancel) = handles.task_registry.register_unowned_for_test(
         AgentId::Main,
         "call-1".into(),
         TaskKind::Bash {
@@ -5487,7 +5487,7 @@ async fn a_cancel_of_a_driven_sub_takes_the_turn_not_its_task() {
         .local_handles(&session)
         .await
         .expect("live session");
-    let (task, task_cancel) = handles.task_registry.register(
+    let (task, task_cancel) = handles.task_registry.register_unowned_for_test(
         AgentId::Main,
         "call-bg".into(),
         TaskKind::Agent {
@@ -5571,6 +5571,10 @@ async fn a_cancel_of_a_driven_sub_takes_the_turn_not_its_task() {
         Some(TaskStatus::Running),
         "and the sub's background task was left alone, being nobody's cancel target",
     );
+    // This fixture stages registry state without a detached driver. Settle that
+    // synthetic entry before host teardown, which cannot reap work that does
+    // not exist.
+    handles.task_registry.set_status(task, TaskStatus::Killed);
     harness.host.shutdown().await;
 }
 
@@ -5597,7 +5601,7 @@ async fn a_terminal_agent_task_closes_the_completion_race() {
         .local_handles(&session)
         .await
         .expect("live session");
-    let (task, task_cancel) = handles.task_registry.register(
+    let (task, task_cancel) = handles.task_registry.register_unowned_for_test(
         AgentId::Main,
         "call-bg".into(),
         TaskKind::Agent {
@@ -8858,7 +8862,7 @@ async fn a_task_detail_read_omits_host_paths_and_cold_tasks_are_unknown() {
     client.pump_until_idle().await;
     drop(client);
     let handles = harness.host.local_handles(&session).await.expect("handles");
-    let (task, _cancel) = handles.task_registry.register(
+    let (task, _cancel) = handles.task_registry.register_unowned_for_test(
         AgentId::Main,
         "call-1".into(),
         TaskKind::Agent {
@@ -9726,6 +9730,522 @@ async fn shutdown_suppresses_a_task_wake_queued_behind_an_in_flight_command() {
     );
 }
 
+/// A host cutoff can abort the session driver before it reaches `wind_down`.
+/// The session owner still cancels and reaps a real detached process before its
+/// advisory lock becomes available to a rival writer.
+#[tokio::test(start_paused = true)]
+async fn forced_driver_abort_reaps_detached_bash_before_releasing_the_session_lock() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "starting it",
+                "call-bash",
+                "bash",
+                serde_json::json!({
+                    "command": "sleep 30",
+                    "run_in_background": true,
+                    "description": "sleep"
+                }),
+            ),
+            finalized_text_message("the task is running"),
+        ],
+        0,
+        Duration::ZERO,
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "start background work").await;
+    client.pump_until_idle().await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let task = handles
+        .task_registry
+        .snapshot()
+        .into_iter()
+        .find(|task| {
+            matches!(task.kind, TaskKind::Bash { .. }) && task.status == TaskStatus::Running
+        })
+        .expect("the fixture has a live detached bash driver")
+        .id;
+    let held = handles.log.lock().await;
+    let command_host = harness.host.clone();
+    let command_session = session.clone();
+    let command = tokio::spawn(async move {
+        command_host
+            .command(
+                &command_session,
+                Command::Settings(SettingsChange {
+                    agent: AgentId::Main,
+                    persist: PersistAction::None,
+                    axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+                }),
+            )
+            .await
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !command.is_finished(),
+        "the held log wedges a command ahead of the shutdown request"
+    );
+
+    let began = tokio::time::Instant::now();
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    // The detached process is real while the host deadline uses Tokio time.
+    // Advance in bounded steps so the OS child-exit and pipe-readiness events
+    // are polled between logical deadlines instead of jumping straight to 30s.
+    for _ in 0..30 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        if shutdown.is_finished() {
+            break;
+        }
+    }
+    shutdown.await.expect("shutdown task");
+
+    assert!(
+        began.elapsed() >= Duration::from_secs(20) && began.elapsed() <= Duration::from_secs(31),
+        "the driver reached the forced host cutoff, then reaped its task inside the total budget: {:?}",
+        began.elapsed()
+    );
+    assert!(
+        command.await.expect("command task").is_err(),
+        "the forced driver refuses its blocked command"
+    );
+    assert_eq!(
+        handles.task_registry.status(task),
+        Some(TaskStatus::Killed),
+        "the detached process driver reached terminal state before shutdown returned"
+    );
+    assert!(
+        handles.task_registry.quiesce(Duration::ZERO).await,
+        "terminal status includes real detached-driver completion"
+    );
+    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("the rival lock follows detached-process reap");
+    drop(rival);
+    drop(held);
+}
+
+/// Detached work observes the host stop directly through the map-independent
+/// session controls. It does not wait for `Request::Shutdown` behind a blocked
+/// command, while the session owner still retains the advisory lock.
+#[tokio::test]
+async fn shutdown_cancels_detached_tasks_before_a_blocked_driver_reaches_its_request() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let registry = handles.task_registry.clone();
+    let (task, cancel, driver) = registry.register_driver(
+        AgentId::Main,
+        "test-call".to_string(),
+        TaskKind::Agent {
+            agent_id: 1,
+            task: "wait for session stop".to_string(),
+        },
+        "agent 1".to_string(),
+        Arc::new(FixedTaskOutput),
+    );
+    let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+    driver.spawn(async move {
+        cancel.cancelled().await;
+        let _ = cancelled_tx.send(());
+    });
+    let held = handles.log.lock().await;
+    let command_host = harness.host.clone();
+    let command_session = session.clone();
+    let command = tokio::spawn(async move {
+        command_host
+            .command(
+                &command_session,
+                Command::Settings(SettingsChange {
+                    agent: AgentId::Main,
+                    persist: PersistAction::None,
+                    axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+                }),
+            )
+            .await
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !command.is_finished(),
+        "the command is blocked on the held log"
+    );
+
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    bounded("the detached task to observe host shutdown", cancelled_rx)
+        .await
+        .expect("cancellation observation");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !shutdown.is_finished() && !command.is_finished(),
+        "task cancellation did not wait for the blocked session driver"
+    );
+    assert_eq!(registry.status(task), Some(TaskStatus::Killed));
+    assert!(registry.quiesce(Duration::ZERO).await);
+    assert!(
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "early detached-task completion does not release the session owner"
+    );
+
+    drop(held);
+    command
+        .await
+        .expect("command task")
+        .expect("in-flight command completes");
+    shutdown.await.expect("shutdown task");
+}
+
+/// Foreground turns are not displayed background-task entries, but they can
+/// write the log and own tool cleanup. The session completion barrier includes
+/// them for the whole spawned future lifetime.
+#[tokio::test]
+async fn a_driven_foreground_turn_is_part_of_session_cleanup_ownership() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message(
+            "an answer long enough to remain in flight while ownership is inspected",
+        )],
+        1,
+        Duration::from_millis(20),
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    harness.prompt(&session, "answer this").await;
+    frames_until(&mut stream, "the foreground provider to stream", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(
+                    event.known(),
+                    Some(AgentEvent::MessageUpdate { agent_id: AgentId::Main, .. })
+                )
+        )
+    })
+    .await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    assert!(
+        !handles.task_registry.quiesce(Duration::ZERO).await,
+        "a foreground turn retains the session completion barrier"
+    );
+
+    harness.host.shutdown().await;
+    assert!(
+        handles.task_registry.quiesce(Duration::ZERO).await,
+        "turn cancellation completion releases the session barrier"
+    );
+}
+
+/// A forced inner-driver abort drops its foreground turn set. The turn and a
+/// foreground Bash process's asynchronous drop cleanup remain part of the
+/// session owner, so neither can outlive the advisory lock.
+#[tokio::test(start_paused = true)]
+async fn forced_driver_abort_reaps_foreground_bash_before_releasing_the_lock() {
+    let harness = Harness::with_provider(scripted(
+        vec![calling(
+            "running until host cutoff",
+            "call-bash",
+            "bash",
+            serde_json::json!({
+                "command": "trap '' TERM; while :; do sleep 1; done",
+                "description": "ignore TERM until forced cleanup"
+            }),
+        )],
+        0,
+        Duration::ZERO,
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    harness.prompt(&session, "run the command").await;
+    frames_until(
+        &mut stream,
+        "foreground Bash to report output state",
+        |frame| {
+            matches!(
+                frame,
+                Frame::Event { event, .. }
+                    if matches!(
+                        event.known(),
+                        Some(AgentEvent::ToolExecutionUpdate {
+                            agent_id: AgentId::Main,
+                            tool,
+                            ..
+                        }) if tool == "bash"
+                    )
+            )
+        },
+    )
+    .await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let held = handles.log.lock().await;
+    let command_host = harness.host.clone();
+    let command_session = session.clone();
+    let command = tokio::spawn(async move {
+        command_host
+            .command(
+                &command_session,
+                Command::Settings(SettingsChange {
+                    agent: AgentId::Main,
+                    persist: PersistAction::None,
+                    axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+                }),
+            )
+            .await
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !command.is_finished(),
+        "the driver is blocked ahead of shutdown"
+    );
+
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    bounded("shutdown to claim the host", async {
+        loop {
+            if harness.host.sessions().await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(21)).await;
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !shutdown.is_finished() && !handles.task_registry.quiesce(Duration::ZERO).await,
+        "foreground turn and process cleanup remain owned after driver cutoff"
+    );
+    assert!(
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "foreground process cleanup retains the advisory lock"
+    );
+
+    tokio::time::advance(Duration::from_secs(3)).await;
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+    }
+    shutdown.await.expect("shutdown task");
+    assert!(handles.task_registry.quiesce(Duration::ZERO).await);
+    assert!(command.await.expect("command task").is_err());
+    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("foreground process reap releases the session owner");
+    drop(rival);
+    drop(held);
+}
+
+/// The outer session owner, not the inner driver, owns the advisory lock. A
+/// process-kind task that has passed the driver's bounded grace but is still
+/// reaping keeps that lock until its tracked future actually returns.
+#[tokio::test(start_paused = true)]
+async fn session_owner_retains_the_lock_while_a_non_abortable_task_reaps() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let registry = handles.task_registry.clone();
+    let (task, cancel, driver) = registry.register_driver(
+        AgentId::Main,
+        "test-call".to_string(),
+        TaskKind::Bash {
+            command: "a deliberately slow reap".to_string(),
+        },
+        "slow reap".to_string(),
+        Arc::new(FixedTaskOutput),
+    );
+    let driver_registry = registry.clone();
+    driver.spawn(async move {
+        cancel.cancelled().await;
+        // Longer than the driver's five-second background-task grace. Bash
+        // drivers are not force-aborted because dropping one would detach its
+        // process reap, so the outer owner must retain the session instead.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        driver_registry.set_status(task, TaskStatus::Killed);
+    });
+
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    bounded("shutdown to claim the host", async {
+        loop {
+            if harness.host.sessions().await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !shutdown.is_finished() && registry.status(task) == Some(TaskStatus::Running),
+        "the fixture reached owner-level reap after the inner driver's grace"
+    );
+    assert!(
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "the advisory lock cannot precede tracked task-driver completion"
+    );
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    shutdown.await.expect("shutdown task");
+    assert_eq!(registry.status(task), Some(TaskStatus::Killed));
+    assert!(registry.quiesce(Duration::ZERO).await);
+    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("tracked task completion releases the session owner");
+    drop(rival);
+}
+
+/// A detached agent can already be inside a snapshotted persistence listener
+/// when graceful task quiescence expires. Forced task teardown drains that
+/// invocation before the old session lock is released.
+#[tokio::test(start_paused = true)]
+async fn timed_out_background_agent_cannot_append_after_a_rival_takes_the_lock() {
+    let (capture, start) = trace_capture();
+    let harness =
+        Harness::with_provider(scripted(detached_sub_turn(), 1, Duration::from_millis(20)));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    harness
+        .prompt(&session, "look into it in the background")
+        .await;
+    frames_until(&mut stream, "the detached provider to stream", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(
+                    event.known(),
+                    Some(AgentEvent::MessageUpdate { agent_id: AgentId::Sub(1), .. })
+                )
+        )
+    })
+    .await;
+    let task = running_agent_task(&harness, &session)
+        .await
+        .expect("the streaming detached agent has a running task entry");
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let held = handles.log.lock().await;
+    let old_len = held.len();
+    // The entire scripted response costs less than this. Remaining Running
+    // afterward means its terminal durable event reached the listener and is
+    // parked on the held log rather than still streaming from the provider.
+    tokio::time::advance(Duration::from_secs(10)).await;
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        handles.task_registry.status(task),
+        Some(TaskStatus::Running),
+        "the old detached writer is admitted and blocked on persistence"
+    );
+
+    harness.host.shutdown().await;
+
+    assert_eq!(
+        handles.task_registry.status(task),
+        Some(TaskStatus::Killed),
+        "the timed-out detached writer was forced down"
+    );
+    assert!(
+        handles.task_registry.quiesce(Duration::ZERO).await,
+        "shutdown awaited the detached driver, not only its display status"
+    );
+    assert!(
+        handles.persistence_fence.is_closed(),
+        "the session owner fenced every snapshotted persistence invocation before releasing its lock"
+    );
+    let traces = traces_since(&capture, start);
+    assert!(
+        traces.lines().any(|line| line.contains(&session)
+            && line.contains("background task quiesce")
+            && line.contains("session owner retains reap responsibility")),
+        "the fixture exercised the timed-out task path: {traces}"
+    );
+    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("the rival lock follows the old writer fence");
+    drop(rival);
+    drop(held);
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let resumed = ConversationLog::resume(&harness.persistence, &session).expect("resume log");
+    assert_eq!(
+        resumed.len(),
+        old_len,
+        "no snapshotted old listener appended after the rival acquired the lock"
+    );
+}
+
 /// A later shutdown caller cannot interfere with the owner already winding
 /// drivers down or close attachment streams before that work completes.
 #[tokio::test]
@@ -9767,6 +10287,10 @@ async fn concurrent_shutdown_does_not_close_the_owners_fanout_early() {
     let second_host = harness.host.clone();
     let second = tokio::spawn(async move { second_host.shutdown().await });
     tokio::task::yield_now().await;
+    assert!(
+        !second.is_finished(),
+        "the later caller waits for the first teardown to complete"
+    );
     while stream.try_recv().is_some() {}
     assert!(
         tokio::time::timeout(Duration::from_millis(20), stream.recv())
@@ -9788,11 +10312,11 @@ async fn concurrent_shutdown_does_not_close_the_owners_fanout_early() {
     {}
 }
 
-/// Cancelling the shutdown future cannot detach drivers it already took out of
-/// the map. Its drop guards abort them and close streams, so no later caller or
-/// host drop can wait forever on state the cancelled future alone owned.
+/// Cancelling a shutdown caller cannot cancel the host-owned teardown task.
+/// A later caller waits for that same task rather than reporting completion
+/// while its drivers and advisory locks are still live.
 #[tokio::test]
-async fn cancelling_the_shutdown_owner_aborts_its_drivers_and_closes_fanout() {
+async fn cancelling_a_shutdown_caller_leaves_the_owned_reaper_and_waiters_intact() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
     let mut stream = harness
@@ -9851,23 +10375,40 @@ async fn cancelling_the_shutdown_owner_aborts_its_drivers_and_closes_fanout() {
             .await
             .expect_err("the owner task was cancelled")
             .is_cancelled(),
-        "the fixture cancelled shutdown while it owned the driver joins"
+        "the fixture cancelled the first caller while owned teardown continued"
     );
-    tokio::time::timeout(Duration::from_millis(100), harness.host.shutdown())
+    let waiter_host = harness.host.clone();
+    let waiter = tokio::spawn(async move { waiter_host.shutdown().await });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !waiter.is_finished(),
+        "a later shutdown caller waits for the owned teardown"
+    );
+    assert!(
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "the owned reaper retains the advisory lock while teardown is blocked"
+    );
+
+    drop(held);
+    bounded("the waiting shutdown caller", waiter)
         .await
-        .expect("a later shutdown call does not wedge");
-    while bounded("the cancelled owner's fanout to close", stream.recv())
+        .expect("waiter task");
+    while bounded("the owned reaper's fanout to close", stream.recv())
         .await
         .is_some()
     {}
     assert!(
-        bounded("the cancelled owner to refuse its stuck command", command)
+        bounded("the in-flight command to finish", command)
             .await
             .expect("command task")
-            .is_err(),
-        "aborting the orphaned driver refuses the command it could not finish"
+            .is_ok(),
+        "caller cancellation left the owned driver alive to finish work already in flight"
     );
-    bounded("the cancelled driver to release its advisory lock", async {
+    bounded("the owned reaper to release its advisory lock", async {
         loop {
             if let Some(lock) =
                 SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
@@ -9880,7 +10421,6 @@ async fn cancelling_the_shutdown_owner_aborts_its_drivers_and_closes_fanout() {
         }
     })
     .await;
-    drop(held);
 }
 
 /// Terminal fanout closure reaches the composed attachment even while its
@@ -10138,8 +10678,8 @@ async fn shutdown_aborts_and_names_every_driver_stuck_in_a_command() {
         .expect("the host-wide shutdown deadline");
 
     assert!(
-        began.elapsed() >= Duration::from_secs(29) && began.elapsed() < Duration::from_secs(30),
-        "the graceful cutoff reserves one second inside the total deadline: {:?}",
+        began.elapsed() >= Duration::from_secs(20) && began.elapsed() < Duration::from_secs(21),
+        "the graceful cutoff reserves detached-task cleanup inside the total deadline: {:?}",
         began.elapsed()
     );
     for session in &sessions {
@@ -10252,7 +10792,7 @@ async fn shutdown_bounds_a_session_map_held_by_idle_release() {
         .expect("the map acquisition is inside the host-wide deadline");
 
     assert!(
-        began.elapsed() >= Duration::from_secs(29) && began.elapsed() < Duration::from_secs(30),
+        began.elapsed() >= Duration::from_secs(20) && began.elapsed() < Duration::from_secs(21),
         "the abort reserve recovers the held session map inside the total deadline: {:?}",
         began.elapsed()
     );

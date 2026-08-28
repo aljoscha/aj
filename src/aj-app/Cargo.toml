@@ -59,7 +59,7 @@ anthropic-sdk = { path = "../anthropic-sdk" }
 # builders and a headless agent builder) to downstream crates' tests.
 # Kept behind a feature rather than `#[cfg(test)]` because a crate's
 # `cfg(test)` items are invisible to other crates.
-test-support = []
+test-support = ["aj-agent/test-support"]
 
 [lints]
 workspace = true

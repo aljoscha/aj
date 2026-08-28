@@ -25,8 +25,8 @@ use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, StreamOptions};
 use aj_session::{
-    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, TaggedEvent,
-    persistence_listener, persisting_forwarder,
+    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, PersistenceFence,
+    TaggedEvent, fenced_persisting_forwarder, persistence_listener,
 };
 use anyhow::Result;
 use tokio::sync::Mutex as TokioMutex;
@@ -292,6 +292,9 @@ pub struct SessionCore {
     /// and replaced wholesale by
     /// [`SessionCore::install_persisting_forwarder`].
     persistence_handle: SubscriptionHandle,
+    /// Rejects and drains snapshotted persistence-listener calls before a host
+    /// releases this session's advisory lock.
+    pub(crate) persistence_fence: PersistenceFence,
 }
 
 impl SessionCore {
@@ -436,6 +439,7 @@ impl SessionCore {
             session_id,
             restore_notices,
             persistence_handle,
+            persistence_fence: PersistenceFence::default(),
         };
         Ok((core, seed))
     }
@@ -475,10 +479,11 @@ impl SessionCore {
         handoff: &AppendHandoff,
     ) -> UnboundedReceiver<TaggedEvent> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.persistence_handle = self.bus.subscribe(persisting_forwarder(
+        self.persistence_handle = self.bus.subscribe(fenced_persisting_forwarder(
             Arc::clone(&self.log),
             handoff.clone(),
             tx,
+            self.persistence_fence.clone(),
         ));
         rx
     }

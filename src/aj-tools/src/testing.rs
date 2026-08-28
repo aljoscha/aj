@@ -117,7 +117,7 @@ impl ToolContext for DummyToolContext {
         label: String,
         output: Arc<dyn TaskOutputSource>,
     ) -> StartedTask {
-        let (id, cancel) = self.task_registry.register(
+        let (id, cancel, driver) = self.task_registry.register_driver(
             self.agent_id,
             "dummy-call".to_string(),
             kind,
@@ -132,6 +132,11 @@ impl ToolContext for DummyToolContext {
             "dummy-call".to_string(),
             label,
         );
-        StartedTask { id, cancel, events }
+        StartedTask {
+            id,
+            cancel,
+            events,
+            driver,
+        }
     }
 }

@@ -343,9 +343,11 @@ impl Turns {
         let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
         let log = Arc::clone(&core.log);
         let handoff = self.handoff.clone();
+        let cleanup = core.task_registry.track_cleanup();
         let turn_cancel = CancellationToken::new();
         self.cancels.insert(target, turn_cancel.clone());
         let handle = self.set.spawn(async move {
+            let _cleanup = cleanup;
             let mut a = handle.lock().await;
             let result = drive_turn(
                 &mut a,
@@ -1232,7 +1234,7 @@ mod turns_tests {
     /// Register a background agent-backed task for `Sub(n)`, returning
     /// the task id so a test can drive its status.
     fn register_agent_task(registry: &TaskRegistry, n: usize) -> usize {
-        let (id, _cancel) = registry.register(
+        let (id, _cancel) = registry.register_unowned_for_test(
             AgentId::Main,
             "test-call".to_string(),
             TaskKind::Agent {

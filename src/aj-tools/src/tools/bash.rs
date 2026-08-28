@@ -76,6 +76,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use aj_agent::TaskCleanupGuard;
 use aj_agent::tool::{
     BashStreamTruncation, ExecutionMode, StartedTask, TaskEventSink, TaskId, TaskKind, TaskNotice,
     TaskOutputSource, TaskRead, TaskStatus, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
@@ -379,6 +380,7 @@ impl ToolDefinition for BashTool {
             cmd.process_group(0);
         }
 
+        let cleanup = ctx.task_registry().track_cleanup();
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -392,7 +394,7 @@ impl ToolDefinition for BashTool {
         // Armed on the line after the spawn, before anything that can
         // fail: every `?` below this point would otherwise return with
         // the command running and nothing left to reach it.
-        let mut guard = ProcessGuard::arm(child)?;
+        let mut guard = ProcessGuard::arm(child, cleanup)?;
         let child_pid = guard.pgid();
         let stdout = guard
             .child_mut()
@@ -462,23 +464,25 @@ impl ToolDefinition for BashTool {
             let kind = TaskKind::Bash {
                 command: command.clone(),
             };
-            let StartedTask { id, cancel, events } =
-                ctx.start_background_task(kind, command.clone(), output);
-            // NOTE: no await point between the registry registration
-            // above and the driver spawn below. Tool futures are
-            // cancelled by drop, and a drop in that window would leave
-            // a phantom `Running` entry with no driver to ever flip it
-            // (and an orphaned child process nobody watches). The
-            // driver owns all task lifecycle emissions: `TaskStart`
-            // first, then `TaskOutput` / `TaskEnd`. That first emit
-            // races this future's own return, so `TaskStart` may land
-            // before or after the launch's `ToolExecutionEnd`.
+            let StartedTask {
+                id,
+                cancel,
+                events,
+                driver,
+            } = ctx.start_background_task(kind, command.clone(), output);
+            // Registration and driver spawn stay one synchronous ownership
+            // handoff. A drop before the spawn settles the registration and
+            // leaves the process guard armed in this future. Once spawned, the
+            // driver owns all task lifecycle emissions: `TaskStart` first, then
+            // `TaskOutput` / `TaskEnd`. That first emit races this future's own
+            // return, so `TaskStart` may land before or after the launch's
+            // `ToolExecutionEnd`.
             //
-            // Disarming here is what lets a background task outlive the
-            // turn that started it: its lifetime now belongs to the
-            // driver and the task registry.
-            tokio::spawn(drive_background_bash(BackgroundBash {
-                child: guard.disarm(),
+            // The armed process guard moves with the background future. It no
+            // longer belongs to this turn, but remains armed so a forced task-
+            // driver abort still terminates the process group and readers.
+            driver.spawn(drive_background_bash(BackgroundBash {
+                process: guard,
                 child_pid,
                 stdout_reader,
                 stderr_reader,
@@ -1053,7 +1057,7 @@ fn tail_snapshot(state: &Arc<Mutex<StreamState>>) -> (String, u64) {
 
 /// Everything a detached background-bash driver owns.
 struct BackgroundBash {
-    child: tokio::process::Child,
+    process: ProcessGuard,
     child_pid: i32,
     stdout_reader: tokio::task::JoinHandle<()>,
     stderr_reader: tokio::task::JoinHandle<()>,
@@ -1073,7 +1077,7 @@ struct BackgroundBash {
 /// flip + completion notice.
 async fn drive_background_bash(task: BackgroundBash) {
     let BackgroundBash {
-        mut child,
+        mut process,
         child_pid,
         stdout_reader,
         stderr_reader,
@@ -1134,10 +1138,10 @@ async fn drive_background_bash(task: BackgroundBash) {
             // deliberately not wired in — outliving the turn is the
             // point.
             _ = cancel.cancelled() => {
-                terminate_process_group(&mut child, child_pid).await;
+                terminate_process_group(process.child_mut(), child_pid).await;
                 break TaskStatus::Killed;
             }
-            res = child.wait() => {
+            res = process.child_mut().wait() => {
                 break TaskStatus::Exited(res.ok().and_then(|s| s.code()));
             }
             _ = tokio::time::sleep(UPDATE_DEBOUNCE) => {}
@@ -1198,6 +1202,9 @@ async fn drive_background_bash(task: BackgroundBash) {
         body,
     };
     events.finished(status, notice).await;
+    // Every cancellation or panic above keeps the guard armed. Only a fully
+    // reported driver relinquishes the already-reaped child.
+    drop(process.disarm());
 }
 
 /// Human-readable terminal-status phrase shared by completion notices
@@ -1521,11 +1528,10 @@ fn decode_stream_output(bytes: Vec<u8>) -> String {
 ///
 /// Armed at the spawn, before the first fallible step, because a
 /// command that outlives an early `?` leaks exactly as a cancelled one
-/// does. Disarm when the command's lifetime belongs to someone else:
-/// the normal return, where the command has already ended, and the
-/// background handoff, where the driver takes over. Every other way out
-/// (a `?`, a panic unwinding through the turn, the driver's drop)
-/// leaves it armed and tears the group down.
+/// does. A normal foreground return disarms after the command has ended. A
+/// background handoff moves the armed guard into its tracked driver, which
+/// disarms only after final reporting. Every abnormal way out (a `?`, a panic,
+/// or either future being dropped) leaves it armed and tears the group down.
 ///
 /// Only the `SIGTERM` is guaranteed. The escalation to `SIGKILL` and
 /// the reap run on the runtime, so a host exiting under an in-flight
@@ -1540,6 +1546,9 @@ struct ProcessGuard {
 struct ArmedProcess {
     child: Child,
     pgid: i32,
+    /// Retains the session's advisory-lock lifetime through asynchronous
+    /// teardown when the owning tool or task future is dropped.
+    _cleanup: TaskCleanupGuard,
     /// Empty between the spawn and [`ProcessGuard::watch_readers`]: the
     /// reader tasks do not exist for the first few lines of a call.
     readers: Vec<tokio::task::AbortHandle>,
@@ -1551,7 +1560,7 @@ impl ProcessGuard {
     /// Fails only if the pid is unavailable, which cannot happen
     /// between a spawn and the reap, and which would leave nothing to
     /// signal anyway.
-    fn arm(child: Child) -> Result<Self, aj_agent::BoxError> {
+    fn arm(child: Child, cleanup: TaskCleanupGuard) -> Result<Self, aj_agent::BoxError> {
         // The pid is the group id, because the child was spawned with
         // `process_group(0)`.
         let pgid: i32 = child
@@ -1563,6 +1572,7 @@ impl ProcessGuard {
             armed: Some(ArmedProcess {
                 child,
                 pgid,
+                _cleanup: cleanup,
                 readers: Vec::new(),
             }),
         })
@@ -1665,6 +1675,7 @@ async fn tear_down_process(armed: ArmedProcess) {
     let ArmedProcess {
         mut child,
         pgid,
+        _cleanup,
         readers,
     } = armed;
     // `Drop` sent the `SIGTERM` before spawning this. The sleep is the
@@ -1684,6 +1695,7 @@ async fn tear_down_process(armed: ArmedProcess) {
     for reader in &readers {
         reader.abort();
     }
+    drop(_cleanup);
 }
 
 /// Send one signal to a command's process group.
@@ -1752,6 +1764,7 @@ async fn terminate_process_group(child: &mut Child, _pgid: i32) {
 mod tests {
     use super::*;
     use crate::testing::DummyToolContext;
+    use aj_agent::TaskRegistry;
     use aj_models::types::UserContent;
     use std::path::Path;
     use std::pin::Pin;
@@ -1761,6 +1774,11 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio_util::sync::CancellationToken;
+
+    fn arm_for_test(child: Child) -> ProcessGuard {
+        let registry = TaskRegistry::default();
+        ProcessGuard::arm(child, registry.track_cleanup()).expect("arm")
+    }
 
     struct FailingReader;
 
@@ -3001,7 +3019,9 @@ mod tests {
         // own, so finishing at all means the teardown aborted them.
         let stdout_reader = tokio::spawn(std::future::pending::<()>());
         let stderr_reader = tokio::spawn(std::future::pending::<()>());
-        let mut guard = ProcessGuard::arm(child).expect("arm");
+        let registry = TaskRegistry::default();
+        let mut guard =
+            ProcessGuard::arm(child, registry.track_cleanup()).expect("arm process guard");
         guard.watch_readers([stdout_reader.abort_handle(), stderr_reader.abort_handle()]);
 
         assert!(
@@ -3009,6 +3029,10 @@ mod tests {
             "the readers have to be running before the drop"
         );
         drop(guard);
+        assert!(
+            !registry.quiesce(Duration::ZERO).await,
+            "the dropped guard transfers its session lease into asynchronous process cleanup"
+        );
 
         wait_until(
             || stdout_reader.is_finished() && stderr_reader.is_finished(),
@@ -3020,6 +3044,10 @@ mod tests {
             "the dropped command to be killed",
         )
         .await;
+        assert!(
+            registry.quiesce(Duration::ZERO).await,
+            "the session lease ends only after process and reader cleanup"
+        );
     }
 
     /// The tool hands its reader abort handles to the guard, so a
@@ -3254,7 +3282,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let descendant = read_pid(&pid_path);
-            let mut guard = ProcessGuard::arm(child).expect("arm");
+            let mut guard = arm_for_test(child);
             guard.watch_readers(readers);
             (guard, pgid, descendant)
         });
@@ -3380,7 +3408,7 @@ mod tests {
                     .stderr(Stdio::null())
                     .process_group(0);
                 let child = cmd.spawn().expect("spawn");
-                let _guard = ProcessGuard::arm(child).expect("arm");
+                let _guard = arm_for_test(child);
                 let _probe = DropContextProbe(probe);
                 std::future::pending::<()>().await;
             });

@@ -2237,6 +2237,29 @@ struct TaskRegistryInner {
     /// Last minted task id; ids start at 1 and are monotonic per
     /// session.
     last_id: TaskId,
+    /// Detached drivers that have not returned yet. Status is a user-facing
+    /// lifecycle fact, while this map is the ownership fence: a task is not
+    /// quiescent until its driver has finished every terminal event and
+    /// dropped everything it could still write through.
+    drivers: HashMap<TaskId, TaskDriver>,
+    /// Session work that is not itself a displayed background task: driven
+    /// foreground turns and process cleanup transferred out of a dropped tool
+    /// future. The session lock cannot be released while any lease remains.
+    cleanups: usize,
+    /// Terminal cutoff for this session's detached drivers. Registrations can
+    /// race shutdown while a turn is still being cancelled, so the cutoff is
+    /// sticky and applies to drivers attached afterwards too.
+    drivers_aborted: bool,
+}
+
+struct TaskDriver {
+    abort: Option<tokio::task::AbortHandle>,
+    abort_requested: bool,
+    /// Agent drivers can be aborted after the graceful cutoff because every
+    /// nested process resource transfers its teardown into a tracked cleanup
+    /// lease when its tool future drops. A top-level bash driver remains polled
+    /// through its normal cancellation and reap path.
+    force_abort: bool,
 }
 
 /// Shared registry of background tasks, sibling of
@@ -2259,11 +2282,97 @@ pub struct TaskRegistry {
     status_changed: Arc<tokio::sync::Notify>,
 }
 
+/// Registration half of one detached task driver.
+///
+/// The task entry exists before its driver is spawned, so shutdown cannot miss
+/// work in the handoff window. [`Self::spawn`] attaches the Tokio task to the
+/// registry and a completion guard removes it only after the driver's future
+/// has fully returned. Dropping an unspawned registration settles the phantom
+/// entry as killed.
+pub struct TaskDriverRegistration {
+    registry: TaskRegistry,
+    task_id: TaskId,
+    spawned: bool,
+}
+
+impl TaskDriverRegistration {
+    /// Spawn `driver` and retain cancellation and completion ownership in the
+    /// task registry.
+    pub fn spawn(mut self, driver: impl std::future::Future<Output = ()> + Send + 'static) {
+        let guard = TaskDriverGuard {
+            registry: self.registry.clone(),
+            task_id: self.task_id,
+        };
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            driver.await;
+        });
+        self.spawned = true;
+        self.registry
+            .arm_driver(self.task_id, handle.abort_handle());
+    }
+}
+
+impl Drop for TaskDriverRegistration {
+    fn drop(&mut self) {
+        if !self.spawned {
+            self.registry.finish_driver(self.task_id);
+        }
+    }
+}
+
+struct TaskDriverGuard {
+    registry: TaskRegistry,
+    task_id: TaskId,
+}
+
+/// One non-background-task operation that belongs to the session writer
+/// lifetime.
+///
+/// Dropping the guard publishes completion to
+/// [`TaskRegistry::wait_for_quiescence`].
+/// A resource whose `Drop` spawns asynchronous cleanup moves this guard into
+/// that cleanup future rather than releasing it at the handoff.
+pub struct TaskCleanupGuard {
+    registry: TaskRegistry,
+}
+
+impl Drop for TaskCleanupGuard {
+    fn drop(&mut self) {
+        {
+            let mut inner = self
+                .registry
+                .inner
+                .lock()
+                .expect("task registry mutex poisoned");
+            inner.cleanups -= 1;
+        }
+        self.registry.status_changed.notify_waiters();
+    }
+}
+
+impl Drop for TaskDriverGuard {
+    fn drop(&mut self) {
+        self.registry.finish_driver(self.task_id);
+    }
+}
+
 impl TaskRegistry {
-    /// Mint a task id and insert a `Running` entry for it. Returns the
-    /// id plus the task's cancel token (a child of the registry root)
-    /// for the detached driver.
-    pub fn register(
+    /// Retain the session writer lifetime for work outside the displayed
+    /// background-task driver map.
+    pub fn track_cleanup(&self) -> TaskCleanupGuard {
+        self.inner
+            .lock()
+            .expect("task registry mutex poisoned")
+            .cleanups += 1;
+        TaskCleanupGuard {
+            registry: self.clone(),
+        }
+    }
+
+    /// Mint a task id and insert its `Running` entry. Driver ownership is added
+    /// separately by [`TaskRegistry::register_driver`].
+    fn register_entry(
         &self,
         owner: AgentId,
         call_id: String,
@@ -2290,6 +2399,94 @@ impl TaskRegistry {
             },
         );
         (id, cancel)
+    }
+
+    /// Insert a synthetic task entry with no detached driver.
+    ///
+    /// Test fixtures use this to stage registry states directly. Production
+    /// task creation must use [`TaskRegistry::register_driver`], so every live
+    /// entry has cancellation and completion ownership.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_unowned_for_test(
+        &self,
+        owner: AgentId,
+        call_id: String,
+        kind: TaskKind,
+        label: String,
+        output: Arc<dyn TaskOutputSource>,
+    ) -> (TaskId, CancellationToken) {
+        self.register_entry(owner, call_id, kind, label, output)
+    }
+
+    /// Register a task whose detached driver must be cancelled and reaped with
+    /// this registry.
+    ///
+    /// The returned registration must be consumed by
+    /// [`TaskDriverRegistration::spawn`] without an await in between. The
+    /// pending driver record makes shutdown safe even if it begins in that
+    /// synchronous handoff window.
+    pub fn register_driver(
+        &self,
+        owner: AgentId,
+        call_id: String,
+        kind: TaskKind,
+        label: String,
+        output: Arc<dyn TaskOutputSource>,
+    ) -> (TaskId, CancellationToken, TaskDriverRegistration) {
+        let force_abort = matches!(kind, TaskKind::Agent { .. });
+        let (id, cancel) = self.register_entry(owner, call_id, kind, label, output);
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        let abort_requested = inner.drivers_aborted && force_abort;
+        inner.drivers.insert(
+            id,
+            TaskDriver {
+                abort: None,
+                abort_requested,
+                force_abort,
+            },
+        );
+        drop(inner);
+        (
+            id,
+            cancel,
+            TaskDriverRegistration {
+                registry: self.clone(),
+                task_id: id,
+                spawned: false,
+            },
+        )
+    }
+
+    fn arm_driver(&self, id: TaskId, abort: tokio::task::AbortHandle) {
+        let abort_now = {
+            let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+            let Some(driver) = inner.drivers.get_mut(&id) else {
+                // The driver can finish on another runtime worker before the
+                // spawning task records its abort handle.
+                return;
+            };
+            driver.abort = Some(abort.clone());
+            driver.abort_requested
+        };
+        if abort_now {
+            abort.abort();
+        }
+    }
+
+    fn finish_driver(&self, id: TaskId) {
+        {
+            let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+            inner.drivers.remove(&id);
+            if let Some(entry) = inner.entries.get_mut(&id)
+                && entry.status == TaskStatus::Running
+            {
+                // An aborted or panicked driver cannot publish its normal
+                // terminal event. The registry still must not report work as
+                // live after the task that owned it is gone.
+                entry.status = TaskStatus::Killed;
+            }
+        }
+        self.status_changed.notify_waiters();
     }
 
     /// Current status plus a stateless output snapshot for task `id`.
@@ -2529,16 +2726,49 @@ impl TaskRegistry {
         self.root_cancel.cancel();
     }
 
-    /// Wait until every tracked task reaches a terminal status,
-    /// bounded by `grace`.
+    /// Abort every detached driver whose resources can be dropped
+    /// synchronously.
+    ///
+    /// Callers first cancel the session root and allow a graceful quiescence
+    /// window. This is the cutoff for a driver wedged in a listener or other
+    /// await that does not observe the task token itself. Background bash
+    /// drivers are not aborted here because dropping one delegates process
+    /// reap to another task. They remain in the completion barrier and keep a
+    /// session supervisor alive until normal cancellation reaps them. A safe
+    /// registration still in its synchronous spawn handoff records the request
+    /// and aborts as soon as its handle is attached.
+    pub fn abort_drivers(&self) {
+        let aborts = {
+            let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+            inner.drivers_aborted = true;
+            inner
+                .drivers
+                .values_mut()
+                .filter_map(|driver| {
+                    if driver.force_abort {
+                        driver.abort_requested = true;
+                        driver.abort.clone()
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for abort in aborts {
+            abort.abort();
+        }
+    }
+
+    /// Wait until every tracked task reaches a terminal status and every
+    /// detached driver has fully returned, bounded by `grace`.
     ///
     /// Returns `true` when the registry is quiescent (every entry
     /// terminal, or nothing tracked), `false` when the grace expired
     /// with a task still running. Callers fire
-    /// [`TaskRegistry::shutdown`] first; drivers respond promptly to
-    /// the root cancel (SIGKILL on the process group + reap, or a
-    /// cancelled child run), so an expiry means a wedged driver and
-    /// the caller should proceed with teardown anyway.
+    /// [`TaskRegistry::shutdown`] first; drivers respond promptly to the root
+    /// cancel (SIGKILL on the process group + reap, or a cancelled child run).
+    /// A caller that cannot leave detached work behind can follow an expiry
+    /// with [`TaskRegistry::abort_drivers`] and another quiescence wait.
     pub async fn quiesce(&self, grace: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + grace;
         loop {
@@ -2555,9 +2785,29 @@ impl TaskRegistry {
         }
     }
 
+    /// Wait without a second deadline until every terminal status and detached
+    /// driver completion has landed.
+    ///
+    /// Used after [`TaskRegistry::abort_drivers`]. Tokio task abortion is
+    /// cooperative at await points, while process-owning drivers finish through
+    /// their cancellation path. Returning before this barrier would let a
+    /// snapshotted persistence listener or child process outlive its session
+    /// lock.
+    pub async fn wait_for_quiescence(&self) {
+        loop {
+            let notified = self.status_changed.notified();
+            if self.all_terminal() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn all_terminal(&self) -> bool {
         let inner = self.inner.lock().expect("task registry mutex poisoned");
         inner.entries.values().all(|e| e.status.is_terminal())
+            && inner.drivers.is_empty()
+            && inner.cleanups == 0
     }
 }
 
@@ -2734,7 +2984,7 @@ mod task_registry_tests {
         owner: AgentId,
         command: &str,
     ) -> (usize, CancellationToken) {
-        registry.register(
+        registry.register_unowned_for_test(
             owner,
             "test-call".to_string(),
             TaskKind::Bash {
@@ -2804,7 +3054,7 @@ mod task_registry_tests {
         register(&registry, AgentId::Main, "sleep 5");
         assert!(!registry.agent_task_running(7));
 
-        let (id, _) = registry.register(
+        let (id, _) = registry.register_unowned_for_test(
             AgentId::Main,
             "test-call".to_string(),
             TaskKind::Agent {
@@ -2824,7 +3074,7 @@ mod task_registry_tests {
     #[test]
     fn latest_agent_task_picks_the_newest_incarnation_and_its_status() {
         let registry = TaskRegistry::default();
-        let (old, _) = registry.register(
+        let (old, _) = registry.register_unowned_for_test(
             AgentId::Main,
             "old-call".to_string(),
             TaskKind::Agent {
@@ -2834,7 +3084,7 @@ mod task_registry_tests {
             "old run".to_string(),
             Arc::new(StubOutput),
         );
-        let (new, _) = registry.register(
+        let (new, _) = registry.register_unowned_for_test(
             AgentId::Main,
             "new-call".to_string(),
             TaskKind::Agent {
@@ -2976,6 +3226,40 @@ mod task_registry_tests {
         };
         assert!(registry.quiesce(std::time::Duration::from_secs(5)).await);
         flipper.await.expect("flipper joined");
+    }
+
+    #[tokio::test]
+    async fn terminal_status_does_not_quiesce_before_the_detached_driver_returns() {
+        let registry = TaskRegistry::default();
+        let (id, _cancel, driver) = registry.register_driver(
+            AgentId::Main,
+            "test-call".to_string(),
+            TaskKind::Agent {
+                agent_id: 1,
+                task: "park after status".to_string(),
+            },
+            "agent 1".to_string(),
+            Arc::new(StubOutput),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        driver.spawn(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+        });
+        started_rx.await.expect("the tracked driver started");
+
+        registry.set_status(id, TaskStatus::Exited(Some(0)));
+        assert!(
+            !registry.quiesce(std::time::Duration::from_millis(10)).await,
+            "display status is not a completion fence for the driver"
+        );
+
+        release_tx.send(()).expect("release the tracked driver");
+        assert!(
+            registry.quiesce(std::time::Duration::from_secs(1)).await,
+            "quiescence follows the real driver completion"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3254,19 +3538,21 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             self.sub_agent_registry
                 .insert(agent_id, Arc::clone(&shared));
 
-            // NOTE: no await point between the registry registration
-            // in the background arm above and the driver spawn below
-            // (the `sub_agent_registry.insert` in between is sync and
-            // must stay that way). Tool futures are cancelled by drop,
-            // and a drop in that window would leave a phantom `Running`
-            // entry with no driver to ever flip it. The driver owns all
-            // task lifecycle emissions: `TaskStart` first, then
-            // `TaskOutput` / `TaskEnd`. That first emit races this
-            // future's own return, so `TaskStart` may land before or
-            // after the spawn's `ToolExecutionEnd`.
+            // The registry insertion, retained sub-agent, and driver spawn are
+            // one synchronous ownership handoff. If this future is dropped
+            // before the spawn, TaskDriverRegistration settles the entry as
+            // killed. Once spawned, the driver owns all task lifecycle
+            // emissions: `TaskStart` first, then `TaskOutput` / `TaskEnd`. That
+            // first emit races this future's own return, so `TaskStart` may land
+            // before or after the spawn's `ToolExecutionEnd`.
             if let Some((started, kind, output)) = background {
-                let StartedTask { id, cancel, events } = started;
-                tokio::spawn(drive_background_agent(BackgroundAgentRun {
+                let StartedTask {
+                    id,
+                    cancel,
+                    events,
+                    driver,
+                } = started;
+                driver.spawn(drive_background_agent(BackgroundAgentRun {
                     shared,
                     task,
                     kind,
@@ -3386,9 +3672,13 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
         // tools authorize against are one expression and cannot drift
         // apart.
         let owner = self.agent_id();
-        let (id, cancel) =
-            self.task_registry
-                .register(owner, self.call_id.clone(), kind, label.clone(), output);
+        let (id, cancel, driver) = self.task_registry.register_driver(
+            owner,
+            self.call_id.clone(),
+            kind,
+            label.clone(),
+            output,
+        );
         let events = TaskEventSink::new(
             self.parent_bus.clone(),
             self.task_registry.clone(),
@@ -3397,7 +3687,12 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             self.call_id.clone(),
             label,
         );
-        StartedTask { id, cancel, events }
+        StartedTask {
+            id,
+            cancel,
+            events,
+            driver,
+        }
     }
 }
 

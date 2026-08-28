@@ -1141,7 +1141,7 @@ impl Driver {
             tracing::warn!(
                 session = self.session.id(),
                 phase = "background task quiesce",
-                "background tasks still running after the shutdown grace; proceeding"
+                "background tasks still running after the shutdown grace; forced abortable drivers while the session owner retains reap responsibility"
             );
         }
         // Detached task drivers emit their terminal events while quiescing.
