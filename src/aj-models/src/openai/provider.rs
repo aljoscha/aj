@@ -1370,7 +1370,7 @@ mod tests {
     };
     use openai_sdk::types::chat_completions::{
         ChatCompletionStreamChoice, ChatCompletionStreamResponseDelta, FunctionCallDelta,
-        PromptTokensDetails, ToolCallDelta,
+        PromptTokensDetails, Role, ToolCallDelta,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -1962,11 +1962,16 @@ mod tests {
     #[test]
     fn a_cancelled_stream_harvests_and_prices_the_usage_it_saw() {
         let mut state = StreamState::new(&fake_model());
+        let _ = state.process(delta_chunk(text_delta("complete")));
+        let _ = state.process(finish_chunk(FinishReason::Stop));
         let _ = state.process(usage_chunk());
         assert!(
-            state.partial.usage.total_tokens == 0,
-            "the cancel must find the usage still unharvested in the side field, \
-             or this test measures a seal that had nothing left to do"
+            state.saw_terminal(),
+            "the fixture must process finish before trailing usage"
+        );
+        assert_eq!(
+            state.partial.usage.total_tokens, 0,
+            "the cancel must find usage still unharvested in the side field"
         );
 
         match state.cancelled() {
@@ -1984,8 +1989,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_live_mid_stream_cancel_harvests_the_usage_chunk() {
-        let event = serde_json::to_string(&usage_chunk()).expect("serialize usage chunk");
+    async fn the_live_mid_stream_cancel_emits_the_states_aborted_terminal() {
+        let mut opening = text_delta("partial");
+        opening.role = Some(Role::Assistant);
+        let event = serde_json::to_string(&delta_chunk(opening)).expect("serialize opening chunk");
         let server =
             crate::provider_test_support::held_sse_server("POST /v1/chat/completions", vec![event])
                 .await;
@@ -1996,11 +2003,21 @@ mod tests {
         let mut stream =
             OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
 
-        let start = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
-            .await
-            .expect("provider emits Start")
-            .expect("stream event");
-        assert!(matches!(start, AssistantMessageEvent::Start { .. }));
+        let delta = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match stream.next().await {
+                    Some(AssistantMessageEvent::TextDelta { delta, .. }) => break delta,
+                    Some(event) if event.is_terminal() => {
+                        panic!("provider terminated before the opening text: {event:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("provider stream ended before the opening text"),
+                }
+            }
+        })
+        .await
+        .expect("provider emits the opening text");
+        assert_eq!(delta, "partial");
         token.cancel();
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
             .await
@@ -2009,9 +2026,10 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert_eq!(terminal.usage.total_tokens, 120);
-        let expected = 0.000_075 + 0.000_2 + 0.000_003_125;
-        assert!((terminal.usage.cost.total - expected).abs() < 1e-12);
+        match terminal.content.first() {
+            Some(AssistantContent::Text(text)) => assert_eq!(text.text, "partial"),
+            other => panic!("expected preserved partial text, got {other:?}"),
+        }
     }
 
     /// The trailing usage-only chunk: prompt 100 of which 40 cached and
