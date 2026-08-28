@@ -12629,6 +12629,38 @@ mod tests {
         (world, shell)
     }
 
+    /// A fresh local session whose environment enters through the real launch
+    /// create path, so its log contains the canonical immutable meta entry.
+    async fn world_and_shell_with_env(
+        dir: &TempDir,
+        demo: &str,
+        env: &str,
+    ) -> (World, Rc<RefCell<Shell>>) {
+        let args = Args::parse_from(["aj", "--scripted", demo, "--env", env]);
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let world = build_world(
+            &args,
+            layers_spilling_into(dir),
+            &[],
+            &auth,
+            &persistence,
+            None,
+        )
+        .await
+        .expect("build env-bearing world");
+        let shell = Rc::new(RefCell::new(Shell::new(
+            Rc::clone(&world.chat),
+            Rc::clone(&world.status),
+            Some(world.handles().task_registry.clone()),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
+            "aj".to_string(),
+            "",
+            dir.path().to_path_buf(),
+        )));
+        (world, shell)
+    }
+
     /// Invoke [`apply_command_action`] with a throwaway export delivery
     /// channel, for the tests that exercise actions other than `ExportHtml`
     /// (which is the only arm that sends on it). Tests that exercise the
@@ -21664,16 +21696,41 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// The session-info page shows the label from the peer's row and the usage
-    /// breakdown from the focused log, through the same composed fetch path.
+    /// The session-info page shows the label from the peer's row, usage, and
+    /// environment extracted from the focused persisted log. The assertion is
+    /// made on a drawn page so the extraction, fetch handoff, row renderer, and
+    /// terminal widget are all part of the observed path.
     #[tokio::test]
-    async fn the_session_info_page_shows_the_label_and_usage_breakdown() {
+    async fn the_session_info_page_draws_the_focused_logs_environment() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let env_key = "INFO_ENV_SENTINEL";
+        let env_value = "from\nthe persisted log ";
+        let launch_env = format!("{env_key}={env_value}");
+        let (mut world, shell) =
+            world_and_shell_with_env(&dir, "streaming-text", &launch_env).await;
         run_prompt(&mut world, "a prompt").await;
         seed_tag(&mut world, &shell, "fix-auth").await;
 
-        let stats = world.handles().log.lock().await.stats();
+        let (stats, log_path) = {
+            let log = world.handles().log.lock().await;
+            (log.stats(), log.path().to_path_buf())
+        };
+        assert_eq!(
+            stats
+                .session_env
+                .as_ref()
+                .and_then(|env| env.get(env_key))
+                .map(String::as_str),
+            Some(env_value),
+            "the real stats extraction sees the focused log's environment",
+        );
+        let persisted = std::fs::read_to_string(log_path).expect("read the punctuated log");
+        assert!(
+            persisted.contains("\"type\":\"env_change\"")
+                && persisted.contains(env_key)
+                && persisted.contains("from\\nthe persisted log "),
+            "the fixture must reach the on-disk log before the info fetch: {persisted}",
+        );
         assert!(
             !stats.usage_breakdown.is_empty(),
             "the scripted prompt records a usage bucket"
@@ -21695,15 +21752,8 @@ mod tests {
         let (kind, rows) = rx.recv().await.expect("the fetch delivered rows");
         assert_eq!(kind, FetchKind::SessionInfo);
 
-        let page = rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|span| span.text.as_str())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut overlay = crate::content_overlay::ContentOverlay::new(rows);
+        let page = flatten(&overlay.draw(&draw_ctx(80, 80))).join("\n");
         assert!(
             page.lines()
                 .any(|line| line.contains(bucket_key) && line.contains(&bucket_value)),
@@ -21714,7 +21764,99 @@ mod tests {
                 .any(|line| line.trim_start().starts_with("tag") && line.contains("fix-auth")),
             "the page carries a tag row: {page}",
         );
+        assert!(
+            page.lines().any(|line| {
+                line.contains(&format!("\"{env_key}\""))
+                    && line.contains(r#""from\nthe\x20persisted\x20log\x20""#)
+            }),
+            "the exact persisted value reaches the drawn local page: {page}",
+        );
         shut_down(&world).await;
+    }
+
+    /// Session info remains host-local in connect mode. A value demonstrably
+    /// present in the remote host's focused log must yield only the unsupported
+    /// notice and never cross onto the connected client's drawn page.
+    #[tokio::test]
+    async fn connected_session_info_never_draws_the_hosts_environment() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let sentinel_key = "REMOTE_INFO_SENTINEL";
+        let sentinel_value = "host-only-secret-value";
+        let session = remote
+            .host
+            .create_with(
+                None,
+                None,
+                None,
+                Some(std::collections::BTreeMap::from([(
+                    sentinel_key.to_string(),
+                    sentinel_value.to_string(),
+                )])),
+            )
+            .await
+            .expect("create env-bearing host session");
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[&session]).await;
+        assert!(world.local.is_none(), "the fixture must use connect mode");
+        assert!(handle_submit(&mut world, "persist the host log".to_string()).await);
+        settle(&mut world).await;
+
+        let handles = remote
+            .host
+            .local_handles(&session)
+            .await
+            .expect("host local handles");
+        let (stats, log_path) = {
+            let log = handles.log.lock().await;
+            (log.stats(), log.path().to_path_buf())
+        };
+        assert_eq!(
+            stats
+                .session_env
+                .as_ref()
+                .and_then(|env| env.get(sentinel_key))
+                .map(String::as_str),
+            Some(sentinel_value),
+            "the remote host holds the sentinel this boundary must not expose",
+        );
+        let persisted = std::fs::read_to_string(log_path).expect("read the host's log");
+        assert!(
+            persisted.contains("\"type\":\"env_change\"")
+                && persisted.contains(sentinel_key)
+                && persisted.contains(sentinel_value),
+            "the remote sentinel must be persisted before the refusal is observed: {persisted}",
+        );
+
+        let (tx, mut rx) = unbounded_channel();
+        spawn_shell_overlay_fetch(&world, &shell, FetchKind::SessionInfo, &tx);
+        let (kind, rows) = rx.recv().await.expect("the refusal delivered rows");
+        assert_eq!(kind, FetchKind::SessionInfo);
+        let fetched = rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert_eq!(rows.len(), 1, "connect mode returns only its refusal");
+        assert!(
+            fetched.contains("Can't show session info over a connection"),
+            "connect mode returns the unsupported notice: {fetched}",
+        );
+        assert!(
+            !fetched.contains(sentinel_key) && !fetched.contains(sentinel_value),
+            "host-local environment entered the complete fetched row set: {fetched}",
+        );
+
+        let mut overlay = crate::content_overlay::ContentOverlay::new(rows);
+        let page = flatten(&overlay.draw(&draw_ctx(64, 8))).join("\n");
+        assert!(
+            page.contains("Can't show session info over a connection"),
+            "connect mode draws the unsupported notice: {page}",
+        );
+        assert!(
+            !page.contains(sentinel_key) && !page.contains(sentinel_value),
+            "host-local environment crossed the connection boundary: {page}",
+        );
+        remote.shutdown().await;
     }
 
     /// The selector labels its rows from the same scan it lists them from, so

@@ -772,16 +772,19 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyle
 /// occupies a real line instead of collapsing to zero height in the
 /// [`ListView`].
 ///
-/// The tag is folded to one line on the way in: it is the one value here a
-/// peer supplies, and every row is drawn as a `RichText` that a control
-/// character would either split or panic (see [`crate::text::one_line`]).
+/// Ordinary digest fields are folded to one line at this render boundary.
+/// Environment pairs retain their typed row until here, where both sides are
+/// quoted and escaped to an ASCII-only representation. This keeps every valid
+/// pair distinguishable and leaves no terminal-active text for [`RichText`].
 pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<Row> {
     let tag = tag.map(crate::text::one_line);
     let rows = aj_app::session_info::digest(stats, tag.as_deref());
     let key_width = rows
         .iter()
         .filter_map(|row| match row {
-            aj_app::session_info::InfoRow::Kv { key, .. } => Some(key.chars().count()),
+            aj_app::session_info::InfoRow::Kv { key, .. } => {
+                Some(crate::text::one_line(key).chars().count())
+            }
             _ => None,
         })
         .max()
@@ -790,7 +793,14 @@ pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<
         .map(|row| match row {
             aj_app::session_info::InfoRow::Header(title) => plain(title.as_str()),
             aj_app::session_info::InfoRow::Kv { key, value } => {
+                let key = crate::text::one_line(key);
+                let value = crate::text::one_line(value);
                 plain(format!("  {key:<key_width$}  {value}"))
+            }
+            aj_app::session_info::InfoRow::Env { key, value } => {
+                let key = quoted_env_text(key);
+                let value = quoted_env_text(value);
+                plain(format!("  {key}={value}"))
             }
             // A single space, not the empty string: an empty `RichText`
             // row collapses to zero height in the `ListView`, which would
@@ -798,6 +808,23 @@ pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<
             aj_app::session_info::InfoRow::Blank => plain(" "),
         })
         .collect()
+}
+
+/// Quote arbitrary persisted environment text with an injective representation
+/// made only of graphic ASCII. Spaces are explicit too: [`RichText`] may drop
+/// separator whitespace at a soft-wrap boundary, while `\x20` remains visible
+/// and reconstructable wherever the terminal wraps the row.
+fn quoted_env_text(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for ch in value.chars() {
+        if ch == ' ' {
+            quoted.push_str("\\x20");
+        } else {
+            quoted.extend(ch.escape_default());
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(test)]
@@ -1648,6 +1675,140 @@ mod tests {
             " ",
             "spacer row before Settings is a non-collapsing single-space \
              line, not an empty string: {texts:?}"
+        );
+    }
+
+    /// Environment rows are lossless, terminal-inert, and independently
+    /// bounded. Pathological valid text draws in a narrow viewport while a long
+    /// key cannot push the neighboring identity value behind unbounded padding.
+    #[test]
+    fn session_info_rows_render_only_the_recorded_environment() {
+        let without_env = session_info_rows(&sample_stats(), None);
+        assert!(
+            !without_env.iter().any(|row| row_text(row) == "Env"),
+            "an absent environment rendered a section: {:?}",
+            without_env.iter().map(row_text).collect::<Vec<_>>(),
+        );
+
+        let mut stats = sample_stats();
+        let long_zwj_grapheme = std::iter::repeat_n("👩", 130)
+            .collect::<Vec<_>>()
+            .join("\u{200d}");
+        let long_key = "Z".repeat(2_048);
+        stats.session_env = Some(std::collections::BTreeMap::from([
+            ("BEADS_ACTOR".to_string(), "azurite ".to_string()),
+            ("COMBINED_e\u{301}".to_string(), "plain".to_string()),
+            ("DISTINCT_NEWLINE".to_string(), "A\nB".to_string()),
+            ("DISTINCT_PLAIN".to_string(), "AB".to_string()),
+            ("DISTINCT_TAB".to_string(), "a\tb".to_string()),
+            ("DISTINCT_UNTABBED".to_string(), "ab".to_string()),
+            (
+                "FORMAT\u{202e}".to_string(),
+                "line\u{2028}separator".to_string(),
+            ),
+            ("WIDE_界".to_string(), "wide".to_string()),
+            ("ZWJ".to_string(), long_zwj_grapheme),
+            (long_key.clone(), "long-key-value".to_string()),
+        ]));
+        let rows = session_info_rows(&stats, None);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        let settings = texts
+            .iter()
+            .position(|row| row == "Settings")
+            .expect("Settings section");
+        let env = texts
+            .iter()
+            .position(|row| row == "Env")
+            .expect("Env section");
+        let activity = texts
+            .iter()
+            .position(|row| row == "Activity")
+            .expect("Activity section");
+
+        assert!(settings < env && env < activity, "section order: {texts:?}");
+        let actor = texts
+            .iter()
+            .find(|row| row.contains("\"BEADS_ACTOR\""))
+            .expect("identity row");
+        assert_eq!(
+            actor, r#"  "BEADS_ACTOR"="azurite\x20""#,
+            "a long neighboring key adds no padding to the identity row",
+        );
+        for (key, value) in [
+            (r#""DISTINCT_NEWLINE""#, r#""A\nB""#),
+            (r#""DISTINCT_PLAIN""#, r#""AB""#),
+            (r#""DISTINCT_TAB""#, r#""a\tb""#),
+            (r#""DISTINCT_UNTABBED""#, r#""ab""#),
+            (r#""COMBINED_e\u{301}""#, r#""plain""#),
+            (r#""FORMAT\u{202e}""#, r#""line\u{2028}separator""#),
+            (r#""WIDE_\u{754c}""#, r#""wide""#),
+        ] {
+            let row = texts[env..activity]
+                .iter()
+                .find(|row| row.contains(key))
+                .unwrap_or_else(|| panic!("missing escaped environment key {key:?}"));
+            assert!(
+                row.contains(&format!("={value}")),
+                "escaped key and value must share a delimited row: {row:?}",
+            );
+        }
+        assert!(
+            texts[env..activity]
+                .iter()
+                .all(|row| row.is_ascii() && !row.contains(['\r', '\n'])),
+            "terminal-active text reached an environment row: {:?}",
+            &texts[env..activity],
+        );
+
+        let mut narrow = draw_ctx(24, 512);
+        narrow.width_method = vaxis::gwidth::Method::Wcwidth;
+        // Draw every row so the long ZWJ-linked value reaches RichText's
+        // grapheme-width conversion. Escaping it into independent ASCII cells
+        // prevents both a u8-width panic and hard-break injection.
+        for row in &rows {
+            let mut text = RichText::new(row.clone());
+            let _ = text.draw(&narrow);
+        }
+        let mut overlay = ContentOverlay::new(rows[env + 1..activity - 1].to_vec());
+        let surface = overlay.draw(&narrow);
+        let drawn = crate::test_support::flatten(&surface)
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.char.grapheme())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let packed: String = drawn
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect();
+        assert!(
+            packed.contains("\"BEADS_ACTOR\""),
+            "drawn identity key: {drawn}"
+        );
+        assert!(
+            packed.contains("\"azurite\\x20\""),
+            "drawn exact value: {drawn}"
+        );
+
+        let id_without_env = without_env
+            .iter()
+            .map(row_text)
+            .find(|row| row.starts_with("  id "))
+            .expect("ordinary id row without env");
+        let id_with_env = texts
+            .iter()
+            .find(|row| row.starts_with("  id "))
+            .expect("ordinary id row with env");
+        assert_eq!(
+            id_with_env, &id_without_env,
+            "environment layout must not change ordinary digest padding",
+        );
+        assert!(
+            texts.iter().any(|row| row.contains(&long_key)),
+            "the long key remains complete on its own independently wrapped row",
         );
     }
 

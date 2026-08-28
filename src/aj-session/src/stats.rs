@@ -368,6 +368,17 @@ mod tests {
     }
 
     #[test]
+    fn stats_preserves_an_explicitly_empty_session_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).unwrap();
+        log.set_system_prompt("p".into()).expect("root");
+        log.append_env_change(BTreeMap::new()).expect("empty env");
+
+        assert_eq!(log.stats().session_env, Some(BTreeMap::new()));
+    }
+
+    #[test]
     fn stats_reads_session_env_outside_branch_settings() {
         let dir = tempfile::tempdir().unwrap();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());

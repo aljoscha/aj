@@ -8,11 +8,17 @@
 use aj_session::{SessionStats, UsageBucket};
 use chrono::{DateTime, Utc};
 
-/// One digest row: a section header, a key/value pair, or a blank
-/// spacer between sections.
+/// One digest row: a section header, an ordinary key/value pair, a raw
+/// environment pair, or a blank spacer between sections.
+///
+/// Environment text stays typed until the frontend's terminal boundary because
+/// its validation permits arbitrary non-NUL values and almost-arbitrary keys.
+/// A terminal frontend must quote and escape it rather than applying the
+/// display rules used for ordinary digest fields.
 pub enum InfoRow {
     Header(String),
     Kv { key: String, value: String },
+    Env { key: String, value: String },
     Blank,
 }
 
@@ -23,9 +29,9 @@ fn kv(key: &str, value: &str) -> InfoRow {
     }
 }
 
-/// Build the session-info digest: identity, recorded settings, activity
-/// timing, message counts, aggregate usage, its per-provider/model usage
-/// breakdown, and the per-tool call breakdown, grouped into labelled
+/// Build the session-info digest: identity, recorded settings and environment,
+/// activity timing, message counts, aggregate usage, its per-provider/model
+/// usage breakdown, and the per-tool call breakdown, grouped into labelled
 /// sections separated by blank rows.
 ///
 /// `tag` is the label the session carries, which lives beside the log rather
@@ -54,6 +60,20 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
             "verbosity",
             stats.settings.verbosity.as_deref().unwrap_or("(default)"),
         ),
+    ];
+
+    if let Some(env) = &stats.session_env {
+        rows.push(InfoRow::Blank);
+        rows.push(InfoRow::Header("Env".to_string()));
+        for (key, value) in env {
+            rows.push(InfoRow::Env {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+
+    rows.extend([
         InfoRow::Blank,
         InfoRow::Header("Activity".to_string()),
         kv("created", &timestamp(stats.created_at, "(unknown)")),
@@ -70,7 +90,7 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
         kv("log entries", &stats.total_entries.to_string()),
         InfoRow::Blank,
         InfoRow::Header("Usage".to_string()),
-    ];
+    ]);
     if stats.usage.incomplete {
         rows.push(kv("status", "partial (recorded usage only)"));
     }
@@ -310,6 +330,7 @@ mod tests {
     enum RowView {
         Header(String),
         Kv(String, String),
+        Env(String, String),
         Blank,
     }
 
@@ -318,6 +339,7 @@ mod tests {
             .map(|r| match r {
                 InfoRow::Header(t) => RowView::Header(t.clone()),
                 InfoRow::Kv { key, value } => RowView::Kv(key.clone(), value.clone()),
+                InfoRow::Env { key, value } => RowView::Env(key.clone(), value.clone()),
                 InfoRow::Blank => RowView::Blank,
             })
             .collect()
@@ -387,6 +409,62 @@ mod tests {
             RowView::Kv("Bash".to_string(), "8".to_string()),
         ];
         assert_eq!(rows, expected);
+    }
+
+    /// Environment is recorded state, not a defaulted setting. A recorded map
+    /// appears as its own section immediately below Settings, while an old log
+    /// with no environment record keeps the prior digest shape.
+    #[test]
+    fn digest_lists_the_recorded_environment_only_when_it_exists() {
+        let without_env = view(&digest(&sample_stats(), None));
+        assert!(
+            !without_env
+                .iter()
+                .any(|row| row == &RowView::Header("Env".to_string())),
+            "an absent environment grew a section: {without_env:?}",
+        );
+
+        let mut stats = sample_stats();
+        stats.session_env = Some(std::collections::BTreeMap::new());
+        let empty = view(&digest(&stats, None));
+        let env = empty
+            .iter()
+            .position(|row| row == &RowView::Header("Env".to_string()))
+            .expect("a recorded empty environment keeps its section");
+        assert_eq!(
+            &empty[env..env + 2],
+            &[RowView::Header("Env".to_string()), RowView::Blank],
+            "Some(empty) stays distinct from an unrecorded environment",
+        );
+
+        stats.session_env = Some(std::collections::BTreeMap::from([
+            ("BEADS_ACTOR".to_string(), "azurite".to_string()),
+            ("WORKTREE".to_string(), "/home/ubuntu/work/aj-1".to_string()),
+        ]));
+        let rows = view(&digest(&stats, None));
+        let settings = rows
+            .iter()
+            .position(|row| row == &RowView::Header("Settings".to_string()))
+            .expect("Settings section");
+        let env = rows
+            .iter()
+            .position(|row| row == &RowView::Header("Env".to_string()))
+            .expect("Env section");
+        let activity = rows
+            .iter()
+            .position(|row| row == &RowView::Header("Activity".to_string()))
+            .expect("Activity section");
+
+        assert!(settings < env && env < activity, "section order: {rows:?}");
+        assert_eq!(
+            &rows[env..activity],
+            &[
+                RowView::Header("Env".to_string()),
+                RowView::Env("BEADS_ACTOR".to_string(), "azurite".to_string()),
+                RowView::Env("WORKTREE".to_string(), "/home/ubuntu/work/aj-1".to_string(),),
+                RowView::Blank,
+            ],
+        );
     }
 
     /// The compaction line reports the recorded spend, and says how many
