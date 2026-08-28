@@ -514,6 +514,35 @@
     return html + '</div>';
   }
 
+  // Environment values are redacted before this renderer receives them and
+  // remain unread here. Keys are arbitrary persisted text. Quote delimiters
+  // and render every non-ASCII or control code point as inert ASCII text,
+  // matching the replay boundary's terminal-safe representation.
+  function quoteDisplayText(value) {
+    let out = '"';
+    for (const ch of String(value)) {
+      if (ch === '"') out += '\\"';
+      else if (ch === '\'') out += "\\'";
+      else if (ch === '\\') out += '\\\\';
+      else if (ch === '\0') out += '\\0';
+      else if (ch === '\n') out += '\\n';
+      else if (ch === '\r') out += '\\r';
+      else if (ch === '\t') out += '\\t';
+      else {
+        const cp = ch.codePointAt(0);
+        out += cp < 0x20 || cp > 0x7E
+          ? '\\u{' + cp.toString(16) + '}'
+          : ch;
+      }
+    }
+    return out + '"';
+  }
+
+  function formatEnvKeys(entry) {
+    const keys = Object.keys((entry && entry.env) || {}).sort();
+    return keys.length ? keys.map(quoteDisplayText).join(', ') : 'none';
+  }
+
   function renderEntry(entry) {
     if (entry.type === 'message') {
       const msg = entry.message;
@@ -540,6 +569,10 @@
     }
     if (entry.type === 'verbosity_change') {
       return '<div class="notice" id="entry-' + escapeHtml(entry.id) + '">verbosity: ' + escapeHtml(entry.verbosity) + '</div>';
+    }
+    if (entry.type === 'env_change') {
+      return '<div class="notice" id="entry-' + escapeHtml(entry.id) + '">session environment keys: ' +
+        escapeHtml(formatEnvKeys(entry)) + '</div>';
     }
     return '';
   }
@@ -650,7 +683,7 @@
   // The tree shows the conversation, its branches, and (toggleable)
   // sub-agent runs. A sub-agent run hangs off the assistant that spawned
   // it: its `sub_agent_spawn` entry is parented at that assistant, so the
-  // run appears as a branch there. Settings and system entries are kept
+  // run appears as a branch there. Session-state and system entries are kept
   // but hidden by the default filter. The layout (indent, ASCII
   // connectors, gutters) draws each branch point one level deeper, so the
   // conversation's branch structure reads at a glance.
@@ -992,6 +1025,7 @@
       case 'thinking_change': return treeMuted('[thinking: ' + escapeHtml(entry.level) + ']');
       case 'speed_change': return treeMuted('[speed: ' + escapeHtml(entry.speed) + ']');
       case 'verbosity_change': return treeMuted('[verbosity: ' + escapeHtml(entry.verbosity) + ']');
+      case 'env_change': return treeMuted('[environment: ' + escapeHtml(formatEnvKeys(entry)) + ']');
       default: return treeMuted('[' + escapeHtml(entry.type) + ']');
     }
   }
@@ -1012,6 +1046,8 @@
       parts.push(entry.summary || '');
     } else if (entry.type === 'model_change') {
       parts.push(entry.model_id || '');
+    } else if (entry.type === 'env_change') {
+      parts.push(...Object.keys(entry.env || {}));
     }
     return parts.join(' ').toLowerCase();
   }
@@ -1024,20 +1060,23 @@
   let searchQuery = '';
   // Sub-agent runs are shown by default; the sidebar toggle hides them.
   let showSubAgents = true;
-  const SETTINGS_TYPES = ['system_prompt', 'model_change', 'thinking_change', 'speed_change', 'verbosity_change'];
+  const STATE_TYPES = ['system_prompt', 'model_change', 'thinking_change', 'speed_change', 'verbosity_change', 'env_change'];
+  const activeLeafIsExempt = (entry, leafId) =>
+    entry.id === leafId && !STATE_TYPES.includes(entry.type);
 
   // Structural suppression that runs in every filter mode: the
   // sub-agent toggle, the duplicate `agent` tool result, and the empty
   // assistant wrapper whose tool calls already show as their own
-  // tool-result rows. The current leaf is exempt so the active branch
-  // never vanishes. This set is the widest any mode can show, so it is
+  // tool-result rows. The current non-state leaf is exempt so the active
+  // conversation never vanishes. State leaves still obey the selected mode.
+  // This set is the widest any mode can show, so it is
   // the denominator for the "x / y entries" status: under "All" with no
   // search the numerator equals it and the status reads N / N.
   function structurallyVisible(entry, leafId) {
     // Sub-agent rows appear only when the toggle is on. Checked before
     // the leaf rule so hiding wins even if the leaf is a sub-agent.
     if (entry.thread === 'subagent' && !showSubAgents) return false;
-    if (entry.id === leafId) return true;
+    if (activeLeafIsExempt(entry, leafId)) return true;
 
     // A successful `agent` tool result duplicates its sub-agent run:
     // when sub-agent rows are shown, the run's spawn node already names
@@ -1066,25 +1105,25 @@
   }
 
   function passesMode(entry) {
-    const isSettings = SETTINGS_TYPES.includes(entry.type);
+    const isState = STATE_TYPES.includes(entry.type);
     switch (filterMode) {
       case 'user-only': return entry.type === 'message' && entry.message && entry.message.role === 'user';
-      case 'no-tools': return !isSettings && !(entry.type === 'message' && entry.message && entry.message.role === 'tool_result');
+      case 'no-tools': return !isState && !(entry.type === 'message' && entry.message && entry.message.role === 'tool_result');
       case 'all': return true;
-      default: return !isSettings;
+      default: return !isState;
     }
   }
 
   // Returns the laid-out visible nodes plus `total`, the structural
   // count that is the status denominator. The active mode and search
-  // narrow the structural set; the leaf stays visible regardless,
-  // matching structurallyVisible.
+  // narrow the structural set. A non-state leaf stays visible regardless,
+  // matching structurallyVisible, while a state leaf obeys the mode.
   function filterNodes(flatNodes, leafId, activeIds) {
     const tokens = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
     const structural = flatNodes.filter((flat) => structurallyVisible(flat.node.entry, leafId));
     const visible = structural.filter((flat) => {
       const entry = flat.node.entry;
-      if (entry.id === leafId) return true;
+      if (activeLeafIsExempt(entry, leafId)) return true;
       if (!passesMode(entry)) return false;
       if (tokens.length > 0) {
         const text = searchableText(entry);

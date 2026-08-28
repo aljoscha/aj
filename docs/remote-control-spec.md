@@ -99,7 +99,7 @@ Facts about the current codebase that the design depends on:
   entry per `MessageEnd` (plus `SubAgentSpawn` roots). The log is
   append-only JSONL, entries form a tree via `parent_id`, and
   `linearize(head)` produces the model-facing view. Non-punctuation
-  entries (settings, spawn roots) buffer in memory until the next
+  entries (state records, spawn roots) buffer in memory until the next
   punctuating append, and a torn tail is truncated on resume, so the
   on-disk suffix is not crash-stable. The protocol accounts for this
   (epoch lifetime, section 6.5).
@@ -414,12 +414,12 @@ Every frame is in exactly one class:
   `MessageEnd` that triggers persistence, the `SubAgentStart` that
   writes the spawn root, the `CompactionEnd` whose checkpoint entry the
   compaction path appends itself, and the notices the projection derives
-  from settings entries (which the host synthesizes live, since no bus
-  event exists for those). Durable frames carry `seq` (the entry's
-  1-based append position, so `0` reads as "nothing durable yet") and
+  from notice-producing state entries (which the host synthesizes live,
+  since no bus event exists for those). Durable frames carry `seq` (the
+  entry's 1-based append position, so `0` reads as "nothing durable yet") and
   `entry_id`. They are exactly what backfill can regenerate. Seqs are
   strictly monotone per session but **not contiguous**: some entries
-  project no event (system-prompt roots, seed settings). Clients must
+  project no event (system-prompt roots, seed state entries). Clients must
   not do gap detection on seq, continuity comes from the stream being
   FIFO plus explicit `reset` signals.
 
@@ -605,7 +605,7 @@ Client application rules:
   place, a re-synthesized `SubAgentStart` for a known sub reuses its box
   and marks that run in progress, a re-served transcript row for a known
   message id updates in place, a re-served compaction checkpoint or
-  settings notice updates its existing row rather than appending a second
+  state notice updates its existing row rather than appending a second
   one. That last pair has no identity on the event itself, so the client
   hands the frame's `entry_id` to its reducer. (This is a deliberate
   hardening of the reducer, which today appends unconditionally.) A

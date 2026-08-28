@@ -159,7 +159,7 @@ pub struct Backfill {
 /// Project the events of every entry after `cursor`, for a live log.
 ///
 /// The walk starts at entry 0 regardless of the cursor, so the tool-name
-/// map, the usage accumulators, the settings-notice gate and the
+/// map, the usage accumulators, the state-notice gate and the
 /// sub-agent bracketing state are complete: events of entries at or
 /// below the cursor are computed and dropped, never skipped. `None`
 /// projects the whole log, and so does a cursor beyond the log's
@@ -178,8 +178,8 @@ pub struct Backfill {
 /// on what a cursor covers. That is the `MessageEnd` of a `Message`
 /// entry, the `SubAgentStart` of a `SubAgentSpawn` root, the
 /// `CompactionEnd` of a `Compaction` entry, and the `Notice` of a
-/// settings entry. At most one event per entry is tagged, which is what
-/// makes the client's per-frame cursor advance well-defined.
+/// notice-producing state entry. At most one event per entry is tagged,
+/// which is what makes the client's per-frame cursor advance well-defined.
 pub fn project_suffix(
     log: &LogSnapshot,
     cursor: Option<u64>,
@@ -198,20 +198,20 @@ pub fn project_suffix(
 }
 
 impl LogSnapshot {
-    /// The [`AgentEvent::Notice`] the projection derives from a settings
-    /// entry, `None` when it derives none (or when `entry` is not a
-    /// settings entry on the active path).
+    /// The [`AgentEvent::Notice`] the projection derives from a
+    /// notice-producing state entry, `None` when it derives none (or when
+    /// `entry` is not such an entry on the active path).
     ///
-    /// A settings entry before its thread's first message projects
+    /// A state entry before its thread's first message projects
     /// nothing, so a host that synthesized a notice unconditionally would
     /// emit a live frame that no backfill regenerates. Asking here is
     /// what keeps the two in agreement.
     ///
     /// This runs the projection rather than restating its rule. That is a
-    /// walk of the log per call, which a settings change can afford.
-    pub fn project_settings_entry(&self, entry: &EntryId) -> Option<AgentEvent> {
+    /// walk of the log per call, which a state change can afford.
+    pub fn project_state_entry(&self, entry: &EntryId) -> Option<AgentEvent> {
         // `live_subs` is irrelevant: it only affects bracketing frames,
-        // and those are never tagged with a settings entry.
+        // and those are never tagged with a state entry.
         project_suffix(self, None, &BTreeSet::new())
             .events
             .into_iter()
@@ -220,6 +220,26 @@ impl LogSnapshot {
                 (tagged_entry.id == *entry && matches!(tagged.event, AgentEvent::Notice { .. }))
                     .then_some(tagged.event)
             })
+    }
+
+    /// Compatibility projection for inference-settings entries.
+    ///
+    /// New state-entry callers should use [`Self::project_state_entry`]. This
+    /// wrapper retains the original settings-only contract and returns `None`
+    /// for environment and non-state entries.
+    #[deprecated(note = "use project_state_entry for notice-producing state entries")]
+    pub fn project_settings_entry(&self, entry: &EntryId) -> Option<AgentEvent> {
+        let persisted = self.get(entry)?;
+        if !matches!(
+            &persisted.entry,
+            ConversationEntryKind::ModelChange { .. }
+                | ConversationEntryKind::ThinkingChange { .. }
+                | ConversationEntryKind::SpeedChange { .. }
+                | ConversationEntryKind::VerbosityChange { .. }
+        ) {
+            return None;
+        }
+        self.project_state_entry(entry)
     }
 }
 
@@ -275,7 +295,7 @@ pub fn replay_deferring_subs(log: &ConversationLog) -> impl Iterator<Item = Agen
 pub fn project_thread(conv: &Conversation, agent: AgentId) -> Vec<AgentEvent> {
     // A fresh state scoped to this thread reproduces full replay's
     // per-agent projection: the usage accumulator and the
-    // settings-notice gate are keyed per `AgentId`, and every entry on
+    // state-notice gate are keyed per `AgentId`, and every entry on
     // this thread is `agent`, so the `UsageUpdate` sequence and `Notice`
     // gating match what full replay produces for this sub-agent.
     debug_assert!(
@@ -402,7 +422,7 @@ fn included_entries(log: &LogSnapshot) -> Option<HashSet<String>> {
     let head = log.head()?;
 
     // Main path: walk parent pointers from the head, collecting the
-    // head's user and meta ancestors (settings and system-prompt
+    // head's user and meta ancestors (state and system-prompt
     // entries chain here too, so they stay included). This is the only
     // source of main-thread inclusion, so sibling branches never enter
     // the set.
@@ -577,9 +597,9 @@ struct ReplayState {
     /// (spec 6.5).
     spawned: HashMap<usize, AgentEvent>,
     /// Agents for which at least one `Message` entry has been
-    /// projected. Settings entries emit a [`AgentEvent::Notice`]
-    /// only for agents present here; seed entries (before any
-    /// message on their thread) stay silent.
+    /// projected. Notice-producing state entries emit a
+    /// [`AgentEvent::Notice`] only for agents present here; seed entries
+    /// (before any message on their thread) stay silent.
     seen_message: HashSet<AgentId>,
 }
 
@@ -745,7 +765,7 @@ impl ReplayState {
                 });
                 self.open_run(n, start, None, keep, out);
             }
-            // Settings entries ahead of any message don't open the
+            // State entries ahead of any message don't open the
             // bracket; the first `Message` entry does. A compaction
             // marker likewise opens no bracket.
             ConversationEntryKind::ModelChange { .. }
@@ -873,7 +893,7 @@ impl ReplayState {
                 // Model-facing metadata; not user-visible.
             }
             ConversationEntryKind::ModelChange { provider, model_id } => {
-                self.settings_notice(
+                self.state_notice(
                     agent_id,
                     at,
                     format!("Model set to {provider}/{model_id}."),
@@ -881,7 +901,7 @@ impl ReplayState {
                 );
             }
             ConversationEntryKind::ThinkingChange { level } => {
-                self.settings_notice(
+                self.state_notice(
                     agent_id,
                     at,
                     format!("Thinking effort set to {level}."),
@@ -889,10 +909,10 @@ impl ReplayState {
                 );
             }
             ConversationEntryKind::SpeedChange { speed } => {
-                self.settings_notice(agent_id, at, format!("Speed set to {speed}."), out);
+                self.state_notice(agent_id, at, format!("Speed set to {speed}."), out);
             }
             ConversationEntryKind::VerbosityChange { verbosity } => {
-                self.settings_notice(
+                self.state_notice(
                     agent_id,
                     at,
                     format!("Output verbosity set to {verbosity}."),
@@ -903,9 +923,15 @@ impl ReplayState {
                 let keys = if env.is_empty() {
                     "none".to_string()
                 } else {
-                    env.keys().cloned().collect::<Vec<_>>().join(", ")
+                    // A key is arbitrary persisted text, not an identifier.
+                    // ASCII-only quoting makes delimiters unambiguous and
+                    // leaves no terminal-active Unicode in the notice.
+                    env.keys()
+                        .map(|key| format!("\"{}\"", key.escape_default()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 };
-                self.settings_notice(
+                self.state_notice(
                     agent_id,
                     at,
                     format!("Session environment keys: {keys}."),
@@ -990,12 +1016,12 @@ impl ReplayState {
         }
     }
 
-    /// Emit a [`AgentEvent::Notice`] for a settings entry, but only
+    /// Emit a [`AgentEvent::Notice`] for a notice-producing state entry, but only
     /// when `agent_id`'s thread has already projected a `Message`
     /// entry — seed entries (session creation) precede any message
     /// on their thread and stay silent, since they never produced a
     /// visible notice live either.
-    fn settings_notice(
+    fn state_notice(
         &self,
         agent_id: AgentId,
         at: Option<EntryRef>,
@@ -2734,7 +2760,10 @@ mod tests {
             .collect();
         assert_eq!(
             notices,
-            vec![(2, "Session environment keys: BEADS_ACTOR, SECRET_TOKEN.")],
+            vec![(
+                2,
+                "Session environment keys: \"BEADS_ACTOR\", \"SECRET_TOKEN\"."
+            )],
             "EnvChange must project exactly one notice between the two messages"
         );
         assert!(
@@ -2752,6 +2781,85 @@ mod tests {
                 "env value {value:?} leaked into the replay event stream: {stream}"
             );
         }
+    }
+
+    #[test]
+    fn replay_quotes_pathological_env_keys_before_they_reach_notice_text() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("before")).expect("first message");
+        }
+        let env_entry = log
+            .append_env_change(BTreeMap::from([
+                ("bidi\u{202e}key".to_string(), "hunter2".to_string()),
+                ("carriage\rreturn".to_string(), "hunter2".to_string()),
+                ("comma,key".to_string(), "hunter2".to_string()),
+                ("escape\u{1b}[31m".to_string(), "hunter2".to_string()),
+                ("line\nbreak".to_string(), "hunter2".to_string()),
+                ("line\u{2028}separator".to_string(), "hunter2".to_string()),
+                ("quote\"slash\\".to_string(), "hunter2".to_string()),
+                ("tab\tkey".to_string(), "hunter2".to_string()),
+                ("unicode界".to_string(), "hunter2".to_string()),
+                ("zero\u{200b}width".to_string(), "hunter2".to_string()),
+            ]))
+            .expect("mid-session env");
+        let env_entry_id = env_entry.id;
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("after"))
+                .expect("flush env entry");
+        }
+        let session_id = log.session_id().to_string();
+        drop(log);
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+
+        let events: Vec<AgentEvent> = replay(&resumed).collect();
+        let notices = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Notice { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices.len(),
+            1,
+            "the environment state entry must project exactly one notice: {events:#?}"
+        );
+        let notice = notices[0];
+        let AgentEvent::Notice { text, .. } = notice else {
+            unreachable!("matched above")
+        };
+        assert_eq!(
+            text,
+            r#"Session environment keys: "bidi\u{202e}key", "carriage\rreturn", "comma,key", "escape\u{1b}[31m", "line\nbreak", "line\u{2028}separator", "quote\"slash\\", "tab\tkey", "unicode\u{754c}", "zero\u{200b}width"."#,
+            "the complete terminal-facing notice must be quoted and escaped"
+        );
+        assert!(
+            text.is_ascii(),
+            "non-ASCII text reached the terminal-facing notice: {text:?}"
+        );
+        assert!(
+            !text.contains("hunter2"),
+            "an environment value reached notice text: {text:?}"
+        );
+
+        let snapshot = resumed.snapshot();
+        let projected = snapshot
+            .project_state_entry(&env_entry_id)
+            .expect("the public state projection covers environment entries");
+        assert_eq!(
+            wire(&projected),
+            wire(notice),
+            "the public state-entry API must return the replayed environment notice"
+        );
+        #[allow(deprecated)]
+        let settings_projection = snapshot.project_settings_entry(&env_entry_id);
+        assert!(
+            settings_projection.is_none(),
+            "the compatibility API must retain its settings-only contract"
+        );
     }
 
     /// A settings entry recorded after a message on the same thread
@@ -4788,7 +4896,8 @@ mod tests {
     }
 
     #[test]
-    fn project_settings_entry_answers_what_the_projection_emits() {
+    #[allow(deprecated)]
+    fn project_state_entry_answers_what_the_projection_emits() {
         let (_dir, log) = open_sub_log();
         let snapshot = log.snapshot();
         let entry_at = |seq: u64| {
@@ -4802,12 +4911,15 @@ mod tests {
         // Position 2 is the seed model change, ahead of any message on
         // its thread, so it projects nothing and the host must not
         // synthesize a notice for it.
-        assert!(snapshot.project_settings_entry(&entry_at(2)).is_none());
+        assert!(snapshot.project_state_entry(&entry_at(2)).is_none());
 
         // Position 6 is the mid-session thinking change.
         let projected = snapshot
-            .project_settings_entry(&entry_at(6))
+            .project_state_entry(&entry_at(6))
             .expect("a mid-session settings entry projects a notice");
+        let compatibility = snapshot
+            .project_settings_entry(&entry_at(6))
+            .expect("the compatibility API still projects inference settings");
         let from_backfill = project_suffix(&snapshot, Some(5), &live([1]))
             .events
             .into_iter()
@@ -4819,9 +4931,14 @@ mod tests {
             wire(&from_backfill),
             "the answer must be exactly what a backfill regenerates"
         );
+        assert_eq!(
+            wire(&compatibility),
+            wire(&projected),
+            "the compatibility API must preserve the previous settings result"
+        );
 
-        // A message entry is not a settings entry.
-        assert!(snapshot.project_settings_entry(&entry_at(3)).is_none());
+        // A message entry is not a notice-producing state entry.
+        assert!(snapshot.project_state_entry(&entry_at(3)).is_none());
     }
 
     #[test]

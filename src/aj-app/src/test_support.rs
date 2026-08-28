@@ -909,7 +909,7 @@ mod tests {
         assert_ne!(
             projected.convergent(),
             empty.convergent(),
-            "a projected settings notice survives the mask",
+            "a projected state notice survives the mask",
         );
     }
 

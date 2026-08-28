@@ -2,8 +2,8 @@
 //
 // Runs the *real* vendored libraries and template.js against a fixture
 // session in a minimal DOM shim, then asserts on the rendered HTML.
-// This is a dev tool, not wired into cargo: cargo tests cover the
-// server-side assembly, this covers the client-side rendering.
+// A cargo test launches this script when Node is available. Rust tests cover
+// the server-side assembly, while this covers the client-side rendering.
 //
 //   node src/aj/assets/export/smoke_test.mjs
 //
@@ -26,6 +26,12 @@ const entries = [
   { id: 'root', thread: 'meta', type: 'system_prompt', text: 'You are aj.', timestamp: '2024-01-01T00:00:00Z' },
   { id: 'u1', parent_id: 'root', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:01Z',
     message: { role: 'user', content: [{ type: 'text', text: 'Fix the **bug**. Here is code:\n```rust\nfn main(){}\n```' }], timestamp: 0 } },
+  // The exporter preserves keys but replaces every value before the renderer
+  // sees it. This state entry stays out of the default tree, appears under
+  // All with a keys-only label, and renders a real navigation target.
+  { id: 'env1', parent_id: 'u1', thread: 'user', type: 'env_change', timestamp: '2024-01-01T00:00:01Z',
+    env: { BEADS_ACTOR: '[redacted]', SECRET_TOKEN: '[redacted]', ['line\nbidi\u202e']: '[redacted]',
+      ['quote"slash\\']: '[redacted]', ['unicode界']: '[redacted]' } },
   { id: 'a1', parent_id: 'u1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:02Z',
     message: { role: 'assistant', model: 'claude-test', provider: 'anthropic',
       content: [
@@ -178,8 +184,18 @@ const filterButtons = ['default', 'no-tools', 'user-only', 'all'].map((mode) => 
   return btn;
 });
 
+// The shim does not parse assigned innerHTML. Resolve transcript ids from the
+// real rendered markup so navigation's getElementById and scroll path remain
+// observable rather than succeeding against a fixed element table.
+const scrolledTargets = [];
 const documentShim = {
-  getElementById: (id) => elements[id] || null,
+  getElementById: (id) => {
+    if (elements[id]) return elements[id];
+    if (!elements['messages'].innerHTML.includes('id="' + id + '"')) return null;
+    const renderedElement = makeEl('div');
+    renderedElement.scrollIntoView = () => scrolledTargets.push(id);
+    return renderedElement;
+  },
   createElement: (tag) => makeEl(tag),
   querySelector: () => null,
   querySelectorAll: (sel) => (sel === '.filter-btn' ? filterButtons : []),
@@ -295,6 +311,10 @@ has('code fence rendered as block', '<pre><code>');
 has('code fence content escaped', 'fn main(){}');
 has('assistant model label', 'claude-test');
 has('thinking block', 'thinking-block');
+hasnt('off-path environment target is absent before navigation', 'id="entry-env1"');
+hasnt('environment entry never renders redacted values', '[redacted]');
+hasnt('environment entry never renders a raw bidi override', '\u202e');
+hasnt('environment entry never renders raw non-ASCII key text', '界');
 
 console.log('tools');
 has('read_file summary', 'read_file /home/me/x.rs');
@@ -356,6 +376,7 @@ check('tree status line', /\d+ \/ \d+ entries/.test(treeStatus));
 check('tree node text escaped', !treeText.includes('<script>alert'));
 check('tree shows branch sibling', treeText.includes('alternative branch'));
 check('tree draws branch connectors', treeText.includes('\u251c') || treeText.includes('\u2514'));
+check('default tree hides environment state', !treeText.includes('[environment:'));
 
 // Spine layout: a sub-agent run hangs one level in off the message that
 // spawned it and renders before the conversation continues, while the
@@ -368,14 +389,47 @@ check('tree draws branch connectors', treeText.includes('\u251c') || treeText.in
 console.log('filter denominator');
 {
   const byMode = (m) => filterButtons.find((b) => b.dataset.filter === m);
+  fire(byMode('no-tools'), 'click');
+  check('no-tools tree hides environment state',
+    !elements['tree-container'].children.some((n) => n.dataset.id === 'env1'));
   fire(byMode('all'), 'click');
   const all = elements['tree-status'].textContent.match(/(\d+) \/ (\d+)/);
   check('all filter reads N / N', !!all && all[1] === all[2]);
+  const envNode = elements['tree-container'].children.find((n) => n.dataset.id === 'env1');
+  check('all filter gives environment state a keys-only row',
+    !!envNode && nodeText(envNode).includes('environment:') &&
+      nodeText(envNode).includes('BEADS_ACTOR') && nodeText(envNode).includes('SECRET_TOKEN') &&
+      nodeText(envNode).includes('line\\nbidi\\u{202e}') &&
+      !nodeText(envNode).includes('[redacted]') && !nodeText(envNode).includes('\u202e'));
+  if (envNode) {
+    fire(envNode, 'click');
+    const envTranscript = elements['messages'].innerHTML;
+    check('environment row navigates to its rendered transcript target',
+      envTranscript.includes('id="entry-env1"'));
+    check('environment target names keys without values',
+      envTranscript.includes('session environment keys: &quot;BEADS_ACTOR&quot;, &quot;SECRET_TOKEN&quot;') &&
+        envTranscript.includes('line\\nbidi\\u{202e}') &&
+        envTranscript.includes('quote\\&quot;slash\\\\') &&
+        envTranscript.includes('unicode\\u{754c}') &&
+        !envTranscript.includes('[redacted]') && !envTranscript.includes('\u202e') &&
+        !envTranscript.includes('界'));
+    check('environment target lookup reaches the scroll path',
+      scrolledTargets.includes('entry-env1'));
+    const activeEnv = elements['tree-container'].children.find((n) => n.classList.contains('active'));
+    check('environment row becomes the active target', !!activeEnv && activeEnv.dataset.id === 'env1');
+  }
+  fire(byMode('no-tools'), 'click');
+  check('no-tools hides environment state at the active head',
+    !elements['tree-container'].children.some((n) => n.dataset.id === 'env1'));
   fire(byMode('user-only'), 'click');
+  check('user-only hides environment state at the active head',
+    !elements['tree-container'].children.some((n) => n.dataset.id === 'env1'));
   const narrow = elements['tree-status'].textContent.match(/(\d+) \/ (\d+)/);
   check('narrowing keeps the same denominator', !!narrow && narrow[2] === all[2]);
   check('narrowing lowers the numerator', !!narrow && Number(narrow[1]) < Number(all[1]));
   fire(byMode('default'), 'click'); // restore the default view for later checks
+  check('default hides environment state at the active head',
+    !elements['tree-container'].children.some((n) => n.dataset.id === 'env1'));
 }
 
 console.log('layout');

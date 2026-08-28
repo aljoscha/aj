@@ -72,7 +72,7 @@ pub struct SessionStats {
     /// Size of the backing file. `None` when the file does not exist yet
     /// (a fresh log whose only entries are still buffered in memory).
     pub size_bytes: Option<u64>,
-    /// Every entry in the file: messages, settings records, the system
+    /// Every entry in the file: messages, state records, the system
     /// prompt, sub-agent roots, and compaction checkpoints.
     pub total_entries: usize,
     pub user_messages: usize,
@@ -118,7 +118,8 @@ pub struct SessionStats {
     /// indistinguishable, since a summarizer that legitimately reported
     /// nothing also sums to zero.
     pub compactions_with_usage: usize,
-    /// Model / thinking / speed currently recorded on the user thread.
+    /// Model, thinking, speed, verbosity, and environment currently recorded
+    /// on the user thread.
     pub settings: SessionSettings,
 }
 

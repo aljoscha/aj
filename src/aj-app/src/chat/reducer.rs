@@ -44,8 +44,8 @@ pub struct Redraw(pub bool);
 /// event of a dead-log replay.
 ///
 /// It is the durable identity of the effects whose event carries none of
-/// its own: a compaction checkpoint's summary row and a projected
-/// settings notice. Handing it in is what lets a re-served backfill
+/// its own: a compaction checkpoint's summary row and a projected state
+/// notice. Handing it in is what lets a re-served backfill
 /// update those rows in place instead of appending a second one, which
 /// the cursor invariant cannot do for them (spec 6.5). It also tells a
 /// `SubAgentStart` that names a spawn root from the entry-less bracketing
@@ -292,7 +292,7 @@ pub fn reduce(
 
         // ---- Notices --------------------------------------------------------
         AgentEvent::Notice { agent_id, text } => {
-            // The projected notice of a settings entry is durable, and
+            // The projected notice of a state entry is durable, and
             // `entry` is the only identity it has: a re-served suffix
             // updates the row it already produced instead of appending a
             // second one. A locally raised notice carries none and
@@ -1130,7 +1130,7 @@ fn append_tool_entry(
 /// Append a notice row, or update in place the row that `origin` already
 /// produced.
 ///
-/// `origin` is the durable identity the notice derives from: the settings
+/// `origin` is the durable identity the notice derives from: the state
 /// log entry behind a projected notice, the assistant message behind an
 /// in-band error line. `None` is "no durable identity" and appends
 /// unconditionally, which is what every locally raised notice carries.

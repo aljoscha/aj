@@ -822,7 +822,7 @@ impl Driver {
             // lock and projected outside it, because the projection walks
             // the whole log.
             let snapshot = self.session.core.log.lock().await.snapshot();
-            let notice = snapshot.project_settings_entry(&entry.id);
+            let notice = snapshot.project_state_entry(&entry.id);
 
             // Splice the notice into the stream at its own append
             // position. The confirm released the log lock before
@@ -1136,7 +1136,7 @@ impl Driver {
         }
         self.drain_events();
         crate::shutdown_background_tasks(&self.session.core.task_registry).await;
-        // Buffered non-punctuation entries (the settings records, spawn
+        // Buffered non-punctuation entries (the state records, spawn
         // roots) are lost with the process otherwise: nothing else forces
         // them out.
         if let Err(err) = self.session.core.log.lock().await.flush_pending() {

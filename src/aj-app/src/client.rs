@@ -732,7 +732,7 @@ mod tests {
         }
     }
 
-    /// A durable event with a body: the projected settings notice, which
+    /// A durable event with a body: a projected state notice, which
     /// takes its whole identity from the frame's `entry_id`.
     fn notice(text: &str) -> AgentEvent {
         AgentEvent::Notice {

@@ -251,7 +251,7 @@ pub struct NoticeEntry {
     pub level: NoticeLevel,
     pub text: String,
     /// What this notice derives from, when that has durable identity:
-    /// the settings log entry behind a projected notice, or the assistant
+    /// the state log entry behind a projected notice, or the assistant
     /// message behind an in-band error line. Keyed on so a re-served
     /// suffix updates the row it already produced. `None` for every
     /// locally raised notice (warnings, retry cadence, a compaction

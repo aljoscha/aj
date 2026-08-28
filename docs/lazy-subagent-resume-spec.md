@@ -227,7 +227,7 @@ so re-observing a sub-agent does no work.
 never contains a `Compaction` entry (compaction runs on the USER thread
 only), so single-thread projection needs no `log` handle for the
 compaction estimate that full replay computes. Parity with full replay
-holds because the usage accumulator and the settings-notice gate are
+holds because the usage accumulator and the state-notice gate are
 keyed per `AgentId`, so a fresh state scoped to `Sub(n)` reproduces the
 same `UsageUpdate` sequence and `Notice` gating that full replay
 produces for that sub-agent.

@@ -237,7 +237,7 @@ impl ConversationEntryKind {
     /// an assistant turn, a tool result) — anything we want durable
     /// per-line as the agent loop runs, and anything whose existence
     /// proves the session is worth keeping. Non-punctuation entries
-    /// are meta (the system prompt, settings records, and sub-agent
+    /// are framing and state (the system prompt, state records, and sub-agent
     /// spawn roots) and buffer in-memory until a punctuation flushes
     /// them.
     ///
@@ -492,7 +492,7 @@ impl Conversation {
                 ConversationEntryKind::SystemPrompt { .. } => {}
                 // Compaction does not change settings: it keeps the
                 // retained tail's last assistant model plus any
-                // pre-boundary settings entries.
+                // pre-boundary state entries.
                 ConversationEntryKind::Compaction { .. } => {}
             }
         }
@@ -531,7 +531,7 @@ pub struct LogSnapshot {
     /// This is the explicit head that replaces the implicit
     /// "most recently appended user entry" convention. Every
     /// user-thread [`ConversationLog::append`] advances it (messages,
-    /// settings records, compaction, repair); sub-agent and meta appends
+    /// state records, compaction, repair); sub-agent and meta appends
     /// leave it untouched. [`ConversationLog::set_head`] moves it to an
     /// earlier entry to start a sibling branch. `None` only while the
     /// user thread is empty (no user-thread entry yet); the next append
@@ -745,13 +745,13 @@ impl LogSnapshot {
             // Sub threads are linear per `agent_id`, so they anchor at
             // their own leaf. Branching does not apply to them.
             ThreadKind::Subagent => self.latest_leaf(filter),
-            // Settings and compaction appends only ever target the user
+            // State and compaction appends only ever target the user
             // or a sub-agent thread. A `Meta` filter is a misuse: a
             // `ThreadFilter` is never constructed with `thread: Meta`
             // (see `ThreadFilter::matches`), so reaching here means a
             // caller built an invalid filter.
             ThreadKind::Meta => {
-                unreachable!("settings/compaction appends never target the meta thread")
+                unreachable!("state/compaction appends never target the meta thread")
             }
         };
         leaf.or_else(|| self.system_prompt_id().cloned())
@@ -1161,7 +1161,7 @@ impl ConversationLog {
         // Advance the explicit head on every user-thread append, once
         // the entry is committed to the in-memory maps. This single
         // point covers every user-thread writer (messages via the
-        // persistence listener, settings, compaction, repair).
+        // persistence listener, state records, compaction, repair).
         // Sub-agent and meta appends must not touch the head.
         if thread == ThreadKind::User {
             self.core.head = Some(id.clone());
@@ -1247,7 +1247,7 @@ impl ConversationLog {
 
     /// Drain the buffered non-punctuation writes to disk, in append order.
     ///
-    /// Non-punctuation entries (settings records, spawn roots) normally
+    /// Non-punctuation entries (state records, spawn roots) normally
     /// buffer in memory until the next punctuation append flushes them
     /// (see [`ConversationEntryKind::is_punctuation`]). Branch rebuilds
     /// re-resume the log from disk, so any still-buffered entries would be
@@ -1396,14 +1396,14 @@ impl ConversationLog {
     }
 
     /// Record a model change on the thread selected by `filter`. See
-    /// [`Self::append_settings_entry`] for anchoring and durability.
+    /// [`Self::append_state_entry`] for anchoring and durability.
     pub fn append_model_change(
         &mut self,
         filter: ThreadFilter,
         provider: &str,
         model_id: &str,
     ) -> Result<EntryRef, ConversationError> {
-        self.append_settings_entry(
+        self.append_state_entry(
             filter,
             ConversationEntryKind::ModelChange {
                 provider: provider.to_string(),
@@ -1413,13 +1413,13 @@ impl ConversationLog {
     }
 
     /// Record a thinking-effort change on the thread selected by
-    /// `filter`. See [`Self::append_settings_entry`].
+    /// `filter`. See [`Self::append_state_entry`].
     pub fn append_thinking_change(
         &mut self,
         filter: ThreadFilter,
         level: &str,
     ) -> Result<EntryRef, ConversationError> {
-        self.append_settings_entry(
+        self.append_state_entry(
             filter,
             ConversationEntryKind::ThinkingChange {
                 level: level.to_string(),
@@ -1428,13 +1428,13 @@ impl ConversationLog {
     }
 
     /// Record a speed change on the thread selected by `filter`. See
-    /// [`Self::append_settings_entry`].
+    /// [`Self::append_state_entry`].
     pub fn append_speed_change(
         &mut self,
         filter: ThreadFilter,
         speed: &str,
     ) -> Result<EntryRef, ConversationError> {
-        self.append_settings_entry(
+        self.append_state_entry(
             filter,
             ConversationEntryKind::SpeedChange {
                 speed: speed.to_string(),
@@ -1443,13 +1443,13 @@ impl ConversationLog {
     }
 
     /// Record an output-verbosity change on the thread selected by
-    /// `filter`. See [`Self::append_settings_entry`].
+    /// `filter`. See [`Self::append_state_entry`].
     pub fn append_verbosity_change(
         &mut self,
         filter: ThreadFilter,
         verbosity: &str,
     ) -> Result<EntryRef, ConversationError> {
-        self.append_settings_entry(
+        self.append_state_entry(
             filter,
             ConversationEntryKind::VerbosityChange {
                 verbosity: verbosity.to_string(),
@@ -1466,7 +1466,7 @@ impl ConversationLog {
         &mut self,
         env: BTreeMap<String, String>,
     ) -> Result<EntryRef, ConversationError> {
-        self.append_settings_entry(ThreadFilter::USER, ConversationEntryKind::EnvChange { env })
+        self.append_state_entry(ThreadFilter::USER, ConversationEntryKind::EnvChange { env })
     }
 
     /// Record a compaction checkpoint on `filter`'s thread, anchored at
@@ -1535,12 +1535,12 @@ impl ConversationLog {
         )
     }
 
-    /// Append a settings entry on `filter`'s thread, anchored at the
+    /// Append a state entry on `filter`'s thread, anchored at the
     /// thread's current head and falling back to the system-prompt
-    /// root when the thread is empty. Settings entries are
+    /// root when the thread is empty. State entries are
     /// non-punctuation, so they buffer until the next punctuation
     /// append (see [`ConversationEntryKind::is_punctuation`]).
-    fn append_settings_entry(
+    fn append_state_entry(
         &mut self,
         filter: ThreadFilter,
         entry: ConversationEntryKind,
