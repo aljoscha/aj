@@ -2997,13 +2997,102 @@ fn a_base_url_has_to_be_absolute_http() {
 // The identity gate over HTTP (spec 6.11, 11.4)
 // ---------------------------------------------------------------------------
 
+const PROBED_ROUTES: [&str; 18] = [
+    "GET /v1/hello",
+    "GET /v1/sessions",
+    "POST /v1/sessions",
+    "GET /v1/sessions/{id}/tasks",
+    "GET /v1/sessions/{id}/tasks/1",
+    "GET /v1/sessions/{id}/queue",
+    "GET /v1/sessions/{id}/tree",
+    "GET /v1/events",
+    "POST /v1/sessions/{id}/cancel",
+    "POST /v1/sessions/{id}/queue",
+    "POST /v1/sessions/{id}/settings",
+    "POST /v1/sessions/{id}/tag",
+    "POST /v1/sessions/{id}/archive",
+    "POST /v1/sessions/{id}/head",
+    "POST /v1/sessions/{id}/tasks/1/kill",
+    "POST /v1/sessions/{id}/compact",
+    "POST /v1/sessions/{id}/prompt",
+    "POST /v1/sessions/{id}/steer",
+];
+
+struct RouteProbe {
+    route: String,
+    status: StatusCode,
+    error: Option<ErrorResponse>,
+}
+
+/// Name a probe from the HTTP request that will be executed, rather than from
+/// a parallel label that could silently drift to another route.
+fn probed_route(request: &reqwest::Request, session: &str) -> String {
+    let session_path = format!("/v1/sessions/{session}");
+    let path = request
+        .url()
+        .path()
+        .replacen(&session_path, "/v1/sessions/{id}", 1);
+    format!("{} {path}", request.method())
+}
+
+async fn probe_requests(
+    http: &reqwest::Client,
+    session: &str,
+    requests: Vec<reqwest::Request>,
+) -> Vec<RouteProbe> {
+    let mut probes = Vec::with_capacity(requests.len());
+    for request in requests {
+        let route = probed_route(&request, session);
+        let waiting_for = format!("{route} response and error body");
+        let (status, error) =
+            bounded(&waiting_for, async {
+                let response = http
+                    .execute(request)
+                    .await
+                    .unwrap_or_else(|err| panic!("{route} could not reach the server: {err}"));
+                let status = response.status();
+                let error =
+                    if status.is_success() {
+                        None
+                    } else {
+                        Some(response.json().await.unwrap_or_else(|err| {
+                            panic!("{route} returned no protocol error: {err}")
+                        }))
+                    };
+                (status, error)
+            })
+            .await;
+        probes.push(RouteProbe {
+            route,
+            status,
+            error,
+        });
+    }
+    probes
+}
+
+fn command_probe(
+    http: &reqwest::Client,
+    base: &str,
+    session: &str,
+    command: &RemoteCommand,
+) -> reqwest::Request {
+    http.post(format!("{base}/v1/sessions/{session}/{}", command.route()))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(command.body().expect("encode a route probe"))
+        .build()
+        .expect("build a route probe")
+}
+
 /// Every route, ordered so each mutation's session precondition is stable.
 ///
 /// Commands through `KillTask` leave the session idle. `Compact` then starts
 /// work, after which prompt and steer are valid whether that work is still live
 /// or has already finished. The gate probe therefore has no turn-completion
 /// race to mistake for an authorization failure.
-async fn probe_every_route(client: &RemoteClient, session: &str) -> Vec<Result<(), RemoteError>> {
+async fn probe_every_route(client: &RemoteClient, session: &str) -> Vec<RouteProbe> {
+    let http = reqwest::Client::new();
+    let base = client.base();
     let commands = [
         RemoteCommand::Cancel(CancelRequest::default()),
         RemoteCommand::Queue(QueueRequest {
@@ -3035,30 +3124,69 @@ async fn probe_every_route(client: &RemoteClient, session: &str) -> Vec<Result<(
             agent: None,
         }),
     ];
-
-    let mut probes = vec![
-        client.hello().await.map(|_| ()),
-        client.sessions().await.map(|_| ()),
-        client
-            .create_session(CreateSessionRequest::default())
-            .await
-            .map(|_| ()),
-        client.tasks(session).await.map(|_| ()),
-        client.task(session, 1).await.map(|_| ()),
-        client.queue(session).await.map(|_| ()),
-        client.tree(session).await.map(|_| ()),
-        client
-            .events(&[AttachRequest {
-                session: session.to_string(),
-                cursor: None,
-            }])
-            .await
-            .map(|_| ()),
+    let mut requests = vec![
+        http.get(format!("{base}/v1/hello"))
+            .build()
+            .expect("build the hello probe"),
+        http.get(format!("{base}/v1/sessions"))
+            .build()
+            .expect("build the session-list probe"),
+        http.post(format!("{base}/v1/sessions"))
+            .json(&CreateSessionRequest::default())
+            .build()
+            .expect("build the create probe"),
+        http.get(format!("{base}/v1/sessions/{session}/tasks"))
+            .build()
+            .expect("build the task-list probe"),
+        http.get(format!("{base}/v1/sessions/{session}/tasks/1"))
+            .build()
+            .expect("build the task probe"),
+        http.get(format!("{base}/v1/sessions/{session}/queue"))
+            .build()
+            .expect("build the queue probe"),
+        http.get(format!("{base}/v1/sessions/{session}/tree"))
+            .build()
+            .expect("build the tree probe"),
+        http.get(format!("{base}/v1/events"))
+            .query(&[("session", session)])
+            .build()
+            .expect("build the event-stream probe"),
     ];
     for command in &commands {
-        probes.push(client.command(session, command).await.map(|_| ()));
+        requests.push(command_probe(&http, base, session, command));
     }
-    probes
+    probe_requests(&http, session, requests).await
+}
+
+fn assert_route_census(probes: &[RouteProbe]) {
+    assert_eq!(
+        probes
+            .iter()
+            .map(|probe| probe.route.as_str())
+            .collect::<Vec<_>>(),
+        PROBED_ROUTES,
+        "every registered request is probed once",
+    );
+}
+
+fn assert_generic_forbidden(probe: &RouteProbe) {
+    assert_eq!(
+        probe.status,
+        StatusCode::FORBIDDEN,
+        "{} got {}",
+        probe.route,
+        probe.status,
+    );
+    let error = probe
+        .error
+        .as_ref()
+        .unwrap_or_else(|| panic!("{} returned no protocol refusal", probe.route));
+    assert_eq!(error.code, "forbidden", "{} got {error:?}", probe.route);
+    assert_eq!(
+        error.message, "this peer is not authorized",
+        "{} exposed a peer-specific refusal",
+        probe.route,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3074,16 +3202,23 @@ async fn a_rejected_peer_gets_403_on_every_route() {
 
     let probes = probe_every_route(&fixture.client, &session).await;
 
-    assert_eq!(probes.len(), 18, "every route is probed");
-    for probe in probes {
-        let err = probe.expect_err("the gate refuses");
-        assert_eq!(err.status(), Some(StatusCode::FORBIDDEN), "got {err}");
-        assert_eq!(err.code(), Some("forbidden"), "got {err}");
-        assert!(
-            !err.to_string().contains("alice@github"),
-            "a refusal does not hand the allowlist to the peer: {err}",
-        );
+    assert_route_census(&probes);
+    for probe in &probes {
+        assert_generic_forbidden(probe);
     }
+
+    let http = reqwest::Client::new();
+    let fallback = http
+        .get(format!(
+            "{}/v1/not-a-registered-route",
+            fixture.client.base()
+        ))
+        .build()
+        .expect("build the router fallback probe");
+    let fallback = probe_requests(&http, &session, vec![fallback]).await;
+    assert_eq!(fallback[0].route, "GET /v1/not-a-registered-route");
+    assert_generic_forbidden(&fallback[0]);
+
     assert!(
         !whois.asked().is_empty(),
         "the gate resolved the connection's peer",
@@ -3107,17 +3242,35 @@ async fn an_authorized_peer_reaches_every_route() {
 
     let probes = probe_every_route(&fixture.client, &session).await;
 
-    assert_eq!(probes.len(), 18, "every route is probed");
-    for (index, probe) in probes.into_iter().enumerate() {
-        // Three of the probes name something that does not exist (task 1,
-        // and the head entry), so they are refused on their own merits. What
-        // matters here is that nothing is refused by the gate.
-        if let Err(err) = probe {
-            assert_eq!(
-                err.status(),
-                Some(StatusCode::NOT_FOUND),
-                "probe {index} was refused by something other than its own merits: {err}",
-            );
+    assert_route_census(&probes);
+    for probe in probes {
+        let expected_error = match probe.route.as_str() {
+            "GET /v1/sessions/{id}/tasks/1" | "POST /v1/sessions/{id}/tasks/1/kill" => {
+                Some("unknown_task")
+            }
+            "POST /v1/sessions/{id}/head" => Some("unknown_entry"),
+            _ => None,
+        };
+        match expected_error {
+            None => assert!(
+                probe.status.is_success(),
+                "{} was refused by something other than its own merits: {:?}",
+                probe.route,
+                probe.error,
+            ),
+            Some(code) => {
+                assert_eq!(
+                    probe.status,
+                    StatusCode::NOT_FOUND,
+                    "{} got {:?}",
+                    probe.route,
+                    probe.error,
+                );
+                let error = probe.error.unwrap_or_else(|| {
+                    panic!("{} succeeded instead of answering {code}", probe.route)
+                });
+                assert_eq!(error.code, code, "{} got {error:?}", probe.route);
+            }
         }
     }
     fixture.shutdown().await;

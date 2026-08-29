@@ -130,7 +130,7 @@ pub(crate) enum RemoteCommand {
 
 impl RemoteCommand {
     /// The route under `/v1/sessions/{id}/`.
-    fn route(&self) -> String {
+    pub(super) fn route(&self) -> String {
         match self {
             Self::Prompt(_) => "prompt".to_string(),
             Self::Steer(_) => "steer".to_string(),
@@ -145,7 +145,7 @@ impl RemoteCommand {
         }
     }
 
-    fn body(&self) -> Result<Vec<u8>, RemoteError> {
+    pub(super) fn body(&self) -> Result<Vec<u8>, RemoteError> {
         match self {
             Self::Prompt(request) => encode(request),
             Self::Steer(request) => encode(request),
