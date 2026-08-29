@@ -364,8 +364,7 @@ ruled to work over a connection, one host-side read per feature under
 the doctrine spec 9.1 states, queued behind the work in flight. Spec
 section 13's two banked entries (remote previews, cross-host prompt
 history) graduate to live design when that work starts, and 9.1's
-refusal list shrinks as each lands. The render-loop cost stays banked,
-re-prioritized by actual use.
+refusal list shrinks as each lands.
 
 The `locked` row bit and its generation (spec 6.5, 6.8) are published
 and read: every host acquire advances the session's counter before a
