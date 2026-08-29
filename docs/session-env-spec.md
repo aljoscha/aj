@@ -29,6 +29,13 @@ under `--listen`, and a launch env that rode the host's base config
 would stamp the launcher's identity onto sessions remote peers
 create.
 
+**Log scope.** Session env is immutable log-level creation metadata,
+not user-thread or branch state. Selecting, reconstructing, or
+switching a conversation head cannot select, replace, or clear it.
+Every branch of an env-bearing session executes with the same map,
+including one rooted directly at the system prompt before any
+inference-setting entry. In v1 only creation records the map.
+
 Consequences, each ruled below:
 
 - A parked session re-materialized after the bench changed occupants
@@ -180,41 +187,54 @@ One new variant on `ConversationEntryKind`, beside the four settings
 variants:
 
 ```rust
-/// The session's environment map (or its first recording). Whole-map
-/// semantics: the entry states the complete session env from this
-/// point on the path, so a fold keeps the last entry seen and never
-/// merges. v1 writes exactly one, at creation. A future mutation
-/// surface appends the complete resulting map as a new entry with no
-/// format change.
+/// The complete environment fixed for this session at creation.
+/// V1 writes it once as log-level creation metadata when creation
+/// stated a map. An empty map is distinct from no record.
 EnvChange { env: BTreeMap<String, String> },
 ```
 
 Serialized as `"type": "env_change"` under the existing tagged
-scheme. Non-punctuation, like the settings seeds: a created session
-that never receives a message leaves no file.
+scheme. The creation record is `ThreadKind::Meta`, has no `agent_id`,
+and names the system-prompt root as its parent. It is never a legal
+conversation head. Non-punctuation, like the settings seeds: a
+created session that never receives a message leaves no file.
 
-- **Seed**: `freeze_and_seed` appends one `EnvChange` after the four
-  settings seeds on a brand-new log, exactly when the create stated
-  env (absent env writes no entry, `None` stays distinct from
-  `Some({})`).
-- **Extraction**: `aj-session`'s `SessionSettings` (the extraction
-  struct on `Conversation`, not the wire struct of the same name)
-  gains `env: Option<BTreeMap<String, String>>`, filled by the same
-  single forward scan, last entry wins. `None` means nothing
-  recorded (legacy log or env-less create).
-- **Compaction**: carried for free. A `Compaction` entry only changes
-  message projection, `linearize` keeps every entry kind on the
-  chain, so `settings()` still sees the seed. Pinned by a test, not
-  by new mechanism.
-- **Branching**: branches are subtrees of one log and the seed
-  precedes any fork, so every branch shares it by construction. The
-  branch-switch restore path (`head_switch` re-running settings
-  restore) re-applies the recorded env uniformly, which is a no-op in
-  v1 and stays correct if mutation ever lands.
-- **Replay**: mirrors the settings-entry rule. An `EnvChange` with no
-  preceding message on its thread (the seed, always in v1) projects
-  nothing. A post-message entry projects one notice naming the keys
-  only. Values never enter replay output.
+**Transactional first publication.** A new log does not expose its
+target file one line at a time. On the first punctuation append,
+`ConversationLog` assembles the pending system prompt, optional
+`EnvChange`, inference-setting seeds, and punctuation into one complete
+initial image at a same-directory staging path outside the session-log
+namespace. After the complete image is written and flushed, it is
+atomically installed at the canonical session path without replacing
+an existing file.
+
+Pending records are not drained until installation succeeds. A
+surfaced write, flush, or install error leaves the canonical path absent
+or unchanged and keeps the fresh log's complete pending prefix for a
+same-object retry. A process failure before install may leave only an
+ignored staging artifact. After install the canonical image has a
+punctuation record after `EnvChange`. `flush_pending` remains a no-op
+before first punctuation. Later appends and the existing power-loss
+contract are unchanged.
+
+- **Seed**: `freeze_and_seed` appends one `EnvChange` immediately after
+  the system-prompt root and before the user-thread inference-setting
+  seeds, exactly when the create stated env. An absent map writes no
+  entry, so `None` stays distinct from `Some({})`.
+- **Extraction**: `LogSnapshot` and `ConversationLog` expose
+  `session_env()`, which reads the log-level creation record
+  independently of the active head. `None` means a legacy log or an
+  env-less create. `aj-session`'s `SessionSettings` remains
+  inference-only, and `Conversation::settings()` cannot state session
+  identity because a `Conversation` is head-filtered.
+- **Compaction**: cannot affect `session_env()`, because extraction
+  uses neither message projection nor a head-linearized conversation.
+- **Branching**: existing head targets remain valid, including the
+  system-prompt root and inference-setting entries before the first
+  message. `head_switch` restores branch-local inference settings but
+  neither reapplies nor clears the session env.
+- **Replay**: the log-level creation record always projects nothing.
+  V1 has no post-message env change to announce.
 - **Export**: the `/export` artifact embeds every log entry verbatim
   today, and a self-contained HTML file is built to leave the
   machine. The `ExportEntry` serializer (which already normalizes
@@ -236,9 +256,10 @@ which already carries whatever secrets pass through tool output.
 - **Agent state**: the `Agent`'s session state holds
   `session_env: BTreeMap<String, String>` (empty when none), set at
   `SessionCore::build`: from the create's map on Create, from
-  `conversation.settings().env` on Resume. Remote materialize goes
-  through the same build, so parked sessions restore their env across
-  host restarts with no extra mechanism.
+  `PreparedLog::session_env` on Resume. Remote materialize goes through
+  the same log-level extraction, so parked sessions restore their env
+  across host restarts. Head switching restores only branch-local
+  inference settings and never mutates session env.
 - **Tool seam**: `ToolContext` gains a `session_env()` accessor,
   backed by the session state through `SessionContextWrapper` like
   `working_directory()`. `BashTool::execute` applies it at the single
@@ -279,16 +300,17 @@ same on either side of a subcommand and reaches `connect`):
   to `create_with`, the Remote arm puts it on the wire request).
   It is not baked into the composed host's base config, per the
   invariant.
-- **Resume**: on any resume or materialize the log wins, exactly as
-  settings restore already works. A log that records env restores
-  it, and a log that records none resumes with none. The launch env
-  stays armed for creates the run performs later (an in-TUI new
-  session), so a resume does not consume or apply it. Where a run's
-  primary gesture creates nothing (`aj continue --env`, a bare
-  `aj connect --env` that attached), the run says the resumed or
-  attached session keeps its own env and that `--env` names
-  creations, mirroring how a `--tag` that named nothing is handled.
-  No backfill entry is written.
+- **Resume**: on any resume or materialize the log-level creation
+  record wins independently of the selected conversation head. A log
+  that records env restores it, and a log that records none resumes
+  with none. No branch-local settings fold or launch env may substitute
+  for that record. The launch env stays armed for creates the run
+  performs later (an in-TUI new session), so a resume does not consume
+  or apply it. Where a run's primary gesture creates nothing
+  (`aj continue --env`, a bare `aj connect --env` that attached), the
+  run says the resumed or attached session keeps its own env and that
+  `--env` names creations, mirroring how a `--tag` that named nothing
+  is handled. No backfill entry is written.
 - **`aj serve` / `aj gateway`**: refuse `--env` at startup with an
   error saying session env is stated per create.
 - **Print mode**: a fresh `aj -p` run seeds and applies env like the
@@ -305,6 +327,8 @@ same on either side of a subcommand and reaches `connect`):
   (spec 9.1) and reads the same log the operator could `cat`, so
   values are shown: verifying identity at a glance is the use case,
   and `BEADS_ACTOR` redacted to a key name verifies nothing.
+  `SessionStats` carries the log-level `session_env` separately from
+  its branch-local inference settings.
 - **Export**: keys only, values redacted (section 3).
 - **Non-goals, v1**: no env in the sessions directory rows, `state`
   frames, or any remote read. When session info learns to answer
@@ -313,12 +337,16 @@ same on either side of a subcommand and reaches `connect`):
 
 ## 7. Back-compat
 
-- New binary, old log: no `EnvChange` entry, `settings().env` is
-  `None`, session runs with no env. No migration.
-- Old binary, new log: the unknown `"type": "env_change"` tag makes
-  the resume report the log as corrupt, the accepted posture for
-  every entry-kind addition (settings persistence shipped the same
-  way).
+- New binary, old log: no `EnvChange` entry, `session_env()` is `None`,
+  session runs with no env. No migration.
+- Old binary, new log: under the process-crash and surfaced-error
+  contract, transactional first publication leaves either no canonical
+  file or a complete initial image in which the unknown
+  `"type": "env_change"` entry is followed by the first punctuation.
+  The old reader therefore reports the interior unknown entry as corrupt
+  and leaves the file unchanged. Its general rule still treats an
+  unknown final entry as a torn tail and truncates it, but the v1 writer
+  does not expose `EnvChange` in that position.
 - New client, old host: section 2.2. The echo's absence is the
   signal, the client is loud, nothing pre-gates.
 - Old client, new host: never states env, never sees `env_keys`
@@ -358,6 +386,26 @@ helper-built component is driven directly.
   the log's env (the occupant-change case, the reason persistence
   exists). Legacy log resumed with `--env` runs env-less and
   notices.
+- **First publication**: an owning subprocess drives the production
+  first-punctuation path through deterministic checkpoints after the
+  staged image is written and flushed and around no-clobber install.
+  Kill and wait at each checkpoint. The canonical path is always absent
+  or contains punctuation after `EnvChange`. Injected write, flush, and
+  install errors keep the complete pending prefix; retrying a
+  punctuation append on the same `ConversationLog` publishes the
+  original env once. A frozen pre-`EnvChange` codec fixture first proves
+  it truncates a manually constructed final unknown entry, then proves
+  it refuses the published interior unknown entry without changing
+  bytes. Direct target writes or draining pending records before install
+  must make these tests red.
+- **Head independence**: through a real `SessionHost`, create with env,
+  switch successfully to the system-prompt root, and send a prompt whose
+  user-thread ancestry omits every inference-setting seed. Before that
+  prompt the switch leaves the canonical path absent. `session_env()`
+  and the real bash child still observe the creation map, including
+  after host restart and materialization on that branch. Deriving env
+  from `Conversation::settings()`, clearing it on head switch, or
+  rejecting the root head must make this test red.
 - **Local paths**: launch `--env` reaches the startup create's seed
   entry and an in-TUI new session's seed entry. `aj serve --env`
   refuses to start. Duplicate-key and missing-`=` parses refuse.
