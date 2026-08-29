@@ -304,14 +304,12 @@ async fn run_stream_inner(
                 for out in state.process(ev) {
                     producer.push(out);
                 }
+                if state.saw_terminal() {
+                    break;
+                }
             }
             SelectOutcome::Ready(Some(Err(err))) => {
-                producer.push(error_message(
-                    API_NAME,
-                    model,
-                    credential.account.as_deref(),
-                    classify_client_error(&err),
-                ));
+                producer.push(state.client_failed(classify_client_error(&err)));
                 return Ok(());
             }
             SelectOutcome::Ready(None) => break,
@@ -1024,6 +1022,10 @@ enum ItemSlot {
 pub(super) struct StreamState {
     partial: AssistantMessage,
     started: bool,
+    /// Whether the first provider lifecycle terminal has been observed.
+    /// This is independent of `finish_status`, which is optional on a
+    /// completed response.
+    terminal_seen: bool,
     /// Slots keyed by `output_index` — stable per output item.
     slots: HashMap<u32, ItemSlot>,
     /// Captured terminal Response (from `response.completed` /
@@ -1090,6 +1092,7 @@ impl StreamState {
         Self {
             partial,
             started: false,
+            terminal_seen: false,
             slots: HashMap::new(),
             final_response: None,
             finish_status: None,
@@ -1102,6 +1105,17 @@ impl StreamState {
     }
 
     pub(super) fn process(&mut self, event: ResponseStreamEvent) -> Vec<AssistantMessageEvent> {
+        if self.terminal_seen {
+            return Vec::new();
+        }
+        self.terminal_seen = matches!(
+            &event,
+            ResponseStreamEvent::ResponseCompleted { .. }
+                | ResponseStreamEvent::ResponseIncomplete { .. }
+                | ResponseStreamEvent::ResponseFailed { .. }
+                | ResponseStreamEvent::Error { .. }
+        );
+
         let mut out = Vec::new();
         match event {
             ResponseStreamEvent::ResponseCreated { response, .. }
@@ -1516,12 +1530,10 @@ impl StreamState {
         });
     }
 
-    /// Whether the wire stream delivered its terminal lifecycle event
-    /// (`response.completed` / `response.incomplete` / `response.failed`,
-    /// or a top-level SSE `error`), each of which sets `finish_status`.
-    /// When `false` at stream end the turn was truncated mid-flight.
+    /// Whether the wire stream delivered its terminal lifecycle event.
+    /// Kept separately from status because completed responses may omit it.
     pub(super) fn saw_terminal(&self) -> bool {
-        self.finish_status.is_some()
+        self.terminal_seen
     }
 
     /// The service-tier price multiplier for this turn.
@@ -1571,6 +1583,22 @@ impl StreamState {
     pub(super) fn cancelled(&mut self) -> AssistantMessageEvent {
         self.seal();
         AssistantMessageEvent::aborted(self.partial.clone())
+    }
+
+    /// Terminalize an SDK item failure from the state that consumed every
+    /// preceding frame. A provider lifecycle terminal wins over later
+    /// transport noise.
+    pub(super) fn client_failed(mut self, error: AssistantError) -> AssistantMessageEvent {
+        if self.saw_terminal() {
+            return self.finalize();
+        }
+        self.seal();
+        self.partial.stop_reason = StopReason::Error;
+        self.partial.error = Some(error);
+        AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error: self.partial,
+        }
     }
 
     /// Build the stream's terminal event, classifying a stream that ended
@@ -1814,6 +1842,59 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn partial_text_events(text: &str) -> Vec<String> {
+        [
+            serde_json::json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_1", "object": "response", "created_at": 0.0,
+                    "model": "gpt-5", "output": [], "parallel_tool_calls": true,
+                    "tools": [], "status": "in_progress"
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "message", "id": "msg_1", "content": [],
+                    "role": "assistant", "status": "in_progress"
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                "delta": text
+            }),
+        ]
+        .into_iter()
+        .map(|event| event.to_string())
+        .collect()
+    }
+
+    fn completed_without_status() -> ResponseStreamEvent {
+        let mut completed = priced_flex_completed_response();
+        completed
+            .get_mut("response")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completed response object")
+            .remove("status");
+        serde_json::from_value(completed).expect("completed response without status")
+    }
+
+    fn message_text(message: &AssistantMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -2143,9 +2224,10 @@ mod tests {
             other => panic!("expected truncated Error, got {other:?}"),
         }
 
-        // Positive control: a terminal lifecycle status finalizes `Done`.
+        // Positive control: the lifecycle event is terminal even when its
+        // optional response status is absent.
         let mut state = StreamState::new(&fake_model(false), None);
-        state.finish_status = Some(ResponseStatus::Completed);
+        let _ = state.process(completed_without_status());
         assert!(state.saw_terminal());
         assert!(matches!(
             state.finalize_or_truncate(),
@@ -2316,32 +2398,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_live_mid_stream_cancel_harvests_the_completed_response() {
-        let completed = priced_flex_completed_response().to_string();
-        let server =
-            crate::provider_test_support::held_sse_server("POST /v1/responses", vec![completed])
-                .await;
+    async fn a_live_sdk_read_failure_keeps_responses_state() {
+        let server = crate::provider_test_support::failing_sse_server(
+            "POST /v1/responses",
+            partial_text_events("partial"),
+        )
+        .await;
         let mut model = fake_model(false);
         model.base_url = format!("{}/v1", server.base_url);
-        let token = CancellationToken::new();
-        let options = labeled_options(token.clone());
+        let options = labeled_options(CancellationToken::new());
         let mut stream = OpenAiResponsesProvider.stream(&model, &Context::new("system"), &options);
 
-        let start = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
-            .await
-            .expect("provider emits Start")
-            .expect("stream event");
-        assert!(matches!(start, AssistantMessageEvent::Start { .. }));
-        token.cancel();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match stream.next().await {
+                    Some(AssistantMessageEvent::TextDelta { delta, .. }) => break delta,
+                    Some(event) if event.is_terminal() => {
+                        panic!("provider terminated before the opening text: {event:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("provider stream ended before the opening text"),
+                }
+            }
+        })
+        .await
+        .expect("provider emits opening text");
+        assert_eq!(observed, "partial");
+        server.finish().await;
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
             .await
-            .expect("cancel emits terminal");
+            .expect("body failure emits terminal");
+
+        assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert_eq!(terminal.api, API_NAME);
+        assert_eq!(terminal.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(message_text(&terminal), "partial");
+        assert_eq!(
+            (
+                terminal.usage.input,
+                terminal.usage.output,
+                terminal.usage.cache_read,
+                terminal.usage.cache_write,
+                terminal.usage.total_tokens,
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(terminal.usage.cost.total, 0.0);
+        let error = terminal.error.expect("transport error retained");
+        assert_eq!(error.category, ErrorCategory::Transient);
+        assert!(
+            error.message.contains("internal:"),
+            "got: {}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn response_completed_returns_before_the_http_body_closes() {
+        let mut events = partial_text_events("complete");
+        events.push(priced_flex_completed_response().to_string());
+        let server =
+            crate::provider_test_support::held_sse_server("POST /v1/responses", events).await;
+        let mut model = fake_model(false);
+        model.base_url = format!("{}/v1", server.base_url);
+        let options = labeled_options(CancellationToken::new());
+        let stream = OpenAiResponsesProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("completion returns before held HTTP body closes");
         server.finish().await;
 
-        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.stop_reason, StopReason::Stop);
+        assert!(terminal.error.is_none());
+        assert_eq!(message_text(&terminal), "complete");
+        assert_eq!(terminal.response_id.as_deref(), Some("resp_1"));
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(terminal.usage.total_tokens, 2_000_000);
         assert!((terminal.usage.cost.total - 5.625).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lifecycle_type_owns_terminal_state_and_the_first_terminal_is_sticky() {
+        let mut state = StreamState::new(&fake_model(false), Some(ServiceTier::Flex));
+        for event in partial_text_events("A") {
+            let event = serde_json::from_str(&event).expect("partial response event");
+            let _ = state.process(event);
+        }
+        assert!(!state.saw_terminal());
+
+        let _ = state.process(completed_without_status());
+        assert!(state.saw_terminal());
+        let conflicting_failure: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.failed",
+            "sequence_number": 9,
+            "response": {
+                "id": "resp_other", "object": "response", "created_at": 0.0,
+                "model": "gpt-5", "output": [], "parallel_tool_calls": true,
+                "tools": [], "status": "failed",
+                "error": {"code": "server_error", "message": "later failure"},
+                "usage": {"input_tokens": 9, "output_tokens": 9, "total_tokens": 18}
+            }
+        }))
+        .expect("conflicting response.failed");
+        let later_delta: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 10,
+            "item_id": "msg_1", "output_index": 0, "content_index": 0,
+            "delta": "B"
+        }))
+        .expect("later text delta");
+        assert!(state.process(conflicting_failure).is_empty());
+        assert!(state.process(later_delta).is_empty());
+
+        let terminal = state.client_failed(AssistantError::new(
+            ErrorCategory::Transient,
+            "later transport failure",
+        ));
+        let message = terminal.partial();
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert!(message.error.is_none());
+        assert_eq!(message_text(message), "A");
+        assert_eq!(message.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(message.usage.total_tokens, 2_000_000);
+        assert!((message.usage.cost.total - 5.625).abs() < 1e-9);
     }
 
     #[test]

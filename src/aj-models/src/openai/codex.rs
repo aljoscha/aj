@@ -47,12 +47,13 @@ use crate::provider::Provider;
 use crate::registry::{ModelInfo, validate_thinking_level};
 use crate::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
 use crate::transform::transform_messages;
+#[cfg(any(test, feature = "test-support"))]
+use crate::types::AssistantMessage;
 #[cfg(test)]
 use crate::types::StopReason;
 use crate::types::{
-    AssistantError, AssistantMessage, Context, ErrorCategory,
-    ReasoningSummary as UnifiedReasoningSummary, SimpleStreamOptions, StreamOptions, ThinkingLevel,
-    ToolDefinition,
+    AssistantError, Context, ErrorCategory, ReasoningSummary as UnifiedReasoningSummary,
+    SimpleStreamOptions, StreamOptions, ThinkingLevel, ToolDefinition,
 };
 // Used only by the `test-support` round-trip helpers below.
 #[cfg(any(test, feature = "test-support"))]
@@ -282,12 +283,7 @@ async fn run_stream_inner(
                 }
             },
             SelectOutcome::Ready(Some(Err(err))) => {
-                producer.push(error_message(
-                    API_NAME,
-                    model,
-                    credential.account.as_deref(),
-                    classify_codex_client_error(&err),
-                ));
+                producer.push(state.client_failed(classify_codex_client_error(&err)));
                 return Ok(());
             }
             SelectOutcome::Ready(None) => break,
@@ -870,6 +866,49 @@ mod tests {
         options
     }
 
+    fn partial_text_events(text: &str) -> Vec<String> {
+        [
+            serde_json::json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_1", "object": "response", "created_at": 0.0,
+                    "model": "gpt-5.5", "output": [], "parallel_tool_calls": true,
+                    "tools": [], "status": "in_progress"
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "message", "id": "msg_1", "content": [],
+                    "role": "assistant", "status": "in_progress"
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                "delta": text
+            }),
+        ]
+        .into_iter()
+        .map(|event| event.to_string())
+        .collect()
+    }
+
+    fn message_text(message: &AssistantMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn the_live_mid_stream_cancel_emits_an_aborted_terminal() {
         let created = serde_json::json!({
@@ -912,6 +951,99 @@ mod tests {
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(terminal.usage.total_tokens, 0);
         assert_eq!(terminal.usage.cost.total, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_live_sdk_read_failure_keeps_codex_state() {
+        let server = crate::provider_test_support::failing_sse_server(
+            "POST /codex/responses",
+            partial_text_events("partial"),
+        )
+        .await;
+        let mut model = fake_model("gpt-5.5", false);
+        model.base_url = server.base_url.clone();
+        let options = labeled_options(tokio_util::sync::CancellationToken::new());
+        let mut stream =
+            OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match stream.next().await {
+                    Some(AssistantMessageEvent::TextDelta { delta, .. }) => break delta,
+                    Some(event) if event.is_terminal() => {
+                        panic!("provider terminated before the opening text: {event:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("provider stream ended before the opening text"),
+                }
+            }
+        })
+        .await
+        .expect("provider emits opening text");
+        assert_eq!(observed, "partial");
+        server.finish().await;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("body failure emits terminal");
+
+        assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert_eq!(terminal.api, API_NAME);
+        assert_eq!(terminal.model, "gpt-5.5");
+        assert_eq!(terminal.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(message_text(&terminal), "partial");
+        assert_eq!(terminal.usage.total_tokens, 0);
+        assert_eq!(terminal.usage.cost.total, 0.0);
+        let error = terminal.error.expect("transport error retained");
+        assert_eq!(error.category, ErrorCategory::Transient);
+        assert!(
+            error.message.contains("internal:"),
+            "got: {}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_codex_terminal_returns_before_the_http_body_closes() {
+        let mut events = partial_text_events("complete");
+        events.push(
+            serde_json::json!({
+                "type": "response.done",
+                "sequence_number": 3,
+                "response": {
+                    "id": "resp_1", "object": "response", "created_at": 0.0,
+                    "model": "gpt-5.5", "output": [], "parallel_tool_calls": true,
+                    "tools": [], "status": "unknown_terminal_status",
+                    "service_tier": "priority",
+                    "usage": {
+                        "input_tokens": 1_000_000,
+                        "output_tokens": 1_000_000,
+                        "total_tokens": 2_000_000
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let server =
+            crate::provider_test_support::held_sse_server("POST /codex/responses", events).await;
+        let mut model = fake_model("gpt-5.5", false);
+        model.base_url = server.base_url.clone();
+        let options = labeled_options(tokio_util::sync::CancellationToken::new());
+        let stream = OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("legacy terminal returns before held HTTP body closes");
+        server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Stop);
+        assert!(terminal.error.is_none());
+        assert_eq!(terminal.api, API_NAME);
+        assert_eq!(terminal.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(message_text(&terminal), "complete");
+        assert_eq!(terminal.usage.total_tokens, 2_000_000);
+        assert!((terminal.usage.cost.total - 7.5).abs() < 1e-9);
     }
 
     #[test]

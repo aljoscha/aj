@@ -206,13 +206,12 @@ async fn run_stream_inner(
                 for ev in state.process(chunk) {
                     producer.push(ev);
                 }
+                if state.ready_after_trailing_usage() {
+                    break;
+                }
             }
             SelectOutcome::Ready(Some(Err(err))) => {
-                producer.push(error_message(
-                    model,
-                    credential.account.as_deref(),
-                    classify_client_error(&err),
-                ));
+                producer.push(state.client_failed(classify_client_error(&err)));
                 return Ok(());
             }
             // The server closes the stream after the trailing
@@ -816,9 +815,9 @@ struct StreamState {
     /// Maps a seen tool-call `id` to its `tool_calls` key. See
     /// `tool_calls` for why this fallback exists and what it omits.
     tool_calls_by_id: HashMap<String, i32>,
-    /// Latest finish_reason seen across choices. Set on the chunk
-    /// that carried a non-null finish_reason; finalized into a
-    /// terminal event on stream end.
+    /// First finish_reason seen across choices. Once set, content and
+    /// classification are frozen while a trailing usage chunk may still
+    /// update `usage`.
     finish_reason: Option<FinishReason>,
     /// Latest streamed usage — only the last chunk carries the real
     /// totals; replace each time we see one.
@@ -867,6 +866,17 @@ impl StreamState {
     fn process(&mut self, chunk: CreateChatCompletionStreamResponse) -> Vec<AssistantMessageEvent> {
         let mut events = Vec::new();
 
+        if let Some(usage) = chunk.usage.as_ref() {
+            self.usage = Some(usage.clone());
+        }
+
+        // A finish reason is the protocol terminal. Chat keeps polling only
+        // because usage arrives in a later chunk, so no later choice may
+        // mutate the answer or its classification.
+        if self.finish_reason.is_some() {
+            return events;
+        }
+
         if !self.started {
             self.started = true;
             self.partial.response_id = Some(chunk.id.clone());
@@ -875,11 +885,11 @@ impl StreamState {
             });
         }
 
-        if let Some(usage) = chunk.usage.as_ref() {
-            self.usage = Some(usage.clone());
-        }
-
         for choice in chunk.choices {
+            if self.finish_reason.is_some() {
+                break;
+            }
+
             // Text delta.
             if let Some(text) = choice.delta.content.as_deref()
                 && !text.is_empty()
@@ -1174,6 +1184,13 @@ impl StreamState {
         self.finish_reason.is_some()
     }
 
+    /// Whether every meaningful protocol fact has arrived. Chat asks for
+    /// trailing usage, so a finish reason alone is terminal but not yet ready
+    /// to stop polling while the transport remains healthy.
+    fn ready_after_trailing_usage(&self) -> bool {
+        self.finish_reason.is_some() && self.usage.is_some()
+    }
+
     /// Complete the running partial's usage: fold in whatever the wire
     /// reported, total the tokens and price them at the rates
     /// snapshotted for this call.
@@ -1201,6 +1218,21 @@ impl StreamState {
     fn cancelled(&mut self) -> AssistantMessageEvent {
         self.seal();
         AssistantMessageEvent::aborted(self.partial.clone())
+    }
+
+    /// Terminalize an SDK item failure from the state that consumed every
+    /// preceding frame. A protocol finish wins over later transport noise.
+    fn client_failed(mut self, error: AssistantError) -> AssistantMessageEvent {
+        if self.saw_terminal() {
+            return self.finalize();
+        }
+        self.seal();
+        self.partial.stop_reason = StopReason::Error;
+        self.partial.error = Some(error);
+        AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error: self.partial,
+        }
     }
 
     /// Build the stream's terminal event, classifying a stream that ended
@@ -1410,6 +1442,17 @@ mod tests {
             })
         })));
         options
+    }
+
+    fn message_text(message: &AssistantMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -2030,6 +2073,157 @@ mod tests {
             Some(AssistantContent::Text(text)) => assert_eq!(text.text, "partial"),
             other => panic!("expected preserved partial text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_live_sdk_read_failure_keeps_chat_state() {
+        let mut opening = text_delta("partial");
+        opening.role = Some(Role::Assistant);
+        let event = serde_json::to_string(&delta_chunk(opening)).expect("serialize opening chunk");
+        let server = crate::provider_test_support::failing_sse_server(
+            "POST /v1/chat/completions",
+            vec![event],
+        )
+        .await;
+        let mut model = fake_model();
+        model.base_url = format!("{}/v1", server.base_url);
+        let options = labeled_options(CancellationToken::new());
+        let mut stream =
+            OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match stream.next().await {
+                    Some(AssistantMessageEvent::TextDelta { delta, .. }) => break delta,
+                    Some(event) if event.is_terminal() => {
+                        panic!("provider terminated before the opening text: {event:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("provider stream ended before the opening text"),
+                }
+            }
+        })
+        .await
+        .expect("provider emits the opening text");
+        assert_eq!(observed, "partial");
+        server.finish().await;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("body failure emits terminal");
+
+        assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert_eq!(terminal.response_id.as_deref(), Some("chatcmpl_1"));
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(message_text(&terminal), "partial");
+        assert_eq!(terminal.usage.total_tokens, 0);
+        let error = terminal.error.expect("transport error retained");
+        assert_eq!(error.category, ErrorCategory::Transient);
+        assert!(
+            error.message.contains("internal:"),
+            "got: {}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_finish_reason_precedes_a_later_body_failure() {
+        let events = vec![
+            serde_json::to_string(&delta_chunk(text_delta("complete"))).expect("serialize text"),
+            serde_json::to_string(&finish_chunk(FinishReason::Stop)).expect("serialize finish"),
+        ];
+        let server =
+            crate::provider_test_support::failing_sse_server("POST /v1/chat/completions", events)
+                .await;
+        let mut model = fake_model();
+        model.base_url = format!("{}/v1", server.base_url);
+        let options = labeled_options(CancellationToken::new());
+        let mut stream =
+            OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match stream.next().await {
+                    Some(AssistantMessageEvent::TextEnd { .. }) => break,
+                    Some(event) if event.is_terminal() => {
+                        panic!("provider terminated before observing finish: {event:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("provider stream ended before observing finish"),
+                }
+            }
+        })
+        .await
+        .expect("provider observes finish_reason");
+        server.finish().await;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("finished response terminalizes after body failure");
+
+        assert_eq!(terminal.stop_reason, StopReason::Stop);
+        assert!(terminal.error.is_none());
+        assert_eq!(message_text(&terminal), "complete");
+        assert_eq!(terminal.usage.total_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn chat_stops_after_first_finish_and_trailing_usage() {
+        let events = vec![
+            serde_json::to_string(&delta_chunk(text_delta("A"))).expect("serialize text A"),
+            serde_json::to_string(&finish_chunk(FinishReason::Stop)).expect("serialize stop"),
+            serde_json::to_string(&delta_chunk(text_delta("B"))).expect("serialize text B"),
+            serde_json::to_string(&finish_chunk(FinishReason::NetworkError))
+                .expect("serialize conflicting finish"),
+            serde_json::to_string(&usage_chunk()).expect("serialize usage"),
+        ];
+        let server =
+            crate::provider_test_support::held_sse_server("POST /v1/chat/completions", events)
+                .await;
+        let mut model = fake_model();
+        model.base_url = format!("{}/v1", server.base_url);
+        let options = labeled_options(CancellationToken::new());
+        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("finish plus usage returns before HTTP body closes");
+        server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Stop);
+        assert!(terminal.error.is_none());
+        assert_eq!(message_text(&terminal), "A");
+        assert_eq!(terminal.usage.total_tokens, 120);
+        let expected = 0.000_075 + 0.000_2 + 0.000_003_125;
+        assert!((terminal.usage.cost.total - expected).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn chat_retryable_finish_keeps_trailing_usage() {
+        let events = vec![
+            serde_json::to_string(&delta_chunk(text_delta("partial"))).expect("serialize text"),
+            serde_json::to_string(&finish_chunk(FinishReason::NetworkError))
+                .expect("serialize finish"),
+            serde_json::to_string(&usage_chunk()).expect("serialize usage"),
+        ];
+        let server =
+            crate::provider_test_support::held_sse_server("POST /v1/chat/completions", events)
+                .await;
+        let mut model = fake_model();
+        model.base_url = format!("{}/v1", server.base_url);
+        let options = labeled_options(CancellationToken::new());
+        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("retryable finish plus usage returns before body closes");
+        server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert_eq!(message_text(&terminal), "partial");
+        assert_eq!(terminal.usage.total_tokens, 120);
+        assert_eq!(
+            terminal.error.as_ref().map(|error| error.category),
+            Some(ErrorCategory::Transient)
+        );
     }
 
     /// The trailing usage-only chunk: prompt 100 of which 40 cached and
