@@ -54,6 +54,7 @@ The current CI gate for review-ready work is:
 - `cargo build --all-targets`
 - `./scripts/check-no-tui-dep.sh`
 - `./scripts/check-no-http-dep.sh`
+- `./scripts/test-check-test-scratch.sh`
 - `./scripts/check-test-scratch.sh`
 
 Scale targeted checks while iterating, but verify the final range against the

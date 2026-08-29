@@ -16,12 +16,13 @@ set -euo pipefail
 # needs that justification, and the pattern must be specific enough that a new
 # leak cannot hide behind it.
 #
-#   aj-usage-*  the usage overlay spawns its fetch onto a deliberately leaked
-#               runtime, so a task holding a clone of its credential store
-#               outlives the test that built it and writes afterwards. The
-#               stores sit in per-test subdirectories under this one root.
+#   aj-usage-XXXXXX  the usage overlay spawns its fetch onto a deliberately
+#                    leaked runtime, so a task holding a clone of its credential
+#                    store outlives the test that built it and writes afterwards.
+#                    TempDir adds exactly six random alphanumeric characters to
+#                    the prefix; stores use per-test subdirectories below it.
 allowed=(
-    'aj-usage-[A-Za-z0-9]*'
+    'aj-usage-[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'
 )
 
 scratch="$(mktemp -d)"
@@ -49,7 +50,8 @@ fi
 
 residue=()
 while IFS= read -r -d '' entry; do
-    name="$(basename "$entry")"
+    # Command substitution strips trailing newlines from filenames.
+    name="${entry##*/}"
     for pattern in "${allowed[@]}"; do
         # shellcheck disable=SC2053 # the pattern is meant to glob
         if [[ $name == $pattern ]]; then
