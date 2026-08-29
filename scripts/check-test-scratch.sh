@@ -27,6 +27,9 @@ allowed=(
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
+scan="$(mktemp)"
+trap 'rm -rf "$scratch" "$scan"' EXIT
+
 cargo test --workspace --no-run --quiet
 # Gateway integration tests each own a multi-thread Tokio runtime. Letting
 # libtest run several of them together can starve their real loopback requests
@@ -36,6 +39,13 @@ cargo test --workspace --no-run --quiet
 TMPDIR="$scratch" cargo test --workspace --exclude aj --quiet
 TMPDIR="$scratch" cargo test -p aj --quiet -- --skip gateway::tests
 TMPDIR="$scratch" cargo test -p aj --quiet gateway::tests -- --test-threads=1
+
+# Bash does not propagate a process substitution's status through its reader,
+# so materialize the NUL stream before accepting an empty scan as clean.
+if ! find "$scratch" -mindepth 1 -maxdepth 1 -print0 >"$scan"; then
+    echo "error: could not scan test scratch space for residue" >&2
+    exit 1
+fi
 
 residue=()
 while IFS= read -r -d '' entry; do
@@ -47,7 +57,7 @@ while IFS= read -r -d '' entry; do
         fi
     done
     residue+=("$name")
-done < <(find "$scratch" -mindepth 1 -maxdepth 1 -print0)
+done <"$scan"
 
 if [ ${#residue[@]} -ne 0 ]; then
     echo "error: the test suite left scratch space behind:" >&2
