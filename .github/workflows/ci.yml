@@ -66,4 +66,5 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/test-check-test-scratch.sh
       - run: ./scripts/check-test-scratch.sh
