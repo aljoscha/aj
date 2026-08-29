@@ -44,10 +44,10 @@ use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::types::{AssistantContent, AssistantMessage, StopReason, ToolCall};
 use aj_session::{ConversationPersistence, ThreadFilter};
 use aj_wire::{
-    CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedFrame, ErrorResponse,
-    Frame, HeadRequest, ModelSelection, PROTOCOL_VERSION, PromptInput, PromptRequest,
-    QueueOperation, QueueRequest, QueueState, SessionSettings, SessionSummary, SettingsRequest,
-    SteerRequest, TagRequest, TaskTable,
+    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedFrame,
+    ErrorResponse, Frame, HeadRequest, ModelSelection, PROTOCOL_VERSION, PromptInput,
+    PromptRequest, QueueOperation, QueueRequest, QueueState, SessionSettings, SessionSummary,
+    SettingsRequest, SteerRequest, TagRequest, TaskTable,
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -2997,25 +2997,19 @@ fn a_base_url_has_to_be_absolute_http() {
 // The identity gate over HTTP (spec 6.11, 11.4)
 // ---------------------------------------------------------------------------
 
-/// Every route, so a gate that let one through by accident is caught.
+/// Every route, ordered so each mutation's session precondition is stable.
+///
+/// Commands through `KillTask` leave the session idle. `Compact` then starts
+/// work, after which prompt and steer are valid whether that work is still live
+/// or has already finished. The gate probe therefore has no turn-completion
+/// race to mistake for an authorization failure.
 async fn probe_every_route(client: &RemoteClient, session: &str) -> Vec<Result<(), RemoteError>> {
     let commands = [
-        RemoteCommand::Prompt(PromptRequest {
-            agent: None,
-            input: PromptInput::Text {
-                text: "hi".to_string(),
-            },
-        }),
-        RemoteCommand::Steer(SteerRequest {
-            text: "hi".to_string(),
-            agent: None,
-        }),
         RemoteCommand::Cancel(CancelRequest::default()),
         RemoteCommand::Queue(QueueRequest {
             op: QueueOperation::Clear,
             agent: None,
         }),
-        RemoteCommand::Compact(CompactRequest::default()),
         RemoteCommand::Settings(SettingsRequest {
             agent: None,
             change: SessionSettings {
@@ -3026,8 +3020,20 @@ async fn probe_every_route(client: &RemoteClient, session: &str) -> Vec<Result<(
         RemoteCommand::Tag(TagRequest {
             tag: "probe".to_string(),
         }),
+        RemoteCommand::Archive(ArchiveRequest { archived: true }),
         RemoteCommand::Head(HeadRequest::entry("whatever".to_string())),
         RemoteCommand::KillTask(1),
+        RemoteCommand::Compact(CompactRequest::default()),
+        RemoteCommand::Prompt(PromptRequest {
+            agent: None,
+            input: PromptInput::Text {
+                text: "hi".to_string(),
+            },
+        }),
+        RemoteCommand::Steer(SteerRequest {
+            text: "hi".to_string(),
+            agent: None,
+        }),
     ];
 
     let mut probes = vec![
@@ -3068,7 +3074,7 @@ async fn a_rejected_peer_gets_403_on_every_route() {
 
     let probes = probe_every_route(&fixture.client, &session).await;
 
-    assert_eq!(probes.len(), 17, "every route is probed");
+    assert_eq!(probes.len(), 18, "every route is probed");
     for probe in probes {
         let err = probe.expect_err("the gate refuses");
         assert_eq!(err.status(), Some(StatusCode::FORBIDDEN), "got {err}");
@@ -3101,6 +3107,7 @@ async fn an_authorized_peer_reaches_every_route() {
 
     let probes = probe_every_route(&fixture.client, &session).await;
 
+    assert_eq!(probes.len(), 18, "every route is probed");
     for (index, probe) in probes.into_iter().enumerate() {
         // Three of the probes name something that does not exist (task 1,
         // and the head entry), so they are refused on their own merits. What
