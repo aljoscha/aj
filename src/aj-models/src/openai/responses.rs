@@ -2526,6 +2526,92 @@ mod tests {
     }
 
     #[test]
+    fn every_lifecycle_terminal_sets_the_latch_without_relying_on_status() {
+        let created_with_terminal_status: ResponseStreamEvent =
+            serde_json::from_value(serde_json::json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_1", "object": "response", "created_at": 0.0,
+                    "model": "gpt-5", "output": [], "parallel_tool_calls": true,
+                    "tools": [], "status": "completed"
+                }
+            }))
+            .expect("created response with status");
+        let mut created = StreamState::new(&fake_model(false), None);
+        let _ = created.process(created_with_terminal_status);
+        assert!(
+            !created.saw_terminal(),
+            "a status on a nonterminal lifecycle event is not terminal"
+        );
+
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "response.completed", "sequence_number": 1,
+                    "response": {
+                        "id": "resp_1", "object": "response", "created_at": 0.0,
+                        "model": "gpt-5", "output": [], "parallel_tool_calls": true,
+                        "tools": []
+                    }
+                }),
+                StopReason::Stop,
+                None,
+            ),
+            (
+                serde_json::json!({
+                    "type": "response.incomplete", "sequence_number": 1,
+                    "response": {
+                        "id": "resp_1", "object": "response", "created_at": 0.0,
+                        "model": "gpt-5", "output": [], "parallel_tool_calls": true,
+                        "tools": [],
+                        "incomplete_details": {"reason": "max_output_tokens"}
+                    }
+                }),
+                StopReason::Length,
+                None,
+            ),
+            (
+                serde_json::json!({
+                    "type": "response.failed", "sequence_number": 1,
+                    "response": {
+                        "id": "resp_1", "object": "response", "created_at": 0.0,
+                        "model": "gpt-5", "output": [], "parallel_tool_calls": true,
+                        "tools": []
+                    }
+                }),
+                StopReason::Error,
+                Some(ErrorCategory::Transient),
+            ),
+            (
+                serde_json::json!({
+                    "type": "error", "sequence_number": 1,
+                    "code": "server_error", "message": "try again"
+                }),
+                StopReason::Error,
+                Some(ErrorCategory::Transient),
+            ),
+        ];
+
+        for (wire, stop_reason, category) in cases {
+            let event = serde_json::from_value(wire).expect("lifecycle event");
+            let mut state = StreamState::new(&fake_model(false), None);
+            let _ = state.process(event);
+            assert!(state.saw_terminal());
+            let terminal = state.finalize_or_truncate();
+            assert_eq!(terminal.partial().stop_reason, stop_reason);
+            assert_eq!(
+                terminal
+                    .partial()
+                    .error
+                    .as_ref()
+                    .map(|error| error.category),
+                category
+            );
+        }
+    }
+
+    #[test]
     fn finalize_usage_composes_context_tier_with_multiplier() {
         // A large request on a gpt-5.6-sol-shaped model: the context tier
         // replaces the base rates, then the service-tier multiplier scales
