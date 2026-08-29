@@ -214,9 +214,8 @@ async fn run_stream_inner(
                 producer.push(state.client_failed(classify_client_error(&err)));
                 return Ok(());
             }
-            // The server closes the stream after the trailing
-            // usage-only chunk (there is no protocol terminator to
-            // break on), so we consume to stream end.
+            // EOF after a finish but before trailing usage still completes
+            // from that finish. EOF without one remains a truncation.
             SelectOutcome::Ready(None) => break,
             SelectOutcome::Cancelled => {
                 producer.push(state.cancelled());
@@ -870,13 +869,6 @@ impl StreamState {
             self.usage = Some(usage.clone());
         }
 
-        // A finish reason is the protocol terminal. Chat keeps polling only
-        // because usage arrives in a later chunk, so no later choice may
-        // mutate the answer or its classification.
-        if self.finish_reason.is_some() {
-            return events;
-        }
-
         if !self.started {
             self.started = true;
             self.partial.response_id = Some(chunk.id.clone());
@@ -885,6 +877,9 @@ impl StreamState {
             });
         }
 
+        // A finish reason is the protocol terminal. Chat keeps polling only
+        // because usage arrives in a later chunk, so no later choice may
+        // mutate the answer or its classification.
         for choice in chunk.choices {
             if self.finish_reason.is_some() {
                 break;

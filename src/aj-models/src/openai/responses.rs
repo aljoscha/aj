@@ -1559,10 +1559,9 @@ impl StreamState {
     /// the rates snapshotted for this call, tier multiplier included.
     ///
     /// This API reports usage only on the terminal lifecycle event, so
-    /// an exit taken before that event prices a zero usage. The one
-    /// exit where that is not academic is a cancel that wins the poll
-    /// after `response.completed` was processed: the response is
-    /// captured, and without this the turn is handed out unharvested.
+    /// an exit taken before that event prices a zero usage. Stateful exits
+    /// all seal through this method so a preterminal partial is internally
+    /// consistent and a provider terminal is always fully harvested.
     ///
     /// Idempotent, and it must stay whole to be: `finalize_usage`
     /// applies the multiplier with `*=` to cost fields `calculate_cost`
@@ -1613,16 +1612,10 @@ impl StreamState {
                 api = %self.partial.api,
                 "stream ended before terminal frame; treating turn as truncated (retryable)"
             );
-            // Normally there is nothing to harvest: a stream cut before
-            // its terminal frame carries no `final_response`, so the seal
-            // prices a zero and runs for the invariant rather than for
-            // tokens. It is not conditional on that, though, because
-            // `seal` reads `final_response` directly. A response that did
-            // land without a recognized status still gets its tokens
-            // priced here, which the codex legacy `done` path can
-            // produce. The converse goes to finalize: an in-stream
-            // `error` frame sets `finish_status` with no
-            // `final_response`.
+            // A preterminal stream cut normally has no response usage to
+            // harvest. Seal still runs so every exit carries a consistent
+            // total and price without making that protocol assumption part
+            // of the terminal message contract.
             self.seal();
             AssistantMessageEvent::truncated(self.partial.clone())
         }
