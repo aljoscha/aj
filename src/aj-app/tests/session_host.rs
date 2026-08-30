@@ -6145,6 +6145,45 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
 /// accumulate spend that has no durable owner.
 #[tokio::test]
 async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
+    struct GatedSummaryProvider {
+        message: AssistantMessage,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl aj_models::provider::Provider for GatedSummaryProvider {
+        fn stream(
+            &self,
+            _model: &aj_models::registry::ModelInfo,
+            _context: &aj_models::types::Context,
+            _options: &aj_models::types::StreamOptions,
+        ) -> aj_models::streaming::AssistantMessageEventStream {
+            panic!("the gated provider is installed only for compaction")
+        }
+
+        fn stream_simple(
+            &self,
+            _model: &aj_models::registry::ModelInfo,
+            _context: &aj_models::types::Context,
+            _options: &aj_models::types::SimpleStreamOptions,
+        ) -> aj_models::streaming::AssistantMessageEventStream {
+            let stream = aj_models::streaming::AssistantMessageEventStream::new();
+            let producer = stream.clone();
+            let message = self.message.clone();
+            let started = Arc::clone(&self.started);
+            let release = Arc::clone(&self.release);
+            tokio::spawn(async move {
+                started.notify_one();
+                release.notified().await;
+                producer.push(aj_models::streaming::AssistantMessageEvent::Done {
+                    reason: aj_models::streaming::DoneReason::Stop,
+                    message,
+                });
+            });
+            stream
+        }
+    }
+
     fn priced(text: &str, usage: [u64; 4]) -> AssistantMessage {
         let mut message = finalized_text_message(text);
         message.usage.input = usage[0];
@@ -6210,17 +6249,19 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
     let original_durable = durable_usage(&*handles.log.lock().await);
     assert_eq!(original_durable, before_total);
 
-    // Slow only the summarizer. CompactionProgress::Summarizing proves the
-    // plan has captured an id from the original log before the swap below.
+    // Gate only the summarizer. Its start proves the plan has captured an id
+    // from the original log before the swap below.
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
     handles
         .run_config
         .lock()
         .expect("run config mutex poisoned")
-        .provider = scripted(
-        vec![priced("SUMMARY", summarizer)],
-        1,
-        Duration::from_millis(50),
-    );
+        .provider = Arc::new(GatedSummaryProvider {
+        message: priced("SUMMARY", summarizer),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    });
     let fault_persistence = ConversationPersistence::new(harness._dir.path().join("append-fault"));
     let mut replacement = ConversationLog::create(&fault_persistence).expect("replacement log");
     replacement
@@ -6243,28 +6284,13 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         .command(&session, Command::Compact { instructions: None })
         .await
         .expect("compact accepted");
-    let started = frames_until(&mut client.stream, "summarization to start", |frame| {
-        matches!(
-            frame,
-            Frame::Event { event, .. }
-                if matches!(
-                    event.known(),
-                    Some(AgentEvent::CompactionProgress {
-                        phase: aj_agent::events::CompactionPhase::Summarizing,
-                        ..
-                    })
-                )
-        )
-    })
-    .await;
-    for frame in started {
-        let _ = client.client.apply(&mut client.chat, frame);
-    }
+    bounded("summarizer start", started.notified()).await;
 
     let original = {
         let mut log = handles.log.lock().await;
         std::mem::replace(&mut *log, replacement)
     };
+    release.notify_one();
     let frames = client.pump_until_idle().await;
     assert!(
         frames.iter().any(|frame| matches!(
