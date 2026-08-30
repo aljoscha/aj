@@ -57,7 +57,7 @@ use aj_models::types::{Speed, UserContent};
 use aj_models::{speed_from_name, thinking_config_from_name, verbosity_from_name};
 use aj_session::{
     AppendHandoff, ConversationLog, ConversationPersistence, EntryId, LockHolder, SessionLock,
-    normalize_tag, project_suffix,
+    normalize_tag, project_suffix, validate_session_env,
 };
 use aj_wire::{
     ARCHIVE_CAPABILITY, AgentQueue, Cursor, DurableEvent, Frame, Hello, MAX_HOST_NAME_BYTES,
@@ -781,7 +781,7 @@ impl SessionHost {
     /// Create a session in the host's working directory and hold it live.
     pub async fn create(&self) -> Result<String, HostError> {
         self.alive()?;
-        self.mint(None).await
+        self.mint(None, None).await
     }
 
     /// Whether a create naming `host` is this host's to serve (spec 6.6).
@@ -804,13 +804,13 @@ impl SessionHost {
         }
     }
 
-    /// Creates a session with creator-selected settings, a first prompt and a
-    /// tag.
+    /// Creates a session with creator-selected settings, a first prompt, a tag,
+    /// and an immutable environment map.
     ///
     /// Creation is the operation that either happens or does not. Every
-    /// setting, the prompt and the tag are validated before a log is created,
-    /// so a request this host refuses ([`CreateError::Refused`]) leaves no
-    /// discoverable empty session behind.
+    /// setting, the prompt, tag, and environment are validated before a
+    /// log is created, so a request this host refuses
+    /// ([`CreateError::Refused`]) leaves no discoverable empty session behind.
     ///
     /// The tag and the prompt are applied once the session is live, through
     /// the same commands a later relabelling or prompt takes, so they land
@@ -826,6 +826,7 @@ impl SessionHost {
         settings: Option<SessionSettings>,
         prompt: Option<Vec<UserContent>>,
         tag: Option<String>,
+        session_env: Option<BTreeMap<String, String>>,
     ) -> Result<String, CreateError> {
         self.alive()?;
         if let Some(content) = prompt.as_deref() {
@@ -833,7 +834,11 @@ impl SessionHost {
         }
         let tag = normalize_tag(tag.as_deref().unwrap_or_default())
             .map_err(|err| HostError::Invalid(format!("tag: {err}")))?;
-        let session = self.mint(settings.as_ref()).await?;
+        if let Some(env) = session_env.as_ref() {
+            validate_session_env(env)
+                .map_err(|err| HostError::Invalid(format!("session env: {err}")))?;
+        }
+        let session = self.mint(settings.as_ref(), session_env).await?;
         if tag.is_some() {
             if let Err(err) = self.command(&session, Command::Tag { tag }).await {
                 return Err(PartialCreate::tag(session, err).into());
@@ -857,11 +862,15 @@ impl SessionHost {
     /// The half of a create that is all-or-nothing. Callers gate on
     /// [`Self::alive`] first, so that a shut-down host refuses before it
     /// validates anything.
-    async fn mint(&self, settings: Option<&SessionSettings>) -> Result<String, HostError> {
+    async fn mint(
+        &self,
+        settings: Option<&SessionSettings>,
+        session_env: Option<BTreeMap<String, String>>,
+    ) -> Result<String, HostError> {
         let run_config = self.resolve_creator_settings(settings)?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
-            .materialize(&mut sessions, None, Some(run_config))
+            .materialize(&mut sessions, None, Some(run_config), session_env)
             .await?;
         Ok(live.id().to_string())
     }
@@ -1691,7 +1700,9 @@ impl SessionHost {
         self.alive()?;
         validate_session_id(session)?;
         let mut sessions = self.inner.sessions.lock().await;
-        let live = self.materialize(&mut sessions, Some(session), None).await?;
+        let live = self
+            .materialize(&mut sessions, Some(session), None, None)
+            .await?;
         Ok((sessions, live))
     }
 
@@ -1849,6 +1860,7 @@ impl SessionHost {
         sessions: &mut HashMap<String, LiveEntry>,
         id: Option<&str>,
         create_run_config: Option<RunConfigSnapshot>,
+        create_session_env: Option<BTreeMap<String, String>>,
     ) -> Result<Arc<LiveSession>, HostError> {
         if let Some(id) = id {
             if let Some(entry) = sessions.get(id) {
@@ -1878,6 +1890,7 @@ impl SessionHost {
             },
             None => SessionSpec::Create {
                 entry: SessionEntry::Startup,
+                session_env: create_session_env,
             },
         };
         // NOTE: the build does blocking IO (a resume reads the whole log,

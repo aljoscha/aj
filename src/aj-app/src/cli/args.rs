@@ -5,18 +5,46 @@
 //! TUI. Subcommands (`list-sessions`, `continue`, `update-models`)
 //! short-circuit before mode dispatch.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use aj_conf::ConfigThinkingLevel;
-use aj_session::{TagError, normalize_tag};
+use aj_session::{SessionEnvError, TagError, normalize_tag, validate_session_env};
 use aj_wire::{HostNameError, normalize_host_name};
 use clap::{Parser, Subcommand, ValueEnum};
+use thiserror::Error;
+
+/// Why repeated `--env KEY=VALUE` launch arguments are invalid.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum LaunchEnvError {
+    #[error("environment argument {argument:?} must contain '='")]
+    MissingEquals { argument: String },
+    #[error("environment key {key:?} was stated more than once")]
+    DuplicateKey { key: String },
+    #[error(transparent)]
+    Invalid(#[from] SessionEnvError),
+}
 
 /// Top-level CLI for the `aj` binary.
-#[derive(Parser, Debug)]
-#[command(name = "aj")]
-#[command(about = "AI-driven agent for software engineering")]
-#[command(flatten_help = true)]
+///
+/// Construct this type through [`Args::parse`], [`Args::parse_from`],
+/// [`Args::try_parse`], or [`Args::try_parse_from`]. The `clap::Args` trait is
+/// an implementation detail used to flatten these fields into the private root
+/// parser. It is not a supported construction boundary because clap's
+/// `ArgMatches` representation has already discarded outer occurrences of a
+/// repeatable global `--env` when the same option follows a subcommand.
+///
+/// `Args` deliberately does not implement `clap::Parser`:
+///
+/// ```compile_fail
+/// use aj_app::cli::args::Args;
+///
+/// let _ = <Args as clap::Parser>::try_parse_from([
+///     "aj", "--env", "BEFORE=one", "list-sessions", "--env", "AFTER=two",
+/// ]);
+/// ```
+#[derive(clap::Args, Debug)]
 pub struct Args {
     /// Model API to use (e.g. `anthropic`, `openai`, `openai-codex`,
     /// `openrouter`).
@@ -143,6 +171,20 @@ pub struct Args {
     #[arg(long, global = true)]
     pub tag: Option<String>,
 
+    /// Add one fixed environment entry to sessions this invocation creates.
+    ///
+    /// Repeatable and create-only. The first `=` separates key from value, so
+    /// values may contain additional equals signs. Intentionally has no
+    /// environment-variable binding: session identity must be stated on the
+    /// create rather than inherited from the launching process.
+    #[arg(
+        long,
+        global = true,
+        value_name = "KEY=VALUE",
+        action = clap::ArgAction::Append
+    )]
+    pub env: Vec<String>,
+
     /// Name the host this run serves, shown in place of its id wherever a
     /// client lists hosts.
     ///
@@ -164,7 +206,67 @@ pub struct Args {
     pub command: Option<Command>,
 }
 
+#[derive(Parser, Debug)]
+#[command(name = "aj")]
+#[command(about = "AI-driven agent for software engineering")]
+#[command(long_about = None)]
+#[command(flatten_help = true)]
+struct CliParser {
+    #[command(flatten)]
+    args: Args,
+}
+
 impl Args {
+    /// Parse the process command line while preserving every global `--env`
+    /// occurrence across subcommand boundaries.
+    pub fn parse() -> Self {
+        Self::parse_from(std::env::args_os())
+    }
+
+    /// Parse the process command line, returning clap's normal diagnostic on
+    /// failure.
+    pub fn try_parse() -> Result<Self, clap::Error> {
+        Self::try_parse_from(std::env::args_os())
+    }
+
+    /// Parse `argv`, exiting with clap's normal diagnostic on failure.
+    pub fn parse_from<I, T>(argv: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        Self::try_parse_from(argv).unwrap_or_else(|err| err.exit())
+    }
+
+    /// Parse `argv` while preserving every global `--env` occurrence across
+    /// subcommand boundaries.
+    ///
+    /// Clap propagates one matched value set for a global argument through the
+    /// command hierarchy. For an append argument used on both sides of a
+    /// subcommand, the deeper set replaces the outer set. Re-reading this one
+    /// repeatable argument from the already accepted argv retains the complete
+    /// user statement in command-line order without reinterpreting any other
+    /// part of the grammar.
+    pub fn try_parse_from<I, T>(argv: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let argv = argv.into_iter().map(Into::into).collect::<Vec<_>>();
+        let mut parsed = <CliParser as Parser>::try_parse_from(argv.clone())?.args;
+        parsed.env = global_env_arguments(&argv);
+        Ok(parsed)
+    }
+
+    /// Build the clap command for help, completion, and grammar introspection.
+    ///
+    /// An [`Args`] value is constructed only by this type's parse methods.
+    /// Materializing one from this command's `ArgMatches` would bypass the argv
+    /// normalization described by [`Self::try_parse_from`].
+    pub fn command() -> clap::Command {
+        <CliParser as clap::CommandFactory>::command()
+    }
+
     /// The validated `--tag` value for the session this run creates.
     ///
     /// `Ok(None)` covers both "no flag" and a flag whose value normalizes to
@@ -177,6 +279,34 @@ impl Args {
             Some(tag) => normalize_tag(tag),
             None => Ok(None),
         }
+    }
+
+    /// The complete validated environment map for each create this run makes.
+    ///
+    /// `None` means the flag was not stated and differs from an explicitly
+    /// supplied empty map at non-CLI create boundaries. Validation remains
+    /// exact and case-sensitive because a connected host may execute under a
+    /// different process environment than this client.
+    pub fn launch_env(&self) -> Result<Option<BTreeMap<String, String>>, LaunchEnvError> {
+        if self.env.is_empty() {
+            return Ok(None);
+        }
+        let mut env = BTreeMap::new();
+        for argument in &self.env {
+            let Some((key, value)) = argument.split_once('=') else {
+                return Err(LaunchEnvError::MissingEquals {
+                    argument: argument.clone(),
+                });
+            };
+            if env.contains_key(key) {
+                return Err(LaunchEnvError::DuplicateKey {
+                    key: key.to_string(),
+                });
+            }
+            env.insert(key.to_string(), value.to_string());
+        }
+        validate_session_env(&env)?;
+        Ok(Some(env))
     }
 
     /// The validated `--name` value for the host this run serves.
@@ -210,6 +340,11 @@ impl Args {
     /// [`Self::launch_tag`], which every mode calls before anything is minted.
     pub fn has_launch_tag(&self) -> bool {
         matches!(self.launch_tag(), Ok(Some(_)))
+    }
+
+    /// Whether this invocation stated at least one create-only env argument.
+    pub fn has_launch_env(&self) -> bool {
+        !self.env.is_empty()
     }
 
     /// What a `connect` run asks for, or `None` for every other command.
@@ -269,6 +404,41 @@ impl Args {
         }
         subcommand
     }
+}
+
+/// Collect the `--env` values clap has already accepted, in argv order.
+fn global_env_arguments(argv: &[OsString]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut index = 1;
+    let mut options = true;
+    while index < argv.len() {
+        let argument = &argv[index];
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options && argument == "--env" {
+            let value = argv
+                .get(index + 1)
+                .expect("clap accepted --env with a value")
+                .clone()
+                .into_string()
+                .expect("clap accepted --env as a String");
+            values.push(value);
+            index += 2;
+            continue;
+        }
+        if options {
+            if let Some(argument) = argument.to_str() {
+                if let Some(value) = argument.strip_prefix("--env=") {
+                    values.push(value.to_string());
+                }
+            }
+        }
+        index += 1;
+    }
+    values
 }
 
 /// What a `connect` run's command line asks for.
@@ -341,6 +511,9 @@ pub const HOST_WITHOUT_A_CREATE: &str = "--host has nothing to point at: this ru
 /// instead.
 pub const THINKING_WITHOUT_A_CREATE: &str = "--thinking has nothing to set: this run attached an existing session rather than \
      creating one, and attaching does not change that session's thinking level.";
+
+/// What a run says when `--env` was armed but its primary gesture resumed.
+pub const ENV_WITHOUT_A_CREATE: &str = "--env applies only to sessions this run creates. The resumed or attached session keeps the environment recorded in its own log.";
 
 /// Control-port address a bare `--listen` binds: loopback, because the
 /// port is remote code execution and the identity gate's default mode
@@ -462,8 +635,6 @@ pub enum Command {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
     use super::*;
 
     #[test]
@@ -590,6 +761,119 @@ mod tests {
             );
         }
         assert_eq!(parse(&["aj"]).launch_tag(), Ok(None), "no flag, no label");
+    }
+
+    #[test]
+    fn launch_env_is_global_repeatable_and_splits_only_the_first_equals() {
+        let invocations: [&[&str]; 2] = [
+            &[
+                "aj",
+                "--env",
+                "AJ_CASE=upper",
+                "--env",
+                "aj_case=lower=tail",
+                "serve",
+            ],
+            &[
+                "aj",
+                "serve",
+                "--env",
+                "AJ_CASE=upper",
+                "--env",
+                "aj_case=lower=tail",
+            ],
+        ];
+        for argv in invocations {
+            let args = parse(argv);
+            assert_eq!(
+                args.launch_env(),
+                Ok(Some(BTreeMap::from([
+                    ("AJ_CASE".to_string(), "upper".to_string()),
+                    ("aj_case".to_string(), "lower=tail".to_string()),
+                ]))),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(parse(&["aj"]).launch_env(), Ok(None));
+    }
+
+    #[test]
+    fn launch_env_aggregates_two_valid_values_across_a_subcommand() {
+        let two_valid = parse(&[
+            "aj",
+            "--env",
+            "BEFORE=one",
+            "list-sessions",
+            "--env=AFTER=two=tail",
+        ]);
+        assert_eq!(
+            two_valid.launch_env(),
+            Ok(Some(BTreeMap::from([
+                ("AFTER".to_string(), "two=tail".to_string()),
+                ("BEFORE".to_string(), "one".to_string()),
+            ])))
+        );
+    }
+
+    #[test]
+    fn long_help_keeps_product_description_and_lists_global_env_once() {
+        let help = Args::command().render_long_help().to_string();
+        assert_eq!(help.matches("--env <KEY=VALUE>").count(), 1, "{help}");
+        assert!(
+            help.starts_with("AI-driven agent for software engineering"),
+            "{help}"
+        );
+        assert!(!help.contains("Construct this type through"), "{help}");
+        assert!(!help.contains("<Args as clap::Parser>"), "{help}");
+    }
+
+    #[test]
+    fn launch_env_keeps_a_malformed_value_before_a_subcommand() {
+        let malformed = parse(&[
+            "aj",
+            "--env",
+            "MISSING",
+            "list-sessions",
+            "--env",
+            "OK=value",
+        ]);
+        assert!(matches!(
+            malformed.launch_env(),
+            Err(LaunchEnvError::MissingEquals { argument }) if argument == "MISSING"
+        ));
+    }
+
+    #[test]
+    fn launch_env_detects_a_duplicate_split_by_a_subcommand() {
+        let duplicate = parse(&[
+            "aj",
+            "--env",
+            "KEY=first",
+            "list-sessions",
+            "--env",
+            "KEY=second",
+        ]);
+        assert!(matches!(
+            duplicate.launch_env(),
+            Err(LaunchEnvError::DuplicateKey { key }) if key == "KEY"
+        ));
+    }
+
+    #[test]
+    fn launch_env_refuses_missing_equals_empty_key_and_exact_duplicates() {
+        let cases: [(&[&str], &str); 3] = [
+            (&["aj", "--env", "MISSING"], "must contain '='"),
+            (&["aj", "--env", "=value"], "key \"\" is empty"),
+            (
+                &["aj", "--env", "KEY=first", "--env", "KEY=second"],
+                "key \"KEY\" was stated more than once",
+            ),
+        ];
+        for (argv, expected) in cases {
+            let args = parse(argv);
+            let err = args.launch_env().expect_err("invalid launch env");
+            assert!(err.to_string().contains(expected), "{argv:?}: {err}");
+        }
     }
 
     /// Thinking is global, so its spelling reads the same on either side of a

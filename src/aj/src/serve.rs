@@ -315,8 +315,7 @@ mod tests {
 
     #[test]
     fn the_gate_mode_comes_from_auth() {
-        let args =
-            |argv: &[&str]| <Args as clap::Parser>::try_parse_from(argv).expect("args parse");
+        let args = |argv: &[&str]| Args::try_parse_from(argv).expect("args parse");
         assert!(build_gate(&args(&["aj"])).is_ok(), "local is the default");
         assert!(build_gate(&args(&["aj", "--auth", "open"])).is_ok());
         assert!(

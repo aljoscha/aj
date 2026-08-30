@@ -57,13 +57,14 @@ use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TaskRegistry, TurnError};
 use aj_conf::{Config, ConfigSpeed, Severity};
 use aj_models::auth::AuthStorage;
+use aj_models::provider::Provider;
 use aj_models::types::Speed;
 use aj_session::{ConversationPersistence, ThreadFilter, persistence_listener, replay};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::args::{Args, Command, PrintFormat, TAG_WITHOUT_A_CREATE};
+use crate::cli::args::{Args, Command, ENV_WITHOUT_A_CREATE, PrintFormat, TAG_WITHOUT_A_CREATE};
 use crate::session_setup::{
     BuiltAgent, PreparedLog, SessionSource, build_agent, build_initial_run_config, freeze_and_seed,
     prepare_log, resolve_thinking,
@@ -121,6 +122,7 @@ pub async fn run(args: Args) -> Result<()> {
         conversation_persistence,
         cwd,
         Arc::new(Mutex::new(io::stdout())),
+        None,
     )
     .await?;
     Ok(())
@@ -157,6 +159,7 @@ async fn run_inner<W: Write + Send + 'static>(
     conversation_persistence: ConversationPersistence,
     cwd: PathBuf,
     out: Arc<Mutex<W>>,
+    provider_override: Option<Arc<dyn Provider>>,
 ) -> Result<Agent> {
     // Validate dispatch shape early so the user sees a clear error
     // instead of a confusing failure later. `Continue` resolves to
@@ -194,6 +197,7 @@ async fn run_inner<W: Write + Send + 'static>(
     // Validated before anything is minted, so a label the store would refuse
     // costs no session.
     let launch_tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
+    let launch_env = args.launch_env().map_err(|err| anyhow!("--env: {err}"))?;
 
     let thinking = resolve_thinking(&args, &config)?;
 
@@ -216,8 +220,11 @@ async fn run_inner<W: Write + Send + 'static>(
     // loop, so the snapshot is built, optionally overwritten by the
     // resumed log's recorded settings (inside `prepare_log`), and read
     // once to build the agent.
-    let (run_config, restore_context) =
+    let (mut run_config, restore_context) =
         build_initial_run_config(&args, &config, &auth, thinking, speed)?;
+    if let Some(provider) = provider_override {
+        run_config.provider = provider;
+    }
     let run_config = Arc::new(std::sync::Mutex::new(run_config));
 
     // Apply a `--api-key` runtime override to the resolved provider.
@@ -248,7 +255,9 @@ async fn run_inner<W: Write + Send + 'static>(
                  without `continue` to start a fresh session"
             ),
         },
-        None => SessionSource::Create,
+        None => SessionSource::Create {
+            session_env: launch_env.clone(),
+        },
     };
 
     // Resolve + repair the log and, on a resume, restore its recorded
@@ -260,6 +269,7 @@ async fn run_inner<W: Write + Send + 'static>(
         mut log,
         transcript,
         restore_notices,
+        session_env,
     } = prepare_log(
         &conversation_persistence,
         &source,
@@ -270,12 +280,15 @@ async fn run_inner<W: Write + Send + 'static>(
     for notice in &restore_notices {
         eprintln!("aj: {notice}");
     }
+    if matches!(source, SessionSource::Resume { .. }) && args.has_launch_env() {
+        eprintln!("aj: warning: {ENV_WITHOUT_A_CREATE}");
+    }
 
     // `--tag` labels the session a run creates. The sidecar is written
     // straight here rather than through a command: print mode owns the log it
     // just minted and no other writer knows its id yet.
     match (&launch_tag, &source) {
-        (Some(tag), SessionSource::Create) => conversation_persistence
+        (Some(tag), SessionSource::Create { .. }) => conversation_persistence
             .write_tag(log.session_id(), Some(tag))
             .with_context(|| format!("failed to tag session {}", log.session_id()))?,
         (Some(_), SessionSource::Resume { .. }) => {
@@ -332,6 +345,7 @@ async fn run_inner<W: Write + Send + 'static>(
         thinking.clone(),
         agent_speed,
     );
+    agent.set_session_env(session_env.unwrap_or_default());
     for d in &env.skill_diagnostics {
         eprintln!("aj: warning: {d}");
     }
@@ -357,6 +371,7 @@ async fn run_inner<W: Write + Send + 'static>(
         transcript,
         &env,
         include_skills,
+        source.creation_env(),
         &model_key,
         thinking.as_ref(),
         agent_speed,
@@ -551,7 +566,6 @@ fn print_final_assistant_text<W: Write>(agent: &Agent, out: &Arc<Mutex<W>>) -> R
 mod tests {
     use aj_models::auth::AuthStorage;
     use aj_session::ConversationLog;
-    use clap::Parser;
     use tempfile::TempDir;
 
     use super::*;
@@ -702,6 +716,7 @@ mod tests {
         persistence: &ConversationPersistence,
         cli: &[&str],
         config: Config,
+        provider_override: Option<Arc<dyn Provider>>,
     ) -> (String, Agent) {
         let auth_dir = TempDir::new().expect("auth tempdir");
         let cwd = TempDir::new().expect("cwd tempdir");
@@ -715,6 +730,7 @@ mod tests {
             persistence.clone(),
             cwd.path().to_path_buf(),
             Arc::clone(&sink),
+            provider_override,
         )
         .await
         .expect("print run completes");
@@ -726,7 +742,7 @@ mod tests {
 
     /// The default-config form used by tests that only need print output.
     async fn run_capture(persistence: &ConversationPersistence, cli: &[&str]) -> String {
-        run_capture_with_config(persistence, cli, Config::default())
+        run_capture_with_config(persistence, cli, Config::default(), None)
             .await
             .0
     }
@@ -750,8 +766,35 @@ mod tests {
     ) -> (String, Agent, ConversationPersistence, TempDir) {
         let sessions = TempDir::new().expect("sessions tempdir");
         let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
-        let (out, agent) = run_capture_with_config(&persistence, cli, config).await;
+        let (out, agent) = run_capture_with_config(&persistence, cli, config, None).await;
         (out, agent, persistence, sessions)
+    }
+
+    fn env_print_provider(call_id: &str) -> Arc<dyn Provider> {
+        let mut call = crate::test_support::finalized_text_message("checking identity");
+        call.content
+            .push(aj_models::types::AssistantContent::ToolCall(
+                aj_models::types::ToolCall {
+                    id: call_id.to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({
+                        "command": "printf 'identity=%s' \"$AJ_SESSION_ENV_TEST_IDENTITY\"",
+                        "description": "read print session identity"
+                    }),
+                },
+            ));
+        call.stop_reason = aj_models::types::StopReason::ToolUse;
+        Arc::new(
+            aj_models::scripted::ScriptedProvider::from_messages(
+                vec![
+                    call,
+                    crate::test_support::finalized_text_message("identity checked"),
+                ],
+                0,
+                std::time::Duration::ZERO,
+            )
+            .on_exhausted(aj_models::scripted::ExhaustedBehavior::Panic),
+        )
     }
 
     #[tokio::test(start_paused = true)]
@@ -799,6 +842,135 @@ mod tests {
             persistence.read_tag(&id).expect("read the sidecar"),
             Some("fix-auth".to_string()),
         );
+    }
+
+    #[tokio::test]
+    async fn print_fresh_and_continue_use_the_log_env_not_the_resumers_flag() {
+        const KEY: &str = "AJ_SESSION_ENV_TEST_IDENTITY";
+        assert!(
+            std::env::var_os(KEY).is_none(),
+            "the process env would mask an absent overlay"
+        );
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+
+        let (_fresh_out, fresh_agent) = run_capture_with_config(
+            &persistence,
+            &[
+                "--print",
+                "--scripted",
+                "streaming-text",
+                "--env",
+                "AJ_SESSION_ENV_TEST_IDENTITY=original",
+                "create",
+            ],
+            Config::default(),
+            Some(env_print_provider("fresh-env")),
+        )
+        .await;
+        assert!(
+            format!("{:?}", fresh_agent.messages()).contains("identity=original"),
+            "the fresh print Bash child did not observe the create map: {:?}",
+            fresh_agent.messages()
+        );
+        let id = persistence
+            .get_latest_session_id()
+            .expect("read latest session")
+            .expect("fresh print session");
+        let initial = ConversationLog::resume(&persistence, &id).expect("fresh log");
+        assert_eq!(
+            initial.session_env(),
+            Some(&std::collections::BTreeMap::from([(
+                KEY.to_string(),
+                "original".to_string(),
+            )]))
+        );
+        drop(initial);
+
+        let (_out, resumed_agent) = run_capture_with_config(
+            &persistence,
+            &[
+                "--print",
+                "--scripted",
+                "streaming-text",
+                "--env",
+                "AJ_SESSION_ENV_TEST_IDENTITY=other",
+                "continue",
+                &id,
+                "resume",
+            ],
+            Config::default(),
+            Some(env_print_provider("resumed-env")),
+        )
+        .await;
+        let resumed_messages = format!("{:?}", resumed_agent.messages());
+        assert!(
+            resumed_messages.contains("identity=original")
+                && !resumed_messages.contains("identity=other"),
+            "the resumer's launch env replaced recorded identity: {resumed_messages}"
+        );
+        let resumed = ConversationLog::resume(&persistence, &id).expect("resumed log");
+        assert_eq!(
+            resumed
+                .entries_in_order()
+                .iter()
+                .filter(|entry| matches!(
+                    entry.entry,
+                    aj_session::ConversationEntryKind::EnvChange { .. }
+                ))
+                .count(),
+            1,
+            "print continue appended a second creation identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn print_continue_of_a_legacy_log_ignores_armed_env() {
+        const KEY: &str = "AJ_SESSION_ENV_TEST_IDENTITY";
+        assert!(
+            std::env::var_os(KEY).is_none(),
+            "the process env would mask an absent overlay"
+        );
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let _ = run_capture(
+            &persistence,
+            &["--print", "--scripted", "streaming-text", "legacy"],
+        )
+        .await;
+        let id = persistence
+            .get_latest_session_id()
+            .expect("read latest")
+            .expect("legacy session");
+
+        let (_out, agent) = run_capture_with_config(
+            &persistence,
+            &[
+                "--print",
+                "--scripted",
+                "streaming-text",
+                "--env",
+                "AJ_SESSION_ENV_TEST_IDENTITY=backfill",
+                "continue",
+                &id,
+                "resume",
+            ],
+            Config::default(),
+            Some(env_print_provider("legacy-env")),
+        )
+        .await;
+        assert!(
+            format!("{:?}", agent.messages()).contains("identity=\"")
+                || format!("{:?}", agent.messages()).contains("identity="),
+            "legacy resume did not run the real Bash child: {:?}",
+            agent.messages()
+        );
+        assert!(
+            !format!("{:?}", agent.messages()).contains("identity=backfill"),
+            "launch env backfilled an env-less legacy session"
+        );
+        let resumed = ConversationLog::resume(&persistence, &id).expect("legacy log");
+        assert_eq!(resumed.session_env(), None);
     }
 
     /// A fresh print run records the CLI thinking level it actually gave the
@@ -896,6 +1068,7 @@ mod tests {
             persistence.clone(),
             cwd.path().to_path_buf(),
             Arc::new(Mutex::new(Vec::<u8>::new())),
+            None,
         )
         .await
         .err()

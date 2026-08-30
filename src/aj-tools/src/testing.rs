@@ -4,6 +4,7 @@
 //! tools can be exercised from CLI bins and integration tests
 //! without standing up a full agent runtime.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,6 +30,8 @@ use tokio_util::sync::CancellationToken;
 pub struct DummyToolContext {
     /// Working directory returned by [`ToolContext::working_directory`].
     pub working_directory: PathBuf,
+    /// Environment overlay returned by [`ToolContext::session_env`].
+    pub session_env: BTreeMap<String, String>,
     /// Backing storage for [`ToolContext::get_todo_list`] /
     /// [`ToolContext::set_todo_list`].
     pub todos: Vec<TodoItem>,
@@ -58,6 +61,7 @@ impl Default for DummyToolContext {
     fn default() -> Self {
         Self {
             working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            session_env: BTreeMap::new(),
             todos: Vec::new(),
             cancellation: CancellationToken::new(),
             task_registry: TaskRegistry::default(),
@@ -70,6 +74,10 @@ impl Default for DummyToolContext {
 impl ToolContext for DummyToolContext {
     fn working_directory(&self) -> PathBuf {
         self.working_directory.clone()
+    }
+
+    fn session_env(&self) -> BTreeMap<String, String> {
+        self.session_env.clone()
     }
 
     fn get_todo_list(&self) -> Vec<TodoItem> {

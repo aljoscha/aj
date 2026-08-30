@@ -11,6 +11,7 @@
 //! registry, bus subscriptions, and event pump. Print mode adds the
 //! JSONL / persistence listeners and the one-shot turn.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -450,13 +451,24 @@ pub fn build_agent(
 /// mode-agnostic counterpart to the interactive `SessionSpec`, which
 /// additionally carries the header-notice wording.
 pub enum SessionSource {
-    Create,
-    Resume { session_id: String },
+    Create {
+        session_env: Option<BTreeMap<String, String>>,
+    },
+    Resume {
+        session_id: String,
+    },
 }
 
 impl SessionSource {
     fn is_resume(&self) -> bool {
         matches!(self, SessionSource::Resume { .. })
+    }
+
+    pub fn creation_env(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            SessionSource::Create { session_env } => session_env.as_ref(),
+            SessionSource::Resume { .. } => None,
+        }
     }
 }
 
@@ -475,6 +487,9 @@ pub struct PreparedLog {
     /// restored, or why a recorded value was kept out). Empty unless
     /// resuming with a [`RestoreContext`].
     pub restore_notices: Vec<String>,
+    /// Immutable session environment from the explicit create or resumed log.
+    /// `None` differs from a recorded empty map.
+    pub session_env: Option<BTreeMap<String, String>>,
 }
 
 /// Resolve the log for `source`, repair any interrupted tool uses, and
@@ -493,12 +508,16 @@ pub fn prepare_log(
     restore: Option<&RestoreContext>,
 ) -> Result<PreparedLog> {
     let mut log = match source {
-        SessionSource::Create => ConversationLog::create(persistence)
+        SessionSource::Create { .. } => ConversationLog::create(persistence)
             .context("failed to create a fresh conversation log")?,
         SessionSource::Resume { session_id, .. } => {
             ConversationLog::resume(persistence, session_id)
                 .with_context(|| format!("failed to resume session {session_id}"))?
         }
+    };
+    let session_env = match source {
+        SessionSource::Create { session_env } => session_env.clone(),
+        SessionSource::Resume { .. } => log.session_env().cloned(),
     };
 
     let mut restore_notices = Vec::new();
@@ -540,6 +559,7 @@ pub fn prepare_log(
         log,
         transcript,
         restore_notices,
+        session_env,
     })
 }
 
@@ -559,6 +579,7 @@ pub fn freeze_and_seed(
     transcript: Vec<AgentMessage>,
     env: &AgentEnv,
     include_skills: bool,
+    creation_env: Option<&BTreeMap<String, String>>,
     model_key: &(String, String),
     thinking: Option<&ThinkingConfig>,
     speed: Option<Speed>,
@@ -570,6 +591,9 @@ pub fn freeze_and_seed(
         let assembled = crate::system_prompt::assemble_system_prompt(env, include_skills);
         if log.is_empty() {
             log.set_system_prompt(assembled.clone())?;
+            if let Some(session_env) = creation_env {
+                log.append_env_change(session_env.clone())?;
+            }
             log.append_model_change(ThreadFilter::USER, &model_key.0, &model_key.1)?;
             log.append_thinking_change(ThreadFilter::USER, thinking_config_name(thinking))?;
             log.append_speed_change(ThreadFilter::USER, speed_name(speed))?;
@@ -589,7 +613,6 @@ pub fn freeze_and_seed(
 #[cfg(test)]
 mod tests {
     use aj_conf::ConfigLayer;
-    use clap::Parser;
     use tempfile::TempDir;
 
     use super::*;
@@ -715,7 +738,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let prepared = prepare_log(
             &persistence,
-            &SessionSource::Create,
+            &SessionSource::Create { session_env: None },
             &config,
             &run_config,
             None,

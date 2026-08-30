@@ -29,7 +29,6 @@ use aj_wire::{
     Frame, HostList, HostSource, HostSummary, PROTOCOL_VERSION, PromptInput, PromptRequest,
     SessionCreated, SessionList, SessionSummary,
 };
-use clap::Parser;
 use reqwest::StatusCode;
 use tempfile::TempDir;
 

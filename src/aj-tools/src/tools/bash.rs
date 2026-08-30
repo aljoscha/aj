@@ -71,16 +71,17 @@
 //!   runs in `Sequential` mode: a batch containing it serializes
 //!   around any other in-flight tool calls.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aj_agent::TaskCleanupGuard;
 use aj_agent::tool::{
     BashStreamTruncation, ExecutionMode, StartedTask, TaskEventSink, TaskId, TaskKind, TaskNotice,
     TaskOutputSource, TaskRead, TaskStatus, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
 };
+use aj_agent::{TaskCleanupGuard, TaskRegistry};
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,9 @@ const TRIM_TRIGGER_BYTES: usize = ROLLING_CAP_BYTES * 2;
 /// reaches a renderer without waiting for the next tick.
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(100);
 
+/// Maximum time the host-side rtk hook may spend deciding whether to rewrite.
+const RTK_HOOK_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Grace period a terminated command's process group gets to exit on
 /// `SIGTERM` before we escalate to `SIGKILL`.
 ///
@@ -175,7 +179,7 @@ pub struct BashTool {
     /// When true, eligible commands are dispatched through `rtk`
     /// (https://github.com/rtk-ai/rtk) to compress their output before
     /// it reaches the model. See [`rtk_rewrite`] for the eligibility
-    /// rules and [`rtk_available`] for the PATH probe.
+    /// rules and [`find_rtk_on_path`] for the PATH probe.
     rtk: bool,
     /// Where spill files are written. `None` uses the ambient temp
     /// directory, which is what an unset `spill_dir` config means.
@@ -226,32 +230,128 @@ impl BashTool {
     /// engine the Claude Code / Cursor / Gemini PreToolUse hooks use,
     /// so we inherit rtk's shell-aware handling of compounds, pipes,
     /// and `env`/`sudo` prefixes instead of maintaining our own
-    /// approximation of rtk's subcommand catalog.
-    async fn rtk_rewrite(&self, command: &str) -> Option<String> {
-        if !self.rtk || !rtk_available() {
+    /// approximation of rtk's subcommand catalog. The helper belongs to the
+    /// host: selection and hook checking use plain process inheritance, while
+    /// the accepted rewrite binds that selected absolute executable before the
+    /// session overlay reaches Bash.
+    async fn rtk_rewrite(
+        &self,
+        command: &str,
+        working_dir: &Path,
+        tasks: &TaskRegistry,
+    ) -> Option<String> {
+        let host_path = std::env::var_os("PATH");
+        self.rtk_rewrite_with_host_path(command, host_path.as_deref(), working_dir, tasks)
+            .await
+    }
+
+    async fn rtk_rewrite_with_host_path(
+        &self,
+        command: &str,
+        host_path: Option<&OsStr>,
+        working_dir: &Path,
+        tasks: &TaskRegistry,
+    ) -> Option<String> {
+        if !self.rtk {
             return None;
         }
-        rtk_hook_check(command).await
+        // An existing shell name can define, alias, or directly invoke rtk.
+        // In that case there is no unambiguous way to distinguish the hook's
+        // insertion from the caller's command, so passthrough stays off.
+        if contains_shell_identifier(command, "rtk") {
+            return None;
+        }
+        let executable = find_rtk_on_path(host_path)?;
+        let rewritten =
+            rtk_hook_check(&executable, working_dir, command, tasks.track_cleanup()).await?;
+        bind_rtk_rewrite(&rewritten, &executable)
     }
 }
 
-/// Whether an `rtk` executable is reachable on `PATH`. Resolved once
-/// and cached for the process lifetime: rtk being installed or removed
-/// mid-session is rare, and we'd otherwise attempt a spawn on every
-/// bash call even when rtk is absent.
-fn rtk_available() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(find_rtk_on_path)
+/// Find the host-owned `rtk` executable on the inherited process PATH.
+///
+/// Relative and empty entries cannot name one stable absolute helper after the
+/// hook changes directory, so passthrough declines when the host PATH contains
+/// one. Non-executable regular files are skipped just as shell PATH lookup skips
+/// them in favor of a later executable. The selected absolute path is bound into
+/// every accepted rewrite.
+fn find_rtk_on_path(paths: Option<&OsStr>) -> Option<PathBuf> {
+    let Some(paths) = paths else {
+        return None;
+    };
+    let directories: Vec<PathBuf> = std::env::split_paths(paths).collect();
+    if directories.iter().any(|dir| !dir.is_absolute()) {
+        return None;
+    }
+    directories
+        .into_iter()
+        .map(|dir| dir.join("rtk"))
+        .find(|candidate| is_executable_file(candidate))
 }
 
-fn find_rtk_on_path() -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
+fn is_executable_file(candidate: &Path) -> bool {
+    let Ok(metadata) = candidate.metadata() else {
         return false;
     };
-    std::env::split_paths(&paths).any(|dir| {
-        // `rtk.exe` on Windows, `rtk` elsewhere. Checking both is
-        // harmless and keeps the probe platform-agnostic.
-        dir.join("rtk").is_file() || dir.join("rtk.exe").is_file()
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use nix::unistd::{AccessFlags, access};
+
+        access(candidate, AccessFlags::X_OK).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Bind every helper command introduced by the hook to the executable selected
+/// by the PATH probe. Callers reject an original command containing standalone
+/// `rtk`, so every standalone `rtk ` in the hook's answer belongs to the hook
+/// even when it canonicalizes another command (`rg` to `grep`, for example).
+fn bind_rtk_rewrite(rewritten: &str, executable: &Path) -> Option<String> {
+    let executable = executable.to_str()?;
+    let quoted = format!("'{}'", executable.replace('\'', "'\"'\"'"));
+    let bytes = rewritten.as_bytes();
+    let mut bound = String::with_capacity(rewritten.len() + quoted.len());
+    let mut copied_to = 0;
+    let mut replacements = 0;
+    for (start, _) in rewritten.match_indices("rtk") {
+        let before_is_name = start
+            .checked_sub(1)
+            .and_then(|index| bytes.get(index))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        let after = start + "rtk".len();
+        let after_is_space = bytes.get(after).is_some_and(u8::is_ascii_whitespace);
+        if before_is_name || !after_is_space {
+            continue;
+        }
+        bound.push_str(&rewritten[copied_to..start]);
+        bound.push_str(&quoted);
+        copied_to = after;
+        replacements += 1;
+    }
+    if replacements == 0 {
+        return None;
+    }
+    bound.push_str(&rewritten[copied_to..]);
+    Some(bound)
+}
+
+fn contains_shell_identifier(command: &str, identifier: &str) -> bool {
+    let bytes = command.as_bytes();
+    command.match_indices(identifier).any(|(start, _)| {
+        let before = start
+            .checked_sub(1)
+            .and_then(|index| bytes.get(index))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        let after = bytes
+            .get(start + identifier.len())
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        !before && !after
     })
 }
 
@@ -266,29 +366,80 @@ fn find_rtk_on_path() -> bool {
 /// `command` is passed as a single argv element so shell
 /// metacharacters in it are never interpreted by a shell at this
 /// layer. rtk parses the string itself. The 500ms timeout guards
-/// against a wedged rtk blocking the tool call.
-async fn rtk_hook_check(command: &str) -> Option<String> {
-    let output = tokio::time::timeout(
-        Duration::from_millis(500),
-        tokio::process::Command::new("rtk")
-            .arg("hook")
-            .arg("check")
-            .arg(command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output(),
-    )
+/// against a wedged rtk blocking the tool call. The hook inherits the host
+/// process environment unchanged. Its own process group and cleanup lease keep
+/// timeout or outer-future cancellation from detaching the helper tree. A
+/// discarded formatter probe gets no graceful-shutdown window: both paths kill
+/// its group immediately, make a bounded attempt to reap the owned leader, then
+/// release capture and cleanup ownership even if the kernel cannot reap it yet.
+async fn rtk_hook_check(
+    executable: &Path,
+    working_dir: &Path,
+    command: &str,
+    cleanup: TaskCleanupGuard,
+) -> Option<String> {
+    rtk_hook_check_with_timeout(executable, working_dir, command, cleanup, RTK_HOOK_TIMEOUT).await
+}
+
+async fn rtk_hook_check_with_timeout(
+    executable: &Path,
+    working_dir: &Path,
+    command: &str,
+    cleanup: TaskCleanupGuard,
+    timeout: Duration,
+) -> Option<String> {
+    let mut check = tokio::process::Command::new(executable);
+    check
+        .arg("hook")
+        .arg("check")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        check.process_group(0);
+    }
+    let child = check.spawn().ok()?;
+    let mut guard = ProcessGuard::arm_host_helper(child, cleanup).ok()?;
+    let mut stdout = guard.child_mut().stdout.take()?;
+    let mut stderr = guard.child_mut().stderr.take()?;
+    let stdout_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    guard.watch_readers([stdout_reader.abort_handle(), stderr_reader.abort_handle()]);
+
+    let output = tokio::time::timeout(timeout, async {
+        let status = guard.child_mut().wait().await?;
+        let stdout = stdout_reader.await.map_err(std::io::Error::other)??;
+        let stderr = stderr_reader.await.map_err(std::io::Error::other)??;
+        Ok::<_, std::io::Error>((status, stdout, stderr))
+    })
     .await;
-    let output = match output {
-        Ok(Ok(o)) => o,
-        // Timeout, spawn failure, or rtk missing: run verbatim.
-        _ => return None,
+    let (status, stdout, _stderr) = match output {
+        Ok(Ok(output)) => output,
+        // Timeout, capture failure, or a malformed helper lifecycle all use
+        // the original command, after the complete hook group is owned down.
+        _ => {
+            guard.terminate().await;
+            return None;
+        }
     };
-    if !output.status.success() {
+    drop(guard.disarm());
+    if !status.success() {
         return None;
     }
-    let rewritten = String::from_utf8_lossy(&output.stdout);
+    let rewritten = String::from_utf8(stdout).ok()?;
+    if rewritten.contains('\0') {
+        return None;
+    }
     let rewritten = rewritten.trim();
     if rewritten.is_empty() || rewritten == command {
         return None;
@@ -323,13 +474,15 @@ impl ToolDefinition for BashTool {
         let cancellation = ctx.cancellation();
         let timeout = Duration::from_secs(input.timeout);
         let command = input.command.clone();
+        let session_env = ctx.session_env();
+        let tasks = ctx.task_registry();
 
         // Optionally dispatch through `rtk` to compress output. The
         // model-facing `command` stays the original. Only the string
         // handed to `bash -c` is rewritten, so snapshots, the wire
         // trailer, and `ToolDetails::Bash` keep showing what the model
         // asked for.
-        let executed = match self.rtk_rewrite(&command).await {
+        let executed = match self.rtk_rewrite(&command, &working_dir, &tasks).await {
             Some(rewritten) => {
                 tracing::debug!(original = %command, rewritten = %rewritten, "rtk passthrough");
                 rewritten
@@ -356,7 +509,7 @@ impl ToolDefinition for BashTool {
         // `Command` inherits the process environment by default. Apply the
         // session map afterward so it shadows inherited values, then apply
         // the fixed overrides below so deterministic output still wins.
-        cmd.envs(ctx.session_env());
+        cmd.envs(session_env);
         // Overlay a fixed set of environment overrides on top of the
         // inherited and session environment. We capture output rather than
         // attach a terminal, so we force programs into a deterministic,
@@ -1515,7 +1668,7 @@ fn decode_stream_output(bytes: Vec<u8>) -> String {
     crate::sanitize_terminal_output(&lossy)
 }
 
-/// Owns a spawned command's teardown for as long as this tool's future
+/// Owns a spawned process group's teardown for as long as this tool's future
 /// can be dropped.
 ///
 /// The driver races a tool against cancellation and drops the losing
@@ -1549,18 +1702,43 @@ struct ArmedProcess {
     /// Retains the session's advisory-lock lifetime through asynchronous
     /// teardown when the owning tool or task future is dropped.
     _cleanup: TaskCleanupGuard,
+    teardown: ProcessTeardown,
     /// Empty between the spawn and [`ProcessGuard::watch_readers`]: the
     /// reader tasks do not exist for the first few lines of a call.
     readers: Vec<tokio::task::AbortHandle>,
 }
 
+#[derive(Clone, Copy)]
+enum ProcessTeardown {
+    /// User commands get a chance to handle TERM before escalation.
+    Graceful,
+    /// Optional host probes are discarded with an immediate group kill.
+    Immediate,
+}
+
 impl ProcessGuard {
-    /// Take ownership of a freshly spawned child.
+    /// Take ownership of a freshly spawned user-command child.
     ///
     /// Fails only if the pid is unavailable, which cannot happen
     /// between a spawn and the reap, and which would leave nothing to
     /// signal anyway.
     fn arm(child: Child, cleanup: TaskCleanupGuard) -> Result<Self, aj_agent::BoxError> {
+        Self::arm_with(child, cleanup, ProcessTeardown::Graceful)
+    }
+
+    /// Own a bounded host helper under the session's cleanup lease.
+    fn arm_host_helper(
+        child: Child,
+        cleanup: TaskCleanupGuard,
+    ) -> Result<Self, aj_agent::BoxError> {
+        Self::arm_with(child, cleanup, ProcessTeardown::Immediate)
+    }
+
+    fn arm_with(
+        child: Child,
+        cleanup: TaskCleanupGuard,
+        teardown: ProcessTeardown,
+    ) -> Result<Self, aj_agent::BoxError> {
         // The pid is the group id, because the child was spawned with
         // `process_group(0)`.
         let pgid: i32 = child
@@ -1573,6 +1751,7 @@ impl ProcessGuard {
                 child,
                 pgid,
                 _cleanup: cleanup,
+                teardown,
                 readers: Vec::new(),
             }),
         })
@@ -1610,6 +1789,26 @@ impl ProcessGuard {
             .child
     }
 
+    /// Kill an optional helper's group and make a bounded attempt to reap its
+    /// immediate child. Ownership stays in `self` across the reap, so
+    /// cancellation hands the still-armed group to [`Drop`] rather than
+    /// detaching it. A child stuck in uninterruptible kernel I/O cannot retain
+    /// the session cleanup lease beyond the reap bound.
+    async fn terminate(&mut self) {
+        let Some(armed) = self.armed.as_mut() else {
+            return;
+        };
+        debug_assert!(matches!(armed.teardown, ProcessTeardown::Immediate));
+        signal_process_group(armed.pgid, GroupSignal::Kill);
+        reap_child_bounded(&mut armed.child).await;
+        for reader in &armed.readers {
+            reader.abort();
+        }
+        // Every await is complete. Taking the process now releases the cleanup
+        // lease without leaving a cancellation point between ownership moves.
+        self.armed.take();
+    }
+
     fn expect_armed(&self) -> &ArmedProcess {
         self.armed
             .as_ref()
@@ -1626,10 +1825,22 @@ impl Drop for ProcessGuard {
         // the teardown, because a spawn is not a promise: a runtime
         // that is shutting down answers one by dropping the future
         // unpolled, and then nothing would ever be sent.
-        signal_process_group(armed.pgid, GroupSignal::Term);
+        let teardown = armed.teardown;
+        signal_process_group(
+            armed.pgid,
+            match teardown {
+                ProcessTeardown::Graceful => GroupSignal::Term,
+                ProcessTeardown::Immediate => GroupSignal::Kill,
+            },
+        );
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(tear_down_process(armed));
+                runtime.spawn(async move {
+                    match teardown {
+                        ProcessTeardown::Graceful => tear_down_process(armed).await,
+                        ProcessTeardown::Immediate => reap_killed_process(armed).await,
+                    }
+                });
             }
             Err(_) => {
                 // Dropped outside a runtime, so there is nothing to
@@ -1643,7 +1854,7 @@ impl Drop for ProcessGuard {
     }
 }
 
-/// Finish what [`ProcessGuard`]'s `Drop` started: give the group its
+/// Finish what [`ProcessGuard`]'s caller started: give the group its
 /// grace, escalate to `SIGKILL`, reap what is still ours, and drop the
 /// pipe read ends.
 ///
@@ -1676,10 +1887,11 @@ async fn tear_down_process(armed: ArmedProcess) {
         mut child,
         pgid,
         _cleanup,
+        teardown: _,
         readers,
     } = armed;
-    // `Drop` sent the `SIGTERM` before spawning this. The sleep is the
-    // window that signal gets.
+    // Drop or synchronous termination sent SIGTERM before entering here. The
+    // sleep is the window that signal gets.
     tokio::time::sleep(KILL_GRACE).await;
     signal_process_group(pgid, GroupSignal::Kill);
     if child.id().is_some() {
@@ -1696,6 +1908,32 @@ async fn tear_down_process(armed: ArmedProcess) {
         reader.abort();
     }
     drop(_cleanup);
+}
+
+/// Reap an optional host helper after `Drop` has synchronously killed its
+/// process group. The cleanup lease remains here through the bounded reap
+/// attempt, then the child handle and capture readers are released together.
+async fn reap_killed_process(armed: ArmedProcess) {
+    let ArmedProcess {
+        mut child,
+        pgid: _,
+        _cleanup,
+        teardown: _,
+        readers,
+    } = armed;
+    reap_child_bounded(&mut child).await;
+    for reader in &readers {
+        reader.abort();
+    }
+    drop(_cleanup);
+}
+
+/// Reap a killed child when the kernel makes it available, without allowing an
+/// uninterruptible wait to retain the caller's cleanup ownership indefinitely.
+async fn reap_child_bounded(child: &mut Child) {
+    if child.id().is_some() {
+        let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+    }
 }
 
 /// Send one signal to a command's process group.
@@ -1766,6 +2004,7 @@ mod tests {
     use crate::testing::DummyToolContext;
     use aj_agent::TaskRegistry;
     use aj_models::types::UserContent;
+    use std::ffi::OsString;
     use std::path::Path;
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
@@ -1778,6 +2017,10 @@ mod tests {
     fn arm_for_test(child: Child) -> ProcessGuard {
         let registry = TaskRegistry::default();
         ProcessGuard::arm(child, registry.track_cleanup()).expect("arm")
+    }
+
+    fn hook_cleanup() -> TaskCleanupGuard {
+        TaskRegistry::default().track_cleanup()
     }
 
     struct FailingReader;
@@ -1851,12 +2094,16 @@ mod tests {
 
     #[tokio::test]
     async fn rtk_hook_check_rewrites_known_commands() {
-        if !rtk_available() {
+        let host_path = std::env::var_os("PATH");
+        let working_dir = std::env::current_dir().expect("current directory");
+        let Some(rtk) = find_rtk_on_path(host_path.as_deref()) else {
             return;
-        }
+        };
         // Plain single commands get the rtk prefix.
         assert_eq!(
-            rtk_hook_check("git status").await.as_deref(),
+            rtk_hook_check(&rtk, &working_dir, "git status", hook_cleanup())
+                .await
+                .as_deref(),
             Some("rtk git status")
         );
         // rtk's rewriter is shell-aware: it rewrites each eligible
@@ -1864,38 +2111,663 @@ mod tests {
         // rewrites only the producer side of a pipe. We inherit that
         // by delegating rather than reimplementing it.
         assert_eq!(
-            rtk_hook_check("cargo fmt && cargo check").await.as_deref(),
+            rtk_hook_check(
+                &rtk,
+                &working_dir,
+                "cargo fmt && cargo check",
+                hook_cleanup(),
+            )
+            .await
+            .as_deref(),
             Some("rtk cargo fmt && rtk cargo check")
         );
         assert_eq!(
-            rtk_hook_check("env FOO=bar git status").await.as_deref(),
+            rtk_hook_check(&rtk, &working_dir, "env FOO=bar git status", hook_cleanup(),)
+                .await
+                .as_deref(),
             Some("env FOO=bar rtk git status")
         );
         assert_eq!(
-            rtk_hook_check("git log | grep foo").await.as_deref(),
+            rtk_hook_check(&rtk, &working_dir, "git log | grep foo", hook_cleanup(),)
+                .await
+                .as_deref(),
             Some("rtk git log | grep foo")
         );
     }
 
     #[tokio::test]
     async fn rtk_hook_check_returns_none_for_non_rewriteable() {
-        if !rtk_available() {
+        let host_path = std::env::var_os("PATH");
+        let working_dir = std::env::current_dir().expect("current directory");
+        let Some(rtk) = find_rtk_on_path(host_path.as_deref()) else {
             return;
-        }
+        };
         // rtk declines commands it has no proxy for (echo) and the
         // shell-builtin collision (test); we surface that as None and
         // run the original verbatim.
-        assert_eq!(rtk_hook_check("echo hi").await, None);
-        assert_eq!(rtk_hook_check("test -f x").await, None);
+        assert_eq!(
+            rtk_hook_check(&rtk, &working_dir, "echo hi", hook_cleanup()).await,
+            None
+        );
+        assert_eq!(
+            rtk_hook_check(&rtk, &working_dir, "test -f x", hook_cleanup()).await,
+            None
+        );
     }
 
     #[tokio::test]
     async fn rtk_rewrite_disabled_when_rtk_flag_off() {
         // With passthrough off the method short-circuits before
-        // touching the PATH cache or spawning rtk, so no rtk
+        // inspecting the host PATH or spawning rtk, so no rtk
         // installation is needed for this test.
         let tool = BashTool::new(false, None);
-        assert_eq!(tool.rtk_rewrite("git status").await, None);
+        let tasks = TaskRegistry::default();
+        assert_eq!(
+            tool.rtk_rewrite("git status", Path::new("."), &tasks).await,
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).expect("write executable fixture");
+        let mut permissions = std::fs::metadata(path)
+            .expect("fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make fixture executable");
+    }
+
+    #[cfg(unix)]
+    fn host_executable(name: &str) -> PathBuf {
+        let path = std::env::var_os("PATH").expect("supported host has PATH");
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .filter(|candidate| {
+                candidate.is_file()
+                    && nix::unistd::access(candidate, nix::unistd::AccessFlags::X_OK).is_ok()
+            })
+            .find_map(|candidate| candidate.canonicalize().ok())
+            .unwrap_or_else(|| panic!("supported host PATH has executable {name}"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rtk_hook_check_rejects_non_utf8_output() {
+        let dir = TempDir::new().expect("tempdir");
+        let rtk = dir.path().join("rtk");
+        write_executable(&rtk, "#!/bin/sh\nprintf 'rtk git status\\377\\n'\n");
+
+        assert_eq!(
+            rtk_hook_check(&rtk, dir.path(), "git status", hook_cleanup(),).await,
+            None,
+            "malformed hook output must fall back to the original command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rtk_hook_check_rejects_nul_output() {
+        let dir = TempDir::new().expect("tempdir");
+        let rtk = dir.path().join("rtk");
+        write_executable(&rtk, "#!/bin/sh\nprintf 'rtk git status\\000\n'\n");
+
+        assert_eq!(
+            rtk_hook_check(&rtk, dir.path(), "git status", hook_cleanup()).await,
+            None,
+            "an unrepresentable rewrite must fall back to the original command"
+        );
+    }
+
+    #[test]
+    fn rtk_rewrite_binds_only_inserted_helpers_to_the_selected_executable() {
+        let selected = Path::new("/host/bin/rtk");
+        assert_eq!(
+            bind_rtk_rewrite(
+                "PATH=/command/bin rtk git status && rtk cargo check",
+                selected,
+            )
+            .as_deref(),
+            Some("PATH=/command/bin '/host/bin/rtk' git status && '/host/bin/rtk' cargo check")
+        );
+        assert_eq!(
+            bind_rtk_rewrite("rtk grep needle src", selected).as_deref(),
+            Some("'/host/bin/rtk' grep needle src"),
+            "canonicalizing hook rewrites must retain passthrough"
+        );
+        assert_eq!(
+            bind_rtk_rewrite("artk git status", selected),
+            None,
+            "embedded text is not a helper command"
+        );
+    }
+
+    #[test]
+    fn rtk_rewrite_shell_quotes_the_selected_executable() {
+        assert_eq!(
+            bind_rtk_rewrite("rtk git status", Path::new("/selected path/it's/bin/rtk")).as_deref(),
+            Some("'/selected path/it'\"'\"'s/bin/rtk' git status")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rtk_rewrite_declines_a_non_utf8_selected_executable() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let selected = PathBuf::from(OsString::from_vec(b"/host/\xff/rtk".to_vec()));
+        assert_eq!(bind_rtk_rewrite("rtk git status", &selected), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rtk_rewrite_declines_a_command_local_rtk_binding() {
+        let dir = TempDir::new().expect("tempdir");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).expect("create PATH directory");
+        let marker = dir.path().join("hook-ran");
+        write_executable(
+            &bin.join("rtk"),
+            &format!(
+                "#!/bin/sh\nprintf hook > '{}'\nprintf 'rtk git status\\n'\n",
+                marker.display()
+            ),
+        );
+        let path = std::env::join_paths([&bin]).expect("fixture PATH");
+        assert_eq!(
+            find_rtk_on_path(Some(&path)),
+            Some(bin.join("rtk")),
+            "the fixture must offer the helper that would otherwise run"
+        );
+
+        let rewritten = BashTool::new(true, None)
+            .rtk_rewrite_with_host_path(
+                "rtk() { printf rebound; }; git status",
+                Some(&path),
+                dir.path(),
+                &TaskRegistry::default(),
+            )
+            .await;
+        assert_eq!(rewritten, None);
+        assert!(
+            !marker.exists(),
+            "the hook ran despite the local rtk binding"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_local_path_cannot_retarget_the_selected_rtk() {
+        let dir = TempDir::new().expect("tempdir");
+        let host_bin = dir.path().join("host-bin");
+        let command_bin = dir.path().join("command-bin");
+        std::fs::create_dir(&host_bin).expect("create host PATH");
+        std::fs::create_dir(&command_bin).expect("create command PATH");
+        write_executable(
+            &command_bin.join("git"),
+            "#!/bin/sh\nprintf 'command-path-git\\n'\n",
+        );
+        let command = format!("PATH={} git status", command_bin.display());
+        write_executable(
+            &host_bin.join("rtk"),
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$1 $2\" = \"hook check\" ]; then\n\
+                   printf '%s\\n' 'PATH={} rtk git status'\n\
+                 elif [ \"$1 $2\" = \"git status\" ]; then\n\
+                   printf 'selected-host-rtk\\n'\n\
+                 fi\n",
+                command_bin.display()
+            ),
+        );
+        assert!(
+            !command_bin.join("rtk").exists(),
+            "the command-local PATH must be unable to resolve literal rtk"
+        );
+        let host_path = std::env::join_paths([&host_bin]).expect("fixture host PATH");
+        let rewritten = BashTool::new(true, None)
+            .rtk_rewrite_with_host_path(
+                &command,
+                Some(&host_path),
+                dir.path(),
+                &TaskRegistry::default(),
+            )
+            .await
+            .expect("the host helper rewrites the command");
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&rewritten)
+            .current_dir(dir.path())
+            .output()
+            .expect("execute bound rewrite");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"selected-host-rtk\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn killed_helper_reap_releases_ownership_after_its_bound() {
+        let sleep = host_executable("sleep");
+        let mut command = Command::new(sleep);
+        command.arg("30").process_group(0);
+        let child = command.spawn().expect("spawn unreaped-child fixture");
+        let pid: i32 = child
+            .id()
+            .expect("fixture pid")
+            .try_into()
+            .expect("fixture pid fits i32");
+        let mut fixture = FixtureProcess(Some(pid));
+        let registry = TaskRegistry::default();
+        let stdout_reader = tokio::spawn(std::future::pending::<()>());
+        let stderr_reader = tokio::spawn(std::future::pending::<()>());
+        let armed = ArmedProcess {
+            child,
+            pgid: pid,
+            _cleanup: registry.track_cleanup(),
+            teardown: ProcessTeardown::Immediate,
+            readers: vec![stdout_reader.abort_handle(), stderr_reader.abort_handle()],
+        };
+
+        // Do not signal this fixture. It stands in for a SIGKILL-pending child
+        // that the kernel cannot reap yet, which ordinary process states cannot
+        // reproduce safely in a test.
+        let result = tokio::time::timeout(
+            KILL_GRACE + Duration::from_secs(1),
+            reap_killed_process(armed),
+        )
+        .await;
+        assert!(result.is_ok(), "helper reap exceeded its ownership bound");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stdout_reader)
+                .await
+                .expect("stdout reader abort was bounded")
+                .expect_err("stdout reader was aborted")
+                .is_cancelled()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stderr_reader)
+                .await
+                .expect("stderr reader abort was bounded")
+                .expect_err("stderr reader was aborted")
+                .is_cancelled()
+        );
+        assert!(
+            registry.quiesce(Duration::ZERO).await,
+            "bounded reap retained the session cleanup lease"
+        );
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        wait_until(
+            || !process_is_live(pid),
+            "the unreaped-child fixture to terminate",
+        )
+        .await;
+        fixture.disarm();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminating_helper_releases_readers_and_cleanup_after_its_bound() {
+        let sleep = host_executable("sleep");
+        let child = Command::new(sleep)
+            .arg("30")
+            .spawn()
+            .expect("spawn unreaped-child fixture");
+        let pid: i32 = child
+            .id()
+            .expect("fixture pid")
+            .try_into()
+            .expect("fixture pid fits i32");
+        let mut fixture = FixtureProcess(Some(pid));
+        let registry = TaskRegistry::default();
+        let mut guard = ProcessGuard {
+            armed: Some(ArmedProcess {
+                child,
+                // No process group owns this id, so terminate's SIGKILL cannot
+                // make the fixture reapable. This deterministically models the
+                // kernel-level wait the production bound protects against.
+                pgid: i32::MAX,
+                _cleanup: registry.track_cleanup(),
+                teardown: ProcessTeardown::Immediate,
+                readers: Vec::new(),
+            }),
+        };
+        let stdout_reader = tokio::spawn(std::future::pending::<()>());
+        let stderr_reader = tokio::spawn(std::future::pending::<()>());
+        guard.watch_readers([stdout_reader.abort_handle(), stderr_reader.abort_handle()]);
+
+        let result =
+            tokio::time::timeout(KILL_GRACE + Duration::from_secs(1), guard.terminate()).await;
+        assert!(
+            result.is_ok(),
+            "helper termination exceeded its ownership bound"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stdout_reader)
+                .await
+                .expect("stdout reader abort was bounded")
+                .expect_err("stdout reader was aborted")
+                .is_cancelled()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stderr_reader)
+                .await
+                .expect("stderr reader abort was bounded")
+                .expect_err("stderr reader was aborted")
+                .is_cancelled()
+        );
+        assert!(
+            registry.quiesce(Duration::ZERO).await,
+            "bounded termination retained the session cleanup lease"
+        );
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        wait_until(|| !process_is_live(pid), "the terminate fixture to stop").await;
+        fixture.disarm();
+    }
+
+    #[cfg(target_os = "linux")]
+    struct FixtureProcess(Option<i32>);
+
+    #[cfg(target_os = "linux")]
+    impl FixtureProcess {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FixtureProcess {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rtk_hook_timeout_terminates_helper_descendants() {
+        let started = std::time::Instant::now();
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tools::bash::tests::rtk_hook_timeout_child",
+                "--nocapture",
+            ])
+            .env("AJ_RTK_TIMEOUT_FIXTURE", "1")
+            .output()
+            .expect("run isolated hook-timeout test");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "hook timeout did not promptly own down its process group: {output:?}"
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "the exact child test did not run: {output:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn rtk_hook_timeout_child() {
+        if std::env::var_os("AJ_RTK_TIMEOUT_FIXTURE").is_none() {
+            return;
+        }
+        let dir = TempDir::new().expect("tempdir");
+        let rtk = dir.path().join("rtk");
+        let leader_pid_file = dir.path().join("rtk.pid");
+        let pid_file = dir.path().join("rtk.child.pid");
+        write_executable(
+            &rtk,
+            "#!/bin/sh\nprintf '%s\n' \"$$\" > \"$0.pid\"\n/bin/sh -c 'trap \"\" TERM; exec /bin/sleep 10' &\nprintf '%s\n' \"$!\" > \"$0.child.pid\"\nwait\n",
+        );
+        let registry = TaskRegistry::default();
+
+        assert_eq!(
+            rtk_hook_check_with_timeout(
+                &rtk,
+                dir.path(),
+                "git status",
+                registry.track_cleanup(),
+                Duration::from_secs(2),
+            )
+            .await,
+            None,
+        );
+        let leader_pid = read_pid(&leader_pid_file);
+        let pid = read_pid(&pid_file);
+        let mut leader = FixtureProcess(Some(leader_pid));
+        let mut fixture = FixtureProcess(Some(pid));
+        assert!(
+            !Path::new(&format!("/proc/{leader_pid}")).exists(),
+            "the timed-out hook leader {leader_pid} was not reaped"
+        );
+        wait_until(
+            || !process_is_live(pid),
+            "the timed-out hook descendant to terminate",
+        )
+        .await;
+        assert!(
+            registry.quiesce(Duration::ZERO).await,
+            "hook cleanup lease survived synchronous timeout cleanup"
+        );
+        leader.disarm();
+        fixture.disarm();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_rtk_hook_check_terminates_helper_descendants() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tools::bash::tests::dropping_rtk_hook_check_child",
+                "--nocapture",
+            ])
+            .env("AJ_RTK_DROP_FIXTURE", "1")
+            .output()
+            .expect("run isolated hook-cancellation test");
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "the exact child test did not run: {output:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_rtk_hook_check_child() {
+        if std::env::var_os("AJ_RTK_DROP_FIXTURE").is_none() {
+            return;
+        }
+        let dir = TempDir::new().expect("tempdir");
+        let rtk = dir.path().join("rtk");
+        let leader_pid_file = dir.path().join("rtk.pid");
+        let pid_file = dir.path().join("rtk.child.pid");
+        write_executable(
+            &rtk,
+            "#!/bin/sh\nprintf '%s\n' \"$$\" > \"$0.pid\"\n/bin/sh -c 'trap \"\" TERM; exec /bin/sleep 10' &\nprintf '%s\n' \"$!\" > \"$0.child.pid\"\nwait\n",
+        );
+        let registry = TaskRegistry::default();
+
+        drop_when_ready(
+            rtk_hook_check_with_timeout(
+                &rtk,
+                dir.path(),
+                "git status",
+                registry.track_cleanup(),
+                Duration::from_secs(5),
+            ),
+            &pid_file,
+        )
+        .await;
+        let leader_pid = read_pid(&leader_pid_file);
+        let pid = read_pid(&pid_file);
+        let mut leader = FixtureProcess(Some(leader_pid));
+        let mut fixture = FixtureProcess(Some(pid));
+        assert!(
+            registry.quiesce(Duration::from_secs(1)).await,
+            "outer-cancelled hook teardown did not release its cleanup lease"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{leader_pid}")).exists(),
+            "the cancelled hook leader {leader_pid} was not reaped"
+        );
+        wait_until(
+            || !process_is_live(pid),
+            "the cancelled rtk hook descendant to terminate",
+        )
+        .await;
+        leader.disarm();
+        fixture.disarm();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rtk_path_lookup_ignores_the_windows_executable_name() {
+        let dir = TempDir::new().expect("tempdir");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir(&first).expect("create first PATH directory");
+        std::fs::create_dir(&second).expect("create second PATH directory");
+        write_executable(&first.join("rtk.exe"), "#!/bin/sh\nexit 0\n");
+        write_executable(&second.join("rtk"), "#!/bin/sh\nexit 0\n");
+        let path = std::env::join_paths([&first, &second]).expect("join fixture PATH");
+
+        assert_eq!(find_rtk_on_path(Some(&path)), Some(second.join("rtk")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rtk_selection_and_hook_environment_belong_to_the_host() {
+        let dir = TempDir::new().expect("tempdir");
+        let shadow_bin = dir.path().join("shadow-bin");
+        let host_bin = dir.path().join("host-bin");
+        let session_bin = dir.path().join("session-bin");
+        std::fs::create_dir(&shadow_bin).expect("create shadow bin");
+        std::fs::create_dir(&host_bin).expect("create host bin");
+        std::fs::create_dir(&session_bin).expect("create session bin");
+        std::fs::write(
+            shadow_bin.join("rtk"),
+            "#!/bin/sh\nprintf 'non-executable-shadow\\n'\n",
+        )
+        .expect("write non-executable rtk shadow");
+        assert!(
+            nix::unistd::access(&shadow_bin.join("rtk"), nix::unistd::AccessFlags::X_OK,).is_err(),
+            "the earlier PATH candidate must be genuinely unexecutable"
+        );
+        let bash = host_executable("bash");
+        std::os::unix::fs::symlink(bash, session_bin.join("bash"))
+            .expect("link bash into session PATH");
+        write_executable(
+            &host_bin.join("rtk"),
+            "#!/bin/sh\n\
+             if [ \"$1 $2\" = \"hook check\" ]; then\n\
+               [ \"$PATH\" = \"$AJ_RTK_EXPECTED_HOST_PATH\" ] || exit 20\n\
+               [ -z \"${AJ_RTK_SESSION_ONLY+x}\" ] || exit 21\n\
+               printf 'rtk host-probe\\n'\n\
+             elif [ \"$1\" = \"host-probe\" ]; then\n\
+               [ \"$AJ_RTK_SESSION_ONLY\" = session ] || exit 22\n\
+               printf 'host-rewrite\\n'\n\
+             fi\n",
+        );
+        write_executable(
+            &session_bin.join("rtk"),
+            "#!/bin/sh\nif [ \"$1 $2\" = \"hook check\" ]; then printf 'rtk session-probe\\n'; else printf 'session-rewrite\\n'; fi\n",
+        );
+        write_executable(
+            &session_bin.join("git"),
+            "#!/bin/sh\nprintf 'raw-session-git\\n'\n",
+        );
+
+        let host_path = std::env::join_paths([&shadow_bin, &host_bin]).expect("join host PATH");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tools::bash::tests::rtk_host_contract_child",
+                "--nocapture",
+            ])
+            .env("PATH", &host_path)
+            .env("AJ_RTK_EXPECTED_HOST_PATH", &host_path)
+            .env("AJ_RTK_SESSION_BIN", &session_bin)
+            .output()
+            .expect("run isolated host-environment test");
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "the exact child test did not run: {output:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rtk_host_contract_child() {
+        let Some(session_bin) = std::env::var_os("AJ_RTK_SESSION_BIN") else {
+            return;
+        };
+        let session_bin = PathBuf::from(session_bin);
+        let mut ctx = DummyToolContext {
+            working_directory: session_bin
+                .parent()
+                .expect("session bin has a parent")
+                .to_path_buf(),
+            session_env: std::collections::BTreeMap::from([
+                (
+                    "PATH".to_string(),
+                    session_bin.to_string_lossy().into_owned(),
+                ),
+                ("AJ_RTK_SESSION_ONLY".to_string(), "session".to_string()),
+            ]),
+            ..DummyToolContext::default()
+        };
+        let outcome = BashTool::new(true, Some(ctx.working_directory.clone()))
+            .execute(
+                &mut ctx,
+                BashInput {
+                    command: "git status".to_string(),
+                    timeout: 5,
+                    description: "test host-owned rtk".to_string(),
+                    run_in_background: false,
+                },
+            )
+            .await
+            .expect("execute with distinct host and session environments");
+        let ToolDetails::Bash {
+            exit_code,
+            stdout,
+            stderr,
+            ..
+        } = &outcome.details
+        else {
+            panic!("expected Bash details, got {:?}", outcome.details)
+        };
+        assert_eq!(*exit_code, Some(0), "stderr: {stderr}");
+        assert_eq!(stdout, "host-rewrite\n", "stderr: {stderr}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rtk_rewrite_declines_an_empty_path_component() {
+        let dir = TempDir::new().expect("tempdir");
+        write_executable(&dir.path().join("rtk"), "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            find_rtk_on_path(Some(OsStr::new(""))),
+            None,
+            "an empty component moves with the shell cwd"
+        );
     }
 
     /// `ToolContext` wrapper that records every `emit_update` snapshot

@@ -98,7 +98,6 @@ mod tests {
     use std::path::Path;
 
     use aj_models::types::UserContent;
-    use clap::Parser;
     use tempfile::tempdir;
 
     use crate::cli::args::Args;

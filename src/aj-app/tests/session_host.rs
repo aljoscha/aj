@@ -5,6 +5,7 @@
 //! frames asserted on are the ones a network server would serialize and
 //! the client fold ([`SessionClient`]) would receive.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -327,6 +328,21 @@ fn calling(text: &str, call_id: &str, tool: &str, args: serde_json::Value) -> As
     }));
     message.stop_reason = StopReason::ToolUse;
     message
+}
+
+fn env_bash_turn(call_id: &str) -> Vec<AssistantMessage> {
+    vec![
+        calling(
+            "checking session identity",
+            call_id,
+            "bash",
+            serde_json::json!({
+                "command": "printf 'actor=%s case=%s/%s fixed=%s' \"$BEADS_ACTOR\" \"$AJ_CASE\" \"$aj_case\" \"$AGENT\"",
+                "description": "read session environment"
+            }),
+        ),
+        finalized_text_message("identity checked"),
+    ]
 }
 
 /// A turn that spawns a blocking sub-agent, then concludes. The parent and
@@ -695,6 +711,23 @@ fn main_tools(state: &CanonicalState) -> Vec<String> {
         .collect()
 }
 
+fn main_tool_content(state: &CanonicalState, call_id: &str) -> serde_json::Value {
+    state
+        .agent(AgentId::Main)
+        .expect("main transcript")
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            aj_app::test_support::CanonicalEntry::Tool {
+                call_id: seen,
+                content,
+                ..
+            } if seen == call_id => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no tool result for call {call_id}"))
+}
+
 /// The report sub-agent `child`'s box renders, which is what a client shows
 /// for a run it is not observing.
 fn sub_report(state: &CanonicalState, child: usize) -> Option<String> {
@@ -833,6 +866,7 @@ async fn explicit_creation_applies_settings_before_its_first_prompt() {
             }),
             Some(vec![UserContent::text("begin")]),
             None,
+            None,
         )
         .await
         .expect("create with settings");
@@ -856,6 +890,117 @@ async fn explicit_creation_applies_settings_before_its_first_prompt() {
 }
 
 #[tokio::test]
+async fn session_env_survives_root_head_switch_real_bash_and_host_restart() {
+    let harness = Harness::new(env_bash_turn("first-env"));
+    let env = BTreeMap::from([
+        ("BEADS_ACTOR".to_string(), "session-actor".to_string()),
+        ("AJ_CASE".to_string(), "upper".to_string()),
+        ("aj_case".to_string(), "lower".to_string()),
+        ("AGENT".to_string(), "session-value".to_string()),
+    ]);
+    let session = harness
+        .host
+        .create_with(None, None, None, Some(env.clone()))
+        .await
+        .expect("create with session env");
+    let canonical = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{session}.jsonl"));
+    let handles = harness.host.local_handles(&session).await.expect("handles");
+    let root = {
+        let log = handles.log.lock().await;
+        assert_eq!(log.session_env(), Some(&env));
+        let entries = log.entries_in_order();
+        assert!(matches!(
+            entries.first().map(|entry| &entry.entry),
+            Some(aj_session::ConversationEntryKind::SystemPrompt { .. })
+        ));
+        assert!(matches!(
+            entries.get(1).map(|entry| &entry.entry),
+            Some(aj_session::ConversationEntryKind::EnvChange { .. })
+        ));
+        assert!(matches!(
+            entries.get(2).map(|entry| &entry.entry),
+            Some(aj_session::ConversationEntryKind::ModelChange { .. })
+        ));
+        log.system_prompt_id().cloned().expect("system-prompt root")
+    };
+    assert!(
+        !canonical.exists(),
+        "creation seeds published before punctuation"
+    );
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(root.clone()),
+            },
+        )
+        .await
+        .expect("the system-prompt root remains a legal head");
+    assert!(
+        !canonical.exists(),
+        "head switching flushed seed-only identity"
+    );
+
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "check identity").await;
+    client.pump_until_idle().await;
+    let first = client.canonical();
+    assert!(
+        main_tool_content(&first, "first-env")
+            .to_string()
+            .contains("actor=session-actor case=upper/lower fixed=aj"),
+        "the real Bash child did not observe exact session layering: {first:?}"
+    );
+    {
+        let log = handles.log.lock().await;
+        assert_eq!(log.session_env(), Some(&env));
+        let first_user = log
+            .entries_in_order()
+            .into_iter()
+            .find(|entry| {
+                matches!(
+                    &entry.entry,
+                    aj_session::ConversationEntryKind::Message { message }
+                        if matches!(message.as_stored_wire(), Some(aj_models::types::Message::User(_)))
+                )
+            })
+            .expect("first user message on root branch");
+        assert_eq!(
+            first_user.parent_id.as_ref(),
+            Some(&root),
+            "the fixture's active branch did not omit every inference-setting seed"
+        );
+    }
+    drop((client, handles));
+    harness.host.shutdown().await;
+
+    let revived = harness.revive(env_bash_turn("revived-env"));
+    let mut client = Client::attach(&revived.host, &session).await;
+    revived.prompt(&session, "check after restart").await;
+    client.pump_until_idle().await;
+    let after_restart = client.canonical();
+    assert!(
+        main_tool_content(&after_restart, "revived-env")
+            .to_string()
+            .contains("actor=session-actor case=upper/lower fixed=aj"),
+        "materialization did not restore log-level session identity: {after_restart:?}"
+    );
+    let handles = revived
+        .host
+        .local_handles(&session)
+        .await
+        .expect("revived handles");
+    assert_eq!(handles.log.lock().await.session_env(), Some(&env));
+    drop((client, handles));
+    revived.host.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
     // A host whose configured level its own model has no word for, which is
     // ordinary: the level comes from a config file, the model from a catalog.
@@ -874,6 +1019,7 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
             }),
             None,
             None,
+            None,
         )
         .await
         .expect("an unstated axis is the host's to default");
@@ -890,6 +1036,7 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
                 thinking: Some("xhigh".into()),
                 ..SessionSettings::default()
             }),
+            None,
             None,
             None,
         )
@@ -939,7 +1086,7 @@ async fn refused_creation_leaves_no_discoverable_session() {
     ] {
         let refused = harness
             .host
-            .create_with(settings, prompt, tag)
+            .create_with(settings, prompt, tag, None)
             .await
             .expect_err("creation is refused");
         assert!(
@@ -957,6 +1104,28 @@ async fn refused_creation_leaves_no_discoverable_session() {
             "validation happens before the log is created",
         );
     }
+
+    let refused = harness
+        .host
+        .create_with(
+            None,
+            None,
+            None,
+            Some(BTreeMap::from([("".to_string(), "value".to_string())])),
+        )
+        .await
+        .expect_err("an invalid session env is refused before mint");
+    assert!(matches!(refused, CreateError::Refused(_)), "{refused}");
+    assert!(
+        harness
+            .host
+            .sessions()
+            .await
+            .expect("sessions")
+            .sessions
+            .is_empty(),
+        "invalid session env left a discoverable session"
+    );
     harness.host.shutdown().await;
 }
 
@@ -973,7 +1142,7 @@ async fn a_tag_the_store_will_not_take_leaves_the_session_created() {
 
     let err = harness
         .host
-        .create_with(None, None, Some("fix-auth".to_string()))
+        .create_with(None, None, Some("fix-auth".to_string()), None)
         .await
         .expect_err("the sidecar write cannot land");
     let CreateError::Incomplete(partial) = err else {
@@ -1048,6 +1217,7 @@ async fn creation_resolves_real_models_from_the_host_catalog_with_lazy_auth() {
                 }),
                 ..SessionSettings::default()
             }),
+            None,
             None,
             None,
         )
@@ -7995,6 +8165,7 @@ async fn a_session_can_be_created_already_tagged() {
             Some(vec![UserContent::text("hi")]),
             // Padded, because the store keeps the trimmed label (spec 6.6).
             Some("  spike  ".to_string()),
+            None,
         )
         .await
         .expect("create with a tag");

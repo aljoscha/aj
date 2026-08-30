@@ -49,14 +49,15 @@
 //! - [`ConversationEntryKind::ModelChange`] /
 //!   [`ConversationEntryKind::ThinkingChange`] /
 //!   [`ConversationEntryKind::SpeedChange`] /
-//!   [`ConversationEntryKind::VerbosityChange`] /
-//!   [`ConversationEntryKind::EnvChange`]: one
+//!   [`ConversationEntryKind::VerbosityChange`]: one
 //!   [`AgentEvent::Notice`] (`Model set to <provider>/<id>.`, etc.),
 //!   but only when at least one `Message` entry precedes the entry
 //!   on the same thread. This renders mid-session switches in
 //!   resumed scrollback while keeping seed entries (session
 //!   creation) silent — they never produced a visible notice live
 //!   either.
+//! - [`ConversationEntryKind::EnvChange`]: no event. It is immutable
+//!   log-level creation metadata, not a state transition on any thread.
 //! - [`ConversationEntryKind::SubAgentSpawn`]: no notice; the entry
 //!   feeds the sub-agent bracketing below.
 //! - [`ConversationEntryKind::Compaction`]: a single
@@ -919,25 +920,9 @@ impl ReplayState {
                     out,
                 );
             }
-            ConversationEntryKind::EnvChange { env } => {
-                let keys = if env.is_empty() {
-                    "none".to_string()
-                } else {
-                    // A key is arbitrary persisted text, not an identifier.
-                    // ASCII-only quoting makes delimiters unambiguous and
-                    // leaves no terminal-active Unicode in the notice.
-                    env.keys()
-                        .map(|key| format!("\"{}\"", key.escape_default()))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                self.state_notice(
-                    agent_id,
-                    at,
-                    format!("Session environment keys: {keys}."),
-                    out,
-                );
-            }
+            // Immutable creation metadata, read at the session boundary rather
+            // than announced as a branch-local state transition.
+            ConversationEntryKind::EnvChange { .. } => {}
             ConversationEntryKind::SubAgentSpawn { .. } => {
                 // Seed entry: projected as the synthesized
                 // SubAgentStart by `bracket_subagent`, never as a
@@ -2719,147 +2704,6 @@ mod tests {
                 "env value {value:?} leaked into the replay event stream: {stream}"
             );
         }
-    }
-
-    #[test]
-    fn replay_emits_one_keys_only_notice_for_a_post_message_env_change() {
-        let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let session_id = {
-            let mut log = ConversationLog::create(&persistence).expect("create log");
-            log.set_system_prompt("p".into()).expect("sp");
-            {
-                let mut view = ConversationView::user(&mut log);
-                view.add_message(user_msg("before")).expect("first message");
-            }
-            log.append_env_change(BTreeMap::from([
-                ("BEADS_ACTOR".to_string(), "azurite".to_string()),
-                ("SECRET_TOKEN".to_string(), "hunter2".to_string()),
-            ]))
-            .expect("mid-session env");
-            {
-                let mut view = ConversationView::user(&mut log);
-                view.add_message(user_msg("after"))
-                    .expect("flush env entry");
-            }
-            log.session_id().to_string()
-        };
-        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
-
-        let events: Vec<AgentEvent> = replay(&resumed).collect();
-        let notices: Vec<(usize, &str)> = events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| match event {
-                AgentEvent::Notice { agent_id, text } => {
-                    assert_eq!(*agent_id, AgentId::Main);
-                    Some((index, text.as_str()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            notices,
-            vec![(
-                2,
-                "Session environment keys: \"BEADS_ACTOR\", \"SECRET_TOKEN\"."
-            )],
-            "EnvChange must project exactly one notice between the two messages"
-        );
-        assert!(
-            matches!(events[1], AgentEvent::MessageEnd { .. }),
-            "the notice did not follow the preceding message: {events:#?}"
-        );
-        assert!(
-            matches!(events[3], AgentEvent::MessageStart { .. }),
-            "the notice did not precede the following message: {events:#?}"
-        );
-        let stream = serde_json::to_string(&events).expect("replay events serialize");
-        for value in ["azurite", "hunter2"] {
-            assert!(
-                !stream.contains(value),
-                "env value {value:?} leaked into the replay event stream: {stream}"
-            );
-        }
-    }
-
-    #[test]
-    fn replay_quotes_pathological_env_keys_before_they_reach_notice_text() {
-        let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
-        log.set_system_prompt("p".into()).expect("sp");
-        {
-            let mut view = ConversationView::user(&mut log);
-            view.add_message(user_msg("before")).expect("first message");
-        }
-        let env_entry = log
-            .append_env_change(BTreeMap::from([
-                ("bidi\u{202e}key".to_string(), "hunter2".to_string()),
-                ("carriage\rreturn".to_string(), "hunter2".to_string()),
-                ("comma,key".to_string(), "hunter2".to_string()),
-                ("escape\u{1b}[31m".to_string(), "hunter2".to_string()),
-                ("line\nbreak".to_string(), "hunter2".to_string()),
-                ("line\u{2028}separator".to_string(), "hunter2".to_string()),
-                ("quote\"slash\\".to_string(), "hunter2".to_string()),
-                ("tab\tkey".to_string(), "hunter2".to_string()),
-                ("unicode界".to_string(), "hunter2".to_string()),
-                ("zero\u{200b}width".to_string(), "hunter2".to_string()),
-            ]))
-            .expect("mid-session env");
-        let env_entry_id = env_entry.id;
-        {
-            let mut view = ConversationView::user(&mut log);
-            view.add_message(user_msg("after"))
-                .expect("flush env entry");
-        }
-        let session_id = log.session_id().to_string();
-        drop(log);
-        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
-
-        let events: Vec<AgentEvent> = replay(&resumed).collect();
-        let notices = events
-            .iter()
-            .filter(|event| matches!(event, AgentEvent::Notice { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            notices.len(),
-            1,
-            "the environment state entry must project exactly one notice: {events:#?}"
-        );
-        let notice = notices[0];
-        let AgentEvent::Notice { text, .. } = notice else {
-            unreachable!("matched above")
-        };
-        assert_eq!(
-            text,
-            r#"Session environment keys: "bidi\u{202e}key", "carriage\rreturn", "comma,key", "escape\u{1b}[31m", "line\nbreak", "line\u{2028}separator", "quote\"slash\\", "tab\tkey", "unicode\u{754c}", "zero\u{200b}width"."#,
-            "the complete terminal-facing notice must be quoted and escaped"
-        );
-        assert!(
-            text.is_ascii(),
-            "non-ASCII text reached the terminal-facing notice: {text:?}"
-        );
-        assert!(
-            !text.contains("hunter2"),
-            "an environment value reached notice text: {text:?}"
-        );
-
-        let snapshot = resumed.snapshot();
-        let projected = snapshot
-            .project_state_entry(&env_entry_id)
-            .expect("the public state projection covers environment entries");
-        assert_eq!(
-            wire(&projected),
-            wire(notice),
-            "the public state-entry API must return the replayed environment notice"
-        );
-        #[allow(deprecated)]
-        let settings_projection = snapshot.project_settings_entry(&env_entry_id);
-        assert!(
-            settings_projection.is_none(),
-            "the compatibility API must retain its settings-only contract"
-        );
     }
 
     /// A settings entry recorded after a message on the same thread

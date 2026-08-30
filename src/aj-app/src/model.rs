@@ -634,7 +634,6 @@ mod tests {
 
     #[test]
     fn model_selection_cli_overrides_config() {
-        use clap::Parser;
         let args = Args::parse_from(["aj", "--model-api", "openai", "--model-name", "gpt-x"]);
         let config = Config {
             model_api: Some("anthropic".to_string()),
@@ -652,7 +651,6 @@ mod tests {
 
     #[test]
     fn model_selection_falls_back_to_config_then_default() {
-        use clap::Parser;
         let args = Args::parse_from(["aj"]);
         let config = Config {
             model_name: Some("claude-x".to_string()),

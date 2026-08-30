@@ -161,9 +161,14 @@ impl Config {
         Some(git_root.join(".aj").join("config.toml"))
     }
 
+    /// Path to `~/.aj/.env` without creating the config directory. Startup
+    /// probes this before command validation, so a refused invocation must not
+    /// leave configuration state behind merely by looking for secrets.
     pub fn get_dotenv_file_path() -> Result<PathBuf, ConfigError> {
-        let aj_dir = Self::get_config_dir()?;
-        Ok(aj_dir.join(".env"))
+        Ok(home_dir()
+            .ok_or(ConfigError::HomeNotFound)?
+            .join(".aj")
+            .join(".env"))
     }
 
     /// Get the sessions directory path for the current project. The sessions

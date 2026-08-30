@@ -10,6 +10,7 @@
 //! [`TranscriptView`] renders it with follow-tail.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +24,7 @@ use aj_agent::types::UsageSummary;
 use aj_app::actions::AjAction;
 use aj_app::chat::ChatState;
 use aj_app::cli::args::{
-    Args, Command as CliCommand, HOST_WITHOUT_A_CREATE, TAG_WITHOUT_A_CREATE,
+    Args, Command as CliCommand, ENV_WITHOUT_A_CREATE, HOST_WITHOUT_A_CREATE, TAG_WITHOUT_A_CREATE,
     THINKING_WITHOUT_A_CREATE,
 };
 use aj_app::client::{Attach, SessionClient};
@@ -187,6 +188,10 @@ struct World {
     /// The project's sessions store, shared with the prompt-history scan
     /// (run detached on a blocking thread off the drive loop).
     persistence: ConversationPersistence,
+    /// Environment armed for every create this invocation performs. It stays
+    /// with the frontend rather than the host so unrelated remote creates on
+    /// an embedded server cannot inherit the launcher's identity.
+    launch_env: Option<BTreeMap<String, String>>,
 }
 
 /// Which session the process opens with.
@@ -252,13 +257,15 @@ async fn build_world(
     // Refused before the host is asked to mint anything, so an illegal label
     // costs no session and reports on the normal screen.
     let tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
+    let launch_env = args.launch_env().map_err(|err| anyhow!("--env: {err}"))?;
     // A create that minted its session and could not apply the label still
     // gives us a session to run. Refusing to start over a label that did not
     // stick would strand the user with a session they cannot see, and the
     // remedy is to retag rather than to create another one.
     let mut partial_create = None;
     let session = match startup {
-        StartupSession::Create => match host.create_with(None, None, tag).await {
+        StartupSession::Create => match host.create_with(None, None, tag, launch_env.clone()).await
+        {
             Ok(session) => session,
             Err(CreateError::Incomplete(partial)) => {
                 let session = partial.session.clone();
@@ -309,6 +316,7 @@ async fn build_world(
         catalog,
         auth: auth.clone(),
         persistence: persistence.clone(),
+        launch_env,
     };
     // Awaited rather than drained: the block is producer-paced, and the
     // resumed history has to be in the model before the first frame is drawn.
@@ -358,6 +366,9 @@ async fn build_world(
     }
     if !fresh && args.has_launch_tag() {
         fold_warning(&mut world, TAG_WITHOUT_A_CREATE);
+    }
+    if !fresh && args.has_launch_env() {
+        fold_warning(&mut world, ENV_WITHOUT_A_CREATE);
     }
     if let Some(warning) = &partial_create {
         fold_warning(&mut world, warning);
@@ -454,6 +465,7 @@ async fn build_connect_world(
         catalog,
         auth: auth.clone(),
         persistence: persistence.clone(),
+        launch_env: args.launch_env().map_err(|err| anyhow!("--env: {err}"))?,
     };
     fold_attach_block(&mut world).await;
     refresh_client_reads(&mut world).await;
@@ -473,6 +485,9 @@ async fn build_connect_world(
     }
     if !created && args.thinking.is_some() {
         fold_warning(&mut world, THINKING_WITHOUT_A_CREATE);
+    }
+    if !created && args.has_launch_env() {
+        fold_warning(&mut world, ENV_WITHOUT_A_CREATE);
     }
     let dialed = format!("Connected to {}.", connect_url(&world));
     fold_notice(&mut world, &dialed);
@@ -1158,7 +1173,11 @@ async fn apply_focus_request(
 ) -> Focus {
     let focus = match request {
         FocusRequest::Create { host } => {
-            let created = match world.control.create(host, None, None, None).await {
+            let created = match world
+                .control
+                .create(host, None, None, None, world.launch_env.clone())
+                .await
+            {
                 Ok(session) => focus_session(app, shell, world, session.clone(), true)
                     .await
                     .map(|()| session),
@@ -7290,7 +7309,6 @@ mod tests {
     use aj_app::chat::{EntryKind, NoticeLevel, SubAgentStatus, ToolStatus, reduce};
     use aj_app::session::AgentLifecycle;
     use aj_app::test_support::CanonicalState;
-    use clap::Parser;
     use tempfile::TempDir;
     use vaxis::gwidth;
     use vaxis::key::{Key, Modifiers};
@@ -17454,7 +17472,7 @@ mod tests {
         let home = world.session().to_string();
         let other = world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session");
         assert!(
@@ -17655,7 +17673,7 @@ mod tests {
         let home = world.session().to_string();
         let put_away = world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session");
         world
@@ -17735,7 +17753,7 @@ mod tests {
 
         let other = world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session");
         // Its row has to exist before the visit below: the viewed stamp is the
@@ -17833,7 +17851,7 @@ mod tests {
         run_prompt(&mut world, "seed").await;
         world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session");
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -17890,12 +17908,12 @@ mod tests {
         let focused = world.session().to_string();
         let background = world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session");
         let listed = world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a third session");
         for session in [&background, &listed] {
@@ -18223,7 +18241,7 @@ mod tests {
         for _ in 0..2 {
             world
                 .control
-                .create(None, None, None, None)
+                .create(None, None, None, None, None)
                 .await
                 .expect("another session");
         }
@@ -18302,7 +18320,7 @@ mod tests {
         run_prompt(&mut world, "seed").await;
         world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session to step onto");
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -18398,7 +18416,7 @@ mod tests {
         toggle().await;
         world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session");
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -18434,7 +18452,7 @@ mod tests {
         run_prompt(&mut world, "seed").await;
         let other = world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session");
         assert!(
@@ -18695,7 +18713,7 @@ mod tests {
         for _ in 0..2 {
             world
                 .control
-                .create(None, None, None, None)
+                .create(None, None, None, None, None)
                 .await
                 .expect("another session");
         }
@@ -22893,6 +22911,92 @@ mod tests {
         remote.shutdown().await;
     }
 
+    /// A connected attach cannot apply create-only environment identity. The
+    /// warning is client-visible, and neither a second session nor an EnvChange
+    /// may appear on the host as a side effect of carrying the flag.
+    #[tokio::test]
+    async fn a_launch_env_on_connect_attach_warns_without_backfilling_identity() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let session = remote
+            .host
+            .create_with(
+                None,
+                Some(vec![UserContent::text("persist the legacy session")]),
+                None,
+                None,
+            )
+            .await
+            .expect("create an env-less session on the host");
+        crate::remote::tests::bounded("the seed turn to become idle", async {
+            loop {
+                let rows = remote.host.sessions().await.expect("host rows");
+                if rows
+                    .sessions
+                    .iter()
+                    .any(|row| row.id == session && !row.working)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let path = persistence.sessions_dir().join(format!("{session}.jsonl"));
+        let before = std::fs::read(&path).expect("persisted env-less session");
+
+        let world = connect_world(&dir, &remote, &["--env", "BEADS_ACTOR=other-session"]).await;
+        assert_eq!(
+            world.session(),
+            session,
+            "the connect created instead of attaching"
+        );
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|notice| notice == ENV_WITHOUT_A_CREATE),
+            "the unused env flag was silent: {:?}",
+            main_notices(&world)
+        );
+        assert_eq!(
+            remote
+                .host
+                .sessions()
+                .await
+                .expect("host rows after attach")
+                .sessions
+                .len(),
+            1,
+            "connect minted another session instead of attaching"
+        );
+        drop(world);
+
+        assert_eq!(
+            std::fs::read(&path).expect("session bytes after attach"),
+            before,
+            "connect backfilled the existing session log"
+        );
+        let resumed =
+            aj_session::ConversationLog::resume(&persistence, &session).expect("resume host log");
+        assert_eq!(resumed.session_env(), None);
+        assert_eq!(
+            resumed
+                .entries_in_order()
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.entry,
+                        aj_session::ConversationEntryKind::EnvChange { .. }
+                    )
+                })
+                .count(),
+            0,
+            "connect attached with a physical EnvChange backfill"
+        );
+        remote.shutdown().await;
+    }
+
     /// A thinking flag cannot change a session this run merely attached, so it
     /// is reported at the connect world's visible transcript surface. With no
     /// flag there is nothing to report, and a create applies its flag rather
@@ -23201,7 +23305,7 @@ mod tests {
         let (world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
         let second = world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session");
 
@@ -23302,7 +23406,7 @@ mod tests {
         // be confused.
         let other = world
             .control
-            .create(None, None, None, None)
+            .create(None, None, None, None, None)
             .await
             .expect("a second session");
         assert_ne!(other, world.session());
@@ -23658,6 +23762,152 @@ mod tests {
             .take_autocomplete_rx()
             .expect("editor hands out its autocomplete receiver once");
         (inert_theme_watch(), None, autocomplete_rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_input_new_session_keeps_the_launch_env_armed() {
+        let dir = TempDir::new().expect("tempdir");
+        let legacy = create_disk_session(&dir, "legacy env-less session").await;
+        let args = Args::parse_from([
+            "aj",
+            "--scripted",
+            "streaming-text",
+            "--env",
+            "BEADS_ACTOR=session-actor",
+            "continue",
+            &legacy,
+        ]);
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let mut world = build_world(
+            &args,
+            layers_spilling_into(&dir),
+            &[],
+            &auth,
+            &persistence,
+            None,
+        )
+        .await
+        .expect("build launch-env world");
+        let initial = world.session().to_string();
+        assert_eq!(
+            initial, legacy,
+            "the fixture did not resume its env-less log"
+        );
+        assert_eq!(world.handles().log.lock().await.session_env(), None);
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|notice| notice == ENV_WITHOUT_A_CREATE),
+            "resume did not report the still-armed create-only env: {:?}",
+            main_notices(&world)
+        );
+        let shell = Rc::new(RefCell::new(Shell::new(
+            Rc::clone(&world.chat),
+            Rc::clone(&world.status),
+            Some(world.handles().task_registry.clone()),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
+            "aj".to_string(),
+            "",
+            dir.path().to_path_buf(),
+        )));
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNew))
+            .expect("new-session chord");
+
+        let exit = crate::remote::tests::bounded(
+            "the create chord to end the drive loop",
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        let SessionExit::New { host } = exit else {
+            panic!("the real input did not request a new session")
+        };
+        assert!(matches!(
+            apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create { host },).await,
+            Focus::Moved
+        ));
+        assert_ne!(
+            world.session(),
+            initial,
+            "the fixture did not create a session"
+        );
+        let expected = BTreeMap::from([("BEADS_ACTOR".to_string(), "session-actor".to_string())]);
+        assert_eq!(
+            world.handles().log.lock().await.session_env(),
+            Some(&expected),
+            "the /new production arm dropped the frontend's armed env map"
+        );
+        shut_down(&world).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn embedded_server_never_inherits_the_launchers_session_env() {
+        let dir = TempDir::new().expect("tempdir");
+        let args = Args::parse_from([
+            "aj",
+            "--scripted",
+            "streaming-text",
+            "--listen=127.0.0.1:0",
+            "--env",
+            "BEADS_ACTOR=session-actor",
+        ]);
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let world = build_world(
+            &args,
+            layers_spilling_into(&dir),
+            &[],
+            &auth,
+            &persistence,
+            None,
+        )
+        .await
+        .expect("build embedded-host world");
+        let host = world.control.host().expect("local host").clone();
+        let expected = BTreeMap::from([("BEADS_ACTOR".to_string(), "session-actor".to_string())]);
+        assert_eq!(
+            world.handles().log.lock().await.session_env(),
+            Some(&expected),
+            "the invocation's own startup create lost its env"
+        );
+
+        let server = crate::remote::RemoteServer::bind(
+            host.clone(),
+            crate::remote::tests::addr("127.0.0.1:0"),
+            crate::remote::IdentityGate::local(),
+        )
+        .await
+        .expect("bind embedded host");
+        let client = crate::remote::RemoteClient::new(&server.url()).expect("remote client");
+        let remote = client
+            .create_session(aj_wire::CreateSessionRequest::default())
+            .await
+            .expect("remote create without env")
+            .id;
+        let handles = host
+            .local_handles(&remote)
+            .await
+            .expect("remote session handles");
+        assert_eq!(
+            handles.log.lock().await.session_env(),
+            None,
+            "the host base config leaked launcher identity into a peer's create"
+        );
+        drop(handles);
+        server.shutdown().await;
+        shut_down(&world).await;
     }
 
     /// The whole gesture through the real loop: the create chord opens the

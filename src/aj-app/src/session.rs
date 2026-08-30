@@ -11,7 +11,7 @@
 //! shape, so per-session state can never leak across session
 //! boundaries.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_agent::bus::{EventBus, SubscriptionHandle};
@@ -58,7 +58,12 @@ pub fn window_title(app_title: &str, session_id: &str, cwd: &std::path::Path) ->
 /// when it is installed.
 pub enum SessionSpec {
     /// Mint a fresh conversation log.
-    Create { entry: SessionEntry },
+    Create {
+        entry: SessionEntry,
+        /// Complete environment stated by this creation. `None` differs from
+        /// an explicitly stated empty map in the on-disk creation record.
+        session_env: Option<BTreeMap<String, String>>,
+    },
     /// Resume the identified log from disk.
     Resume {
         session_id: String,
@@ -325,7 +330,9 @@ impl SessionCore {
         restore: Option<&RestoreContext>,
     ) -> Result<(SessionCore, MainAgentSeed)> {
         let source = match spec {
-            SessionSpec::Create { .. } => SessionSource::Create,
+            SessionSpec::Create { session_env, .. } => SessionSource::Create {
+                session_env: session_env.clone(),
+            },
             SessionSpec::Resume { session_id, .. } => SessionSource::Resume {
                 session_id: session_id.clone(),
             },
@@ -342,6 +349,7 @@ impl SessionCore {
             mut log,
             transcript,
             restore_notices,
+            session_env,
         } = prepare_log(persistence, &source, config, &run_config, restore)?;
 
         // Build a fresh agent off the run-config snapshot, which at this
@@ -372,6 +380,7 @@ impl SessionCore {
             thinking.clone(),
             speed,
         );
+        agent.set_session_env(session_env.unwrap_or_default());
 
         // Freeze the system prompt (fresh log) or reuse the persisted
         // one (resume), then seed the agent's transcript, prompt, and
@@ -382,6 +391,7 @@ impl SessionCore {
             transcript,
             &env,
             include_skills,
+            source.creation_env(),
             &model_key,
             thinking.as_ref(),
             speed,

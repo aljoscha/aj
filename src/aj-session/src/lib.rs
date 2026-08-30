@@ -42,6 +42,8 @@ pub mod listener;
 pub mod lock;
 pub mod log;
 pub mod persistence;
+#[cfg(test)]
+mod pre_env_codec_fixture;
 pub mod prompt_history;
 pub mod repair;
 pub mod replay;
@@ -62,7 +64,8 @@ pub use listener::{
 pub use lock::{LockHolder, LockMetadata, SessionLock};
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
-    EntryId, EntryRef, LogSnapshot, SessionSettings, ThreadFilter, ThreadKind,
+    EntryId, EntryRef, LogSnapshot, SessionEnvError, SessionSettings, ThreadFilter, ThreadKind,
+    validate_session_env,
 };
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview, SidecarMetadata};
 pub use prompt_history::{

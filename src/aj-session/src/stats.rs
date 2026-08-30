@@ -9,7 +9,7 @@
 //! activity.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use aj_models::types::{AssistantContent, Message, Usage};
@@ -118,9 +118,12 @@ pub struct SessionStats {
     /// indistinguishable, since a summarizer that legitimately reported
     /// nothing also sums to zero.
     pub compactions_with_usage: usize,
-    /// Model, thinking, speed, verbosity, and environment currently recorded
-    /// on the user thread.
+    /// Model, thinking, speed, and verbosity currently recorded on the user
+    /// thread.
     pub settings: SessionSettings,
+    /// Immutable log-level creation environment. `None` differs from a
+    /// recorded empty map.
+    pub session_env: Option<BTreeMap<String, String>>,
 }
 
 impl ConversationLog {
@@ -231,12 +234,15 @@ impl ConversationLog {
             compaction_usage,
             compactions_with_usage,
             settings,
+            session_env: self.session_env().cloned(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use aj_agent::events::AgentSettings;
     use aj_agent::message::AgentMessage;
     use aj_models::types::{
@@ -246,7 +252,8 @@ mod tests {
     use serde_json::json;
 
     use crate::log::{
-        ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter, ThreadKind,
+        ConversationEntryKind, ConversationLog, ConversationView, SessionSettings, ThreadFilter,
+        ThreadKind,
     };
     use crate::persistence::ConversationPersistence;
 
@@ -350,7 +357,23 @@ mod tests {
         assert_eq!(stats.tool_calls, 0);
         assert!(stats.tool_call_counts.is_empty());
         assert!(stats.last_activity.is_none());
+        assert_eq!(stats.session_env, None);
         assert!(log.latest_leaf(ThreadFilter::USER).is_none());
+    }
+
+    #[test]
+    fn stats_reads_session_env_outside_branch_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).unwrap();
+        let expected = BTreeMap::from([("BEADS_ACTOR".to_string(), "session-actor".to_string())]);
+        let root = log.set_system_prompt("p".into()).expect("root");
+        log.append_env_change(expected.clone()).expect("env");
+        log.set_head(root.id).expect("root head");
+
+        let stats = log.stats();
+        assert_eq!(stats.settings, SessionSettings::default());
+        assert_eq!(stats.session_env, Some(expected));
     }
 
     /// Build an assistant message carrying explicit token usage and a

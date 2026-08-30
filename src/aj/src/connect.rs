@@ -67,12 +67,13 @@ pub(crate) async fn connect(
     // for its label is a round trip that reports after the terminal is gone,
     // and the flag is this client's own input to validate (spec 6.6).
     let tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
+    let session_env = args.launch_env().map_err(|err| anyhow!("--env: {err}"))?;
     let host = match launch.host() {
         Some(named) => resolve_named_host(&control, &hello, named).await?,
         None => None,
     };
     let (session, created) =
-        resolve_session(&control, launch.session(), host, settings, tag).await?;
+        resolve_session(&control, launch.session(), host, settings, tag, session_env).await?;
     Ok(Connected {
         control,
         session,
@@ -136,10 +137,14 @@ async fn resolve_session(
     host: Option<String>,
     settings: Option<SessionSettings>,
     tag: Option<String>,
+    session_env: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<(String, bool)> {
     match session {
         ConnectSession::Named(id) => Ok((id.to_string(), false)),
-        ConnectSession::Fresh => Ok((create(control, host, settings, tag).await?, true)),
+        ConnectSession::Fresh => Ok((
+            create(control, host, settings, tag, session_env).await?,
+            true,
+        )),
         ConnectSession::Latest => {
             let list = control
                 .sessions()
@@ -161,7 +166,10 @@ async fn resolve_session(
                 // A fresh `aj serve` holds nothing, and a host holding only
                 // archived sessions offers nothing either, so connect mode
                 // would otherwise have nothing to attach at all.
-                None => Ok((create(control, host, settings, tag).await?, true)),
+                None => Ok((
+                    create(control, host, settings, tag, session_env).await?,
+                    true,
+                )),
             }
         }
     }
@@ -178,8 +186,9 @@ async fn create(
     host: Option<String>,
     settings: Option<SessionSettings>,
     tag: Option<String>,
+    session_env: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<String> {
-    match control.create(host, settings, None, tag).await {
+    match control.create(host, settings, None, tag, session_env).await {
         Ok(session) => Ok(session),
         Err(ControlError::PartialCreate { session, message }) => {
             eprintln!("aj: warning: {message}");
@@ -274,11 +283,11 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use aj_app::host::{Command, SessionHost};
     use aj_wire::SessionSummary;
-    use clap::Parser;
     use tempfile::TempDir;
 
     use super::*;
@@ -464,9 +473,12 @@ mod tests {
 
         /// A session on the host, which is the only way a fresh one holds any.
         async fn create(&self) -> String {
-            bounded("a create", self.control.create(None, None, None, None))
-                .await
-                .expect("create a session")
+            bounded(
+                "a create",
+                self.control.create(None, None, None, None, None),
+            )
+            .await
+            .expect("create a session")
         }
 
         async fn archive(&self, session: &str) {
@@ -516,6 +528,87 @@ mod tests {
             self.host.shutdown().await;
             self.server.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn connect_new_selection_preserves_env_stated_on_both_sides_of_the_subcommand() {
+        let peer = Peer::start().await;
+        let existing = peer.create().await;
+        let expected = BTreeMap::from([
+            ("AFTER".to_string(), "two".to_string()),
+            ("BEFORE".to_string(), "one".to_string()),
+        ]);
+        let url = peer.server.url();
+        let parsed = args(&[
+            "aj",
+            "--env",
+            "BEFORE=one",
+            "connect",
+            &url,
+            "--new",
+            "--env",
+            "AFTER=two",
+        ]);
+        let launch = parsed.connect_launch().expect("connect launch");
+        let remote_result = bounded(
+            "the current remote boundary to refuse before create",
+            connect(&parsed, &Config::default(), &nothing_stated(), &launch),
+        )
+        .await;
+        let remote_err = match remote_result {
+            Ok(_) => panic!("remote environment transport is a separate boundary"),
+            Err(err) => err,
+        };
+        let remote_message = format!("{remote_err:#}");
+        assert!(
+            remote_message.contains("session env on a remote create is not served"),
+            "unexpected remote refusal: {remote_err:#}"
+        );
+        assert_eq!(
+            peer.rows().await.len(),
+            1,
+            "the unsupported remote create minted a partial identity"
+        );
+
+        let control = Control::local(peer.host.clone());
+        // The shared connect selection and Control create path cross into a
+        // real local host here, where this range owns the immutable log
+        // identity independently of remote transport.
+        let (session, created) = resolve_session(
+            &control,
+            launch.session(),
+            None,
+            None,
+            None,
+            parsed.launch_env().expect("valid split env"),
+        )
+        .await
+        .expect("connect selection creates through Control");
+        assert!(created, "connect attached instead of creating");
+        assert_ne!(session, existing, "--new reused the existing session");
+
+        let handles = peer
+            .host
+            .local_handles(&session)
+            .await
+            .expect("the created session is live on the real host");
+        let log = handles.log.lock().await;
+        assert_eq!(log.session_env(), Some(&expected));
+        assert_eq!(
+            log.entries_in_order()
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.entry,
+                        aj_session::ConversationEntryKind::EnvChange { .. }
+                    )
+                })
+                .count(),
+            1,
+            "connect did not publish exactly one immutable environment identity"
+        );
+        drop(log);
+        peer.shutdown().await;
     }
 
     /// Bare connect takes the newest session its user is not done with, so an

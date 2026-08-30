@@ -15,6 +15,7 @@
 //! refused this" apart from "the transport failed". The recovery is the same
 //! either way, a re-attach with a cursor (spec 6.5).
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aj_agent::events::AgentId;
@@ -284,13 +285,23 @@ impl Control {
         settings: Option<SessionSettings>,
         prompt: Option<Vec<UserContent>>,
         tag: Option<String>,
+        session_env: Option<BTreeMap<String, String>>,
     ) -> Result<String, ControlError> {
         match self {
             Self::Local(local) => {
                 local.host.creates_here(host.as_deref())?;
-                Ok(local.host.create_with(settings, prompt, tag).await?)
+                Ok(local
+                    .host
+                    .create_with(settings, prompt, tag, session_env)
+                    .await?)
             }
             Self::Remote(remote) => {
+                if session_env.is_some() {
+                    return Err(HostError::Unsupported(
+                        "session env on a remote create is not served by this build".to_string(),
+                    )
+                    .into());
+                }
                 let created = remote
                     .client
                     .create_session(CreateSessionRequest {

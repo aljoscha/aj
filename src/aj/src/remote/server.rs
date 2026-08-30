@@ -259,7 +259,12 @@ async fn create_session(
     state.host.creates_here(host.as_deref())?;
     let created = state
         .host
-        .create_with(settings, prompt.map(|prompt| prompt.into_content()), tag)
+        .create_with(
+            settings,
+            prompt.map(|prompt| prompt.into_content()),
+            tag,
+            None,
+        )
         .await;
     let created = match created {
         Ok(id) => SessionCreated {

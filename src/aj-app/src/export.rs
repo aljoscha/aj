@@ -467,8 +467,8 @@ mod tests {
 
     #[test]
     fn export_redacts_env_values_in_the_embedded_entries_without_mutating_the_log() {
-        let env = r#"{"id":"e0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:00Z","thread":"user","type":"env_change","env":{"BEADS_ACTOR":"azurite","SECRET_TOKEN":"hunter2"}}"#;
-        let user = r#"{"id":"u0000001","parent_id":"e0000001","timestamp":"2024-01-01T00:00:01Z","thread":"user","type":"message","message":{"role":"user","content":[{"type":"text","text":"Hello"}],"timestamp":1704067201000}}"#;
+        let env = r#"{"id":"e0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:00Z","thread":"meta","type":"env_change","env":{"BEADS_ACTOR":"session-actor","SECRET_TOKEN":"hunter2"}}"#;
+        let user = r#"{"id":"u0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:01Z","thread":"user","type":"message","message":{"role":"user","content":[{"type":"text","text":"Hello"}],"timestamp":1704067201000}}"#;
         let (dir, log) = log_from_jsonl(&[SYSTEM, env, user]);
         let source_path = dir.path().join("test-session.jsonl");
         let source_bytes = fs::read(&source_path).expect("read source log before export");
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(
             env,
             &std::collections::BTreeMap::from([
-                ("BEADS_ACTOR".to_string(), "azurite".to_string()),
+                ("BEADS_ACTOR".to_string(), "session-actor".to_string()),
                 ("SECRET_TOKEN".to_string(), "hunter2".to_string()),
             ]),
             "export redaction wrote back into the source log",

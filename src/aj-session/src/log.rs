@@ -1,19 +1,21 @@
 //! Append-only conversation log + read-only inference view.
 //!
-//! Each session is one `.jsonl` file under the project's sessions
-//! directory. `ConversationLog` holds the in-memory image and writes
-//! every append to disk before mutating the in-memory maps, so a
-//! crashed process never leaves the two diverging beyond the last
-//! line (which [`ConversationLog::resume`] repairs with a warning).
+//! Each session is one `.jsonl` file under the project's sessions directory.
+//! `ConversationLog` holds the in-memory image. A fresh log publishes its
+//! complete creation prefix plus first punctuation as one staged, no-replace
+//! image. Later appends reach the canonical file before mutating the in-memory
+//! maps, so a crashed process can diverge only at the final line, which
+//! [`ConversationLog::resume`] repairs with a warning.
 //!
 //! `ConversationView` is a short-lived, crate-internal mutation handle
 //! that tracks a head pointer and routes appends to a specific thread
-//! (the user's main conversation, or one sub-agent subtree). It writes
-//! one JSONL line per call; the write reaches the OS before the call
-//! returns, so the entry survives a crash of *this* process. It is
-//! deliberately not `fsync`'d, so a host crash or power loss can still
-//! lose the most recent line(s). [`ConversationLog::resume`] drops a
-//! torn final line with a warning before reopening the log for append.
+//! (the user's main conversation, or one sub-agent subtree). The first
+//! punctuation commits every buffered creation record and itself together. A
+//! later write reaches the OS before the call returns, so the entry survives a
+//! crash of *this* process. Writes are deliberately not `fsync`'d, so a host
+//! crash or power loss can still lose the most recent line(s).
+//! [`ConversationLog::resume`] drops a torn final line with a warning before
+//! reopening the log for append.
 //!
 //! [`Conversation`] is the read-only linearized projection consumed
 //! by the wire layer. It carries the materialized [`AgentMessage`]
@@ -53,6 +55,136 @@ pub enum ConversationError {
     /// could not name a log in this store and is never turned into a path.
     #[error("{0:?} is not a session id")]
     InvalidSessionId(String),
+}
+
+/// Why a session environment map cannot be recorded or executed.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SessionEnvError {
+    #[error("environment key {key:?} is empty")]
+    EmptyKey { key: String },
+    #[error("environment key {key:?} contains '='")]
+    KeyContainsEquals { key: String },
+    #[error("environment key {key:?} contains NUL")]
+    KeyContainsNul { key: String },
+    #[error("environment value for key {key:?} contains NUL")]
+    ValueContainsNul { key: String },
+}
+
+/// Validate the portable syntax of one complete session environment map.
+///
+/// Keys compare exactly and case-sensitively. Collisions with inherited or
+/// fixed tool environment entries are legal because the layering boundary,
+/// rather than validation, decides which value a child receives.
+pub fn validate_session_env(env: &BTreeMap<String, String>) -> Result<(), SessionEnvError> {
+    for (key, value) in env {
+        if key.is_empty() {
+            return Err(SessionEnvError::EmptyKey { key: key.clone() });
+        }
+        if key.contains('=') {
+            return Err(SessionEnvError::KeyContainsEquals { key: key.clone() });
+        }
+        if key.contains('\0') {
+            return Err(SessionEnvError::KeyContainsNul { key: key.clone() });
+        }
+        if value.contains('\0') {
+            return Err(SessionEnvError::ValueContainsNul { key: key.clone() });
+        }
+    }
+    Ok(())
+}
+
+fn validate_recorded_system_prompt(
+    order: &[EntryId],
+    entries: &HashMap<EntryId, ConversationEntry>,
+) -> Result<(), ConversationError> {
+    let prompts: Vec<(usize, &ConversationEntry)> = order
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            let entry = entries.get(id)?;
+            matches!(entry.entry, ConversationEntryKind::SystemPrompt { .. })
+                .then_some((index, entry))
+        })
+        .collect();
+    if prompts.is_empty() {
+        return Ok(());
+    }
+    let [(index, prompt)] = prompts.as_slice() else {
+        return Err(ConversationError::Corrupt(
+            "session log contains more than one system_prompt creation record".to_string(),
+        ));
+    };
+    let valid = *index == 0
+        && prompt.thread == ThreadKind::Meta
+        && prompt.agent_id.is_none()
+        && prompt.parent_id.is_none();
+    if !valid {
+        return Err(ConversationError::Corrupt(
+            "system_prompt must be the single root meta entry".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recorded_session_env(
+    order: &[EntryId],
+    entries: &HashMap<EntryId, ConversationEntry>,
+) -> Result<(), ConversationError> {
+    let env_entries: Vec<(usize, &ConversationEntry)> = order
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            let entry = entries.get(id)?;
+            matches!(entry.entry, ConversationEntryKind::EnvChange { .. }).then_some((index, entry))
+        })
+        .collect();
+    let Some((index, entry)) = env_entries.first().copied() else {
+        return Ok(());
+    };
+    if env_entries.len() != 1 {
+        return Err(ConversationError::Corrupt(
+            "session log contains more than one env_change creation record".to_string(),
+        ));
+    }
+    let Some(root_id) = order.first() else {
+        return Err(ConversationError::Corrupt(
+            "env_change exists without a system-prompt root".to_string(),
+        ));
+    };
+    let Some(root) = entries.get(root_id) else {
+        return Err(ConversationError::Corrupt(
+            "env_change root is missing from the entry map".to_string(),
+        ));
+    };
+    let layout_is_valid = index == 1
+        && root.thread == ThreadKind::Meta
+        && root.agent_id.is_none()
+        && root.parent_id.is_none()
+        && matches!(root.entry, ConversationEntryKind::SystemPrompt { .. })
+        && entry.thread == ThreadKind::Meta
+        && entry.agent_id.is_none()
+        && entry.parent_id.as_ref() == Some(root_id);
+    if !layout_is_valid {
+        return Err(ConversationError::Corrupt(
+            "env_change must be the single root-parented meta entry immediately after the system prompt"
+                .to_string(),
+        ));
+    }
+    let ConversationEntryKind::EnvChange { env } = &entry.entry else {
+        unreachable!("filtered to env_change above")
+    };
+    validate_session_env(env)
+        .map_err(|err| ConversationError::Corrupt(format!("invalid env_change: {err}")))?;
+    let has_successor_punctuation = order[index + 1..]
+        .iter()
+        .filter_map(|id| entries.get(id))
+        .any(|entry| entry.entry.is_punctuation());
+    if !has_successor_punctuation {
+        return Err(ConversationError::Corrupt(
+            "env_change must have a successor punctuation entry".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A unique identifier for a [ConversationEntry] within a single
@@ -170,11 +302,12 @@ pub enum ConversationEntryKind {
     /// speed. `thinking_display` also affects inference, but remains a
     /// live-only session setting and is deliberately not recorded.
     VerbosityChange { verbosity: String },
-    /// The session's complete environment map from this point on the path.
+    /// The complete environment fixed for this session at creation.
     ///
-    /// Whole-map semantics: extraction keeps the last entry seen and never
-    /// merges maps. An empty map is an explicit recording, distinct from no
-    /// entry. Values remain on disk for restore but are redacted from export.
+    /// Written at most once as root-parented [`ThreadKind::Meta`] metadata,
+    /// independently of every conversation head. An empty map is an explicit
+    /// recording, distinct from no entry. Values remain on disk for restore but
+    /// are redacted from export.
     EnvChange { env: BTreeMap<String, String> },
     /// The structural root of a sub-agent thread, written when the
     /// sub-agent is spawned and anchored at the parent thread's head
@@ -321,10 +454,6 @@ pub struct SessionSettings {
     /// "nothing recorded" (inherit the current default) — distinct
     /// from `Some("default")`, which pins the server default.
     pub verbosity: Option<String>,
-    /// Last complete session environment map recorded on this path.
-    /// `None` means no entry exists, which is distinct from an explicitly
-    /// recorded empty map.
-    pub env: Option<BTreeMap<String, String>>,
 }
 
 /// A linearized, read-only view of (a slice of) a conversation log. Produced
@@ -450,16 +579,15 @@ impl Conversation {
     /// Extract the session settings recorded on this path. One
     /// forward scan over [`Self::entries`], keeping the last value
     /// seen per axis. `ModelChange` entries and assistant-role
-    /// messages both update the model; a `SubAgentSpawn` snapshot
-    /// updates the inference axes but never the session environment;
-    /// whichever entry comes later on the path wins.
+    /// messages both update the model; a `SubAgentSpawn` snapshot updates the
+    /// inference axes. Session environment is log-level creation metadata and
+    /// deliberately absent from this branch-filtered projection.
     pub fn settings(&self) -> SessionSettings {
         let mut settings = SessionSettings {
             model: None,
             thinking: None,
             speed: None,
             verbosity: None,
-            env: None,
         };
         for entry in &self.entries {
             match &entry.entry {
@@ -475,9 +603,7 @@ impl Conversation {
                 ConversationEntryKind::VerbosityChange { verbosity } => {
                     settings.verbosity = Some(verbosity.clone());
                 }
-                ConversationEntryKind::EnvChange { env } => {
-                    settings.env = Some(env.clone());
-                }
+                ConversationEntryKind::EnvChange { .. } => {}
                 ConversationEntryKind::SubAgentSpawn { settings: snap, .. } => {
                     settings.model = Some((snap.provider.clone(), snap.model_id.clone()));
                     settings.thinking = Some(snap.thinking.clone());
@@ -547,10 +673,11 @@ pub struct LogSnapshot {
 /// and branch offshoots, held in memory and mirrored to a single JSONL file
 /// on disk.
 ///
-/// Entries are written to disk before they are inserted into the in-memory
-/// maps, so a failed write never leaves the two diverging. A process crash
-/// truncates at most the last line, which [ConversationLog::resume] drops
-/// with a warning before reopening the log for append.
+/// Punctuation is persisted before it enters the in-memory maps, so a failed
+/// write never leaves the two diverging. A fresh log's first punctuation
+/// publishes all creation records in one complete image. Later process crashes
+/// truncate at most the last line, which [ConversationLog::resume] drops with a
+/// warning before reopening the log for append.
 ///
 /// Concurrent writers are tolerated rather than locked out: the same session
 /// can be resumed in two processes at once (`aj continue <id>` twice). Entry
@@ -577,10 +704,35 @@ pub struct ConversationLog {
     /// Pre-serialized lines for entries that have been [Self::append]ed
     /// in memory but whose persistence is deferred until the next
     /// "punctuation" append (see [`ConversationEntryKind::is_punctuation`]).
-    /// Drained in order — followed by the punctuation line itself —
-    /// on the next punctuation append. Resume initialises this empty:
-    /// anything on disk is already committed, by definition.
+    /// Retained in order until the next punctuation is successfully
+    /// published. Resume initialises this empty: anything on disk is already
+    /// committed, by definition.
     pending_writes: Vec<String>,
+    #[cfg(test)]
+    initial_publication_fault: Option<InitialPublicationFault>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitialPublicationFault {
+    Write,
+    Flush,
+    Install,
+}
+
+#[cfg(test)]
+fn initial_publication_checkpoint(name: &str) {
+    if std::env::var("AJ_TEST_INITIAL_PUBLICATION_CHECKPOINT").as_deref() != Ok(name) {
+        return;
+    }
+    println!("initial-publication-checkpoint:{name}");
+    std::io::stdout()
+        .flush()
+        .expect("flush initial-publication checkpoint");
+    let mut release = [0_u8; 1];
+    std::io::stdin()
+        .read_exact(&mut release)
+        .expect("checkpoint parent releases or kills the child");
 }
 
 impl LogSnapshot {
@@ -731,6 +883,22 @@ impl LogSnapshot {
         self.system_prompt_entry().map(|e| &e.id)
     }
 
+    /// The immutable environment recorded when this session was created.
+    ///
+    /// Read from log-level metadata rather than a linearized conversation, so
+    /// selecting a different user-thread head cannot select, replace, or clear
+    /// session identity. `None` is a legacy or explicitly env-less session and
+    /// differs from a recorded empty map.
+    pub fn session_env(&self) -> Option<&BTreeMap<String, String>> {
+        self.order.iter().find_map(|id| {
+            let entry = self.entries.get(id)?;
+            match &entry.entry {
+                ConversationEntryKind::EnvChange { env } => Some(env),
+                _ => None,
+            }
+        })
+    }
+
     /// The parent id for the next append on `filter`'s thread.
     ///
     /// The user thread anchors at the explicit [`Self::head`]; a
@@ -802,6 +970,8 @@ impl ConversationLog {
             path,
             file: None,
             pending_writes: Vec::new(),
+            #[cfg(test)]
+            initial_publication_fault: None,
         })
     }
 
@@ -884,21 +1054,45 @@ impl ConversationLog {
         // A duplicated line (a hand-edited log, or one line written
         // twice) would otherwise give one entry two append positions and
         // project its message twice. `append` rejects a duplicate id
-        // loudly. On resume we keep the first occurrence and carry on,
-        // since the rest of the file is still usable.
+        // loudly. On resume we keep the first ordinary occurrence and
+        // carry on, since the rest of the file is still usable. Creation
+        // identity is stricter: coalescing a reused root or EnvChange id
+        // could erase the physical identity record before its layout is
+        // validated, so any duplicate involving either is corruption.
         let adopt = |order: &mut Vec<EntryId>,
                      entries: &mut HashMap<EntryId, ConversationEntry>,
-                     entry: ConversationEntry| {
-            if entries.contains_key(&entry.id) {
+                     entry: ConversationEntry,
+                     line_number: u64|
+         -> Result<(), ConversationError> {
+            if let Some(existing) = entries.get(&entry.id) {
+                let is_creation_identity = order.first() == Some(&entry.id)
+                    || matches!(
+                        &existing.entry,
+                        ConversationEntryKind::SystemPrompt { .. }
+                            | ConversationEntryKind::EnvChange { .. }
+                    )
+                    || matches!(
+                        &entry.entry,
+                        ConversationEntryKind::SystemPrompt { .. }
+                            | ConversationEntryKind::EnvChange { .. }
+                    );
+                if is_creation_identity {
+                    return Err(ConversationError::Corrupt(format!(
+                        "{}:line {line_number}: duplicate creation identity entry id {}",
+                        path.display(),
+                        entry.id,
+                    )));
+                }
                 tracing::warn!(
                     "duplicate entry id {} in {}: keeping the first occurrence",
                     entry.id,
                     path.display()
                 );
-                return;
+                return Ok(());
             }
             order.push(entry.id.clone());
             entries.insert(entry.id.clone(), entry);
+            Ok(())
         };
 
         loop {
@@ -928,9 +1122,17 @@ impl ConversationLog {
 
             if let Some(line_number) = pending_line_number {
                 match serde_json::from_str::<ConversationEntry>(&pending_line) {
-                    Ok(entry) => adopt(&mut order, &mut entries, entry),
+                    Ok(entry) => {
+                        if let Err(err) = adopt(&mut order, &mut entries, entry, line_number) {
+                            corruption = Some(err);
+                            continue;
+                        }
+                    }
                     Err(err) => {
-                        corruption = Some((line_number, err));
+                        corruption = Some(ConversationError::Corrupt(format!(
+                            "{}:line {line_number}: {err}",
+                            path.display()
+                        )));
                         continue;
                     }
                 }
@@ -952,17 +1154,14 @@ impl ConversationLog {
             )));
         }
 
-        if let Some((line_number, err)) = corruption {
-            return Err(ConversationError::Corrupt(format!(
-                "{}:line {line_number}: {err}",
-                path.display()
-            )));
+        if let Some(err) = corruption {
+            return Err(err);
         }
 
         let mut truncate_to = None;
-        if pending_line_number.is_some() {
+        if let Some(line_number) = pending_line_number {
             match serde_json::from_str::<ConversationEntry>(&pending_line) {
-                Ok(entry) => adopt(&mut order, &mut entries, entry),
+                Ok(entry) => adopt(&mut order, &mut entries, entry, line_number)?,
                 Err(err) => {
                     tracing::warn!(
                         "dropping truncated trailing entry in {}: {err}",
@@ -972,6 +1171,13 @@ impl ConversationLog {
                 }
             }
         }
+
+        // Creation identity is validated before resume truncates a torn tail
+        // or adds a missing final newline. A syntactically valid but malformed
+        // env record is corruption, and refusing it must leave the source
+        // bytes untouched.
+        validate_recorded_system_prompt(&order, &entries)?;
+        validate_recorded_session_env(&order, &entries)?;
 
         drop(reader);
         if let Some(len) = truncate_to {
@@ -1004,6 +1210,8 @@ impl ConversationLog {
             file: Some(file),
             // Anything on disk is by definition already committed.
             pending_writes: Vec::new(),
+            #[cfg(test)]
+            initial_publication_fault: None,
         };
         // Recover the head from the last-written user entry. The most
         // recently appended entry is always on the branch that was last
@@ -1024,14 +1232,14 @@ impl ConversationLog {
     /// Durability depends on the entry's kind (see
     /// [`ConversationEntryKind::is_punctuation`]):
     ///
-    /// - For a **punctuation** entry, this drains any buffered
-    ///   non-punctuation lines into the file (creating it on first
-    ///   use) and then writes the new entry's line, in order, before
-    ///   returning. After `Ok(_)`, the entry and everything that
-    ///   preceded it have been written to the OS — they survive a
-    ///   crash of this process, though they are not `fsync`'d, so a
-    ///   power loss can still lose the tail. This write-before-return
-    ///   is what `repair_interrupted_tool_uses` relies on.
+    /// - For a **punctuation** entry on a fresh log, this stages the complete
+    ///   buffered prefix and punctuation, flushes it, and atomically installs
+    ///   the canonical path without replacement. On a durable log it appends
+    ///   buffered lines and punctuation in order. After `Ok(_)`, the entry and
+    ///   everything preceding it have reached the OS. They survive a process
+    ///   crash, though they are not `fsync`'d, so power loss can still lose the
+    ///   tail. This write-before-return is what
+    ///   `repair_interrupted_tool_uses` relies on.
     /// - For a **non-punctuation** entry, this serializes the line
     ///   and queues it in `pending_writes` without touching disk.
     ///   It becomes durable only when a subsequent punctuation
@@ -1086,6 +1294,17 @@ impl ConversationLog {
             }
             _ => {}
         }
+        if matches!(entry, ConversationEntryKind::SystemPrompt { .. }) {
+            let valid = thread == ThreadKind::Meta
+                && agent_id.is_none()
+                && parent_id.is_none()
+                && self.core.order.is_empty();
+            if !valid {
+                return Err(ConversationError::InvalidAppend(
+                    "system_prompt must be the root meta entry in an empty log".to_string(),
+                ));
+            }
+        }
         if let Some(parent) = &parent_id {
             if !self.core.entries.contains_key(parent) {
                 return Err(ConversationError::InvalidAppend(format!(
@@ -1096,6 +1315,21 @@ impl ConversationLog {
             return Err(ConversationError::InvalidAppend(
                 "log already has a root entry; additional entries must have a parent".to_string(),
             ));
+        }
+        if let ConversationEntryKind::EnvChange { env } = &entry {
+            validate_session_env(env)
+                .map_err(|err| ConversationError::InvalidAppend(err.to_string()))?;
+            let root = self.core.system_prompt_id();
+            let valid = thread == ThreadKind::Meta
+                && agent_id.is_none()
+                && self.core.order.len() == 1
+                && parent_id.as_ref() == root;
+            if !valid {
+                return Err(ConversationError::InvalidAppend(
+                    "env_change must be the single root-parented meta entry immediately after the system prompt"
+                        .to_string(),
+                ));
+            }
         }
 
         let mut entry = entry;
@@ -1136,22 +1370,18 @@ impl ConversationLog {
         let json = serde_json::to_string(&record)?;
 
         if record.entry.is_punctuation() {
-            // Drain any buffered lines first so they hit disk before
-            // this punctuation, matching in-memory `order` exactly.
-            // The buffer is only non-empty for `create`'d logs that
-            // have seen a non-punctuation append (today: a system
-            // prompt) and not yet a punctuation; `resume`'d logs
-            // initialise it empty.
-            let queued: Vec<String> = self.pending_writes.drain(..).collect();
-            let file = self.ensure_open()?;
-            // Pass each entry as one buffer (line + trailing newline) rather
-            // than making separate body and newline calls. This narrows the
-            // interleaving window, but `write_all` may still issue multiple
-            // writes after a short write. Resume repairs such a torn tail.
-            for line in &queued {
-                file.write_all(format!("{line}\n").as_bytes())?;
+            if let Some(file) = self.file.as_mut() {
+                // Later appends retain the existing per-line contract. Pass
+                // each entry as one buffer (line plus newline) to narrow the
+                // concurrent-writer interleaving window.
+                let queued: Vec<String> = self.pending_writes.drain(..).collect();
+                for line in &queued {
+                    file.write_all(format!("{line}\n").as_bytes())?;
+                }
+                file.write_all(format!("{json}\n").as_bytes())?;
+            } else {
+                self.publish_initial(&json)?;
             }
-            file.write_all(format!("{json}\n").as_bytes())?;
         } else {
             self.pending_writes.push(json);
         }
@@ -1172,21 +1402,118 @@ impl ConversationLog {
         })
     }
 
-    /// Open the backing file on first use (lazy init for `create`'d
-    /// logs) and return a mutable reference to it. Only ever called
-    /// from [`Self::append`] on a punctuation entry, so the file is
-    /// created exactly when there's real content to write — never
-    /// for a session that only saw a deferred system-prompt append.
-    /// `resume`'d logs always return a `Some`-initialized file.
-    fn ensure_open(&mut self) -> Result<&mut File, ConversationError> {
-        if self.file.is_none() {
-            let f = OpenOptions::new()
-                .create_new(true)
-                .append(true)
-                .open(&self.path)?;
-            self.file = Some(f);
+    /// Publish a fresh log as one complete, no-replace initial image.
+    ///
+    /// The staging name is not a session-log candidate, so no reader can see
+    /// the pending prefix. A hard link installs the complete inode atomically
+    /// only when the canonical path remains absent. The staging descriptor is
+    /// opened with `O_APPEND` and retained after installation, preserving the
+    /// existing concurrent-writer contract without a post-commit reopen gap.
+    fn publish_initial(&mut self, punctuation: &str) -> Result<(), ConversationError> {
+        let mut image = String::new();
+        for line in &self.pending_writes {
+            image.push_str(line);
+            image.push('\n');
         }
-        Ok(self.file.as_mut().expect("file just opened above"))
+        image.push_str(punctuation);
+        image.push('\n');
+
+        let (stage_path, mut stage) = self.create_initial_stage()?;
+        let publish = (|| -> std::io::Result<()> {
+            #[cfg(test)]
+            self.inject_initial_publication_fault(InitialPublicationFault::Write)?;
+            stage.write_all(image.as_bytes())?;
+            #[cfg(test)]
+            initial_publication_checkpoint("written");
+
+            #[cfg(test)]
+            self.inject_initial_publication_fault(InitialPublicationFault::Flush)?;
+            stage.flush()?;
+            #[cfg(test)]
+            initial_publication_checkpoint("flushed");
+
+            #[cfg(test)]
+            self.inject_initial_publication_fault(InitialPublicationFault::Install)?;
+            #[cfg(test)]
+            initial_publication_checkpoint("installing");
+            fs::hard_link(&stage_path, &self.path)?;
+            #[cfg(test)]
+            initial_publication_checkpoint("installed");
+            Ok(())
+        })();
+
+        if let Err(err) = publish {
+            drop(stage);
+            if let Err(cleanup) = fs::remove_file(&stage_path)
+                && cleanup.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    path = %stage_path.display(),
+                    "could not remove failed initial-publication stage: {cleanup}"
+                );
+            }
+            return Err(err.into());
+        }
+
+        // The canonical hard link is the commit. A cleanup failure can leave
+        // only an ignored staging alias and must not turn a committed append
+        // into a retry that collides with its own target.
+        if let Err(err) = fs::remove_file(&stage_path) {
+            tracing::warn!(
+                path = %stage_path.display(),
+                "could not remove committed initial-publication stage: {err}"
+            );
+        }
+        self.pending_writes.clear();
+        self.file = Some(stage);
+        Ok(())
+    }
+
+    /// Create one same-directory staging file outside the `.jsonl` namespace.
+    fn create_initial_stage(&self) -> Result<(PathBuf, File), ConversationError> {
+        let dir = self.path.parent().ok_or_else(|| {
+            ConversationError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("session path {} has no parent", self.path.display()),
+            ))
+        })?;
+        for _ in 0..1000 {
+            let path = dir.join(format!(
+                ".{}-{:032x}.stage",
+                self.session_id(),
+                rand::random::<u128>()
+            ));
+            match OpenOptions::new().create_new(true).append(true).open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(ConversationError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "could not mint an initial-publication stage for {}",
+                self.session_id()
+            ),
+        )))
+    }
+
+    #[cfg(test)]
+    fn inject_initial_publication_fault(
+        &self,
+        fault: InitialPublicationFault,
+    ) -> std::io::Result<()> {
+        if self.initial_publication_fault == Some(fault) {
+            return Err(std::io::Error::other(format!(
+                "injected initial-publication {fault:?} failure"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_initial_publication_fault(&mut self, fault: Option<InitialPublicationFault>) {
+        self.initial_publication_fault = fault;
     }
 
     /// Mint a fresh entry id: a random 128-bit value as 32 hex digits,
@@ -1317,6 +1644,11 @@ impl ConversationLog {
     /// See [`LogSnapshot::head`].
     pub fn head(&self) -> Option<&EntryId> {
         self.core.head()
+    }
+
+    /// See [`LogSnapshot::session_env`].
+    pub fn session_env(&self) -> Option<&BTreeMap<String, String>> {
+        self.core.session_env()
     }
 
     /// See [`LogSnapshot::len`].
@@ -1457,16 +1789,23 @@ impl ConversationLog {
         )
     }
 
-    /// Record the complete session environment map on the active user path.
+    /// Record the complete immutable session environment at creation.
     ///
-    /// The entry replaces any earlier map during extraction. It is
-    /// non-punctuation, so a brand-new session seeded with env but no message
-    /// still leaves no conversation file behind.
+    /// Exactly one root-parented meta entry is legal, immediately after the
+    /// system prompt and before inference-setting seeds. It is non-punctuation,
+    /// so a brand-new session seeded with env but no message still leaves no
+    /// conversation file behind.
     pub fn append_env_change(
         &mut self,
         env: BTreeMap<String, String>,
     ) -> Result<EntryRef, ConversationError> {
-        self.append_state_entry(ThreadFilter::USER, ConversationEntryKind::EnvChange { env })
+        let parent = self.core.system_prompt_id().cloned();
+        self.append(
+            parent,
+            ThreadKind::Meta,
+            None,
+            ConversationEntryKind::EnvChange { env },
+        )
     }
 
     /// Record a compaction checkpoint on `filter`'s thread, anchored at
@@ -1637,10 +1976,17 @@ impl<'a> ConversationView<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead as _, BufReader as StdBufReader};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
     use tempfile::TempDir;
 
     use super::*;
     use crate::persistence::ConversationPersistence;
+    use crate::prompt_history::workspace_history;
     use aj_models::types::{
         AssistantContent, AssistantMessage, TextContent, ToolCall, ToolResultMessage, UserContent,
         UserMessage,
@@ -1657,6 +2003,131 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect()
+    }
+
+    fn seeded_env_log(
+        persistence: &ConversationPersistence,
+    ) -> (ConversationLog, BTreeMap<String, String>) {
+        let env = env_map(&[("BEADS_ACTOR", "session-actor"), ("SECRET", "value")]);
+        let mut log = ConversationLog::create(persistence).expect("create log");
+        log.set_system_prompt("system".to_string())
+            .expect("system prompt");
+        log.append_env_change(env.clone()).expect("creation env");
+        log.append_model_change(ThreadFilter::USER, "scripted", "scripted")
+            .expect("model seed");
+        log.append_thinking_change(ThreadFilter::USER, "off")
+            .expect("thinking seed");
+        log.append_speed_change(ThreadFilter::USER, "standard")
+            .expect("speed seed");
+        log.append_verbosity_change(ThreadFilter::USER, "default")
+            .expect("verbosity seed");
+        (log, env)
+    }
+
+    fn punctuation(log: &mut ConversationLog, text: &str) -> Result<EntryRef, ConversationError> {
+        ConversationView::user(log).add_message(user_text(text))
+    }
+
+    fn stage_paths(dir: &std::path::Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("read sessions dir")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension().and_then(|ext| ext.to_str()) == Some("stage")).then_some(path)
+            })
+            .collect()
+    }
+
+    struct CrashChild {
+        child: Option<Child>,
+        lines: Receiver<String>,
+        reader: Option<JoinHandle<()>>,
+    }
+
+    impl CrashChild {
+        fn spawn(dir: &std::path::Path, checkpoint: &str) -> Self {
+            let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "log::tests::initial_publication_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("AJ_TEST_INITIAL_PUBLICATION_DIR", dir)
+                .env("AJ_TEST_INITIAL_PUBLICATION_CHECKPOINT", checkpoint)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn crash child");
+            let stdout = child.stdout.take().expect("child stdout");
+            let (tx, lines) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in StdBufReader::new(stdout).lines() {
+                    match line {
+                        Ok(line) => {
+                            if tx.send(line).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                child: Some(child),
+                lines,
+                reader: Some(reader),
+            }
+        }
+
+        fn wait_for(&self, expected: &str) -> Vec<String> {
+            let mut seen = Vec::new();
+            loop {
+                let line = self
+                    .lines
+                    .recv_timeout(Duration::from_secs(20))
+                    .unwrap_or_else(|err| {
+                        panic!("child did not announce {expected:?}: {err}; saw {seen:?}")
+                    });
+                let done = line == expected;
+                seen.push(line);
+                if done {
+                    return seen;
+                }
+            }
+        }
+
+        fn terminate(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                child.wait().expect("reap crash child");
+            }
+            if let Some(reader) = self.reader.take() {
+                reader.join().expect("join crash child stdout reader");
+            }
+        }
+
+        fn release_and_wait(&mut self) -> std::process::ExitStatus {
+            let mut child = self.child.take().expect("live crash child");
+            child
+                .stdin
+                .take()
+                .expect("child checkpoint stdin")
+                .write_all(b"x")
+                .expect("release child checkpoint");
+            let status = child.wait().expect("wait for released child");
+            if let Some(reader) = self.reader.take() {
+                reader.join().expect("join released child stdout reader");
+            }
+            status
+        }
+    }
+
+    impl Drop for CrashChild {
+        fn drop(&mut self) {
+            self.terminate();
+        }
     }
 
     fn user_text(text: &str) -> AgentMessage {
@@ -1933,6 +2404,48 @@ mod tests {
         assert_eq!(message_ends.len(), 1, "got {message_ends:?}");
     }
 
+    #[test]
+    fn resume_refuses_a_duplicated_legacy_root_without_changing_bytes() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let session_id = "2000-01-01-00-00-00-000_9";
+        let path = persistence.session_path(session_id);
+        let root = ConversationEntry {
+            id: "legacy-root".to_string(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::Message {
+                message: user_text("legacy root"),
+            },
+        };
+        let line = serde_json::to_string(&root).expect("legacy root JSON");
+        // The missing final newline also proves corruption refusal does not
+        // normalize a legacy source before returning.
+        let bytes = format!("{line}\n{line}").into_bytes();
+        std::fs::write(&path, &bytes).expect("write duplicated legacy root");
+
+        let err = ConversationLog::resume(&persistence, session_id)
+            .err()
+            .expect("a duplicated physical root is corruption");
+        match err {
+            ConversationError::Corrupt(message) => assert_eq!(
+                message,
+                format!(
+                    "{}:line 2: duplicate creation identity entry id legacy-root",
+                    path.display()
+                ),
+            ),
+            other => panic!("expected corrupt log, got {other}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("source bytes"),
+            bytes,
+            "resume changed the refused legacy log"
+        );
+    }
+
     /// `create` has to reserve its id with an atomic filesystem
     /// operation. Nothing is written to the log file until the first
     /// punctuation append, so an existence check cannot see a competing
@@ -2042,6 +2555,31 @@ mod tests {
 
         let err = match ConversationLog::resume(&persistence, &session_id) {
             Ok(_) => panic!("invalid UTF-8 must win over earlier corruption"),
+            Err(err) => err,
+        };
+
+        match err {
+            ConversationError::Io(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected IO error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resume_io_error_wins_over_an_earlier_duplicate_creation_identity() {
+        let (_dir, persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        let mut contents = records[0].as_bytes().to_vec();
+        contents.extend_from_slice(b"\n");
+        contents.extend_from_slice(records[0].as_bytes());
+        contents.extend_from_slice(b"\n");
+        contents.extend_from_slice(records[1].as_bytes());
+        contents.extend_from_slice(b"\n\xff\n");
+        std::fs::write(&path, contents).expect("rewrite fixture log");
+
+        let err = match ConversationLog::resume(&persistence, &session_id) {
+            Ok(_) => panic!("invalid UTF-8 must win over duplicate identity corruption"),
             Err(err) => err,
         };
 
@@ -2735,7 +3273,10 @@ mod tests {
     fn env_change_round_trips_with_its_stable_tag_and_is_not_punctuation() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let expected = env_map(&[("BEADS_ACTOR", "azurite"), ("SECRET_TOKEN", "hunter2")]);
+        let expected = env_map(&[
+            ("BEADS_ACTOR", "session-actor"),
+            ("SECRET_TOKEN", "hunter2"),
+        ]);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         let env_ref = log
@@ -2781,6 +3322,298 @@ mod tests {
             panic!("env_change tag did not deserialize as EnvChange");
         };
         assert_eq!(env, &expected);
+        assert_eq!(resumed.session_env(), Some(&expected));
+    }
+
+    #[test]
+    fn surfaced_initial_publication_failures_keep_the_complete_prefix_retryable() {
+        for fault in [
+            InitialPublicationFault::Write,
+            InitialPublicationFault::Flush,
+            InitialPublicationFault::Install,
+        ] {
+            let dir = fresh_sessions_dir();
+            let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+            let (mut log, env) = seeded_env_log(&persistence);
+            let canonical = log.path().to_path_buf();
+            let prefix_len = log.len();
+            let pending_len = log.pending_writes.len();
+
+            log.set_initial_publication_fault(Some(fault));
+            let err = punctuation(&mut log, "first")
+                .expect_err("the selected initial-publication operation fails");
+            assert!(matches!(err, ConversationError::Io(_)), "{fault:?}: {err}");
+            assert!(!canonical.exists(), "{fault:?}: canonical target escaped");
+            assert_eq!(
+                log.len(),
+                prefix_len,
+                "{fault:?}: punctuation entered memory"
+            );
+            assert_eq!(
+                log.pending_writes.len(),
+                pending_len,
+                "{fault:?}: creation prefix was drained"
+            );
+            assert!(
+                stage_paths(dir.path()).is_empty(),
+                "{fault:?}: stage leaked"
+            );
+
+            log.set_initial_publication_fault(None);
+            punctuation(&mut log, "retry").expect("same-log retry publishes");
+            let session_id = log.session_id().to_string();
+            drop(log);
+            let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume retry");
+            assert_eq!(resumed.session_env(), Some(&env), "{fault:?}: env changed");
+            assert_eq!(
+                resumed
+                    .entries_in_order()
+                    .iter()
+                    .filter(|entry| matches!(entry.entry, ConversationEntryKind::EnvChange { .. }))
+                    .count(),
+                1,
+                "{fault:?}: retry duplicated env identity"
+            );
+            assert!(
+                matches!(
+                    resumed.entries_in_order().last().map(|entry| &entry.entry),
+                    Some(ConversationEntryKind::Message { .. })
+                ),
+                "{fault:?}: published image does not end in punctuation"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_publication_never_replaces_a_rival_target_and_can_retry() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let (mut log, env) = seeded_env_log(&persistence);
+        let canonical = log.path().to_path_buf();
+        let sentinel = b"rival bytes stay byte-identical\n";
+        std::fs::write(&canonical, sentinel).expect("install rival target");
+
+        let err = punctuation(&mut log, "blocked").expect_err("no-replace install refuses");
+        assert!(matches!(err, ConversationError::Io(_)), "{err}");
+        assert_eq!(std::fs::read(&canonical).expect("rival bytes"), sentinel);
+        assert_eq!(log.session_env(), Some(&env));
+        assert!(stage_paths(dir.path()).is_empty(), "failed stage leaked");
+
+        std::fs::remove_file(&canonical).expect("remove test-owned rival");
+        punctuation(&mut log, "retry").expect("retry after rival leaves");
+        assert!(canonical.is_file());
+    }
+
+    #[test]
+    fn no_clobber_install_loses_an_actual_race_without_replacing_the_winner() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let marker = "initial-publication-checkpoint:installing";
+        let mut child = CrashChild::spawn(dir.path(), "installing");
+        let lines = child.wait_for(marker);
+        let session_id = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("initial-publication-session:"))
+            .expect("child announced its session id");
+        let canonical = persistence.session_path(session_id);
+        let sentinel = b"rival won after the publisher reached its install boundary\n";
+        std::fs::write(&canonical, sentinel).expect("rival publishes canonical target");
+
+        let status = child.release_and_wait();
+        assert!(
+            !status.success(),
+            "the child replaced the rival instead of surfacing no-clobber failure"
+        );
+        assert_eq!(
+            std::fs::read(&canonical).expect("winning target"),
+            sentinel,
+            "the publisher replaced a target created at the install boundary"
+        );
+        assert!(
+            stage_paths(dir.path()).is_empty(),
+            "losing stage was not removed"
+        );
+    }
+
+    #[test]
+    fn retained_initial_descriptor_appends_after_a_resumed_writer() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let (mut creator, _) = seeded_env_log(&persistence);
+        punctuation(&mut creator, "creator first").expect("publish initial image");
+        let session_id = creator.session_id().to_string();
+
+        let mut resumed =
+            ConversationLog::resume(&persistence, &session_id).expect("second writer");
+        punctuation(&mut resumed, "resumed second").expect("resumed append");
+        punctuation(&mut creator, "creator third").expect("creator append after resumer");
+        drop((creator, resumed));
+
+        let reader = ConversationLog::resume(&persistence, &session_id).expect("third reader");
+        let user_texts: Vec<String> = reader
+            .entries_in_order()
+            .iter()
+            .filter_map(|entry| match &entry.entry {
+                ConversationEntryKind::Message { message } => message
+                    .as_stored_wire()
+                    .and_then(|message| match message {
+                        Message::User(user) => Some(user),
+                        _ => None,
+                    })
+                    .and_then(|user| user.content.first())
+                    .and_then(|content| match content {
+                        UserContent::Text(text) => Some(text.text.clone()),
+                        UserContent::Image(_) => None,
+                    }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            ["creator first", "resumed second", "creator third"],
+            "the creator descriptor overwrote the resumer instead of appending"
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned by transactional_first_publication_survives_process_crashes"]
+    fn initial_publication_crash_child() {
+        let dir = std::env::var_os("AJ_TEST_INITIAL_PUBLICATION_DIR")
+            .map(PathBuf::from)
+            .expect("child sessions directory");
+        let persistence = ConversationPersistence::new(dir);
+        let (mut log, _) = seeded_env_log(&persistence);
+        println!("initial-publication-session:{}", log.session_id());
+        std::io::stdout().flush().expect("flush child session id");
+        punctuation(&mut log, "crash boundary").expect("drive first punctuation");
+    }
+
+    #[test]
+    fn transactional_first_publication_survives_process_crashes() {
+        for checkpoint in ["written", "flushed", "installed"] {
+            let dir = fresh_sessions_dir();
+            let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+            let marker = format!("initial-publication-checkpoint:{checkpoint}");
+            let mut child = CrashChild::spawn(dir.path(), checkpoint);
+            let lines = child.wait_for(&marker);
+            let session_id = lines
+                .iter()
+                .find_map(|line| line.strip_prefix("initial-publication-session:"))
+                .expect("child announced its session id");
+            let canonical = persistence.session_path(session_id);
+            let stages = stage_paths(dir.path());
+            assert_eq!(stages.len(), 1, "{checkpoint}: expected one stage");
+            assert!(
+                stages[0].extension().and_then(|ext| ext.to_str()) != Some("jsonl"),
+                "{checkpoint}: staging entered the session-log namespace"
+            );
+
+            if checkpoint == "installed" {
+                assert!(canonical.is_file(), "install checkpoint has no target");
+                let entries: Vec<ConversationEntryKind> = std::fs::read_to_string(&canonical)
+                    .expect("read installed image")
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str::<ConversationEntry>(line)
+                            .expect("complete installed line")
+                            .entry
+                    })
+                    .collect();
+                let env_index = entries
+                    .iter()
+                    .position(|entry| matches!(entry, ConversationEntryKind::EnvChange { .. }))
+                    .expect("installed env entry");
+                assert!(
+                    entries[env_index + 1..]
+                        .iter()
+                        .any(ConversationEntryKind::is_punctuation),
+                    "installed image exposes env_change as its final record"
+                );
+            } else {
+                assert!(!canonical.exists(), "{checkpoint}: target published early");
+                assert!(
+                    persistence
+                        .list_sessions()
+                        .expect("list sessions")
+                        .is_empty(),
+                    "{checkpoint}: session discovery saw the stage"
+                );
+                assert!(
+                    workspace_history(&persistence, 100, &|| false).is_empty(),
+                    "{checkpoint}: prompt history saw the staged prompt"
+                );
+            }
+
+            child.terminate();
+            if checkpoint == "installed" {
+                let bytes = std::fs::read(&canonical).expect("installed bytes survive child kill");
+                assert!(!bytes.is_empty());
+                ConversationLog::resume(&persistence, session_id)
+                    .expect("installed image remains resumable after child death");
+            } else {
+                assert!(!canonical.exists(), "{checkpoint}: kill exposed a target");
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_pre_env_codec_truncates_final_unknown_but_refuses_published_interior_unknown() {
+        let dir = fresh_sessions_dir();
+        let final_unknown = dir.path().join("final-unknown.jsonl");
+        let root = ConversationEntry {
+            id: "root".to_string(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::Meta,
+            agent_id: None,
+            entry: ConversationEntryKind::SystemPrompt {
+                text: "system".to_string(),
+            },
+        };
+        let env = ConversationEntry {
+            id: "env".to_string(),
+            parent_id: Some("root".to_string()),
+            timestamp: None,
+            thread: ThreadKind::Meta,
+            agent_id: None,
+            entry: ConversationEntryKind::EnvChange {
+                env: env_map(&[("BEADS_ACTOR", "session-actor")]),
+            },
+        };
+        let root_line = format!("{}\n", serde_json::to_string(&root).expect("root JSON"));
+        std::fs::write(
+            &final_unknown,
+            format!(
+                "{root_line}{}\n",
+                serde_json::to_string(&env).expect("env JSON")
+            ),
+        )
+        .expect("write final unknown fixture");
+
+        crate::pre_env_codec_fixture::resume(&final_unknown)
+            .expect("frozen codec truncates an unknown final record");
+        assert_eq!(
+            std::fs::read(&final_unknown).expect("truncated fixture"),
+            root_line.as_bytes(),
+            "the frozen decoder did not demonstrate the identity-losing tail rule"
+        );
+
+        let persistence = ConversationPersistence::new(dir.path().join("published"));
+        let (mut log, _) = seeded_env_log(&persistence);
+        punctuation(&mut log, "punctuation").expect("transactional publish");
+        let canonical = log.path().to_path_buf();
+        let before = std::fs::read(&canonical).expect("published bytes");
+        let err = crate::pre_env_codec_fixture::resume(&canonical)
+            .expect_err("frozen codec refuses an interior unknown record");
+        assert!(
+            err.contains("unknown variant") && err.contains("env_change"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&canonical).expect("bytes after refusal"),
+            before,
+            "old-codec interior refusal changed the published log"
+        );
     }
 
     #[test]
@@ -2790,15 +3623,13 @@ mod tests {
 
         let mut absent = ConversationLog::create(&persistence).expect("create absent log");
         absent.set_system_prompt("p".into()).expect("set sp");
-        let absent_head = {
+        {
             let mut view = ConversationView::user(&mut absent);
-            view.add_message(user_text("no env")).expect("user").id
-        };
-        let absent_settings = absent
-            .linearize(&absent_head, ThreadFilter::USER)
-            .settings();
+            view.add_message(user_text("no env")).expect("user");
+        }
         assert_eq!(
-            absent_settings.env, None,
+            absent.session_env(),
+            None,
             "a log with no EnvChange must extract None"
         );
 
@@ -2807,56 +3638,392 @@ mod tests {
         empty
             .append_env_change(BTreeMap::new())
             .expect("append explicit empty env");
-        let empty_head = {
+        {
             let mut view = ConversationView::user(&mut empty);
-            view.add_message(user_text("empty env")).expect("user").id
-        };
-        let empty_settings = empty.linearize(&empty_head, ThreadFilter::USER).settings();
+            view.add_message(user_text("empty env")).expect("user");
+        }
         assert_eq!(
-            empty_settings.env,
-            Some(BTreeMap::new()),
+            empty.session_env(),
+            Some(&BTreeMap::new()),
             "a recorded empty EnvChange must extract Some(empty)"
         );
     }
 
     #[test]
-    fn env_extraction_replaces_the_whole_map_when_a_later_entry_drops_a_key() {
+    fn session_env_validation_is_exact_and_resume_refuses_invalid_identity_without_writes() {
+        let distinct_case = env_map(&[("AJ_CASE", "upper"), ("aj_case", "lower")]);
+        validate_session_env(&distinct_case).expect("supported hosts keep exact key spelling");
+
+        for (env, expected) in [
+            (env_map(&[("", "value")]), "is empty"),
+            (env_map(&[("BAD=KEY", "value")]), "contains '='"),
+            (env_map(&[("BAD\0KEY", "value")]), "contains NUL"),
+            (env_map(&[("KEY", "bad\0value")]), "contains NUL"),
+        ] {
+            let err = validate_session_env(&env).expect_err("invalid map is refused");
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let session_id = "2000-01-01-00-00-00-000";
+        let path = persistence.session_path(session_id);
+        let root = ConversationEntry {
+            id: "root".to_string(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::Meta,
+            agent_id: None,
+            entry: ConversationEntryKind::SystemPrompt { text: "p".into() },
+        };
+        let invalid_env = ConversationEntry {
+            id: "env".to_string(),
+            parent_id: Some("root".to_string()),
+            timestamp: None,
+            thread: ThreadKind::Meta,
+            agent_id: None,
+            entry: ConversationEntryKind::EnvChange {
+                env: env_map(&[("", "value")]),
+            },
+        };
+        let message = ConversationEntry {
+            id: "message".to_string(),
+            parent_id: Some("root".to_string()),
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::Message {
+                message: user_text("hi"),
+            },
+        };
+        let bytes = format!(
+            "{}\n{}\n{}",
+            serde_json::to_string(&root).expect("root"),
+            serde_json::to_string(&invalid_env).expect("env"),
+            serde_json::to_string(&message).expect("message")
+        )
+        .into_bytes();
+        std::fs::write(&path, &bytes).expect("write invalid recorded env without final newline");
+
+        let err = ConversationLog::resume(&persistence, session_id)
+            .err()
+            .expect("invalid recorded identity is corruption");
+        assert!(
+            err.to_string().contains("environment key \"\" is empty"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("source bytes"),
+            bytes,
+            "validation ran after resume normalized the source file"
+        );
+    }
+
+    #[test]
+    fn append_refuses_a_system_prompt_outside_the_meta_root_boundary() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+
+        let err = log
+            .append(
+                None,
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::SystemPrompt {
+                    text: "wrong-thread root".to_string(),
+                },
+            )
+            .expect_err("a user-thread system prompt is not a legal creation root");
+        assert!(matches!(err, ConversationError::InvalidAppend(_)), "{err}");
+        assert!(log.is_empty(), "the refused root entered the in-memory log");
+        assert!(
+            !log.path().exists(),
+            "the refused root published a session file"
+        );
+
+        let root = log
+            .set_system_prompt("valid root".to_string())
+            .expect("the refused append leaves the log reusable");
+        let stored = log.core().get(&root.id).expect("stored valid root");
+        assert_eq!(stored.thread, ThreadKind::Meta);
+        assert_eq!(stored.parent_id, None);
+
+        let err = log
+            .append(
+                Some(root.id.clone()),
+                ThreadKind::Meta,
+                None,
+                ConversationEntryKind::SystemPrompt {
+                    text: "second prompt".to_string(),
+                },
+            )
+            .expect_err("a second root-parented meta system prompt is not legal");
+        assert!(matches!(err, ConversationError::InvalidAppend(_)), "{err}");
+        assert_eq!(log.len(), 1, "the refused second prompt entered the log");
+        assert_eq!(
+            log.system_prompt(),
+            Some("valid root"),
+            "the refused prompt displaced the creation root"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_a_non_meta_system_prompt_without_an_env_record() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let session_id = "2000-01-01-00-00-00-000_8";
+        let root = ConversationEntry {
+            id: "root".to_string(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::SystemPrompt { text: "p".into() },
+        };
+        let message = ConversationEntry {
+            id: "message".to_string(),
+            parent_id: Some("root".to_string()),
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::Message {
+                message: user_text("punctuation"),
+            },
+        };
+        let bytes = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&root).expect("root JSON"),
+            serde_json::to_string(&message).expect("message JSON"),
+        )
+        .into_bytes();
+        let path = persistence.session_path(session_id);
+        std::fs::write(&path, &bytes).expect("write malformed prompt layout");
+
+        let err = ConversationLog::resume(&persistence, session_id)
+            .err()
+            .expect("a non-meta system prompt is corruption without EnvChange too");
+        assert!(matches!(err, ConversationError::Corrupt(_)), "{err}");
+        assert_eq!(
+            std::fs::read(&path).expect("source bytes"),
+            bytes,
+            "resume changed malformed system-prompt layout"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_every_malformed_env_creation_layout_without_changing_bytes() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let root = ConversationEntry {
+            id: "root".to_string(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::Meta,
+            agent_id: None,
+            entry: ConversationEntryKind::SystemPrompt { text: "p".into() },
+        };
+        let message = ConversationEntry {
+            id: "message".to_string(),
+            parent_id: Some("root".to_string()),
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::Message {
+                message: user_text("punctuation"),
+            },
+        };
+        let env_entry = |id: &str, parent: &str, thread: ThreadKind| ConversationEntry {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            timestamp: None,
+            thread,
+            agent_id: None,
+            entry: ConversationEntryKind::EnvChange {
+                env: env_map(&[("BEADS_ACTOR", "session-actor")]),
+            },
+        };
+        let cases = [
+            (
+                "2000-01-01-00-00-00-000_1",
+                vec![
+                    root.clone(),
+                    message.clone(),
+                    env_entry("env", "root", ThreadKind::Meta),
+                ],
+            ),
+            (
+                "2000-01-01-00-00-00-000_2",
+                vec![
+                    root.clone(),
+                    env_entry("env", "root", ThreadKind::User),
+                    message.clone(),
+                ],
+            ),
+            (
+                "2000-01-01-00-00-00-000_3",
+                vec![
+                    root.clone(),
+                    env_entry("env", "wrong-parent", ThreadKind::Meta),
+                    message.clone(),
+                ],
+            ),
+            (
+                "2000-01-01-00-00-00-000_4",
+                vec![
+                    root.clone(),
+                    env_entry("env-1", "root", ThreadKind::Meta),
+                    env_entry("env-2", "root", ThreadKind::Meta),
+                    message.clone(),
+                ],
+            ),
+            (
+                "2000-01-01-00-00-00-000_5",
+                vec![root.clone(), env_entry("env", "root", ThreadKind::Meta)],
+            ),
+            (
+                "2000-01-01-00-00-00-000_6",
+                vec![
+                    root.clone(),
+                    env_entry("root", "root", ThreadKind::Meta),
+                    message.clone(),
+                ],
+            ),
+            (
+                "2000-01-01-00-00-00-000_7",
+                vec![
+                    root,
+                    env_entry("env", "root", ThreadKind::Meta),
+                    ConversationEntry {
+                        id: "second-prompt".to_string(),
+                        parent_id: Some("root".to_string()),
+                        timestamp: None,
+                        thread: ThreadKind::Meta,
+                        agent_id: None,
+                        entry: ConversationEntryKind::SystemPrompt {
+                            text: "ambiguous".to_string(),
+                        },
+                    },
+                    message,
+                ],
+            ),
+        ];
+
+        for (session_id, entries) in cases {
+            let bytes = entries
+                .iter()
+                .map(|entry| serde_json::to_string(entry).expect("entry JSON"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes();
+            let path = persistence.session_path(session_id);
+            std::fs::write(&path, &bytes).expect("write malformed env layout");
+            let err = ConversationLog::resume(&persistence, session_id)
+                .err()
+                .expect("malformed creation identity is refused");
+            assert!(matches!(err, ConversationError::Corrupt(_)), "{err}");
+            assert_eq!(
+                std::fs::read(&path).expect("source bytes"),
+                bytes,
+                "resume changed malformed env layout {session_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_recorded_env_is_refused_before_a_torn_tail_is_truncated() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let session_id = "2000-01-01-00-00-00-001";
+        let root = ConversationEntry {
+            id: "root".to_string(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::Meta,
+            agent_id: None,
+            entry: ConversationEntryKind::SystemPrompt { text: "p".into() },
+        };
+        let invalid_env = ConversationEntry {
+            id: "env".to_string(),
+            parent_id: Some("root".to_string()),
+            timestamp: None,
+            thread: ThreadKind::Meta,
+            agent_id: None,
+            entry: ConversationEntryKind::EnvChange {
+                env: env_map(&[("", "value")]),
+            },
+        };
+        let bytes = format!(
+            "{}\n{}\n{{torn",
+            serde_json::to_string(&root).expect("root"),
+            serde_json::to_string(&invalid_env).expect("env")
+        )
+        .into_bytes();
+        let path = persistence.session_path(session_id);
+        std::fs::write(&path, &bytes).expect("write invalid identity and torn tail");
+
+        let err = ConversationLog::resume(&persistence, session_id)
+            .err()
+            .expect("invalid identity wins over tail repair");
+        assert!(
+            err.to_string().contains("environment key \"\" is empty"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("source bytes"),
+            bytes,
+            "tail repair ran before identity validation"
+        );
+    }
+
+    #[test]
+    fn env_creation_record_is_meta_rooted_and_never_a_head() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let root = log.set_system_prompt("p".into()).expect("root");
+        let env = log
+            .append_env_change(env_map(&[("BEADS_ACTOR", "session-actor")]))
+            .expect("env creation record");
+        let entry = log.core().get(&env.id).expect("env entry");
+        assert_eq!(entry.thread, ThreadKind::Meta);
+        assert_eq!(entry.agent_id, None);
+        assert_eq!(entry.parent_id.as_ref(), Some(&root.id));
+        assert_eq!(log.head(), None, "meta identity advanced the user head");
+        assert!(
+            matches!(log.set_head(env.id), Err(ConversationError::InvalidHead(_))),
+            "immutable creation metadata became a legal conversation head"
+        );
+        log.set_head(root.id)
+            .expect("system-prompt root remains a legal head");
+    }
+
+    #[test]
+    fn a_second_env_creation_record_is_refused_without_replacing_identity() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
-        log.append_env_change(env_map(&[
-            ("BEADS_ACTOR", "azurite"),
-            ("DROPPED_KEY", "old"),
-        ]))
-        .expect("first env map");
-        let replacement = env_map(&[("BEADS_ACTOR", "cerulean")]);
-        log.append_env_change(replacement.clone())
-            .expect("replacement env map");
-        let head = {
-            let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("user").id
-        };
-
-        let extracted = log.linearize(&head, ThreadFilter::USER).settings().env;
+        let original = env_map(&[("BEADS_ACTOR", "original-actor"), ("DROPPED_KEY", "old")]);
+        log.append_env_change(original.clone())
+            .expect("creation env");
+        let replacement = env_map(&[("BEADS_ACTOR", "replacement-actor")]);
+        let err = log
+            .append_env_change(replacement)
+            .expect_err("session identity is immutable");
         assert_eq!(
-            extracted,
-            Some(replacement),
-            "the last EnvChange replaces rather than merges the earlier map"
+            log.session_env(),
+            Some(&original),
+            "the refused replacement changed the creation identity"
         );
-        assert!(
-            !extracted
-                .as_ref()
-                .is_some_and(|env| env.contains_key("DROPPED_KEY")),
-            "the key omitted by the replacement survived a merge fold"
-        );
+        assert!(matches!(err, ConversationError::InvalidAppend(_)), "{err}");
     }
 
     #[test]
     fn env_extraction_carries_the_seed_past_a_real_compaction_boundary() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let expected = env_map(&[("BEADS_ACTOR", "azurite")]);
+        let expected = env_map(&[("BEADS_ACTOR", "original-actor")]);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         let seed = log
@@ -2890,10 +4057,14 @@ mod tests {
         let head = log
             .latest_leaf(ThreadFilter::USER)
             .expect("post-compaction head");
+        assert!(
+            log.contains(&head),
+            "compaction did not produce a real head"
+        );
         assert_eq!(
-            log.linearize(&head, ThreadFilter::USER).settings().env,
-            Some(expected),
-            "the post-compaction path lost the pre-boundary env seed"
+            log.session_env(),
+            Some(&expected),
+            "log-level identity changed across compaction"
         );
     }
 
@@ -2901,7 +4072,7 @@ mod tests {
     fn env_seed_is_shared_by_a_branch_forked_after_it() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let expected = env_map(&[("BEADS_ACTOR", "azurite")]);
+        let expected = env_map(&[("BEADS_ACTOR", "original-actor")]);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         let seed = log
@@ -2947,11 +4118,9 @@ mod tests {
             "the new branch is not active"
         );
         assert_eq!(
-            log.linearize(&branch_head, ThreadFilter::USER)
-                .settings()
-                .env,
-            Some(expected),
-            "the new branch did not inherit its ancestor env seed"
+            log.session_env(),
+            Some(&expected),
+            "switching branches changed log-level identity"
         );
     }
 

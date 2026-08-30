@@ -20,7 +20,7 @@
 //! Every wait is bounded by [`DEADLINE`], so a wedged host fails a test
 //! instead of hanging CI.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1403,12 +1403,12 @@ async fn both_control_arms_refuse_a_create_meant_for_another_host() {
     ] {
         here.push(
             control
-                .create(Some(own.clone()), None, None, None)
+                .create(Some(own.clone()), None, None, None, None)
                 .await
                 .expect("this host's own id is a create for here"),
         );
         let err = control
-            .create(Some(elsewhere.to_string()), None, None, None)
+            .create(Some(elsewhere.to_string()), None, None, None, None)
             .await
             .expect_err("another host's id is not this host's to serve");
         let refusal = err.to_string();
@@ -1433,6 +1433,51 @@ async fn both_control_arms_refuse_a_create_meant_for_another_host() {
         "only the creates for this host minted a session",
     );
 
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_never_drops_env_from_a_remote_create() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let env = BTreeMap::from([("BEADS_ACTOR".to_string(), "session-actor".to_string())]);
+    let local = Control::local(fixture.host.clone())
+        .create(None, None, None, None, Some(env.clone()))
+        .await
+        .expect("local control carries session env");
+    let handles = fixture
+        .host
+        .local_handles(&local)
+        .await
+        .expect("local handles");
+    assert_eq!(handles.log.lock().await.session_env(), Some(&env));
+    drop(handles);
+
+    let before = fixture
+        .host
+        .sessions()
+        .await
+        .expect("sessions")
+        .sessions
+        .len();
+    let err = Control::remote(fixture.client())
+        .create(None, None, None, None, Some(env))
+        .await
+        .expect_err("the pre-wire remote arm refuses rather than dropping identity");
+    assert!(
+        err.to_string().contains("remote create is not served"),
+        "{err}"
+    );
+    assert_eq!(
+        fixture
+            .host
+            .sessions()
+            .await
+            .expect("sessions")
+            .sessions
+            .len(),
+        before,
+        "an identityless remote session was minted behind the refusal"
+    );
     fixture.shutdown().await;
 }
 
@@ -1903,7 +1948,7 @@ async fn both_control_arms_report_a_created_session_whose_label_did_not_stick() 
         Control::remote(fixture.client()),
     ] {
         let err = control
-            .create(None, None, None, Some("fix-auth".to_string()))
+            .create(None, None, None, Some("fix-auth".to_string()), None)
             .await
             .expect_err("the sidecar write cannot land");
         assert!(

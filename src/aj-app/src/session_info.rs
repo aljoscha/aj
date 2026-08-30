@@ -286,8 +286,8 @@ mod tests {
                 thinking: Some("medium".to_string()),
                 speed: None,
                 verbosity: None,
-                env: None,
             },
+            session_env: None,
         }
     }
 

@@ -147,6 +147,7 @@ pub fn build_test_agent(
     let config = Config::default();
     let spec = SessionSpec::Create {
         entry: SessionEntry::Startup,
+        session_env: None,
     };
     // The core owns its own run config (one per session), so the shared
     // fixture is cloned in rather than handed over. Tests that stage a
