@@ -6117,6 +6117,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         .expect("live usage");
     assert_eq!(summary_usage(&host_usage), session_total);
     let after_sources = usage_sources(&client.chat);
+    assert_eq!(after_sources.len(), 3, "one usage row per accounted source");
     assert_eq!(&after_sources[..2], before_sources.as_slice());
     assert_eq!(
         after_sources[2].as_deref(),
