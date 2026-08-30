@@ -3225,6 +3225,34 @@ mod tests {
     }
 
     #[test]
+    fn usage_update_completeness_reaches_the_context_footer() {
+        let display = |incomplete| {
+            let mut state = ChatState::new(main_settings(), 20_000_000, Arc::new(Vec::new()));
+            let mut lifecycle = AgentLifecycle::default();
+            let mut usage = token_usage([9_999, 0, 0, 0]);
+            usage.turn_incomplete = incomplete;
+            apply(
+                &mut state,
+                &mut lifecycle,
+                AgentEvent::UsageUpdate {
+                    agent_id: AgentId::Main,
+                    usage,
+                },
+            );
+            crate::footer::context_usage_display(state.footers().context_usage(AgentId::Main))
+                .expect("main has a context window")
+        };
+
+        let incomplete = display(true);
+        assert_eq!(incomplete.ratio, "≥10.0k/20M");
+        assert_eq!(incomplete.percent, None);
+
+        let complete = display(false);
+        assert_eq!(complete.ratio, "10.0k/20M");
+        assert!(complete.percent.is_some());
+    }
+
+    #[test]
     fn sub_agent_start_resolves_window_via_catalog_main_identity_and_miss() {
         let catalog_model = ModelInfo {
             id: "gpt-sub".into(),
