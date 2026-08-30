@@ -62,10 +62,11 @@
 //!   feeds the sub-agent bracketing below.
 //! - [`ConversationEntryKind::Compaction`][]: an
 //!   [`AgentEvent::CompactionEnd`] marking the boundary, followed by a
-//!   [`AgentEvent::CompactionUsageUpdate`] when the entry records summarizer spend. This
-//!   mirrors the live path while keeping the footer occupancy at the reduced
-//!   size. The retained tail's assistant usage is stale. The summarized prefix
-//!   entries still replay in order, so
+//!   [`AgentEvent::CompactionUsageUpdate`] carrying that entry's id when it
+//!   records summarizer spend. This mirrors the live path while keeping the
+//!   footer occupancy at the reduced size and makes a retained duplicate update
+//!   independently idempotent. The retained tail's assistant usage is stale.
+//!   The summarized prefix entries still replay in order, so
 //!   the scrollback shows the full history even though the model
 //!   context (rebuilt via `agent_messages`) is the reduced projection.
 //!
@@ -968,7 +969,7 @@ impl ReplayState {
                     },
                 ));
                 if let Some(usage) = usage {
-                    self.project_usage(agent_id, usage, true, out);
+                    self.project_usage(agent_id, usage, Some(&entry.id), out);
                 }
             }
             ConversationEntryKind::Message { message: agent_msg } => {
@@ -1078,7 +1079,7 @@ impl ReplayState {
         &mut self,
         agent_id: AgentId,
         delta: &Usage,
-        checkpoint: bool,
+        checkpoint_id: Option<&str>,
         out: &mut VecDeque<TaggedEvent>,
     ) {
         let accumulated = self.usage_accumulators.entry(agent_id).or_default();
@@ -1094,10 +1095,13 @@ impl ReplayState {
             turn_incomplete: delta.incomplete,
             accumulated_incomplete: accumulated.incomplete,
         };
-        let event = if checkpoint {
-            AgentEvent::CompactionUsageUpdate { agent_id, usage }
-        } else {
-            AgentEvent::UsageUpdate { agent_id, usage }
+        let event = match checkpoint_id {
+            Some(checkpoint_id) => AgentEvent::CompactionUsageUpdate {
+                agent_id,
+                checkpoint_id: checkpoint_id.to_string(),
+                usage,
+            },
+            None => AgentEvent::UsageUpdate { agent_id, usage },
         };
         out.push_back(transient(event));
         accumulated.accumulate(delta);
@@ -1177,7 +1181,7 @@ impl ReplayState {
         // and "reported zero" are the same state, and skipping on zero
         // would drop a `UsageUpdate` the live path did emit.
         if assistant.stop_reason.completed() {
-            self.project_usage(agent_id, &assistant.usage, false, out);
+            self.project_usage(agent_id, &assistant.usage, None, out);
         }
 
         // Track tool_call blocks so subsequent tool_result entries
@@ -2559,22 +2563,23 @@ mod tests {
             None,
         )
         .expect("append legacy compaction");
-        log.append_compaction(
-            ThreadFilter::USER,
-            "PRICED SUMMARY".into(),
-            first_kept,
-            50_000,
-            None,
-            Some(Usage {
-                input: 7,
-                output: 11,
-                cache_write: 13,
-                cache_read: 17,
-                total_tokens: 48,
-                ..Usage::default()
-            }),
-        )
-        .expect("append priced compaction");
+        let priced_checkpoint = log
+            .append_compaction(
+                ThreadFilter::USER,
+                "PRICED SUMMARY".into(),
+                first_kept,
+                50_000,
+                None,
+                Some(Usage {
+                    input: 7,
+                    output: 11,
+                    cache_write: 13,
+                    cache_read: 17,
+                    total_tokens: 48,
+                    ..Usage::default()
+                }),
+            )
+            .expect("append priced compaction");
 
         let events: Vec<AgentEvent> = replay(&log).collect();
 
@@ -2644,6 +2649,11 @@ mod tests {
         assert_eq!(checkpoint.turn_output, 11);
         assert_eq!(checkpoint.turn_cache_write, 13);
         assert_eq!(checkpoint.turn_cache_read, 17);
+        let checkpoint_id = events.iter().find_map(|event| match event {
+            AgentEvent::CompactionUsageUpdate { checkpoint_id, .. } => Some(checkpoint_id),
+            _ => None,
+        });
+        assert_eq!(checkpoint_id, Some(&priced_checkpoint.id));
     }
 
     /// Main and sub-agent assistants keep independent

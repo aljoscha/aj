@@ -14,6 +14,7 @@ use std::time::Instant;
 use aj_agent::events::{AgentEvent, AgentId, SubAgentConclusion};
 use aj_agent::message::{AgentMessageKind, TaskNotification};
 use aj_agent::tool::{TaskStatus, ToolDetails};
+use aj_agent::types::TokenUsage;
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{
     AssistantContent, AssistantMessage, ErrorCategory, Message, StopReason, UserContent,
@@ -332,50 +333,26 @@ pub fn reduce(
         }
 
         // ---- Accounted token usage -------------------------------------------
-        AgentEvent::UsageUpdate { agent_id, usage }
-        | AgentEvent::CompactionUsageUpdate { agent_id, usage } => {
-            let origin = state
+        AgentEvent::UsageUpdate { agent_id, usage } => {
+            let source_entry = state
                 .render
                 .get(&agent_id)
-                .and_then(|render| render.last_usage_origin.clone());
-            // Assistant deltas describe the latest model context and feed the
-            // occupancy footer. Compaction deltas describe out-of-band spend;
-            // CompactionEnd already set occupancy to the reduced projection.
-            if !origin.as_ref().is_some_and(UsageOrigin::is_compaction) {
-                state.footers.record_turn_usage(agent_id, &usage);
-            }
-            // The row belongs to the assistant or checkpoint it follows, so a
-            // re-applied update overwrites its row instead of adding one.
-            let source_entry = origin
-                .as_ref()
+                .and_then(|render| render.last_usage_origin.as_ref())
                 .and_then(UsageOrigin::source_entry)
                 .map(str::to_string);
-            let existing = source_entry
-                .as_deref()
-                .and_then(|source| indexed_row(state, agent_id, source, usage_origin));
-            match existing {
-                Some(id) => {
-                    if let Some(EntryKind::TurnUsage(row)) = state
-                        .transcripts
-                        .get_mut(&agent_id)
-                        .and_then(|t| t.get_mut(id))
-                        .map(|e| &mut e.kind)
-                    {
-                        row.usage = usage;
-                    }
-                }
-                None => {
-                    state
-                        .transcripts
-                        .entry(agent_id)
-                        .or_default()
-                        .append(EntryKind::TurnUsage(TurnUsageEntry {
-                            agent_id,
-                            usage,
-                            source_entry,
-                        }));
-                }
-            }
+            state.footers.record_turn_usage(agent_id, &usage);
+            upsert_usage_row(state, agent_id, usage, source_entry);
+            Redraw(true)
+        }
+        AgentEvent::CompactionUsageUpdate {
+            agent_id,
+            checkpoint_id,
+            usage,
+        } => {
+            // Checkpoint spend owns its identity and never describes model
+            // context occupancy. This stays idempotent when attach filtering
+            // drops a duplicate CompactionEnd but retains this update.
+            upsert_usage_row(state, agent_id, usage, durable_id(&checkpoint_id));
             Redraw(true)
         }
 
@@ -400,7 +377,6 @@ pub fn reduce(
             agent_id,
             tokens_before,
             tokens_after,
-            has_usage,
             summary,
             error,
             ..
@@ -424,13 +400,8 @@ pub fn reduce(
                     None,
                 );
             } else if let Some(summary) = summary {
-                if has_usage {
-                    state.render.entry(agent_id).or_default().last_usage_origin =
-                        Some(UsageOrigin::Compaction(entry.cloned()));
-                }
                 // A successful compaction appends its checkpoint entry,
-                // and `CompactionEnd` carries no identity of its own, so
-                // that entry is the row's key. The cursor invariant is not
+                // and its tagged entry is the row's key. The cursor invariant is not
                 // enough on its own: it is a de-duplication optimization
                 // (spec 6.5), and a client that offers an older cursor or
                 // re-attaches under a fresh epoch is served the entry
@@ -890,6 +861,41 @@ fn indexed_row(
         .map(|entry| entry.id)
 }
 
+/// Insert one usage row or replace the row already owned by `source_entry`.
+fn upsert_usage_row(
+    state: &mut ChatState,
+    agent_id: AgentId,
+    usage: TokenUsage,
+    source_entry: Option<String>,
+) {
+    let existing = source_entry
+        .as_deref()
+        .and_then(|source| indexed_row(state, agent_id, source, usage_origin));
+    match existing {
+        Some(id) => {
+            if let Some(EntryKind::TurnUsage(row)) = state
+                .transcripts
+                .get_mut(&agent_id)
+                .and_then(|transcript| transcript.get_mut(id))
+                .map(|entry| &mut entry.kind)
+            {
+                row.usage = usage;
+            }
+        }
+        None => {
+            state
+                .transcripts
+                .entry(agent_id)
+                .or_default()
+                .append(EntryKind::TurnUsage(TurnUsageEntry {
+                    agent_id,
+                    usage,
+                    source_entry,
+                }));
+        }
+    }
+}
+
 /// Durable identity of a usage row: the assistant or checkpoint it reports on.
 fn usage_origin(kind: &EntryKind) -> Option<&str> {
     match kind {
@@ -1046,7 +1052,7 @@ fn reduce_assistant_end(
     // turn): the trailing `UsageUpdate` still reports on this message
     // and keys its row off this id.
     state.render.entry(agent_id).or_default().last_usage_origin =
-        Some(UsageOrigin::Assistant(message_id.clone()));
+        Some(UsageOrigin::new(message_id.clone()));
     // A sub-agent's box renders its report, not the sub's transcript, so keep
     // the report fresh from the sub's latest conclusion while it runs. A
     // continuation or steering re-run completes through `AgentEnd(Sub n)`,
@@ -3074,8 +3080,9 @@ mod tests {
         let _ = reduce(
             &mut s,
             &mut life,
-            AgentEvent::UsageUpdate {
+            AgentEvent::CompactionUsageUpdate {
                 agent_id: AgentId::Main,
+                checkpoint_id: checkpoint.clone(),
                 usage: token_usage([900, 50, 20, 30]),
             },
             None,
@@ -3085,6 +3092,82 @@ mod tests {
         assert_eq!(usage[0].source_entry.as_deref(), Some("checkpoint"));
         // The summarizer's prompt is spend, not the model's retained context.
         assert_eq!(s.footers().context_usage(AgentId::Main).tokens, Some(300));
+    }
+
+    #[test]
+    fn duplicate_compaction_usage_without_its_end_keeps_later_assistant_usage() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let checkpoint = "checkpoint".to_string();
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            AgentEvent::CompactionEnd {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Manual,
+                tokens_before: 1_200,
+                tokens_after: 300,
+                has_usage: true,
+                summary: Some("summary".into()),
+                error: None,
+            },
+            Some(&checkpoint),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::CompactionUsageUpdate {
+                agent_id: AgentId::Main,
+                checkpoint_id: checkpoint.clone(),
+                usage: token_usage([1_000, 100, 0, 0]),
+            },
+        );
+
+        apply(
+            &mut s,
+            &mut life,
+            with_id(assistant_message_end(text_partial("later")), "assistant"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([10, 1, 0, 70]),
+            },
+        );
+        let occupancy = s.footers().context_usage(AgentId::Main);
+
+        // Attach filtering may remove the duplicate durable CompactionEnd while
+        // retaining its transient usage event after a later assistant pair.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::CompactionUsageUpdate {
+                agent_id: AgentId::Main,
+                checkpoint_id: checkpoint,
+                usage: token_usage([1_000, 100, 0, 0]),
+            },
+        );
+
+        let rows = usage_rows(&s, AgentId::Main);
+        assert_eq!(rows.len(), 2, "one row per durable source");
+        let assistant = rows
+            .iter()
+            .find(|row| row.source_entry.as_deref() == Some("assistant"))
+            .expect("assistant usage row");
+        assert_eq!(assistant.usage.turn_input, 10);
+        assert_eq!(assistant.usage.turn_cache_read, 70);
+        let checkpoint = rows
+            .iter()
+            .find(|row| row.source_entry.as_deref() == Some("checkpoint"))
+            .expect("checkpoint usage row");
+        assert_eq!(checkpoint.usage.turn_input, 1_000);
+        assert_eq!(
+            s.footers().context_usage(AgentId::Main),
+            occupancy,
+            "summarizer usage replaced assistant context occupancy"
+        );
     }
 
     #[test]

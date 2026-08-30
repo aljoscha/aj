@@ -386,8 +386,11 @@ pub enum AgentEvent {
     /// Cumulative usage for one committed compaction checkpoint. Kept as a
     /// distinct wire event so protocol-1 clients that predate compaction spend
     /// ignore it instead of treating the summarizer prompt as assistant context.
+    /// `checkpoint_id` makes duplicate delivery independently idempotent even
+    /// when attach filtering removes the preceding [`AgentEvent::CompactionEnd`].
     CompactionUsageUpdate {
         agent_id: AgentId,
+        checkpoint_id: String,
         usage: TokenUsage,
     },
 

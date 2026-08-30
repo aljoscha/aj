@@ -228,6 +228,7 @@
   {
     "type": "compaction_usage_update",
     "agent_id": "main",
+    "checkpoint_id": "checkpoint-usage-1",
     "usage": {
       "accumulated_input": 10,
       "turn_input": 20,

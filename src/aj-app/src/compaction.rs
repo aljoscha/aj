@@ -208,17 +208,19 @@ pub async fn run_compaction(
         let after = planning::estimate_conversation_context(&conversation).tokens;
         agent.reseed_transcript(messages);
 
-        handoff.file(checkpoint);
-        // Both events happen under the guard on purpose: a durable append
-        // landing between the checkpoint, its CompactionEnd, and its usage
-        // would make the forwarded seqs non-monotone or replace the reducer's
-        // usage origin. A listener must not take the log lock for either event.
-        // account_usage suppresses the dependent update if CompactionEnd fails,
-        // while still retaining spend in the shutdown accumulator.
+        let checkpoint_id = checkpoint.id.clone();
+        let _handoff_guard = handoff.file(checkpoint);
+        // The pair happens under the guard on purpose: a durable append landing
+        // between the checkpoint, its CompactionEnd, and its usage would make
+        // the forwarded seqs non-monotone. EventBus delivers the pair to one
+        // stable listener cohort, and the usage event carries `checkpoint_id`
+        // so attach filtering can safely retain it on its own. A listener must
+        // not take the log lock for either event.
         if let Err(err) = agent
-            .account_usage(
+            .account_compaction_usage(
                 &summarizer_usage,
-                Some(AgentEvent::CompactionEnd {
+                checkpoint_id,
+                AgentEvent::CompactionEnd {
                     agent_id: AgentId::Main,
                     reason,
                     tokens_before: plan.tokens_before,
@@ -226,13 +228,10 @@ pub async fn run_compaction(
                     has_usage: true,
                     summary: Some(summary),
                     error: None,
-                }),
+                },
             )
             .await
         {
-            // If a listener rejected CompactionEnd before the tagging forwarder,
-            // clear the undelivered handoff so it cannot tag a later checkpoint.
-            let _ = handoff.take();
             tracing::warn!("failed to emit committed compaction events: {err}");
         }
         after
@@ -699,6 +698,138 @@ mod tests {
             (usage.cost.total - expected).abs() < 1e-9,
             "the checkpoint totals both calls' dollars: got {} expected {expected}",
             usage.cost.total
+        );
+    }
+
+    /// Cancellation after the checkpoint commit cannot erase its spend or
+    /// leave its append identity for a later terminal event.
+    #[tokio::test]
+    async fn committed_accounting_and_handoff_survive_listener_cancellation() {
+        use aj_agent::events::AgentEvent;
+        use aj_models::types::Usage;
+        use aj_session::{
+            AppendHandoff, ConversationEntryKind, ConversationPersistence, TaggedEvent,
+            persisting_forwarder,
+        };
+        use tempfile::TempDir;
+        use tokio_util::sync::CancellationToken;
+
+        use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
+
+        let dir = TempDir::new().expect("tempdir");
+        let store = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut summary = finalized_text_message("SUMMARY");
+        summary.usage = Usage {
+            input: 7,
+            output: 11,
+            cache_write: 13,
+            cache_read: 17,
+            total_tokens: 48,
+            ..Usage::default()
+        };
+        let run_config = scripted_run_config(vec![
+            finalized_text_message("first answer"),
+            finalized_text_message("second answer"),
+            summary,
+        ]);
+        let (mut agent, log, persistence) = build_test_agent(&store, &run_config);
+        drop(persistence);
+
+        let listener_entered = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::clone(&listener_entered);
+        let _gate = agent.subscribe(Arc::new(move |event| {
+            let entered = Arc::clone(&entered);
+            let hold = matches!(
+                event,
+                AgentEvent::CompactionEnd {
+                    has_usage: true,
+                    summary: Some(_),
+                    ..
+                }
+            );
+            Box::pin(async move {
+                if hold {
+                    entered.notify_one();
+                    std::future::pending().await
+                } else {
+                    Ok(())
+                }
+            })
+        }));
+        let handoff = AppendHandoff::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TaggedEvent>();
+        let _forwarder =
+            agent.subscribe(persisting_forwarder(Arc::clone(&log), handoff.clone(), tx));
+
+        agent
+            .prompt("first question".to_string(), CancellationToken::new())
+            .await
+            .expect("first turn");
+        agent
+            .prompt(
+                format!("second question {}", "X".repeat(2000)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second turn");
+        while rx.try_recv().is_ok() {}
+
+        let mut compaction = Box::pin(run_compaction(
+            &mut agent,
+            &log,
+            &handoff,
+            CompactionReason::Manual,
+            None,
+            100,
+            CancellationToken::new(),
+        ));
+        tokio::select! {
+            () = listener_entered.notified() => {}
+            outcome = &mut compaction => panic!("listener did not hold compaction: {outcome:?}"),
+        }
+        drop(compaction);
+
+        let accumulated = agent.accumulated_usage();
+        assert_eq!(accumulated.input, 7);
+        assert_eq!(accumulated.output, 11);
+        assert_eq!(accumulated.cache_write, 13);
+        assert_eq!(accumulated.cache_read, 17);
+        let log_guard = log.lock().await;
+        let checkpoint_usage = log_guard
+            .entries_in_order()
+            .into_iter()
+            .find_map(|entry| match &entry.entry {
+                ConversationEntryKind::Compaction { usage, .. } => usage.clone(),
+                _ => None,
+            })
+            .expect("committed checkpoint usage");
+        assert_eq!(checkpoint_usage.input, 7);
+        assert_eq!(checkpoint_usage.output, 11);
+        assert_eq!(checkpoint_usage.cache_write, 13);
+        assert_eq!(checkpoint_usage.cache_read, 17);
+        drop(log_guard);
+        while rx.try_recv().is_ok() {}
+
+        agent
+            .emit_event(AgentEvent::CompactionEnd {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Threshold,
+                tokens_before: 100,
+                tokens_after: 100,
+                has_usage: false,
+                summary: None,
+                error: Some("later failure".into()),
+            })
+            .await
+            .expect("emit later failed compaction");
+        let forwarded = rx.try_recv().expect("later terminal event forwarded");
+        assert!(matches!(
+            forwarded.event,
+            AgentEvent::CompactionEnd { error: Some(_), .. }
+        ));
+        assert_eq!(
+            forwarded.entry, None,
+            "canceled delivery left a stale checkpoint handoff"
         );
     }
 

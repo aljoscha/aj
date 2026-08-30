@@ -6029,10 +6029,12 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
             Frame::Event {
                 durability, event, ..
             } => match event.known() {
-                Some(AgentEvent::CompactionUsageUpdate { usage, .. })
-                    if usage.turn_input == compaction_total[0] =>
-                {
-                    Some((durability, usage))
+                Some(AgentEvent::CompactionUsageUpdate {
+                    checkpoint_id,
+                    usage,
+                    ..
+                }) if usage.turn_input == compaction_total[0] => {
+                    Some((durability, checkpoint_id, usage))
                 }
                 _ => None,
             },
@@ -6049,11 +6051,15 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         "CompactionEnd alone carries the checkpoint's durable tag",
     );
     assert_eq!(
+        checkpoint_updates[0].1, &durability.entry_id,
+        "the transient update identifies its durable checkpoint",
+    );
+    assert_eq!(
         [
-            checkpoint_updates[0].1.turn_input,
-            checkpoint_updates[0].1.turn_output,
-            checkpoint_updates[0].1.turn_cache_write,
-            checkpoint_updates[0].1.turn_cache_read,
+            checkpoint_updates[0].2.turn_input,
+            checkpoint_updates[0].2.turn_output,
+            checkpoint_updates[0].2.turn_cache_write,
+            checkpoint_updates[0].2.turn_cache_read,
         ],
         compaction_total,
     );

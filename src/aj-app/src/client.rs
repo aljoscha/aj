@@ -196,9 +196,9 @@ pub struct SessionClient {
     epoch: Option<String>,
     /// The seq offered on re-attach. It lags `applied` by one durable
     /// frame, because a log entry can project trailing untagged events (an
-    /// assistant `UsageUpdate`, a `CompactionUsageUpdate`, or a tool-result entry's bracket) and
-    /// a drop in between would otherwise make the client claim an entry it
-    /// only half applied.
+    /// assistant `UsageUpdate`, a self-identifying `CompactionUsageUpdate`, or
+    /// a tool-result entry's bracket) and a drop in between would otherwise make
+    /// the client claim an entry it only half applied.
     committed: Option<u64>,
     /// The durable high-water mark the cursor invariant compares against.
     applied: Option<u64>,
@@ -861,6 +861,7 @@ mod tests {
     use aj_agent::events::CompactionReason;
     use aj_agent::message::AgentMessage;
     use aj_agent::tool::{TaskKind, TaskStatus, ToolDetails};
+    use aj_agent::types::TokenUsage;
     use aj_models::streaming::AssistantMessageEvent;
     use aj_models::types::{
         AssistantContent, AssistantMessage as WireAssistantMessage, Message, StopReason,
@@ -1659,6 +1660,110 @@ mod tests {
             streaming(&chat),
             "a re-emitted state frame does not quiesce"
         );
+    }
+
+    #[test]
+    fn attach_filtering_keeps_duplicate_compaction_usage_on_its_checkpoint() {
+        let (mut client, mut chat) = attached();
+        let checkpoint_end = AgentEvent::CompactionEnd {
+            agent_id: AgentId::Main,
+            reason: CompactionReason::Manual,
+            tokens_before: 1_200,
+            tokens_after: 300,
+            has_usage: true,
+            summary: Some("summary".into()),
+            error: None,
+        };
+        let checkpoint_usage = AgentEvent::CompactionUsageUpdate {
+            agent_id: AgentId::Main,
+            checkpoint_id: "checkpoint".into(),
+            usage: TokenUsage {
+                accumulated_input: 0,
+                turn_input: 1_000,
+                accumulated_output: 0,
+                turn_output: 100,
+                accumulated_cache_write: 0,
+                turn_cache_write: 0,
+                accumulated_cache_read: 0,
+                turn_cache_read: 0,
+            },
+        };
+        let assistant = WireAssistantMessage {
+            content: vec![AssistantContent::Text(TextContent {
+                text: "later".into(),
+                text_signature: None,
+            })],
+            api: "scripted".into(),
+            provider: "scripted".into(),
+            model: "scripted".into(),
+            account: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error: None,
+            timestamp: 0,
+        };
+        let mut assistant_message = AgentMessage::wire(Message::Assistant(assistant));
+        assistant_message.set_id("assistant".into());
+        let assistant_end = AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: assistant_message,
+        };
+        let assistant_usage = AgentEvent::UsageUpdate {
+            agent_id: AgentId::Main,
+            usage: TokenUsage {
+                accumulated_input: 1_000,
+                turn_input: 10,
+                accumulated_output: 100,
+                turn_output: 1,
+                accumulated_cache_write: 0,
+                turn_cache_write: 0,
+                accumulated_cache_read: 0,
+                turn_cache_read: 70,
+            },
+        };
+
+        let _ = client.apply(
+            &mut chat,
+            durable(EPOCH, 1, "checkpoint", checkpoint_end.clone()),
+        );
+        let _ = client.apply(&mut chat, live(EPOCH, checkpoint_usage.clone()));
+        let _ = client.apply(&mut chat, durable(EPOCH, 2, "assistant", assistant_end));
+        let _ = client.apply(&mut chat, live(EPOCH, assistant_usage));
+        let occupancy = chat.footers().context_usage(AgentId::Main);
+
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(EPOCH, false));
+        assert!(
+            !client
+                .apply(&mut chat, durable(EPOCH, 1, "checkpoint", checkpoint_end))
+                .0,
+            "the durable duplicate is filtered"
+        );
+        assert!(
+            client.apply(&mut chat, live(EPOCH, checkpoint_usage)).0,
+            "the trailing transient update is retained"
+        );
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 2));
+
+        let rows: Vec<_> = chat
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::TurnUsage(usage) => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        let assistant = rows
+            .iter()
+            .find(|row| row.source_entry.as_deref() == Some("assistant"))
+            .expect("assistant usage row");
+        assert_eq!(assistant.usage.turn_input, 10);
+        assert_eq!(assistant.usage.turn_cache_read, 70);
+        assert_eq!(chat.footers().context_usage(AgentId::Main), occupancy);
     }
 
     #[test]

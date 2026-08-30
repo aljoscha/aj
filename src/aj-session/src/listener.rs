@@ -135,26 +135,77 @@ impl Drop for PersistencePermit {
 /// must therefore not take the log lock for either event in that sequence, or
 /// it deadlocks against the emitting append.
 ///
-/// One slot: at most one compaction runs per session at a time, and a
-/// filed entry is taken by the very next `CompactionEnd`.
+/// One slot: at most one compaction runs per session at a time, and a filed
+/// entry is taken by the very next `CompactionEnd`. The guard returned by
+/// [`AppendHandoff::file`] clears an unconsumed slot if delivery is canceled.
 #[derive(Clone, Default)]
 pub struct AppendHandoff {
-    entry: Arc<StdMutex<Option<EntryRef>>>,
+    state: Arc<StdMutex<AppendHandoffState>>,
+}
+
+#[derive(Default)]
+struct AppendHandoffState {
+    next_token: u64,
+    filed: Option<(u64, EntryRef)>,
+}
+
+/// Ownership of one filed append handoff.
+///
+/// The compaction run holds this guard across event delivery. If that future is
+/// canceled before the forwarder consumes the handoff, dropping the guard
+/// clears only its own filing so a later `CompactionEnd` cannot inherit it.
+#[must_use = "dropping the guard clears an unconsumed append handoff"]
+pub struct AppendHandoffGuard {
+    handoff: AppendHandoff,
+    token: u64,
 }
 
 impl AppendHandoff {
-    /// Hand `entry` to the next `CompactionEnd` the forwarder sees.
-    pub fn file(&self, entry: EntryRef) {
-        *self.entry.lock().expect("append handoff mutex poisoned") = Some(entry);
+    /// Hand `entry` to the next `CompactionEnd` the forwarder sees and return
+    /// the guard that owns the filing until it is consumed.
+    pub fn file(&self, entry: EntryRef) -> AppendHandoffGuard {
+        let token = {
+            let mut state = self.state.lock().expect("append handoff mutex poisoned");
+            state.next_token = state
+                .next_token
+                .checked_add(1)
+                .expect("append handoff token overflow");
+            let token = state.next_token;
+            state.filed = Some((token, entry));
+            token
+        };
+        AppendHandoffGuard {
+            handoff: self.clone(),
+            token,
+        }
     }
 
     /// Take the filed entry, leaving the slot empty. `None` when the
     /// compaction appended nothing (it failed or was canceled).
     pub fn take(&self) -> Option<EntryRef> {
-        self.entry
+        self.state
             .lock()
             .expect("append handoff mutex poisoned")
+            .filed
             .take()
+            .map(|(_, entry)| entry)
+    }
+
+    fn clear(&self, token: u64) {
+        let mut state = self.state.lock().expect("append handoff mutex poisoned");
+        if state
+            .filed
+            .as_ref()
+            .is_some_and(|(filed_token, _)| *filed_token == token)
+        {
+            state.filed = None;
+        }
+    }
+}
+
+impl Drop for AppendHandoffGuard {
+    fn drop(&mut self) {
+        self.handoff.clear(self.token);
     }
 }
 
@@ -367,7 +418,8 @@ mod tests {
         persisting_forwarder,
     };
     use crate::log::{
-        ConversationEntry, ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter,
+        ConversationEntry, ConversationEntryKind, ConversationLog, ConversationView, EntryRef,
+        ThreadFilter,
     };
     use crate::persistence::ConversationPersistence;
     use crate::replay::TaggedEvent;
@@ -1070,7 +1122,7 @@ mod tests {
                 None,
             )
             .expect("append the compaction checkpoint");
-        handoff.file(checkpoint);
+        let _filed = handoff.file(checkpoint);
         bus.emit(AgentEvent::CompactionEnd {
             agent_id: AgentId::Main,
             reason: aj_agent::events::CompactionReason::Manual,
@@ -1189,7 +1241,7 @@ mod tests {
                 None,
             )
             .expect("append the compaction checkpoint");
-        handoff.file(earlier);
+        let _filed = handoff.file(earlier);
         bus.emit(AgentEvent::CompactionEnd {
             agent_id: AgentId::Main,
             reason: aj_agent::events::CompactionReason::Manual,
@@ -1221,6 +1273,37 @@ mod tests {
             forwarded[0].entry.is_none(),
             "a failed compaction appends nothing, so its event is not durable"
         );
+    }
+
+    #[test]
+    fn append_handoff_guard_clears_only_its_own_unconsumed_filing() {
+        let handoff = AppendHandoff::default();
+        let stale = handoff.file(EntryRef {
+            seq: 1,
+            id: "stale".into(),
+        });
+        let current = handoff.file(EntryRef {
+            seq: 2,
+            id: "current".into(),
+        });
+
+        drop(stale);
+        assert_eq!(
+            handoff.take(),
+            Some(EntryRef {
+                seq: 2,
+                id: "current".into(),
+            }),
+            "an older guard cleared a newer filing"
+        );
+        drop(current);
+
+        let canceled = handoff.file(EntryRef {
+            seq: 3,
+            id: "canceled".into(),
+        });
+        drop(canceled);
+        assert_eq!(handoff.take(), None, "canceled filing survived its owner");
     }
 
     /// A tool batch persists one entry per result, so the forwarder has to

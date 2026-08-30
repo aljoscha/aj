@@ -258,11 +258,8 @@ pub struct CanonicalAgent {
 /// coupling to [`EntryId`](crate::chat::EntryId) counters.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct CanonicalRender {
-    /// Durable assistant or checkpoint a following usage event reports on.
+    /// Durable assistant a following ordinary usage event reports on.
     pub last_usage_source: Option<String>,
-    /// Whether that source is a compaction checkpoint, whose spend must not
-    /// overwrite the footer's post-compaction context occupancy.
-    pub usage_source_is_compaction: bool,
     /// The `call_id`s that resolve to a cell.
     pub tool_calls: BTreeSet<String>,
     /// The message ids that resolve to a row.
@@ -460,7 +457,6 @@ impl CanonicalState {
                     .get(&agent)
                     .map(|render| CanonicalRender {
                         last_usage_source: render.last_usage_source().map(str::to_string),
-                        usage_source_is_compaction: render.usage_source_is_compaction(),
                         tool_calls: render.tool_index.keys().cloned().collect(),
                         messages: render.message_index.keys().cloned().collect(),
                         streaming: render.current_assistant.is_some(),

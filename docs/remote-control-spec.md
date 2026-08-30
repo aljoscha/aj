@@ -452,6 +452,13 @@ Every frame is in exactly one class:
   delivered in order or the client must be evicted (section 6.9),
   never silently dropped.
 
+  A `CompactionEnd` with recorded spend and its trailing
+  `CompactionUsageUpdate` are one stable-cohort bus sequence. The usage event
+  carries the checkpoint entry id even though it carries no durable frame tag.
+  Attach filtering may therefore remove a duplicate end and retain its trailing
+  update without making row ownership or context occupancy depend on whichever
+  durable event was reduced most recently.
+
 ### 6.5 Attach and catch-up
 
 Per session the host maintains:
@@ -1128,7 +1135,8 @@ especially with long-lived VMs. Rules:
   one string per feature with the surface it covers (an endpoint, a
   frame kind, an event type) and who advertises
   it: `archive` covers `POST /v1/sessions/{id}/archive` (section
-  6.6), and `compaction_usage` covers the `compaction_usage_update` event.
+  6.6), and `compaction_usage` covers the `compaction_usage_update` event,
+  including its checkpoint entry id.
   Both are advertised by hosts. A capability is self-description, never
   a gate: probing an endpoint (404 vs 2xx) is a valid fallback check,
   and what a peer does with the list is the peer's business. A

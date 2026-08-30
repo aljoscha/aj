@@ -484,17 +484,22 @@ changes neither).
 ### 6.3 `Agent::account_usage`
 
 Normal assistant terminals and committed compactions share one live accounting
-transition. `account_usage(delta, prerequisite)` snapshots the pre-add
-accumulator, delivers an optional prerequisite, then emits one cumulative usage
-event carrying that snapshot plus `delta`. Normal turns use `UsageUpdate`.
-Checkpoint prerequisites use the additive `CompactionUsageUpdate`, which older
-clients ignore instead of treating summarizer input as assistant context. A rejected prerequisite
-suppresses the dependent update so no listener can see checkpoint usage without
-its `CompactionEnd`. The complete `Usage` is still folded into
-`Agent::accumulated_usage` because listener failure cannot erase spend that
-already happened, and callers must not retry the operation. Compaction invokes
-it only after the checkpoint append commits and supplies the tagged
-`CompactionEnd` as the prerequisite.
+transition. It snapshots the pre-add accumulator and synchronously folds the
+complete `Usage` before awaiting any listener, so cancellation or listener
+failure cannot erase spend that already happened. Normal turns then emit
+`UsageUpdate`.
+
+Committed compactions call `account_compaction_usage` only after the checkpoint
+append succeeds. It delivers the tagged `CompactionEnd` and a
+`CompactionUsageUpdate` through one `EventBus::emit_sequence` operation. The bus
+snapshots one listener cohort and gives each listener both events in order before
+advancing to the next. An earlier successful listener therefore keeps the whole
+pair if a later listener rejects the end, and a listener registered between the
+two events does not observe half of the operation. The additive usage event also
+carries the checkpoint's durable id, so attach filtering may retain it without
+its duplicate end and current clients still update the right row. Older clients
+ignore the unknown event instead of treating summarizer input as assistant
+context.
 
 ### 6.4 Compaction events
 
@@ -521,6 +526,14 @@ CompactionEnd {
     has_usage: bool,
     summary: Option<String>,
     error: Option<String>,
+},
+
+/// Cumulative spend for one committed checkpoint. `checkpoint_id` is the
+/// durable Compaction entry this transient update reports on.
+CompactionUsageUpdate {
+    agent_id: AgentId,
+    checkpoint_id: String,
+    usage: TokenUsage,
 },
 ```
 
@@ -623,11 +636,13 @@ Steps:
 5. **Reseed**: re-linearize from the new head → `agent_messages()`
    (now compaction-aware) → `reseed_transcript(...)` on the borrowed
    agent, trimming a trailing failed assistant (below).
-6. Compute `tokens_after` (occupancy of the reseeded projection), then pass the
-   checkpoint-tagged `CompactionEnd` and `summarizer_usage` to the Agent's
-   shared accounting operation. This emits the end followed by one cumulative
-   `CompactionUsageUpdate` and updates the shutdown accumulator. A rejected end suppresses
-   only the dependent update, not the already-incurred accumulator delta.
+6. Compute `tokens_after` (occupancy of the reseeded projection), file the
+   checkpoint's append handoff under an owning guard, then pass its id, the
+   checkpoint-tagged `CompactionEnd`, and `summarizer_usage` to the Agent's
+   shared accounting operation. Accounting is folded synchronously before the
+   first listener await. One stable-cohort bus operation emits the end followed
+   by one cumulative self-identifying `CompactionUsageUpdate`. Dropping the
+   in-flight future clears an unconsumed handoff through its owner guard.
 7. Return `Compacted { tokens_before, tokens_after, summary }`.
 
 Cancellation (`cancel`) is selected against the `complete_oneshot`
@@ -828,8 +843,8 @@ renderer events so a resumed session looks like a live one. The
   is stale, so this keeps a resumed footer from showing pre-compaction
   occupancy.
 - One transient cumulative `CompactionUsageUpdate` when the checkpoint's `usage` is
-  `Some`. It carries the replay accumulator before the compaction plus the
-  checkpoint delta, then advances that accumulator. Legacy `usage: None`
+  `Some`. It carries the checkpoint entry id, the replay accumulator before the
+  compaction, and the checkpoint delta, then advances that accumulator. Legacy `usage: None`
   sets `has_usage: false` and projects no spend, so stale-cursor replay leaves
   the preceding accounted source intact.
 
@@ -841,9 +856,11 @@ projection. Replay is about what the user sees; projection is about what
 the model sees. They intentionally diverge after a compaction. The
 replay `Compaction` row marks the boundary in the scrollback.
 
-The checkpoint usage row is keyed to the durable compaction entry, not to the
-preceding assistant. Re-serving an older cursor or rebuilding from a fresh
-epoch therefore updates that row rather than duplicating it.
+The checkpoint usage row is keyed directly by the event's durable compaction id,
+not by ambient reducer state or the preceding assistant. Re-serving an older
+cursor, retaining a transient duplicate after filtering its durable end, or
+rebuilding from a fresh epoch therefore updates that row rather than duplicating
+it or overwriting later assistant usage.
 
 ## 9. Configuration
 

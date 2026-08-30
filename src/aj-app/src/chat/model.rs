@@ -382,22 +382,17 @@ impl Transcript {
     }
 }
 
-/// Durable source immediately preceding an accounted usage delta.
+/// Durable assistant source immediately preceding an ordinary usage delta.
 #[derive(Debug, Clone)]
-pub(crate) enum UsageOrigin {
-    Assistant(Option<String>),
-    Compaction(Option<String>),
-}
+pub(crate) struct UsageOrigin(Option<String>);
 
 impl UsageOrigin {
-    pub(crate) fn source_entry(&self) -> Option<&str> {
-        match self {
-            Self::Assistant(entry) | Self::Compaction(entry) => entry.as_deref(),
-        }
+    pub(crate) fn new(entry: Option<String>) -> Self {
+        Self(entry)
     }
 
-    pub(crate) fn is_compaction(&self) -> bool {
-        matches!(self, Self::Compaction(_))
+    pub(crate) fn source_entry(&self) -> Option<&str> {
+        self.0.as_deref()
     }
 }
 
@@ -405,7 +400,7 @@ impl UsageOrigin {
 /// route to the right entry inside that agent's own transcript.
 ///
 /// Three of the four fields are the agent's durable-identity state: the
-/// two indexes and the last usage origin. They outlive a turn
+/// two indexes and the last assistant usage origin. They outlive a turn
 /// so a re-applied event finds the entry it already produced instead of
 /// appending a second one. Streaming state
 /// ([`Self::current_assistant`]) is per-turn and cleared on `AgentEnd`.
@@ -431,8 +426,7 @@ pub struct AgentRender {
     /// Durable message id -> the entry it produced, covering user,
     /// finalized assistant and task-notification rows.
     pub(crate) message_index: HashMap<String, EntryId>,
-    /// Durable assistant or checkpoint source a following usage event reports
-    /// on.
+    /// Durable assistant source a following ordinary usage event reports on.
     pub(crate) last_usage_origin: Option<UsageOrigin>,
 }
 
@@ -442,12 +436,6 @@ impl AgentRender {
         self.last_usage_origin
             .as_ref()
             .and_then(UsageOrigin::source_entry)
-    }
-
-    pub(crate) fn usage_source_is_compaction(&self) -> bool {
-        self.last_usage_origin
-            .as_ref()
-            .is_some_and(UsageOrigin::is_compaction)
     }
 }
 
