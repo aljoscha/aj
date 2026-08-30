@@ -2158,13 +2158,14 @@ async fn apply_auth_request(
 }
 
 /// Tear down the login dialog when the shared cancel flag is set (the
-/// dialog's Esc/Ctrl+C flipped it). Aborts the task and folds a notice;
-/// a no-op when no login is in flight or the flag is clear.
+/// dialog's Esc/Ctrl+C flipped it). Aborts the task, waits for it to terminate,
+/// and then folds its actual outcome. A no-op when no login is in flight or the
+/// flag is clear.
 ///
 /// We take `login_session` before aborting so the completion arm (which
 /// keys off `login_session`) then sees `None` and its future pends,
 /// avoiding a double-close of the overlay.
-fn cancel_login(
+async fn cancel_login(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     app: &mut AsyncApp,
@@ -2178,12 +2179,16 @@ fn cancel_login(
     }
     let session = login_session.take().expect("login session present");
     session.handle.abort();
-    close_login_overlay(shell, app);
-    fold_notice(
-        world,
-        &format!("Login to {} cancelled.", session.provider_name),
-    );
-    app.request_redraw();
+
+    // Intentionally no timeout. `abort` stops a task at its next suspension,
+    // including while it waits for the credential lock, but cannot interrupt
+    // the synchronous read/modify/write after that lock is acquired. Returning
+    // on a deadline would detach exactly that task and allow a later credential
+    // commit after the UI had reported cancellation. The drive loop may pause
+    // behind a stuck filesystem operation here, which is preferable to stating
+    // an outcome before the commit boundary has resolved.
+    let outcome = session.handle.await;
+    complete_login(world, shell, app, session.provider_name, outcome, true);
 }
 
 /// Handle the login task completing: close the dialog, fold the outcome
@@ -2204,11 +2209,28 @@ fn finish_login(
     let Some(session) = login_session.take() else {
         return;
     };
+    complete_login(world, shell, app, session.provider_name, outcome, false);
+}
+
+/// Close the login dialog and report the task outcome after its termination
+/// barrier. A requested cancellation is reported only when abort won. A task
+/// that reached its uninterruptible credential write and completed still
+/// reports success.
+fn complete_login(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    app: &mut AsyncApp,
+    provider_name: String,
+    outcome: Result<Result<(), AuthError>, tokio::task::JoinError>,
+    cancellation_requested: bool,
+) {
     close_login_overlay(shell, app);
-    let name = session.provider_name;
     match outcome {
-        Ok(Ok(())) => fold_notice(world, &format!("Logged in to {name}.")),
-        Ok(Err(err)) => fold_warning(world, &format!("Login to {name} failed: {err}")),
+        Ok(Ok(())) => fold_notice(world, &format!("Logged in to {provider_name}.")),
+        Ok(Err(err)) => fold_warning(world, &format!("Login to {provider_name} failed: {err}")),
+        Err(join) if join.is_cancelled() && cancellation_requested => {
+            fold_notice(world, &format!("Login to {provider_name} cancelled."))
+        }
         Err(join) if join.is_cancelled() => {}
         Err(join) => fold_warning(world, &format!("Login task error: {join}")),
     }
@@ -7135,9 +7157,9 @@ async fn drive(
                             .await;
                         }
                         // Login cancellation: the dialog's Esc/Ctrl+C flipped
-                        // the shared flag. Tear the dialog down and abort the
-                        // task.
-                        cancel_login(world, shell, app, &mut login_session);
+                        // the shared flag. Abort and join before reporting which
+                        // side of the credential commit boundary won.
+                        cancel_login(world, shell, app, &mut login_session).await;
                         // A confirmed session-tag edit. Bound out of the borrow
                         // first: the command awaits on the peer.
                         let tag_edit = shell.borrow().take_tag_edit();
@@ -7750,7 +7772,11 @@ mod tests {
     use aj_app::chat::{EntryKind, NoticeLevel, SubAgentStatus, ToolStatus, reduce};
     use aj_app::session::AgentLifecycle;
     use aj_app::test_support::CanonicalState;
+    use aj_models::auth::{AuthCredential, CredentialSource};
+    use aj_models::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
+    use async_trait::async_trait;
     use tempfile::TempDir;
+    use tokio::sync::Notify;
     use vaxis::gwidth;
     use vaxis::key::{Key, Modifiers};
     use vaxis::tty::TestTty;
@@ -13211,6 +13237,85 @@ mod tests {
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "picker open");
     }
 
+    /// Whether a controlled OAuth flow yields before persistence or returns
+    /// credentials immediately.
+    enum LoginGate {
+        Waiting,
+        Immediate,
+    }
+
+    struct LoginTermination(Arc<AtomicBool>);
+
+    impl Drop for LoginTermination {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    struct ControlledOAuthProvider {
+        id: String,
+        started: Arc<Notify>,
+        terminated: Arc<AtomicBool>,
+        gate: LoginGate,
+        credentials: OAuthCredentials,
+    }
+
+    #[async_trait]
+    impl OAuthProvider for ControlledOAuthProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "Controlled OAuth"
+        }
+
+        async fn login(
+            &self,
+            _callbacks: &dyn OAuthCallbacks,
+        ) -> Result<OAuthCredentials, OAuthError> {
+            let _termination = LoginTermination(Arc::clone(&self.terminated));
+            self.started.notify_one();
+            match &self.gate {
+                LoginGate::Waiting => std::future::pending().await,
+                LoginGate::Immediate => {}
+            }
+            Ok(self.credentials.clone())
+        }
+
+        async fn refresh_token(
+            &self,
+            credentials: &OAuthCredentials,
+        ) -> Result<OAuthCredentials, OAuthError> {
+            Ok(credentials.clone())
+        }
+    }
+
+    async fn register_controlled_oauth(
+        world: &World,
+        id: &str,
+        access: &str,
+        gate: LoginGate,
+    ) -> (Arc<Notify>, Arc<AtomicBool>) {
+        let started = Arc::new(Notify::new());
+        let terminated = Arc::new(AtomicBool::new(false));
+        world
+            .auth
+            .register_oauth_provider(Arc::new(ControlledOAuthProvider {
+                id: id.to_string(),
+                started: Arc::clone(&started),
+                terminated: Arc::clone(&terminated),
+                gate,
+                credentials: OAuthCredentials::new("refresh", access, i64::MAX),
+            }))
+            .await;
+        (started, terminated)
+    }
+
+    fn stored_auth_bytes(auth: &AuthStorage) -> Option<Vec<u8>> {
+        std::fs::read(auth.path()).ok()
+    }
+
     /// `/logout` with nothing stored folds an explanatory notice instead
     /// of opening an empty picker.
     #[tokio::test]
@@ -13235,9 +13340,6 @@ mod tests {
     /// notice.
     #[tokio::test]
     async fn logout_removes_stored_credential_and_notes_it() {
-        use aj_models::auth::AuthCredential;
-        use aj_models::oauth::OAuthCredentials;
-
         let dir = TempDir::new().expect("tempdir");
         let (mut app, _writer, mut world, shell, _root) =
             init_app_with_world(&dir, "streaming-text").await;
@@ -13388,13 +13490,18 @@ mod tests {
         );
     }
 
-    /// The cancel-poll aborts the task, closes the dialog, and folds the
-    /// cancelled notice when the dialog flips the shared flag.
+    /// Cancellation while OAuth is suspended wins before the first credential
+    /// insertion. The termination witness is checked before any post-return
+    /// await, so abort without the join barrier cannot pass accidentally.
     #[tokio::test]
-    async fn cancel_login_aborts_closes_and_notes() {
+    async fn cancel_login_before_first_commit_preserves_store_and_resolver() {
         let dir = TempDir::new().expect("tempdir");
         let (mut app, _writer, mut world, shell, _root) =
             init_app_with_world(&dir, "streaming-text").await;
+        let provider_id = "cancel-first";
+        let (started, terminated) =
+            register_controlled_oauth(&world, provider_id, "new-access", LoginGate::Waiting).await;
+        let before = stored_auth_bytes(&world.auth);
 
         let (tx, _rx) = unbounded_channel();
         let mut login_session = None;
@@ -13404,26 +13511,154 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            "anthropic".to_string(),
-            "Anthropic".to_string(),
+            provider_id.to_string(),
+            "Controlled OAuth".to_string(),
         );
-        // The dialog would flip this on Esc/Ctrl+C.
+        started.notified().await;
         login_session
             .as_ref()
-            .unwrap()
+            .expect("login tracked")
             .cancel
             .store(true, Ordering::Relaxed);
 
-        cancel_login(&mut world, &shell, &mut app, &mut login_session);
-        assert!(login_session.is_none(), "session cleared");
-        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            cancel_login(&mut world, &shell, &mut app, &mut login_session),
+        )
+        .await
+        .expect("abort and termination barrier complete");
         assert!(
-            main_notices(&world)
-                .iter()
-                .any(|n| n.contains("Login to Anthropic cancelled")),
-            "{:?}",
-            main_notices(&world)
+            terminated.load(Ordering::Relaxed),
+            "cancel returned before the OAuth task was destroyed"
         );
+        assert!(login_session.is_none(), "cancelled session cleared");
+
+        assert_eq!(stored_auth_bytes(&world.auth), before, "auth.json changed");
+        assert!(
+            world
+                .auth
+                .get_api_key(provider_id, None)
+                .await
+                .expect("resolve after cancellation")
+                .is_none(),
+            "cancelled first login became the resolver winner"
+        );
+        let notices = main_notices(&world);
+        assert!(
+            notices
+                .last()
+                .is_some_and(|notice| notice == "Login to Controlled OAuth cancelled."),
+            "cancel outcome: {notices:?}"
+        );
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
+    }
+
+    /// Cancellation processed after reactivation committed joins the completed
+    /// task and reports success rather than contradicting the resolver winner.
+    #[tokio::test]
+    async fn cancel_login_after_reactivation_commit_reports_success() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, _writer, mut world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        let provider_id = "cancel-reactivate";
+        let account = "work";
+        let (started, _terminated) =
+            register_controlled_oauth(&world, provider_id, "new-access", LoginGate::Immediate)
+                .await;
+        world
+            .auth
+            .set_account(
+                provider_id,
+                account,
+                AuthCredential::OAuth(OAuthCredentials::new("old-refresh", "old-access", i64::MAX)),
+            )
+            .await
+            .expect("seed existing account");
+        let before = stored_auth_bytes(&world.auth).expect("seeded auth.json");
+        let resolved_before = world
+            .auth
+            .get_api_key(provider_id, None)
+            .await
+            .expect("resolve old default")
+            .expect("old default present");
+        assert_eq!(resolved_before.key, "old-access", "fixture old winner");
+        assert_eq!(
+            resolved_before.source,
+            CredentialSource::Account(account.to_string()),
+            "fixture default account"
+        );
+
+        let (tx, _rx) = unbounded_channel();
+        let mut login_session = None;
+        start_login(
+            &world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            provider_id.to_string(),
+            "Controlled OAuth".to_string(),
+        );
+        started.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !login_session
+                .as_ref()
+                .expect("login tracked")
+                .handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reactivation task finishes");
+        let committed = world
+            .auth
+            .get_api_key(provider_id, None)
+            .await
+            .expect("resolve committed default")
+            .expect("committed default present");
+        assert_eq!(committed.key, "new-access", "commit precondition");
+        assert_eq!(
+            committed.source,
+            CredentialSource::Account(account.to_string()),
+            "commit stayed in the selected default slot"
+        );
+        login_session
+            .as_ref()
+            .expect("login tracked")
+            .cancel
+            .store(true, Ordering::Relaxed);
+
+        cancel_login(&mut world, &shell, &mut app, &mut login_session).await;
+        assert!(login_session.is_none(), "completed session cleared");
+
+        let after = stored_auth_bytes(&world.auth).expect("reactivated auth.json");
+        assert_ne!(after, before, "reactivation never committed");
+        let resolved_after = world
+            .auth
+            .get_api_key(provider_id, None)
+            .await
+            .expect("resolve reactivated default")
+            .expect("reactivated default present");
+        assert_eq!(resolved_after.key, "new-access", "new resolver winner");
+        assert_eq!(
+            resolved_after.source,
+            CredentialSource::Account(account.to_string()),
+            "reactivation kept the exact default slot"
+        );
+        let notices = main_notices(&world);
+        assert!(
+            notices
+                .last()
+                .is_some_and(|notice| notice == "Logged in to Controlled OAuth."),
+            "committed outcome: {notices:?}"
+        );
+        assert!(
+            notices.iter().all(|notice| !notice.contains("cancelled")),
+            "committed login also reported cancellation: {notices:?}"
+        );
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
     }
 
     /// Confirming session info opens a "Loading…" overlay and parks a
