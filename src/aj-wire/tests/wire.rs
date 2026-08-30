@@ -1564,11 +1564,16 @@ fn message_end_decodes_the_account_and_old_frames_without_it() {
         let Some(aj_models::types::Message::Assistant(message)) = message.as_stored_wire() else {
             panic!("expected assistant message");
         };
-        (message.account.clone(), message.usage.incomplete)
+        (
+            message.account.clone(),
+            message.usage.incomplete,
+            message.usage.input,
+            message.usage.total_tokens,
+        )
     };
 
-    let labeled = r#"{"kind":"event","session":"session-1","epoch":"epoch-1","seq":1,"entry_id":"entry-1","event":{"type":"message_end","agent_id":"main","message":{"role":"assistant","content":[],"api":"scripted","provider":"anthropic","model":"claude-test","account":"work","usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"total_tokens":0,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0},"incomplete":true},"stop_reason":"Stop","timestamp":10}}}"#;
-    assert_eq!(decode(labeled), (Some("work".to_string()), true));
+    let labeled = r#"{"kind":"event","session":"session-1","epoch":"epoch-1","seq":1,"entry_id":"entry-1","event":{"type":"message_end","agent_id":"main","message":{"role":"assistant","content":[],"api":"scripted","provider":"anthropic","model":"claude-test","account":"work","usage":{"input":12,"output":3,"cache_read":0,"cache_write":0,"total_tokens":15,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0},"incomplete":true},"stop_reason":"Stop","timestamp":10}}}"#;
+    assert_eq!(decode(labeled), (Some("work".to_string()), true, 12, 15));
     let mut gateway_frame: DecodedFrame = serde_json::from_str(labeled).unwrap();
     assert!(gateway_frame.rewrite_session("gateway/session-1").unwrap());
     let gateway_json = serde_json::to_value(gateway_frame).unwrap();
@@ -1580,8 +1585,8 @@ fn message_end_decodes_the_account_and_old_frames_without_it() {
 
     // A literal old frame, not a value built by today's serializer.
     // Only this direction proves a pre-account peer still decodes.
-    let old = r#"{"kind":"event","session":"session-1","epoch":"epoch-1","seq":1,"entry_id":"entry-1","event":{"type":"message_end","agent_id":"main","message":{"role":"assistant","content":[],"api":"scripted","provider":"anthropic","model":"claude-test","usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"total_tokens":0,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0}},"stop_reason":"Stop","timestamp":10}}}"#;
-    assert_eq!(decode(old), (None, false));
+    let old = r#"{"kind":"event","session":"session-1","epoch":"epoch-1","seq":1,"entry_id":"entry-1","event":{"type":"message_end","agent_id":"main","message":{"role":"assistant","content":[],"api":"scripted","provider":"anthropic","model":"claude-test","usage":{"input":12,"output":3,"cache_read":0,"cache_write":0,"total_tokens":15,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0}},"stop_reason":"Stop","timestamp":10}}}"#;
+    assert_eq!(decode(old), (None, false, 12, 15));
 }
 
 #[test]
