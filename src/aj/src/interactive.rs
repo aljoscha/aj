@@ -13553,6 +13553,81 @@ mod tests {
         assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
     }
 
+    /// Esc reaches the same abort-and-join barrier through the drive loop. The
+    /// provider's drop witness makes removing the call site observable before
+    /// any post-drive await can let an otherwise detached task terminate.
+    #[tokio::test]
+    async fn drive_loop_esc_joins_login_before_reporting_cancellation() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        let provider_id = "drive-cancel";
+        let (started, terminated) =
+            register_controlled_oauth(&world, provider_id, "new-access", LoginGate::Waiting).await;
+        let before = stored_auth_bytes(&world.auth);
+        *shell.borrow().auth_request.borrow_mut() = Some(AuthPickerRequest::Login {
+            provider_id: provider_id.to_string(),
+            provider_name: "Controlled OAuth".to_string(),
+        });
+
+        // One ordinary key gives the input arm a turn to drain the parked login
+        // request. The provider witness then releases Esc and EOF only after the
+        // real task is waiting and the dialog has synchronously taken focus.
+        writer.write_all(b"x").expect("trigger auth request drain");
+        let cancel_input = tokio::spawn(async move {
+            started.notified().await;
+            writer.write_all(b"\x1b").expect("cancel login");
+            drop(writer);
+        });
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let exit = tokio::time::timeout(
+            Duration::from_secs(2),
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await
+        .expect("drive processes login cancellation")
+        .expect("drive exits without a fatal error");
+
+        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
+        assert!(
+            terminated.load(Ordering::Relaxed),
+            "drive returned before the login task was destroyed"
+        );
+        cancel_input.await.expect("cancel input task");
+        assert_eq!(stored_auth_bytes(&world.auth), before, "auth.json changed");
+        assert!(
+            world
+                .auth
+                .get_api_key(provider_id, None)
+                .await
+                .expect("resolve after drive cancellation")
+                .is_none(),
+            "drive cancellation installed a resolver winner"
+        );
+        let notices = main_notices(&world);
+        assert!(
+            notices
+                .last()
+                .is_some_and(|notice| notice == "Login to Controlled OAuth cancelled."),
+            "drive cancellation outcome: {notices:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .all(|notice| !notice.contains("Logged in to Controlled OAuth")),
+            "drive cancellation also reported success: {notices:?}"
+        );
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
+    }
+
     /// Cancellation processed after reactivation committed joins the completed
     /// task and reports success rather than contradicting the resolver winner.
     #[tokio::test]
