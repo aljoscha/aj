@@ -268,15 +268,15 @@ pub struct TurnUsageEntry {
     pub agent_id: AgentId,
     pub usage: TokenUsage,
     /// The durable assistant message or compaction checkpoint this row reports
-    /// on. Live accounting and log projection both emit `UsageUpdate` after
-    /// that source, so a re-applied update overwrites the row instead of adding
-    /// one. `None` for an update without identified durable ownership, which
-    /// stays append-only.
+    /// on. Live accounting and log projection both emit the matching usage
+    /// event after that source, so a re-applied update overwrites the row instead
+    /// of adding one. `None` for an update without identified durable ownership,
+    /// which stays append-only.
     pub source_entry: Option<String>,
 }
 
 impl TurnUsageEntry {
-    /// Render the `Token Usage - ...` line for this turn. Sub-agents
+    /// Render the `Token Usage - ...` line for this delta. Sub-agents
     /// get a leading `(sub agent N)` tag so their per-turn counts stay
     /// distinguishable in a shared scrollback.
     pub fn line(&self) -> String {
@@ -284,11 +284,11 @@ impl TurnUsageEntry {
     }
 }
 
-/// Render the `Token Usage - ...` line for a single `UsageUpdate`.
+/// Render the `Token Usage - ...` line for one usage event.
 fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
-    // `format_tokens` renders the accumulated total bare when the turn
+    // `format_tokens` renders the accumulated total bare when the operation
     // contributed nothing (e.g. a cached read of an existing tool
-    // result), or `acc+turn` so the per-turn delta is visible at a
+    // result), or `acc+turn` so the operation's delta is visible at a
     // glance.
     let format_tokens = |acc: u64, turn: u64| -> String {
         if turn == 0 {
@@ -431,8 +431,8 @@ pub struct AgentRender {
     /// Durable message id -> the entry it produced, covering user,
     /// finalized assistant and task-notification rows.
     pub(crate) message_index: HashMap<String, EntryId>,
-    /// Durable assistant or checkpoint source a following `UsageUpdate`
-    /// reports on.
+    /// Durable assistant or checkpoint source a following usage event reports
+    /// on.
     pub(crate) last_usage_origin: Option<UsageOrigin>,
 }
 
@@ -990,8 +990,8 @@ impl ChatState {
     /// finished box for a live sub and dropping it would orphan the child
     /// transcript. The host is authoritative for concluding sub boxes.
     ///
-    /// Deliberately kept: `last_usage_origin`. It anchors the trailing
-    /// `UsageUpdate` of a re-served assistant or compaction entry, whose
+    /// Deliberately kept: `last_usage_origin`. It anchors the trailing usage
+    /// event of a re-served assistant or compaction entry, whose
     /// own durable frame the cursor invariant drops, so clearing it would
     /// grow a second usage row on every re-attach.
     ///

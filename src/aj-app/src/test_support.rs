@@ -258,7 +258,7 @@ pub struct CanonicalAgent {
 /// coupling to [`EntryId`](crate::chat::EntryId) counters.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct CanonicalRender {
-    /// Durable assistant or checkpoint a following `UsageUpdate` reports on.
+    /// Durable assistant or checkpoint a following usage event reports on.
     pub last_usage_source: Option<String>,
     /// Whether that source is a compaction checkpoint, whose spend must not
     /// overwrite the footer's post-compaction context occupancy.
