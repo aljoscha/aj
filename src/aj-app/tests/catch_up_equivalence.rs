@@ -464,9 +464,7 @@ async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
             .entries
             .iter()
             .filter_map(|entry| match entry {
-                CanonicalEntry::TurnUsage {
-                    after_message_id, ..
-                } => Some(after_message_id.clone()),
+                CanonicalEntry::TurnUsage { source_entry, .. } => Some(source_entry.clone()),
                 _ => None,
             })
             .collect()

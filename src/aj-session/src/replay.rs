@@ -60,11 +60,12 @@
 //!   log-level creation metadata, not a state transition on any thread.
 //! - [`ConversationEntryKind::SubAgentSpawn`]: no notice; the entry
 //!   feeds the sub-agent bracketing below.
-//! - [`ConversationEntryKind::Compaction`]: a single
-//!   [`AgentEvent::CompactionEnd`] marking the boundary, mirroring the
-//!   live path so the footer occupancy drops to the reduced size (no
-//!   `UsageUpdate` follows a compaction, and the retained tail's usage is
-//!   stale). The summarized prefix entries still replay in order, so
+//! - [`ConversationEntryKind::Compaction`]: an
+//!   [`AgentEvent::CompactionEnd`] marking the boundary, followed by a
+//!   checkpoint usage update when the entry records summarizer spend. This
+//!   mirrors the live path while keeping the footer occupancy at the reduced
+//!   size. The retained tail's assistant usage is stale. The summarized prefix
+//!   entries still replay in order, so
 //!   the scrollback shows the full history even though the model
 //!   context (rebuilt via `agent_messages`) is the reduced projection.
 //!
@@ -572,9 +573,9 @@ struct ReplayState {
     /// Per-agent accumulated [`Usage`] running totals, used to
     /// build the `accumulated_*` fields on synthesized
     /// [`AgentEvent::UsageUpdate`] events. The map starts empty and
-    /// grows on demand the first time we see an assistant message
-    /// for an [`AgentId`]; the value stored at `agent_id` is the
-    /// accumulator *as observed before* the next turn is emitted,
+    /// grows on demand the first time we see accounted usage for an
+    /// [`AgentId`]; the value stored at `agent_id` is the
+    /// accumulator *as observed before* the next delta is emitted,
     /// matching the live agent's event order (see
     /// `aj_agent::Agent::prompt`: `UsageUpdate` carries the
     /// pre-add total, and the per-turn delta is added afterwards).
@@ -931,17 +932,16 @@ impl ReplayState {
             ConversationEntryKind::Compaction {
                 tokens_before,
                 summary,
+                usage,
                 ..
             } => {
-                // Mirror the live path: a compaction reduces context
-                // but emits no `UsageUpdate`, and the retained tail's
-                // assistant `usage` is stale, so the footer would keep
-                // showing the pre-compaction occupancy without this.
-                // `tokens_after` is the occupancy of the reduced
-                // projection as of this boundary. The summary is the
-                // durable on-disk record, so we carry it through here
-                // to paint the same collapsible compaction-summary row
-                // a live run shows.
+                // Mirror the live path: `CompactionEnd` first establishes the
+                // checkpoint row and reduced context occupancy, then the
+                // checkpoint's usage advances cumulative spend without being
+                // mistaken for model-context occupancy. The retained tail's
+                // assistant usage is stale. The summary is the durable on-disk
+                // record, so we carry it through to paint the same collapsible
+                // row a live run shows.
                 let Some(log) = log else {
                     // Only single-thread projection passes `None`, and a
                     // sub-agent thread never carries a `Compaction`
@@ -966,6 +966,9 @@ impl ReplayState {
                         error: None,
                     },
                 ));
+                if let Some(usage) = usage {
+                    self.project_usage(agent_id, usage, out);
+                }
             }
             ConversationEntryKind::Message { message: agent_msg } => {
                 self.seen_message.insert(agent_id);
@@ -1068,6 +1071,26 @@ impl ReplayState {
         }
     }
 
+    /// Emit one usage delta against this projection's pre-add accumulator,
+    /// then fold it for the next event. Live accounting uses the same order.
+    fn project_usage(&mut self, agent_id: AgentId, delta: &Usage, out: &mut VecDeque<TaggedEvent>) {
+        let accumulated = self.usage_accumulators.entry(agent_id).or_default();
+        let usage = TokenUsage {
+            accumulated_input: accumulated.input,
+            turn_input: delta.input,
+            accumulated_output: accumulated.output,
+            turn_output: delta.output,
+            accumulated_cache_write: accumulated.cache_write,
+            turn_cache_write: delta.cache_write,
+            accumulated_cache_read: accumulated.cache_read,
+            turn_cache_read: delta.cache_read,
+            turn_incomplete: delta.incomplete,
+            accumulated_incomplete: accumulated.incomplete,
+        };
+        out.push_back(transient(AgentEvent::UsageUpdate { agent_id, usage }));
+        accumulated.accumulate(delta);
+    }
+
     /// Project an assistant-role message into a `MessageStart`
     /// (with an empty placeholder so renderers can open the slot)
     /// followed by a `MessageEnd` carrying the finalized message.
@@ -1142,24 +1165,7 @@ impl ReplayState {
         // and "reported zero" are the same state, and skipping on zero
         // would drop a `UsageUpdate` the live path did emit.
         if assistant.stop_reason.completed() {
-            let acc = self.usage_accumulators.entry(agent_id).or_default();
-            let turn_usage = TokenUsage {
-                accumulated_input: acc.input,
-                turn_input: assistant.usage.input,
-                accumulated_output: acc.output,
-                turn_output: assistant.usage.output,
-                accumulated_cache_write: acc.cache_write,
-                turn_cache_write: assistant.usage.cache_write,
-                accumulated_cache_read: acc.cache_read,
-                turn_cache_read: assistant.usage.cache_read,
-                turn_incomplete: assistant.usage.incomplete,
-                accumulated_incomplete: acc.incomplete,
-            };
-            out.push_back(transient(AgentEvent::UsageUpdate {
-                agent_id,
-                usage: turn_usage,
-            }));
-            acc.accumulate(&assistant.usage);
+            self.project_usage(agent_id, &assistant.usage, out);
         }
 
         // Track tool_call blocks so subsequent tool_result entries
@@ -2493,13 +2499,11 @@ mod tests {
         assert!(second.accumulated_incomplete);
     }
 
-    /// A `Compaction` entry replays as a `CompactionEnd` whose
-    /// `tokens_after` reflects the reduced projection — not the
-    /// retained tail's stale pre-compaction usage. This is what keeps a
-    /// resumed compacted session from showing the old occupancy in the
-    /// footer.
+    /// A `Compaction` entry replays its reduced occupancy and only projects
+    /// usage when the checkpoint records it. A legacy `None` stays unknown;
+    /// the following priced checkpoint advances the pre-add accumulator once.
     #[test]
-    fn replay_compaction_emits_compaction_end_with_reduced_after() {
+    fn replay_compaction_projects_reduced_occupancy_and_recorded_usage() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -2536,13 +2540,29 @@ mod tests {
         };
         log.append_compaction(
             ThreadFilter::USER,
-            "SUMMARY".into(),
-            first_kept,
+            "LEGACY SUMMARY".into(),
+            first_kept.clone(),
             100_000,
             None,
             None,
         )
-        .expect("append compaction");
+        .expect("append legacy compaction");
+        log.append_compaction(
+            ThreadFilter::USER,
+            "PRICED SUMMARY".into(),
+            first_kept,
+            50_000,
+            None,
+            Some(Usage {
+                input: 7,
+                output: 11,
+                cache_write: 13,
+                cache_read: 17,
+                total_tokens: 48,
+                ..Usage::default()
+            }),
+        )
+        .expect("append priced compaction");
 
         let events: Vec<AgentEvent> = replay(&log).collect();
 
@@ -2565,17 +2585,36 @@ mod tests {
                 } => {
                     // The durable on-disk summary is carried through so a
                     // resumed session paints the same collapsible row.
-                    assert_eq!(summary.as_deref(), Some("SUMMARY"));
+                    assert_eq!(summary.as_deref(), Some("PRICED SUMMARY"));
                     Some((*tokens_before, *tokens_after))
                 }
                 _ => None,
             })
             .expect("a CompactionEnd event");
-        assert_eq!(before, 100_000);
+        assert_eq!(before, 50_000);
         assert!(
             after < 10_000,
             "tokens_after should drop below the stale 100k anchor, got {after}"
         );
+        let updates: Vec<&TokenUsage> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::UsageUpdate { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            updates.len(),
+            3,
+            "two assistants plus only the priced checkpoint"
+        );
+        let checkpoint = updates.last().expect("checkpoint usage");
+        assert_eq!(checkpoint.accumulated_input, 200_000);
+        assert_eq!(checkpoint.accumulated_output, 20);
+        assert_eq!(checkpoint.turn_input, 7);
+        assert_eq!(checkpoint.turn_output, 11);
+        assert_eq!(checkpoint.turn_cache_write, 13);
+        assert_eq!(checkpoint.turn_cache_read, 17);
     }
 
     /// Main and sub-agent assistants keep independent

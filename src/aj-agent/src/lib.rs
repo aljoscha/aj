@@ -559,6 +559,40 @@ impl Agent {
         self.session_state.accumulated_usage()
     }
 
+    /// Account for one successful priced operation in this agent's live total.
+    ///
+    /// The emitted [`AgentEvent::UsageUpdate`] carries the accumulator snapshot
+    /// from before `delta`, matching the event shape used by assistant turns.
+    /// After delivery is attempted, `delta` is folded into
+    /// [`Agent::accumulated_usage`] even if a listener rejects the event: the
+    /// spend already happened and callers must not retry it. Callers that also
+    /// persist the operation must invoke this only after its durable record
+    /// commits.
+    pub async fn account_usage(&self, delta: &Usage) -> Result<(), TurnError> {
+        let accumulated = self.session_state.accumulated_usage();
+        let usage = TokenUsage {
+            accumulated_input: accumulated.input,
+            turn_input: delta.input,
+            accumulated_output: accumulated.output,
+            turn_output: delta.output,
+            accumulated_cache_write: accumulated.cache_write,
+            turn_cache_write: delta.cache_write,
+            accumulated_cache_read: accumulated.cache_read,
+            turn_cache_read: delta.cache_read,
+            turn_incomplete: delta.incomplete,
+            accumulated_incomplete: accumulated.incomplete,
+        };
+        let delivered = self
+            .bus
+            .emit(AgentEvent::UsageUpdate {
+                agent_id: self.agent_id,
+                usage,
+            })
+            .await;
+        self.session_state.accumulate_usage(delta);
+        delivered.map_err(TurnError::Fatal)
+    }
+
     /// Snapshot of the per-sub-agent accumulated [`Usage`] map. The
     /// binary uses this to compute the end-of-session usage summary
     /// (the agent does not render one — the binary owns
@@ -1503,28 +1537,7 @@ impl Agent {
             self.transcript
                 .push(AgentMessage::wire(Message::Assistant(response.clone())));
 
-            let accumulated = self.session_state.accumulated_usage();
-            let usage = TokenUsage {
-                accumulated_input: accumulated.input,
-                turn_input: turn_usage.input,
-                accumulated_output: accumulated.output,
-                turn_output: turn_usage.output,
-                accumulated_cache_write: accumulated.cache_write,
-                turn_cache_write: turn_usage.cache_write,
-                accumulated_cache_read: accumulated.cache_read,
-                turn_cache_read: turn_usage.cache_read,
-                turn_incomplete: turn_usage.incomplete,
-                accumulated_incomplete: accumulated.incomplete,
-            };
-            self.bus
-                .emit(AgentEvent::UsageUpdate {
-                    agent_id: self.agent_id,
-                    usage,
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
-
-            self.session_state.accumulate_usage(&turn_usage);
+            self.account_usage(&turn_usage).await?;
 
             // Execute tool calls if any
             if has_tool_use {
@@ -4043,7 +4056,7 @@ mod event_protocol_tests {
     use aj_models::streaming::{AssistantMessageEvent, DoneReason};
     use aj_models::types::{
         AssistantContent, AssistantMessage, Message, StopReason, StreamOptions, TextContent,
-        ToolCall, UserMessage,
+        ToolCall, Usage, UsageCost, UserMessage,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -4594,6 +4607,145 @@ mod event_protocol_tests {
             }
             other => panic!("expected user message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn complete_oneshot_is_bus_transcript_and_accumulator_silent() {
+        let mut response = finalize_text("summary");
+        response.usage = Usage {
+            input: 10,
+            output: 20,
+            cache_write: 30,
+            cache_read: 40,
+            total_tokens: 100,
+            cost: UsageCost::default(),
+        };
+        let agent = build_agent(vec![finalize_script(response)], Vec::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        let _subscription = agent.subscribe(listener_from_sync(move |event| {
+            recorded.lock().unwrap().push(label(event));
+        }));
+
+        let result = agent
+            .complete_oneshot(
+                "summarize",
+                "the conversation".to_string(),
+                1_000,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("one-shot response");
+
+        assert_eq!(result.usage.input, 10);
+        assert_eq!(result.usage.output, 20);
+        assert_eq!(result.usage.cache_write, 30);
+        assert_eq!(result.usage.cache_read, 40);
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "one-shot emitted an event"
+        );
+        assert!(
+            agent.messages().is_empty(),
+            "one-shot changed the transcript"
+        );
+        let accumulated = agent.accumulated_usage();
+        assert_eq!(accumulated.total_tokens, 0, "one-shot changed accounting");
+    }
+
+    #[tokio::test]
+    async fn account_usage_emits_pre_add_snapshots_and_accumulates_every_dimension() {
+        let agent = build_agent(Vec::new(), Vec::new());
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&updates);
+        let _subscription = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::UsageUpdate { usage, .. } = event {
+                recorded.lock().unwrap().push(usage.clone());
+            }
+        }));
+        let first = Usage {
+            input: 1,
+            output: 2,
+            cache_write: 3,
+            cache_read: 4,
+            total_tokens: 10,
+            cost: UsageCost {
+                total: 0.5,
+                ..UsageCost::default()
+            },
+        };
+        let second = Usage {
+            input: 10,
+            output: 20,
+            cache_write: 30,
+            cache_read: 40,
+            total_tokens: 100,
+            cost: UsageCost {
+                total: 1.5,
+                ..UsageCost::default()
+            },
+        };
+
+        agent.account_usage(&first).await.expect("first accounting");
+        agent
+            .account_usage(&second)
+            .await
+            .expect("second accounting");
+
+        let updates = updates.lock().unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].accumulated_input, 0);
+        assert_eq!(updates[0].turn_input, 1);
+        assert_eq!(updates[1].accumulated_input, 1);
+        assert_eq!(updates[1].turn_input, 10);
+        assert_eq!(updates[1].accumulated_output, 2);
+        assert_eq!(updates[1].turn_output, 20);
+        assert_eq!(updates[1].accumulated_cache_write, 3);
+        assert_eq!(updates[1].turn_cache_write, 30);
+        assert_eq!(updates[1].accumulated_cache_read, 4);
+        assert_eq!(updates[1].turn_cache_read, 40);
+        drop(updates);
+
+        let accumulated = agent.accumulated_usage();
+        assert_eq!(accumulated.input, 11);
+        assert_eq!(accumulated.output, 22);
+        assert_eq!(accumulated.cache_write, 33);
+        assert_eq!(accumulated.cache_read, 44);
+        assert_eq!(accumulated.total_tokens, 110);
+        assert!((accumulated.cost.total - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn account_usage_keeps_spend_when_event_delivery_fails() {
+        let agent = build_agent(Vec::new(), Vec::new());
+        let _subscription = agent.subscribe(Arc::new(|_| {
+            Box::pin(async { Err(crate::BoxError::from("injected usage listener failure")) })
+        }));
+        let delta = Usage {
+            input: 7,
+            output: 11,
+            cache_write: 13,
+            cache_read: 17,
+            total_tokens: 48,
+            cost: UsageCost {
+                total: 0.25,
+                ..UsageCost::default()
+            },
+        };
+
+        let error = agent
+            .account_usage(&delta)
+            .await
+            .expect_err("listener failure remains fatal");
+
+        assert!(matches!(error, crate::TurnError::Fatal(_)));
+        let accumulated = agent.accumulated_usage();
+        assert_eq!(accumulated.input, 7);
+        assert_eq!(accumulated.output, 11);
+        assert_eq!(accumulated.cache_write, 13);
+        assert_eq!(accumulated.cache_read, 17);
+        assert_eq!(accumulated.total_tokens, 48);
+        assert!((accumulated.cost.total - 0.25).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

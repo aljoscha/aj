@@ -3,23 +3,23 @@
 //! [`TokenUsage`], [`SubAgentUsage`], and [`UsageSummary`] are
 //! structured token-count snapshots the renderer formats.
 //! [`TokenUsage`] rides on [`crate::events::AgentEvent::UsageUpdate`]
-//! at the end of every assistant turn; the summary types are
+//! after every accounted assistant turn or out-of-band operation; the summary types are
 //! synthesized by the binary at end-of-session.
 
 use serde::{Deserialize, Serialize};
 
-/// Per-turn token-usage snapshot suitable for an at-a-glance
-/// renderer. Carries both turn-local and accumulated counts so the
+/// Per-operation token-usage snapshot suitable for an at-a-glance
+/// renderer. Carries both operation-local and accumulated counts so the
 /// caller doesn't need to subtract.
 ///
 /// The accumulator semantics match what the agent maintains in
-/// [`crate::Agent::accumulated_usage`]: every successful turn adds
-/// its [`aj_models::types::Usage`] into the accumulator. The
+/// [`crate::Agent::accumulated_usage`]: every successful accounted operation
+/// adds its [`aj_models::types::Usage`] into the accumulator. The
 /// snapshot here is taken *before* that add, so `accumulated_*`
-/// reflects the running total **observed before this turn was
+/// reflects the running total **observed before this operation was
 /// folded in**. Together with `turn_*`, a single event answers the
-/// question "what was there before, and what is this turn adding"
-/// — the running total after the turn is exactly
+/// question "what was there before, and what is this operation adding"
+/// — the running total afterwards is exactly
 /// `accumulated_* + turn_*`. Field names mirror the unified usage
 /// shape (`input`, `output`, `cache_read`, `cache_write`).
 ///

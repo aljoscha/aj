@@ -371,10 +371,10 @@ pub enum AgentEvent {
         error: String,
     },
 
-    /// Cumulative token-usage snapshot, emitted once at the end of
-    /// each assistant turn. The [`TokenUsage`] payload carries both
-    /// this turn's delta (`turn_*`) and the session running totals
-    /// (`accumulated_*`, which the agent maintains across turns), so a
+    /// Cumulative token-usage snapshot, emitted once for each accounted
+    /// assistant turn or committed out-of-band operation. The [`TokenUsage`]
+    /// payload carries both this operation's delta (`turn_*`) and the running totals
+    /// (`accumulated_*`, which the agent maintains across operations), so a
     /// renderer can show a usage indicator without re-aggregating from
     /// [`AgentEvent::MessageEnd`] payloads. Distinct from
     /// [`AgentEvent::TurnEnd`]: that closes a turn's lifecycle and

@@ -258,8 +258,11 @@ pub struct CanonicalAgent {
 /// coupling to [`EntryId`](crate::chat::EntryId) counters.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct CanonicalRender {
-    /// The message a following `UsageUpdate` reports on.
-    pub last_finalized_assistant: Option<String>,
+    /// Durable assistant or checkpoint a following `UsageUpdate` reports on.
+    pub last_usage_source: Option<String>,
+    /// Whether that source is a compaction checkpoint, whose spend must not
+    /// overwrite the footer's post-compaction context occupancy.
+    pub usage_source_is_compaction: bool,
     /// The `call_id`s that resolve to a cell.
     pub tool_calls: BTreeSet<String>,
     /// The message ids that resolve to a row.
@@ -358,7 +361,7 @@ pub enum CanonicalEntry {
     },
     TurnUsage {
         agent: AgentId,
-        after_message_id: Option<String>,
+        source_entry: Option<String>,
         usage: Value,
     },
     TaskNotification {
@@ -456,7 +459,14 @@ impl CanonicalState {
                     .render
                     .get(&agent)
                     .map(|render| CanonicalRender {
-                        last_finalized_assistant: render.last_finalized_assistant.clone(),
+                        last_usage_source: render
+                            .last_usage_origin
+                            .as_ref()
+                            .and_then(|origin| origin.source_entry().map(str::to_string)),
+                        usage_source_is_compaction: render
+                            .last_usage_origin
+                            .as_ref()
+                            .is_some_and(crate::chat::UsageOrigin::is_compaction),
                         tool_calls: render.tool_index.keys().cloned().collect(),
                         messages: render.message_index.keys().cloned().collect(),
                         streaming: render.current_assistant.is_some(),
@@ -746,7 +756,7 @@ fn canonical_entry(entry: &Entry) -> CanonicalEntry {
         },
         EntryKind::TurnUsage(u) => CanonicalEntry::TurnUsage {
             agent: u.agent_id,
-            after_message_id: u.after_message_id.clone(),
+            source_entry: u.source_entry.clone(),
             usage: json(&u.usage),
         },
         EntryKind::TaskNotification(n) => CanonicalEntry::TaskNotification {

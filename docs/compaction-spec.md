@@ -117,6 +117,10 @@ Compaction {
     /// when extraction found nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     details: Option<CompactionDetails>,
+    /// Priced usage summed across the successful summarizer calls. `None` on
+    /// legacy checkpoints means unknown spend, not zero spend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
 },
 ```
 
@@ -214,7 +218,8 @@ pub fn append_compaction(
     first_kept_entry_id: EntryId,
     tokens_before: u64,
     details: Option<CompactionDetails>,
-) -> Result<EntryId, ConversationError>;
+    usage: Option<Usage>,
+) -> Result<EntryRef, ConversationError>;
 ```
 
 It anchors at `latest_leaf(filter)` (falling back to the system-prompt
@@ -418,14 +423,14 @@ It does **not** call the model — summary generation is the host's job
 
 ## 6. Agent runtime additions (`aj-agent`)
 
-The agent gains two generic mechanisms and two events. Nothing
+The agent gains three generic mechanisms and two events. Nothing
 compaction-specific (no prompts, no thresholds) lives in `aj-agent`.
 
 ### 6.1 `Agent::complete_oneshot`
 
 ```rust
 /// Run a single, bus-silent completion against the agent's provider and
-/// return the concatenated assistant text. Does not touch the
+/// return the complete priced assistant message. Does not touch the
 /// transcript, emits no `Message*` / `UsageUpdate` events (so persistence
 /// never sees it), and does not accumulate usage. Honors the supplied
 /// cancellation token.
@@ -439,21 +444,22 @@ pub async fn complete_oneshot(
     text: String,
     max_tokens: u64,
     cancel: CancellationToken,
-) -> Result<String, TurnError>;
+) -> Result<AssistantMessage, TurnError>;
 ```
 
 It builds a `Context { system_prompt, messages: [user(text)], tools: [] }`
 and drives `provider.stream_simple` with the agent's `model_info` and a
 clone of `stream_options` (output capped at `max_tokens`, thinking left
-at the agent's default unless the summary budget is too small), collects
-the streamed text, and returns it. Because it takes `&self` and emits
+at the agent's default unless the summary budget is too small), then returns
+the finalized message with its provider usage. Because it takes `&self` and emits
 nothing, the binary can call it while holding the agent lock between
 turns without disturbing transcript or persistence.
 
 NOTE: it is bus-silent by design. We do *not* want a summarizer turn to
 produce a `MessageEnd` (which the persistence listener would write to the
-log) or a `UsageUpdate` (which would move the footer occupancy). The
-summary's only durable record is the `Compaction` log entry.
+log) or a per-call `UsageUpdate`. `run_compaction` owns the calls, persists
+their aggregate on the checkpoint, and emits one aggregate accounting update
+only after that append commits.
 
 ### 6.2 `Agent::reseed_transcript`
 
@@ -475,7 +481,17 @@ pub fn reseed_transcript(&mut self, transcript: Vec<AgentMessage>);
 The system prompt and sub-agent counter are untouched (compaction
 changes neither).
 
-### 6.3 Compaction events
+### 6.3 `Agent::account_usage`
+
+Normal assistant terminals and committed compactions share one live accounting
+transition. `account_usage(delta)` snapshots the pre-add accumulator, emits one
+cumulative `UsageUpdate` carrying that snapshot plus `delta`, then folds the
+complete `Usage` into `Agent::accumulated_usage`. A listener failure does not
+erase spend that already happened, and callers must not retry the operation.
+Compaction invokes it only after the checkpoint append and tagged
+`CompactionEnd` succeed.
+
+### 6.4 Compaction events
 
 Add to `AgentEvent` (`aj-agent/src/events.rs`), both carrying `agent_id`:
 
@@ -515,7 +531,7 @@ contract (the locked
 `agent_event_serializes_with_internally_tagged_snake_case_shape` test in
 `aj-agent::events` gets new cases).
 
-### 6.4 `Agent::last_assistant`
+### 6.5 `Agent::last_assistant`
 
 The host's post-turn policy (overflow recovery, threshold compaction)
 needs two facts about the turn that just ran: whether it was a context
@@ -591,15 +607,20 @@ Steps:
    `serialize_conversation(&plan.messages_to_summarize)` for the body;
    `custom_instructions` threaded in). When `plan.turn_prefix_messages`
    is non-empty, generate the turn-prefix summary in a second
-   `complete_oneshot` call and append it. Append the file-op lists.
+   `complete_oneshot` call and append it. Sum the priced usage of every
+   successful summarizer response and append the file-op lists.
    `max_tokens` for the summary = `min(model.max_tokens, SUMMARY_OUTPUT_CAP)`.
 4. **Persist**: lock `log`, `append_compaction(USER, summary,
-   plan.first_kept_entry_id, plan.tokens_before, Some(plan.file_ops))`.
+   plan.first_kept_entry_id, plan.tokens_before, Some(plan.file_ops),
+   Some(summarizer_usage.clone()))`.
 5. **Reseed**: re-linearize from the new head → `agent_messages()`
    (now compaction-aware) → `reseed_transcript(...)` on the borrowed
    agent, trimming a trailing failed assistant (below).
-6. Compute `tokens_after` (occupancy of the reseeded projection) and
-   return `Compacted { tokens_before, tokens_after, summary }`.
+6. Compute `tokens_after` (occupancy of the reseeded projection), emit the
+   checkpoint-tagged `CompactionEnd`, then pass `summarizer_usage` to the
+   Agent's shared accounting operation. This emits one cumulative
+   `UsageUpdate` and updates the shutdown accumulator.
+7. Return `Compacted { tokens_before, tokens_after, summary }`.
 
 Cancellation (`cancel`) is selected against the `complete_oneshot`
 calls; an abort before step 4 leaves the log untouched (no partial
@@ -793,13 +814,15 @@ renderer events so a resumed session looks like a live one. The
 `Compaction` arm of `ReplayState::project_entry` emits:
 
 - `CompactionEnd { reason: Manual, tokens_before, tokens_after, summary:
-  None, error: None }`, where `tokens_after` is
+  Some(summary), error: None }`, where `tokens_after` is
   `estimate_conversation_context` of the user thread linearized up to the
-  compaction (the reduced projection's occupancy). This mirrors the live
-  path: a compaction emits no `UsageUpdate` and the retained tail's usage
-  is stale, so without it a resumed footer would keep showing the
-  pre-compaction occupancy. `summary` is omitted to keep replay events
-  lean — the durable record is the log's compaction entry.
+  compaction (the reduced projection's occupancy). The retained tail's usage
+  is stale, so this keeps a resumed footer from showing pre-compaction
+  occupancy.
+- One transient cumulative `UsageUpdate` when the checkpoint's `usage` is
+  `Some`. It carries the replay accumulator before the compaction plus the
+  checkpoint delta, then advances that accumulator. Legacy `usage: None`
+  projects no spend.
 
 Crucially, replay's other arms are unaffected: the summarized prefix
 entries are still in the log and `replay` still walks them in order, so
@@ -809,8 +832,9 @@ projection. Replay is about what the user sees; projection is about what
 the model sees. They intentionally diverge after a compaction. The
 replay `Compaction` row marks the boundary in the scrollback.
 
-The replay usage accumulator (`ReplayState::usage_accumulators`,
-`replay.rs:118`) is unchanged: a `Compaction` entry carries no `usage`.
+The checkpoint usage row is keyed to the durable compaction entry, not to the
+preceding assistant. Re-serving an older cursor or rebuilding from a fresh
+epoch therefore updates that row rather than duplicating it.
 
 ## 9. Configuration
 

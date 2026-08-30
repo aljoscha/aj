@@ -218,10 +218,10 @@ encoded in `EventPump::handle` and the message/tool handlers. Routing is by
 | `ToolExecutionEnd` | Skip `agent`. Build the entry on miss (replay path: no Start seen, args empty), then set `status: Done{is_error}`, `details`, `content`. The build-on-miss branch replicates the live bookkeeping (record `tool_index`, clear `current_assistant`). |
 | `Notice` / `Warning` / `Error` | Append `NoticeEntry` with level `Info` / `Warning` / `Error`. |
 | `StreamRetry` | Append `NoticeEntry{Warning}` with the retry cadence line (the failed attempt's error already rendered from its `MessageEnd`). |
-| `UsageUpdate` | Append a `TurnUsage` entry and fold into `footers.record_turn_usage(id, usage)`. The footer tracks the viewed agent, so the view repaints the footer only when `id == active_view`. |
+| `UsageUpdate` | Append or update a `TurnUsage` row keyed to the preceding assistant or compaction checkpoint. Assistant usage folds into `footers.record_turn_usage(id, usage)`. Compaction usage advances cumulative spend but does not replace context occupancy with the summarizer's prompt size. |
 | `CompactionStart` | `lifecycle.compacting.insert(id)`; the view labels the spinner "Compacting context...". |
 | `CompactionProgress` | Record the phase in `ChatState.compaction_phase` for the view's spinner label (`Summarizing` / `SummarizingTurnPrefix` / `Saving`). No transcript entry. |
-| `CompactionEnd` | `lifecycle.compacting.remove(id)`. On `error`, append `Notice{Warning}` "Compaction failed: ...". On `summary` (success), append `CompactionEntry` and `footers.set_context_tokens(id, tokens_after)` (no `UsageUpdate` follows compaction). On neither, append `Notice{Info}` "Compaction canceled." |
+| `CompactionEnd` | `lifecycle.compacting.remove(id)`. On `error`, append `Notice{Warning}` "Compaction failed: ...". On `summary` (success), append `CompactionEntry`, install its durable id as the following usage origin, and call `footers.set_context_tokens(id, tokens_after)`. On neither, append `Notice{Info}` "Compaction canceled." |
 | `SubAgentStart` | Ensure the `Sub(n)` transcript and a `SubAgentEntry{Running}` in the parent (the box). Seed `footers.note_settings(child, settings, resolve_window(settings))`. The running status and footer count derive from the paired `AgentStart(Sub n)`. |
 | `SubAgentEnd` | Set the `Sub(n)` box status to `Done`. |
 | `TaskStart` | Snapshot the launch cell (`render[owner].tool_index[call_id]`) now, since the owner's `AgentEnd` will clear it. Insert `TaskInfo{Running, cell}`. |

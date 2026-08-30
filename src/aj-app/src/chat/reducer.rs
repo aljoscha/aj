@@ -25,7 +25,7 @@ use serde_json::Value;
 use crate::chat::model::{
     AssistantEntry, ChatState, CompactionEntry, EntryId, EntryKind, NoticeEntry, NoticeLevel,
     SubAgentEntry, SubAgentStatus, TaskInfo, TaskNotificationEntry, ToolEntry, ToolStatus,
-    TurnUsageEntry, UserEntry, joined_user_text,
+    TurnUsageEntry, UsageOrigin, UserEntry, joined_user_text,
 };
 use crate::session::AgentLifecycle;
 
@@ -331,25 +331,27 @@ pub fn reduce(
             Redraw(true)
         }
 
-        // ---- Per-turn token usage --------------------------------------------
+        // ---- Accounted token usage -------------------------------------------
         AgentEvent::UsageUpdate { agent_id, usage } => {
-            // A tagged update belongs to a durable checkpoint rather than an
-            // assistant turn. It still renders its accounting row, but must
-            // not replace latest-assistant context occupancy. Ordinary live
-            // and replayed assistant updates are untagged.
-            if entry.is_none() {
-                state.footers.record_turn_usage(agent_id, &usage);
-            }
-            // The row belongs to the assistant message it follows, which
-            // is this row's durable identity, so a re-applied update
-            // overwrites its row instead of adding one.
-            let after = state
+            let origin = state
                 .render
                 .get(&agent_id)
-                .and_then(|r| r.last_finalized_assistant.clone());
-            let existing = after
+                .and_then(|render| render.last_usage_origin.clone());
+            // Assistant deltas describe the latest model context and feed the
+            // occupancy footer. Compaction deltas describe out-of-band spend;
+            // CompactionEnd already set occupancy to the reduced projection.
+            if !origin.as_ref().is_some_and(UsageOrigin::is_compaction) {
+                state.footers.record_turn_usage(agent_id, &usage);
+            }
+            // The row belongs to the assistant or checkpoint it follows, so a
+            // re-applied update overwrites its row instead of adding one.
+            let source_entry = origin
+                .as_ref()
+                .and_then(UsageOrigin::source_entry)
+                .map(str::to_string);
+            let existing = source_entry
                 .as_deref()
-                .and_then(|after| indexed_row(state, agent_id, after, usage_origin));
+                .and_then(|source| indexed_row(state, agent_id, source, usage_origin));
             match existing {
                 Some(id) => {
                     if let Some(EntryKind::TurnUsage(row)) = state
@@ -369,7 +371,7 @@ pub fn reduce(
                         .append(EntryKind::TurnUsage(TurnUsageEntry {
                             agent_id,
                             usage,
-                            after_message_id: after,
+                            source_entry,
                         }));
                 }
             }
@@ -420,6 +422,8 @@ pub fn reduce(
                     None,
                 );
             } else if let Some(summary) = summary {
+                state.render.entry(agent_id).or_default().last_usage_origin =
+                    Some(UsageOrigin::Compaction(entry.cloned()));
                 // A successful compaction appends its checkpoint entry,
                 // and `CompactionEnd` carries no identity of its own, so
                 // that entry is the row's key. The cursor invariant is not
@@ -450,9 +454,9 @@ pub fn reduce(
                         );
                     }
                 }
-                // No `UsageUpdate` follows a compaction, so refresh the
-                // footer occupancy directly to the post-compaction
-                // estimate.
+                // Refresh occupancy directly to the post-compaction estimate.
+                // The following UsageUpdate accounts summarizer spend and is
+                // deliberately ignored by the occupancy fold above.
                 state.footers.set_context_tokens(agent_id, tokens_after);
             } else {
                 record_notice(
@@ -882,10 +886,10 @@ fn indexed_row(
         .map(|entry| entry.id)
 }
 
-/// Durable identity of a usage row: the assistant message it reports on.
+/// Durable identity of a usage row: the assistant or checkpoint it reports on.
 fn usage_origin(kind: &EntryKind) -> Option<&str> {
     match kind {
-        EntryKind::TurnUsage(row) => row.after_message_id.as_deref(),
+        EntryKind::TurnUsage(row) => row.source_entry.as_deref(),
         _ => None,
     }
 }
@@ -1037,11 +1041,8 @@ fn reduce_assistant_end(
     // Recorded even when the message rendered no entry (a tool-use-only
     // turn): the trailing `UsageUpdate` still reports on this message
     // and keys its row off this id.
-    state
-        .render
-        .entry(agent_id)
-        .or_default()
-        .last_finalized_assistant = message_id.clone();
+    state.render.entry(agent_id).or_default().last_usage_origin =
+        Some(UsageOrigin::Assistant(message_id.clone()));
     // A sub-agent's box renders its report, not the sub's transcript, so keep
     // the report fresh from the sub's latest conclusion while it runs. A
     // continuation or steering re-run completes through `AgentEnd(Sub n)`,
@@ -3041,7 +3042,8 @@ mod tests {
             Some(CompactionPhase::Saving),
         );
 
-        apply(
+        let checkpoint = "checkpoint".to_string();
+        let _ = reduce(
             &mut s,
             &mut life,
             AgentEvent::CompactionEnd {
@@ -3052,6 +3054,7 @@ mod tests {
                 summary: Some("did stuff".into()),
                 error: None,
             },
+            Some(&checkpoint),
         );
         assert!(!life.is_compacting(AgentId::Main));
         assert_eq!(s.compaction_phase(AgentId::Main), None);
@@ -3063,8 +3066,19 @@ mod tests {
             }
             other => panic!("unexpected kind: {other:?}"),
         }
-        // No UsageUpdate follows a compaction, so the footer numerator
-        // is refreshed directly.
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([900, 50, 20, 30]),
+            },
+            None,
+        );
+        let usage = usage_rows(&s, AgentId::Main);
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].source_entry.as_deref(), Some("checkpoint"));
+        // The summarizer's prompt is spend, not the model's retained context.
         assert_eq!(s.footers().context_usage(AgentId::Main).tokens, Some(300));
     }
 
@@ -3836,7 +3850,7 @@ mod tests {
     #[test]
     fn a_tool_use_only_turn_still_anchors_its_usage_row() {
         // The message renders no entry, so nothing but
-        // `last_finalized_assistant` can key its trailing usage row. A
+        // `last_usage_origin` can key its trailing usage row. A
         // re-served entry has to overwrite that row rather than add one.
         let mut s = state();
         let mut life = AgentLifecycle::default();
@@ -3845,7 +3859,8 @@ mod tests {
         assert_eq!(
             s.render
                 .get(&AgentId::Main)
-                .and_then(|r| r.last_finalized_assistant.as_deref()),
+                .and_then(|r| r.last_usage_origin.as_ref())
+                .and_then(UsageOrigin::source_entry),
             Some("m-tools"),
             "the anchor is recorded even with no row to show",
         );
@@ -3870,7 +3885,7 @@ mod tests {
 
         let rows = usage_rows(&s, AgentId::Main);
         assert_eq!(rows.len(), 1, "one usage row for one message");
-        assert_eq!(rows[0].after_message_id.as_deref(), Some("m-tools"));
+        assert_eq!(rows[0].source_entry.as_deref(), Some("m-tools"));
         assert_eq!(rows[0].usage.turn_input, 200, "the later value wins");
     }
 
@@ -4636,7 +4651,7 @@ mod tests {
     }
 
     #[test]
-    fn quiesce_keeps_the_last_finalized_assistant_anchor() {
+    fn quiesce_keeps_the_last_usage_origin() {
         // The anchor is what the trailing `UsageUpdate` of a re-served
         // entry keys its row on, and the cursor invariant drops that
         // entry's own durable frame, so clearing the anchor here would
@@ -4659,7 +4674,8 @@ mod tests {
         assert_eq!(
             s.render
                 .get(&AgentId::Main)
-                .and_then(|r| r.last_finalized_assistant.as_deref()),
+                .and_then(|r| r.last_usage_origin.as_ref())
+                .and_then(UsageOrigin::source_entry),
             Some("m-answer"),
             "quiesce keeps durable identity",
         );
@@ -4676,7 +4692,7 @@ mod tests {
         );
         let rows = usage_rows(&s, AgentId::Main);
         assert_eq!(rows.len(), 1, "one usage row for one message");
-        assert_eq!(rows[0].after_message_id.as_deref(), Some("m-answer"));
+        assert_eq!(rows[0].source_entry.as_deref(), Some("m-answer"));
         assert_eq!(rows[0].usage.turn_input, 200);
     }
 

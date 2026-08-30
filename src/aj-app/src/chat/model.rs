@@ -259,20 +259,20 @@ pub struct NoticeEntry {
     pub entry: Option<String>,
 }
 
-/// Per-turn token usage row, stored structured so views format it
-/// without reparsing.
+/// One accounted usage delta, stored structured so views format it without
+/// reparsing. Most rows follow assistant turns; compaction rows follow their
+/// checkpoint.
 #[derive(Debug)]
 pub struct TurnUsageEntry {
     /// The emitting agent, for the sub-agent line prefix.
     pub agent_id: AgentId,
     pub usage: TokenUsage,
-    /// The assistant message this row reports on: its durable identity.
-    /// Both the live agent and the log projection emit `UsageUpdate`
-    /// directly after that message's `MessageEnd`, so the row belongs to
-    /// it and a re-applied update overwrites the row instead of adding
-    /// one. `None` for an update that followed no identified message,
-    /// which stays append-only.
-    pub after_message_id: Option<String>,
+    /// The durable assistant message or compaction checkpoint this row reports
+    /// on. Live accounting and log projection both emit `UsageUpdate` after
+    /// that source, so a re-applied update overwrites the row instead of adding
+    /// one. `None` for an update without identified durable ownership, which
+    /// stays append-only.
+    pub source_entry: Option<String>,
 }
 
 impl TurnUsageEntry {
@@ -382,11 +382,30 @@ impl Transcript {
     }
 }
 
+/// Durable source immediately preceding an accounted usage delta.
+#[derive(Debug, Clone)]
+pub(crate) enum UsageOrigin {
+    Assistant(Option<String>),
+    Compaction(Option<String>),
+}
+
+impl UsageOrigin {
+    pub(crate) fn source_entry(&self) -> Option<&str> {
+        match self {
+            Self::Assistant(entry) | Self::Compaction(entry) => entry.as_deref(),
+        }
+    }
+
+    pub(crate) fn is_compaction(&self) -> bool {
+        matches!(self, Self::Compaction(_))
+    }
+}
+
 /// Per-agent streaming bookkeeping. One per agent, so streaming events
 /// route to the right entry inside that agent's own transcript.
 ///
 /// Three of the four fields are the agent's durable-identity state: the
-/// two indexes and the last finalized assistant id. They outlive a turn
+/// two indexes and the last usage origin. They outlive a turn
 /// so a re-applied event finds the entry it already produced instead of
 /// appending a second one. Streaming state
 /// ([`Self::current_assistant`]) is per-turn and cleared on `AgentEnd`.
@@ -412,9 +431,9 @@ pub struct AgentRender {
     /// Durable message id -> the entry it produced, covering user,
     /// finalized assistant and task-notification rows.
     pub(crate) message_index: HashMap<String, EntryId>,
-    /// Durable id of the last finalized assistant message, which is the
-    /// message a following `UsageUpdate` reports on.
-    pub(crate) last_finalized_assistant: Option<String>,
+    /// Durable assistant or checkpoint source a following `UsageUpdate`
+    /// reports on.
+    pub(crate) last_usage_origin: Option<UsageOrigin>,
 }
 
 /// One background task tracked from `TaskStart` / `TaskEnd`. Drives a
@@ -956,8 +975,8 @@ impl ChatState {
     /// finished box for a live sub and dropping it would orphan the child
     /// transcript. The host is authoritative for concluding sub boxes.
     ///
-    /// Deliberately kept: `last_finalized_assistant`. It is what anchors
-    /// the trailing `UsageUpdate` of a re-served assistant entry, whose
+    /// Deliberately kept: `last_usage_origin`. It anchors the trailing
+    /// `UsageUpdate` of a re-served assistant or compaction entry, whose
     /// own durable frame the cursor invariant drops, so clearing it would
     /// grow a second usage row on every re-attach.
     ///
@@ -1237,7 +1256,7 @@ mod tests {
             .append(EntryKind::TurnUsage(TurnUsageEntry {
                 agent_id: AgentId::Main,
                 usage: main_usage,
-                after_message_id: Some("main-message".into()),
+                source_entry: Some("main-message".into()),
             }));
         chat.transcripts
             .entry(AgentId::Sub(2))
@@ -1245,7 +1264,7 @@ mod tests {
             .append(EntryKind::TurnUsage(TurnUsageEntry {
                 agent_id: AgentId::Sub(2),
                 usage: token_usage([7, 4, 1, 2], [0, 0, 0, 0]),
-                after_message_id: Some("sub-message".into()),
+                source_entry: Some("sub-message".into()),
             }));
 
         let usage = chat.usage_summary();

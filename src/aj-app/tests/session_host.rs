@@ -5923,52 +5923,86 @@ async fn compaction_is_refused_while_busy() {
     harness.host.shutdown().await;
 }
 
-/// A manual compaction's `CompactionEnd` is durable, tagged with the
-/// checkpoint entry the compaction appended. Nothing on the bus carries
-/// that identity, so it can only come from the append handoff the host
-/// shares with its event forwarder.
+/// Committed compaction spend reaches the live client and shutdown accumulator
+/// once, while the checkpoint remains its durable owner across reattachment.
 #[tokio::test]
-async fn a_compaction_end_is_tagged_with_its_checkpoint_entry() {
+async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
+    fn priced(text: &str, usage: [u64; 4]) -> AssistantMessage {
+        let mut message = finalized_text_message(text);
+        message.usage.input = usage[0];
+        message.usage.output = usage[1];
+        message.usage.cache_write = usage[2];
+        message.usage.cache_read = usage[3];
+        message.usage.total_tokens = usage.into_iter().sum();
+        message
+    }
+
+    fn summary_usage(summary: &aj_agent::types::UsageSummary) -> [u64; 4] {
+        [
+            summary.main_agent_usage.input_tokens,
+            summary.main_agent_usage.output_tokens,
+            summary.main_agent_usage.cache_write_tokens,
+            summary.main_agent_usage.cache_read_tokens,
+        ]
+    }
+
+    fn usage_sources(chat: &ChatState) -> Vec<Option<String>> {
+        chat.transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                aj_app::chat::EntryKind::TurnUsage(usage) => Some(usage.source_entry.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn compaction_rows(chat: &ChatState) -> usize {
+        chat.transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.kind, aj_app::chat::EntryKind::Compaction(_)))
+            .count()
+    }
+
+    let normal_first = [10, 20, 30, 40];
+    let normal_second = [100, 200, 300, 400];
+    let summary = [1_000, 2_000, 3_000, 4_000];
+    let prefix = [10_000, 20_000, 30_000, 40_000];
+    let compaction_total = [11_000, 22_000, 33_000, 44_000];
+    let session_total = [11_110, 22_220, 33_330, 44_440];
     let harness = Harness::new(vec![
-        finalized_text_message("first answer"),
-        finalized_text_message("second answer"),
-        finalized_text_message("SUMMARY of the earlier work"),
+        priced("first answer", normal_first),
+        priced(
+            &format!("second answer {}", "X".repeat(4_000)),
+            normal_second,
+        ),
+        priced("SUMMARY", summary),
+        priced("PREFIX", prefix),
     ]);
-    // Keep almost nothing verbatim, so a two-turn session has something to
-    // summarize.
     harness
         .config
         .lock()
         .expect("config mutex poisoned")
-        .compact_keep_recent = 10;
+        .compact_keep_recent = 100;
     let session = harness.create().await;
-    let mut stream = harness
-        .host
-        .attach(&[AttachRequest {
-            session: session.clone(),
-            cursor: None,
-        }])
-        .await
-        .expect("attach");
-    frames_until(&mut stream, "caught_up", |frame| {
-        matches!(frame, Frame::CaughtUp { .. })
-    })
-    .await;
+    let mut client = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "one").await;
-    until_idle(&mut stream).await;
-    // A large second prompt, so the keep-recent cut lands on it and the
-    // first turn is left as the range to summarize.
-    harness
-        .prompt(&session, &format!("two {}", "X".repeat(2000)))
-        .await;
-    until_idle(&mut stream).await;
+    client.pump_until_idle().await;
+    harness.prompt(&session, "two").await;
+    client.pump_until_idle().await;
+    let before_sources = usage_sources(&client.chat);
+    assert_eq!(before_sources.len(), 2, "two ordinary assistant rows");
+    let older_cursor = client.client.cursor().expect("pre-compaction cursor");
 
     harness
         .host
         .command(&session, Command::Compact { instructions: None })
         .await
         .expect("compact on an idle session");
-    let frames = until_idle(&mut stream).await;
+    let frames = client.pump_until_idle().await;
 
     let end = frames
         .iter()
@@ -5989,6 +6023,40 @@ async fn a_compaction_end_is_tagged_with_its_checkpoint_entry() {
         "the compaction wrote a summary, so it appended a checkpoint",
     );
     let durability = end.0.expect("a successful compaction's end is durable");
+    let checkpoint_updates: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Event {
+                durability, event, ..
+            } => match event.known() {
+                Some(AgentEvent::UsageUpdate { usage, .. })
+                    if usage.turn_input == compaction_total[0] =>
+                {
+                    Some((durability, usage))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checkpoint_updates.len(),
+        1,
+        "one aggregate checkpoint update"
+    );
+    assert!(
+        checkpoint_updates[0].0.is_none(),
+        "CompactionEnd alone carries the checkpoint's durable tag",
+    );
+    assert_eq!(
+        [
+            checkpoint_updates[0].1.turn_input,
+            checkpoint_updates[0].1.turn_output,
+            checkpoint_updates[0].1.turn_cache_write,
+            checkpoint_updates[0].1.turn_cache_read,
+        ],
+        compaction_total,
+    );
 
     let handles = harness
         .host
@@ -6000,15 +6068,245 @@ async fn a_compaction_end_is_tagged_with_its_checkpoint_entry() {
     let index = usize::try_from(durability.seq).expect("seq fits usize") - 1;
     let entry = entries.get(index).expect("an entry at that position");
     assert_eq!(entry.id, durability.entry_id);
+    let (checkpoint_usage, checkpoint_summary) = match &entry.entry {
+        aj_session::ConversationEntryKind::Compaction { usage, summary, .. } => {
+            (usage.as_ref().expect("priced checkpoint"), summary)
+        }
+        other => panic!("the tagged entry is the compaction checkpoint: {other:?}"),
+    };
     assert!(
-        matches!(
-            entry.entry,
-            aj_session::ConversationEntryKind::Compaction { .. }
-        ),
-        "the tagged entry is the compaction checkpoint: {:?}",
-        entry.entry,
+        checkpoint_summary.contains("PREFIX"),
+        "the cut took the two-call split-turn path: {checkpoint_summary}",
+    );
+    assert_eq!(
+        [
+            checkpoint_usage.input,
+            checkpoint_usage.output,
+            checkpoint_usage.cache_write,
+            checkpoint_usage.cache_read,
+        ],
+        compaction_total,
+    );
+    let stats = log.stats();
+    assert_eq!(
+        [
+            stats.compaction_usage.input,
+            stats.compaction_usage.output,
+            stats.compaction_usage.cache_write,
+            stats.compaction_usage.cache_read,
+        ],
+        compaction_total,
+    );
+    assert_eq!(
+        [
+            stats.usage.input,
+            stats.usage.output,
+            stats.usage.cache_write,
+            stats.usage.cache_read,
+        ],
+        session_total,
     );
     drop(log);
+
+    assert_eq!(summary_usage(&client.chat.usage_summary()), session_total);
+    let host_usage = harness
+        .host
+        .usage(&session)
+        .await
+        .expect("usage read")
+        .expect("live usage");
+    assert_eq!(summary_usage(&host_usage), session_total);
+    let after_sources = usage_sources(&client.chat);
+    assert_eq!(&after_sources[..2], before_sources.as_slice());
+    assert_eq!(
+        after_sources[2].as_deref(),
+        Some(durability.entry_id.as_str()),
+        "compaction spend belongs to the checkpoint rather than the assistant",
+    );
+    assert_eq!(compaction_rows(&client.chat), 1);
+
+    client.reattach(&harness.host, older_cursor).await;
+    assert_eq!(usage_sources(&client.chat), after_sources);
+    assert_eq!(compaction_rows(&client.chat), 1);
+    assert_eq!(summary_usage(&client.chat.usage_summary()), session_total);
+
+    let stale_cursor = client.client.cursor().expect("old host cursor");
+    harness.host.shutdown().await;
+    let revived = harness.revive(Vec::new());
+    client.reattach(&revived.host, stale_cursor).await;
+    assert_eq!(usage_sources(&client.chat), after_sources);
+    assert_eq!(compaction_rows(&client.chat), 1);
+    assert_eq!(summary_usage(&client.chat.usage_summary()), session_total);
+    revived.host.shutdown().await;
+}
+
+/// A checkpoint append failure after successful summarization cannot publish or
+/// accumulate spend that has no durable owner.
+#[tokio::test]
+async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
+    fn priced(text: &str, usage: [u64; 4]) -> AssistantMessage {
+        let mut message = finalized_text_message(text);
+        message.usage.input = usage[0];
+        message.usage.output = usage[1];
+        message.usage.cache_write = usage[2];
+        message.usage.cache_read = usage[3];
+        message.usage.total_tokens = usage.into_iter().sum();
+        message
+    }
+
+    fn summary_usage(summary: &aj_agent::types::UsageSummary) -> [u64; 4] {
+        [
+            summary.main_agent_usage.input_tokens,
+            summary.main_agent_usage.output_tokens,
+            summary.main_agent_usage.cache_write_tokens,
+            summary.main_agent_usage.cache_read_tokens,
+        ]
+    }
+
+    fn durable_usage(log: &ConversationLog) -> [u64; 4] {
+        let usage = &log.stats().usage;
+        [
+            usage.input,
+            usage.output,
+            usage.cache_write,
+            usage.cache_read,
+        ]
+    }
+
+    let first = [10, 20, 30, 40];
+    let second = [100, 200, 300, 400];
+    let before_total = [110, 220, 330, 440];
+    let summarizer = [1_000, 2_000, 3_000, 4_000];
+    let harness = Harness::new(vec![priced("first", first), priced("second", second)]);
+    harness
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .compact_keep_recent = 10;
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "one").await;
+    client.pump_until_idle().await;
+    harness
+        .prompt(&session, &format!("two {}", "X".repeat(2_000)))
+        .await;
+    client.pump_until_idle().await;
+
+    let before_rows = client.chat.usage_summary();
+    assert_eq!(summary_usage(&before_rows), before_total);
+    let before_host = harness
+        .host
+        .usage(&session)
+        .await
+        .expect("usage read")
+        .expect("live usage");
+    assert_eq!(summary_usage(&before_host), before_total);
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let original_durable = durable_usage(&*handles.log.lock().await);
+    assert_eq!(original_durable, before_total);
+
+    // Slow only the summarizer. CompactionProgress::Summarizing proves the
+    // plan has captured an id from the original log before the swap below.
+    handles
+        .run_config
+        .lock()
+        .expect("run config mutex poisoned")
+        .provider = scripted(
+        vec![priced("SUMMARY", summarizer)],
+        1,
+        Duration::from_millis(50),
+    );
+    let fault_persistence = ConversationPersistence::new(harness._dir.path().join("append-fault"));
+    let mut replacement = ConversationLog::create(&fault_persistence).expect("replacement log");
+    replacement
+        .append(
+            None,
+            aj_session::ThreadKind::User,
+            None,
+            aj_session::ConversationEntryKind::Message {
+                message: aj_agent::message::AgentMessage::wire(
+                    aj_models::types::Message::Assistant(priced("baseline", before_total)),
+                ),
+            },
+        )
+        .expect("seed replacement usage");
+    let replacement_entries = replacement.len();
+    assert_eq!(durable_usage(&replacement), before_total);
+
+    harness
+        .host
+        .command(&session, Command::Compact { instructions: None })
+        .await
+        .expect("compact accepted");
+    let started = frames_until(&mut client.stream, "summarization to start", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(
+                    event.known(),
+                    Some(AgentEvent::CompactionProgress {
+                        phase: aj_agent::events::CompactionPhase::Summarizing,
+                        ..
+                    })
+                )
+        )
+    })
+    .await;
+    for frame in started {
+        let _ = client.client.apply(&mut client.chat, frame);
+    }
+
+    let original = {
+        let mut log = handles.log.lock().await;
+        std::mem::replace(&mut *log, replacement)
+    };
+    let frames = client.pump_until_idle().await;
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::CompactionEnd { error: Some(_), .. }))
+        )),
+        "the missing planned id rejects the checkpoint append",
+    );
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::UsageUpdate { usage, .. })
+                    if usage.turn_input == summarizer[0])
+        )),
+        "uncommitted summarizer usage reached the live fold",
+    );
+
+    let replacement = {
+        let mut log = handles.log.lock().await;
+        assert_eq!(
+            log.len(),
+            replacement_entries,
+            "failed append changed the log"
+        );
+        assert_eq!(durable_usage(&log), before_total);
+        std::mem::replace(&mut *log, original)
+    };
+    drop(replacement);
+    assert_eq!(
+        durable_usage(&*handles.log.lock().await),
+        original_durable,
+        "the session log stayed unchanged",
+    );
+    assert_eq!(summary_usage(&client.chat.usage_summary()), before_total);
+    let after_host = harness
+        .host
+        .usage(&session)
+        .await
+        .expect("usage read")
+        .expect("live usage");
+    assert_eq!(summary_usage(&after_host), before_total);
     harness.host.shutdown().await;
 }
 

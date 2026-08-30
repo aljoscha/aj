@@ -183,7 +183,7 @@ pub async fn run_compaction(
             plan.first_kept_entry_id.clone(),
             plan.tokens_before,
             Some(plan.file_ops.clone()),
-            Some(summarizer_usage),
+            Some(summarizer_usage.clone()),
         ) {
             Ok(entry) => entry,
             Err(err) => {
@@ -226,6 +226,14 @@ pub async fn run_compaction(
             .await
         {
             tracing::warn!("failed to emit CompactionEnd: {err}");
+        }
+
+        // The checkpoint is the durable owner of this out-of-band spend.
+        // Account only after its append and tagged CompactionEnd have
+        // completed, while the same guard prevents another main-thread event
+        // from replacing the reducer's checkpoint usage origin in between.
+        if let Err(err) = agent.account_usage(&summarizer_usage).await {
+            tracing::warn!("failed to emit committed compaction usage: {err}");
         }
         after
     };

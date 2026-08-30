@@ -282,10 +282,10 @@ impl AgentFooters {
         }
     }
 
-    /// Overwrite `id`'s context-occupancy numerator. Used after a
-    /// compaction reseeds the transcript: no `UsageUpdate` follows a
-    /// compaction, so without this the footer would keep showing the
-    /// pre-compaction occupancy until the next real turn. A missing
+    /// Overwrite `id`'s context-occupancy numerator. Used after a compaction
+    /// reseeds the transcript. Its following `UsageUpdate` reports summarizer
+    /// spend rather than model-context occupancy, so without this the footer
+    /// would keep showing the pre-compaction occupancy until the next real turn. A missing
     /// entry is left untouched (nothing to display against yet).
     pub fn set_context_tokens(&mut self, id: AgentId, tokens: u64) {
         if let Some(entry) = self.agents.get_mut(&id) {

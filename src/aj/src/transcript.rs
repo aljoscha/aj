@@ -4219,7 +4219,7 @@ mod tests {
 
         let t = transcript_with(EntryKind::TurnUsage(aj_app::chat::TurnUsageEntry {
             agent_id: aj_agent::events::AgentId::Main,
-            after_message_id: None,
+            source_entry: None,
             usage: aj_agent::types::TokenUsage {
                 accumulated_input: 0,
                 turn_input: 0,

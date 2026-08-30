@@ -425,7 +425,8 @@ Every frame is in exactly one class:
 
   At most one frame per log entry is durable. An entry can project
   several events (a tool-result entry projects a tool bracket around its
-  `MessageEnd`, an assistant entry projects a trailing `UsageUpdate`) and
+  `MessageEnd`, and assistant or priced compaction entries project a trailing
+  `UsageUpdate`) and
   only one of them carries the tag, in both live flow and backfill, so
   that "the cursor is at seq N" stays a statement about entries.
 
@@ -460,7 +461,7 @@ Per session the host maintains:
   compares against, and the last it has **committed**, which is what it
   offers on re-attach. An applied seq is committed once a later durable
   frame or a `caught_up` arrives, because a log entry can project a
-  trailing untagged event (an assistant entry's `UsageUpdate`) and a
+  trailing untagged event (an assistant or compaction entry's `UsageUpdate`) and a
   connection that drops in between would otherwise leave the client
   claiming an entry it only partly applied. Offering an older cursor is
   always safe: the server serves one more entry and idempotent
