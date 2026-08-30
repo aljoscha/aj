@@ -23,6 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -39,9 +40,14 @@ use aj_app::test_support::{
 };
 use aj_conf::{Config, ConfigLayer};
 use aj_models::auth::AuthStorage;
+use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
-use aj_models::types::{AssistantContent, AssistantMessage, StopReason, ToolCall};
+use aj_models::streaming::AssistantMessageEventStream;
+use aj_models::types::{
+    AssistantContent, AssistantMessage, Context, SimpleStreamOptions, StopReason, StreamOptions,
+    ToolCall,
+};
 use aj_session::{ConversationPersistence, ThreadFilter};
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedFrame,
@@ -417,6 +423,92 @@ pub(crate) fn scripted(
     )
 }
 
+/// In-process account of every provider call made by an observed fixture.
+///
+/// The count advances before delegation so an exhausted scripted provider is
+/// still visible here even when its panic belongs to a detached turn worker.
+struct InferenceObservation {
+    scripted: usize,
+    attempts: AtomicUsize,
+}
+
+impl InferenceObservation {
+    fn new(scripted: usize) -> Self {
+        Self {
+            scripted,
+            attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn record_attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
+    }
+
+    fn assert_attempts(&self, expected: usize) {
+        assert_eq!(
+            self.attempts(),
+            expected,
+            "the host attempted an unexpected number of inferences in this route phase",
+        );
+    }
+
+    /// Assert both sides of strict fixture consumption after host quiescence.
+    fn assert_consumed_exactly(&self, expected: usize) {
+        assert_eq!(
+            self.scripted, expected,
+            "the fixture supplied an unexpected number of inference scripts",
+        );
+        assert_eq!(
+            self.attempts(),
+            expected,
+            "the host attempted a different number of inferences than scripted",
+        );
+    }
+}
+
+/// A strict scripted provider whose calls remain observable by its owning test.
+struct ObservedScriptedProvider {
+    inner: Arc<ScriptedProvider>,
+    observation: Arc<InferenceObservation>,
+}
+
+impl Provider for ObservedScriptedProvider {
+    fn stream(
+        &self,
+        model: &ModelInfo,
+        context: &Context,
+        options: &StreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.observation.record_attempt();
+        self.inner.stream(model, context, options)
+    }
+
+    fn stream_simple(
+        &self,
+        model: &ModelInfo,
+        context: &Context,
+        options: &SimpleStreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.observation.record_attempt();
+        self.inner.stream_simple(model, context, options)
+    }
+}
+
+fn observed_scripted(
+    messages: Vec<AssistantMessage>,
+) -> (Arc<dyn Provider>, Arc<InferenceObservation>) {
+    let observation = Arc::new(InferenceObservation::new(messages.len()));
+    let provider: Arc<dyn Provider> = Arc::new(ObservedScriptedProvider {
+        inner: scripted(messages, 0, Duration::ZERO),
+        observation: Arc::clone(&observation),
+    });
+    (provider, observation)
+}
+
 /// The config a test host reads, with bash's spill files aimed inside `dir`.
 ///
 /// A background task's spill is persisted by contract, so left at the ambient
@@ -460,7 +552,7 @@ impl HostHandles {
 /// here, so what "a test host" is stays in one place.
 pub(crate) fn scripted_host(
     dir: &TempDir,
-    provider: Arc<ScriptedProvider>,
+    provider: Arc<dyn Provider>,
     handles: HostHandles,
     name: Option<&str>,
 ) -> SessionHost {
@@ -480,7 +572,7 @@ pub(crate) fn scripted_host(
     .expect("a host over the temp store")
 }
 
-fn snapshot(provider: Arc<ScriptedProvider>) -> RunConfigSnapshot {
+fn snapshot(provider: Arc<dyn Provider>) -> RunConfigSnapshot {
     RunConfigSnapshot {
         provider,
         model_info: Arc::new(scripted_model_info()),
@@ -621,20 +713,18 @@ impl Fixture {
         Self::build(provider, IdentityGate::local(), Duration::from_secs(30)).await
     }
 
-    async fn with_gate(gate: IdentityGate) -> Self {
-        Self::build(
-            scripted(vec![finalized_text_message("hi")], 0, Duration::ZERO),
-            gate,
-            Duration::from_secs(30),
+    async fn with_gate(
+        gate: IdentityGate,
+        messages: Vec<AssistantMessage>,
+    ) -> (Self, Arc<InferenceObservation>) {
+        let (provider, observation) = observed_scripted(messages);
+        (
+            Self::build(provider, gate, Duration::from_secs(30)).await,
+            observation,
         )
-        .await
     }
 
-    async fn build(
-        provider: Arc<ScriptedProvider>,
-        gate: IdentityGate,
-        heartbeat: Duration,
-    ) -> Self {
+    async fn build(provider: Arc<dyn Provider>, gate: IdentityGate, heartbeat: Duration) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let handles = HostHandles::new(&dir);
         let host = scripted_host(&dir, provider, handles.clone(), None);
@@ -3042,33 +3132,42 @@ async fn probe_requests(
 ) -> Vec<RouteProbe> {
     let mut probes = Vec::with_capacity(requests.len());
     for request in requests {
-        let route = probed_route(&request, session);
-        let waiting_for = format!("{route} response and error body");
-        let (status, error) =
-            bounded(&waiting_for, async {
-                let response = http
-                    .execute(request)
-                    .await
-                    .unwrap_or_else(|err| panic!("{route} could not reach the server: {err}"));
-                let status = response.status();
-                let error =
-                    if status.is_success() {
-                        None
-                    } else {
-                        Some(response.json().await.unwrap_or_else(|err| {
-                            panic!("{route} returned no protocol error: {err}")
-                        }))
-                    };
-                (status, error)
-            })
-            .await;
-        probes.push(RouteProbe {
-            route,
-            status,
-            error,
-        });
+        probes.push(probe_request(http, session, request).await);
     }
     probes
+}
+
+async fn probe_request(
+    http: &reqwest::Client,
+    session: &str,
+    request: reqwest::Request,
+) -> RouteProbe {
+    let route = probed_route(&request, session);
+    let waiting_for = format!("{route} response and error body");
+    let (status, error) = bounded(&waiting_for, async {
+        let response = http
+            .execute(request)
+            .await
+            .unwrap_or_else(|err| panic!("{route} could not reach the server: {err}"));
+        let status = response.status();
+        let error = if status.is_success() {
+            None
+        } else {
+            Some(
+                response
+                    .json()
+                    .await
+                    .unwrap_or_else(|err| panic!("{route} returned no protocol error: {err}")),
+            )
+        };
+        (status, error)
+    })
+    .await;
+    RouteProbe {
+        route,
+        status,
+        error,
+    }
 }
 
 fn command_probe(
@@ -3086,11 +3185,16 @@ fn command_probe(
 
 /// Every route, ordered so each mutation's session precondition is stable.
 ///
-/// Commands through `KillTask` leave the session idle. `Compact` then starts
-/// work, after which prompt and steer are valid whether that work is still live
-/// or has already finished. The gate probe therefore has no turn-completion
-/// race to mistake for an authorization failure.
-async fn probe_every_route(client: &RemoteClient, session: &str) -> Vec<RouteProbe> {
+/// Commands through `KillTask` leave the session idle. `Compact` then starts a
+/// turn but consumes no inference script on this fresh log. An authorized probe
+/// completes Prompt before issuing Steer, making both route validity and exact
+/// script consumption independent of scheduler timing. A rejected probe starts
+/// no work and needs no inference barrier.
+async fn probe_every_route(
+    client: &RemoteClient,
+    session: &str,
+    mut inference: Option<(&InferenceObservation, &mut Attached)>,
+) -> Vec<RouteProbe> {
     let http = reqwest::Client::new();
     let base = client.base();
     let commands = [
@@ -3155,7 +3259,24 @@ async fn probe_every_route(client: &RemoteClient, session: &str) -> Vec<RoutePro
     for command in &commands {
         requests.push(command_probe(&http, base, session, command));
     }
-    probe_requests(&http, session, requests).await
+
+    let mut probes = Vec::with_capacity(requests.len());
+    for request in requests {
+        let probe = probe_request(&http, session, request).await;
+        if let Some((observation, attached)) = inference.as_mut() {
+            let expected = match probe.route.as_str() {
+                "POST /v1/sessions/{id}/prompt" => Some(1),
+                "POST /v1/sessions/{id}/steer" => Some(2),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                attached.settle().await;
+                observation.assert_attempts(expected);
+            }
+        }
+        probes.push(probe);
+    }
+    probes
 }
 
 fn assert_route_census(probes: &[RouteProbe]) {
@@ -3192,15 +3313,15 @@ fn assert_generic_forbidden(probe: &RouteProbe) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_peer_gets_403_on_every_route() {
     let whois = FakeWhois::resolving(user_peer("intruder@github"));
-    let fixture = Fixture::with_gate(IdentityGate::tailscale(
-        ["alice@github".to_string()],
-        whois.resolver(),
-    ))
+    let (fixture, inferences) = Fixture::with_gate(
+        IdentityGate::tailscale(["alice@github".to_string()], whois.resolver()),
+        Vec::new(),
+    )
     .await;
     // Created behind the gate's back, so a 403 cannot be mistaken for a 404.
     let session = fixture.host.create().await.expect("create a session");
 
-    let probes = probe_every_route(&fixture.client, &session).await;
+    let probes = probe_every_route(&fixture.client, &session, None).await;
 
     assert_route_census(&probes);
     for probe in &probes {
@@ -3229,18 +3350,28 @@ async fn a_rejected_peer_gets_403_on_every_route() {
         whois.asked(),
     );
     fixture.shutdown().await;
+    inferences.assert_consumed_exactly(0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_authorized_peer_reaches_every_route() {
-    let fixture = Fixture::with_gate(IdentityGate::tailscale(
-        [],
-        FakeWhois::resolving(tagged_peer(&[AJ_CONTROL_CAPABILITY])),
-    ))
+    let (fixture, inferences) = Fixture::with_gate(
+        IdentityGate::tailscale(
+            [],
+            FakeWhois::resolving(tagged_peer(&[AJ_CONTROL_CAPABILITY])),
+        ),
+        vec![finalized_text_message("hi"), finalized_text_message("hi")],
+    )
     .await;
     let session = fixture.create().await;
+    let mut attached = fixture.oracle(&session).await;
 
-    let probes = probe_every_route(&fixture.client, &session).await;
+    let probes = probe_every_route(
+        &fixture.client,
+        &session,
+        Some((inferences.as_ref(), &mut attached)),
+    )
+    .await;
 
     assert_route_census(&probes);
     for probe in probes {
@@ -3274,6 +3405,7 @@ async fn an_authorized_peer_reaches_every_route() {
         }
     }
     fixture.shutdown().await;
+    inferences.assert_consumed_exactly(2);
 }
 
 /// The allowlist handed to the real HTTP gate is the whole operator statement,
