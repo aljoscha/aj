@@ -9901,6 +9901,144 @@ async fn shutdown_suppresses_a_task_wake_queued_behind_an_in_flight_command() {
     );
 }
 
+/// The host deadline escalates cleanup but does not transfer ownership. A
+/// detached driver that remains live past it keeps shutdown pending and the
+/// advisory lock held until the registry can publish terminal state.
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_past_escalation_for_detached_driver_and_lock_release() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let registry = handles.task_registry.clone();
+    let (task, _cancel, driver) = registry.register_driver(
+        AgentId::Main,
+        "staged-call".to_string(),
+        TaskKind::Bash {
+            command: "staged detached process".to_string(),
+        },
+        "staged detached process".to_string(),
+        Arc::new(FixedTaskOutput),
+    );
+    let (release, held) = tokio::sync::oneshot::channel();
+    driver.spawn(async move {
+        let _ = held.await;
+    });
+
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    for _ in 0..31 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    assert!(
+        !shutdown.is_finished(),
+        "the host reported shutdown while its detached driver remained live"
+    );
+    assert_eq!(registry.status(task), Some(TaskStatus::Running));
+    assert!(
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "shutdown released the advisory lock ahead of detached-driver completion"
+    );
+
+    release.send(()).expect("release staged detached driver");
+    bounded("shutdown to observe detached-driver completion", shutdown)
+        .await
+        .expect("shutdown task");
+    assert_eq!(registry.status(task), Some(TaskStatus::Killed));
+    assert!(registry.quiesce(Duration::ZERO).await);
+    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("the rival lock follows detached-driver completion");
+    drop(rival);
+}
+
+/// An idle release can hold the live-session map while it joins the session
+/// owner. If shutdown reaches its deadline on that lock, it still cannot report
+/// completion before the owner's detached-driver and advisory-lock fences.
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_past_a_map_deadline_for_complete_session_ownership() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let registry = handles.task_registry.clone();
+    let (task, _cancel, driver) = registry.register_driver(
+        AgentId::Main,
+        "staged-call".to_string(),
+        TaskKind::Bash {
+            command: "staged detached process".to_string(),
+        },
+        "staged detached process".to_string(),
+        Arc::new(FixedTaskOutput),
+    );
+    let (release, task_held) = tokio::sync::oneshot::channel();
+    driver.spawn(async move {
+        let _ = task_held.await;
+    });
+
+    let (map_entered, map_is_held) = tokio::sync::oneshot::channel();
+    let (map_release, hold_map) = tokio::sync::oneshot::channel();
+    let map_host = harness.host.clone();
+    let map_holder = tokio::spawn(async move {
+        map_host
+            .hold_session_map_for_test(map_entered, hold_map)
+            .await;
+    });
+    map_is_held.await.expect("session map hold established");
+
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    for _ in 0..31 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert!(
+        !shutdown.is_finished(),
+        "the host reported shutdown while the map still owned its session"
+    );
+    assert_eq!(registry.status(task), Some(TaskStatus::Running));
+    assert!(
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "the map timeout released the advisory lock before detached cleanup"
+    );
+
+    map_release.send(()).expect("release session map");
+    map_holder.await.expect("map holder task");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !shutdown.is_finished(),
+        "releasing the map bypassed the detached-driver ownership fence"
+    );
+    release.send(()).expect("release staged detached driver");
+    bounded("shutdown to finish complete map-held ownership", shutdown)
+        .await
+        .expect("shutdown task");
+    assert_eq!(registry.status(task), Some(TaskStatus::Killed));
+    assert!(registry.quiesce(Duration::ZERO).await);
+    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("the rival lock follows complete map-held ownership");
+    drop(rival);
+}
+
 /// A host cutoff can abort the session driver before it reaches `wind_down`.
 /// The session owner still cancels and reaps a real detached process before its
 /// advisory lock becomes available to a rival writer.

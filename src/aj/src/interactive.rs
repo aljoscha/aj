@@ -15201,7 +15201,7 @@ mod tests {
     /// about a task it did not see start, and it is what the frontend's task
     /// table is built from.
     async fn register_bash_task(world: &mut World, command: &str) -> aj_agent::tool::TaskId {
-        let (id, _cancel) = world.handles().task_registry.register_unowned_for_test(
+        let (id, cancel, driver) = world.handles().task_registry.register_driver(
             AgentId::Main,
             "test-call".to_string(),
             aj_agent::tool::TaskKind::Bash {
@@ -15210,6 +15210,9 @@ mod tests {
             command.to_string(),
             Arc::new(NoOutput),
         );
+        driver.spawn(async move {
+            cancel.cancelled().await;
+        });
         read_host_state(world).await;
         id
     }

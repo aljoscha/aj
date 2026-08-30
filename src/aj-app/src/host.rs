@@ -92,12 +92,14 @@ use fanout::Fanout;
 /// cumulative anyway (spec 6.8).
 const LIST_COALESCE: Duration = Duration::from_millis(200);
 
-/// Total grace for draining every session driver during host shutdown.
+/// Elapsed shutdown time at which unfinished ownership is reported. Currently
+/// 30 seconds. This boundary does not release or transfer that ownership.
 const HOST_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
-/// Time retained inside the total grace for forced session cleanup: detached
-/// task cancellation and the final persistence-writer fence, then Tokio join
-/// completion.
+/// Forced-cleanup reserve between inner-driver abortion and the reporting
+/// boundary. Currently 10 seconds, so inner drivers are aborted at 20 seconds
+/// (`HOST_SHUTDOWN_GRACE - HOST_ABORT_GRACE`) and their outer owners get this
+/// interval before the host reports that it is continuing to wait.
 const HOST_ABORT_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a session stays live with nothing running and nobody attached
@@ -1169,6 +1171,23 @@ impl SessionHost {
         self.directory().await
     }
 
+    /// Hold the live-session map until `release`, exposing entry through
+    /// `entered` once the hold is established.
+    ///
+    /// Test support for the shutdown branch an idle release exercises while it
+    /// joins a session owner. Production callers never coordinate on the map
+    /// directly.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn hold_session_map_for_test(
+        &self,
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    ) {
+        let _sessions = self.inner.sessions.lock().await;
+        let _ = entered.send(());
+        let _ = release.await;
+    }
+
     /// How many times the host has read its session store's `locks/`
     /// directory.
     ///
@@ -1402,10 +1421,10 @@ impl SessionHost {
     /// log given a bounded final flush. Its advisory lock is released only after
     /// the session owner has also reaped detached tasks and fenced old
     /// persistence listeners. Drivers wind down concurrently under one
-    /// host-wide deadline. A driver still running at the cutoff is named and
-    /// aborted. If its owner cannot finish by the total deadline, the owned
-    /// reaper and advisory lock survive this call and a warning names that
-    /// residue.
+    /// host-wide escalation point. A driver still running at the cutoff is
+    /// named and aborted. The call continues awaiting each outer owner after
+    /// that point because returning while its detached process driver or
+    /// advisory lock remains live would report a shutdown that has not happened.
     ///
     /// Terminal: every later request fails rather than rebuilding a session
     /// behind a driver nobody will ever tell to stop.
@@ -1509,9 +1528,10 @@ impl SessionHost {
                     Err(_) => {
                         tracing::warn!(
                             phase = "session map drain",
-                            "the live session map remained locked through the host deadline"
+                            "the live session map remained locked through the host deadline; continuing to await complete session ownership"
                         );
-                        return;
+                        let mut sessions = self.inner.sessions.lock().await;
+                        sessions.drain().map(|(_, entry)| entry).collect()
                     }
                 }
             }
@@ -1572,13 +1592,23 @@ impl SessionHost {
                 Err(_) => break,
             }
         }
-        for session in pending_reapers {
+        if !pending_reapers.is_empty() {
             tracing::warn!(
-                session,
+                sessions = ?pending_reapers,
                 phase = "session owner reap",
-                "session cleanup remained live at the host deadline; its owned reaper retains the advisory lock"
+                "session cleanup remained live at the host deadline; continuing to await detached drivers and advisory-lock release"
             );
         }
+        // The deadline is an escalation and reporting boundary, not an
+        // ownership boundary. Each outer owner holds the advisory lock and the
+        // registry's process-reap fence, so dropping these joins would let
+        // shutdown return while work still reports Running and a rival writer
+        // still cannot acquire the session.
+        while let Some(joined) = drivers.join_next().await {
+            remove_joined_session(&mut pending_reapers, &joined);
+            warn_driver_join(joined);
+        }
+        debug_assert!(pending_reapers.is_empty());
         self.inner
             .session_stops
             .lock()
