@@ -62,7 +62,11 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    fn read(code: &str, lock_generation: Option<u64>) -> Self {
+    /// Classify a peer refusal from its wire code and optional lock generation.
+    ///
+    /// Unknown codes deliberately use [`Self::Other`], whose recovery waits for
+    /// the session row to leave and return instead of assuming lock semantics.
+    pub fn from_code(code: &str, lock_generation: Option<u64>) -> Self {
         if code == "locked" {
             Self::Locked {
                 generation: lock_generation,
@@ -79,6 +83,84 @@ impl Refusal {
             Self::Locked { generation } => generation,
             Self::Other => None,
         }
+    }
+}
+
+/// Action-local rows that must survive each attempt to project an accepted
+/// head switch.
+#[derive(Clone, Debug, Default)]
+struct RecoveryRows {
+    peer_error: Option<String>,
+    warning: Option<String>,
+}
+
+impl RecoveryRows {
+    fn restore(&self, chat: &mut ChatState, lifecycle: &mut AgentLifecycle) {
+        if let Some(text) = &self.peer_error {
+            let _ = reduce(
+                chat,
+                lifecycle,
+                AgentEvent::Error {
+                    agent_id: AgentId::Main,
+                    text: text.clone(),
+                },
+                None,
+            );
+        }
+        if let Some(text) = &self.warning {
+            let _ = reduce(
+                chat,
+                lifecycle,
+                AgentEvent::Warning {
+                    agent_id: AgentId::Main,
+                    text: text.clone(),
+                },
+                None,
+            );
+        }
+    }
+}
+
+/// A head switch whose authoritative attach block still has to replace the
+/// current projection.
+///
+/// The phase prevents an unrelated `caught_up` from discharging the reset. A
+/// refusal or interrupted block returns it to `Awaiting`, preserving its rows
+/// for the next attempt, and only a caught-up block opened under `Applying`
+/// completes it.
+#[derive(Debug)]
+enum ForwardReset {
+    Awaiting(RecoveryRows),
+    Applying(RecoveryRows),
+}
+
+impl ForwardReset {
+    fn rows(&self) -> &RecoveryRows {
+        match self {
+            Self::Awaiting(rows) | Self::Applying(rows) => rows,
+        }
+    }
+
+    fn rows_mut(&mut self) -> &mut RecoveryRows {
+        match self {
+            Self::Awaiting(rows) | Self::Applying(rows) => rows,
+        }
+    }
+
+    fn start_applying(&mut self) {
+        if let Self::Awaiting(rows) = self {
+            *self = Self::Applying(std::mem::take(rows));
+        }
+    }
+
+    fn retry(&mut self) {
+        if let Self::Applying(rows) = self {
+            *self = Self::Awaiting(std::mem::take(rows));
+        }
+    }
+
+    fn is_applying(&self) -> bool {
+        matches!(self, Self::Applying(_))
     }
 }
 
@@ -128,6 +210,17 @@ pub struct SessionClient {
     needs_task_refetch: bool,
     needs_queue_refetch: bool,
     needs_reattach: bool,
+    /// Present after an accepted Head command until its authoritative attach
+    /// block is caught up. While present, every block opening resets the chat
+    /// even when a refusal cleared `epoch`, and restores action-local recovery
+    /// rows before durable backfill starts.
+    forward_reset: Option<ForwardReset>,
+    /// A refusal cleared the epoch while leaving last-known chat visible. The
+    /// next block replaces that cache and restores this exact local error ahead
+    /// of the new authoritative backfill.
+    refusal_error: Option<String>,
+    /// A one-shot frontend signal for each forced projection replacement.
+    forced_replacement_opened: bool,
     /// Refused, and nothing is asking again yet, carrying the reason so the
     /// directory knows which edge re-asks.
     ///
@@ -157,6 +250,9 @@ impl SessionClient {
             needs_task_refetch: false,
             needs_queue_refetch: false,
             needs_reattach: false,
+            forward_reset: None,
+            refusal_error: None,
+            forced_replacement_opened: false,
             withheld: None,
         }
     }
@@ -336,6 +432,16 @@ impl SessionClient {
                 // both tables have to come from their reads (spec 6.7).
                 self.needs_task_refetch = true;
                 self.needs_queue_refetch = true;
+                if self
+                    .forward_reset
+                    .as_ref()
+                    .is_some_and(ForwardReset::is_applying)
+                {
+                    // Only a block opened as the forced replacement can
+                    // discharge it. The restored rows stay in this projection,
+                    // but no later epoch reset should resurrect them.
+                    self.forward_reset = None;
+                }
                 Redraw(true)
             }
             Frame::Error {
@@ -365,7 +471,7 @@ impl SessionClient {
                 // the day something does it arrives on the unknown-code path and
                 // tears the attachment down over a turn that failed. Telling
                 // that kind from a refusal is the branch this arm still owes.
-                self.drop_attachment(Refusal::read(&code, lock_generation));
+                self.drop_attachment(Refusal::from_code(&code, lock_generation), message.clone());
                 // The message verbatim, which spec 6.6 makes sufficient on its
                 // own, so a code this build has never heard of still reads.
                 reduce(
@@ -491,6 +597,55 @@ impl SessionClient {
         self.needs_reattach
     }
 
+    /// Record that a Head command took and the current projection is now
+    /// necessarily behind the session.
+    ///
+    /// The next attach block replaces the chat even if a refusal clears the
+    /// client's epoch before that block arrives. The obligation remains across
+    /// refused and interrupted attempts until one forced block is caught up.
+    pub fn prepare_committed_head(&mut self) {
+        self.forward_reset = Some(ForwardReset::Awaiting(RecoveryRows::default()));
+        self.owe_reattach();
+    }
+
+    /// Retain the local rows explaining why an accepted Head command is not yet
+    /// reflected by the projection.
+    ///
+    /// `peer_error` is the peer's exact text when the failed follow produced an
+    /// error frame. `None` preserves any exact error retained by an earlier
+    /// attempt. `warning` is the frontend's action-level explanation. The rows
+    /// are restored, in that order, whenever the pending replacement resets the
+    /// chat and before its durable backfill is folded.
+    ///
+    /// This is inert without a pending accepted Head command. It only retains
+    /// rows, so the caller still folds the warning into the current projection
+    /// when reporting the failure.
+    pub fn recover_committed_head(&mut self, peer_error: Option<String>, warning: String) {
+        let Some(reset) = &mut self.forward_reset else {
+            return;
+        };
+        if peer_error.is_some() {
+            // The one-shot action handler is transferring this refusal into the
+            // forward-reset rows. A later value in `refusal_error` then really
+            // is a newer passive recovery answer.
+            self.refusal_error = None;
+        }
+        let rows = reset.rows_mut();
+        if let Some(peer_error) = peer_error {
+            rows.peer_error = Some(peer_error);
+        }
+        rows.warning = Some(warning);
+    }
+
+    /// Take the signal that a forced projection replacement opened.
+    ///
+    /// A frontend uses this to retire terminal image ids from the projection
+    /// that [`ChatState::reset`] discarded. Each forced opening raises the
+    /// signal again, including a retry after an interrupted block.
+    pub fn take_forced_replacement_opened(&mut self) -> bool {
+        std::mem::take(&mut self.forced_replacement_opened)
+    }
+
     /// Where this client stands on an attach block.
     ///
     /// This is what a caller folding a block waits on, and it is the client's
@@ -552,6 +707,9 @@ impl SessionClient {
     /// [`Self::apply`]'s `error` arm).
     pub fn abandon_attach(&mut self) {
         self.attach = Attach::Live;
+        if let Some(reset) = &mut self.forward_reset {
+            reset.retry();
+        }
         self.owe_reattach();
     }
 
@@ -577,11 +735,15 @@ impl SessionClient {
     /// Deliberately not what a `reset` does. That one says continuity broke on a
     /// session the server still has, so its obligation stands and is discharged
     /// at once.
-    fn drop_attachment(&mut self, refusal: Refusal) {
+    fn drop_attachment(&mut self, refusal: Refusal, message: String) {
         self.attach = Attach::Live;
         self.epoch = None;
         self.committed = None;
         self.applied = None;
+        if let Some(reset) = &mut self.forward_reset {
+            reset.retry();
+        }
+        self.refusal_error = Some(message);
         self.needs_reattach = false;
         self.withheld = Some(refusal);
     }
@@ -589,23 +751,73 @@ impl SessionClient {
     /// Adopt the epoch of the attach block this client asked for, and
     /// prepare `chat` for the backfill that follows.
     fn open_attach_block(&mut self, chat: &mut ChatState, epoch: String) {
-        match &self.epoch {
-            Some(current) if *current == epoch => {
-                // A re-attach into the epoch we already applied under: the
-                // suffix re-projects entries we saw only partly live, so
-                // the transient detail painted around them goes first.
-                chat.quiesce(&mut self.lifecycle);
+        if let Some(reset) = &mut self.forward_reset
+            && let Some(latest_refusal) = self.refusal_error.take()
+        {
+            // Action presentation is one-shot, while forward recovery may be
+            // refused repeatedly. The authoritative replacement retains the
+            // latest peer answer even after the pending action was consumed.
+            reset.rows_mut().peer_error = Some(latest_refusal);
+            // The old guidance may describe a different refusal class. Without
+            // an action context to word the new one, retaining only the exact
+            // latest peer answer is safer than restoring stale advice.
+            reset.rows_mut().warning = None;
+        }
+        let forced_recovery = self.forward_reset.as_mut().map(|reset| {
+            reset.start_applying();
+            reset.rows().clone()
+        });
+        if let Some(recovery) = forced_recovery {
+            // An accepted Head command is stronger evidence than the local
+            // epoch. In particular, a refusal clears that epoch without making
+            // the projection current again, so the authoritative block must
+            // still replace everything the abandoned branch built.
+            chat.reset(&mut self.lifecycle);
+            self.committed = None;
+            self.applied = None;
+            self.refusal_error = None;
+            self.forced_replacement_opened = true;
+            // These rows explain the action that caused the replacement. They
+            // are local rather than durable, so a reset has to put them back
+            // before replay starts or an interrupted retry would erase them.
+            recovery.restore(chat, &mut self.lifecycle);
+        } else if let Some(error) = self.refusal_error.take() {
+            // Refusal deliberately keeps the last-known transcript visible but
+            // clears its epoch. The next full block can name another branch, so
+            // first-attach append semantics would merge two authoritative
+            // histories. Replace the cache before applying the new block.
+            chat.reset(&mut self.lifecycle);
+            self.committed = None;
+            self.applied = None;
+            self.forced_replacement_opened = true;
+            let _ = reduce(
+                chat,
+                &mut self.lifecycle,
+                AgentEvent::Error {
+                    agent_id: AgentId::Main,
+                    text: error,
+                },
+                None,
+            );
+        } else {
+            match &self.epoch {
+                Some(current) if *current == epoch => {
+                    // A re-attach into the epoch we already applied under: the
+                    // suffix re-projects entries we saw only partly live, so
+                    // the transient detail painted around them goes first.
+                    chat.quiesce(&mut self.lifecycle);
+                }
+                Some(_) => {
+                    // A different epoch. Our seqs, and everything we derived
+                    // from them, describe a history this session no longer
+                    // has, so the fold restarts from the full backfill.
+                    chat.reset(&mut self.lifecycle);
+                    self.committed = None;
+                    self.applied = None;
+                }
+                // A first attach has nothing of its own to quiesce.
+                None => {}
             }
-            Some(_) => {
-                // A different epoch. Our seqs, and everything we derived
-                // from them, describe a history this session no longer
-                // has, so the fold restarts from the full backfill.
-                chat.reset(&mut self.lifecycle);
-                self.committed = None;
-                self.applied = None;
-            }
-            // A first attach has nothing of its own to quiesce.
-            None => {}
         }
         self.epoch = Some(epoch);
         self.attach = Attach::Applying;
@@ -831,6 +1043,22 @@ mod tests {
         notices_at(chat, NoticeLevel::Info)
     }
 
+    /// Every Main notice row in projection order.
+    fn notice_rows(chat: &ChatState) -> Vec<(NoticeLevel, String)> {
+        chat.transcript(AgentId::Main)
+            .map(|transcript| {
+                transcript
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| match &entry.kind {
+                        EntryKind::Notice(notice) => Some((notice.level, notice.text.clone())),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Whether an unfinalized streaming row is open in the Main
     /// transcript.
     fn streaming(chat: &ChatState) -> bool {
@@ -1048,6 +1276,197 @@ mod tests {
                 epoch: "epoch-2".to_string(),
                 seq: 1,
             }),
+        );
+    }
+
+    /// An accepted Head command is authoritative even if its first follow is
+    /// refused and clears the epoch. Each later attempt replaces the abandoned
+    /// branch, puts the action-local failure rows back before replay, and keeps
+    /// that obligation until one whole block commits.
+    #[test]
+    fn an_accepted_head_replaces_after_refusal_and_keeps_recovery_rows_through_retry() {
+        const HEAD_EPOCH: &str = "epoch-after-head";
+        const PEER_ERROR: &str = "session session-1 is temporarily unavailable";
+        const WARNING: &str =
+            "The branch switch was not served through. Reconnecting to the switched branch.";
+
+        let (mut client, mut chat) = attached();
+        let _ = client.apply(
+            &mut chat,
+            durable(EPOCH, 3, "old-entry", notice("the abandoned branch")),
+        );
+
+        client.prepare_committed_head();
+        assert!(
+            client.needs_reattach(),
+            "accepting Head makes its authoritative projection owed",
+        );
+        client.expect_attach();
+        let _ = client.apply(&mut chat, refusal(SESSION, "unknown_session", PEER_ERROR));
+        assert_eq!(client.cursor(), None, "the refusal cleared the epoch");
+        assert_eq!(notices(&chat), vec!["the abandoned branch"]);
+
+        // The refusal frame already painted the peer's exact error. The
+        // frontend paints its warning and retains both so a later replacement
+        // can reconstruct these local, non-durable rows.
+        client.recover_committed_head(Some(PEER_ERROR.to_string()), WARNING.to_string());
+        let _ = client.apply_local(
+            &mut chat,
+            AgentEvent::Warning {
+                agent_id: AgentId::Main,
+                text: WARNING.to_string(),
+            },
+        );
+
+        // The directory edge says the refusal may now succeed. Despite the
+        // missing epoch, the Head obligation makes this a replacement rather
+        // than a first attach that appends to the abandoned branch.
+        client.owe_reattach();
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(HEAD_EPOCH, false));
+        assert!(client.take_forced_replacement_opened());
+        assert!(
+            !client.take_forced_replacement_opened(),
+            "the frontend signal is one-shot per opening",
+        );
+        assert_eq!(notices(&chat), Vec::<String>::new());
+        assert_eq!(errors(&chat), vec![PEER_ERROR]);
+        assert_eq!(notices_at(&chat, NoticeLevel::Warning), vec![WARNING]);
+
+        let _ = client.apply(
+            &mut chat,
+            durable(HEAD_EPOCH, 1, "partial", notice("partial attempt")),
+        );
+        let _ = client.apply(
+            &mut chat,
+            Frame::Reset {
+                session: SESSION.to_string(),
+            },
+        );
+        client.abandon_attach();
+        // This interruption supplied no peer error of its own. Retaining its
+        // warning must not erase the exact refusal text from the earlier try.
+        client.recover_committed_head(None, WARNING.to_string());
+
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(HEAD_EPOCH, false));
+        assert!(
+            client.take_forced_replacement_opened(),
+            "an interrupted replacement raises a fresh retirement signal",
+        );
+        assert_eq!(
+            notice_rows(&chat),
+            vec![
+                (NoticeLevel::Error, PEER_ERROR.to_string()),
+                (NoticeLevel::Warning, WARNING.to_string()),
+            ],
+            "the retry discarded partial backfill and restored each recovery row once",
+        );
+
+        let _ = client.apply(
+            &mut chat,
+            durable(HEAD_EPOCH, 2, "committed", notice("the switched branch")),
+        );
+        let _ = client.apply(&mut chat, caught_up(HEAD_EPOCH, 2));
+        assert_eq!(
+            notice_rows(&chat),
+            vec![
+                (NoticeLevel::Error, PEER_ERROR.to_string()),
+                (NoticeLevel::Warning, WARNING.to_string()),
+                (NoticeLevel::Info, "the switched branch".to_string()),
+            ],
+            "recovery rows precede the committed branch's durable backfill",
+        );
+        assert_eq!(
+            client.cursor(),
+            Some(Cursor {
+                epoch: HEAD_EPOCH.to_string(),
+                seq: 2,
+            }),
+            "the authoritative branch landed and committed",
+        );
+
+        // CaughtUp discharges the forward reset and its retained rows. A later
+        // ordinary epoch replacement must neither restore them nor raise the
+        // forced-replacement signal.
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state("later-epoch", false));
+        assert_eq!(notice_rows(&chat), Vec::new());
+        assert!(!client.take_forced_replacement_opened());
+    }
+
+    /// A refusal leaves last-known chat visible, but clears the epoch. The next
+    /// full block may represent a branch another writer selected, so it replaces
+    /// that cache and restores only the local refusal ahead of new history.
+    #[test]
+    fn a_refused_cached_session_replaces_old_branch_rows_on_rejoin() {
+        let (mut client, mut chat) = attached();
+        let _ = client.apply(
+            &mut chat,
+            durable(EPOCH, 1, "old-branch", notice("old branch only")),
+        );
+        let reason = "another writer held this session";
+        client.expect_attach();
+        let _ = client.apply(&mut chat, refusal(SESSION, "locked", reason));
+        assert_eq!(notices(&chat), vec!["old branch only"]);
+        assert_eq!(errors(&chat), vec![reason]);
+
+        client.owe_reattach();
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state("new-branch", false));
+        assert!(
+            client.take_forced_replacement_opened(),
+            "the frontend was not told to retire stale projection artifacts",
+        );
+        let _ = client.apply(
+            &mut chat,
+            durable("new-branch", 1, "new-branch", notice("new branch only")),
+        );
+        let _ = client.apply(&mut chat, caught_up("new-branch", 1));
+
+        assert_eq!(
+            notices(&chat),
+            vec!["new branch only"],
+            "the old branch survived the authoritative full backfill",
+        );
+        assert_eq!(
+            errors(&chat),
+            vec![reason],
+            "the action-local refusal vanished with the stale cache",
+        );
+        assert_eq!(
+            client.cursor(),
+            Some(Cursor {
+                epoch: "new-branch".to_string(),
+                seq: 1,
+            }),
+        );
+    }
+
+    /// Forward recovery outlives action presentation. If a later attempt is
+    /// refused too, the final replacement carries the latest peer answer rather
+    /// than restoring an older cached reason.
+    #[test]
+    fn accepted_head_recovery_retains_a_later_refusal_after_the_action_settles() {
+        let (mut client, mut chat) = attached();
+        client.prepare_committed_head();
+        client.recover_committed_head(None, "recovering the accepted Head".to_string());
+
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state("first-recovery", false));
+        let latest = "the later recovery attempt was refused";
+        let _ = client.apply(&mut chat, refusal(SESSION, "locked", latest));
+
+        client.owe_reattach();
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state("final-recovery", false));
+        let _ = client.apply(&mut chat, caught_up("final-recovery", 0));
+
+        assert_eq!(errors(&chat), vec![latest]);
+        assert_eq!(
+            notices_at(&chat, NoticeLevel::Warning),
+            Vec::<String>::new(),
+            "guidance from the earlier failure survived a later refusal",
         );
     }
 

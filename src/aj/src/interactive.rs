@@ -10,7 +10,7 @@
 //! [`TranscriptView`] renders it with follow-tail.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,12 +27,14 @@ use aj_app::cli::args::{
     Args, Command as CliCommand, ENV_WITHOUT_A_CREATE, HOST_WITHOUT_A_CREATE, TAG_WITHOUT_A_CREATE,
     THINKING_WITHOUT_A_CREATE,
 };
-use aj_app::client::{Attach, SessionClient};
+use aj_app::client::{Attach, Refusal, SessionClient};
 use aj_app::commands::CommandAction;
 use aj_app::directory::SessionDirectory;
+#[cfg(test)]
+use aj_app::host::AttachRequest;
 use aj_app::host::{
-    AttachRequest, Command, CommandOutcome, CreateError, HeadTarget, LocalHandles, QueueOp,
-    SettingsAxis, SettingsChange,
+    Command, CommandOutcome, CreateError, HeadTarget, LocalHandles, QueueOp, SettingsAxis,
+    SettingsChange,
 };
 use aj_app::keybindings::fixed_keys;
 use aj_app::session::{SessionExit, SessionRequest};
@@ -141,9 +143,13 @@ struct World {
     /// transcript for each session this client attached. Which one is focused
     /// lives here too, so it cannot drift from the fold that serves it.
     directory: SessionDirectory,
-    /// The one stream serving every attached session. Changing the attach set
-    /// means reopening it (spec 6.5), which is what a first focus does.
-    stream: Stream,
+    /// The one stream serving every attached session. `None` while the selected
+    /// session is disconnected and an open or retry is pending.
+    ///
+    /// Changing the attach set means reopening the stream (spec 6.5). Keeping
+    /// absence explicit lets a focus gesture close the prior stream before it
+    /// asks for the selected target, without manufacturing a placeholder stream.
+    stream: Option<Stream>,
     /// Paces the retry of the reads an attach block obliges, so a peer that
     /// fails them cannot make the loop spend every iteration in a request
     /// (see [`refresh_client_reads`]).
@@ -164,6 +170,18 @@ struct World {
     /// Where this client stands with its host. Mirrored into the status chrome
     /// by [`sync_status`].
     connection: Connection,
+    /// The selected session's in-flight stream recovery. Kept on the world so
+    /// leaving and re-entering the drive loop for a refused same-session action
+    /// cannot discard the only owner of an arriving attach block.
+    resume: Option<Resume>,
+    /// The user action waiting for the selected session's own Caught. Consumed
+    /// by its first terminal outcome so passive recovery cannot emit delayed
+    /// action success or failure feedback.
+    transition: Option<PendingTransition>,
+    /// Local startup rows owed by the first Caught after a cross-session focus.
+    /// Separate from action feedback so a failed action followed by passive
+    /// recovery still receives its session's context and restore notices.
+    startup: HashMap<String, PendingStartup>,
     /// The chat model, shared with the [`TranscriptView`]. Only the
     /// loop mutates it (via the client fold and the arm helpers). The view
     /// reads it at draw time. Never borrowed across an await.
@@ -304,11 +322,14 @@ async fn build_world(
     let mut world = World {
         control,
         directory,
-        stream,
+        stream: Some(stream),
         reads_retry: Retry::default(),
         local: Some(handles),
         working_directory: env.working_directory.clone(),
         connection: Connection::Connected,
+        resume: None,
+        transition: None,
+        startup: HashMap::new(),
         chat: Rc::new(RefCell::new(chat)),
         status: Rc::new(RefCell::new(StatusState::default())),
         config,
@@ -451,13 +472,16 @@ async fn build_connect_world(
     let mut world = World {
         control,
         directory,
-        stream,
+        stream: Some(stream),
         reads_retry: Retry::default(),
         local: None,
         // The host's directory, not ours: the session runs there, and its
         // `@file` completions and tool output all name paths on that machine.
         working_directory: working_directory.unwrap_or_default(),
         connection: Connection::Connected,
+        resume: None,
+        transition: None,
+        startup: HashMap::new(),
         chat: Rc::new(RefCell::new(chat)),
         status: Rc::new(RefCell::new(StatusState::default())),
         config,
@@ -573,6 +597,21 @@ impl World {
         self.directory.focused()
     }
 
+    /// The live stream. Call only while this world's connection state says one
+    /// has been opened.
+    fn stream(&self) -> &Stream {
+        self.stream
+            .as_ref()
+            .expect("a live connection state owns a stream")
+    }
+
+    /// The live stream, mutably.
+    fn stream_mut(&mut self) -> &mut Stream {
+        self.stream
+            .as_mut()
+            .expect("a live connection state owns a stream")
+    }
+
     /// The focused session's fold, and the owner of its agent lifecycle,
     /// cursor, and settings view.
     fn client(&self) -> &SessionClient {
@@ -584,8 +623,8 @@ impl World {
         self.directory.client_mut()
     }
 
-    /// Give up on the focused session's attach block, answering `false` so a
-    /// caller can end its fold on this call.
+    /// Give up on the focused session's attach block with the local reason its
+    /// phase establishes.
     ///
     /// The arm is the only record that a block is outstanding, so dropping the
     /// wait without taking it back leaves the session armed for a block nobody
@@ -593,8 +632,20 @@ impl World {
     /// block's opening and the cursor would stop advancing (see
     /// [`SessionClient::abandon_attach`]).
     fn abandon_attach_block(&mut self) -> CatchUp {
-        self.client_mut().abandon_attach();
-        CatchUp::Stalled
+        let stalled = match self.client().attach_phase() {
+            Attach::Live => AttachStall::Unserved,
+            Attach::Requested => AttachStall::NotStarted,
+            Attach::Applying => AttachStall::Silent,
+        };
+        self.stall_attach(stalled)
+    }
+
+    /// End an outstanding attach attempt without inventing a peer refusal.
+    fn stall_attach(&mut self, stalled: AttachStall) -> CatchUp {
+        if self.client().attach_phase() != Attach::Live {
+            self.client_mut().abandon_attach();
+        }
+        CatchUp::Stalled(stalled)
     }
 }
 
@@ -644,65 +695,6 @@ async fn open_stream(
     Ok(stream)
 }
 
-/// Attach the working set a focus on `session` will leave, falling back to
-/// `session` alone if the whole set is refused.
-///
-/// An attach is all-or-nothing (spec 6.5), and the set is requested on every
-/// reopen, so one background session the host will not serve would otherwise
-/// refuse every reopen for every session, including the one the user is looking
-/// at. A session that cannot be attached has no business holding the client
-/// hostage, so it falls out of the working set the same way a displaced one
-/// does. The narrowed attach is the retry, not a second refusal to report: if
-/// that fails too, the reason is about the session being focused and the caller
-/// words it.
-///
-/// The sessions dropped this way are not named here. Their entries stay in the
-/// directory folding nothing, and the next reopen offers them again, so a
-/// transient refusal costs one narrowed attach rather than a permanent
-/// eviction.
-async fn attach_admitting(world: &World, session: &str) -> Result<Attachment, ControlError> {
-    let requests = world.directory.attach_requests(Some(session));
-    match world.control.attach_all(&requests).await {
-        Ok(stream) => Ok(Attachment {
-            stream,
-            narrowed: false,
-        }),
-        Err(_) if requests.len() > 1 => {
-            tracing::warn!(
-                "attaching {} session(s) was refused, narrowing to {session}",
-                requests.len(),
-            );
-            // Keep the cursor the wide attach would have offered, so the
-            // narrowed one still resumes incrementally rather than replaying
-            // the session from its start.
-            let narrowed = requests
-                .into_iter()
-                .find(|request| request.session == session)
-                .unwrap_or_else(|| AttachRequest {
-                    session: session.to_string(),
-                    cursor: None,
-                });
-            let stream = world.control.attach_all(&[narrowed]).await?;
-            Ok(Attachment {
-                stream,
-                narrowed: true,
-            })
-        }
-        Err(err) => Err(err),
-    }
-}
-
-/// A freshly opened stream, and whether the peer refused to serve the whole
-/// working set so the attach had to narrow to the one session being focused.
-///
-/// The flag is load-bearing: a narrowed attach leaves every other member
-/// detached on the peer, and the client has to be told so it re-attaches them
-/// later rather than swapping onto a view nothing feeds.
-struct Attachment {
-    stream: Stream,
-    narrowed: bool,
-}
-
 /// Read the focused session's tree from the host and open the tree overlay
 /// over it, answering the built select.
 ///
@@ -732,10 +724,19 @@ async fn open_tree_overlay(
 /// for the loop's frame arm, which is the one place a lost stream is handled.
 fn fold_ready_frames(world: &mut World) -> bool {
     let mut redraw = false;
-    while let Some(frame) = world.stream.try_recv() {
+    while let Some(frame) = world.stream_mut().try_recv() {
         redraw |= world.directory.apply(&mut world.chat.borrow_mut(), frame).0;
     }
     redraw
+}
+
+/// Receive from an optional stream. A disconnected world has no stream and
+/// leaves this future pending while its resume state owns the next open.
+async fn recv_stream(stream: Option<&mut Stream>) -> ControlFrame {
+    match stream {
+        Some(stream) => stream.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// What became of the attach block a catch-up was waiting for.
@@ -745,18 +746,61 @@ fn fold_ready_frames(world: &mut World) -> bool {
 /// cannot succeed now, so the directory's own rule is what asks again, when the
 /// session's row says the answer can have changed
 /// ([`aj_app::directory::SessionDirectory::rejoin_edges_fired`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CatchUp {
     /// The block arrived whole and its `caught_up` committed it.
     Caught,
     /// A refusal replaced the block (spec 6.5). The stream is live, the fold has
     /// dropped the attachment and folded what that costs, and nothing here asks
     /// again.
-    Refused,
+    Refused { reason: String, refusal: Refusal },
     /// The block stopped arriving: the stream failed, it was abandoned, or it
     /// went quiet about the session past the deadline. The caller owes another
     /// attach.
-    Stalled,
+    Stalled(AttachStall),
+}
+
+/// Why an attach produced no complete block when the peer sent no refusal
+/// message of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AttachStall {
+    /// The stream's served set did not arm the selected session.
+    Unserved,
+    /// The peer accepted and armed the request but never opened its block.
+    NotStarted,
+    /// The block opened, then sent nothing about the session through its bound.
+    Silent,
+    /// A reset superseded the block before it reached `caught_up`.
+    Reset,
+    /// The event stream closed before the block completed.
+    StreamClosed,
+    /// The transport failed before the block completed, in its own words.
+    StreamLost(String),
+}
+
+impl AttachStall {
+    fn reason(&self) -> String {
+        match self {
+            Self::Unserved => "the peer did not serve the selected session".to_string(),
+            Self::NotStarted => {
+                "the peer did not start the selected session's attach block".to_string()
+            }
+            Self::Silent => {
+                "the selected session's attach block went silent before it caught up".to_string()
+            }
+            Self::Reset => {
+                "the selected session reset before its attach block caught up".to_string()
+            }
+            Self::StreamClosed => {
+                "the selected session's event stream closed before its attach block caught up"
+                    .to_string()
+            }
+            Self::StreamLost(reason) => format!(
+                "the selected session's event stream failed before its attach block caught up: \
+                 {reason}"
+            ),
+        }
+    }
 }
 
 /// The fold of one attach block as it arrives, frame by frame.
@@ -829,18 +873,19 @@ impl Block {
     /// and not one this fold was owed. No re-attach is taken back either, or a
     /// plain view swap would ask for one.
     fn open(world: &World) -> Block {
-        let silence = world.stream.silence();
+        let silence = world.stream().silence();
         Block {
             session: world.session().to_string(),
             silence,
             deadline: Instant::now() + silence,
-            settled: (world.client().attach_phase() == Attach::Live).then_some(CatchUp::Stalled),
+            settled: (world.client().attach_phase() == Attach::Live)
+                .then_some(CatchUp::Stalled(AttachStall::Unserved)),
         }
     }
 
     /// What became of the block, `None` while it is still arriving.
     fn settled(&self) -> Option<CatchUp> {
-        self.settled
+        self.settled.clone()
     }
 
     /// When the block counts as having stopped arriving, for the driver that
@@ -867,15 +912,20 @@ impl Block {
     /// painting driver is the caller's to do once, after the fold.
     async fn fold_through(&mut self, world: &mut World) -> CatchUp {
         loop {
-            if let Some(caught) = self.settled {
+            if let Some(caught) = self.settled.clone() {
                 return caught;
             }
-            match tokio::time::timeout_at(self.deadline.into(), world.stream.recv()).await {
+            match tokio::time::timeout_at(self.deadline.into(), world.stream_mut().recv()).await {
                 Ok(ControlFrame::Frame(frame)) => {
                     self.fold(world, frame);
                 }
-                // The block went quiet, or the stream is gone.
-                _ => self.settle(world.abandon_attach_block()),
+                Ok(ControlFrame::Lost(err)) => {
+                    self.settle(world.stall_attach(AttachStall::StreamLost(err.to_string())))
+                }
+                Ok(ControlFrame::Closed) => {
+                    self.settle(world.stall_attach(AttachStall::StreamClosed));
+                }
+                Err(_) => self.settle(world.abandon_attach_block()),
             }
         }
     }
@@ -897,7 +947,7 @@ impl Block {
     /// nothing, which is the same worst case as not trying.
     fn fold_ready(&mut self, world: &mut World) {
         while self.settled.is_none() {
-            let Some(frame) = world.stream.try_recv() else {
+            let Some(frame) = world.stream_mut().try_recv() else {
                 return;
             };
             self.fold(world, frame);
@@ -933,6 +983,15 @@ impl Block {
             };
         }
         let mine = frame.session() == Some(self.session.as_str());
+        let refusal = match &frame {
+            aj_wire::Frame::Error {
+                code,
+                message,
+                lock_generation,
+                ..
+            } if mine => Some((message.clone(), Refusal::from_code(code, *lock_generation))),
+            _ => None,
+        };
         // Spec 6.5: a `reset` mid-block abandons the block. Folded first,
         // because folding is what records the re-attach it asks for.
         let abandons = mine && matches!(frame, aj_wire::Frame::Reset { .. });
@@ -942,8 +1001,10 @@ impl Block {
         let armed = world.client().attach_phase();
         let redraw = world.directory.apply(&mut world.chat.borrow_mut(), frame).0;
         let phase = world.client().attach_phase();
-        if abandons {
-            self.settle(world.abandon_attach_block());
+        if let Some((reason, refusal)) = refusal {
+            self.settle(CatchUp::Refused { reason, refusal });
+        } else if abandons {
+            self.settle(world.stall_attach(AttachStall::Reset));
         } else if phase == Attach::Live {
             // The block is over and the cursor says how it went: a `caught_up`
             // commits one, and the refusal that replaces a block drops
@@ -956,7 +1017,7 @@ impl Block {
             let caught = if world.client().cursor().is_some() {
                 CatchUp::Caught
             } else {
-                CatchUp::Refused
+                CatchUp::Stalled(AttachStall::Silent)
             };
             self.settle(caught);
         }
@@ -1092,24 +1153,6 @@ fn session_subject(session: &str, tag: Option<&str>) -> String {
     }
 }
 
-/// What a refused session switch tells the user: one subject, named the way
-/// the user knows the session, one cause, and the attempted action carried by
-/// the verb.
-///
-/// The peer words a refusal as a whole sentence about the session, so
-/// composing one with a "failed to switch to <id>" of our own would name the
-/// session twice. Where the peer's sentence opens with the session we asked
-/// about, its subject comes off and ours goes in front. Where it does not,
-/// the peer's sentence stands as it is: it names its own subject, and
-/// re-subjecting a sentence we did not recognize would be a guess.
-fn switch_refusal(session: &str, tag: Option<&str>, err: &ControlError) -> String {
-    let message = peer_refusal(err);
-    match message.strip_prefix(&format!("session {session} ")) {
-        Some(cause) => format!("Can't switch: {} {cause}.", session_subject(session, tag)),
-        None => format!("Can't switch: {message}."),
-    }
-}
-
 /// The peer's own words for a refusal, without the transport wrapper a
 /// connection puts around them.
 ///
@@ -1122,6 +1165,61 @@ fn peer_refusal(err: &ControlError) -> String {
         ControlError::Remote(RemoteError::Status { message, .. }) => message.clone(),
         _ => err.to_string(),
     }
+}
+
+/// The peer or local condition that kept a selected session from reaching
+/// `caught_up`, in the wording used by the action toast.
+fn attach_failure_reason(caught: &CatchUp) -> String {
+    match caught {
+        CatchUp::Refused { reason, .. } => reason.clone(),
+        CatchUp::Stalled(stalled) => stalled.reason(),
+        CatchUp::Caught => panic!("a caught attach is not a failure"),
+    }
+}
+
+/// Report a created session that exists but this client could not follow.
+fn created_session_failure(session: &str, partial: Option<&str>, reason: &str) -> String {
+    match partial {
+        Some(partial) => format!(
+            "Session {session} was created with a warning: {partial} It remains selected, but \
+             this client could not follow it: {reason}."
+        ),
+        None => format!(
+            "Session {session} was created and remains selected, but this client could not \
+             follow it: {reason}."
+        ),
+    }
+}
+
+/// Report a selected session that this client did not reach through Caught.
+fn selected_session_failure(session: &str, tag: Option<&str>, reason: &str) -> String {
+    format!(
+        "Can't follow {}: {reason}. It remains selected.",
+        session_subject(session, tag)
+    )
+}
+
+/// A user-requested transition whose success and usability wait for the
+/// selected session's own Caught.
+enum PendingTransition {
+    Create {
+        session: String,
+        partial: Option<String>,
+    },
+    Switch {
+        session: String,
+        tag: Option<String>,
+    },
+    Head {
+        branching: bool,
+        prompt: Option<String>,
+    },
+}
+
+struct PendingStartup {
+    fresh: bool,
+    attaching: bool,
+    partial_create: Option<String>,
 }
 
 /// A session change the drive loop broke out for.
@@ -1140,20 +1238,20 @@ enum FocusRequest {
     },
 }
 
-/// Whether a focus change moved to another session, which is what decides
-/// if the outgoing session's usage belongs in the exit banner.
+/// Whether selection moved to another session, which is what decides if the
+/// outgoing session's usage belongs in the exit banner.
 enum Focus {
     Moved,
     Same,
 }
 
-/// Apply a session change: point the frontend at another session, or move
-/// the focused one's head and re-attach.
+/// Apply a session change: select another session, or move the focused one's
+/// head and re-attach.
 ///
-/// A refused change (an unknown session, a lock held by another writer, a
-/// head switch the host refuses while work is live) says so and stays where
-/// it is. Nothing is torn down either way: the outgoing session stays live in
-/// the host.
+/// Create refusal and Head refusal leave selection alone because their
+/// authoritative mutation did not happen. Once a cross-session target exists,
+/// selecting it is the gesture's commit point. Its prior stream closes and the
+/// target remains selected even when opening or catching up fails.
 ///
 /// What a change has to say about itself, the confirmation as much as the
 /// refusal, is feedback about this client's gesture rather than anything in
@@ -1173,35 +1271,11 @@ async fn apply_focus_request(
 ) -> Focus {
     let focus = match request {
         FocusRequest::Create { host } => {
-            let created = match world
+            let created = world
                 .control
                 .create(host, None, None, None, world.launch_env.clone())
-                .await
-            {
-                Ok(session) => focus_session(app, shell, world, session.clone(), true)
-                    .await
-                    .map(|()| session),
-                Err(err) => Err(err),
-            };
-            match created {
-                Ok(session) => {
-                    shell
-                        .borrow()
-                        .show_toast(format!("Started a fresh session ({session})."));
-                    Focus::Moved
-                }
-                Err(err) => {
-                    // The refusing server's own sentence, without the transport
-                    // wrapper: a gateway's refusals say they are a gateway's,
-                    // and a client that guessed at the role would be the one
-                    // getting it wrong.
-                    shell.borrow().show_toast(format!(
-                        "Failed to start a fresh session: {}",
-                        peer_refusal(&err)
-                    ));
-                    Focus::Same
-                }
-            }
+                .await;
+            apply_create_result(app, shell, world, created)
         }
         FocusRequest::Resume(session) if session == world.session() => {
             // Nothing to do, and doing it anyway would announce a switch that
@@ -1212,21 +1286,15 @@ async fn apply_focus_request(
             return Focus::Same;
         }
         FocusRequest::Resume(session) => {
-            match focus_session(app, shell, world, session.clone(), false).await {
-                Ok(()) => {
-                    let subject =
-                        session_subject(&session, directory_tag(world, &session).as_deref());
-                    shell.borrow().show_toast(format!("Switched to {subject}."));
-                    Focus::Moved
-                }
-                Err(err) => {
-                    let tag = directory_tag(world, &session);
-                    shell
-                        .borrow()
-                        .show_toast(switch_refusal(&session, tag.as_deref(), &err));
-                    Focus::Same
-                }
-            }
+            let tag = directory_tag(world, &session);
+            focus_session(
+                app,
+                shell,
+                world,
+                session.clone(),
+                PendingTransition::Switch { session, tag },
+            );
+            Focus::Moved
         }
         FocusRequest::Branch { target, prompt } => {
             branch_focused_session(app, shell, world, target, prompt).await;
@@ -1241,6 +1309,50 @@ async fn apply_focus_request(
     // is set, and it is about to park on the select.
     app.request_redraw();
     focus
+}
+
+/// Apply the typed create boundary. `PartialCreate` carries a minted session,
+/// while every other error says no target is known to this client.
+fn apply_create_result(
+    app: &mut AsyncApp,
+    shell: &Rc<RefCell<Shell>>,
+    world: &mut World,
+    created: Result<String, ControlError>,
+) -> Focus {
+    match created {
+        Ok(session) => begin_created_focus(app, shell, world, session, None),
+        Err(ControlError::PartialCreate { session, message }) => {
+            begin_created_focus(app, shell, world, session, Some(message))
+        }
+        Err(err) => {
+            shell.borrow().show_toast(format!(
+                "Failed to start a fresh session: {}",
+                peer_refusal(&err)
+            ));
+            app.request_redraw();
+            Focus::Same
+        }
+    }
+}
+
+/// Select a session the peer already minted, retaining an incomplete-create
+/// warning as part of that durable fact rather than collapsing it into a
+/// pre-mint refusal.
+fn begin_created_focus(
+    app: &mut AsyncApp,
+    shell: &Rc<RefCell<Shell>>,
+    world: &mut World,
+    session: String,
+    partial: Option<String>,
+) -> Focus {
+    focus_session(
+        app,
+        shell,
+        world,
+        session.clone(),
+        PendingTransition::Create { session, partial },
+    );
+    Focus::Moved
 }
 
 /// Settle which host a create is for, answering the request the drive loop
@@ -1279,8 +1391,8 @@ fn settle_create_host(
     None
 }
 
-/// Point the frontend at `session`, folding that session's own startup
-/// notices on top of the history its attach block carries.
+/// Select `session`, close the prior stream, and try to follow the selected
+/// session through its own attach block.
 ///
 /// Rebind by replace-contents: the `chat` and `status` cells keep their
 /// identity across the swap (every chrome widget and the keymap's dispatch
@@ -1289,73 +1401,56 @@ fn settle_create_host(
 /// without rebuilding a widget or re-initializing the app. Only the handles
 /// a content swap cannot reach are repointed in [`Shell::rebind`].
 ///
-/// The world is mutated only once the new session's stream is open, so a
-/// refused attach (an unknown session, a lock another writer holds) leaves
-/// the current one running and hands the reason back for the caller to word.
-async fn focus_session(
+/// Selection is committed before IO. A refused, stalled, or unopened target
+/// therefore keeps its cached transcript on screen under explicit connection
+/// state. Returning to the prior session is an ordinary later switch, never a
+/// rollback hidden in this operation.
+fn focus_session(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
     session: String,
-    fresh: bool,
-) -> Result<(), ControlError> {
-    let host = world.control.host().cloned();
-    // A session already attached is a view swap: its frames have been folding
-    // in the background all along, so there is no stream to reopen and no
-    // block to wait for (spec 9.2).
-    let attaching = !world.directory.is_attached(&session);
-    // Unless it owes a re-attach. A `reset` for a background session stops its
-    // fold until one is served, so swapping onto it would paint the branch the
-    // reset abandoned. The loop discharges these set-wide, but focusing can
-    // arrive first, and the reopen is what makes the switch show the session as
-    // it now is.
-    // Or unless the set itself is about to change: a session the user
-    // archived leaves it on the way out, and the peer only learns that from a
-    // stream opened without it. A swap that skipped the reopen would drop the
-    // row and leave the host holding the session for the rest of the process.
-    let reopening = attaching
-        || world.directory.would_retire(&session)
-        || world
-            .directory
-            .client_for(&session)
-            .is_some_and(|client| client.needs_reattach());
-    // The stream first: its attachment is what stops the host from releasing
-    // the session between here and the handles below (spec section 5,
-    // attachment is the retention signal). Taking the handles first would leave
-    // a window where an idle session past its grace is torn down in between,
-    // and the world would hold handles into a core nothing drives while the
-    // attach materialized a second one.
-    //
-    // Changing the attach set means reopening the stream (spec 6.5), so a first
-    // focus re-attaches every session in the working set alongside the new one.
-    // Each offers its own cursor, so the sessions carried over are served their
-    // suffix rather than a fresh backfill, and the session this one displaces
-    // from the set is detached by going unnamed here.
-    let attachment = if reopening {
-        Some(attach_admitting(world, &session).await?)
-    } else {
-        None
-    };
-    // Direct handles are a read surface into a session in this process, so a
-    // connection has none and everything they feed has a wire form: the attach
-    // block's opening `state` frame carries the settings the footer seeds from,
-    // and the host's working directory arrived with `hello` and is the same for
-    // every session on it.
-    let handles = match &host {
-        Some(host) => Some(host.local_handles(&session).await?),
-        None => None,
-    };
-
-    let (settings, context_window) = match &handles {
-        Some(handles) => local_settings_seed(handles),
-        None => (unknown_settings(), 0),
-    };
-    let minted =
-        attaching.then(|| seeded_chat(&world.config, settings, context_window, &world.catalog));
-    if let Some(handles) = &handles {
-        world.working_directory = handles.env.working_directory.clone();
+    transition: PendingTransition,
+) {
+    if world.resume.take().is_some_and(|resume| resume.arriving()) {
+        world.abandon_attach_block();
     }
-    world.local = handles;
+    // Navigation cancels the prior selection attempt. A branch prompt belongs
+    // to the user even when they navigate away before its attach settles.
+    if let Some(PendingTransition::Head {
+        prompt: Some(prompt),
+        ..
+    }) = world.transition.take()
+    {
+        replace_editor_preserving_draft(&shell.borrow().editor, &prompt);
+    }
+    let attaching = !world.directory.is_attached(&session);
+    let startup = match &transition {
+        PendingTransition::Create { partial, .. } => Some(PendingStartup {
+            fresh: true,
+            attaching,
+            partial_create: partial.clone(),
+        }),
+        PendingTransition::Switch { .. } if attaching => Some(PendingStartup {
+            fresh: false,
+            attaching: true,
+            partial_create: None,
+        }),
+        PendingTransition::Switch { .. } | PendingTransition::Head { .. } => None,
+    };
+    if let Some(startup) = startup {
+        world.startup.entry(session.clone()).or_insert(startup);
+    }
+    // A new local session has no direct handles until its stream retains the
+    // materialization. Start with the same explicit unknown seed connect mode
+    // uses; the opening State frame supplies its real settings before Caught.
+    let minted =
+        attaching.then(|| seeded_chat(&world.config, unknown_settings(), 0, &world.catalog));
+    // Selection is the gesture's commit point. Dropping the stream first keeps
+    // the transition one-stream-at-a-time and makes failure leave no hidden
+    // subscription to the session the user left.
+    world.stream.take();
+    world.local = None;
     // Parks the outgoing session's transcript and brings the incoming one into
     // the cell the widgets read, which is what makes a switch back instant.
     world
@@ -1363,28 +1458,13 @@ async fn focus_session(
         .focus(&mut world.chat.borrow_mut(), &session, || {
             minted.expect("a session focused for the first time was minted a transcript")
         });
-    if let Some(Attachment { stream, narrowed }) = attachment {
-        // Armed after the focus, so the session just inserted is in the set.
-        world
-            .directory
-            .expect_attach(|session| stream.attached(session));
-        world.stream = stream;
-        if narrowed {
-            // The peer serves one session now, so every other member of the
-            // working set is detached in fact. Dropping them says so, and a
-            // later focus re-attaches instead of swapping onto a view no stream
-            // feeds. Their rows stay, which is how the user keeps seeing them.
-            // Safe here and not before the focus: the session being kept is the
-            // focused one, so the parked-transcript invariant holds.
-            let dropped = world.directory.drop_all_but(&session);
-            if !dropped.is_empty() {
-                tracing::warn!("detached by the narrowed attach: {}", dropped.join(", "));
-            }
-        }
-    }
-    // Status is resynced from the client once per iteration; reset it so
-    // the frame between install and the next sync shows idle chrome.
-    *world.status.borrow_mut() = StatusState::default();
+    world.client_mut().owe_reattach();
+    world.connection = Connection::Reconnecting;
+    world.resume = Some(Resume::selected());
+    world.transition = Some(transition);
+    // This selection is painted before the new drive loop's first bottom-of-
+    // iteration sync, so publish its disconnected state now.
+    sync_status(world);
     // Clear any armed branch anchor: the shell and its slots survive session
     // changes, so without this a stale anchor could resolve against the new
     // session's log (and with legacy 8-hex ids even hit a wrong entry).
@@ -1401,45 +1481,9 @@ async fn focus_session(
     // the outgoing session's baked border tint and stale `agent N` marker. This
     // mirrors the `world.status` reset above, which resets chrome for the same
     // install-to-first-draw window.
-    // Fold the attach block before the chrome reconcile below, so the first
-    // frame is drawn against the session's real history and settings.
-    //
-    // Only when this call opened a stream. The fold's own precondition is the
-    // client's arm, and that is not the same fact: an arm is set for every
-    // session a stream was opened over, so a background session can be armed for
-    // a block that is still arriving, or that a peer with no link to its host
-    // will never bring. Awaiting either would park the loop on a swap, which
-    // spec 9.2 makes instant.
-    if reopening {
-        fold_attach_block(world).await;
-    }
-    refresh_client_reads(world).await;
     sync_editor_chrome(world, shell);
-    // Both describe this process reading a session off its own disk, so neither
-    // has anything to say about a session running on another machine. Folded
-    // after the attach block so they land on top of the replayed history: a
-    // fresh session's env notices, then whatever resume-time restoration did.
-    let startup = world
-        .local
-        .as_ref()
-        .map(|handles| (handles.env.clone(), handles.restore_notices.clone()));
-    if let Some((env, restore_notices)) = startup {
-        for event in fresh_env_notices(fresh, &env) {
-            fold_event(world, event);
-        }
-        // Only onto a transcript this focus built. A swap restores one that
-        // already shows them, and they are startup facts about the session, not
-        // about the switch, so re-folding them would stack a copy per visit.
-        if attaching {
-            for notice in restore_notices {
-                fold_notice(world, &notice);
-            }
-        }
-    }
-    // The outgoing session's transmitted image ids belong to its terminal
-    // graphics memory. Free them and empty the store so the new session
-    // starts clean.
     free_session_images(app, shell);
+    app.request_redraw();
     // Retitle the terminal for the switched-to session, and hand focus back
     // to the editor: `rebind` closed the overlay stack, so the widget that
     // held focus may be gone. Both run off the loop with no event context,
@@ -1453,7 +1497,196 @@ async fn focus_session(
         data: None,
     });
     app.request_redraw();
-    Ok(())
+}
+
+/// Fold the selected local session's startup rows after its first usable
+/// Caught. A failed attempt leaves the cached transcript focused without
+/// claiming that restore or fresh-session setup completed.
+fn fold_selected_startup(world: &mut World, startup: PendingStartup) {
+    let local = world
+        .local
+        .as_ref()
+        .map(|handles| (handles.env.clone(), handles.restore_notices.clone()));
+    if let Some((env, restore_notices)) = local {
+        for event in fresh_env_notices(startup.fresh, &env) {
+            fold_event(world, event);
+        }
+        if startup.attaching {
+            for notice in restore_notices {
+                fold_notice(world, &notice);
+            }
+        }
+    }
+    if let Some(partial) = startup.partial_create {
+        let already_visible =
+            world
+                .chat
+                .borrow()
+                .transcript(AgentId::Main)
+                .is_some_and(|transcript| {
+                    transcript.entries().iter().any(|entry| {
+                        matches!(
+                            &entry.kind,
+                            aj_app::chat::EntryKind::Notice(notice) if notice.text == partial
+                        )
+                    })
+                });
+        if !already_visible {
+            fold_warning(world, &partial);
+        }
+    }
+}
+
+/// Complete the pending user transition after the selected target's Caught.
+/// With no action pending this is passive recovery, which stays in scrollback
+/// and never becomes delayed action success.
+async fn complete_pending_transition(
+    app: &mut AsyncApp,
+    shell: &Rc<RefCell<Shell>>,
+    world: &mut World,
+) {
+    let session = world.session().to_string();
+    if let Some(startup) = world.startup.remove(&session) {
+        fold_selected_startup(world, startup);
+    }
+    let Some(transition) = world.transition.take() else {
+        fold_notice(world, reattached_notice(&world.control));
+        app.request_redraw();
+        return;
+    };
+    match transition {
+        PendingTransition::Create { session, partial } => {
+            if let Some(message) = partial {
+                shell.borrow().show_toast(format!(
+                    "Session {session} was created with a warning: {message}"
+                ));
+            } else {
+                shell
+                    .borrow()
+                    .show_toast(format!("Started a fresh session ({session})."));
+            }
+        }
+        PendingTransition::Switch { session, tag } => {
+            shell.borrow().show_toast(format!(
+                "Switched to {}.",
+                session_subject(&session, tag.as_deref())
+            ));
+        }
+        PendingTransition::Head { prompt, .. } => {
+            shell
+                .borrow()
+                .show_toast(branch_switch_notice(prompt.is_some()));
+            if let Some(prompt) = prompt {
+                auto_submit_launch(world, vec![UserContent::text(prompt)]).await;
+            }
+        }
+    }
+    app.request_redraw();
+}
+
+/// The first terminal failure of a user-requested transition. It is consumed
+/// after one toast, while the selected session's paced recovery may continue.
+enum TransitionFailure {
+    Open(String),
+    Attach(CatchUp),
+}
+
+impl TransitionFailure {
+    fn reason(&self) -> String {
+        match self {
+            Self::Open(reason) => reason.clone(),
+            Self::Attach(caught) => attach_failure_reason(caught),
+        }
+    }
+
+    fn refusal(&self) -> Option<(&str, Refusal)> {
+        match self {
+            Self::Attach(CatchUp::Refused { reason, refusal }) => Some((reason, *refusal)),
+            _ => None,
+        }
+    }
+}
+
+/// Present one failed user transition and preserve any action-local facts that
+/// a later authoritative Head projection must restore.
+fn fail_pending_transition(
+    app: &mut AsyncApp,
+    shell: &Rc<RefCell<Shell>>,
+    world: &mut World,
+    failure: TransitionFailure,
+) -> bool {
+    let Some(transition) = world.transition.take() else {
+        return false;
+    };
+    let reason = failure.reason();
+    match transition {
+        PendingTransition::Create {
+            session, partial, ..
+        } => {
+            if let Some(partial) = &partial {
+                fold_warning(world, partial);
+            }
+            if failure.refusal().is_none() {
+                fold_warning(
+                    world,
+                    &format!("This client could not follow the created session: {reason}"),
+                );
+            }
+            shell.borrow().show_toast(created_session_failure(
+                &session,
+                partial.as_deref(),
+                &reason,
+            ));
+        }
+        PendingTransition::Switch { session, tag, .. } => {
+            if failure.refusal().is_none() {
+                fold_warning(
+                    world,
+                    &format!("This client could not follow the selected session: {reason}"),
+                );
+            }
+            shell
+                .borrow()
+                .show_toast(selected_session_failure(&session, tag.as_deref(), &reason));
+        }
+        PendingTransition::Head { branching, prompt } => {
+            let restored_prompt = prompt.is_some();
+            if let Some(prompt) = &prompt {
+                replace_editor_preserving_draft(&shell.borrow().editor, prompt);
+            }
+            let action = if branching {
+                "The branch changed"
+            } else {
+                "The selected branch changed"
+            };
+            let mut toast = format!("{action}, but this client could not follow it: {reason}.");
+            if restored_prompt {
+                toast.push_str(" Your message is back in the editor.");
+            }
+            let (error, warning) = match failure.refusal() {
+                Some((reason, Refusal::Locked { .. })) => (
+                    Some(reason.to_string()),
+                    aj_app::directory::WITHHELD_LOCKED_NOTICE.to_string(),
+                ),
+                Some((reason, Refusal::Other)) => (
+                    Some(reason.to_string()),
+                    aj_app::directory::WITHHELD_NOTICE.to_string(),
+                ),
+                None => {
+                    let warning = format!(
+                        "The branch changed, but this client did not catch up to it: {reason}"
+                    );
+                    fold_warning(world, &warning);
+                    (None, warning)
+                }
+            };
+            world.client_mut().recover_committed_head(error, warning);
+            world.client_mut().owe_reattach();
+            shell.borrow().show_toast(toast);
+        }
+    }
+    app.request_redraw();
+    true
 }
 
 /// Move the focused session's head and re-attach onto the branch that
@@ -1477,6 +1710,16 @@ async fn branch_focused_session(
     target: HeadTarget,
     prompt: Option<String>,
 ) {
+    if world.connection != Connection::Connected {
+        if let Some(prompt) = &prompt {
+            shell.borrow().editor.borrow_mut().set_text(prompt);
+        }
+        shell
+            .borrow()
+            .show_toast("Can't change branches until the selected session finishes attaching.");
+        app.request_redraw();
+        return;
+    }
     let session = world.session().to_string();
     let branching = matches!(target, HeadTarget::Before(_));
     if let Err(err) = world
@@ -1502,30 +1745,16 @@ async fn branch_focused_session(
         app.request_redraw();
         return;
     }
-    // The switch took, so what is on screen now describes a branch the session
-    // left, and it is the re-attach that replaces it. Both ways it can fail cost
-    // the user the same thing, a transcript of the wrong branch, so both are
-    // reported: the request being refused, and the block it opened never
-    // landing. The re-attach the abandoned block re-owes is what asks again.
-    match reattach(world, shell).await {
-        // A refusal has already said on screen that nothing is following the
-        // session, which covers this too: the branch switch took and no
-        // transcript follows it.
-        Ok(CatchUp::Caught | CatchUp::Refused) => {}
-        Ok(CatchUp::Stalled) => fold_warning(
-            world,
-            "The branch switch was not served through, so this transcript is still \
-             the branch you left.",
-        ),
-        Err(err) => fold_warning(world, &format!("Lost the session's event stream: {err}")),
-    }
-    shell
-        .borrow()
-        .show_toast(branch_switch_notice(prompt.is_some()));
-    if let Some(prompt) = prompt {
-        auto_submit_launch(world, vec![UserContent::text(prompt)]).await;
-    }
-    free_session_images(app, shell);
+    // Head is authoritative once accepted. Close the old epoch's stream and
+    // recover forward in the drive loop. The prompt remains client-owned until
+    // that committed epoch reaches Caught, so a failed follow cannot submit it
+    // against a projection the user has not reached.
+    world.client_mut().prepare_committed_head();
+    world.stream.take();
+    world.connection = Connection::Reconnecting;
+    world.resume = Some(Resume::selected());
+    world.transition = Some(PendingTransition::Head { branching, prompt });
+    sync_status(world);
     app.request_redraw();
 }
 
@@ -1563,10 +1792,9 @@ fn head_refusal(branching: bool, err: &ControlError) -> String {
 /// Answers what became of the attach block. A caller has to act on every outcome
 /// but [`CatchUp::Caught`]: the stream a block fails on may well be alive, so
 /// nothing else notices.
+#[cfg(test)]
 async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<CatchUp, ControlError> {
-    let mut stream = open_stream(&world.control, &mut world.directory).await?;
-    std::mem::swap(&mut world.stream, &mut stream);
-    drop(stream);
+    world.stream = Some(open_stream(&world.control, &mut world.directory).await?);
     refresh_local_handles(world, shell).await?;
     let caught = fold_attach_block(world).await;
     refresh_client_reads(world).await;
@@ -1598,7 +1826,9 @@ async fn refresh_local_handles(
     let Some(host) = world.control.host().cloned() else {
         return Ok(());
     };
-    world.local = Some(host.local_handles(world.session()).await?);
+    let handles = host.local_handles(world.session()).await?;
+    world.working_directory = handles.env.working_directory.clone();
+    world.local = Some(handles);
     shell.borrow().rebind_handles(world);
     Ok(())
 }
@@ -2113,11 +2343,9 @@ fn arm_branch(anchor: &Rc<RefCell<Option<String>>>, message_id: String) {
     *anchor.borrow_mut() = Some(message_id);
 }
 
-/// Prefill the editor with the branched-from `message`, preserving whatever
-/// the user was typing by first pushing that draft onto the recall history
-/// (up / Ctrl+P) so it is not lost. A blank draft is skipped by
-/// `add_to_history`.
-fn prefill_branch_editor(editor: &Rc<RefCell<TextArea>>, message: &str) {
+/// Replace the editor text while preserving any displaced draft in recall
+/// history (up / Ctrl+P). A blank draft is skipped by `add_to_history`.
+fn replace_editor_preserving_draft(editor: &Rc<RefCell<TextArea>>, message: &str) {
     let mut editor = editor.borrow_mut();
     let draft = editor.text();
     editor.add_to_history(&draft);
@@ -2398,6 +2626,20 @@ async fn handle_host_action(
     shell: &Rc<RefCell<Shell>>,
     action: AjAction,
 ) -> bool {
+    if world.connection != Connection::Connected {
+        let action = match action {
+            AjAction::CancelTurn => Some("cancel work"),
+            AjAction::Steer => Some("steer"),
+            AjAction::Dequeue => Some("dequeue a message"),
+            _ => None,
+        };
+        if let Some(action) = action {
+            shell.borrow().show_toast(format!(
+                "Can't {action} until the selected session finishes attaching."
+            ));
+            return true;
+        }
+    }
     match action {
         AjAction::CancelTurn => {
             // Nothing running: the chord falls through to the quit ladder,
@@ -2687,6 +2929,23 @@ async fn apply_command_action(
     export_tx: &UnboundedSender<String>,
     redraw_tx: &UnboundedSender<()>,
 ) -> ActionEffect {
+    if world.connection != Connection::Connected {
+        let action = match action {
+            CommandAction::ArchiveSession => Some("archive the session"),
+            CommandAction::Compact => Some("compact"),
+            CommandAction::ExportHtml => Some("export the session"),
+            CommandAction::OpenThinkingSelector => Some("change thinking effort"),
+            CommandAction::OpenModelSelector => Some("change the model"),
+            CommandAction::OpenSessionTag => Some("change the session tag"),
+            _ => None,
+        };
+        if let Some(action) = action {
+            shell.borrow().show_toast(format!(
+                "Can't {action} until the selected session finishes attaching."
+            ));
+            return ActionEffect::Redraw;
+        }
+    }
     match action {
         CommandAction::ArchiveSession => {
             apply_archive(world, !focused_archived(world)).await;
@@ -3118,6 +3377,12 @@ async fn apply_picker_outcome(
             ActionEffect::Redraw
         }
         AgentPickerOutcome::OpenTask(id) => {
+            if world.connection != Connection::Connected {
+                shell.borrow().show_toast(
+                    "Can't open task output until the selected session finishes attaching.",
+                );
+                return ActionEffect::Redraw;
+            }
             // The picker only lists bash tasks, so resolve the command
             // line for the viewer header. A task the model no longer tracks
             // has nothing to show.
@@ -3145,6 +3410,12 @@ async fn apply_picker_outcome(
             }
         }
         AgentPickerOutcome::Kill(id) => {
+            if world.connection != Connection::Connected {
+                shell
+                    .borrow()
+                    .show_toast("Can't kill a task until the selected session finishes attaching.");
+                return ActionEffect::Redraw;
+            }
             let notice = kill_task(world, id).await;
             fold_notice(world, &notice);
             ActionEffect::Redraw
@@ -3158,7 +3429,9 @@ async fn apply_picker_outcome(
 fn open_task_viewer(world: &World, shell: &Rc<RefCell<Shell>>, id: TaskId, command: String) {
     let handles = shell.borrow().overlay_handles();
     let backing = match world.local.as_ref() {
-        Some(local) => TaskBacking::Local(local.task_registry.clone()),
+        Some(local) => {
+            TaskBacking::Local(local.task_registry.clone(), Rc::clone(&handles.task_kill))
+        }
         None => TaskBacking::Remote(Rc::clone(&handles.task_kill)),
     };
     let view = open_task_output(
@@ -3294,6 +3567,26 @@ async fn apply_selector_activity(
     let mut changed = false;
     for item in activity {
         changed = true;
+        let session_mutation = match &item {
+            SelectorActivity::ThinkingConfirmed { .. }
+            | SelectorActivity::ModelConfirmed { .. } => true,
+            SelectorActivity::SettingChange { id, .. }
+            | SelectorActivity::SettingClear { id, .. } => matches!(
+                id.as_str(),
+                MODEL_SETTING_ID | "thinking" | "thinking_display" | "speed" | "verbosity"
+            ),
+            SelectorActivity::SkillToggle { .. } => false,
+        };
+        if world.connection != Connection::Connected && session_mutation {
+            // The settings widgets update their rows optimistically. Closing the
+            // window makes the refusal atomic from the user's perspective; a
+            // later open reads the still-active values again.
+            shell.borrow().overlays.borrow_mut().close_all();
+            shell.borrow().show_toast(
+                "Can't change session settings until the selected session finishes attaching.",
+            );
+            continue;
+        }
         match item {
             SelectorActivity::ThinkingConfirmed { target, level } => {
                 // Session-scoped: the selectors leave `config.toml` alone and
@@ -4873,7 +5166,7 @@ impl Shell {
                         // transcript focus, but the transcript keeps the
                         // highlight box on the branched-from message by reading
                         // the armed anchor.
-                        prefill_branch_editor(&editor_for_actions, &text);
+                        replace_editor_preserving_draft(&editor_for_actions, &text);
                         arm_branch(&branch_anchor_for_actions, message_id);
                         ctx.request_focus(Rc::clone(&editor_widget));
                         ctx.redraw = true;
@@ -6063,7 +6356,7 @@ struct Resume {
 
 enum ResumeStep {
     /// Waiting to re-open the stream.
-    Waiting,
+    Waiting(Connection),
     /// The stream is open and its attach block is arriving.
     CatchingUp(Block),
 }
@@ -6072,9 +6365,19 @@ impl Resume {
     /// The state a lost stream leaves: the first attempt is due at once.
     fn lost() -> Resume {
         Resume {
-            step: ResumeStep::Waiting,
+            step: ResumeStep::Waiting(Connection::Reconnecting),
             retry: Retry::default(),
         }
+    }
+
+    /// Recovery started by a user selection or accepted Head.
+    fn selected() -> Resume {
+        Self::lost()
+    }
+
+    /// Directory-triggered recovery.
+    fn rejoin() -> Resume {
+        Self::lost()
     }
 
     /// Whether the next step may run.
@@ -6086,7 +6389,7 @@ impl Resume {
     /// that follows it.
     fn ready(&self) -> bool {
         match &self.step {
-            ResumeStep::Waiting => self.retry.ready(),
+            ResumeStep::Waiting(_) => self.retry.ready(),
             ResumeStep::CatchingUp(block) => {
                 block.settled().is_some() || Instant::now() >= block.deadline()
             }
@@ -6097,7 +6400,7 @@ impl Resume {
     /// failure is holding the next attempt back, or a block is still arriving.
     fn due(&self) -> Instant {
         match &self.step {
-            ResumeStep::Waiting => self.retry.due().unwrap_or_else(Instant::now),
+            ResumeStep::Waiting(_) => self.retry.due().unwrap_or_else(Instant::now),
             ResumeStep::CatchingUp(block) => block.deadline(),
         }
     }
@@ -6112,7 +6415,7 @@ impl Resume {
     /// be held.
     fn block_mut(&mut self) -> Option<&mut Block> {
         match &mut self.step {
-            ResumeStep::Waiting => None,
+            ResumeStep::Waiting(_) => None,
             ResumeStep::CatchingUp(block) => Some(block),
         }
     }
@@ -6125,17 +6428,25 @@ impl Resume {
 
     fn connection(&self) -> Connection {
         match self.step {
-            ResumeStep::Waiting => Connection::Reconnecting,
+            ResumeStep::Waiting(connection) => connection,
             ResumeStep::CatchingUp(_) => Connection::CatchingUp,
         }
     }
 
     /// Note a failed step: the recovery starts over from the open, after the
     /// backoff.
-    fn failed(&mut self) {
+    fn failed(&mut self, connection: Connection) {
         self.retry.failed();
-        self.step = ResumeStep::Waiting;
+        self.step = ResumeStep::Waiting(connection);
     }
+}
+
+/// One bounded advancement of stream recovery. The drive loop owns user-action
+/// presentation and decides whether a settled outcome keeps retrying.
+enum ResumeAdvance {
+    Pending(Resume),
+    Settled { state: Resume, caught: CatchUp },
+    OpenFailed { state: Resume, error: ControlError },
 }
 
 /// How often an open task-output overlay is refreshed from the per-task read
@@ -6204,25 +6515,31 @@ async fn poll_task_output(world: &World, shell: &Rc<RefCell<Shell>>, retry: &mut
 async fn advance_resume(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
-    mut state: Resume,
-) -> Result<Option<Resume>, ControlError> {
+    state: Resume,
+) -> Result<ResumeAdvance, ControlError> {
+    let mut state = state;
     match state.step {
-        ResumeStep::Waiting => {
+        ResumeStep::Waiting(_) => {
+            // Recovery is one-stream-at-a-time. A stalled or refused stream may
+            // still be live, but it is obsolete before the replacement open
+            // starts and must not retain subscriptions alongside that request.
+            world.stream.take();
             match open_stream(&world.control, &mut world.directory).await {
                 Ok(stream) => {
-                    world.stream = stream;
-                    // The reopened stream may name a fresh materialization, so
-                    // the handles are re-read before the block is folded.
-                    refresh_local_handles(world, shell).await?;
+                    world.stream = Some(stream);
+                    // A local attachment reports only sessions it will serve,
+                    // while its queued Error frame is the selected target's
+                    // exact refusal. Arm the focused target so both action and
+                    // passive rejoin consume that answer instead of racing an
+                    // immediate drain. The block deadline bounds peers that
+                    // answer with neither a block nor an error.
+                    if world.client().attach_phase() == Attach::Live {
+                        world.client_mut().expect_attach();
+                    }
                     state.step = ResumeStep::CatchingUp(Block::open(world));
-                    Ok(Some(state))
+                    Ok(ResumeAdvance::Pending(state))
                 }
-                Err(err) if !world.control.is_remote() => Err(err),
-                Err(err) => {
-                    tracing::warn!("could not re-attach the session: {err}");
-                    state.failed();
-                    Ok(Some(state))
-                }
+                Err(error) => Ok(ResumeAdvance::OpenFailed { state, error }),
             }
         }
         ResumeStep::CatchingUp(ref mut block) => {
@@ -6241,25 +6558,7 @@ async fn advance_resume(
             // Opening it at the new tail is what this is for: the caches keyed
             // by entry id need no telling (see `EntryRenderCache::retire`).
             shell.borrow().transcript.borrow_mut().reset_to_tail();
-            match caught {
-                CatchUp::Caught => {
-                    fold_notice(world, reattached_notice(&world.control));
-                    Ok(None)
-                }
-                // What was applied stays, and the next attach serves the rest
-                // from our cursor.
-                CatchUp::Stalled => {
-                    tracing::warn!("the session's attach block did not land");
-                    state.failed();
-                    Ok(Some(state))
-                }
-                // The recovery is over and it did not get the session back.
-                // Asking again now is what the peer just answered, so the
-                // recovery stops here and the directory's rule takes it from the
-                // session's own `list` row. The fold has already said on screen
-                // that nothing is following the session.
-                CatchUp::Refused => Ok(None),
-            }
+            Ok(ResumeAdvance::Settled { state, caught })
         }
     }
 }
@@ -6293,6 +6592,7 @@ fn reattached_notice(control: &Control) -> &'static str {
 /// row says the answer can have changed
 /// ([`aj_app::directory::SessionDirectory::rejoin_edges_fired`]). Still nothing
 /// gives up, and nothing spins.
+#[cfg(test)]
 async fn discharge_reattach(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
@@ -6307,7 +6607,7 @@ async fn discharge_reattach(
         // Refused. The obligation is discharged and deliberately not re-owed:
         // the peer has answered, and the directory is what asks again when the
         // session's row says the answer can have changed.
-        Ok(CatchUp::Refused) => {
+        Ok(CatchUp::Refused { .. }) => {
             retry.clear();
             return None;
         }
@@ -6317,7 +6617,7 @@ async fn discharge_reattach(
         // has already been taken back, so the obligation alone would ask again
         // unpaced. Its own sentence, because the connection is not what was
         // lost: it is up, and it stopped serving this session's block.
-        Ok(CatchUp::Stalled) => {
+        Ok(CatchUp::Stalled(_)) => {
             "The re-attach was not served through, so this client is asking again.".to_string()
         }
         Err(err) => format!("Lost the session's event stream: {err}"),
@@ -6401,16 +6701,20 @@ async fn drive(
     // subscription is lost for ordinary reasons even in process (see the frame
     // arm), and the re-attach is what tells that apart from a host that is
     // gone.
-    let mut resume: Option<Resume> = None;
+    let mut resume = world
+        .resume
+        .take()
+        .or_else(|| world.directory.needs_reattach().then(Resume::rejoin));
+    if resume.is_some() && world.connection == Connection::Connected {
+        world.connection = Connection::Reconnecting;
+        sync_status(world);
+        app.request_redraw();
+    }
     // Paces the per-task read behind an open remote task-output overlay: the
     // steady cadence while it answers, a backoff while it does not. Cleared
     // while no such viewer is open, which is what bounds the poll to an
     // overlay that can show its answer.
     let mut task_poll = Retry::default();
-    // Paces the re-attach a broken continuity obliges, so a peer that keeps
-    // refusing it cannot turn into one attempt (and one warning row) per
-    // iteration.
-    let mut reattach_retry = Retry::default();
     // Frame pacing: cap redraws at `REDRAW_FPS_CAP`. Requests that arrive
     // within a frame budget coalesce into one paint (the redraw latch is a
     // single bool), and a request landing inside the current budget is
@@ -6438,6 +6742,13 @@ async fn drive(
         // that predate the switch, and a stepping chord would name the session
         // just landed on.
         sync_sidebar(world, shell);
+        // An accepted-Head recovery replaced the projection off the frame arm.
+        // Retire terminal image ids before that epoch draws, since entry ids
+        // restart under the authoritative branch.
+        if world.client_mut().take_forced_replacement_opened() {
+            free_session_images(app, shell);
+            app.request_redraw();
+        }
         // Paint current state before blocking on the next event, subject to
         // the frame cap: whenever the loop is about to wait, the screen must
         // already reflect current state. This flushes redraws requested while
@@ -6482,18 +6793,13 @@ async fn drive(
         // requests the clearing repaint, so each toast vanishes exactly on
         // time even while others stay live.
         let toast_deadline = crate::toasts::earliest_toast_deadline(&shell.borrow().toasts);
-        // A pending re-attach, an open remote task viewer, a paced read retry
-        // and an undischarged re-attach all have work due at a known time, and
-        // none has an event to wake the loop.
+        // A pending re-attach, an open remote task viewer, and a paced read
+        // retry all have work due at a known time, and none has an event to
+        // wake the loop.
         let resume_deadline = resume.as_ref().map(Resume::due);
         let poll_deadline = task_poll.due();
         let reads_deadline = owes_client_reads(world)
             .then(|| world.reads_retry.due())
-            .flatten();
-        let reattach_deadline = world
-            .directory
-            .needs_reattach()
-            .then(|| reattach_retry.due())
             .flatten();
         let deadline = [
             tick_deadline,
@@ -6502,7 +6808,6 @@ async fn drive(
             resume_deadline,
             poll_deadline,
             reads_deadline,
-            reattach_deadline,
         ]
         .into_iter()
         .flatten()
@@ -6627,6 +6932,15 @@ async fn drive(
                         // no `RefCell` ref is held across the await below.
                         let submitted = shell.borrow().take_submitted();
                         if let Some(text) = submitted {
+                            if world.connection != Connection::Connected {
+                                shell.borrow().editor.borrow_mut().set_text(&text);
+                                shell.borrow().show_toast(
+                                    "Can't send until the selected session finishes attaching. \
+                                     Your message remains in the editor.",
+                                );
+                                app.request_redraw();
+                                continue;
+                            }
                             // Record the submitted prompt into the editor's
                             // history ring, idle or busy (matching aj). The
                             // text is already trimmed by the editor's submit;
@@ -6720,17 +7034,33 @@ async fn drive(
                         }
                         // A just-opened async read-only overlay: kick off
                         // its fetch and remember the list to fill.
-                        if let Some(fetch) = shell.borrow().take_fetch() {
-                            // NOTE: Snapshot the content-column tints at
-                            // fetch time. A theme hot-reload while the overlay
-                            // is open won't re-tint its rows, the overlay
-                            // re-tints on next open. This matches the chrome,
-                            // which is also snapshotted at open. Acceptable for
-                            // a transient read-only overlay.
-                            let styles =
-                                ContentStyles::from_theme(&shell.borrow().theme.read());
-                            spawn_overlay_fetch(world, fetch.kind, styles, &fetch_tx);
-                            pending_fills.push((fetch.kind, fetch.list));
+                        let pending_fetch = shell.borrow().take_fetch();
+                        if let Some(fetch) = pending_fetch {
+                            if fetch.kind == FetchKind::SessionInfo
+                                && world.connection != Connection::Connected
+                            {
+                                shell.borrow().overlays.borrow_mut().close_all();
+                                shell.borrow().show_toast(
+                                    "Can't show session info until the selected session finishes \
+                                     attaching.",
+                                );
+                                app.post_app_event(UserEvent {
+                                    name: REFOCUS_OVERLAY_EVENT.to_string(),
+                                    data: None,
+                                });
+                                app.request_redraw();
+                            } else {
+                                // NOTE: Snapshot the content-column tints at
+                                // fetch time. A theme hot-reload while the
+                                // overlay is open won't re-tint its rows, the
+                                // overlay re-tints on next open. This matches the
+                                // chrome, which is also snapshotted at open.
+                                // Acceptable for a transient read-only overlay.
+                                let styles =
+                                    ContentStyles::from_theme(&shell.borrow().theme.read());
+                                spawn_overlay_fetch(world, fetch.kind, styles, &fetch_tx);
+                                pending_fills.push((fetch.kind, fetch.list));
+                            }
                         }
                         // Config edits parked by a selector or settings
                         // overlay (this event may have confirmed one).
@@ -6812,7 +7142,14 @@ async fn drive(
                         // first: the command awaits on the peer.
                         let tag_edit = shell.borrow().take_tag_edit();
                         if let Some(edit) = tag_edit {
-                            apply_tag_edit(world, edit).await;
+                            if world.connection != Connection::Connected {
+                                shell.borrow().show_toast(
+                                    "Can't change the session tag until the selected session \
+                                     finishes attaching.",
+                                );
+                            } else {
+                                apply_tag_edit(world, edit).await;
+                            }
                             app.request_redraw();
                         }
                         // A parked session change (the `NewSession` command, a
@@ -6823,13 +7160,23 @@ async fn drive(
                         // out of the borrow first so no RefCell ref outlives
                         // the statement.
                         let session_request = shell.borrow().take_session_request();
-                        if let Some(request) = session_request
-                            // A create the peer leaves a choice about goes back
-                            // to the user first, and parks itself again once
-                            // they have named a host.
-                            && let Some(request) = settle_create_host(app, shell, world, request)
-                        {
-                            break Ok(request.into_exit());
+                        if let Some(request) = session_request {
+                            if world.connection != Connection::Connected
+                                && matches!(request, SessionRequest::Branch { .. })
+                            {
+                                shell.borrow().show_toast(
+                                    "Can't change branches until the selected session finishes \
+                                     attaching.",
+                                );
+                                app.request_redraw();
+                            } else if let Some(request) =
+                                // A create the peer leaves a choice about goes
+                                // back to the user first, and parks itself again
+                                // once they have named a host.
+                                settle_create_host(app, shell, world, request)
+                            {
+                                break Ok(request.into_exit());
+                            }
                         }
                     }
                     // The reader ended (EOF or a read error), so no
@@ -6852,7 +7199,8 @@ async fn drive(
             // loop. A stream whose attach block is still arriving is live, and
             // this arm is what folds that block: the catch-up runs here, not in
             // a wait off the loop, so the paint and the input survive it.
-            frame = world.stream.recv(), if resume.as_ref().is_none_or(Resume::arriving) => {
+            frame = recv_stream(world.stream.as_mut()),
+                if resume.as_ref().is_none_or(Resume::arriving) => {
                 match frame {
                     ControlFrame::Frame(frame) => {
                         // A frame during a catch-up goes through the arriving
@@ -6898,7 +7246,16 @@ async fn drive(
                             // this failure: it pays the backoff and paints the
                             // state. Nothing is worded here, matching a block
                             // that goes quiet on a stream that stays up.
-                            Some(block) => block.settle(world.abandon_attach_block()),
+                            Some(block) => {
+                                let stalled = match lost {
+                                    ControlFrame::Lost(err) => {
+                                        AttachStall::StreamLost(err.to_string())
+                                    }
+                                    ControlFrame::Closed => AttachStall::StreamClosed,
+                                    ControlFrame::Frame(_) => unreachable!("matched a lost stream"),
+                                };
+                                block.settle(world.stall_attach(stalled));
+                            }
                             None => {
                                 if let ControlFrame::Lost(err) = lost {
                                     fold_warning(world, &format!("Lost the connection: {err}"));
@@ -7061,15 +7418,21 @@ async fn drive(
         // arriving block is watching for and leave a block that had landed to be
         // abandoned at its deadline. The arm above folds the block instead, one
         // frame per iteration.
-        if resume.is_none() && fold_ready_frames(world) {
+        if resume.is_none() && world.stream.is_some() && fold_ready_frames(world) {
             app.request_redraw();
         }
         // A task kill parked by the remote task viewer, which has no registry
         // to kill through.
         let killed = shell.borrow().task_kill.borrow_mut().take();
         if let Some(task) = killed {
-            let notice = kill_task(world, task).await;
-            fold_notice(world, &notice);
+            if world.connection != Connection::Connected {
+                shell
+                    .borrow()
+                    .show_toast("Can't kill a task until the selected session finishes attaching.");
+            } else {
+                let notice = kill_task(world, task).await;
+                fold_notice(world, &notice);
+            }
             app.request_redraw();
         }
         // Advance a pending re-attach, one step per iteration so the paint at
@@ -7077,29 +7440,113 @@ async fn drive(
         if resume.as_ref().is_some_and(Resume::ready) {
             let state = resume.take().expect("checked just above");
             match advance_resume(world, shell, state).await {
-                Ok(next) => resume = next,
-                // Only a local run reaches this: its own host refused to serve
-                // a session it was holding, so the host is gone and the shell
-                // goes with it.
+                Ok(ResumeAdvance::Pending(next)) => {
+                    world.connection = next.connection();
+                    resume = Some(next);
+                }
+                Ok(ResumeAdvance::OpenFailed { mut state, error }) => {
+                    let reason = peer_refusal(&error);
+                    let presented = fail_pending_transition(
+                        app,
+                        shell,
+                        world,
+                        TransitionFailure::Open(reason.clone()),
+                    );
+                    if !presented {
+                        fold_warning(world, &format!("Lost the session's event stream: {reason}"));
+                    }
+                    if !world.control.is_remote() {
+                        break Err(anyhow::anyhow!("the session host is gone: {error}"));
+                    }
+                    tracing::warn!("could not re-attach the selected session: {reason}");
+                    state.failed(Connection::Reconnecting);
+                    world.connection = state.connection();
+                    resume = Some(state);
+                }
+                Ok(ResumeAdvance::Settled { mut state, caught }) => match caught {
+                    CatchUp::Caught => {
+                        // A local stream retains the materialization. Only now,
+                        // after the target proved usable, bind its direct read
+                        // handles into the shell. Failure keeps the selection
+                        // and returns to paced recovery.
+                        if let Err(error) = refresh_local_handles(world, shell).await {
+                            if !world.control.is_remote() {
+                                break Err(anyhow::anyhow!("the session host is gone: {error}"));
+                            }
+                            let reason = peer_refusal(&error);
+                            fail_pending_transition(
+                                app,
+                                shell,
+                                world,
+                                TransitionFailure::Open(reason),
+                            );
+                            world.stream.take();
+                            world.client_mut().owe_reattach();
+                            state.failed(Connection::Reconnecting);
+                            world.connection = Connection::Reconnecting;
+                            resume = Some(state);
+                        } else {
+                            world.connection = Connection::Connected;
+                            complete_pending_transition(app, shell, world).await;
+                            resume = None;
+                        }
+                    }
+                    refused @ CatchUp::Refused { .. } => {
+                        fail_pending_transition(
+                            app,
+                            shell,
+                            world,
+                            TransitionFailure::Attach(refused),
+                        );
+                        world.connection = Connection::Refused;
+                        // An accepted Head re-owes its forward recovery. An
+                        // ordinary refusal waits for the directory's rejoin
+                        // edge instead of polling the peer.
+                        if world.client().needs_reattach() {
+                            state.failed(Connection::Refused);
+                            resume = Some(state);
+                        } else {
+                            resume = None;
+                        }
+                    }
+                    stalled @ CatchUp::Stalled(_) => {
+                        let reason = attach_failure_reason(&stalled);
+                        let presented = fail_pending_transition(
+                            app,
+                            shell,
+                            world,
+                            TransitionFailure::Attach(stalled),
+                        );
+                        if !presented {
+                            fold_warning(
+                                world,
+                                &format!(
+                                    "The re-attach did not land: {reason}. This client is asking \
+                                     again."
+                                ),
+                            );
+                        }
+                        tracing::warn!("the selected session's attach block did not land");
+                        state.failed(Connection::Stalled);
+                        world.connection = Connection::Stalled;
+                        resume = Some(state);
+                    }
+                },
                 Err(err) => break Err(anyhow::anyhow!("the session host is gone: {err}")),
             }
-            world.connection = resume
-                .as_ref()
-                .map_or(Connection::Connected, Resume::connection);
             app.request_redraw();
         }
         // Refresh the open remote task viewer from the per-task read.
         if poll_task_output(world, shell, &mut task_poll).await {
             app.request_redraw();
         }
-        // Continuity broke (a head switch this process did not make), so the
-        // client owes a re-attach. A pending re-attach already owes one, and
-        // its own attach discharges this.
-        if resume.is_none() && world.directory.needs_reattach() && reattach_retry.ready() {
-            resume = discharge_reattach(world, shell, &mut reattach_retry).await;
-            if resume.is_some() {
-                world.connection = Connection::Reconnecting;
-            }
+        // Continuity broke or a refusal's directory edge fired. Hand it to the
+        // same loop-driven recovery as a lost stream, so a producer-paced block
+        // keeps rendering and accepting navigation rather than being awaited
+        // outside the select loop.
+        if resume.is_none() && world.directory.needs_reattach() {
+            resume = Some(Resume::rejoin());
+            world.connection = Connection::Reconnecting;
             app.request_redraw();
         }
         // The attach block a re-attach served may have obliged the reads
@@ -7164,17 +7611,11 @@ async fn drive(
         }
     };
 
-    // The recovery is loop state, so leaving takes it with us: a block still
-    // arriving loses the only thing folding it and the only deadline that would
-    // give up on it. Taking the arm back is what leaves something asking, and
-    // the connection state the recovery was painting stops being true here, so
-    // the session this loop is re-entered on does not inherit it.
-    if let Some(state) = resume.take() {
-        if state.arriving() {
-            world.abandon_attach_block();
-        }
-        world.connection = Connection::Connected;
-    }
+    // Recovery belongs to the world rather than one invocation of `drive`.
+    // A same-session action can leave and re-enter this loop while the selected
+    // target is still catching up, and dropping this state would lose the only
+    // owner of that block and falsely paint Connected.
+    world.resume = resume;
 
     exit
 }
@@ -9108,6 +9549,11 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.connection, Connection::Reconnecting);
+        assert_eq!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Caught
+        );
         assert_eq!(
             contexts(&world),
             1,
@@ -9125,6 +9571,10 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        assert_eq!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Caught
+        );
         assert_eq!(world.session(), resumable);
         assert_eq!(
             contexts(&world),
@@ -9133,29 +9583,84 @@ mod tests {
             main_notices(&world),
         );
 
-        // A refused change stays in the session it was in, so it toasts the
-        // failure and folds no env block.
-        let stayed = apply_focus_request(
+        // A refused target remains selected with no fresh-session context and
+        // an explicit refusal state. Returning is an ordinary later switch.
+        let moved = apply_focus_request(
             &mut app,
             &shell,
             &mut world,
             FocusRequest::Resume("no-such-session".to_string()),
         )
         .await;
-        assert!(matches!(stayed, Focus::Same));
-        assert_eq!(world.session(), resumable, "the focus did not move");
+        assert!(matches!(moved, Focus::Moved));
+        assert!(matches!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Refused { .. }
+        ));
+        assert_eq!(world.session(), "no-such-session");
+        assert_eq!(world.connection, Connection::Refused);
         assert_eq!(
             contexts(&world),
-            1,
+            0,
             "the refusal folds no context: {:?}",
             main_notices(&world),
         );
         assert!(
             toast_lines(&shell)
                 .iter()
-                .any(|t| t == "Can't switch: unknown session no-such-session."),
+                .any(|t| t.contains("unknown session no-such-session")
+                    && t.contains("remains selected")),
             "the refusal says what failed: {:?}",
             toast_lines(&shell),
+        );
+        shut_down(&world).await;
+    }
+
+    /// Navigating away before a new session catches up postpones, rather than
+    /// drops, that session's fresh context rows. A later ordinary switch folds
+    /// them once when the session first becomes usable.
+    #[tokio::test]
+    async fn cancelled_first_attach_keeps_the_fresh_session_startup_obligation() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let previous = world.session().to_string();
+
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        let created = world.session().to_string();
+        assert_ne!(created, previous);
+
+        // Cancel before the create's first open step runs.
+        let moved =
+            apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(previous)).await;
+        assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(created.clone()),
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert_eq!(world.session(), created);
+        assert_eq!(
+            main_notices(&world)
+                .iter()
+                .filter(|notice| notice.contains("Context:"))
+                .count(),
+            1,
+            "the deferred fresh startup rows were lost or duplicated: {:?}",
+            main_notices(&world),
         );
         shut_down(&world).await;
     }
@@ -9223,15 +9728,20 @@ mod tests {
             "the peer lists the held session under its label",
         );
 
-        let stayed = apply_focus_request(
+        let moved = apply_focus_request(
             &mut app,
             &shell,
             &mut world,
             FocusRequest::Resume(held.clone()),
         )
         .await;
-        assert!(matches!(stayed, Focus::Same), "the switch was refused");
-        assert_eq!(world.session(), fresh, "and we stayed where we were");
+        assert!(matches!(moved, Focus::Moved), "the selection committed");
+        assert_eq!(world.session(), held, "the requested target is selected");
+        assert!(matches!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Refused { .. }
+        ));
+        assert_eq!(world.connection, Connection::Refused);
         assert!(
             app.needs_redraw(),
             "and asked for the frame that paints the toast",
@@ -9242,96 +9752,29 @@ mod tests {
             .iter()
             .find(|t| t.contains(&held))
             .unwrap_or_else(|| panic!("the refusal is toasted: {toasts:?}"));
-        assert_eq!(
-            *refusal,
-            format!(
-                "Can't switch: fix-auth ({held}) is held by pid {} of host a-rival-writer.",
-                std::process::id(),
-            ),
-            "the label, the id in full, and the holder to go quit, each once",
+        let exact = format!(
+            "session {held} is held by pid {} of host a-rival-writer",
+            std::process::id(),
         );
         assert!(
-            !main_notices(&world)
-                .iter()
-                .any(|n| n.contains("is held by")),
-            "and nothing about the gesture was folded: {:?}",
+            refusal.contains(&format!("fix-auth ({held})"))
+                && refusal.contains(&exact)
+                && refusal.contains("remains selected"),
+            "the action toast carries the target, exact peer reason, and Option B state: \
+             {refusal:?}",
+        );
+        assert!(
+            main_notices(&world).iter().any(|n| n == &exact),
+            "the exact refusal remains in the selected transcript: {:?}",
             main_notices(&world),
+        );
+        assert!(
+            world.directory.rows().iter().any(|row| row.id == fresh),
+            "the previous session remains available for an ordinary switch",
         );
 
         drop(rival);
         shut_down(&world).await;
-    }
-
-    /// A lock-holder refusal for a tagged session: the subject is named once,
-    /// the way the user knows it, and the id they act on afterwards (`aj
-    /// continue <id>`) rides along in full rather than abbreviated. The cause
-    /// is named once too, by the holder there is to go quit.
-    #[test]
-    fn a_lock_refusal_names_the_session_once() {
-        let session = "2026-08-07-20-00-10-561";
-        let err = locked(session, Some(("a1b2c3", 3231223)));
-        let tagged = switch_refusal(session, Some("fix-auth"), &err);
-        assert_eq!(
-            tagged,
-            "Can't switch: fix-auth (2026-08-07-20-00-10-561) \
-             is held by pid 3231223 of host a1b2c3.",
-        );
-        assert_eq!(
-            tagged.matches(session).count(),
-            1,
-            "the id is in it once: {tagged:?}",
-        );
-        assert_eq!(
-            switch_refusal(session, None, &err),
-            "Can't switch: 2026-08-07-20-00-10-561 is held by pid 3231223 of host a1b2c3.",
-            "an untagged session's only name is its id, so it appears alone",
-        );
-    }
-
-    /// The same refusal over a connection reads the same as in process. The
-    /// status the transport reports belongs in a log, and what reaches the
-    /// user is the host's own sentence under our verb.
-    #[test]
-    fn a_wire_refusal_reads_like_a_local_one() {
-        let session = "2026-08-07-20-00-10-561";
-        let local = locked(session, Some(("a1b2c3", 3231223)));
-        let wire = ControlError::Remote(RemoteError::Status {
-            status: reqwest::StatusCode::CONFLICT,
-            code: Some("locked".to_string()),
-            message: local.to_string(),
-            body: serde_json::json!({"code": "locked", "message": local.to_string()}).to_string(),
-        });
-        assert_eq!(
-            switch_refusal(session, Some("fix-auth"), &wire),
-            switch_refusal(session, Some("fix-auth"), &local),
-        );
-    }
-
-    /// A refusal worded some other way keeps the peer's own subject rather
-    /// than being handed ours: the peer named the session itself, and putting
-    /// a second subject in front of a sentence we did not recognize would
-    /// name it twice again.
-    #[test]
-    fn an_unrecognized_refusal_keeps_the_peers_words() {
-        let err = ControlError::Host(aj_app::host::HostError::UnknownSession(
-            "no-such-session".to_string(),
-        ));
-        assert_eq!(
-            switch_refusal("no-such-session", Some("fix-auth"), &err),
-            "Can't switch: unknown session no-such-session.",
-        );
-    }
-
-    /// A lock refusal from the host, holder and all.
-    fn locked(session: &str, holder: Option<(&str, u32)>) -> ControlError {
-        ControlError::Host(aj_app::host::HostError::Locked {
-            session: session.to_string(),
-            holder: holder.map(|(host_id, pid)| aj_session::LockHolder {
-                pid,
-                host_id: host_id.to_string(),
-            }),
-            generation: None,
-        })
     }
 
     /// A switch that took reports itself in a toast and leaves both
@@ -9357,6 +9800,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         let second = world.session().to_string();
         // Both sessions are attached and owe nothing, so the switch below is a
         // pure view swap: no attach block folds, and any row either transcript
@@ -9377,6 +9821,11 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        assert!(
+            !world.startup.contains_key(&first),
+            "a cached session with no startup work retained a stale obligation",
+        );
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         assert_eq!(world.session(), first);
 
         assert!(
@@ -9424,6 +9873,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         let created = world.session().to_string();
 
         assert!(
@@ -10920,7 +11370,7 @@ mod tests {
                 .expect("a queue withdrawal is always accepted");
         }
         assert!(
-            matches!(world.stream.recv().await, ControlFrame::Closed),
+            matches!(world.stream_mut().recv().await, ControlFrame::Closed),
             "the overflow evicted this subscriber",
         );
     }
@@ -10951,7 +11401,28 @@ mod tests {
             }
             world.connection = state.connection();
             if state.ready() {
-                pending = advance_resume(world, shell, state).await?;
+                match advance_resume(world, shell, state).await? {
+                    ResumeAdvance::Pending(state) => pending = Some(state),
+                    ResumeAdvance::OpenFailed { error, .. } => return Err(error),
+                    ResumeAdvance::Settled {
+                        mut state,
+                        caught: CatchUp::Stalled(_),
+                    } => {
+                        state.failed(Connection::Stalled);
+                        pending = Some(state);
+                    }
+                    ResumeAdvance::Settled {
+                        caught: CatchUp::Caught,
+                        ..
+                    } => {
+                        fold_notice(world, reattached_notice(&world.control));
+                        pending = None;
+                    }
+                    ResumeAdvance::Settled {
+                        caught: CatchUp::Refused { .. },
+                        ..
+                    } => pending = None,
+                }
                 continue;
             }
             match state.block_mut() {
@@ -11026,14 +11497,38 @@ mod tests {
         shut_down(&world).await;
 
         assert!(
-            matches!(world.stream.recv().await, ControlFrame::Closed),
+            matches!(world.stream_mut().recv().await, ControlFrame::Closed),
             "the shutdown closed the stream",
         );
         assert!(
-            advance_resume(&mut world, &shell, Resume::lost())
-                .await
-                .is_err(),
-            "a local host that cannot serve its own session is gone",
+            matches!(
+                advance_resume(&mut world, &shell, Resume::lost()).await,
+                Ok(ResumeAdvance::OpenFailed { .. })
+            ),
+            "a local host that cannot serve its own session is gone"
+        );
+    }
+
+    /// Option B keeps a selected target on session-level failure, but an
+    /// in-process host-wide open failure still ends the shell. Retrying cannot
+    /// recover a host this process already lost.
+    #[tokio::test]
+    async fn a_selected_local_target_does_not_mask_host_loss() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        shut_down(&world).await;
+        world.stream.take();
+        world.resume = Some(Resume::selected());
+        world.connection = Connection::Reconnecting;
+
+        let (exit, ()) = drive_until(&mut world, &shell, |writer| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(writer);
+        })
+        .await;
+        assert!(
+            matches!(exit, Err(ref error) if error.to_string().contains("session host is gone")),
+            "selected-target recovery masked local host loss",
         );
     }
 
@@ -11073,7 +11568,7 @@ mod tests {
             // The stream opened, then died inside the block.
             state.step = ResumeStep::CatchingUp(arriving_block());
             let at = Instant::now();
-            state.failed();
+            state.failed(Connection::Reconnecting);
             assert!(!state.ready(), "attempt {attempt} left nothing holding it");
             assert!(
                 state.due().saturating_duration_since(at) >= applied,
@@ -11087,7 +11582,7 @@ mod tests {
         }
 
         for _ in 0..10 {
-            state.failed();
+            state.failed(Connection::Reconnecting);
         }
         assert_eq!(
             state.retry.delay, RETRY_BACKOFF_MAX,
@@ -11205,68 +11700,6 @@ mod tests {
         None
     }
 
-    /// How many refused re-attaches a chat model was told about, one warning row
-    /// per attempt.
-    fn refusals(chat: &ChatState) -> usize {
-        notices_of(chat)
-            .iter()
-            .filter(|text| text.contains("Lost the session's event stream"))
-            .count()
-    }
-
-    /// A world that owes a re-attach no attach will ever discharge, plus a Shell
-    /// over it.
-    ///
-    /// The obligation comes from a head switch this client did not make, and the
-    /// session id is then pointed at one the host does not have, which is what a
-    /// permanently refused attach looks like from here. Nothing else is left for
-    /// the drive loop to do: the session is idle, its frames are drained and the
-    /// reads the startup attach obliged are discharged, so the loop has to wake
-    /// itself for the retry.
-    async fn a_world_owing_a_refused_re_attach(
-        dir: &TempDir,
-    ) -> (World, Rc<RefCell<Shell>>, String) {
-        let (mut world, shell) = world_and_shell(dir, "streaming-text").await;
-        run_prompt(&mut world, "seed").await;
-
-        let head = world
-            .handles()
-            .log
-            .lock()
-            .await
-            .head()
-            .cloned()
-            .expect("a persisted head");
-        world
-            .host()
-            .command(
-                world.session(),
-                Command::Head {
-                    target: HeadTarget::Entry(head),
-                },
-            )
-            .await
-            .expect("the head switch is accepted");
-        // Wait the host's `list` coalescing out (spec 6.8) before draining, so
-        // no frame of the switch is still to come.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        fold_ready_frames(&mut world);
-        refresh_client_reads(&mut world).await;
-        assert!(
-            world.client().needs_reattach(),
-            "the reset left an obligation",
-        );
-        assert!(
-            !owes_client_reads(&world),
-            "and no read is owed alongside it",
-        );
-
-        let live_session = world
-            .directory
-            .rename_focused("no-such-session".to_string());
-        (world, shell, live_session)
-    }
-
     /// The focused session's durable high-water mark, as the host reports it.
     ///
     /// The directory is the test's window onto the host's own bookkeeping. A
@@ -11345,108 +11778,6 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// The loop comes back for a refused re-attach with nothing else going on.
-    ///
-    /// With the obligation standing and the session quiet, the loop parks on a
-    /// frame stream that will not speak again, so the retry happens only if the
-    /// due time reached the loop's wake deadline. Without it the first refusal is
-    /// also the last, and the transcript stays frozen for good (every later frame
-    /// carries an epoch the fold filters out).
-    #[tokio::test]
-    async fn the_loop_wakes_for_a_refused_re_attach() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell, live_session) = a_world_owing_a_refused_re_attach(&dir).await;
-
-        let chat = Rc::clone(&world.chat);
-        let (exit, retried) = drive_until(&mut world, &shell, |writer| async move {
-            let retried = poll_for(|| (refusals(&chat.borrow()) >= 2).then_some(())).await;
-            drop(writer);
-            retried
-        })
-        .await;
-
-        assert!(
-            matches!(exit, Ok(SessionExit::Quit)),
-            "a refused local re-attach is not the shell's exit",
-        );
-        assert!(
-            retried.is_some(),
-            "the loop stopped retrying after {} attempt(s), so it never woke for \
-             the next one",
-            refusals(&world.chat.borrow()),
-        );
-        assert!(
-            world.client().needs_reattach(),
-            "the obligation still stands, so every iteration had one to discharge",
-        );
-        world.directory.rename_focused(live_session);
-        shut_down(&world).await;
-    }
-
-    /// How many paced attempts a backoff from [`RETRY_BACKOFF_MIN`] allows inside
-    /// `window`: the first is due at once, and each failure doubles the delay up
-    /// to [`RETRY_BACKOFF_MAX`].
-    ///
-    /// An attempt due exactly at the window's end counts, so this is an upper
-    /// bound on what a correctly paced loop can get through.
-    fn allowed_attempts(window: Duration) -> usize {
-        let mut due = Duration::ZERO;
-        let mut delay = RETRY_BACKOFF_MIN;
-        let mut attempts = 0;
-        while due <= window {
-            attempts += 1;
-            due += delay;
-            delay = (delay * 2).min(RETRY_BACKOFF_MAX);
-        }
-        attempts
-    }
-
-    /// A refused re-attach stays held back while the loop is busy with other
-    /// things.
-    ///
-    /// The loop reaches the discharge block once per iteration whatever woke it,
-    /// so without the gate a peer that keeps refusing turns into one attach (and
-    /// one warning row) per keystroke. The keystrokes here are that wake source:
-    /// the pacing has to survive them.
-    ///
-    /// The bound is computed from the window that actually elapsed, so a machine
-    /// that stretches the typing out earns the attempts the backoff owes it and
-    /// nothing more.
-    #[tokio::test]
-    async fn the_loop_holds_a_refused_re_attach_back_while_it_iterates() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell, live_session) = a_world_owing_a_refused_re_attach(&dir).await;
-
-        let wakes = 120;
-        let spacing = Duration::from_millis(5);
-        let started = Instant::now();
-        let (exit, ()) = drive_until(&mut world, &shell, |mut writer| async move {
-            for _ in 0..wakes {
-                writer.write_all(b"x").expect("write a key byte");
-                tokio::time::sleep(spacing).await;
-            }
-            drop(writer);
-        })
-        .await;
-        let window = started.elapsed();
-
-        assert!(matches!(exit, Ok(SessionExit::Quit)));
-        let refused = refusals(&world.chat.borrow());
-        let allowed = allowed_attempts(window);
-        assert!(
-            refused <= allowed,
-            "{refused} refused re-attaches over {wakes} wakes {spacing:?} apart, \
-             where a {window:?} window allows {allowed}: the loop re-asked on \
-             iterations rather than on the backoff",
-        );
-        assert!(
-            refused >= 1,
-            "the loop never attempted the re-attach it owed",
-        );
-        world.directory.rename_focused(live_session);
-        shut_down(&world).await;
-    }
-
     /// The loop's half of pacing the reads an attach block obliges: with nothing
     /// else going on, a retry only happens if the loop wakes itself for it.
     ///
@@ -11461,9 +11792,11 @@ mod tests {
 
         // Attach without discharging the reads, which is the state every
         // `caught_up` leaves the client in (spec 6.7).
-        world.stream = open_stream(&world.control, &mut world.directory)
-            .await
-            .expect("re-attach");
+        world.stream = Some(
+            open_stream(&world.control, &mut world.directory)
+                .await
+                .expect("re-attach"),
+        );
         assert_eq!(
             fold_attach_block(&mut world).await,
             CatchUp::Caught,
@@ -11675,7 +12008,7 @@ mod tests {
         let deadline = Instant::now() + SETTLE_DEADLINE;
         while !saw_prompt(&world) {
             assert!(Instant::now() < deadline, "the prompt never landed");
-            let received = tokio::time::timeout(SETTLE_DEADLINE, world.stream.recv())
+            let received = tokio::time::timeout(SETTLE_DEADLINE, world.stream_mut().recv())
                 .await
                 .expect("a frame arrives before the timeout");
             let ControlFrame::Frame(frame) = received else {
@@ -11913,6 +12246,51 @@ mod tests {
             &e.kind,
             EntryKind::User(u) if u.joined_text() == "hi there"
         )));
+    }
+
+    /// Alt+Enter is a session mutation, so a selected target cannot consume or
+    /// lose its draft until that target's own Caught makes it usable.
+    #[tokio::test]
+    async fn steer_is_refused_before_caught_without_clearing_the_draft() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let task = register_bash_task(&mut world, "sleep 100").await;
+        world.connection = Connection::CatchingUp;
+        shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .set_text("keep this steer");
+
+        assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
+        assert_eq!(shell.borrow().editor.borrow().text(), "keep this steer");
+        assert!(
+            !world.client().working(),
+            "the uncaught target started a turn"
+        );
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.contains("Can't steer") && toast.contains("attaching")),
+            "the refused steer was not surfaced: {:?}",
+            toast_lines(&shell),
+        );
+        assert!(matches!(
+            apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(task)).await,
+            ActionEffect::Redraw
+        ));
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "an uncaught local target opened a viewer with no valid backing",
+        );
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.contains("Can't open task output")),
+            "the refused task viewer was not surfaced: {:?}",
+            toast_lines(&shell),
+        );
+        shut_down(&world).await;
     }
 
     /// Editor-focused busy Alt+Enter returns a scrolled transcript to the live
@@ -13089,6 +13467,83 @@ mod tests {
         assert!(!filled.contains("Loading"), "loading replaced: {filled}");
     }
 
+    /// Session info is parked directly by the palette, so its real drive-loop
+    /// fetch boundary refuses while the selected session is not yet usable.
+    #[tokio::test]
+    async fn palette_session_info_refuses_before_caught_at_the_fetch_boundary() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render palette");
+        writer.write_all(b"info\r").expect("confirm info");
+        for _ in 0..5 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        assert!(shell.borrow().fetch_slot.borrow().is_some());
+
+        world.connection = Connection::CatchingUp;
+        sync_status(&world);
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out autocomplete once");
+        let observed_shell = Rc::clone(&shell);
+        let (exit, typed) = tokio::join!(
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+            async move {
+                writer.write_all(b"x").expect("wake the drive loop");
+                let refused = settled(Duration::from_secs(3), || {
+                    toast_lines(&observed_shell)
+                        .iter()
+                        .any(|toast| toast.contains("Can't show session info"))
+                        .then_some(())
+                })
+                .await;
+                writer.write_all(b"z").expect("type after refocus");
+                let typed = settled(Duration::from_secs(3), || {
+                    observed_shell
+                        .borrow()
+                        .editor
+                        .borrow()
+                        .text()
+                        .contains('z')
+                        .then_some(())
+                })
+                .await;
+                drop(writer);
+                (refused, typed)
+            }
+        );
+        let exit = exit.expect("drive exits without fatal error");
+        assert!(matches!(exit, SessionExit::Quit));
+        assert!(typed.0.is_some(), "the fetch boundary never refused");
+        assert!(typed.1.is_some(), "editor focus was not restored");
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0);
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.contains("Can't show session info")),
+            "the real fetch boundary did not refuse: {:?}",
+            toast_lines(&shell),
+        );
+    }
+
     /// Confirming skills from the palette opens the window immediately, on top
     /// of the palette (depth 2), showing a loading placeholder and returning a
     /// plain `OpenedOverlay` like every other opener. Delivering the discovered
@@ -13584,6 +14039,75 @@ mod tests {
             .await
             .expect("init");
         (world, shell, app, writer, root)
+    }
+
+    /// Settle the user transition parked by [`apply_focus_request`] without a
+    /// terminal driver. Existing unit-composition tests use this after asserting
+    /// the immediate selected/disconnected state. Responsiveness and drawn
+    /// pre-Caught behavior are covered through the real [`drive`] loop.
+    async fn settle_pending_transition(
+        app: &mut AsyncApp,
+        shell: &Rc<RefCell<Shell>>,
+        world: &mut World,
+    ) -> CatchUp {
+        let mut state = world.resume.take().expect("a selected transition");
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            assert!(Instant::now() < deadline, "the selected transition settled");
+            if !state.ready() {
+                match state.block_mut() {
+                    Some(block) => {
+                        block.fold_through(world).await;
+                    }
+                    None => tokio::time::sleep_until(state.due().into()).await,
+                }
+                continue;
+            }
+            match advance_resume(world, shell, state)
+                .await
+                .expect("the recovery driver returns a typed outcome")
+            {
+                ResumeAdvance::Pending(next) => state = next,
+                ResumeAdvance::OpenFailed { error, .. } => {
+                    panic!("the selected transition could not open: {error}")
+                }
+                ResumeAdvance::Settled {
+                    state: _,
+                    caught: CatchUp::Caught,
+                } => {
+                    refresh_local_handles(world, shell)
+                        .await
+                        .expect("caught local session exposes its handles");
+                    world.connection = Connection::Connected;
+                    complete_pending_transition(app, shell, world).await;
+                    return CatchUp::Caught;
+                }
+                ResumeAdvance::Settled { mut state, caught } => {
+                    fail_pending_transition(
+                        app,
+                        shell,
+                        world,
+                        TransitionFailure::Attach(caught.clone()),
+                    );
+                    match &caught {
+                        CatchUp::Refused { .. } => {
+                            world.connection = Connection::Refused;
+                            if world.client().needs_reattach() {
+                                state.failed(Connection::Refused);
+                                world.resume = Some(state);
+                            }
+                        }
+                        CatchUp::Stalled(_) => {
+                            world.connection = Connection::Stalled;
+                            state.failed(Connection::Stalled);
+                            world.resume = Some(state);
+                        }
+                        CatchUp::Caught => unreachable!(),
+                    }
+                    return caught;
+                }
+            }
+        }
     }
 
     // ---- Inline images (lazy transmit + free) ----
@@ -14387,6 +14911,32 @@ mod tests {
         crate::toasts::toast_texts(&shell.borrow().toasts)
             .iter()
             .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    /// Toast text read from the actual ToastStack widget surfaces, isolated
+    /// from identical text that may also be visible in the transcript.
+    fn drawn_toast_lines(shell: &Rc<RefCell<Shell>>) -> Vec<String> {
+        let surfaces = shell.borrow().toast_box.borrow().draw_stack(
+            &crate::test_support::draw_ctx(160, Some(50)),
+            Size {
+                width: 160,
+                height: 50,
+            },
+        );
+        surfaces
+            .iter()
+            .map(|surface| {
+                crate::test_support::rows(surface)
+                    .into_iter()
+                    .filter(|row| row.starts_with('│'))
+                    .map(|row| row.trim_matches('│').trim().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .collect()
     }
 
@@ -15650,6 +16200,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         assert_eq!(world.session(), beta, "the frontend re-attached onto beta");
         // The transcript renders beta's replayed content, not alpha's, which
@@ -15703,6 +16254,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         assert_ne!(world.session(), beta, "a fresh session was minted");
         let fresh_rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
@@ -15823,7 +16375,7 @@ mod tests {
 
         // The arm handler's prefill: the draft goes onto history, the message
         // fills the editor.
-        prefill_branch_editor(&editor, "branched message");
+        replace_editor_preserving_draft(&editor, "branched message");
         assert_eq!(editor.borrow().text(), "branched message");
 
         // Clearing the prefill and pressing up recalls the preserved draft.
@@ -16188,6 +16740,7 @@ mod tests {
             .task_registry
             .set_status(task, aj_agent::tool::TaskStatus::Killed);
         apply_focus_request(&mut app, &shell, &mut world, branch()).await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         assert!(
             toast_lines(&shell)
                 .iter()
@@ -16231,6 +16784,7 @@ mod tests {
         .await;
         assert!(matches!(moved, Focus::Moved));
         assert_ne!(world.session(), outgoing, "the focus moved");
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         let live = world
             .host()
@@ -16275,6 +16829,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         assert!(
             world.directory.is_attached(&first),
             "the outgoing session is still folded, not dropped",
@@ -16343,6 +16898,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         assert_eq!(world.session(), first);
         let users = user_messages(&world);
         assert!(
@@ -16367,7 +16923,7 @@ mod tests {
         const QUIET: Duration = Duration::from_millis(150);
         let deadline = Instant::now() + SETTLE_DEADLINE;
         while Instant::now() < deadline {
-            let Ok(received) = tokio::time::timeout(QUIET, world.stream.recv()).await else {
+            let Ok(received) = tokio::time::timeout(QUIET, world.stream_mut().recv()).await else {
                 return;
             };
             let ControlFrame::Frame(frame) = received else {
@@ -16401,6 +16957,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         // Drain first. The switch reopened the stream over both sessions, so
         // `first`'s own re-attach block is still to come, and a swap that
         // wrongly awaited a block would find that one and return without
@@ -16421,6 +16978,11 @@ mod tests {
             .expect("a swap onto an attached session waits for nothing");
         assert!(matches!(moved, Focus::Moved));
         assert_eq!(world.session(), first);
+        assert_eq!(
+            world.connection,
+            Connection::Reconnecting,
+            "selection is immediate, while usability waits for Caught",
+        );
         shut_down(&world).await;
     }
 
@@ -16452,6 +17014,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         world
             .host()
             .command(
@@ -16530,6 +17093,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         // Another writer moves the backgrounded session's head. The host mints a
         // fresh epoch and publishes `reset` for it.
@@ -16570,6 +17134,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         assert_eq!(world.session(), first);
         assert!(
             !world.directory.needs_reattach(),
@@ -16613,6 +17178,7 @@ mod tests {
         .await;
         assert!(matches!(moved, Focus::Moved));
         assert_ne!(world.session(), outgoing, "the focus moved");
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         // Well past the grace that would release an unattached session.
         tokio::time::sleep(GRACE * 4).await;
@@ -16663,14 +17229,16 @@ mod tests {
         // subscriber leaves behind: nothing holds the session and the grace
         // applies to it.
         let elsewhere = world.host().create().await.expect("a scratch session");
-        world.stream = world
-            .control
-            .attach_all(&[AttachRequest {
-                session: elsewhere.clone(),
-                cursor: None,
-            }])
-            .await
-            .expect("attach elsewhere");
+        world.stream = Some(
+            world
+                .control
+                .attach_all(&[AttachRequest {
+                    session: elsewhere.clone(),
+                    cursor: None,
+                }])
+                .await
+                .expect("attach elsewhere"),
+        );
 
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
@@ -16808,6 +17376,7 @@ mod tests {
             },
         )
         .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
@@ -16842,6 +17411,7 @@ mod tests {
             },
         )
         .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
             rows.contains("branch B prompt"),
@@ -17045,6 +17615,7 @@ mod tests {
             },
         )
         .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         fold_ready_frames(&mut world);
         assert!(world.client().working(), "the branch prompt ran as a turn");
@@ -17487,6 +18058,7 @@ mod tests {
                 apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target))
                     .await;
             assert!(matches!(moved, Focus::Moved), "the visit was refused");
+            settle_pending_transition(&mut app, &shell, &mut world).await;
         }
         assert!(
             world.directory.is_attached(&other),
@@ -17541,6 +18113,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         assert!(
             released(&world, &home).await,
             "the host still holds the archived session, so its lock never frees",
@@ -17565,6 +18138,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         apply_command(&mut world, &shell, CommandAction::ArchiveSession).await;
         assert!(
             main_notices(&world)
@@ -17772,6 +18346,7 @@ mod tests {
                 apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target))
                     .await;
             assert!(matches!(moved, Focus::Moved));
+            settle_pending_transition(&mut app, &shell, &mut world).await;
         }
         assert!(
             poll_row(&mut world, &shell, &other, |row| row.status
@@ -18363,6 +18938,7 @@ mod tests {
         let moved =
             apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target)).await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         let painted = painted_rows(&shell, 100, 40).join("\n");
         assert!(
@@ -20069,9 +20645,9 @@ mod tests {
         fold_ready_frames(&mut world);
         // Cut the connection mid-turn: the state the transport error leaves
         // the stream in.
-        world.stream.cut();
+        world.stream_mut().cut();
         assert!(
-            matches!(world.stream.recv().await, ControlFrame::Lost(_)),
+            matches!(world.stream_mut().recv().await, ControlFrame::Lost(_)),
             "the cut stream reports the loss"
         );
 
@@ -20152,6 +20728,12 @@ mod tests {
         /// the client came back and asked for the session again, which is the far
         /// end of the recovery rather than the client's own bookkeeping.
         opens: Arc<std::sync::atomic::AtomicUsize>,
+        /// Prompt and Head requests received after a scripted attach failure.
+        /// These are the far-end oracles for Caught-gated prompt submission and
+        /// the no-compensation rule.
+        prompts: Arc<std::sync::atomic::AtomicUsize>,
+        steers: Arc<std::sync::atomic::AtomicUsize>,
+        heads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// What a peer does once it has written a stream's script.
@@ -20176,9 +20758,29 @@ mod tests {
             WarmPeer::answering(vec![script], beat, After::Cut).await
         }
 
+        /// Refuse every event-stream open with the peer's exact reason.
+        async fn refusing_events(reason: &str) -> WarmPeer {
+            Self::serve(
+                vec![Vec::new()],
+                Duration::from_millis(10),
+                After::Warm,
+                Some(reason.to_string()),
+            )
+            .await
+        }
+
         /// A script per stream, the last one repeating. What a peer that changes
         /// its answer looks like: refuse the first attach, serve the second.
         async fn answering(scripts: Vec<Vec<String>>, beat: Duration, after: After) -> WarmPeer {
+            Self::serve(scripts, beat, after, None).await
+        }
+
+        async fn serve(
+            scripts: Vec<Vec<String>>,
+            beat: Duration,
+            after: After,
+            event_refusal: Option<String>,
+        ) -> WarmPeer {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind a loopback port");
@@ -20189,25 +20791,55 @@ mod tests {
             let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let scripts = Arc::new(scripts);
+            let event_refusal = Arc::new(event_refusal);
             let counted = Arc::clone(&beats);
             let opened = Arc::clone(&opens);
+            let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let steers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let heads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let recorded_prompts = Arc::clone(&prompts);
+            let recorded_steers = Arc::clone(&steers);
+            let recorded_heads = Arc::clone(&heads);
             let serving = tokio::spawn(async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let counted = Arc::clone(&counted);
                     let opened = Arc::clone(&opened);
                     let scripts = Arc::clone(&scripts);
+                    let event_refusal = Arc::clone(&event_refusal);
+                    let prompts = Arc::clone(&recorded_prompts);
+                    let steers = Arc::clone(&recorded_steers);
+                    let heads = Arc::clone(&recorded_heads);
                     tokio::spawn(async move {
                         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+                        let mut request = Vec::new();
                         let mut buffer = [0u8; 4096];
-                        let read = socket.read(&mut buffer).await.unwrap_or(0);
-                        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        while request.len() < 64 * 1024 {
+                            let read = socket.read(&mut buffer).await.unwrap_or(0);
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&buffer[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let request = String::from_utf8_lossy(&request).to_string();
                         // A block that lands obliges the task and queue reads
                         // (spec 6.7). A peer that left those hanging would park
                         // the caller in a request rather than in the fold, which
                         // is a different failure than the one under test, so they
                         // are answered with the wire types' own empty values.
                         if !request.contains("/v1/events") {
+                            if request.contains("/prompt ") {
+                                prompts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if request.contains("/steer ") {
+                                steers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if request.contains("/head ") {
+                                heads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             let body = if request.contains("/queue") {
                                 serde_json::to_string(&aj_wire::QueueState::default())
                                     .expect("a queue state")
@@ -20226,6 +20858,21 @@ mod tests {
                         // Which stream this is, counted before it is served so
                         // the script and the count cannot disagree.
                         let nth = opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(reason) = event_refusal.as_ref() {
+                            let body = serde_json::json!({
+                                "code": "unavailable",
+                                "message": reason,
+                            })
+                            .to_string();
+                            let answer = format!(
+                                "HTTP/1.1 503 Service Unavailable\r\n\
+                                 content-type: application/json\r\n\
+                                 content-length: {}\r\n\r\n{body}",
+                                body.len(),
+                            );
+                            let _ = socket.write_all(answer.as_bytes()).await;
+                            return;
+                        }
                         let script = &scripts[nth.min(scripts.len() - 1)];
                         let head = b"HTTP/1.1 200 OK\r\n\
                                      content-type: text/event-stream\r\n\
@@ -20261,6 +20908,9 @@ mod tests {
                 serving,
                 beats,
                 opens,
+                prompts,
+                steers,
+                heads,
             }
         }
 
@@ -20270,6 +20920,18 @@ mod tests {
 
         fn opens(&self) -> usize {
             self.opens.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn prompts(&self) -> usize {
+            self.prompts.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn steers(&self) -> usize {
+            self.steers.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn heads(&self) -> usize {
+            self.heads.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
     impl Drop for WarmPeer {
@@ -20289,7 +20951,7 @@ mod tests {
                 .expect("a client against the warm peer")
                 .with_silence(silence),
         );
-        world.stream.cut();
+        world.stream_mut().cut();
     }
 
     /// A `state` frame opening a block under `epoch`, as a peer writes it.
@@ -20341,6 +21003,741 @@ mod tests {
         .expect("a caught_up frame")
     }
 
+    /// Selection commits before attach, remains responsive while the target's
+    /// block arrives, and does not become usable or successful before Caught.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_selected_target_is_not_usable_or_successful_before_its_caught() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let target = "selected-slow-target".to_string();
+        let epoch = "slow-target-epoch";
+        let peer = WarmPeer::start(
+            vec![
+                block_opening(&target, epoch),
+                block_note(&target, epoch, 1, "target history"),
+                block_end(&target, epoch, 1),
+            ],
+            Duration::from_millis(500),
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_secs(5));
+
+        let (mut app, writer, _root) = app_over(&shell).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(target.clone()),
+        )
+        .await;
+        drop(writer);
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.session(), target);
+        assert_eq!(world.connection, Connection::Reconnecting);
+        assert!(toast_lines(&shell).is_empty(), "no pre-Caught success");
+
+        let status = Rc::clone(&world.status);
+        let observed_shell = Rc::clone(&shell);
+        let editor = Rc::clone(&shell.borrow().editor);
+        let chat = Rc::clone(&world.chat);
+        let (exit, observed) = drive_until(&mut world, &shell, move |mut writer| async move {
+            let catching = settled(Duration::from_secs(3), || {
+                (status.borrow().connection == Connection::CatchingUp).then_some(())
+            })
+            .await;
+            let premature = toast_lines(&observed_shell)
+                .iter()
+                .any(|toast| toast.starts_with("Switched to"));
+            writer
+                .write_all(b"still typing\r")
+                .expect("submit during catch-up");
+            let typed = settled(Duration::from_secs(3), || {
+                editor
+                    .borrow()
+                    .text()
+                    .contains("still typing")
+                    .then_some(())
+            })
+            .await;
+            let in_block = settled(Duration::from_secs(3), || {
+                notices_of(&chat.borrow())
+                    .iter()
+                    .any(|notice| notice == "target history")
+                    .then_some(())
+            })
+            .await;
+            let premature_after_state = toast_lines(&observed_shell)
+                .iter()
+                .any(|toast| toast.starts_with("Switched to"));
+            writer
+                .write_all(&[0x15])
+                .expect("clear the first restored draft");
+            writer
+                .write_all(b"after state\r")
+                .expect("submit after State but before Caught");
+            let gated_in_block = settled(Duration::from_secs(3), || {
+                (observed_shell.borrow().editor.borrow().text() == "after state").then_some(())
+            })
+            .await;
+            writer
+                .write_all(&[0x15])
+                .expect("clear the second restored draft");
+            writer
+                .write_all(b"steer while catching\x1b\r")
+                .expect("Alt+Enter during Applying");
+            let steer_gated = settled(Duration::from_secs(3), || {
+                let kept = observed_shell.borrow().editor.borrow().text() == "steer while catching";
+                let refused = toast_lines(&observed_shell)
+                    .iter()
+                    .any(|toast| toast.contains("Can't steer") && toast.contains("attaching"));
+                (kept && refused).then_some(())
+            })
+            .await;
+            let caught = settled(Duration::from_secs(3), || {
+                let connected = status.borrow().connection == Connection::Connected;
+                let success = toast_lines(&observed_shell)
+                    .iter()
+                    .any(|toast| toast == "Switched to selected-slow-target.");
+                (connected && success).then_some(())
+            })
+            .await;
+            drop(writer);
+            (
+                catching,
+                premature,
+                typed,
+                in_block,
+                premature_after_state,
+                gated_in_block,
+                steer_gated,
+                caught,
+            )
+        })
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let (
+            catching,
+            premature,
+            typed,
+            in_block,
+            premature_after_state,
+            gated_in_block,
+            steer_gated,
+            caught,
+        ) = observed;
+        assert!(catching.is_some(), "CatchingUp was never visible");
+        assert!(!premature, "success appeared before the target's Caught");
+        assert!(typed.is_some(), "the drive loop stopped accepting input");
+        assert!(
+            in_block.is_some(),
+            "the test never observed an Applying block"
+        );
+        assert!(
+            !premature_after_state,
+            "success appeared after State but before Caught",
+        );
+        assert!(
+            gated_in_block.is_some(),
+            "submission became usable inside the Applying block",
+        );
+        assert!(
+            steer_gated.is_some(),
+            "Alt+Enter bypassed the pre-Caught usability gate",
+        );
+        assert!(
+            caught.is_some(),
+            "Caught did not enable success and usability"
+        );
+        assert_eq!(
+            peer.prompts(),
+            0,
+            "a prompt was sent before the selected target became usable",
+        );
+        assert_eq!(peer.steers(), 0, "a steer was sent before target Caught");
+        assert_eq!(
+            shell.borrow().editor.borrow().text(),
+            "steer while catching"
+        );
+        assert_eq!(world.connection, Connection::Connected);
+        assert_eq!(world.session(), target);
+        remote.shutdown().await;
+    }
+
+    /// A late peer refusal keeps the requested target selected with its exact
+    /// reason in both durable scrollback and the action ToastStack projection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_refusal_keeps_the_target_selected_and_draws_the_exact_reason() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let previous = world.session().to_string();
+        let target = "selected-refused-target".to_string();
+        let reason = "the target is held by the peer named here";
+        let expected_toast = format!("Can't follow {target}: {reason}. It remains selected.");
+        let peer = WarmPeer::start(
+            vec![
+                list_of(&[&previous, &target]),
+                refusal_frame(&target, "locked", reason),
+            ],
+            Duration::from_millis(20),
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_secs(5));
+
+        let (mut app, writer, _root) = app_over(&shell).await;
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(target.clone()),
+        )
+        .await;
+        drop(writer);
+
+        let status = Rc::clone(&world.status);
+        let observed_shell = Rc::clone(&shell);
+        let expected_in_stack = expected_toast.clone();
+        let (exit, refused) = drive_until(&mut world, &shell, move |writer| async move {
+            let refused = settled(Duration::from_secs(3), || {
+                let state = status.borrow().connection == Connection::Refused;
+                let toast = toast_lines(&observed_shell)
+                    .iter()
+                    .any(|toast| toast == &expected_in_stack);
+                (state && toast).then_some(())
+            })
+            .await;
+            drop(writer);
+            refused
+        })
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(refused.is_some(), "the late refusal did not settle visibly");
+        assert_eq!(world.session(), target);
+        assert_eq!(world.connection, Connection::Refused);
+        assert!(
+            world.directory.rows().iter().any(|row| row.id == previous),
+            "the previous session is not available for an ordinary switch",
+        );
+        assert!(
+            main_notices(&world).iter().any(|notice| notice == reason),
+            "the exact reason did not remain in scrollback: {:?}",
+            main_notices(&world),
+        );
+        let drawn = drawn_toast_lines(&shell);
+        assert!(
+            drawn.iter().any(|toast| toast == &expected_toast),
+            "the ToastStack did not draw the exact action message: {drawn:?}",
+        );
+        assert!(
+            !toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.starts_with("Switched to")),
+            "a refused target also emitted success: {:?}",
+            toast_lines(&shell),
+        );
+        remote.shutdown().await;
+    }
+
+    /// A directory edge after refusal rejoins through the responsive Resume
+    /// driver and completes the selected session's deferred startup obligation
+    /// without turning passive recovery into delayed action success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_target_passively_rejoins_and_completes_its_startup() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let target = "selected-rejoining-target".to_string();
+        let reason = "the target is locked for the first attach";
+        let peer = WarmPeer::answering(
+            vec![
+                vec![
+                    list_lock_at(&target, true, 7, 0),
+                    locked_refusal_at(&target, 7, reason),
+                    list_lock_at(&target, false, 7, 0),
+                ],
+                vec![
+                    block_opening(&target, "rejoined-epoch"),
+                    block_end(&target, "rejoined-epoch", 0),
+                ],
+            ],
+            Duration::from_millis(150),
+            After::Warm,
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_secs(5));
+
+        let (mut app, writer, _root) = app_over(&shell).await;
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(target.clone()),
+        )
+        .await;
+        drop(writer);
+        assert!(world.startup.contains_key(&target));
+
+        let status = Rc::clone(&world.status);
+        let editor = Rc::clone(&shell.borrow().editor);
+        let (exit, observed) = drive_until(&mut world, &shell, move |mut writer| async move {
+            let rejoining = settled(Duration::from_secs(4), || {
+                (status.borrow().connection == Connection::CatchingUp && peer.opens() >= 2)
+                    .then_some(())
+            })
+            .await;
+            writer
+                .write_all(b"responsive")
+                .expect("type during passive rejoin");
+            let responsive = settled(Duration::from_secs(3), || {
+                editor.borrow().text().contains("responsive").then_some(())
+            })
+            .await;
+            let recovered = settled(Duration::from_secs(4), || {
+                (status.borrow().connection == Connection::Connected && peer.opens() >= 2)
+                    .then_some(())
+            })
+            .await;
+            drop(writer);
+            (rejoining, responsive, recovered)
+        })
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let (rejoining, responsive, recovered) = observed;
+        assert!(
+            rejoining.is_some(),
+            "the passive rejoin never painted CatchingUp"
+        );
+        assert!(
+            responsive.is_some(),
+            "the passive rejoin blocked terminal input"
+        );
+        assert!(
+            recovered.is_some(),
+            "the directory rejoin never reached Caught"
+        );
+        assert_eq!(world.session(), target);
+        assert!(!world.startup.contains_key(world.session()));
+        assert!(
+            !toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.starts_with("Switched to")),
+            "passive rejoin emitted delayed action success: {:?}",
+            toast_lines(&shell),
+        );
+        remote.shutdown().await;
+    }
+
+    /// A partial create still names a minted session. A later attach refusal
+    /// keeps that id selected and reports both facts without complete success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partial_create_followed_by_refusal_preserves_the_minted_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = "minted-partial-session".to_string();
+        let partial = "the session exists, but its requested label was not applied";
+        let reason = "the minted session is temporarily withheld";
+        let peer = WarmPeer::start(
+            vec![refusal_frame(&session, "locked", reason)],
+            Duration::from_millis(10),
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_secs(5));
+
+        let (mut app, writer, _root) = app_over(&shell).await;
+        let moved = apply_create_result(
+            &mut app,
+            &shell,
+            &mut world,
+            Err(ControlError::PartialCreate {
+                session: session.clone(),
+                message: partial.to_string(),
+            }),
+        );
+        drop(writer);
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.session(), session);
+        assert!(matches!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Refused { .. }
+        ));
+
+        let toasts = toast_lines(&shell);
+        assert_eq!(toasts.len(), 1, "one action produced one toast: {toasts:?}");
+        assert!(
+            toasts[0].contains(&session)
+                && toasts[0].contains(partial)
+                && toasts[0].contains(reason)
+                && toasts[0].contains("remains selected"),
+            "the partial create lost one of its durable facts: {toasts:?}",
+        );
+        assert!(
+            !toasts[0].contains("Started a fresh session"),
+            "a partial failed follow also emitted complete success: {toasts:?}",
+        );
+        assert!(main_notices(&world).iter().any(|notice| notice == partial));
+        assert!(main_notices(&world).iter().any(|notice| notice == reason));
+
+        // Recover through a full replacement after the refusal cleared the
+        // epoch. The partial-create warning is a minted-session fact, not a row
+        // that may disappear with the stale cache.
+        let recovery = WarmPeer::start(
+            vec![
+                block_opening(&session, "partial-recovery"),
+                block_end(&session, "partial-recovery", 0),
+            ],
+            Duration::from_millis(20),
+        )
+        .await;
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&recovery.url)
+                .expect("a client against the recovery peer")
+                .with_silence(Duration::from_secs(5)),
+        );
+        world.client_mut().owe_reattach();
+        world.resume = Some(Resume::rejoin());
+        let status = Rc::clone(&world.status);
+        let (exit, recovered) = drive_until(&mut world, &shell, move |writer| async move {
+            let recovered = settled(Duration::from_secs(3), || {
+                (status.borrow().connection == Connection::Connected).then_some(())
+            })
+            .await;
+            drop(writer);
+            recovered
+        })
+        .await;
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(recovered.is_some(), "the partial session did not recover");
+        assert!(
+            main_notices(&world).iter().any(|notice| notice == partial),
+            "the full replacement lost the PartialCreate fact: {:?}",
+            main_notices(&world),
+        );
+        assert!(!world.startup.contains_key(&session));
+        remote.shutdown().await;
+    }
+
+    /// Silence about the target is a stalled action outcome, not success and
+    /// not a rollback. Recovery remains paced from the selected target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stalled_switch_keeps_the_target_selected_and_retrying() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let target = "selected-stalled-target".to_string();
+        let silence = Duration::from_millis(150);
+        let peer = WarmPeer::start(Vec::new(), silence / 10).await;
+        redirect_to(&mut world, &peer, silence);
+
+        let (mut app, writer, _root) = app_over(&shell).await;
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(target.clone()),
+        )
+        .await;
+        drop(writer);
+        assert_eq!(world.session(), target);
+        assert_eq!(world.connection, Connection::Reconnecting);
+
+        let status = Rc::clone(&world.status);
+        let observed_shell = Rc::clone(&shell);
+        let expected = "the peer did not start the selected session's attach block";
+        let (exit, stalled) = drive_until(&mut world, &shell, move |writer| async move {
+            let stalled = settled(Duration::from_secs(3), || {
+                let state = status.borrow().connection == Connection::Stalled;
+                let toast = toast_lines(&observed_shell)
+                    .iter()
+                    .any(|toast| toast.contains(expected) && toast.contains("remains selected"));
+                (state && toast).then_some(())
+            })
+            .await;
+            drop(writer);
+            stalled
+        })
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(
+            stalled.is_some(),
+            "the production drive never painted Stalled"
+        );
+        assert_eq!(world.session(), target);
+        assert_eq!(world.connection, Connection::Stalled);
+        assert!(world.resume.is_some(), "the stalled target lost its retry");
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.contains(expected) && toast.contains("remains selected")),
+            "the stalled action was not toasted: {:?}",
+            toast_lines(&shell),
+        );
+        assert!(
+            !toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.starts_with("Switched to")),
+            "the stalled target was called successful",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A request-level stream refusal happens after selection commits. Its exact
+    /// peer reason is toasted once while paced reconnect remains on the target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stream_open_failure_keeps_the_target_selected_and_reconnecting() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let target = "selected-open-failure".to_string();
+        let reason = "the peer refused this replacement stream exactly";
+        let peer = WarmPeer::refusing_events(reason).await;
+        redirect_to(&mut world, &peer, Duration::from_secs(5));
+
+        let (mut app, writer, _root) = app_over(&shell).await;
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(target.clone()),
+        )
+        .await;
+        drop(writer);
+        assert_eq!(world.session(), target);
+
+        let status = Rc::clone(&world.status);
+        let observed_shell = Rc::clone(&shell);
+        let (exit, failed) = drive_until(&mut world, &shell, move |writer| async move {
+            let failed = settled(Duration::from_secs(3), || {
+                let reconnecting = status.borrow().connection == Connection::Reconnecting;
+                let toast = toast_lines(&observed_shell)
+                    .iter()
+                    .any(|toast| toast.contains(reason) && toast.contains("remains selected"));
+                (reconnecting && toast).then_some(())
+            })
+            .await;
+            drop(writer);
+            failed
+        })
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(failed.is_some(), "the stream-open failure was not visible");
+        assert_eq!(world.session(), target);
+        assert_eq!(world.connection, Connection::Reconnecting);
+        assert!(world.resume.is_some(), "the selected target lost its retry");
+        assert!(peer.opens() >= 1, "no replacement stream was requested");
+        assert!(
+            !toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.starts_with("Switched to")),
+            "the unopened target was called successful",
+        );
+        remote.shutdown().await;
+    }
+
+    /// Once Head is accepted, recovery only moves forward. A late refusal keeps
+    /// the branch prompt unsent and restores it to the editor. A later passive
+    /// Caught replaces the stale projection without delayed success or submit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_accepted_head_failure_recovers_forward_without_submitting() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "branch source").await;
+        let session = world.session().to_string();
+        let message = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::User(user) => user.message_id.clone(),
+                _ => None,
+            })
+            .expect("the source prompt has a durable id");
+        let expected_head = {
+            let handles = world
+                .host()
+                .local_handles(&session)
+                .await
+                .expect("local handles");
+            let log = handles.log.lock().await;
+            log.parent_of(&message)
+                .expect("the source prompt has a parent")
+                .clone()
+        };
+        let prompt = "kept branch prompt";
+        let stale_image_entry = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .first()
+            .expect("the branch has an entry")
+            .id;
+        shell
+            .borrow()
+            .image_store
+            .borrow_mut()
+            .insert(AgentId::Main, stale_image_entry, 42);
+
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                target: HeadTarget::Before(message),
+                prompt: Some(prompt.to_string()),
+            },
+        )
+        .await;
+        drop(writer);
+        assert_eq!(world.connection, Connection::Reconnecting);
+        assert_eq!(
+            world
+                .host()
+                .local_handles(&session)
+                .await
+                .expect("the accepted Head keeps the session")
+                .log
+                .lock()
+                .await
+                .head(),
+            Some(&expected_head),
+            "the host's authoritative Head did not change",
+        );
+        world.host().shutdown().await;
+
+        let reason = "the committed head's first follow was refused";
+        let peer = WarmPeer::answering(
+            vec![
+                vec![
+                    serde_json::to_string(&aj_wire::Frame::Heartbeat).expect("a heartbeat"),
+                    refusal_frame(&session, "locked", reason),
+                ],
+                vec![
+                    block_opening(&session, "authoritative-head"),
+                    block_note(
+                        &session,
+                        "authoritative-head",
+                        1,
+                        "authoritative branch recovered",
+                    ),
+                    block_end(&session, "authoritative-head", 1),
+                ],
+            ],
+            Duration::from_millis(150),
+            After::Warm,
+        )
+        .await;
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&peer.url)
+                .expect("a client against the scripted recovery peer")
+                .with_silence(Duration::from_secs(5)),
+        );
+        world.local = None;
+
+        let status = Rc::clone(&world.status);
+        let observed_shell = Rc::clone(&shell);
+        let chat = Rc::clone(&world.chat);
+        let (exit, observed) = drive_until(&mut world, &shell, move |writer| async move {
+            let catching = settled(Duration::from_secs(3), || {
+                (status.borrow().connection == Connection::CatchingUp).then_some(())
+            })
+            .await;
+            observed_shell
+                .borrow()
+                .editor
+                .borrow_mut()
+                .set_text("newer draft");
+            let drafted =
+                (observed_shell.borrow().editor.borrow().text() == "newer draft").then_some(());
+            let recovered = settled(Duration::from_secs(4), || {
+                let connected = status.borrow().connection == Connection::Connected;
+                let row = notices_of(&chat.borrow())
+                    .iter()
+                    .any(|notice| notice == "authoritative branch recovered");
+                (connected && row).then_some(())
+            })
+            .await;
+            drop(writer);
+            (catching, drafted, recovered)
+        })
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let (catching, drafted, recovered) = observed;
+        assert!(catching.is_some(), "Head catch-up was never visible");
+        assert!(drafted.is_some(), "the newer editor draft did not land");
+        assert!(recovered.is_some(), "forward recovery never reached Caught");
+        assert!(peer.opens() >= 2, "the failed Head follow did not retry");
+        assert_eq!(peer.prompts(), 0, "the held branch prompt was submitted");
+        assert_eq!(peer.heads(), 0, "recovery issued a compensating Head");
+        assert_eq!(
+            shell
+                .borrow()
+                .image_store
+                .borrow()
+                .get(AgentId::Main, stale_image_entry),
+            None,
+            "the forced Head replacement retained the abandoned projection's image id",
+        );
+        assert_eq!(shell.borrow().editor.borrow().text(), prompt);
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.contains(reason) && toast.contains("back in the editor")),
+            "the accepted-Head failure was not visible: {:?}",
+            toast_lines(&shell),
+        );
+        shell.borrow().editor.borrow_mut().set_text("");
+        shell.borrow().editor.borrow_mut().handle_event(
+            &mut EventContext::new(),
+            &Event::KeyPress(Key {
+                codepoint: Key::UP,
+                mods: Modifiers::empty(),
+                ..Key::default()
+            }),
+        );
+        assert_eq!(
+            shell.borrow().editor.borrow().text(),
+            "newer draft",
+            "restoring the held branch prompt discarded the newer draft",
+        );
+        assert!(
+            user_messages(&world).is_empty(),
+            "the abandoned branch or held prompt entered the recovered transcript: {:?}",
+            user_messages(&world),
+        );
+        assert!(
+            !toast_lines(&shell).iter().any(|toast| {
+                toast == "Branched the conversation from an earlier message."
+                    || toast == "Switched to the selected branch."
+            }),
+            "passive recovery emitted delayed action success: {:?}",
+            toast_lines(&shell),
+        );
+        for expected in [
+            reason,
+            aj_app::directory::WITHHELD_LOCKED_NOTICE,
+            "authoritative branch recovered",
+        ] {
+            assert!(
+                main_notices(&world).iter().any(|notice| notice == expected),
+                "recovery lost {expected:?}: {:?}",
+                main_notices(&world),
+            );
+        }
+    }
+
     /// A block fold gives up on a peer that keeps its connection warm and never
     /// serves the block, and leaves the re-attach owed so something asks again.
     ///
@@ -20374,7 +21771,7 @@ mod tests {
 
         assert_eq!(
             caught,
-            CatchUp::Stalled,
+            CatchUp::Stalled(AttachStall::NotStarted),
             "a block that never came was reported as something the caller need \
              not ask about again",
         );
@@ -20401,7 +21798,7 @@ mod tests {
             matches!(
                 crate::remote::tests::bounded(
                     "another frame from the warm peer",
-                    world.stream.recv(),
+                    world.stream_mut().recv(),
                 )
                 .await,
                 ControlFrame::Frame(_),
@@ -20513,7 +21910,7 @@ mod tests {
 
         assert_eq!(
             caught,
-            CatchUp::Stalled,
+            CatchUp::Stalled(AttachStall::Reset),
             "an abandoned block reads as one the caller owes another attach",
         );
         assert!(
@@ -20882,7 +22279,7 @@ mod tests {
 
         assert_eq!(
             fold_attach_block(&mut world).await,
-            CatchUp::Stalled,
+            CatchUp::Stalled(AttachStall::Unserved),
             "a fold with nothing armed reported a block it was never owed",
         );
         assert!(
@@ -20908,7 +22305,7 @@ mod tests {
         let mut block = Block::open(&world);
         assert_eq!(
             block.settled(),
-            Some(CatchUp::Stalled),
+            Some(CatchUp::Stalled(AttachStall::Unserved)),
             "the startup block was folded, so this one is over before it starts, \
              which is the state under test",
         );
@@ -20922,7 +22319,7 @@ mod tests {
         block.fold(&mut world, aj_wire::Frame::Heartbeat);
         assert_eq!(
             block.settled(),
-            Some(CatchUp::Stalled),
+            Some(CatchUp::Stalled(AttachStall::Unserved)),
             "a block nobody will bring now reports itself caught",
         );
         remote.shutdown().await;
@@ -20955,16 +22352,19 @@ mod tests {
         .await;
         redirect_to(&mut world, &peer, Duration::from_secs(30));
 
-        let mut state = advance_resume(&mut world, &shell, Resume::lost())
+        let ResumeAdvance::Pending(mut state) = advance_resume(&mut world, &shell, Resume::lost())
             .await
             .expect("a connection's recovery is never fatal")
-            .expect("the peer answered the open, so a block is arriving");
+        else {
+            panic!("the peer answered the open, so a block is arriving");
+        };
         let block = state.block_mut().expect("the open armed a block");
 
         let mut folds = Vec::new();
         while block.settled().is_none() {
             if let ControlFrame::Frame(frame) =
-                crate::remote::tests::bounded("a frame of the block", world.stream.recv()).await
+                crate::remote::tests::bounded("a frame of the block", world.stream_mut().recv())
+                    .await
             {
                 folds.push(block.fold(&mut world, frame));
             }
@@ -21023,16 +22423,18 @@ mod tests {
         let epoch = "epoch-in-hand";
         let silence = Duration::from_millis(300);
 
-        let mut state = advance_resume(&mut world, &shell, Resume::lost())
+        let ResumeAdvance::Pending(mut state) = advance_resume(&mut world, &shell, Resume::lost())
             .await
             .expect("a connection's recovery is never fatal")
-            .expect("the peer answered the open, so a block is arriving");
+        else {
+            panic!("the peer answered the open, so a block is arriving");
+        };
 
         // The whole block, in hand: decoded frames the drain reads straight
         // out of memory. What the peer has written and what a drain can see
         // are two different things over a connection, and only the second one
         // is this rule's business.
-        world.stream = Stream::Remote {
+        world.stream = Some(Stream::Remote {
             events: crate::remote::RemoteEvents::scripted(
                 vec![
                     block_opening(&session, epoch),
@@ -21043,7 +22445,7 @@ mod tests {
             ),
             lost: None,
             attached: vec![session.clone()],
-        };
+        });
 
         let ResumeStep::CatchingUp(ref mut block) = state.step else {
             panic!("the open left a block to catch up on");
@@ -21067,20 +22469,19 @@ mod tests {
             .await
             .expect("a connection's recovery is never fatal");
         assert!(
-            left.is_none(),
+            matches!(
+                left,
+                ResumeAdvance::Settled {
+                    caught: CatchUp::Caught,
+                    ..
+                }
+            ),
             "a block that was sitting in hand was abandoned at its deadline, so \
              the host is asked to project the identical suffix again",
         );
         assert!(
             !world.directory.needs_reattach(),
             "and the client re-owes an attach for a block it already has",
-        );
-        assert!(
-            main_notices(&world)
-                .iter()
-                .any(|text| text == "Reconnected to the host."),
-            "the block landed but the recovery did not report it: {:?}",
-            main_notices(&world),
         );
         remote.shutdown().await;
     }
@@ -21115,10 +22516,12 @@ mod tests {
         .await;
         redirect_to(&mut world, &peer, silence);
 
-        let state = advance_resume(&mut world, &shell, Resume::lost())
+        let ResumeAdvance::Pending(state) = advance_resume(&mut world, &shell, Resume::lost())
             .await
             .expect("a connection's recovery is never fatal")
-            .expect("the peer answered the open, so a block is arriving");
+        else {
+            panic!("the peer answered the open, so a block is arriving");
+        };
 
         // The driver was elsewhere for longer than the block's whole budget.
         tokio::time::sleep(silence * 2).await;
@@ -21131,22 +22534,19 @@ mod tests {
         let left = advance_resume(&mut world, &shell, state)
             .await
             .expect("a connection's recovery is never fatal");
-        let landed = left.is_none();
+        let landed = matches!(
+            left,
+            ResumeAdvance::Settled {
+                caught: CatchUp::Caught,
+                ..
+            }
+        );
         assert_eq!(
             landed,
             !world.directory.needs_reattach(),
             "the client folded the block and still owes an attach, or gave up on \
               one and owes nothing: landed {landed}, re-attach owed {}",
             world.directory.needs_reattach(),
-        );
-        assert_eq!(
-            landed,
-            main_notices(&world)
-                .iter()
-                .any(|text| text == "Reconnected to the host."),
-            "the recovery reported an outcome it did not reach: landed {landed}, \
-             notices {:?}",
-            main_notices(&world),
         );
         remote.shutdown().await;
     }
@@ -21214,16 +22614,27 @@ mod tests {
             "the chord did not break the loop out for a switch, so nothing was \
              interrupted",
         );
-        assert_eq!(
-            world.connection,
-            Connection::Connected,
-            "the recovery is gone but the connection state it painted is not, so \
-             the status line keeps claiming a catch-up nothing is running",
-        );
+        assert_eq!(world.connection, Connection::CatchingUp);
         assert!(
-            world.directory.needs_reattach(),
-            "the block was left with no driver and no re-attach owed, so the \
-             session waits forever for a block nobody brings",
+            world.resume.as_ref().is_some_and(Resume::arriving),
+            "the world did not retain the arriving block while the outer loop \
+             applies the requested navigation",
+        );
+        let Ok(SessionExit::Switch(target)) = exit else {
+            unreachable!("checked the switch exit above")
+        };
+        let (mut app, _writer, _root) = app_over(&shell).await;
+        let moved =
+            apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target)).await;
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.connection, Connection::Reconnecting);
+        assert_eq!(
+            world
+                .directory
+                .client_for(&session)
+                .map(SessionClient::needs_reattach),
+            Some(true),
+            "the navigation abandoned the old block and re-owed its attach",
         );
         remote.shutdown().await;
     }
@@ -21254,6 +22665,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         // Now a peer that answers the attach and serves no block, and one
         // recovery step to open a stream over the whole set through it. Both
@@ -21261,10 +22673,12 @@ mod tests {
         let silence = Duration::from_secs(120);
         let peer = WarmPeer::start(Vec::new(), Duration::from_millis(20)).await;
         redirect_to(&mut world, &peer, silence);
-        let resuming = advance_resume(&mut world, &shell, Resume::lost())
+        let ResumeAdvance::Pending(resuming) = advance_resume(&mut world, &shell, Resume::lost())
             .await
             .expect("a connection's recovery is never fatal")
-            .expect("the peer answered the open, so a block is now awaited");
+        else {
+            panic!("the peer answered the open, so a block is now awaited");
+        };
         assert_eq!(resuming.connection(), Connection::CatchingUp);
         assert_ne!(
             world
@@ -21854,15 +23268,16 @@ mod tests {
             world.client().holds_attachment(),
             "the client is following its session again after two refusals",
         );
-        // Two refusals are two things that happened, and the second is the one a
-        // user would otherwise have no way to learn about.
+        // The latest exact refusal survives the authoritative replacement. The
+        // temporary withheld guidance disappears once the session is followed
+        // again, because its recovery condition no longer applies.
         let rows = main_notices(&world);
         assert_eq!(
             rows.iter()
-                .filter(|text| *text == aj_app::directory::WITHHELD_NOTICE)
+                .filter(|text| *text == "no host serves this session any more")
                 .count(),
-            2,
-            "each refusal says what it costs, once: {rows:?}",
+            1,
+            "the replacement lost or duplicated the latest exact refusal: {rows:?}",
         );
         remote.shutdown().await;
     }
@@ -21936,9 +23351,7 @@ mod tests {
         // client waited out, not some other way of losing an attachment.
         let notices = main_notices(&world);
         assert!(
-            notices
-                .iter()
-                .any(|text| text == aj_app::directory::WITHHELD_LOCKED_NOTICE),
+            notices.iter().any(|text| text == "held by another writer"),
             "the client never withheld the session as held by a rival, so \
              nothing here was waiting on the bit: {notices:?}",
         );
@@ -22053,9 +23466,7 @@ mod tests {
         assert!(matches!(exit, Ok(SessionExit::Quit)));
         let notices = main_notices(&world);
         assert!(
-            notices
-                .iter()
-                .any(|text| text == aj_app::directory::WITHHELD_LOCKED_NOTICE),
+            notices.iter().any(|text| text == "held by another writer"),
             "the client never withheld the session as held by a rival, so \
              nothing here was waiting on the bit: {notices:?}",
         );
@@ -22097,9 +23508,11 @@ mod tests {
 
         // Attach without discharging the reads, which is the state every
         // `caught_up` leaves the client in (spec 6.7).
-        world.stream = open_stream(&world.control, &mut world.directory)
-            .await
-            .expect("re-attach");
+        world.stream = Some(
+            open_stream(&world.control, &mut world.directory)
+                .await
+                .expect("re-attach"),
+        );
         assert_eq!(
             fold_attach_block(&mut world).await,
             CatchUp::Caught,
@@ -22564,6 +23977,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved), "the create was refused");
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         let created = world.session().to_string();
         assert_ne!(created, first, "a fresh session, not the one we were on");
         assert!(
@@ -22603,6 +24017,7 @@ mod tests {
         )
         .await;
         assert!(matches!(moved, Focus::Moved), "the switch was refused");
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         assert_eq!(world.session(), first);
         assert!(
             !user_rows(&world).iter().any(|t| t == "over the wire"),
@@ -23517,6 +24932,7 @@ mod tests {
             },
         )
         .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         assert!(
             toast_lines(&shell)
                 .iter()
@@ -23838,6 +25254,7 @@ mod tests {
             apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create { host },).await,
             Focus::Moved
         ));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
         assert_ne!(
             world.session(),
             initial,
@@ -23973,6 +25390,7 @@ mod tests {
             "the create landed: {:?}",
             crate::toasts::toast_texts(&shell.borrow().toasts),
         );
+        settle_pending_transition(&mut app, &shell, &mut world).await;
 
         // The harm lands in a host's own store, so that is where the assertion
         // goes first: exactly one of the two hosts gained a session, and it is

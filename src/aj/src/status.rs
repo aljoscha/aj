@@ -45,6 +45,10 @@ pub(crate) enum Connection {
     Reconnecting,
     /// The stream is back and its attach block is being folded.
     CatchingUp,
+    /// The peer explicitly refused to serve the selected session.
+    Refused,
+    /// The selected session's attach block stopped before `caught_up`.
+    Stalled,
 }
 
 /// Lifecycle bits the status chrome reads at draw time, mirrored from
@@ -78,7 +82,13 @@ impl StatusState {
     /// idle, so the sub-agent boxes keep their spinners animating even though
     /// the loader line itself stays hidden.
     pub(crate) fn animating(&self) -> bool {
-        self.busy() || self.sub_agents_running > 0
+        self.running
+            || self.compacting
+            || matches!(
+                self.connection,
+                Connection::Reconnecting | Connection::CatchingUp
+            )
+            || self.sub_agents_running > 0
     }
 }
 
@@ -138,6 +148,8 @@ impl StatusLine {
         match status.connection {
             Connection::Reconnecting => return "Reconnecting to the host…".to_string(),
             Connection::CatchingUp => return "Catching up…".to_string(),
+            Connection::Refused => return "The selected session refused the attach.".to_string(),
+            Connection::Stalled => return "The selected session's attach stalled.".to_string(),
             Connection::Connected => {}
         }
         if status.compacting {
@@ -209,9 +221,13 @@ impl Widget for StatusLine {
         // ` {spinner} {message}` on a single row. No leading blank row, so
         // the spinner sits flush under the transcript the same way the
         // collapsed idle slot lets the chat sit flush above the editor.
+        let marker = match self.status.borrow().connection {
+            Connection::Refused | Connection::Stalled => "×",
+            _ => Self::frame(started),
+        };
         let spans = vec![
             span(" ".to_string(), self.styles.text),
-            span(Self::frame(started).to_string(), self.styles.accent),
+            span(marker.to_string(), self.styles.accent),
             span(format!(" {}", self.message()), self.styles.dim),
         ];
         RichText::new(spans).draw(ctx)
@@ -312,6 +328,14 @@ mod tests {
         for (connection, label) in [
             (Connection::Reconnecting, " ⠋ Reconnecting to the host…"),
             (Connection::CatchingUp, " ⠋ Catching up…"),
+            (
+                Connection::Refused,
+                " × The selected session refused the attach.",
+            ),
+            (
+                Connection::Stalled,
+                " × The selected session's attach stalled.",
+            ),
         ] {
             let (line, _) = loader(StatusState {
                 connection,

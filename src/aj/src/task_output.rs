@@ -7,9 +7,8 @@
 //! viewer re-reads the registry on every draw, remotely the drive loop
 //! polls the per-task read and pushes each snapshot in.
 //!
-//! `Ctrl+K` ([`ACTION_TASK_KILL`]) kills a still-running task: in place
-//! through the registry handle locally, or by parking the id for the drive
-//! loop to send as a command. Esc/Enter close.
+//! `Ctrl+K` ([`ACTION_TASK_KILL`]) parks a still-running task's id for the
+//! drive loop to kill through the session command gate. Esc/Enter close.
 //!
 //! Content source: the registry's stateless [`TaskRead`] snapshot. When
 //! the task persists a spill file (background bash tasks always do) the
@@ -46,8 +45,9 @@ const HEADER_ROWS: u16 = 3;
 
 /// Where the viewer's content comes from, and where a kill goes.
 pub(crate) enum TaskBacking {
-    /// A live registry: re-read at draw, killed in place.
-    Local(TaskRegistry),
+    /// A live registry re-read at draw. Kills still park for the drive loop so
+    /// the selected session's Caught gate applies uniformly.
+    Local(TaskRegistry, Rc<RefCell<Option<TaskId>>>),
     /// The per-task read (spec 6.7): the drive loop pushes snapshots in
     /// through [`TaskOutputView::apply_details`], and a kill is parked in the
     /// slot for it to send as a command.
@@ -115,7 +115,7 @@ impl TaskOutputView {
     /// body rows. A remote viewer has nothing to pull: the drive loop pushes
     /// its snapshots in instead (see [`Self::apply_details`]).
     fn refresh(&mut self) {
-        let TaskBacking::Local(registry) = &self.backing else {
+        let TaskBacking::Local(registry, _) = &self.backing else {
             return;
         };
         let Some((status, read)) = registry.read(self.id) else {
@@ -285,18 +285,15 @@ impl Widget for TaskOutputView {
             ctx.consume_and_redraw();
             return;
         }
-        // Overlay-local kill (Spec F): in place through the registry, or
-        // parked for the drive loop to send as a command. The status flip
-        // arrives via the task's `TaskEnd` and repaints the header. Inert once
-        // the task is terminal.
+        // Overlay-local kill (Spec F): parked for the drive loop so local and
+        // remote viewers share mutation gating. The status flip arrives via the
+        // task's `TaskEnd` and repaints the header. Inert once terminal.
         if action_matches(key, ACTION_TASK_KILL) {
             if self.status == TaskStatus::Running {
-                match &self.backing {
-                    TaskBacking::Local(registry) => {
-                        registry.kill(self.id);
-                    }
-                    TaskBacking::Remote(slot) => *slot.borrow_mut() = Some(self.id),
-                }
+                let slot = match &self.backing {
+                    TaskBacking::Local(_, slot) | TaskBacking::Remote(slot) => slot,
+                };
+                *slot.borrow_mut() = Some(self.id);
             }
             ctx.consume_and_redraw();
             return;
@@ -550,12 +547,16 @@ mod tests {
         crate::test_support::rows(surface).join("\n")
     }
 
+    fn local_backing(registry: TaskRegistry) -> TaskBacking {
+        TaskBacking::Local(registry, Rc::new(RefCell::new(None)))
+    }
+
     #[test]
     fn renders_command_status_and_body() {
         let contents: String = (1..=5).map(|n| format!("line{n}\n")).collect();
         let (registry, id, _f) = task(&contents, TaskStatus::Running);
         let mut view = TaskOutputView::new(
-            TaskBacking::Local(registry),
+            local_backing(registry),
             id,
             "echo hi".to_string(),
             Style::default(),
@@ -572,7 +573,7 @@ mod tests {
     fn terminal_status_shows_in_header() {
         let (registry, id, _f) = task("out\n", TaskStatus::Exited(Some(0)));
         let mut view = TaskOutputView::new(
-            TaskBacking::Local(registry),
+            local_backing(registry),
             id,
             "echo hi".to_string(),
             Style::default(),
@@ -585,10 +586,11 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_k_kills_a_running_task() {
+    fn ctrl_k_parks_a_running_local_task_for_the_drive_loop() {
         let (registry, id, _f) = task("out\n", TaskStatus::Running);
+        let slot = Rc::new(RefCell::new(None));
         let mut view = TaskOutputView::new(
-            TaskBacking::Local(registry.clone()),
+            TaskBacking::Local(registry.clone(), Rc::clone(&slot)),
             id,
             "echo hi".to_string(),
             Style::default(),
@@ -603,11 +605,11 @@ mod tests {
         let mut ctx = EventContext::new();
         ctx.phase = Phase::Capturing;
         view.capture_event(&mut ctx, &ctrl_k);
-        // The registry cancelled the task's token; the driver would flip
-        // the status. With no driver, assert the token was cancelled.
-        assert!(
-            registry.summary(id).map(|s| s.status).is_some(),
-            "task still tracked"
+        assert_eq!(*slot.borrow(), Some(id), "the drive loop owns the kill");
+        assert_eq!(
+            registry.summary(id).map(|summary| summary.status),
+            Some(TaskStatus::Running),
+            "the widget killed locally around the drive gate",
         );
         assert!(ctx.consume_event, "kill consumed the chord");
     }
@@ -672,7 +674,7 @@ mod tests {
     fn esc_and_enter_close() {
         let (registry, id, _f) = task("x\n", TaskStatus::Running);
         let mut view = TaskOutputView::new(
-            TaskBacking::Local(registry),
+            local_backing(registry),
             id,
             "echo hi".to_string(),
             Style::default(),
@@ -740,7 +742,7 @@ mod tests {
             ..Style::default()
         };
         let mut view = TaskOutputView::new(
-            TaskBacking::Local(registry),
+            local_backing(registry),
             id,
             "echo hi".to_string(),
             Style::default(),
