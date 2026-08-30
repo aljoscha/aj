@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_renders_an_incomplete_prompt_as_a_lower_bound() {
+    fn footer_renders_an_incomplete_prompt_with_a_marker() {
         let chat = chat_with_window(200_000);
         let mut usage = usage(12_345);
         usage.turn_incomplete = true;

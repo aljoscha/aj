@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn context_usage_display_marks_incomplete_zero_and_nonzero_without_percentages() {
+    fn context_usage_display_marks_only_incomplete_nonzero_evidence() {
         let zero = context_usage_display(ContextUsage {
             tokens: Some(0),
             context_window: 200_000,
@@ -503,14 +503,23 @@ mod tests {
         assert_eq!(zero.ratio, "?/200k");
         assert_eq!(zero.percent, None);
 
-        let lower_bound = context_usage_display(ContextUsage {
-            tokens: Some(20_000),
-            context_window: 200_000,
+        let complete = context_usage_display(ContextUsage {
+            tokens: Some(9_999),
+            context_window: 20_000_000,
+            incomplete: false,
+        })
+        .expect("known window");
+        assert_eq!(complete.ratio, "10.0k/20M");
+        assert!(complete.percent.is_some());
+
+        let incomplete = context_usage_display(ContextUsage {
+            tokens: Some(9_999),
+            context_window: 20_000_000,
             incomplete: true,
         })
         .expect("known window");
-        assert_eq!(lower_bound.ratio, "≥20k/200k");
-        assert_eq!(lower_bound.percent, None);
+        assert_eq!(incomplete.ratio, "≥10.0k/20M");
+        assert_eq!(incomplete.percent, None);
     }
 
     #[test]

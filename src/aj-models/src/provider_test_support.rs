@@ -20,6 +20,22 @@ impl HeldSseServer {
     }
 }
 
+pub(crate) struct OpenAiErrorServer {
+    pub(crate) base_url: String,
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<usize>,
+}
+
+impl OpenAiErrorServer {
+    pub(crate) async fn finish(self) -> usize {
+        let _ = self.stop.send(());
+        tokio::time::timeout(Duration::from_secs(5), self.task)
+            .await
+            .expect("error fixture completed within 5 seconds")
+            .expect("error fixture task")
+    }
+}
+
 pub(crate) struct HeldHandshakeServer {
     pub(crate) base_url: String,
     accepted: Option<oneshot::Receiver<()>>,
@@ -86,6 +102,58 @@ pub(crate) async fn held_sse_server(path: &'static str, events: Vec<String>) -> 
 /// short of the declared Content-Length when the fixture is released.
 pub(crate) async fn failing_sse_server(path: &'static str, events: Vec<String>) -> HeldSseServer {
     held_sse_server_with_body(path, events, BodyEnd::Short).await
+}
+
+/// Answer every request until the provider terminates with an OpenAI-shaped 401.
+/// The returned count makes an adapter's one-issued-request contract observable.
+pub(crate) async fn openai_error_server(path: &'static str) -> OpenAiErrorServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind error fixture server");
+    let address = listener.local_addr().expect("error fixture address");
+    let (stop, mut stopped) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut requests = 0;
+        loop {
+            let accepted = tokio::select! {
+                biased;
+                accepted = listener.accept() => Some(accepted.expect("accept provider request")),
+                _ = &mut stopped => None,
+            };
+            let Some((mut socket, _)) = accepted else {
+                break;
+            };
+            let mut request = vec![0; 32 * 1024];
+            let read = socket
+                .read(&mut request)
+                .await
+                .expect("read provider request");
+            assert!(
+                String::from_utf8_lossy(&request[..read]).contains(path),
+                "provider request did not target {path}"
+            );
+            requests += 1;
+
+            let body = r#"{"error":{"message":"bad key","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write error response");
+        }
+        requests
+    });
+    OpenAiErrorServer {
+        base_url: format!("http://{address}"),
+        stop,
+        task,
+    }
 }
 
 #[derive(Clone, Copy)]

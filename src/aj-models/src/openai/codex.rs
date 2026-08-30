@@ -972,6 +972,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_issued_http_error_keeps_codex_usage_partial() {
+        let server =
+            crate::provider_test_support::openai_error_server("POST /codex/responses").await;
+        let mut model = fake_model("gpt-5.1", false);
+        model.base_url = server.base_url.clone();
+        let options = labeled_options(tokio_util::sync::CancellationToken::new());
+        let stream = OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("HTTP error emits terminal");
+        let requests = server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert_eq!(
+            terminal.error.as_ref().map(|error| error.category),
+            Some(ErrorCategory::Auth)
+        );
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.total_tokens, 0);
+        assert!(terminal.usage.incomplete);
+        assert_eq!(requests, 1, "one inference issues one HTTP request");
+    }
+
+    #[tokio::test]
     async fn a_live_sdk_read_failure_keeps_codex_state() {
         let server = crate::provider_test_support::failing_sse_server(
             "POST /codex/responses",

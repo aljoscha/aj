@@ -2136,6 +2136,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_issued_http_error_keeps_chat_usage_partial() {
+        let server =
+            crate::provider_test_support::openai_error_server("POST /v1/chat/completions").await;
+        let mut model = fake_model();
+        model.base_url = format!("{}/v1", server.base_url);
+        let options = labeled_options(CancellationToken::new());
+        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("HTTP error emits terminal");
+        let requests = server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert_eq!(
+            terminal.error.as_ref().map(|error| error.category),
+            Some(ErrorCategory::Auth)
+        );
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.total_tokens, 0);
+        assert!(terminal.usage.incomplete);
+        assert_eq!(requests, 1, "one inference issues one HTTP request");
+    }
+
+    #[tokio::test]
     async fn a_live_sdk_read_failure_keeps_chat_state() {
         let mut opening = text_delta("partial");
         opening.role = Some(Role::Assistant);
