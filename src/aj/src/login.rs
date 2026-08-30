@@ -38,6 +38,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use aj_app::auth::{LoginLine, auth_lines, browser_available, copy_to_clipboard, open_browser};
 use aj_app::keybindings::{fixed_keys, format_keybinding};
 use aj_app::theme::{Theme, ThemeColor};
+use aj_models::auth::{
+    AccountLabelDisplayMode, display_account_label, validate_account_label,
+    validate_account_label_edit,
+};
 use aj_models::oauth::{OAuthAuthInfo, OAuthCallbacks, OAuthError};
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
@@ -46,8 +50,8 @@ use vaxis::cell::{Hyperlink, Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     Builder, CursorState, DrawContext, Event, EventContext, FilterableSelect, ListView, MaxSize,
-    RelativePoint, RichText, SelectItem, Size, Source, SubSurface, Surface, Text, Widget,
-    WidgetRef, WidthBasis, draw_widget, to_widget_ref,
+    RelativePoint, RichText, ScrollView, ScrollableView, SelectItem, Size, Source, SubSurface,
+    Surface, Text, Widget, WidgetRef, WidthBasis, draw_widget, to_widget_ref,
 };
 
 use crate::overlay::{
@@ -69,6 +73,15 @@ const PAGE_STEP: usize = 10;
 /// into the login task's [`DialogCallbacks`].
 type PendingInput = Arc<StdMutex<Option<oneshot::Sender<String>>>>;
 
+/// Which contract governs the login dialog's active field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginInputKind {
+    /// Provider-owned OAuth code or redirect input.
+    OAuth,
+    /// A prospective account label governed by the shared auth validator.
+    AccountLabel,
+}
+
 /// Display state shared between [`DialogCallbacks`] (writer, on the login
 /// task) and [`LoginDialog`] (reader, on the UI thread).
 #[derive(Default)]
@@ -79,6 +92,10 @@ pub(crate) struct LoginDialogState {
     /// label and the next submit delivers its value to the awaiting
     /// callback.
     pub(crate) input_prompt: Option<String>,
+    /// Validation mode paired with `input_prompt`.
+    input_kind: Option<LoginInputKind>,
+    /// Field-local refusal text. It never includes rejected input bytes.
+    input_error: Option<String>,
     /// The authorization URL, set by [`OAuthCallbacks::on_auth`]. Held
     /// separately from its `Url` display line so Ctrl+Y can copy it.
     pub(crate) url: Option<String>,
@@ -205,6 +222,9 @@ pub(crate) struct LoginDialog {
     /// Owned by value and drawn unstamped: the field is never a focus or
     /// mouse target, so its widget identity is unused.
     field: vaxis::vxfw::TextField,
+    /// Exact field contents mirrored by `TextField::on_change`, used to check
+    /// a prospective account-label insertion before forwarding the event.
+    input_value: Rc<RefCell<String>>,
     list: Rc<RefCell<ListView>>,
     styles: LoginStyles,
     /// Ephemeral feedback (e.g. the Ctrl+Y "Copied…" line) shown at the
@@ -236,6 +256,13 @@ impl LoginDialog {
         let list = Rc::new(RefCell::new(list));
 
         let mut field = vaxis::vxfw::TextField::new();
+        let input_value = Rc::new(RefCell::new(String::new()));
+        {
+            let input_value = Rc::clone(&input_value);
+            field.on_change = Some(Box::new(move |_ctx, value| {
+                *input_value.borrow_mut() = value.to_string();
+            }));
+        }
         {
             // On submit the field hands us its (cleared) contents; deliver
             // them to the awaiting callback. Fires from inside
@@ -244,15 +271,26 @@ impl LoginDialog {
             // since we re-take both here.
             let pending = Arc::clone(&pending_input);
             let st = Arc::clone(&state);
+            let submitted_value = Rc::clone(&input_value);
             field.on_submit = Some(Box::new(move |_ctx, value| {
-                let value = value.trim().to_string();
+                let kind = st.lock().expect("login dialog state poisoned").input_kind;
+                let value = if kind == Some(LoginInputKind::AccountLabel) {
+                    value.to_string()
+                } else {
+                    value.trim().to_string()
+                };
                 let sender = pending.lock().expect("pending input poisoned").take();
                 match sender {
                     // Only deliver a non-empty value; a stray empty submit
                     // leaves the prompt in place for the real paste.
                     Some(tx) if !value.is_empty() => {
+                        *submitted_value.borrow_mut() = String::new();
+                        let mut state = st.lock().expect("login dialog state poisoned");
+                        state.input_prompt = None;
+                        state.input_kind = None;
+                        state.input_error = None;
+                        drop(state);
                         let _ = tx.send(value);
-                        st.lock().expect("login dialog state poisoned").input_prompt = None;
                     }
                     // Put the sender back when we didn't use it.
                     other => *pending.lock().expect("pending input poisoned") = other,
@@ -264,11 +302,73 @@ impl LoginDialog {
             state,
             cancel,
             field,
+            input_value,
             list,
             styles,
             notice: None,
             auto_copied: false,
         }
+    }
+
+    fn input_kind(&self) -> Option<LoginInputKind> {
+        self.state
+            .lock()
+            .expect("login dialog state poisoned")
+            .input_kind
+    }
+
+    /// Check an insertion against the complete prospective raw buffer without
+    /// mutating the field, cursor, viewport, or pending callback.
+    fn account_insertion_is_safe(&self, inserted: &str) -> bool {
+        let current = self.input_value.borrow();
+        let cursor = self.field.byte_offset_to_cursor();
+        let mut prospective = String::with_capacity(current.len() + inserted.len());
+        prospective.push_str(&current[..cursor]);
+        prospective.push_str(inserted);
+        prospective.push_str(&current[cursor..]);
+        validate_account_label_edit(&prospective).is_ok()
+    }
+
+    fn refuse_account_input(&self, message: &str) {
+        self.state
+            .lock()
+            .expect("login dialog state poisoned")
+            .input_error = Some(message.to_string());
+    }
+
+    fn clear_input_error(&self) {
+        self.state
+            .lock()
+            .expect("login dialog state poisoned")
+            .input_error = None;
+    }
+
+    /// Whether forwarding `key` to `TextField` reaches its final text-insert
+    /// branch rather than one of its fixed editing commands.
+    fn field_key_inserts_text(key: &Key) -> bool {
+        key.text.is_some()
+            && !key.matches(Key::BACKSPACE, Modifiers::empty())
+            && !key.matches(Key::DELETE, Modifiers::empty())
+            && !key.matches(u32::from('d'), Modifiers::CTRL)
+            && !key.matches(Key::LEFT, Modifiers::empty())
+            && !key.matches(u32::from('b'), Modifiers::CTRL)
+            && !key.matches(Key::RIGHT, Modifiers::empty())
+            && !key.matches(u32::from('f'), Modifiers::CTRL)
+            && !key.matches(u32::from('a'), Modifiers::CTRL)
+            && !key.matches(Key::HOME, Modifiers::empty())
+            && !key.matches(u32::from('e'), Modifiers::CTRL)
+            && !key.matches(Key::END, Modifiers::empty())
+            && !key.matches(u32::from('k'), Modifiers::CTRL)
+            && !key.matches(u32::from('u'), Modifiers::CTRL)
+            && !key.matches(u32::from('b'), Modifiers::ALT)
+            && !key.matches(Key::LEFT, Modifiers::ALT)
+            && !key.matches(u32::from('f'), Modifiers::ALT)
+            && !key.matches(Key::RIGHT, Modifiers::ALT)
+            && !key.matches(Key::BACKSPACE, Modifiers::ALT)
+            && !key.matches(u32::from('w'), Modifiers::CTRL)
+            && !key.matches(u32::from('d'), Modifiers::ALT)
+            && !key.matches(Key::ENTER, Modifiers::empty())
+            && !key.matches(u32::from('j'), Modifiers::CTRL)
     }
 }
 
@@ -281,9 +381,14 @@ impl Widget for LoginDialog {
             height: 0,
         };
 
-        let (line_count, prompt, url) = {
+        let (line_count, prompt, url, input_error) = {
             let st = self.state.lock().expect("login dialog state poisoned");
-            (st.lines.len(), st.input_prompt.clone(), st.url.clone())
+            (
+                st.lines.len(),
+                st.input_prompt.clone(),
+                st.url.clone(),
+                st.input_error.clone(),
+            )
         };
         self.list.borrow_mut().item_count =
             Some(u32::try_from(line_count).expect("line count fits u32"));
@@ -311,6 +416,9 @@ impl Widget for LoginDialog {
             reserved = reserved.saturating_add(2);
         }
         if self.notice.is_some() {
+            reserved = reserved.saturating_add(1);
+        }
+        if input_error.is_some() {
             reserved = reserved.saturating_add(1);
         }
         let list_height = size.height.saturating_sub(reserved);
@@ -397,6 +505,28 @@ impl Widget for LoginDialog {
                 surface: text.draw(&one_row),
                 z_index: 0,
             });
+            row = row.saturating_add(1);
+        }
+
+        if let Some(error) = input_error {
+            let mut text = Text::new(error);
+            text.style = self.styles.notice;
+            text.width_basis = WidthBasis::Parent;
+            let one_row = ctx.with_constraints(
+                zero,
+                MaxSize {
+                    width: Some(size.width),
+                    height: Some(1),
+                },
+            );
+            surface.children.push(SubSurface {
+                origin: RelativePoint {
+                    row: i32::from(row),
+                    col: 0,
+                },
+                surface: text.draw(&one_row),
+                z_index: 0,
+            });
         }
 
         surface
@@ -411,7 +541,19 @@ impl Widget for LoginDialog {
                 .input_prompt
                 .is_some();
             if prompting {
-                self.field.handle_event(ctx, event);
+                let Event::Paste(text) = event else {
+                    unreachable!("matched paste above")
+                };
+                if self.input_kind() == Some(LoginInputKind::AccountLabel)
+                    && !self.account_insertion_is_safe(text)
+                {
+                    self.refuse_account_input(
+                        "Account label paste rejected: use safe single-line Unicode within 256 bytes.",
+                    );
+                } else {
+                    self.clear_input_error();
+                    self.field.handle_event(ctx, event);
+                }
             }
             ctx.consume_and_redraw();
             return;
@@ -490,6 +632,28 @@ impl Widget for LoginDialog {
             .input_prompt
             .is_some();
         if prompting {
+            if self.input_kind() == Some(LoginInputKind::AccountLabel) {
+                if key.matches(Key::ENTER, Modifiers::empty())
+                    || key.matches(u32::from('j'), Modifiers::CTRL)
+                {
+                    let value = self.input_value.borrow();
+                    if let Err(err) = validate_account_label(&value) {
+                        self.refuse_account_input(&format!("Account label rejected: {err}"));
+                        ctx.consume_and_redraw();
+                        return;
+                    }
+                } else if Self::field_key_inserts_text(key)
+                    && let Some(text) = &key.text
+                    && !self.account_insertion_is_safe(text)
+                {
+                    self.refuse_account_input(
+                        "Account label character rejected: use safe single-line Unicode within 256 bytes.",
+                    );
+                    ctx.consume_and_redraw();
+                    return;
+                }
+            }
+            self.clear_input_error();
             self.field.handle_event(ctx, event);
         }
         // Read-only otherwise: swallow every key so none leaks to the base
@@ -550,15 +714,57 @@ impl DialogCallbacks {
     /// slot, and await the value the dialog delivers. A dropped receiver
     /// (the dialog torn down, or this branch of a race cancelled) resolves
     /// to [`OAuthError::Cancelled`].
-    async fn await_input(&self, prompt: &str) -> Result<String, OAuthError> {
+    async fn await_input(&self, prompt: &str, kind: LoginInputKind) -> Result<String, OAuthError> {
         let (tx, rx) = oneshot::channel();
         {
             let mut st = self.state.lock().expect("login dialog state poisoned");
             st.input_prompt = Some(prompt.to_string());
+            st.input_kind = Some(kind);
+            st.input_error = None;
             *self.pending_input.lock().expect("pending input poisoned") = Some(tx);
         }
         self.ping();
         rx.await.map_err(|_| OAuthError::Cancelled)
+    }
+
+    /// Ask for a new account label before OAuth begins. Existing exact labels
+    /// are represented through the shared grammar for collision guidance.
+    pub(crate) async fn prompt_account_label(
+        &self,
+        existing: &[String],
+    ) -> Result<String, OAuthError> {
+        const REPRESENTATION_BUDGET: usize = 4_096;
+        let mut labels = Vec::new();
+        let mut represented_bytes = 0;
+        let mut omitted = 0;
+        for label in existing {
+            let ordinary = display_account_label(label, AccountLabelDisplayMode::Ordinary);
+            let represented = if ordinary.contains(' ') {
+                display_account_label(label, AccountLabelDisplayMode::Ascii)
+            } else {
+                ordinary
+            };
+            let separator = usize::from(!labels.is_empty()) * 2;
+            if represented_bytes + separator + represented.len() <= REPRESENTATION_BUDGET {
+                represented_bytes += separator + represented.len();
+                labels.push(represented);
+            } else {
+                omitted += 1;
+            }
+        }
+        let labels = labels.join(", ");
+        let prompt = match (labels.is_empty(), omitted) {
+            (true, 0) => "Account name:".to_string(),
+            (true, omitted) => {
+                format!("Account name ({omitted} existing omitted; inspect auth status):")
+            }
+            (false, 0) => format!("Account name (existing: {labels}):"),
+            (false, omitted) => format!(
+                "Account name ({omitted} omitted; inspect auth status; existing: {labels}):"
+            ),
+        };
+        self.await_input(&prompt, LoginInputKind::AccountLabel)
+            .await
     }
 }
 
@@ -583,7 +789,7 @@ impl OAuthCallbacks for DialogCallbacks {
     }
 
     async fn on_prompt(&self, message: &str) -> Result<String, OAuthError> {
-        self.await_input(message).await
+        self.await_input(message, LoginInputKind::OAuth).await
     }
 
     fn on_progress(&self, message: &str) {
@@ -595,10 +801,13 @@ impl OAuthCallbacks for DialogCallbacks {
         // convention, but the label resolves through `format_keybinding` so it
         // reads from one source (see the NOTE in `crate::overlay`).
         let submit = format_keybinding("enter");
-        self.await_input(&format!(
-            "On another machine? Paste the code shown after login (or the full redirect URL), \
-             then press {submit}:"
-        ))
+        self.await_input(
+            &format!(
+                "On another machine? Paste the code shown after login (or the full redirect URL), \
+                 then press {submit}:"
+            ),
+            LoginInputKind::OAuth,
+        )
         .await
     }
 
@@ -607,33 +816,103 @@ impl OAuthCallbacks for DialogCallbacks {
     }
 }
 
-/// What confirming a provider row in the login/logout picker asks the
-/// host to do. Parked in the shell's `auth_request` slot for the drive
-/// loop to drain after the confirming keystroke.
+/// Which explicit OAuth storage intent a login row names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LoginTarget {
+    /// Insert a new credential without replacing any exact key.
+    NewAccount,
+    /// Replace the selected existing bare credential or exact account key.
+    ExistingAccount(Option<String>),
+}
+
+/// A sensitive action over one exact raw account identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AccountAction {
+    ReplaceLogin {
+        provider_id: String,
+        provider_name: String,
+        account_label: String,
+    },
+    Logout {
+        provider_id: String,
+        account_label: String,
+    },
+    SetDefault {
+        provider_id: String,
+        account_label: String,
+    },
+    LogoutWithNewDefault {
+        provider_id: String,
+        account_label: String,
+        new_default: String,
+    },
+    LogoutAll {
+        provider_id: String,
+        expected_accounts: Vec<String>,
+        inspect_index: usize,
+    },
+}
+
+impl AccountAction {
+    pub(crate) fn identity(&self) -> (&str, &str) {
+        match self {
+            Self::ReplaceLogin {
+                provider_id,
+                account_label,
+                ..
+            }
+            | Self::Logout {
+                provider_id,
+                account_label,
+            }
+            | Self::SetDefault {
+                provider_id,
+                account_label,
+            } => (provider_id, account_label),
+            Self::LogoutWithNewDefault {
+                provider_id,
+                new_default,
+                ..
+            } => (provider_id, new_default),
+            Self::LogoutAll {
+                provider_id,
+                expected_accounts,
+                inspect_index,
+            } => (
+                provider_id,
+                expected_accounts
+                    .get(*inspect_index)
+                    .expect("logout-all inspection index names an expected account"),
+            ),
+        }
+    }
+}
+
+/// What confirming an auth picker row asks the host to do. Parked in the
+/// shell's `auth_request` slot for the drive loop to drain after the confirming
+/// keystroke.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AuthPickerRequest {
-    /// Start the provider's OAuth browser login flow.
+    /// Start the provider's OAuth flow for an explicit creation or replacement.
     Login {
         provider_id: String,
         provider_name: String,
+        target: LoginTarget,
     },
-    /// Remove the provider's stored `auth.json` credential.
-    Logout { provider_id: String },
+    /// Open the complete account-label inspection before a sensitive action.
+    InspectAccount(AccountAction),
+    /// Apply an action after its required inspection or acknowledgement.
+    ApplyAccount(AccountAction),
+    /// Remove a provider's bare credential.
+    LogoutBare { provider_id: String },
 }
 
-/// One provider row for a picker: the id returned to the host, the
-/// friendly label shown as the primary column, and a status summary shown
-/// as the muted description.
+/// One auth picker row with separate render, search, and action identity.
 pub(crate) struct AuthRow {
-    pub(crate) provider_id: String,
+    pub(crate) request: AuthPickerRequest,
     pub(crate) label: String,
+    pub(crate) filter_key: String,
     pub(crate) summary: String,
-}
-
-/// Which action the picker's confirm parks.
-#[derive(Clone, Copy)]
-enum PickerMode {
-    Login,
-    Logout,
 }
 
 /// Build one selectable row: the friendly label as the primary column, the
@@ -641,41 +920,28 @@ enum PickerMode {
 /// filter key so typing either the id or the name finds it.
 fn picker_items(rows: &[AuthRow]) -> Vec<SelectItem> {
     rows.iter()
-        .map(|row| {
-            SelectItem::new(
-                row.label.clone(),
-                format!("{} {}", row.provider_id, row.label),
-            )
-            .with_description(row.summary.clone())
+        .enumerate()
+        .map(|(index, row)| {
+            SelectItem::new(row.label.clone(), row.filter_key.clone())
+                .with_value(format!("auth-row-{index}"))
+                .with_description(row.summary.clone())
         })
         .collect()
 }
 
-/// Resolve a confirmed row's filter key back to the action the picker
-/// should park. Returns `None` for a key absent from the map (a row not
-/// backed by a provider, which shouldn't happen but is handled safely).
-fn auth_request_for(
-    map: &HashMap<String, (String, String)>,
-    mode: PickerMode,
-    filter_key: &str,
-) -> Option<AuthPickerRequest> {
-    let (provider_id, provider_name) = map.get(filter_key).cloned()?;
-    Some(match mode {
-        PickerMode::Login => AuthPickerRequest::Login {
-            provider_id,
-            provider_name,
-        },
-        PickerMode::Logout => AuthPickerRequest::Logout { provider_id },
-    })
+fn picker_requests(rows: Vec<AuthRow>) -> HashMap<String, AuthPickerRequest> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, row)| (format!("auth-row-{index}"), row.request))
+        .collect()
 }
 
 /// Open a provider picker and move focus into its filter (via the caller's
 /// refocus event). Confirming a row parks the matching [`AuthPickerRequest`]
 /// in `request_slot` and closes; Esc closes without a request.
 ///
-/// The confirmed id is recovered through a filter-key -> (id, name) map,
-/// the same indirection the command palette and session selector use,
-/// since the widget hands the confirm callback only the row's filter key.
+/// Confirmation resolves the row's opaque `SelectItem::value`. Display and
+/// filter text participate only in presentation and search, never identity.
 fn open_auth_picker(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
@@ -683,30 +949,23 @@ fn open_auth_picker(
     request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
     title: &str,
     rows: Vec<AuthRow>,
-    mode: PickerMode,
 ) {
     let select = Rc::new(RefCell::new(FilterableSelect::new(
         picker_items(&rows),
         chrome.select.clone(),
     )));
     let focus = select.borrow().focus_target();
-    let map: HashMap<String, (String, String)> = rows
-        .into_iter()
-        .map(|row| {
-            (
-                format!("{} {}", row.provider_id, row.label),
-                (row.provider_id, row.label),
-            )
-        })
-        .collect();
+    let map = picker_requests(rows);
     {
         let mut sel = select.borrow_mut();
         let request_c = Rc::clone(request_slot);
         let stack_c = Rc::clone(stack);
         let editor_c = Rc::clone(editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
-            if let Some(request) = auth_request_for(&map, mode, &item.filter_key) {
-                *request_c.borrow_mut() = Some(request);
+            if let Some(value) = item.value.as_deref()
+                && let Some(request) = map.get(value)
+            {
+                *request_c.borrow_mut() = Some(request.clone());
             }
             // A confirmed pick is terminal: tear the whole stack down
             // (palette and picker) back to the transcript. The host's login
@@ -742,19 +1001,34 @@ pub(crate) fn open_login_picker(
     request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
     rows: Vec<AuthRow>,
 ) {
-    open_auth_picker(
-        stack,
-        editor,
-        chrome,
-        request_slot,
-        "Log in",
-        rows,
-        PickerMode::Login,
-    );
+    open_auth_picker(stack, editor, chrome, request_slot, "Log in", rows);
 }
 
 /// Open the `/logout` picker over the providers with a stored credential.
 pub(crate) fn open_logout_picker(
+    stack: &Rc<RefCell<OverlayStack>>,
+    editor: &WidgetRef,
+    chrome: &OverlayChrome,
+    request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
+    rows: Vec<AuthRow>,
+) {
+    open_auth_picker(stack, editor, chrome, request_slot, "Log out", rows);
+}
+
+/// Open the store-default account picker.
+pub(crate) fn open_default_account_picker(
+    stack: &Rc<RefCell<OverlayStack>>,
+    editor: &WidgetRef,
+    chrome: &OverlayChrome,
+    request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
+    rows: Vec<AuthRow>,
+) {
+    open_auth_picker(stack, editor, chrome, request_slot, "Default account", rows);
+}
+
+/// Open the explicit resolution picker for removing a default account that
+/// still has siblings.
+pub(crate) fn open_default_logout_picker(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
     chrome: &OverlayChrome,
@@ -766,9 +1040,217 @@ pub(crate) fn open_logout_picker(
         editor,
         chrome,
         request_slot,
-        "Log out",
+        "Choose a new default or remove all accounts",
         rows,
-        PickerMode::Logout,
+    );
+}
+
+const ACCOUNT_INSPECTION_CELL_LIMIT: usize = 65_535;
+const OVER_LIMIT_PREFIX_CELLS: usize = 512;
+
+/// Non-softwrapped account-label inspection in front of a sensitive action.
+///
+/// The complete representation rides in a real [`ScrollView`] through 65,535
+/// logical cells. Longer legacy representations are classified in `usize`
+/// first and only a bounded represented prefix enters vaxis. Their action is
+/// armed by one explicit acknowledgement before a later Enter can confirm.
+struct AccountConfirmation {
+    /// The identity row is kept concrete so the non-softwrap contract is both
+    /// inspectable and asserted at draw, rather than hidden behind WidgetRef.
+    text: Rc<RefCell<Text>>,
+    view: Rc<RefCell<ScrollView>>,
+    represented_cells: usize,
+    surface_representation_cells: usize,
+    over_limit: bool,
+    acknowledged: bool,
+    last_width: u16,
+    action: AccountAction,
+    request_slot: Rc<RefCell<Option<AuthPickerRequest>>>,
+    stack: Rc<RefCell<OverlayStack>>,
+    editor: WidgetRef,
+    warning_style: Style,
+}
+
+impl AccountConfirmation {
+    fn new(
+        action: AccountAction,
+        request_slot: Rc<RefCell<Option<AuthPickerRequest>>>,
+        stack: Rc<RefCell<OverlayStack>>,
+        editor: WidgetRef,
+        warning_style: Style,
+    ) -> Self {
+        let (_, raw_label) = action.identity();
+        let creation_valid = validate_account_label(raw_label).is_ok();
+        let represented = display_account_label(raw_label, AccountLabelDisplayMode::Ordinary);
+        // A creation-valid ordinary label is bounded to 512 cells by contract.
+        // Only the scalar-escaped legacy branch can approach the u16 limit, and
+        // every one of its bytes is one terminal cell.
+        let represented_cells = if creation_valid {
+            usize::from(vaxis::gwidth::gwidth(
+                &represented,
+                vaxis::gwidth::Method::Unicode,
+            ))
+        } else {
+            represented.len()
+        };
+        let over_limit = represented_cells > ACCOUNT_INSPECTION_CELL_LIMIT;
+        let shown = if over_limit {
+            represented
+                .chars()
+                .take(OVER_LIMIT_PREFIX_CELLS)
+                .collect::<String>()
+        } else {
+            represented
+        };
+        let surface_representation_cells = shown.len();
+        let mut text_widget = Text::new(shown);
+        text_widget.softwrap = false;
+        let text = Rc::new(RefCell::new(text_widget));
+        let mut view = ScrollView::new(Source::Slice(vec![to_widget_ref(Rc::clone(&text))]));
+        view.draw_cursor = false;
+        Self {
+            text,
+            view: Rc::new(RefCell::new(view)),
+            represented_cells,
+            surface_representation_cells,
+            over_limit,
+            acknowledged: false,
+            last_width: 1,
+            action,
+            request_slot,
+            stack,
+            editor,
+            warning_style,
+        }
+    }
+}
+
+impl Widget for AccountConfirmation {
+    fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        debug_assert!(!self.text.borrow().softwrap);
+        debug_assert!(self.surface_representation_cells <= ACCOUNT_INSPECTION_CELL_LIMIT);
+        let size = ctx.max.size();
+        self.last_width = size.width.max(1);
+        let warning_rows = if self.over_limit { 2 } else { 1 };
+        let mut surface = Surface::with_size(size);
+        if size.height > 0 {
+            let view_ctx = ctx.with_constraints(
+                Size {
+                    width: 0,
+                    height: 0,
+                },
+                MaxSize {
+                    width: Some(size.width),
+                    height: Some(1),
+                },
+            );
+            surface.children.push(SubSurface {
+                origin: RelativePoint { row: 0, col: 0 },
+                surface: draw_widget(&to_widget_ref(Rc::clone(&self.view)), &view_ctx),
+                z_index: 0,
+            });
+        }
+        if size.height > 1 {
+            let message = if self.over_limit && self.acknowledged {
+                "Incomplete inspection acknowledged. Press Enter again to continue with the exact raw account."
+                    .to_string()
+            } else if self.over_limit {
+                format!(
+                    "Only a clipped prefix is shown. This legacy account exceeds the 65,535-cell \
+                     terminal inspection limit ({} cells).",
+                    self.represented_cells
+                )
+            } else {
+                "Use Left/Right or Home/End to inspect the complete account label.".to_string()
+            };
+            let mut warning = Text::new(message);
+            warning.style = self.warning_style;
+            warning.softwrap = true;
+            warning.width_basis = WidthBasis::Parent;
+            let warning_ctx = ctx.with_constraints(
+                Size {
+                    width: 0,
+                    height: 0,
+                },
+                MaxSize {
+                    width: Some(size.width),
+                    height: Some(size.height.saturating_sub(1).min(warning_rows)),
+                },
+            );
+            surface.children.push(SubSurface {
+                origin: RelativePoint { row: 1, col: 0 },
+                surface: warning.draw(&warning_ctx),
+                z_index: 0,
+            });
+        }
+        surface
+    }
+
+    fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        let Event::KeyPress(key) = event else {
+            self.view.borrow_mut().handle_event(ctx, event);
+            return;
+        };
+        if key.matches(Key::ESCAPE, Modifiers::empty()) {
+            close_top(&self.stack, ctx, &self.editor);
+        } else if key.matches(Key::HOME, Modifiers::empty()) {
+            self.view.borrow_mut().set_scroll_left(0);
+            ctx.consume_and_redraw();
+        } else if key.matches(Key::END, Modifiers::empty()) {
+            let max_left = self
+                .represented_cells
+                .saturating_sub(usize::from(self.last_width));
+            self.view.borrow_mut().set_scroll_left(
+                u32::try_from(max_left).expect("bounded representation offset fits u32"),
+            );
+            ctx.consume_and_redraw();
+        } else if key.matches(Key::ENTER, Modifiers::empty()) {
+            if self.over_limit && !self.acknowledged {
+                self.acknowledged = true;
+                self.warning_style.bold = true;
+                ctx.consume_and_redraw();
+            } else {
+                *self.request_slot.borrow_mut() =
+                    Some(AuthPickerRequest::ApplyAccount(self.action.clone()));
+                close_all(&self.stack, ctx, &self.editor);
+            }
+        } else {
+            self.view.borrow_mut().handle_event(ctx, event);
+        }
+    }
+
+    fn wants_events(&self) -> bool {
+        true
+    }
+}
+
+/// Open account inspection for one sensitive raw-identity action.
+pub(crate) fn open_account_confirmation(
+    stack: &Rc<RefCell<OverlayStack>>,
+    editor: &WidgetRef,
+    chrome: &OverlayChrome,
+    request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
+    theme: &Theme,
+    action: AccountAction,
+) {
+    let provider_id = action.identity().0.to_string();
+    let warning_style = LoginStyles::from_theme(theme, TerminalCaps::default()).notice;
+    let confirm = Rc::new(RefCell::new(AccountConfirmation::new(
+        action,
+        Rc::clone(request_slot),
+        Rc::clone(stack),
+        Rc::clone(editor),
+        warning_style,
+    )));
+    let focus = to_widget_ref(Rc::clone(&confirm));
+    push_window(
+        stack,
+        chrome,
+        &format!("Confirm account action — {provider_id}"),
+        "Left/Right inspect · Enter acknowledge/confirm · Esc close".to_string(),
+        to_widget_ref(confirm),
+        focus,
+        OverlayPlacement::Small,
     );
 }
 
@@ -962,6 +1444,191 @@ mod tests {
         let got = fut.await.expect("join").expect("input");
         assert_eq!(got, "code123");
         assert!(state.lock().unwrap().input_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn account_label_rejects_unsafe_and_overlength_edits_atomically() {
+        let (mut dialog, state, pending, _cancel) = make();
+        let (cb, _rx) = callbacks(&state, &pending);
+        let fut = tokio::spawn(async move { cb.prompt_account_label(&[]).await });
+        tokio::task::yield_now().await;
+
+        let accepted = "a".repeat(250);
+        let mut ctx = EventContext::new();
+        dialog.handle_event(&mut ctx, &Event::Paste(accepted.clone()));
+        let _ = dialog.draw(&crate::test_support::draw_ctx(12, Some(8)));
+        let snapshot = (
+            dialog.input_value.borrow().clone(),
+            dialog.field.byte_offset_to_cursor(),
+            dialog.field.draw_offset,
+            dialog.field.prev_cursor_col,
+            dialog.field.prev_cursor_idx,
+        );
+
+        for rejected in [
+            Event::Paste("\n".to_string()),
+            Event::Paste("bbbbbbb".to_string()),
+            key_event(0x202e, Modifiers::empty(), Some("\u{202e}")),
+        ] {
+            dialog.handle_event(&mut ctx, &rejected);
+            assert_eq!(
+                (
+                    dialog.input_value.borrow().clone(),
+                    dialog.field.byte_offset_to_cursor(),
+                    dialog.field.draw_offset,
+                    dialog.field.prev_cursor_col,
+                    dialog.field.prev_cursor_idx,
+                ),
+                snapshot,
+                "a rejected edit changed field or viewport state"
+            );
+            assert!(pending.lock().unwrap().is_some(), "sender stayed parked");
+            assert!(!fut.is_finished(), "callback did not fire");
+        }
+        let error = state.lock().unwrap().input_error.clone().unwrap();
+        assert!(
+            !error.contains('\u{202e}'),
+            "diagnostic echoed rejected text"
+        );
+
+        dialog.handle_event(&mut ctx, &Event::Paste("bbbbbb".to_string()));
+        let accepted = format!("{accepted}bbbbbb");
+        assert_eq!(accepted.len(), 256);
+        let cursor = dialog.field.byte_offset_to_cursor();
+        dialog.handle_event(
+            &mut ctx,
+            &key_event(u32::from('z'), Modifiers::empty(), Some("z")),
+        );
+        assert_eq!(dialog.input_value.borrow().as_str(), accepted);
+        assert_eq!(
+            dialog.field.byte_offset_to_cursor(),
+            cursor,
+            "typed insertion crossing the bound is atomic"
+        );
+        assert!(pending.lock().unwrap().is_some());
+        assert!(!fut.is_finished());
+
+        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+        assert_eq!(fut.await.unwrap().unwrap(), accepted);
+    }
+
+    #[tokio::test]
+    async fn incomplete_account_label_stays_editable_after_rejected_submission() {
+        let (mut dialog, state, pending, _cancel) = make();
+        let (cb, _rx) = callbacks(&state, &pending);
+        let fut = tokio::spawn(async move { cb.prompt_account_label(&["wo\nrk".into()]).await });
+        tokio::task::yield_now().await;
+        let prompt = state.lock().unwrap().input_prompt.clone().unwrap();
+        assert!(
+            prompt.contains("\\!\\u{77}"),
+            "legacy label represented: {prompt}"
+        );
+
+        let mut ctx = EventContext::new();
+        dialog.handle_event(&mut ctx, &Event::Paste("work ".to_string()));
+        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+        assert_eq!(dialog.input_value.borrow().as_str(), "work ");
+        assert_eq!(dialog.field.byte_offset_to_cursor(), 5);
+        assert!(pending.lock().unwrap().is_some());
+        assert!(!fut.is_finished());
+        assert!(state.lock().unwrap().input_error.is_some());
+
+        dialog.handle_event(
+            &mut ctx,
+            &key_event(Key::BACKSPACE, Modifiers::empty(), None),
+        );
+        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+        assert_eq!(fut.await.unwrap().unwrap(), "work");
+    }
+
+    #[tokio::test]
+    async fn account_prompt_keeps_distinct_sub_limit_common_prefixes() {
+        let (dialog, state, pending, _cancel) = make();
+        let (cb, _rx) = callbacks(&state, &pending);
+        let left = format!("{}x", "a".repeat(96));
+        let right = format!("{}y", "a".repeat(96));
+        let expected_left = left.clone();
+        let expected_right = right.clone();
+        let fut = tokio::spawn(async move {
+            cb.prompt_account_label(&[left, right, "a b".into(), "a    b".into()])
+                .await
+        });
+        tokio::task::yield_now().await;
+        let prompt = state.lock().unwrap().input_prompt.clone().unwrap();
+        assert!(
+            prompt.contains(&expected_left),
+            "left tail missing: {prompt}"
+        );
+        assert!(
+            prompt.contains(&expected_right),
+            "right tail missing: {prompt}"
+        );
+        assert!(
+            !prompt.contains("[clipped"),
+            "sub-limit labels were rewritten"
+        );
+        assert!(prompt.contains("\\!\\u{61}\\u{20}\\u{62}"), "{prompt}");
+        assert!(prompt.contains("\\u{20}\\u{20}\\u{20}\\u{20}"), "{prompt}");
+        assert!(!prompt.contains("a    b"));
+        drop(dialog);
+        drop(pending.lock().unwrap().take());
+        assert!(matches!(fut.await.unwrap(), Err(OAuthError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn exact_limit_existing_label_uses_width_safe_prompt_guidance() {
+        let (mut dialog, state, pending, _cancel) = make();
+        let (cb, _rx) = callbacks(&state, &pending);
+        let exact_limit = format!("{}\u{0100}", "a".repeat(10_921));
+        assert_eq!(
+            display_account_label(&exact_limit, AccountLabelDisplayMode::Ordinary).len(),
+            65_535
+        );
+        let fut = tokio::spawn(async move { cb.prompt_account_label(&[exact_limit]).await });
+        tokio::task::yield_now().await;
+
+        let prompt = state.lock().unwrap().input_prompt.clone().unwrap();
+        assert!(prompt.contains("1 existing omitted"), "{prompt}");
+        assert!(
+            prompt.len() < 4_500,
+            "prompt exceeded its bounded representation budget"
+        );
+        let surface = dialog.draw(&crate::test_support::draw_ctx(40, Some(14)));
+        let rows = crate::test_support::rows(&surface).join("\n");
+        assert!(
+            rows.contains("omitted"),
+            "width-safe guidance is visible: {rows}"
+        );
+
+        drop(dialog);
+        drop(pending.lock().unwrap().take());
+        assert!(matches!(fut.await.unwrap(), Err(OAuthError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn submitting_account_label_cannot_erase_the_following_oauth_prompt() {
+        let (mut dialog, state, pending, _cancel) = make();
+        let (cb, _rx) = callbacks(&state, &pending);
+        let fut = tokio::spawn(async move {
+            let label = cb.prompt_account_label(&[]).await?;
+            let code = cb.on_prompt("OAuth code:").await?;
+            Ok::<_, OAuthError>((label, code))
+        });
+        tokio::task::yield_now().await;
+
+        let mut ctx = EventContext::new();
+        dialog.handle_event(&mut ctx, &Event::Paste("work".to_string()));
+        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state.lock().unwrap().input_prompt.as_deref(),
+            Some("OAuth code:")
+        );
+        assert!(pending.lock().unwrap().is_some());
+
+        dialog.handle_event(&mut ctx, &Event::Paste("code".to_string()));
+        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+        assert_eq!(fut.await.unwrap().unwrap(), ("work".into(), "code".into()));
     }
 
     /// While a prompt is active, the field's cursor is lifted onto the
@@ -1290,16 +1957,143 @@ mod tests {
         );
     }
 
+    fn confirmation_for(
+        raw_label: String,
+    ) -> (AccountConfirmation, Rc<RefCell<Option<AuthPickerRequest>>>) {
+        let request = Rc::new(RefCell::new(None));
+        let stack = Rc::new(RefCell::new(OverlayStack::default()));
+        let editor: WidgetRef = Rc::new(RefCell::new(Text::new("")));
+        let action = AccountAction::Logout {
+            provider_id: "provider".to_string(),
+            account_label: raw_label,
+        };
+        (
+            AccountConfirmation::new(action, Rc::clone(&request), stack, editor, Style::default()),
+            request,
+        )
+    }
+
+    #[test]
+    fn account_confirmation_preserves_internal_space_without_softwrap() {
+        let (mut one, _) = confirmation_for("a b".to_string());
+        let (mut many, _) = confirmation_for("a    b".to_string());
+        let ctx = crate::test_support::draw_ctx(2, Some(4));
+        assert!(!one.text.borrow().softwrap);
+        assert!(!many.text.borrow().softwrap);
+        let _ = one.draw(&ctx);
+        let _ = many.draw(&ctx);
+        assert!(one.view.borrow().has_more_right());
+        assert!(many.view.borrow().has_more_right());
+
+        let mut event_ctx = EventContext::new();
+        let mut final_rows = String::new();
+        for expected_left in 1..=4 {
+            many.handle_event(
+                &mut event_ctx,
+                &key_event(Key::RIGHT, Modifiers::empty(), None),
+            );
+            final_rows = crate::test_support::rows(&many.draw(&ctx)).join("\n");
+            assert_eq!(many.view.borrow().scroll_left(), expected_left);
+        }
+        assert!(
+            final_rows.contains(" b"),
+            "final cells remain in order: {final_rows:?}"
+        );
+        assert!(!many.view.borrow().has_more_right());
+    }
+
+    #[test]
+    fn account_confirmation_keeps_rtl_graphemes_in_logical_cells_without_isolates() {
+        let raw = "אב";
+        let (mut confirmation, _) = confirmation_for(raw.to_string());
+        let rows = crate::test_support::rows(
+            &confirmation.draw(&crate::test_support::draw_ctx(20, Some(4))),
+        )
+        .join("\n");
+        assert!(rows.contains(raw), "logical source order changed: {rows:?}");
+        assert!(!rows.contains('\u{2068}'), "vaxis must not inject FSI");
+        assert!(!rows.contains('\u{2069}'), "vaxis must not inject PDI");
+    }
+
+    #[test]
+    fn exact_limit_account_confirmation_scrolls_to_the_final_tail() {
+        let raw = format!("{}\u{0100}", "a".repeat(10_921));
+        let (mut confirmation, _) = confirmation_for(raw);
+        assert_eq!(confirmation.represented_cells, 65_535);
+        assert_eq!(confirmation.surface_representation_cells, 65_535);
+        assert!(!confirmation.over_limit);
+
+        let ctx = crate::test_support::draw_ctx(24, Some(4));
+        let _ = confirmation.draw(&ctx);
+        let mut event_ctx = EventContext::new();
+        confirmation.handle_event(
+            &mut event_ctx,
+            &key_event(Key::END, Modifiers::empty(), None),
+        );
+        let tail = crate::test_support::rows(&confirmation.draw(&ctx)).join("\n");
+        assert!(
+            tail.contains("\\u{100}"),
+            "final tail is reachable: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn over_limit_account_requires_acknowledgement_and_keeps_raw_identity() {
+        let raw = format!("{}\u{1000}", "a".repeat(10_921));
+        let (mut confirmation, request) = confirmation_for(raw.clone());
+        assert_eq!(confirmation.represented_cells, 65_536);
+        assert_eq!(
+            confirmation.surface_representation_cells, OVER_LIMIT_PREFIX_CELLS,
+            "only a bounded represented prefix enters vaxis"
+        );
+        assert!(confirmation.over_limit);
+
+        let mut ctx = EventContext::new();
+        confirmation.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+        assert!(confirmation.acknowledged);
+        assert!(
+            request.borrow().is_none(),
+            "acknowledgement is not the action"
+        );
+        let warning = crate::test_support::rows(
+            &confirmation.draw(&crate::test_support::draw_ctx(80, Some(4))),
+        )
+        .join("\n");
+        assert!(
+            warning.contains("Incomplete inspection acknowledged"),
+            "{warning}"
+        );
+
+        confirmation.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+        assert!(matches!(
+            request.borrow().as_ref(),
+            Some(AuthPickerRequest::ApplyAccount(AccountAction::Logout {
+                provider_id,
+                account_label,
+            })) if provider_id == "provider" && account_label == &raw
+        ));
+    }
+
     fn sample_rows() -> Vec<AuthRow> {
         vec![
             AuthRow {
-                provider_id: "anthropic".to_string(),
+                request: AuthPickerRequest::Login {
+                    provider_id: "anthropic".to_string(),
+                    provider_name: "Anthropic (Claude Pro/Max)".to_string(),
+                    target: LoginTarget::NewAccount,
+                },
                 label: "Anthropic (Claude Pro/Max)".to_string(),
+                filter_key: "anthropic Anthropic (Claude Pro/Max)".to_string(),
                 summary: "subscription".to_string(),
             },
             AuthRow {
-                provider_id: "openai".to_string(),
+                request: AuthPickerRequest::Login {
+                    provider_id: "openai".to_string(),
+                    provider_name: "OpenAI".to_string(),
+                    target: LoginTarget::NewAccount,
+                },
                 label: "OpenAI".to_string(),
+                filter_key: "openai OpenAI".to_string(),
                 summary: "not configured".to_string(),
             },
         ]
@@ -1315,33 +2109,21 @@ mod tests {
         assert_eq!(items[0].description.as_deref(), Some("subscription"));
         assert!(items[0].filter_key.contains("anthropic"));
         assert!(items[0].filter_key.contains("Anthropic (Claude Pro/Max)"));
+        assert_eq!(items[0].value.as_deref(), Some("auth-row-0"));
     }
 
-    /// Confirm resolution maps a row's filter key back to the right action:
-    /// Login carries the id and name, Logout carries the id, and an unknown
-    /// key resolves to nothing.
+    /// Confirm resolution uses only the opaque value. Search-key collisions do
+    /// not collapse exact action identity.
     #[test]
-    fn auth_request_resolves_by_mode() {
-        let map: HashMap<String, (String, String)> = sample_rows()
-            .into_iter()
-            .map(|row| {
-                (
-                    format!("{} {}", row.provider_id, row.label),
-                    (row.provider_id, row.label),
-                )
-            })
-            .collect();
-        let key = "anthropic Anthropic (Claude Pro/Max)";
+    fn auth_request_resolves_by_opaque_value() {
+        let items = picker_items(&sample_rows());
+        let map = picker_requests(sample_rows());
         assert!(matches!(
-            auth_request_for(&map, PickerMode::Login, key),
-            Some(AuthPickerRequest::Login { provider_id, provider_name })
+            map.get(items[0].value.as_deref().expect("opaque value")),
+            Some(AuthPickerRequest::Login { provider_id, provider_name, .. })
                 if provider_id == "anthropic" && provider_name.contains("Anthropic")
         ));
-        assert!(matches!(
-            auth_request_for(&map, PickerMode::Logout, key),
-            Some(AuthPickerRequest::Logout { provider_id }) if provider_id == "anthropic"
-        ));
-        assert!(auth_request_for(&map, PickerMode::Login, "nope").is_none());
+        assert!(!map.contains_key("nope"));
     }
 
     /// Opening either picker pushes an overlay onto the stack.

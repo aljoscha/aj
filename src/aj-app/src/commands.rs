@@ -87,6 +87,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::OpenLogoutSelector,
     },
     Command {
+        name: "auth-default",
+        title: "default account",
+        category: "auth",
+        description: "Choose the account used when no account is named.",
+        action_id: None,
+        action: CommandAction::OpenDefaultAccountSelector,
+    },
+    Command {
         name: "auth",
         title: "status",
         category: "auth",
@@ -279,6 +287,9 @@ pub enum CommandAction {
     /// credentials are listed). On confirm the host removes the
     /// chosen provider's `auth.json` entry.
     OpenLogoutSelector,
+    /// Open the labeled-account picker for changing a provider's store
+    /// default. The confirmed exact raw account is inspected before mutation.
+    OpenDefaultAccountSelector,
     /// Open the read-only authentication-status overlay listing each
     /// provider's credential method and source.
     OpenAuthStatus,

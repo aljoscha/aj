@@ -39,6 +39,11 @@ const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openr
 #[derive(Debug, Clone)]
 pub struct ProviderAuthStatus {
     pub provider_id: String,
+    /// Exact raw account identity for a labeled row. `None` is the provider's
+    /// bare credential or a provider-level source such as an environment key.
+    pub account_label: Option<String>,
+    /// Whether `account_label` is the store default.
+    pub is_default: bool,
     /// Whether any credential source is configured.
     pub configured: bool,
     /// Short method/source label (e.g. `"subscription"`,
@@ -64,6 +69,8 @@ pub async fn provider_status(
     if auth.has_runtime_override(provider_id).await {
         return ProviderAuthStatus {
             provider_id: provider_id.to_string(),
+            account_label: None,
+            is_default: false,
             configured: true,
             summary: "API key (--api-key override)".to_string(),
             detail: None,
@@ -76,6 +83,8 @@ pub async fn provider_status(
         Ok(Some(AuthCredential::ApiKey { .. })) => {
             return ProviderAuthStatus {
                 provider_id: provider_id.to_string(),
+                account_label: None,
+                is_default: false,
                 configured: true,
                 summary: "API key (stored)".to_string(),
                 detail: None,
@@ -88,6 +97,8 @@ pub async fn provider_status(
             };
             return ProviderAuthStatus {
                 provider_id: provider_id.to_string(),
+                account_label: None,
+                is_default: false,
                 configured: true,
                 summary,
                 detail: Some(format_remaining(creds.expires, now_unix_ms())),
@@ -99,6 +110,8 @@ pub async fn provider_status(
         Err(err) => {
             return ProviderAuthStatus {
                 provider_id: provider_id.to_string(),
+                account_label: None,
+                is_default: false,
                 configured: false,
                 summary: format!("error reading auth.json: {err}"),
                 detail: None,
@@ -110,6 +123,8 @@ pub async fn provider_status(
     if let Some(var) = first_set_env_var(provider_id) {
         return ProviderAuthStatus {
             provider_id: provider_id.to_string(),
+            account_label: None,
+            is_default: false,
             configured: true,
             summary: format!("env: {var}"),
             detail: None,
@@ -119,9 +134,42 @@ pub async fn provider_status(
     // 5. Nothing configured at any layer.
     ProviderAuthStatus {
         provider_id: provider_id.to_string(),
+        account_label: None,
+        is_default: false,
         configured: false,
         summary: "not configured".to_string(),
         detail: None,
+    }
+}
+
+/// Describe one credential in a provider's labeled set without resolving or
+/// refreshing it. The exact raw label remains separate from the rendered row.
+fn account_status(
+    provider_id: &str,
+    label: String,
+    is_default: bool,
+    credential: AuthCredential,
+    oauth_name: Option<&str>,
+) -> ProviderAuthStatus {
+    let (summary, detail) = match credential {
+        AuthCredential::ApiKey { .. } => ("API key (stored)".to_string(), None),
+        AuthCredential::OAuth(creds) => {
+            let summary = oauth_name
+                .map(|name| format!("subscription — {name}"))
+                .unwrap_or_else(|| "subscription".to_string());
+            (
+                summary,
+                Some(format_remaining(creds.expires, now_unix_ms())),
+            )
+        }
+    };
+    ProviderAuthStatus {
+        provider_id: provider_id.to_string(),
+        account_label: Some(label),
+        is_default,
+        configured: true,
+        summary,
+        detail,
     }
 }
 
@@ -153,7 +201,21 @@ pub async fn collect_statuses(auth: &AuthStorage) -> Vec<ProviderAuthStatus> {
             .iter()
             .find(|(pid, _)| pid == &id)
             .map(|(_, name)| name.as_str());
-        out.push(provider_status(auth, &id, name).await);
+        let has_override = auth.has_runtime_override(&id).await;
+        if has_override {
+            out.push(provider_status(auth, &id, name).await);
+        }
+        match auth.accounts(&id).await {
+            Ok(Some(set)) => {
+                let default = set.default;
+                out.extend(set.accounts.into_iter().map(|(label, credential)| {
+                    let is_default = label == default;
+                    account_status(&id, label, is_default, credential, name)
+                }));
+            }
+            Ok(None) | Err(_) if !has_override => out.push(provider_status(auth, &id, name).await),
+            Ok(None) | Err(_) => {}
+        }
     }
     out
 }
@@ -395,6 +457,11 @@ fn osc52_payload(text: &str, in_tmux: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use aj_models::oauth::OAuthCredentials;
+    use tempfile::TempDir;
+
     use super::*;
 
     /// Collect the line bodies (ignoring the line kind) for assertions.
@@ -416,6 +483,86 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn collect_statuses_lists_each_exact_account_and_marks_the_default_without_secrets() {
+        let dir = TempDir::new().expect("tempdir");
+        let auth = AuthStorage::with_providers(dir.path().join("auth.json"), HashMap::new());
+        auth.insert_account(
+            "anthropic",
+            "work",
+            AuthCredential::OAuth(OAuthCredentials::new(
+                "recognizable-refresh-secret",
+                "recognizable-access-secret",
+                i64::MAX,
+            )),
+        )
+        .await
+        .unwrap();
+        auth.insert_account(
+            "anthropic",
+            "wo\nrk",
+            AuthCredential::ApiKey {
+                key: "recognizable-api-key-secret".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        // Legacy keys are seeded through the raw compatibility boundary, not
+        // through current creation.
+        let raw = serde_json::json!({
+            "anthropic": {
+                "type": "accounts",
+                "default": "work",
+                "accounts": {
+                    "work": {
+                        "type": "oauth",
+                        "refresh": "recognizable-refresh-secret",
+                        "access": "recognizable-access-secret",
+                        "expires": i64::MAX
+                    },
+                    "wo\nrk": {
+                        "type": "api_key",
+                        "key": "recognizable-api-key-secret"
+                    }
+                }
+            }
+        });
+        std::fs::write(auth.path(), serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        auth.set_runtime_api_key("anthropic", "runtime-winner".to_string())
+            .await;
+
+        let statuses = collect_statuses(&auth).await;
+        let rows = statuses
+            .iter()
+            .filter(|status| status.provider_id == "anthropic")
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        let winner = rows
+            .iter()
+            .find(|row| row.account_label.is_none())
+            .expect("provider-level runtime override row");
+        assert!(winner.summary.contains("--api-key override"));
+        let work = rows
+            .iter()
+            .find(|row| row.account_label.as_deref() == Some("work"))
+            .expect("work row");
+        let hostile = rows
+            .iter()
+            .find(|row| row.account_label.as_deref() == Some("wo\nrk"))
+            .expect("hostile row");
+        assert!(work.is_default);
+        assert!(!hostile.is_default);
+        let visible_model = format!("{rows:?}");
+        for secret in [
+            "recognizable-refresh-secret",
+            "recognizable-access-secret",
+            "recognizable-api-key-secret",
+            "runtime-winner",
+        ] {
+            assert!(!visible_model.contains(secret), "status leaked {secret}");
+        }
     }
 
     /// Headless with no hosted manual page (e.g. openai-codex): the user

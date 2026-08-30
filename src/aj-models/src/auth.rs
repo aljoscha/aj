@@ -29,6 +29,8 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +40,13 @@ use tokio::sync::Mutex;
 use crate::oauth::anthropic::AnthropicOAuth;
 use crate::oauth::openai::OpenAIOAuth;
 use crate::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider, now_unix_ms};
+
+mod account_label;
+pub use account_label::{
+    ACCOUNT_LABEL_UNICODE_VERSION, AccountLabelDisplayMode, AccountLabelValidationError,
+    MAX_ACCOUNT_LABEL_BYTES, display_account_label, validate_account_label,
+    validate_account_label_edit,
+};
 
 // ---------------------------------------------------------------------------
 // On-disk shape
@@ -220,8 +229,70 @@ pub struct ProviderAccounts {
     pub accounts: Vec<(String, AuthCredential)>,
 }
 
+/// The complete credential shape stored for one provider.
+///
+/// Account-management surfaces need the whole shape rather than the one
+/// credential [`AuthStorage::get`] resolves. Bare credentials remain unlabeled
+/// for backward compatibility, while account sets retain every exact raw key.
+#[derive(Debug, Clone)]
+pub enum StoredProviderCredentials {
+    /// The pre-accounts shape, with no account label.
+    Bare(AuthCredential),
+    /// A labeled account set and its current default.
+    Accounts(ProviderAccounts),
+}
+
 /// In-memory shape of the entire `auth.json` file.
 type AuthData = HashMap<String, StoredEntry>;
+
+/// Check an absent-key account insertion against the lexical contract and the
+/// provider's prospective namespace without mutating either one.
+fn check_account_insert(data: &AuthData, provider_id: &str, label: &str) -> Result<(), AuthError> {
+    let duplicate = match data.get(provider_id) {
+        Some(StoredEntry::Accounts { accounts, .. }) => accounts.contains_key(label),
+        Some(StoredEntry::ApiKey { .. } | StoredEntry::OAuth(_)) => label == DEFAULT_ACCOUNT_LABEL,
+        None => false,
+    };
+    if duplicate {
+        return Err(AuthError::DuplicateAccount {
+            provider: provider_id.to_string(),
+            label: label.to_string(),
+        });
+    }
+    validate_account_label(label).map_err(|err| AuthError::InvalidLabel(err.to_string()))?;
+    Ok(())
+}
+
+/// Apply an insertion already approved by [`check_account_insert`].
+fn insert_account_entry(
+    existing: Option<StoredEntry>,
+    label: &str,
+    credential: AuthCredential,
+) -> StoredEntry {
+    match existing {
+        None => StoredEntry::Accounts {
+            default: label.to_string(),
+            accounts: HashMap::from([(label.to_string(), credential)]),
+        },
+        Some(StoredEntry::Accounts {
+            default,
+            mut accounts,
+        }) => {
+            accounts.insert(label.to_string(), credential);
+            StoredEntry::Accounts { default, accounts }
+        }
+        Some(bare) => {
+            let existing = bare.resolve(None).expect("a bare entry resolves unlabeled");
+            StoredEntry::Accounts {
+                default: DEFAULT_ACCOUNT_LABEL.to_string(),
+                accounts: HashMap::from([
+                    (DEFAULT_ACCOUNT_LABEL.to_string(), existing),
+                    (label.to_string(), credential),
+                ]),
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -254,17 +325,35 @@ pub enum AuthError {
     UnknownProvider(String),
     /// An account operation named a label the provider's entry does not
     /// hold.
-    #[error("provider {provider:?} has no account labeled {label:?}")]
+    #[error("provider {provider:?} has no selected account with that exact label")]
     UnknownAccount { provider: String, label: String },
     /// Removing the default account of a set that still has others. The
     /// caller picks a new default first: silently re-pointing the
     /// default would move what unlabeled resolution bills against.
-    #[error("account {label:?} is provider {provider:?}'s default; set another default first")]
+    #[error("the selected account is provider {provider:?}'s default; set another default first")]
     RemovingDefault { provider: String, label: String },
     /// An account label the store refuses (empty, or one that would
     /// collide with the name a bare entry adopts on conversion).
     #[error("invalid account label: {0}")]
     InvalidLabel(String),
+    /// Insert-only account creation named an exact key already occupied in
+    /// the provider's prospective account namespace.
+    #[error("provider {provider:?} already has an account with that exact label")]
+    DuplicateAccount { provider: String, label: String },
+    /// A first-login write raced with another process that configured the
+    /// provider while OAuth was in flight.
+    #[error(
+        "provider {provider:?} gained a credential while login was running. Start again to choose an account label"
+    )]
+    ProviderAlreadyConfigured { provider: String },
+    /// An explicit replacement no longer names the required bare or labeled
+    /// storage shape. The caller must reopen the account picker.
+    #[error("provider {provider:?}'s selected credential changed. Reopen the account picker")]
+    ProviderCredentialChanged { provider: String },
+    /// A remove-all confirmation no longer names the account set currently
+    /// stored for the provider.
+    #[error("provider {provider:?}'s accounts changed. Reopen the account picker")]
+    ProviderAccountsChanged { provider: String },
     /// Couldn't acquire the file lock within the timeout.
     #[error("auth storage lock timed out")]
     LockTimeout,
@@ -304,6 +393,10 @@ pub struct AuthStorage {
     path: PathBuf,
     /// Shared mutable state. `Arc`'d so clones see the same overrides.
     state: Arc<Mutex<State>>,
+    /// Observable credential-file reads for ownership-boundary tests. The
+    /// counter is shared with every clone, like the storage state itself.
+    #[cfg(any(test, feature = "test-support"))]
+    credential_reads: Arc<AtomicUsize>,
 }
 
 impl AuthStorage {
@@ -327,7 +420,31 @@ impl AuthStorage {
                 runtime_overrides: HashMap::new(),
                 oauth_providers,
             })),
+            #[cfg(any(test, feature = "test-support"))]
+            credential_reads: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Number of credential-file reads performed by this storage and all of
+    /// its clones. This test-support observer proves remote commands refuse
+    /// before crossing the client credential boundary.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn credential_read_count(&self) -> usize {
+        self.credential_reads.load(Ordering::Relaxed)
+    }
+
+    /// Reset the shared credential-read observer after a fixture is arranged.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_credential_read_count(&self) {
+        self.credential_reads.store(0, Ordering::Relaxed);
+    }
+
+    /// Read the authoritative credential file through the one observable
+    /// boundary used by every storage read and read-modify-write.
+    fn read_credentials(&self) -> Result<AuthData, AuthError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.credential_reads.fetch_add(1, Ordering::Relaxed);
+        read_auth_file(&self.path)
     }
 
     /// Build a storage at the default location, `~/.aj/auth.json`.
@@ -391,9 +508,36 @@ impl AuthStorage {
     /// share the file without a stale-cache problem. Acquires the
     /// file lock so a concurrent write doesn't yield a torn read.
     pub async fn get(&self, provider_id: &str) -> Result<Option<AuthCredential>, AuthError> {
+        Ok(match self.stored_credentials(provider_id).await? {
+            Some(StoredProviderCredentials::Bare(credential)) => Some(credential),
+            Some(StoredProviderCredentials::Accounts(set)) => set
+                .accounts
+                .into_iter()
+                .find_map(|(label, credential)| (label == set.default).then_some(credential)),
+            None => None,
+        })
+    }
+
+    /// Read the provider's complete stored shape under one file lock.
+    pub async fn stored_credentials(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<StoredProviderCredentials>, AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
-        let data = read_auth_file(&self.path)?;
-        Ok(data.get(provider_id).and_then(|entry| entry.resolve(None)))
+        let mut data = self.read_credentials()?;
+        Ok(data.remove(provider_id).map(|entry| match entry {
+            StoredEntry::ApiKey { key } => {
+                StoredProviderCredentials::Bare(AuthCredential::ApiKey { key })
+            }
+            StoredEntry::OAuth(credentials) => {
+                StoredProviderCredentials::Bare(AuthCredential::OAuth(credentials))
+            }
+            StoredEntry::Accounts { default, accounts } => {
+                let mut accounts = accounts.into_iter().collect::<Vec<_>>();
+                accounts.sort_by(|a, b| a.0.cmp(&b.0));
+                StoredProviderCredentials::Accounts(ProviderAccounts { default, accounts })
+            }
+        }))
     }
 
     /// Read one account of `provider_id`'s labeled set. A bare entry
@@ -403,117 +547,90 @@ impl AuthStorage {
         provider_id: &str,
         label: &str,
     ) -> Result<Option<AuthCredential>, AuthError> {
-        let _lock = FileLock::acquire(&self.path).await?;
-        let data = read_auth_file(&self.path)?;
-        Ok(data
-            .get(provider_id)
-            .and_then(|entry| entry.resolve(Some(label))))
+        Ok(match self.stored_credentials(provider_id).await? {
+            Some(StoredProviderCredentials::Accounts(set)) => set
+                .accounts
+                .into_iter()
+                .find_map(|(current, credential)| (current == label).then_some(credential)),
+            Some(StoredProviderCredentials::Bare(_)) | None => None,
+        })
     }
 
     /// The labeled set stored for `provider_id`, or `None` when the
     /// provider holds a bare credential or nothing.
     pub async fn accounts(&self, provider_id: &str) -> Result<Option<ProviderAccounts>, AuthError> {
-        let _lock = FileLock::acquire(&self.path).await?;
-        let data = read_auth_file(&self.path)?;
-        Ok(match data.get(provider_id) {
-            Some(StoredEntry::Accounts { default, accounts }) => {
-                let mut accounts: Vec<(String, AuthCredential)> = accounts
-                    .iter()
-                    .map(|(label, cred)| (label.clone(), cred.clone()))
-                    .collect();
-                accounts.sort_by(|a, b| a.0.cmp(&b.0));
-                Some(ProviderAccounts {
-                    default: default.clone(),
-                    accounts,
-                })
-            }
-            _ => None,
+        Ok(match self.stored_credentials(provider_id).await? {
+            Some(StoredProviderCredentials::Accounts(set)) => Some(set),
+            Some(StoredProviderCredentials::Bare(_)) | None => None,
         })
     }
 
-    /// Persist a credential for `provider_id`. Atomic w.r.t. concurrent
-    /// reads/writes via the file lock.
+    /// Insert the first bare credential for an unconfigured provider.
     ///
-    /// Against a bare or absent entry this replaces the whole slot,
-    /// exactly as it always did. Against a labeled set it replaces the
-    /// DEFAULT account's credential and preserves the rest: this method's
-    /// callers (a login, a key paste) predate accounts and must not be
-    /// able to flatten a set they do not know exists.
-    pub async fn set(
+    /// Creation is explicit and insert-only. A provider another process
+    /// configures before the locked decision is preserved.
+    pub async fn insert_bare(
         &self,
         provider_id: &str,
         credential: AuthCredential,
     ) -> Result<(), AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
-        let mut data = read_auth_file(&self.path)?;
-        let entry = match data.remove(provider_id) {
-            Some(StoredEntry::Accounts {
-                default,
-                mut accounts,
-            }) => {
-                accounts.insert(default.clone(), credential);
-                StoredEntry::Accounts { default, accounts }
-            }
-            _ => StoredEntry::from_credential(credential),
-        };
-        data.insert(provider_id.to_string(), entry);
+        let mut data = self.read_credentials()?;
+        if data.contains_key(provider_id) {
+            return Err(AuthError::ProviderAlreadyConfigured {
+                provider: provider_id.to_string(),
+            });
+        }
+        data.insert(
+            provider_id.to_string(),
+            StoredEntry::from_credential(credential),
+        );
         write_auth_file(&self.path, &data)
     }
 
-    /// Persist a credential under `label` in `provider_id`'s labeled set,
-    /// creating or growing the set as needed.
+    /// Replace the exact bare slot of an already configured provider.
+    ///
+    /// A labeled set is never interpreted as a replacement target, including
+    /// one whose default is dangling. Account replacement uses an explicit
+    /// labeled intent instead.
+    pub async fn replace_bare(
+        &self,
+        provider_id: &str,
+        credential: AuthCredential,
+    ) -> Result<(), AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let mut data = self.read_credentials()?;
+        match data.get_mut(provider_id) {
+            Some(entry @ (StoredEntry::ApiKey { .. } | StoredEntry::OAuth(_))) => {
+                *entry = StoredEntry::from_credential(credential);
+            }
+            Some(StoredEntry::Accounts { .. }) | None => {
+                return Err(AuthError::ProviderCredentialChanged {
+                    provider: provider_id.to_string(),
+                });
+            }
+        }
+        write_auth_file(&self.path, &data)
+    }
+
+    /// Insert a credential under a newly created account label.
     ///
     /// A bare entry converts on first growth: the existing credential is
     /// kept under [`DEFAULT_ACCOUNT_LABEL`] and STAYS the store default,
-    /// so adding an account never silently moves what unlabeled
-    /// resolution bills against. `label` may not be empty, and may not be
-    /// the adopted name while a bare entry still holds it (that write
-    /// would overwrite the credential the conversion exists to keep; use
-    /// [`AuthStorage::set`] to replace it deliberately).
-    pub async fn set_account(
+    /// so adding an account never silently moves what unlabeled resolution
+    /// bills against. Creation is insert-only: an exact existing key or the
+    /// prospective `default` key occupied by a bare credential is a duplicate,
+    /// never an implicit replacement.
+    pub async fn insert_account(
         &self,
         provider_id: &str,
         label: &str,
         credential: AuthCredential,
     ) -> Result<(), AuthError> {
-        if label.is_empty() {
-            return Err(AuthError::InvalidLabel("empty label".to_string()));
-        }
         let _lock = FileLock::acquire(&self.path).await?;
-        let mut data = read_auth_file(&self.path)?;
-        let entry = match data.remove(provider_id) {
-            None => StoredEntry::Accounts {
-                default: label.to_string(),
-                accounts: HashMap::from([(label.to_string(), credential)]),
-            },
-            Some(StoredEntry::Accounts {
-                default,
-                mut accounts,
-            }) => {
-                accounts.insert(label.to_string(), credential);
-                StoredEntry::Accounts { default, accounts }
-            }
-            Some(bare) => {
-                if label == DEFAULT_ACCOUNT_LABEL {
-                    // Put the bare entry back before refusing, `remove`
-                    // above already took it out of the map.
-                    data.insert(provider_id.to_string(), bare);
-                    write_auth_file(&self.path, &data)?;
-                    return Err(AuthError::InvalidLabel(format!(
-                        "{label:?} is the name the existing credential adopts; \
-                         pick another, or replace it with set()"
-                    )));
-                }
-                let existing = bare.resolve(None).expect("a bare entry resolves unlabeled");
-                StoredEntry::Accounts {
-                    default: DEFAULT_ACCOUNT_LABEL.to_string(),
-                    accounts: HashMap::from([
-                        (DEFAULT_ACCOUNT_LABEL.to_string(), existing),
-                        (label.to_string(), credential),
-                    ]),
-                }
-            }
-        };
+        let mut data = self.read_credentials()?;
+        check_account_insert(&data, provider_id, label)?;
+        let entry = insert_account_entry(data.remove(provider_id), label, credential);
         data.insert(provider_id.to_string(), entry);
         write_auth_file(&self.path, &data)
     }
@@ -526,7 +643,7 @@ impl AuthStorage {
         label: &str,
     ) -> Result<(), AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
-        let mut data = read_auth_file(&self.path)?;
+        let mut data = self.read_credentials()?;
         match data.get_mut(provider_id) {
             Some(StoredEntry::Accounts { default, accounts }) if accounts.contains_key(label) => {
                 *default = label.to_string();
@@ -551,7 +668,7 @@ impl AuthStorage {
     /// deliberately and collapsing it back to bare would discard it.
     pub async fn remove_account(&self, provider_id: &str, label: &str) -> Result<(), AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
-        let mut data = read_auth_file(&self.path)?;
+        let mut data = self.read_credentials()?;
         let Some(StoredEntry::Accounts { default, accounts }) = data.get_mut(provider_id) else {
             return Err(AuthError::UnknownAccount {
                 provider: provider_id.to_string(),
@@ -574,27 +691,95 @@ impl AuthStorage {
             data.remove(provider_id);
         } else {
             accounts.remove(label);
+            if accounts.is_empty() {
+                data.remove(provider_id);
+            }
         }
         write_auth_file(&self.path, &data)
     }
 
-    /// Remove the credential stored for `provider_id`. No-op if none
-    /// exists. Removes a labeled set whole, every account of it: this is
-    /// the logout-everything path. Atomic w.r.t. concurrent operations
-    /// via the file lock.
-    pub async fn remove(&self, provider_id: &str) -> Result<(), AuthError> {
+    /// Atomically move a labeled set's default and remove the old default.
+    ///
+    /// Both raw labels are checked under the same file lock, so a stale picker
+    /// cannot briefly point the store at one account and then fail to remove
+    /// another.
+    pub async fn remove_default_account(
+        &self,
+        provider_id: &str,
+        label: &str,
+        new_default: &str,
+    ) -> Result<(), AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
-        let mut data = read_auth_file(&self.path)?;
-        if data.remove(provider_id).is_some() {
-            write_auth_file(&self.path, &data)?;
+        let mut data = self.read_credentials()?;
+        let Some(StoredEntry::Accounts { default, accounts }) = data.get_mut(provider_id) else {
+            return Err(AuthError::ProviderAccountsChanged {
+                provider: provider_id.to_string(),
+            });
+        };
+        if default != label
+            || label == new_default
+            || !accounts.contains_key(label)
+            || !accounts.contains_key(new_default)
+        {
+            return Err(AuthError::ProviderAccountsChanged {
+                provider: provider_id.to_string(),
+            });
         }
-        Ok(())
+        accounts.remove(label);
+        *default = new_default.to_string();
+        write_auth_file(&self.path, &data)
+    }
+
+    /// Remove a labeled provider set only while its exact raw key set still
+    /// matches the one the user confirmed.
+    pub async fn remove_all_accounts(
+        &self,
+        provider_id: &str,
+        expected_accounts: &[String],
+    ) -> Result<(), AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let mut data = self.read_credentials()?;
+        let Some(StoredEntry::Accounts { accounts, .. }) = data.get(provider_id) else {
+            return Err(AuthError::ProviderAccountsChanged {
+                provider: provider_id.to_string(),
+            });
+        };
+        let mut current = accounts.keys().cloned().collect::<Vec<_>>();
+        current.sort();
+        let mut expected = expected_accounts.to_vec();
+        expected.sort();
+        if current != expected {
+            return Err(AuthError::ProviderAccountsChanged {
+                provider: provider_id.to_string(),
+            });
+        }
+        data.remove(provider_id);
+        write_auth_file(&self.path, &data)
+    }
+
+    /// Remove a provider credential only while it is still the bare shape the
+    /// caller selected. A concurrent promotion to labeled accounts is a stale
+    /// choice and must never become an implicit remove-all.
+    pub async fn remove_bare(&self, provider_id: &str) -> Result<(), AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let mut data = self.read_credentials()?;
+        match data.get(provider_id) {
+            Some(StoredEntry::ApiKey { .. } | StoredEntry::OAuth(_)) => {
+                data.remove(provider_id);
+                write_auth_file(&self.path, &data)
+            }
+            Some(StoredEntry::Accounts { .. }) | None => {
+                Err(AuthError::ProviderCredentialChanged {
+                    provider: provider_id.to_string(),
+                })
+            }
+        }
     }
 
     /// List all provider ids currently in `auth.json`.
     pub async fn list(&self) -> Result<Vec<String>, AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
-        let data = read_auth_file(&self.path)?;
+        let data = self.read_credentials()?;
         Ok(data.into_keys().collect())
     }
 
@@ -687,7 +872,7 @@ impl AuthStorage {
         //    here.
         let entry = {
             let _lock = FileLock::acquire(&self.path).await?;
-            read_auth_file(&self.path)?.remove(provider_id)
+            self.read_credentials()?.remove(provider_id)
         };
         if let Some(entry) = entry {
             // The slot is fixed from this read: a refresh writes back to
@@ -751,9 +936,11 @@ impl AuthStorage {
         }))
     }
 
-    /// Run an OAuth login flow and persist the resulting credentials.
-    /// On success, `auth.json` gains a fresh OAuth entry under
-    /// `provider_id`. Errors propagate from the underlying flow.
+    /// Run the first OAuth login for an unconfigured provider.
+    ///
+    /// The absence decision is checked before OAuth and repeated under the
+    /// final file lock. A provider another process configures while the
+    /// browser flow is open is preserved rather than overwritten.
     pub async fn login(
         &self,
         provider_id: &str,
@@ -762,33 +949,151 @@ impl AuthStorage {
         self.login_account(provider_id, None, callbacks).await
     }
 
-    /// Run an OAuth login flow and persist the result under `label` in
-    /// `provider_id`'s labeled set (`None` keeps [`AuthStorage::login`]'s
-    /// unlabeled write, which replaces the bare entry or a set's default
-    /// slot). The flow runs before any write, so a failed or cancelled
-    /// login leaves the store untouched.
+    /// Run insert-only OAuth account creation.
+    ///
+    /// `None` is the first-login bare shape. `Some(label)` is a labeled
+    /// account creation. Both decisions are checked before OAuth and repeated
+    /// under the final file lock, so this API never becomes an upsert.
     pub async fn login_account(
         &self,
         provider_id: &str,
         label: Option<&str>,
         callbacks: &dyn OAuthCallbacks,
     ) -> Result<(), AuthError> {
+        self.check_login_creation(provider_id, label).await?;
         let provider = self.lookup_oauth_provider(provider_id).await?;
         let creds = provider.login(callbacks).await?;
+        self.commit_login_creation(provider_id, label, AuthCredential::OAuth(creds))
+            .await
+    }
+
+    /// Run OAuth for an explicitly selected existing bare credential or
+    /// labeled account.
+    ///
+    /// The exact target must exist before OAuth. An existing legacy account
+    /// remains replaceable without current validation. If a labeled target is
+    /// removed while OAuth runs, committing would recreate a key, so the final
+    /// locked decision applies the current insertion predicate and prospective
+    /// namespace rules before doing so.
+    pub async fn replace_login_account(
+        &self,
+        provider_id: &str,
+        label: Option<&str>,
+        callbacks: &dyn OAuthCallbacks,
+    ) -> Result<(), AuthError> {
+        self.check_login_replacement(provider_id, label).await?;
+        let provider = self.lookup_oauth_provider(provider_id).await?;
+        let creds = provider.login(callbacks).await?;
+        self.commit_login_replacement(provider_id, label, AuthCredential::OAuth(creds))
+            .await
+    }
+
+    async fn check_login_creation(
+        &self,
+        provider_id: &str,
+        label: Option<&str>,
+    ) -> Result<(), AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let data = self.read_credentials()?;
         match label {
-            Some(label) => {
-                self.set_account(provider_id, label, AuthCredential::OAuth(creds))
-                    .await
-            }
-            None => self.set(provider_id, AuthCredential::OAuth(creds)).await,
+            Some(label) => check_account_insert(&data, provider_id, label),
+            None if data.contains_key(provider_id) => Err(AuthError::ProviderAlreadyConfigured {
+                provider: provider_id.to_string(),
+            }),
+            None => Ok(()),
         }
     }
 
-    /// Remove any stored credential for `provider_id`, regardless of
-    /// type (API key or OAuth). Convenience wrapper over
-    /// [`AuthStorage::remove`] used by the CLI's `/logout` path.
-    pub async fn logout(&self, provider_id: &str) -> Result<(), AuthError> {
-        self.remove(provider_id).await
+    async fn commit_login_creation(
+        &self,
+        provider_id: &str,
+        label: Option<&str>,
+        credential: AuthCredential,
+    ) -> Result<(), AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let mut data = self.read_credentials()?;
+        match label {
+            Some(label) => {
+                check_account_insert(&data, provider_id, label)?;
+                let entry = insert_account_entry(data.remove(provider_id), label, credential);
+                data.insert(provider_id.to_string(), entry);
+            }
+            None if data.contains_key(provider_id) => {
+                return Err(AuthError::ProviderAlreadyConfigured {
+                    provider: provider_id.to_string(),
+                });
+            }
+            None => {
+                data.insert(
+                    provider_id.to_string(),
+                    StoredEntry::from_credential(credential),
+                );
+            }
+        }
+        write_auth_file(&self.path, &data)
+    }
+
+    async fn check_login_replacement(
+        &self,
+        provider_id: &str,
+        label: Option<&str>,
+    ) -> Result<(), AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let data = self.read_credentials()?;
+        let exists = match (data.get(provider_id), label) {
+            (Some(StoredEntry::ApiKey { .. } | StoredEntry::OAuth(_)), None) => true,
+            (Some(StoredEntry::Accounts { accounts, .. }), Some(label)) => {
+                accounts.contains_key(label)
+            }
+            _ => false,
+        };
+        if exists {
+            Ok(())
+        } else {
+            Err(AuthError::ProviderCredentialChanged {
+                provider: provider_id.to_string(),
+            })
+        }
+    }
+
+    async fn commit_login_replacement(
+        &self,
+        provider_id: &str,
+        label: Option<&str>,
+        credential: AuthCredential,
+    ) -> Result<(), AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let mut data = self.read_credentials()?;
+        match label {
+            None => match data.get_mut(provider_id) {
+                Some(entry @ (StoredEntry::ApiKey { .. } | StoredEntry::OAuth(_))) => {
+                    *entry = StoredEntry::from_credential(credential);
+                }
+                _ => {
+                    return Err(AuthError::ProviderCredentialChanged {
+                        provider: provider_id.to_string(),
+                    });
+                }
+            },
+            Some(label) => {
+                let still_present = matches!(
+                    data.get(provider_id),
+                    Some(StoredEntry::Accounts { accounts, .. }) if accounts.contains_key(label)
+                );
+                if still_present {
+                    let Some(StoredEntry::Accounts { accounts, .. }) = data.get_mut(provider_id)
+                    else {
+                        unreachable!("presence check matched account set")
+                    };
+                    accounts.insert(label.to_string(), credential);
+                } else {
+                    check_account_insert(&data, provider_id, label)?;
+                    let entry = insert_account_entry(data.remove(provider_id), label, credential);
+                    data.insert(provider_id.to_string(), entry);
+                }
+            }
+        }
+        write_auth_file(&self.path, &data)
     }
 
     /// List the registered OAuth providers as `(id, display_name)`
@@ -843,7 +1148,7 @@ impl AuthStorage {
     ) -> Result<Option<String>, AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
 
-        let mut data = read_auth_file(&self.path)?;
+        let mut data = self.read_credentials()?;
         let creds = match (data.get(provider_id), slot) {
             (Some(StoredEntry::OAuth(c)), Slot::Bare) => c.clone(),
             (Some(StoredEntry::Accounts { accounts, .. }), Slot::Account(label)) => {
@@ -1156,6 +1461,9 @@ fn try_steal_stale_lock(lock_path: &Path, max_age: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use tempfile::TempDir;
 
     use super::*;
@@ -1171,6 +1479,95 @@ mod tests {
         let dir = TempDir::with_prefix(format!("aj-auth-test-{tag}-")).expect("create temp dir");
         let path = dir.path().join("auth.json");
         (dir, path)
+    }
+
+    struct TestCallbacks;
+
+    #[async_trait]
+    impl OAuthCallbacks for TestCallbacks {
+        fn on_auth(&self, _info: crate::oauth::OAuthAuthInfo<'_>) {}
+
+        async fn on_prompt(&self, _message: &str) -> Result<String, OAuthError> {
+            Ok(String::new())
+        }
+    }
+
+    enum LoginRace {
+        None,
+        InsertBare { key: String },
+        Insert { label: String, key: String },
+        Remove { label: String },
+    }
+
+    struct RacingLoginProvider {
+        path: PathBuf,
+        race: StdMutex<LoginRace>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl OAuthProvider for RacingLoginProvider {
+        fn id(&self) -> &str {
+            "stub"
+        }
+
+        fn name(&self) -> &str {
+            "Stub"
+        }
+
+        async fn login(
+            &self,
+            _callbacks: &dyn OAuthCallbacks,
+        ) -> Result<OAuthCredentials, OAuthError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let race = std::mem::replace(
+                &mut *self.race.lock().expect("race mutex poisoned"),
+                LoginRace::None,
+            );
+            let rival = AuthStorage::with_providers(self.path.clone(), HashMap::new());
+            match race {
+                LoginRace::None => {}
+                LoginRace::InsertBare { key } => {
+                    rival
+                        .insert_bare("stub", AuthCredential::ApiKey { key })
+                        .await
+                        .expect("concurrent bare insertion");
+                }
+                LoginRace::Insert { label, key } => {
+                    rival
+                        .insert_account("stub", &label, AuthCredential::ApiKey { key })
+                        .await
+                        .expect("concurrent insertion");
+                }
+                LoginRace::Remove { label } => {
+                    rival
+                        .remove_account("stub", &label)
+                        .await
+                        .expect("concurrent removal");
+                }
+            }
+            Ok(OAuthCredentials::new("new-refresh", "new-access", i64::MAX))
+        }
+
+        async fn refresh_token(
+            &self,
+            _credentials: &OAuthCredentials,
+        ) -> Result<OAuthCredentials, OAuthError> {
+            unreachable!("login tests do not refresh")
+        }
+    }
+
+    fn racing_storage(path: PathBuf, race: LoginRace) -> (AuthStorage, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn OAuthProvider> = Arc::new(RacingLoginProvider {
+            path: path.clone(),
+            race: StdMutex::new(race),
+            calls: Arc::clone(&calls),
+        });
+        (
+            AuthStorage::with_providers(path, HashMap::from([("stub".to_string(), provider)])),
+            calls,
+        )
     }
 
     /// `AuthCredential` round-trip: API-key shape stays a flat
@@ -1224,10 +1621,9 @@ mod tests {
         }
     }
 
-    /// Set / get / remove against an empty file — the storage should
-    /// create the file lazily and return what we just wrote.
+    /// Explicit bare insert, replace, and removal persist their exact slot.
     #[tokio::test]
-    async fn set_get_remove_persists_to_file() {
+    async fn bare_insert_replace_and_remove_persist_to_file() {
         let (_dir, path) = scratch_path("crud");
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
@@ -1235,7 +1631,7 @@ mod tests {
         assert!(!storage.has("anthropic").await.unwrap());
 
         storage
-            .set(
+            .insert_bare(
                 "anthropic",
                 AuthCredential::ApiKey {
                     key: "sk-abc".into(),
@@ -1259,7 +1655,21 @@ mod tests {
             other => panic!("unexpected credential: {other:?}"),
         }
 
-        storage.remove("anthropic").await.unwrap();
+        storage
+            .replace_bare(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "sk-replaced".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.get("anthropic").await.unwrap(),
+            Some(AuthCredential::ApiKey { key }) if key == "sk-replaced"
+        ));
+
+        storage.remove_bare("anthropic").await.unwrap();
         assert!(!storage.has("anthropic").await.unwrap());
     }
 
@@ -1270,7 +1680,7 @@ mod tests {
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         storage
-            .set(
+            .insert_bare(
                 "openai",
                 AuthCredential::ApiKey {
                     key: "from-file".into(),
@@ -1299,7 +1709,7 @@ mod tests {
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         storage
-            .set(
+            .insert_bare(
                 "custom-provider-xyz",
                 AuthCredential::ApiKey {
                     key: "from-file".into(),
@@ -1375,7 +1785,7 @@ mod tests {
 
         // A stored key now wins over the env var.
         storage
-            .set(
+            .insert_bare(
                 "openrouter",
                 AuthCredential::ApiKey {
                     key: "from-file".into(),
@@ -1435,7 +1845,7 @@ mod tests {
 
         // Pre-seed an expired token.
         storage
-            .set(
+            .insert_bare(
                 "stub",
                 AuthCredential::OAuth(OAuthCredentials::new("old-r", "old-a", 1)),
             )
@@ -1493,7 +1903,7 @@ mod tests {
         let storage = AuthStorage::with_providers(path.clone(), providers);
 
         storage
-            .set(
+            .insert_bare(
                 "stub",
                 AuthCredential::OAuth(OAuthCredentials::new("r", "fresh-a", i64::MAX)),
             )
@@ -1553,7 +1963,7 @@ mod tests {
         let storage = AuthStorage::with_providers(path.clone(), providers);
 
         storage
-            .set(
+            .insert_bare(
                 "stub",
                 AuthCredential::OAuth(OAuthCredentials::new("stale-r", "stale-a", 1)),
             )
@@ -1588,7 +1998,7 @@ mod tests {
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         storage
-            .set(
+            .insert_bare(
                 "typod-provider",
                 AuthCredential::OAuth(OAuthCredentials::new("r", "fresh-a", i64::MAX)),
             )
@@ -1655,11 +2065,11 @@ mod tests {
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         storage
-            .set("openai", AuthCredential::ApiKey { key: "sk-1".into() })
+            .insert_bare("openai", AuthCredential::ApiKey { key: "sk-1".into() })
             .await
             .unwrap();
         storage
-            .set(
+            .insert_bare(
                 "anthropic",
                 AuthCredential::OAuth(OAuthCredentials::new("r", "a", 100)),
             )
@@ -1815,10 +2225,10 @@ mod tests {
 
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
-        // A write to *any* provider causes the read-modify-write
-        // cycle inside `set` to round-trip the migrated map.
+        // A write to *any* provider causes its locked read-modify-write to
+        // round-trip the migrated map.
         storage
-            .set("anthropic", AuthCredential::ApiKey { key: "sk-x".into() })
+            .insert_bare("anthropic", AuthCredential::ApiKey { key: "sk-x".into() })
             .await
             .unwrap();
 
@@ -1832,8 +2242,8 @@ mod tests {
         assert_eq!(on_disk["anthropic"]["type"], "api_key");
     }
 
-    /// Concurrent writers serialize via the file lock — ten parallel
-    /// `set` calls should all land without losing entries.
+    /// Concurrent writers serialize via the file lock. Ten parallel
+    /// insert-only calls for distinct providers all land without losing entries.
     #[tokio::test]
     async fn concurrent_writes_serialize_via_lock() {
         let (_dir, path) = scratch_path("concurrent");
@@ -1843,7 +2253,7 @@ mod tests {
         for i in 0..10u8 {
             let s = storage.clone();
             handles.push(tokio::spawn(async move {
-                s.set(
+                s.insert_bare(
                     &format!("p{i}"),
                     AuthCredential::ApiKey {
                         key: format!("k{i}"),
@@ -1904,6 +2314,445 @@ mod tests {
         AuthCredential::ApiKey { key: key.into() }
     }
 
+    #[tokio::test]
+    async fn duplicate_creation_fails_before_oauth_and_preserves_the_credential() {
+        let (_dir, path) = scratch_path("duplicate-login");
+        let (storage, calls) = racing_storage(path, LoginRace::None);
+        storage
+            .insert_account("stub", "work", api_key("keep"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            storage
+                .login_account("stub", Some("work"), &TestCallbacks)
+                .await,
+            Err(AuthError::DuplicateAccount { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "OAuth never started");
+        assert!(matches!(
+            storage.get_account("stub", "work").await.unwrap(),
+            Some(AuthCredential::ApiKey { key }) if key == "keep"
+        ));
+    }
+
+    #[tokio::test]
+    async fn first_login_stays_bare_and_is_insert_only() {
+        let (_dir, path) = scratch_path("first-login");
+        let (storage, calls) = racing_storage(path, LoginRace::None);
+        storage
+            .login("stub", &TestCallbacks)
+            .await
+            .expect("first login succeeds");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            storage.stored_credentials("stub").await.unwrap(),
+            Some(StoredProviderCredentials::Bare(AuthCredential::OAuth(credentials)))
+                if credentials.access == "new-access"
+        ));
+    }
+
+    #[tokio::test]
+    async fn first_login_race_preserves_the_concurrent_bare_credential() {
+        let (_dir, path) = scratch_path("first-login-race");
+        let (storage, calls) = racing_storage(
+            path,
+            LoginRace::InsertBare {
+                key: "racing".to_string(),
+            },
+        );
+        assert!(matches!(
+            storage.login("stub", &TestCallbacks).await,
+            Err(AuthError::ProviderAlreadyConfigured { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            storage.stored_credentials("stub").await.unwrap(),
+            Some(StoredProviderCredentials::Bare(AuthCredential::ApiKey { key }))
+                if key == "racing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloned_read_observer_counts_reads_and_read_modify_writes() {
+        let (_dir, path) = scratch_path("read-observer");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        let clone = storage.clone();
+        storage.reset_credential_read_count();
+
+        clone.list().await.expect("read through clone");
+        assert_eq!(
+            storage.credential_read_count(),
+            1,
+            "the clone shares the observer"
+        );
+        clone
+            .insert_bare("stub", api_key("calibration"))
+            .await
+            .expect("read-modify-write through clone");
+        assert_eq!(
+            storage.credential_read_count(),
+            2,
+            "a mutating boundary also increments"
+        );
+        storage.reset_credential_read_count();
+        assert_eq!(storage.credential_read_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn creation_race_is_duplicate_and_preserves_the_concurrent_credential() {
+        let (_dir, path) = scratch_path("creation-race");
+        let (storage, calls) = racing_storage(
+            path,
+            LoginRace::Insert {
+                label: "work".to_string(),
+                key: "racing".to_string(),
+            },
+        );
+
+        assert!(matches!(
+            storage
+                .login_account("stub", Some("work"), &TestCallbacks)
+                .await,
+            Err(AuthError::DuplicateAccount { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "OAuth did run once");
+        assert!(matches!(
+            storage.get_account("stub", "work").await.unwrap(),
+            Some(AuthCredential::ApiKey { key }) if key == "racing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn second_oauth_login_promotes_and_preserves_the_bare_credential() {
+        let (_dir, path) = scratch_path("second-login-promotes");
+        let (storage, calls) = racing_storage(path, LoginRace::None);
+        storage
+            .insert_bare("stub", api_key("existing"))
+            .await
+            .unwrap();
+
+        storage
+            .login_account("stub", Some("work"), &TestCallbacks)
+            .await
+            .expect("second login creates a labeled account");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let set = storage
+            .accounts("stub")
+            .await
+            .unwrap()
+            .expect("promoted set");
+        assert_eq!(set.default, DEFAULT_ACCOUNT_LABEL);
+        assert!(matches!(
+            storage
+                .get_account("stub", DEFAULT_ACCOUNT_LABEL)
+                .await
+                .unwrap(),
+            Some(AuthCredential::ApiKey { key }) if key == "existing"
+        ));
+        assert!(matches!(
+            storage.get_account("stub", "work").await.unwrap(),
+            Some(AuthCredential::OAuth(credentials)) if credentials.access == "new-access"
+        ));
+    }
+
+    #[tokio::test]
+    async fn second_login_default_collision_refuses_before_oauth_without_rewriting_bare_bytes() {
+        let (_dir, path) = scratch_path("second-login-default-collision");
+        let (storage, calls) = racing_storage(path.clone(), LoginRace::None);
+        storage
+            .insert_bare("stub", api_key("existing"))
+            .await
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(
+            storage
+                .login_account("stub", Some(DEFAULT_ACCOUNT_LABEL), &TestCallbacks)
+                .await,
+            Err(AuthError::DuplicateAccount { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(storage.accounts("stub").await.unwrap().is_none());
+        assert!(matches!(
+            storage.get("stub").await.unwrap(),
+            Some(AuthCredential::ApiKey { key }) if key == "existing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn replacement_requires_an_initial_exact_target_before_oauth() {
+        let (_dir, path) = scratch_path("missing-replacement");
+        let (storage, calls) = racing_storage(path, LoginRace::None);
+
+        assert!(matches!(
+            storage
+                .replace_login_account("stub", Some("work"), &TestCallbacks)
+                .await,
+            Err(AuthError::ProviderCredentialChanged { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "OAuth never started");
+    }
+
+    #[tokio::test]
+    async fn removed_valid_replacement_target_is_recreated_under_current_rules() {
+        let (_dir, path) = scratch_path("valid-replacement-race");
+        let (storage, calls) = racing_storage(
+            path,
+            LoginRace::Remove {
+                label: "work".to_string(),
+            },
+        );
+        storage
+            .insert_account("stub", "work", api_key("old"))
+            .await
+            .unwrap();
+
+        storage
+            .replace_login_account("stub", Some("work"), &TestCallbacks)
+            .await
+            .expect("current-valid absent target may be recreated");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            storage.get_account("stub", "work").await.unwrap(),
+            Some(AuthCredential::OAuth(credentials)) if credentials.access == "new-access"
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_replacement_works_in_place_but_is_not_recreated_after_removal() {
+        let legacy = "wo\nrk";
+
+        let (_kept_dir, kept_path) = scratch_path("legacy-replace-kept");
+        std::fs::write(
+            &kept_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "stub": {
+                    "type": "accounts",
+                    "default": legacy,
+                    "accounts": {
+                        (legacy): { "type": "api_key", "key": "old" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (kept, _) = racing_storage(kept_path, LoginRace::None);
+        kept.replace_login_account("stub", Some(legacy), &TestCallbacks)
+            .await
+            .expect("existing legacy key remains replaceable");
+        assert!(matches!(
+            kept.get_account("stub", legacy).await.unwrap(),
+            Some(AuthCredential::OAuth(credentials)) if credentials.access == "new-access"
+        ));
+
+        let (_removed_dir, removed_path) = scratch_path("legacy-replace-removed");
+        std::fs::write(
+            &removed_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "stub": {
+                    "type": "accounts",
+                    "default": legacy,
+                    "accounts": {
+                        (legacy): { "type": "api_key", "key": "old" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (removed, _) = racing_storage(
+            removed_path,
+            LoginRace::Remove {
+                label: legacy.to_string(),
+            },
+        );
+        assert!(matches!(
+            removed
+                .replace_login_account("stub", Some(legacy), &TestCallbacks)
+                .await,
+            Err(AuthError::InvalidLabel(_))
+        ));
+        assert!(
+            removed.get("stub").await.unwrap().is_none(),
+            "removed legacy target was not recreated"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlength_legacy_key_remains_exactly_replaceable_while_present() {
+        let label = "a".repeat(MAX_ACCOUNT_LABEL_BYTES + 1);
+        let (_dir, path) = scratch_path("overlength-replace");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "stub": {
+                    "type": "accounts",
+                    "default": label,
+                    "accounts": {
+                        (label.clone()): { "type": "api_key", "key": "old" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (storage, _) = racing_storage(path, LoginRace::None);
+        storage
+            .replace_login_account("stub", Some(&label), &TestCallbacks)
+            .await
+            .expect("present overlength legacy key remains replaceable");
+        assert!(matches!(
+            storage.get_account("stub", &label).await.unwrap(),
+            Some(AuthCredential::OAuth(credentials)) if credentials.access == "new-access"
+        ));
+    }
+
+    #[tokio::test]
+    async fn removed_overlength_replacement_target_is_not_recreated() {
+        let label = "a".repeat(MAX_ACCOUNT_LABEL_BYTES + 1);
+        let (_dir, path) = scratch_path("overlength-replace-removed");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "stub": {
+                    "type": "accounts",
+                    "default": label.clone(),
+                    "accounts": {
+                        (label.clone()): { "type": "api_key", "key": "old" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (storage, _) = racing_storage(
+            path,
+            LoginRace::Remove {
+                label: label.clone(),
+            },
+        );
+        assert!(matches!(
+            storage
+                .replace_login_account("stub", Some(&label), &TestCallbacks)
+                .await,
+            Err(AuthError::InvalidLabel(_))
+        ));
+        assert!(storage.get("stub").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn over_limit_legacy_identity_lists_resolves_defaults_refreshes_and_removes_exactly() {
+        struct LegacyRefreshProvider;
+
+        #[async_trait]
+        impl OAuthProvider for LegacyRefreshProvider {
+            fn id(&self) -> &str {
+                "stub"
+            }
+
+            fn name(&self) -> &str {
+                "Stub"
+            }
+
+            async fn login(
+                &self,
+                _callbacks: &dyn OAuthCallbacks,
+            ) -> Result<OAuthCredentials, OAuthError> {
+                Ok(OAuthCredentials::new(
+                    "reactivated-r",
+                    "reactivated-a",
+                    i64::MAX,
+                ))
+            }
+
+            async fn refresh_token(
+                &self,
+                _credentials: &OAuthCredentials,
+            ) -> Result<OAuthCredentials, OAuthError> {
+                Ok(OAuthCredentials::new(
+                    "refreshed-r",
+                    "refreshed-a",
+                    i64::MAX,
+                ))
+            }
+        }
+
+        let label = format!("{}\u{1000}", "a".repeat(10_921));
+        assert_eq!(
+            display_account_label(&label, AccountLabelDisplayMode::Ordinary).len(),
+            65_536,
+            "fixture crosses the terminal inspection boundary"
+        );
+        let (_dir, path) = scratch_path("over-limit-legacy-matrix");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "stub": {
+                    "type": "accounts",
+                    "default": "safe",
+                    "accounts": {
+                        "safe": { "type": "api_key", "key": "safe-key" },
+                        (label.clone()): {
+                            "type": "oauth",
+                            "refresh": "old-r",
+                            "access": "old-a",
+                            "expires": 0
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let provider: Arc<dyn OAuthProvider> = Arc::new(LegacyRefreshProvider);
+        let storage = AuthStorage::with_providers(
+            path.clone(),
+            HashMap::from([("stub".to_string(), provider)]),
+        );
+
+        let set = storage.accounts("stub").await.unwrap().unwrap();
+        assert!(set.accounts.iter().any(|(current, _)| current == &label));
+        assert!(storage.get_account("stub", &label).await.unwrap().is_some());
+        assert!(matches!(
+            storage
+                .insert_account("stub", &label, api_key("overwrite"))
+                .await,
+            Err(AuthError::DuplicateAccount { .. })
+        ));
+        storage.set_default_account("stub", &label).await.unwrap();
+        let resolved = storage
+            .get_api_key("stub", None)
+            .await
+            .unwrap()
+            .expect("legacy default refreshes");
+        assert_eq!(resolved.key, "refreshed-a");
+        assert_eq!(resolved.source, CredentialSource::Account(label.clone()));
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["stub"]["default"], label);
+        assert_eq!(
+            json["stub"]["accounts"][label.as_str()]["access"],
+            "refreshed-a"
+        );
+
+        storage
+            .replace_login_account("stub", Some(&label), &TestCallbacks)
+            .await
+            .expect("over-limit legacy identity remains reactivatable");
+        assert!(matches!(
+            storage.get_account("stub", &label).await.unwrap(),
+            Some(AuthCredential::OAuth(credentials)) if credentials.access == "reactivated-a"
+        ));
+
+        storage.set_default_account("stub", "safe").await.unwrap();
+        storage.remove_account("stub", &label).await.unwrap();
+        assert!(storage.get_account("stub", &label).await.unwrap().is_none());
+        assert!(storage.get_account("stub", "safe").await.unwrap().is_some());
+    }
+
     /// A pre-accounts auth.json, as literal bytes rather than a
     /// round-trip through our own serializer: a serializer bug that
     /// changed the written shape would keep a round-trip green while
@@ -1945,9 +2794,12 @@ mod tests {
     async fn growing_a_bare_entry_keeps_it_the_default() {
         let (_dir, path) = scratch_path("grow");
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
-        storage.set("prov-x", api_key("first")).await.unwrap();
         storage
-            .set_account("prov-x", "work", api_key("second"))
+            .insert_bare("prov-x", api_key("first"))
+            .await
+            .unwrap();
+        storage
+            .insert_account("prov-x", "work", api_key("second"))
             .await
             .unwrap();
 
@@ -1997,7 +2849,7 @@ mod tests {
         let (_dir, path) = scratch_path("absent-label");
         let storage = AuthStorage::with_providers(path, HashMap::new());
         storage
-            .set_account("prov-x", "personal", api_key("k1"))
+            .insert_account("prov-x", "personal", api_key("k1"))
             .await
             .unwrap();
 
@@ -2030,7 +2882,7 @@ mod tests {
     async fn a_label_against_a_bare_entry_misses() {
         let (_dir, path) = scratch_path("label-vs-bare");
         let storage = AuthStorage::with_providers(path, HashMap::new());
-        storage.set("prov-x", api_key("k1")).await.unwrap();
+        storage.insert_bare("prov-x", api_key("k1")).await.unwrap();
         let resolved = storage.get_api_key("prov-x", Some("work")).await.unwrap();
         assert!(
             resolved.is_none(),
@@ -2048,7 +2900,7 @@ mod tests {
         let (_dir, path) = scratch_path("source-default");
         let storage = AuthStorage::with_providers(path, HashMap::new());
         storage
-            .set_account("prov-x", "personal", api_key("k1"))
+            .insert_account("prov-x", "personal", api_key("k1"))
             .await
             .unwrap();
 
@@ -2071,11 +2923,11 @@ mod tests {
         let (_dir, path) = scratch_path("source-labeled");
         let storage = AuthStorage::with_providers(path, HashMap::new());
         storage
-            .set_account("prov-x", "personal", api_key("k1"))
+            .insert_account("prov-x", "personal", api_key("k1"))
             .await
             .unwrap();
         storage
-            .set_account("prov-x", "work", api_key("k2"))
+            .insert_account("prov-x", "work", api_key("k2"))
             .await
             .unwrap();
 
@@ -2097,7 +2949,7 @@ mod tests {
     async fn a_bare_entry_reports_itself_as_bare() {
         let (_dir, path) = scratch_path("source-bare");
         let storage = AuthStorage::with_providers(path, HashMap::new());
-        storage.set("prov-x", api_key("k1")).await.unwrap();
+        storage.insert_bare("prov-x", api_key("k1")).await.unwrap();
 
         let resolved = storage
             .get_api_key("prov-x", None)
@@ -2116,7 +2968,7 @@ mod tests {
         let (_dir, path) = scratch_path("source-override");
         let storage = AuthStorage::with_providers(path, HashMap::new());
         storage
-            .set_account("prov-x", "work", api_key("k2"))
+            .insert_account("prov-x", "work", api_key("k2"))
             .await
             .unwrap();
         storage
@@ -2196,7 +3048,7 @@ mod tests {
         let (_dir, path) = scratch_path("override-vs-label");
         let storage = AuthStorage::with_providers(path, HashMap::new());
         storage
-            .set_account("prov-x", "work", api_key("stored"))
+            .insert_account("prov-x", "work", api_key("stored"))
             .await
             .unwrap();
         storage
@@ -2254,7 +3106,7 @@ mod tests {
         // Default account holds a FRESH token, the picked account an
         // expired one, so only the picked slot has any business moving.
         storage
-            .set_account(
+            .insert_account(
                 "stub",
                 "personal",
                 AuthCredential::OAuth(OAuthCredentials::new("p-r", "p-a", i64::MAX)),
@@ -2262,7 +3114,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .set_account(
+            .insert_account(
                 "stub",
                 "work",
                 AuthCredential::OAuth(OAuthCredentials::new("w-r", "w-a", 1)),
@@ -2305,23 +3157,29 @@ mod tests {
         }
     }
 
-    /// An unlabeled write against a labeled set replaces the default
-    /// slot and preserves the rest: pre-accounts callers cannot flatten
-    /// a set they do not know exists.
+    /// Bare creation and replacement never infer a labeled target from the
+    /// default at lock acquisition.
     #[tokio::test]
-    async fn an_unlabeled_set_replaces_only_the_default_slot() {
-        let (_dir, path) = scratch_path("unlabeled-set");
+    async fn bare_intents_refuse_a_labeled_set_without_mutation() {
+        let (_dir, path) = scratch_path("bare-vs-labeled-set");
         let storage = AuthStorage::with_providers(path, HashMap::new());
         storage
-            .set_account("prov-x", "personal", api_key("k1"))
+            .insert_account("prov-x", "personal", api_key("k1"))
             .await
             .unwrap();
         storage
-            .set_account("prov-x", "work", api_key("k2"))
+            .insert_account("prov-x", "work", api_key("k2"))
             .await
             .unwrap();
 
-        storage.set("prov-x", api_key("k1-replaced")).await.unwrap();
+        assert!(matches!(
+            storage.insert_bare("prov-x", api_key("insert")).await,
+            Err(AuthError::ProviderAlreadyConfigured { .. })
+        ));
+        assert!(matches!(
+            storage.replace_bare("prov-x", api_key("replace")).await,
+            Err(AuthError::ProviderCredentialChanged { .. })
+        ));
 
         let set = storage
             .accounts("prov-x")
@@ -2336,7 +3194,7 @@ mod tests {
                 .unwrap()
                 .map(|resolved| resolved.key)
                 .as_deref(),
-            Some("k1-replaced"),
+            Some("k1"),
         );
         assert_eq!(
             storage
@@ -2346,7 +3204,7 @@ mod tests {
                 .map(|resolved| resolved.key)
                 .as_deref(),
             Some("k2"),
-            "the sibling account survived the unlabeled write",
+            "the sibling account remains untouched",
         );
     }
 
@@ -2356,20 +3214,33 @@ mod tests {
     #[tokio::test]
     async fn invalid_labels_are_refused_and_leave_the_store_intact() {
         let (_dir, path) = scratch_path("bad-labels");
-        let storage = AuthStorage::with_providers(path, HashMap::new());
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         assert!(matches!(
-            storage.set_account("prov-x", "", api_key("k")).await,
+            storage.insert_account("prov-x", "", api_key("k")).await,
             Err(AuthError::InvalidLabel(_)),
         ));
 
-        storage.set("prov-x", api_key("keep-me")).await.unwrap();
+        storage
+            .insert_bare("prov-x", api_key("keep-me"))
+            .await
+            .unwrap();
+        let before = std::fs::read(&path).expect("read bare credential bytes");
         assert!(matches!(
             storage
-                .set_account("prov-x", DEFAULT_ACCOUNT_LABEL, api_key("clobber"))
+                .insert_account("prov-x", DEFAULT_ACCOUNT_LABEL, api_key("clobber"))
                 .await,
-            Err(AuthError::InvalidLabel(_)),
+            Err(AuthError::DuplicateAccount { .. }),
         ));
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved credential bytes"),
+            before,
+            "prospective default collision performs no write"
+        );
+        assert!(
+            storage.accounts("prov-x").await.unwrap().is_none(),
+            "the refused promotion remains bare"
+        );
         assert_eq!(
             storage
                 .get_api_key("prov-x", None)
@@ -2390,11 +3261,11 @@ mod tests {
         let (_dir, path) = scratch_path("remove-accounts");
         let storage = AuthStorage::with_providers(path, HashMap::new());
         storage
-            .set_account("prov-x", "personal", api_key("k1"))
+            .insert_account("prov-x", "personal", api_key("k1"))
             .await
             .unwrap();
         storage
-            .set_account("prov-x", "work", api_key("k2"))
+            .insert_account("prov-x", "work", api_key("k2"))
             .await
             .unwrap();
 
@@ -2420,6 +3291,102 @@ mod tests {
         storage.remove_account("prov-x", "work").await.unwrap();
         assert!(!storage.has("prov-x").await.unwrap());
         assert!(storage.accounts("prov-x").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn default_replacement_and_removal_are_one_locked_transition() {
+        let (_dir, path) = scratch_path("replace-default-and-remove");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .insert_account("prov-x", "personal", api_key("k1"))
+            .await
+            .unwrap();
+        storage
+            .insert_account("prov-x", "work", api_key("k2"))
+            .await
+            .unwrap();
+
+        storage
+            .remove_default_account("prov-x", "personal", "work")
+            .await
+            .unwrap();
+        let set = storage.accounts("prov-x").await.unwrap().unwrap();
+        assert_eq!(set.default, "work");
+        assert_eq!(
+            set.accounts
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_bare_removal_cannot_delete_a_promoted_account_set() {
+        let (_dir, path) = scratch_path("stale-bare-removal");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .insert_bare("prov-x", api_key("bare"))
+            .await
+            .unwrap();
+        // A sibling promotes the exact bare credential after the picker read.
+        storage
+            .insert_account("prov-x", "work", api_key("second"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            storage.remove_bare("prov-x").await,
+            Err(AuthError::ProviderCredentialChanged { .. })
+        ));
+        let set = storage.accounts("prov-x").await.unwrap().unwrap();
+        assert_eq!(set.default, DEFAULT_ACCOUNT_LABEL);
+        assert_eq!(set.accounts.len(), 2);
+        assert!(matches!(
+            storage
+                .get_account("prov-x", DEFAULT_ACCOUNT_LABEL)
+                .await
+                .unwrap(),
+            Some(AuthCredential::ApiKey { key }) if key == "bare"
+        ));
+        assert!(matches!(
+            storage.get_account("prov-x", "work").await.unwrap(),
+            Some(AuthCredential::ApiKey { key }) if key == "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_all_refuses_when_the_exact_account_set_changed() {
+        let (_dir, path) = scratch_path("remove-all-stale");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .insert_account("prov-x", "personal", api_key("k1"))
+            .await
+            .unwrap();
+        storage
+            .insert_account("prov-x", "work", api_key("k2"))
+            .await
+            .unwrap();
+        let expected = vec!["personal".to_string(), "work".to_string()];
+        storage
+            .insert_account("prov-x", "later", api_key("k3"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            storage.remove_all_accounts("prov-x", &expected).await,
+            Err(AuthError::ProviderAccountsChanged { .. })
+        ));
+        assert_eq!(
+            storage
+                .accounts("prov-x")
+                .await
+                .unwrap()
+                .unwrap()
+                .accounts
+                .len(),
+            3
+        );
     }
 
     /// A hand-edited default that names no account resolves like a
@@ -2456,6 +3423,56 @@ mod tests {
                 .as_deref(),
             Some("k2"),
             "the intact account still resolves by name",
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_intent_does_not_target_dangling_default_and_last_real_account_cleans_up() {
+        let (_dir, path) = scratch_path("dangling-legacy-default");
+        std::fs::write(
+            &path,
+            r#"{
+  "prov-x": {
+    "type": "accounts",
+    "default": "bad\nlabel",
+    "accounts": { "work": { "type": "api_key", "key": "keep" } }
+  }
+}"#,
+        )
+        .unwrap();
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(
+            storage
+                .insert_bare("prov-x", api_key("must-not-recreate"))
+                .await,
+            Err(AuthError::ProviderAlreadyConfigured { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            storage
+                .get_account("prov-x", "bad\nlabel")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_account("prov-x", "work")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        storage.remove_account("prov-x", "work").await.unwrap();
+        assert!(
+            storage
+                .stored_credentials("prov-x")
+                .await
+                .unwrap()
+                .is_none(),
+            "removing the last real account does not leave an empty ghost set"
         );
     }
 }

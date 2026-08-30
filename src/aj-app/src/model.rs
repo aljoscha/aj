@@ -411,10 +411,10 @@ mod tests {
     #[tokio::test]
     async fn resolver_records_the_default_label_that_actually_resolved() {
         let (_dir, auth) = auth_storage("default-label");
-        auth.set_account("anthropic", "personal", key("personal-key"))
+        auth.insert_account("anthropic", "personal", key("personal-key"))
             .await
             .unwrap();
-        auth.set_account("anthropic", "work", key("work-key"))
+        auth.insert_account("anthropic", "work", key("work-key"))
             .await
             .unwrap();
         let mut options = StreamOptions::default();
@@ -435,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn resolver_does_not_stamp_a_pick_the_runtime_override_served() {
         let (_dir, auth) = auth_storage("override");
-        auth.set_account("anthropic", "work", key("work-key"))
+        auth.insert_account("anthropic", "work", key("work-key"))
             .await
             .unwrap();
         auth.set_runtime_api_key("anthropic", "override-key".to_string())

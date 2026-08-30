@@ -34,6 +34,7 @@ use aj_app::keybindings::{
 };
 use aj_app::theme::{Theme, ThemeColor};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
+use aj_models::auth::{AccountLabelDisplayMode, display_account_label};
 use aj_session::SessionStats;
 use vaxis::cell::{Segment, Style};
 use vaxis::key::{Key, Modifiers};
@@ -520,6 +521,31 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles)
         .map(|s| s.provider_id.chars().count())
         .max()
         .unwrap_or(0);
+    let represented = statuses
+        .iter()
+        .map(|status| {
+            status.account_label.as_deref().map(|label| {
+                let ordinary = display_account_label(label, AccountLabelDisplayMode::Ordinary);
+                let represented = if ordinary.contains(' ') {
+                    display_account_label(label, AccountLabelDisplayMode::Ascii)
+                } else {
+                    ordinary
+                };
+                if represented.len() > 65_535 {
+                    let prefix = represented.chars().take(96).collect::<String>();
+                    format!("[clipped; exceeds 65,535-cell inspection limit] {prefix}…")
+                } else {
+                    represented
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let account_w = represented
+        .iter()
+        .filter_map(|label| label.as_ref())
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
     // Only rows that carry a detail need a fixed summary column: padding
     // the summary to this width lands every detail value in the same
     // place. A detail-less row leaves its summary unpadded (no trailing
@@ -532,16 +558,29 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles)
         .unwrap_or(0);
     statuses
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(index, s)| {
             let summary = if s.detail.is_some() {
                 format!("  {summary:<summary_w$}", summary = s.summary)
             } else {
                 format!("  {summary}", summary = s.summary)
             };
-            let mut row = vec![
-                span(format!("{id:>id_w$}", id = s.provider_id), styles.muted),
-                span(summary, Style::default()),
-            ];
+            let mut row = vec![span(
+                format!("{id:>id_w$}", id = s.provider_id),
+                styles.muted,
+            )];
+            if let Some(label) = &represented[index] {
+                row.push(span(format!("  {label:<account_w$}"), Style::default()));
+                row.push(span(
+                    if s.is_default {
+                        "  default"
+                    } else {
+                        "         "
+                    },
+                    styles.muted,
+                ));
+            }
+            row.push(span(summary, Style::default()));
             if let Some(detail) = &s.detail {
                 row.push(span(format!("  {detail}"), styles.muted));
             }
@@ -885,12 +924,16 @@ mod tests {
             &[
                 ProviderAuthStatus {
                     provider_id: "anthropic".into(),
+                    account_label: None,
+                    is_default: false,
                     configured: true,
                     summary: "subscription".into(),
                     detail: Some("expires in 1h".into()),
                 },
                 ProviderAuthStatus {
                     provider_id: "openai".into(),
+                    account_label: None,
+                    is_default: false,
                     configured: false,
                     summary: "not configured".into(),
                     detail: None,
@@ -904,6 +947,134 @@ mod tests {
         assert!(rows.contains("not configured"), "{rows}");
     }
 
+    #[test]
+    fn auth_rows_represent_each_account_injectively_and_mark_only_the_default() {
+        let rows = rows_text(&auth_rows(
+            &[
+                ProviderAuthStatus {
+                    provider_id: "anthropic".into(),
+                    account_label: Some("work".into()),
+                    is_default: true,
+                    configured: true,
+                    summary: "subscription".into(),
+                    detail: None,
+                },
+                ProviderAuthStatus {
+                    provider_id: "anthropic".into(),
+                    account_label: Some("wo\nrk".into()),
+                    is_default: false,
+                    configured: true,
+                    summary: "API key (stored)".into(),
+                    detail: None,
+                },
+            ],
+            &test_styles(),
+        ));
+        assert!(rows.contains("work"), "{rows}");
+        assert!(
+            rows.contains("\\!\\u{77}\\u{6f}\\u{a}\\u{72}\\u{6b}"),
+            "{rows}"
+        );
+        assert_eq!(rows.matches("default").count(), 1, "{rows}");
+        assert!(
+            !rows.contains("wo\nrk"),
+            "raw control-bearing label leaked: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn auth_rows_keep_complete_distinct_labels_below_the_inspection_limit() {
+        let left = format!("{}x", "a".repeat(96));
+        let right = format!("{}y", "a".repeat(96));
+        let rows = rows_text(&auth_rows(
+            &[
+                ProviderAuthStatus {
+                    provider_id: "provider".into(),
+                    account_label: Some(left.clone()),
+                    is_default: true,
+                    configured: true,
+                    summary: "subscription".into(),
+                    detail: None,
+                },
+                ProviderAuthStatus {
+                    provider_id: "provider".into(),
+                    account_label: Some(right.clone()),
+                    is_default: false,
+                    configured: true,
+                    summary: "subscription".into(),
+                    detail: None,
+                },
+            ],
+            &test_styles(),
+        ));
+        assert!(rows.contains(&left), "left tail missing: {rows}");
+        assert!(rows.contains(&right), "right tail missing: {rows}");
+        assert!(
+            !rows.contains("[clipped"),
+            "sub-limit labels were rewritten: {rows}"
+        );
+    }
+
+    #[test]
+    fn auth_rows_encode_spaces_before_the_prose_wrapper() {
+        let rows = rows_text(&auth_rows(
+            &[
+                ProviderAuthStatus {
+                    provider_id: "provider".into(),
+                    account_label: Some("a b".into()),
+                    is_default: true,
+                    configured: true,
+                    summary: "subscription".into(),
+                    detail: None,
+                },
+                ProviderAuthStatus {
+                    provider_id: "provider".into(),
+                    account_label: Some("a    b".into()),
+                    is_default: false,
+                    configured: true,
+                    summary: "subscription".into(),
+                    detail: None,
+                },
+            ],
+            &test_styles(),
+        ));
+        assert!(rows.contains("\\!\\u{61}\\u{20}\\u{62}"), "{rows}");
+        assert!(rows.contains("\\u{20}\\u{20}\\u{20}\\u{20}"), "{rows}");
+        assert!(
+            !rows.contains("a    b"),
+            "raw trimmable identity reached RichText"
+        );
+    }
+
+    #[test]
+    fn auth_rows_disclose_bounded_geometry_for_over_limit_legacy_labels() {
+        let label = format!("{}\u{1000}", "a".repeat(10_921));
+        let rows = rows_text(&auth_rows(
+            &[ProviderAuthStatus {
+                provider_id: "provider".into(),
+                account_label: Some(label),
+                is_default: true,
+                configured: true,
+                summary: "API key (stored)".into(),
+                detail: None,
+            }],
+            &test_styles(),
+        ));
+        assert!(
+            rows.contains("[clipped; exceeds 65,535-cell inspection limit]"),
+            "{rows}"
+        );
+        assert!(
+            !rows.contains("\\u{1000}"),
+            "the final tail entered vaxis: {rows}"
+        );
+        assert!(
+            rows.len() < 512,
+            "bounded row grew unexpectedly: {}",
+            rows.len()
+        );
+    }
+
     /// The auth page tints its columns: the provider id and detail in the
     /// muted style, the summary in the default style between them, and no
     /// parentheses around the detail. This fails if a column is
@@ -914,6 +1085,8 @@ mod tests {
         let rows = auth_rows(
             &[ProviderAuthStatus {
                 provider_id: "anthropic".into(),
+                account_label: None,
+                is_default: false,
                 configured: true,
                 summary: "subscription".into(),
                 detail: Some("expires in 1h".into()),
@@ -946,6 +1119,8 @@ mod tests {
         let rows = auth_rows(
             &[ProviderAuthStatus {
                 provider_id: "openai".into(),
+                account_label: None,
+                is_default: false,
                 configured: false,
                 summary: "not configured".into(),
                 detail: None,
@@ -966,12 +1141,16 @@ mod tests {
             &[
                 ProviderAuthStatus {
                     provider_id: "anthropic".into(), // widest id (9)
+                    account_label: None,
+                    is_default: false,
                     configured: true,
                     summary: "subscription".into(),
                     detail: Some("expires in 1h".into()),
                 },
                 ProviderAuthStatus {
                     provider_id: "openai".into(), // shorter id (6)
+                    account_label: None,
+                    is_default: false,
                     configured: true,
                     summary: "api key".into(),
                     detail: Some("no expiry".into()),

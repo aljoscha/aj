@@ -90,7 +90,8 @@ impl Default for SelectStyles {
     }
 }
 
-/// One selectable row: what the list shows and what the filter matches.
+/// One selectable row: what the list shows, what the filter matches, and an
+/// optional opaque value the confirming caller can act on.
 ///
 /// The `label` and `filter_key` are separate on purpose: the display label is
 /// the human title while the filter should match a curated key (a category
@@ -107,6 +108,9 @@ pub struct SelectItem {
     pub label: String,
     /// Text the fuzzy filter matches and ranks against.
     pub filter_key: String,
+    /// Opaque action identity, deliberately separate from rendered and
+    /// searchable text. The widget never interprets it.
+    pub value: Option<String>,
     /// Narrower text a scoped query matches instead of `filter_key`, for a
     /// select that offers one (see [`FilterableSelect::set_scope_sigil`]). A
     /// row without one never matches a scoped query.
@@ -129,11 +133,18 @@ impl SelectItem {
         SelectItem {
             label: label.into(),
             filter_key: filter_key.into(),
+            value: None,
             scope_key: None,
             prefix: None,
             shortcut: None,
             description: None,
         }
+    }
+
+    /// Adds an opaque action identity independent of display and search text.
+    pub fn with_value(mut self, value: impl Into<String>) -> SelectItem {
+        self.value = Some(value.into());
+        self
     }
 
     /// Adds the text a scoped query matches against, for a select with a
