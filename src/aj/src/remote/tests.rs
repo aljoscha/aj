@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_app::chat::{ChatState, SubAgentStatus};
+use aj_app::cli::args::Args;
 use aj_app::client::SessionClient;
 use aj_app::host::{AttachRequest, Attachment, CommandOutcome, HostSetup, SessionHost};
 use aj_app::session_setup::RunConfigSnapshot;
@@ -3113,6 +3114,35 @@ async fn an_authorized_peer_reaches_every_route() {
         }
     }
     fixture.shutdown().await;
+}
+
+/// The allowlist handed to the real HTTP gate is the whole operator statement,
+/// even when a subcommand divides its occurrences. Alice appears only in the
+/// outer occurrence, so losing that occurrence turns this handshake into 403.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_from_the_outer_global_allow_occurrence_can_connect() {
+    let args = Args::try_parse_from([
+        "aj",
+        "--auth=tailscale",
+        "--allow=alice@github,carol@github",
+        "serve",
+        "--allow",
+        "bob@github",
+        "--allow=dana@github,erin@github",
+    ])
+    .expect("serve arguments parse");
+    let whois = FakeWhois::resolving(user_peer("alice@github"));
+    let fixture = Fixture::with_gate(IdentityGate::tailscale(args.allow, whois.resolver())).await;
+
+    let hello = fixture.client.hello().await;
+    let asked = whois.asked();
+    fixture.shutdown().await;
+
+    hello.expect("the peer named only before serve reaches the real control port");
+    assert!(
+        asked.iter().any(|peer| peer.ip().is_loopback()),
+        "the gate authorized the connection's real peer address",
+    );
 }
 
 // ---------------------------------------------------------------------------

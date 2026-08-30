@@ -32,8 +32,9 @@ pub enum LaunchEnvError {
 /// [`Args::try_parse`], or [`Args::try_parse_from`]. The `clap::Args` trait is
 /// an implementation detail used to flatten these fields into the private root
 /// parser. It is not a supported construction boundary because clap's
-/// `ArgMatches` representation has already discarded outer occurrences of a
-/// repeatable global `--env` when the same option follows a subcommand.
+/// `ArgMatches` representation has already discarded outer occurrences of
+/// repeatable globals such as `--env` and `--allow` when the same option follows
+/// a subcommand.
 ///
 /// `Args` deliberately does not implement `clap::Parser`:
 ///
@@ -217,8 +218,8 @@ struct CliParser {
 }
 
 impl Args {
-    /// Parse the process command line while preserving every global `--env`
-    /// occurrence across subcommand boundaries.
+    /// Parse the process command line while preserving every global `--env` and
+    /// `--allow` occurrence across subcommand boundaries.
     pub fn parse() -> Self {
         Self::parse_from(std::env::args_os())
     }
@@ -238,15 +239,15 @@ impl Args {
         Self::try_parse_from(argv).unwrap_or_else(|err| err.exit())
     }
 
-    /// Parse `argv` while preserving every global `--env` occurrence across
-    /// subcommand boundaries.
+    /// Parse `argv` while preserving every global `--env` and `--allow`
+    /// occurrence across subcommand boundaries.
     ///
     /// Clap propagates one matched value set for a global argument through the
     /// command hierarchy. For an append argument used on both sides of a
-    /// subcommand, the deeper set replaces the outer set. Re-reading this one
-    /// repeatable argument from the already accepted argv retains the complete
-    /// user statement in command-line order without reinterpreting any other
-    /// part of the grammar.
+    /// subcommand, the deeper set replaces the outer set. Re-reading those
+    /// repeatable arguments from the already accepted argv retains each
+    /// complete user statement in command-line order without reinterpreting any
+    /// other part of the grammar.
     pub fn try_parse_from<I, T>(argv: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
@@ -254,7 +255,10 @@ impl Args {
     {
         let argv = argv.into_iter().map(Into::into).collect::<Vec<_>>();
         let mut parsed = <CliParser as Parser>::try_parse_from(argv.clone())?.args;
-        parsed.env = global_env_arguments(&argv);
+        parsed.env = explicit_global_arguments(&argv, "--env", None).unwrap_or_default();
+        if let Some(allow) = explicit_global_arguments(&argv, "--allow", Some(',')) {
+            parsed.allow = allow;
+        }
         Ok(parsed)
     }
 
@@ -406,9 +410,19 @@ impl Args {
     }
 }
 
-/// Collect the `--env` values clap has already accepted, in argv order.
-fn global_env_arguments(argv: &[OsString]) -> Vec<String> {
-    let mut values = Vec::new();
+/// Collect values for one repeatable global option clap has already accepted.
+///
+/// `None` distinguishes no explicit occurrence from an explicitly supplied
+/// value set. Callers with an environment binding preserve clap's environment
+/// result only in the former case. `value_delimiter` is the field's clap
+/// delimiter and is applied to each recovered occurrence in place.
+fn explicit_global_arguments(
+    argv: &[OsString],
+    option: &str,
+    value_delimiter: Option<char>,
+) -> Option<Vec<String>> {
+    let mut values = None;
+    let equals_prefix = format!("{option}=");
     let mut index = 1;
     let mut options = true;
     while index < argv.len() {
@@ -418,27 +432,35 @@ fn global_env_arguments(argv: &[OsString]) -> Vec<String> {
             index += 1;
             continue;
         }
-        if options && argument == "--env" {
+        if options && argument == option {
             let value = argv
                 .get(index + 1)
-                .expect("clap accepted --env with a value")
+                .unwrap_or_else(|| panic!("clap accepted {option} with a value"))
                 .clone()
                 .into_string()
-                .expect("clap accepted --env as a String");
-            values.push(value);
+                .unwrap_or_else(|_| panic!("clap accepted {option} as a String"));
+            push_global_argument(&mut values, &value, value_delimiter);
             index += 2;
             continue;
         }
         if options {
             if let Some(argument) = argument.to_str() {
-                if let Some(value) = argument.strip_prefix("--env=") {
-                    values.push(value.to_string());
+                if let Some(value) = argument.strip_prefix(&equals_prefix) {
+                    push_global_argument(&mut values, value, value_delimiter);
                 }
             }
         }
         index += 1;
     }
     values
+}
+
+fn push_global_argument(values: &mut Option<Vec<String>>, value: &str, delimiter: Option<char>) {
+    let values = values.get_or_insert_with(Vec::new);
+    match delimiter {
+        Some(delimiter) => values.extend(value.split(delimiter).map(String::from)),
+        None => values.push(value.to_string()),
+    }
 }
 
 /// What a `connect` run's command line asks for.
@@ -689,6 +711,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_control_allowlist_aggregates_across_a_subcommand() {
+        let args = parse(&[
+            "aj",
+            "--allow=alice@github,carol@github",
+            "serve",
+            "--allow",
+            "bob@github",
+            "--allow=dana@github,erin@github",
+        ]);
+
+        assert_eq!(
+            args.allow,
+            [
+                "alice@github",
+                "carol@github",
+                "bob@github",
+                "dana@github",
+                "erin@github",
+            ],
+        );
+    }
+
+    /// The argv recovery applies only to explicit flags. Clap's environment
+    /// binding remains authoritative when argv states no allowlist at all. The
+    /// parse runs in a child so changing AJ_ALLOW cannot race sibling tests.
+    #[test]
+    fn the_control_allowlist_keeps_an_environment_only_value() {
+        const CHILD_SENTINEL: &str = "AJ_TEST_ALLOW_ENV_CHILD_SENTINEL";
+
+        if let Some(sentinel) = std::env::var_os(CHILD_SENTINEL) {
+            let args = parse(&["aj", "serve"]);
+            assert_eq!(
+                args.allow,
+                ["env-alice@github", "env-bob@github"],
+                "argv recovery replaced AJ_ALLOW despite seeing no --allow flag",
+            );
+            assert_eq!(
+                parse(&[
+                    "aj",
+                    "--allow",
+                    "cli-alice@github",
+                    "serve",
+                    "--allow",
+                    "cli-bob@github",
+                ])
+                .allow,
+                ["cli-alice@github", "cli-bob@github"],
+                "an explicit allowlist must retain CLI precedence over AJ_ALLOW",
+            );
+            std::fs::write(sentinel, "observed").expect("write the child sentinel");
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().expect("sentinel tempdir");
+        let sentinel = dir.path().join("observed");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("locate this test binary"))
+                .args([
+                    "--exact",
+                    "cli::args::tests::the_control_allowlist_keeps_an_environment_only_value",
+                    "--nocapture",
+                ])
+                .env("AJ_ALLOW", "env-alice@github,env-bob@github")
+                .env(CHILD_SENTINEL, &sentinel)
+                .output()
+                .expect("run the isolated parser child");
+
+        assert!(
+            output.status.success(),
+            "isolated parser child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            std::fs::read_to_string(sentinel).expect("the exact child test ran"),
+            "observed",
+        );
+    }
+
     /// A bare `--listen` takes the loopback default in either placement, and
     /// `--auth` defaults to the mode that trusts nothing but loopback.
     #[test]
@@ -769,7 +871,7 @@ mod tests {
             &[
                 "aj",
                 "--env",
-                "AJ_CASE=upper",
+                "AJ_CASE=upper,comma",
                 "--env",
                 "aj_case=lower=tail",
                 "serve",
@@ -778,7 +880,7 @@ mod tests {
                 "aj",
                 "serve",
                 "--env",
-                "AJ_CASE=upper",
+                "AJ_CASE=upper,comma",
                 "--env",
                 "aj_case=lower=tail",
             ],
@@ -788,7 +890,7 @@ mod tests {
             assert_eq!(
                 args.launch_env(),
                 Ok(Some(BTreeMap::from([
-                    ("AJ_CASE".to_string(), "upper".to_string()),
+                    ("AJ_CASE".to_string(), "upper,comma".to_string()),
                     ("aj_case".to_string(), "lower=tail".to_string()),
                 ]))),
                 "{argv:?}"
@@ -816,9 +918,11 @@ mod tests {
     }
 
     #[test]
-    fn long_help_keeps_product_description_and_lists_global_env_once() {
+    fn long_help_keeps_product_description_and_lists_recovered_globals_once() {
         let help = Args::command().render_long_help().to_string();
         assert_eq!(help.matches("--env <KEY=VALUE>").count(), 1, "{help}");
+        assert_eq!(help.matches("--allow <ALLOW>").count(), 1, "{help}");
+        assert_eq!(help.matches("[env: AJ_ALLOW=]").count(), 1, "{help}");
         assert!(
             help.starts_with("AI-driven agent for software engineering"),
             "{help}"
