@@ -40,3 +40,55 @@ where
         value = &mut fut => SelectOutcome::Ready(value),
     }
 }
+
+/// Await an HTTP request future after guaranteeing it receives its first poll.
+///
+/// Providers re-check cancellation before calling this. If cancellation races
+/// that check, polling `fut` first is the request-issuance boundary: any later
+/// cancellation may have reached upstream and must retain partial accounting.
+pub(crate) async fn select_cancel_after_poll<T, F>(
+    token: Option<&tokio_util::sync::CancellationToken>,
+    fut: F,
+) -> SelectOutcome<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(token) = token else {
+        return SelectOutcome::Ready(fut.await);
+    };
+    tokio::pin!(fut);
+    tokio::select! {
+        biased;
+        value = &mut fut => SelectOutcome::Ready(value),
+        _ = token.cancelled() => SelectOutcome::Cancelled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn request_selection_polls_once_before_a_racing_cancel_wins() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&polled);
+        let request = std::future::poll_fn(move |_| {
+            observed.store(true, Ordering::SeqCst);
+            Poll::<()>::Pending
+        });
+
+        assert!(matches!(
+            select_cancel_after_poll(Some(&token), request).await,
+            SelectOutcome::Cancelled
+        ));
+        assert!(polled.load(Ordering::SeqCst));
+    }
+}

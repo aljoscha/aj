@@ -19,7 +19,7 @@ use anthropic_sdk::messages::{
 use futures::StreamExt;
 use serde_json::Value;
 
-use crate::cancel::{SelectOutcome, select_cancel};
+use crate::cancel::{SelectOutcome, select_cancel, select_cancel_after_poll};
 use crate::errors::{
     classify_anthropic_error, classify_anthropic_stop_reason, parse_retry_after, transport_error,
 };
@@ -171,30 +171,43 @@ async fn run_stream_inner(
         }
     }
 
-    // HTTP handshake. Wrap in a select so a cancel during request
-    // setup tears down the connect / TLS handshake instead of
-    // waiting for it to finish.
+    if options
+        .cancel
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+    {
+        producer.push(AssistantMessageEvent::aborted(empty_partial(
+            model,
+            credential.account.as_deref(),
+        )));
+        return Ok(());
+    }
+
+    // Crossing into the client request future is the issuance boundary. From
+    // here until final protocol usage arrives, a terminal carries only a
+    // recorded subtotal, including handshake cancellation or failure.
+    let mut state = StreamState::new_with_account(model, credential.account.clone());
     let mut sse =
-        match select_cancel(options.cancel.as_ref(), client.messages_stream(request)).await {
+        match select_cancel_after_poll(options.cancel.as_ref(), client.messages_stream(request))
+            .await
+        {
             SelectOutcome::Ready(Ok(sse)) => sse,
             SelectOutcome::Ready(Err(err)) => {
-                producer.push(error_before_state(
-                    model,
-                    account_for_client_error(&err, credential.account.as_deref()),
-                    classify_client_error(&err),
-                ));
+                let account = account_for_client_error(&err, credential.account.as_deref());
+                let error = classify_client_error(&err);
+                let terminal = if client_error_was_issued(&err) {
+                    state.client_failed(error)
+                } else {
+                    error_before_state(model, account, error)
+                };
+                producer.push(terminal);
                 return Ok(());
             }
             SelectOutcome::Cancelled => {
-                producer.push(AssistantMessageEvent::aborted(empty_partial(
-                    model,
-                    credential.account.as_deref(),
-                )));
+                producer.push(state.cancelled());
                 return Ok(());
             }
         };
-
-    let mut state = StreamState::new_with_account(model, credential.account.clone());
 
     loop {
         match select_cancel(options.cancel.as_ref(), sse.next()).await {
@@ -350,6 +363,10 @@ fn account_for_client_error<'a>(err: &ClientError, account: Option<&'a str>) -> 
         ClientError::TransportError(err) if err.is_builder() => None,
         _ => account,
     }
+}
+
+fn client_error_was_issued(err: &ClientError) -> bool {
+    !matches!(err, ClientError::TransportError(err) if err.is_builder())
 }
 
 // ---------------------------------------------------------------------------
@@ -1355,6 +1372,18 @@ impl StreamState {
         AssistantMessageEvent::aborted(self.partial.clone())
     }
 
+    /// Terminalize a request failure after the provider call was issued but
+    /// before an SSE stream was established.
+    fn client_failed(mut self, error: AssistantError) -> AssistantMessageEvent {
+        self.seal();
+        self.partial.stop_reason = StopReason::Error;
+        self.partial.error = Some(error);
+        AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error: self.partial,
+        }
+    }
+
     /// Build the stream's terminal event, classifying a stream that ended
     /// before its wire terminal frame as a retryable truncation error
     /// rather than a successful `Done`. Otherwise defers to
@@ -1754,6 +1783,7 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Error);
         assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
@@ -1771,6 +1801,7 @@ mod tests {
             terminal.error.is_some(),
             "the malformed URL must fail locally"
         );
+        assert!(!terminal.usage.incomplete);
         assert_eq!(
             terminal.account, None,
             "no request left the process, so no credential served"
@@ -1790,6 +1821,7 @@ mod tests {
             .await
             .expect("provider stream terminates");
         assert_eq!(terminal.account, None);
+        assert!(!terminal.usage.incomplete);
     }
 
     #[tokio::test]
@@ -1828,6 +1860,7 @@ mod tests {
         let _ = server.await;
 
         assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(terminal.usage.incomplete);
     }
 
     #[test]

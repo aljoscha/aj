@@ -20,6 +20,64 @@ impl HeldSseServer {
     }
 }
 
+pub(crate) struct HeldHandshakeServer {
+    pub(crate) base_url: String,
+    accepted: Option<oneshot::Receiver<()>>,
+    release: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+impl HeldHandshakeServer {
+    pub(crate) async fn wait_for_request(&mut self) {
+        let accepted = self.accepted.take().expect("request awaited once");
+        tokio::time::timeout(Duration::from_secs(5), accepted)
+            .await
+            .expect("provider reaches handshake fixture")
+            .expect("handshake fixture stays alive");
+    }
+
+    pub(crate) async fn finish(self) {
+        let _ = self.release.send(());
+        tokio::time::timeout(Duration::from_secs(5), self.task)
+            .await
+            .expect("handshake fixture completed within 5 seconds")
+            .expect("handshake fixture task");
+    }
+}
+
+/// Accept one provider request without sending an HTTP response, leaving the
+/// client in its handshake until the caller cancels it.
+pub(crate) async fn held_handshake_server(path: &'static str) -> HeldHandshakeServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind handshake fixture server");
+    let address = listener.local_addr().expect("handshake fixture address");
+    let (accepted_tx, accepted) = oneshot::channel();
+    let (release, held) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept provider request");
+        let mut request = vec![0; 32 * 1024];
+        let read = socket
+            .read(&mut request)
+            .await
+            .expect("read provider request");
+        assert!(
+            String::from_utf8_lossy(&request[..read]).contains(path),
+            "provider request did not target {path}"
+        );
+        accepted_tx
+            .send(())
+            .expect("signal accepted provider request");
+        let _ = held.await;
+    });
+    HeldHandshakeServer {
+        base_url: format!("http://{address}"),
+        accepted: Some(accepted),
+        release,
+        task,
+    }
+}
+
 pub(crate) async fn held_sse_server(path: &'static str, events: Vec<String>) -> HeldSseServer {
     held_sse_server_with_body(path, events, BodyEnd::Clean).await
 }

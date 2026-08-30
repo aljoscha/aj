@@ -29,9 +29,11 @@ use openai_sdk::types::chat_completions::{
 use openai_sdk::types::common::ReasoningEffort;
 use serde_json::Value;
 
-use crate::cancel::{SelectOutcome, select_cancel};
+use crate::cancel::{SelectOutcome, select_cancel, select_cancel_after_poll};
 use crate::errors::classify_openai_finish_reason;
-use crate::openai::errors::{account_for_client_error, classify_client_error};
+use crate::openai::errors::{
+    account_for_client_error, classify_client_error, client_error_was_issued,
+};
 use crate::openai::responses::map_verbosity;
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
@@ -174,7 +176,23 @@ async fn run_stream_inner(
         }
     }
 
-    let mut sse = match select_cancel(
+    if options
+        .cancel
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+    {
+        producer.push(AssistantMessageEvent::aborted(empty_partial(
+            model,
+            credential.account.as_deref(),
+        )));
+        return Ok(());
+    }
+
+    // Crossing into the client request future is the issuance boundary. From
+    // here until final protocol usage arrives, a terminal carries only a
+    // recorded subtotal, including handshake cancellation or failure.
+    let mut state = StreamState::new_with_account(model, credential.account.clone());
+    let mut sse = match select_cancel_after_poll(
         options.cancel.as_ref(),
         client.chat_completions_stream(request),
     )
@@ -182,23 +200,21 @@ async fn run_stream_inner(
     {
         SelectOutcome::Ready(Ok(sse)) => sse,
         SelectOutcome::Ready(Err(err)) => {
-            producer.push(error_message(
-                model,
-                account_for_client_error(&err, credential.account.as_deref()),
-                classify_client_error(&err),
-            ));
+            let account = account_for_client_error(&err, credential.account.as_deref());
+            let error = classify_client_error(&err);
+            let terminal = if client_error_was_issued(&err) {
+                state.client_failed(error)
+            } else {
+                error_message(model, account, error)
+            };
+            producer.push(terminal);
             return Ok(());
         }
         SelectOutcome::Cancelled => {
-            producer.push(AssistantMessageEvent::aborted(empty_partial(
-                model,
-                credential.account.as_deref(),
-            )));
+            producer.push(state.cancelled());
             return Ok(());
         }
     };
-
-    let mut state = StreamState::new_with_account(model, credential.account.clone());
 
     loop {
         match select_cancel(options.cancel.as_ref(), sse.next()).await {
@@ -1395,7 +1411,8 @@ mod tests {
     use super::*;
     use crate::registry::InputModality;
     use crate::types::{
-        ApiKeyResolver, AssistantContent, Message, ThinkingContent, UserContent, UserMessage,
+        ApiKeyResolver, AssistantContent, Message, OnPayload, ThinkingContent, UserContent,
+        UserMessage,
     };
     use openai_sdk::types::chat_completions::{
         ChatCompletionStreamChoice, ChatCompletionStreamResponseDelta, FunctionCallDelta,
@@ -2076,6 +2093,46 @@ mod tests {
             Some(AssistantContent::Text(text)) => assert_eq!(text.text, "partial"),
             other => panic!("expected preserved partial text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_handshake_cancel_marks_the_issued_request_partial() {
+        let mut server =
+            crate::provider_test_support::held_handshake_server("POST /v1/chat/completions").await;
+        let mut model = fake_model();
+        model.base_url = format!("{}/v1", server.base_url);
+        let token = CancellationToken::new();
+        let options = labeled_options(token.clone());
+        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+
+        server.wait_for_request().await;
+        token.cancel();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("cancel emits terminal");
+        server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(terminal.usage.incomplete);
+    }
+
+    #[tokio::test]
+    async fn cancellation_from_the_payload_callback_stays_pre_request_complete_zero() {
+        let mut model = fake_model();
+        model.base_url = "http://127.0.0.1:9/v1".to_string();
+        let token = CancellationToken::new();
+        let mut options = labeled_options(token.clone());
+        options.on_payload = Some(OnPayload::new(move |_| token.cancel()));
+        let stream = OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("pre-request cancellation emits terminal");
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(!terminal.usage.incomplete);
     }
 
     #[tokio::test]

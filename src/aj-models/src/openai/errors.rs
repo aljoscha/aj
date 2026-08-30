@@ -31,6 +31,12 @@ pub(super) fn account_for_client_error<'a>(
     }
 }
 
+/// Whether the request reached the client execution boundary rather than
+/// failing local request construction.
+pub(super) fn client_error_was_issued(err: &ClientError) -> bool {
+    !matches!(err, ClientError::TransportError(err) if err.is_builder())
+}
+
 /// Like [`classify_client_error`], but lets the caller rewrite the
 /// human-facing message of a typed `ApiError` before classification.
 ///

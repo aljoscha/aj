@@ -33,9 +33,11 @@ use openai_sdk::types::responses::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cancel::{SelectOutcome, select_cancel};
+use crate::cancel::{SelectOutcome, select_cancel, select_cancel_after_poll};
 use crate::errors::classify_openai_stream_failure;
-use crate::openai::errors::{account_for_client_error, classify_client_error};
+use crate::openai::errors::{
+    account_for_client_error, classify_client_error, client_error_was_issued,
+};
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{
@@ -270,33 +272,48 @@ async fn run_stream_inner(
         }
     }
 
-    let mut sse =
-        match select_cancel(options.cancel.as_ref(), client.responses_stream(request)).await {
-            SelectOutcome::Ready(Ok(sse)) => sse,
-            SelectOutcome::Ready(Err(err)) => {
-                producer.push(error_message(
-                    API_NAME,
-                    model,
-                    account_for_client_error(&err, credential.account.as_deref()),
-                    classify_client_error(&err),
-                ));
-                return Ok(());
-            }
-            SelectOutcome::Cancelled => {
-                producer.push(AssistantMessageEvent::aborted(empty_partial(
-                    API_NAME,
-                    model,
-                    credential.account.as_deref(),
-                )));
-                return Ok(());
-            }
-        };
+    if options
+        .cancel
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+    {
+        producer.push(AssistantMessageEvent::aborted(empty_partial(
+            API_NAME,
+            model,
+            credential.account.as_deref(),
+        )));
+        return Ok(());
+    }
 
+    // Crossing into the client request future is the issuance boundary. From
+    // here until final protocol usage arrives, a terminal carries only a
+    // recorded subtotal, including handshake cancellation or failure.
     let mut state = StreamState::new_with_account(
         model,
         options.service_tier.clone(),
         credential.account.clone(),
     );
+    let mut sse =
+        match select_cancel_after_poll(options.cancel.as_ref(), client.responses_stream(request))
+            .await
+        {
+            SelectOutcome::Ready(Ok(sse)) => sse,
+            SelectOutcome::Ready(Err(err)) => {
+                let account = account_for_client_error(&err, credential.account.as_deref());
+                let error = classify_client_error(&err);
+                let terminal = if client_error_was_issued(&err) {
+                    state.client_failed(error)
+                } else {
+                    error_message(API_NAME, model, account, error)
+                };
+                producer.push(terminal);
+                return Ok(());
+            }
+            SelectOutcome::Cancelled => {
+                producer.push(state.cancelled());
+                return Ok(());
+            }
+        };
 
     loop {
         match select_cancel(options.cancel.as_ref(), sse.next()).await {
@@ -2643,6 +2660,28 @@ mod tests {
             "got: {}",
             error.message
         );
+    }
+
+    #[tokio::test]
+    async fn a_handshake_cancel_marks_the_issued_request_partial() {
+        let mut server =
+            crate::provider_test_support::held_handshake_server("POST /v1/responses").await;
+        let mut model = fake_model(false);
+        model.base_url = format!("{}/v1", server.base_url);
+        let token = CancellationToken::new();
+        let options = labeled_options(token.clone());
+        let stream = OpenAiResponsesProvider.stream(&model, &Context::new("system"), &options);
+
+        server.wait_for_request().await;
+        token.cancel();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("cancel emits terminal");
+        server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
