@@ -1182,6 +1182,7 @@ mod tests {
                     cache_write: 0.02,
                     total: 0.33,
                 },
+                incomplete: false,
             },
             usage_breakdown: vec![UsageBucket {
                 provider: "anthropic".to_string(),
@@ -1200,6 +1201,7 @@ mod tests {
                         cache_write: 0.02,
                         total: 0.33,
                     },
+                    incomplete: false,
                 },
                 responses: 18,
                 unpriced_responses: 0,

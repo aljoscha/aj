@@ -1104,6 +1104,7 @@ impl StreamState {
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
         partial.account = account;
+        partial.usage.incomplete = true;
         Self {
             partial,
             started: false,
@@ -1587,6 +1588,7 @@ impl StreamState {
         let multiplier = self.tier_multiplier();
         if let Some(usage) = self.final_response.as_ref().and_then(|r| r.usage.as_ref()) {
             apply_usage(&mut self.partial.usage, usage);
+            self.partial.usage.incomplete = false;
         }
         finalize_usage(&mut self.partial.usage, &self.cost, multiplier);
     }
@@ -2785,6 +2787,7 @@ mod tests {
         for (wire, stop_reason, category) in cases {
             let event = serde_json::from_value(wire).expect("lifecycle event");
             let mut state = StreamState::new(&fake_model(false), None);
+            assert!(state.partial.usage.incomplete);
             let _ = state.process(event);
             assert!(state.saw_terminal());
             let terminal = state.finalize_or_truncate();
@@ -2797,7 +2800,31 @@ mod tests {
                     .map(|error| error.category),
                 category
             );
+            assert!(
+                terminal.partial().usage.incomplete,
+                "a lifecycle terminal without response usage stays partial"
+            );
         }
+    }
+
+    #[test]
+    fn an_explicit_zero_terminal_usage_is_complete() {
+        let completed: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.completed", "sequence_number": 1,
+            "response": {
+                "id": "resp_1", "object": "response", "created_at": 0.0,
+                "model": "gpt-5", "output": [], "parallel_tool_calls": true,
+                "tools": [], "status": "completed",
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            }
+        }))
+        .expect("completed response with zero usage");
+        let mut state = StreamState::new(&fake_model(false), None);
+        let _ = state.process(completed);
+
+        let terminal = state.finalize_or_truncate();
+        assert_eq!(terminal.partial().usage.total_tokens, 0);
+        assert!(!terminal.partial().usage.incomplete);
     }
 
     #[test]

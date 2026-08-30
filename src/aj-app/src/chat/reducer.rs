@@ -333,10 +333,13 @@ pub fn reduce(
 
         // ---- Per-turn token usage --------------------------------------------
         AgentEvent::UsageUpdate { agent_id, usage } => {
-            // Every agent's usage folds into its own footer entry. The
-            // rendered footer tracks the viewed agent, so views repaint
-            // it only when `agent_id == active_view`.
-            state.footers.record_turn_usage(agent_id, &usage);
+            // A tagged update belongs to a durable checkpoint rather than an
+            // assistant turn. It still renders its accounting row, but must
+            // not replace latest-assistant context occupancy. Ordinary live
+            // and replayed assistant updates are untagged.
+            if entry.is_none() {
+                state.footers.record_turn_usage(agent_id, &usage);
+            }
             // The row belongs to the assistant message it follows, which
             // is this row's durable identity, so a re-applied update
             // overwrites its row instead of adding one.
@@ -1448,6 +1451,8 @@ mod tests {
             turn_cache_write: turn[2],
             accumulated_cache_read: 0,
             turn_cache_read: turn[3],
+            turn_incomplete: false,
+            accumulated_incomplete: false,
         }
     }
 
@@ -3199,6 +3204,27 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_usage_update_stays_measured_and_unmarked() {
+        let event: AgentEvent = serde_json::from_str(
+            r#"{"type":"usage_update","agent_id":"main","usage":{"accumulated_input":1,"turn_input":10,"accumulated_output":3,"turn_output":4,"accumulated_cache_write":5,"turn_cache_write":5,"accumulated_cache_read":7,"turn_cache_read":7}}"#,
+        )
+        .expect("frozen legacy usage event decodes");
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(&mut s, &mut life, event);
+
+        let EntryKind::TurnUsage(row) = &entries(&s, AgentId::Main)[0].kind else {
+            panic!("legacy event projected a usage row");
+        };
+        assert!(row.line().starts_with("Token Usage - "));
+        assert!(!row.line().contains("recorded minimum"));
+        let footer = crate::footer::context_usage_display(s.footers().context_usage(AgentId::Main))
+            .expect("main has a context window");
+        assert_eq!(footer.ratio, "22/200k");
+        assert_eq!(footer.percent.as_deref(), Some("(0.0%)"));
+    }
+
+    #[test]
     fn sub_agent_start_resolves_window_via_catalog_main_identity_and_miss() {
         let catalog_model = ModelInfo {
             id: "gpt-sub".into(),
@@ -3611,6 +3637,7 @@ mod tests {
             crate::footer::ContextUsage {
                 tokens: Some(1_000),
                 context_window: 400_000,
+                incomplete: false,
             },
             "and its occupancy accounting",
         );
@@ -4257,6 +4284,56 @@ mod tests {
         assert_eq!(
             count_kind(&s, AgentId::Main, |k| matches!(k, EntryKind::Compaction(_))),
             3,
+        );
+    }
+
+    #[test]
+    fn checkpoint_usage_does_not_replace_latest_assistant_footer_occupancy() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([100, 0, 0, 0]),
+            },
+        );
+        apply(&mut s, &mut life, compaction_end("summary", 300));
+
+        let entry = "e-checkpoint".to_string();
+        let mut checkpoint_usage = token_usage([900, 0, 0, 0]);
+        checkpoint_usage.turn_incomplete = true;
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: checkpoint_usage,
+            },
+            Some(&entry),
+        );
+        assert_eq!(
+            s.footers().context_usage(AgentId::Main),
+            crate::footer::ContextUsage {
+                tokens: Some(300),
+                context_window: 200_000,
+                incomplete: false,
+            }
+        );
+
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([400, 0, 0, 0]),
+            },
+        );
+        assert_eq!(
+            s.footers().context_usage(AgentId::Main).tokens,
+            Some(400),
+            "a later assistant-origin update still replaces occupancy"
         );
     }
 

@@ -236,6 +236,8 @@ mod tests {
             turn_cache_write: 0,
             accumulated_cache_read: 0,
             turn_cache_read: 0,
+            turn_incomplete: false,
+            accumulated_incomplete: false,
         }
     }
 
@@ -254,6 +256,19 @@ mod tests {
         let r = draw_rows(&mut f, 80);
         assert_eq!(r.len(), 1, "one footer row: {r:?}");
         assert_eq!(r[0], " opus high  ·  /home/user/proj  ·  12k/200k (6.2%)");
+    }
+
+    #[test]
+    fn footer_renders_an_incomplete_prompt_as_a_lower_bound() {
+        let chat = chat_with_window(200_000);
+        let mut usage = usage(12_345);
+        usage.turn_incomplete = true;
+        chat.borrow_mut()
+            .footers_mut()
+            .record_turn_usage(AgentId::Main, &usage);
+        let mut f = footer(chat, StatusState::default());
+        let r = draw_rows(&mut f, 80);
+        assert_eq!(r, [" opus high  ·  /home/user/proj  ·  ≥12k/200k"]);
     }
 
     #[test]

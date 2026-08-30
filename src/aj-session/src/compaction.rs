@@ -219,20 +219,18 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
 
 /// Estimate the context tokens a linearized message list occupies.
 ///
-/// Prefers the most recent assistant `usage`
+/// Prefers the most recent complete assistant `usage`
 /// (`input + cache_read + cache_write`) as the authoritative prompt
 /// size — the same numerator the footer uses — and adds the heuristic
 /// estimate of only the messages trailing it. With no usage anywhere
-/// it estimates the whole list heuristically.
+/// it estimates the whole list heuristically. An incomplete usage record is a
+/// lower bound for accounting, not an exact context anchor.
 pub fn estimate_context_tokens(messages: &[Message]) -> ContextEstimate {
     let last_usage = messages.iter().enumerate().rev().find_map(|(i, m)| {
-        if let Message::Assistant(a) = m {
-            let base = a.usage.input + a.usage.cache_read + a.usage.cache_write;
-            if base > 0 {
-                return Some((i, base));
-            }
-        }
-        None
+        let Message::Assistant(assistant) = m else {
+            return None;
+        };
+        assistant_usage_anchor(assistant).map(|tokens| (i, tokens))
     });
 
     match last_usage {
@@ -250,23 +248,36 @@ pub fn estimate_context_tokens(messages: &[Message]) -> ContextEstimate {
     }
 }
 
-/// Whether the most-recent-assistant-`usage` anchor would over-report
-/// occupancy for this entry path.
+fn assistant_usage_anchor(assistant: &aj_models::types::AssistantMessage) -> Option<u64> {
+    if assistant.usage.incomplete {
+        return None;
+    }
+    let tokens = assistant.usage.input + assistant.usage.cache_read + assistant.usage.cache_write;
+    (tokens > 0).then_some(tokens)
+}
+
+/// Whether the most recent complete, nonzero assistant usage anchor would
+/// over-report occupancy for this entry path.
 ///
 /// The anchor is stale exactly when a `Compaction` is the most recent
 /// entry among {compaction, assistant message}: every retained
-/// assistant message then predates the summary, so its `usage` still
+/// assistant anchor then predates the summary, so its `usage` still
 /// reflects the old, pre-compaction prompt — the full summarized prefix
 /// included — rather than the reduced projection that will actually be
-/// sent next. Once a real assistant turn runs after the compaction,
-/// that turn's `usage` measures the reduced context and the anchor is
-/// trustworthy again.
+/// sent next. Once a real assistant turn discloses complete nonzero usage after
+/// the compaction, that turn measures the reduced context and the anchor is
+/// trustworthy again. Incomplete and zero-usage turns do not revive an older
+/// pre-compaction anchor.
 fn usage_anchor_is_stale(entries: &[ConversationEntry]) -> bool {
     for entry in entries.iter().rev() {
         match &entry.entry {
             ConversationEntryKind::Compaction { .. } => return true,
             ConversationEntryKind::Message { message }
-                if matches!(message.as_stored_wire(), Some(Message::Assistant(_))) =>
+                if matches!(
+                    message.as_stored_wire(),
+                    Some(Message::Assistant(assistant))
+                        if assistant_usage_anchor(assistant).is_some()
+                ) =>
             {
                 return false;
             }
@@ -763,6 +774,14 @@ mod tests {
         })
     }
 
+    fn assistant_with_incomplete_usage(text: &str, base: u64) -> Message {
+        let Message::Assistant(mut assistant) = assistant_with_usage(text, base) else {
+            unreachable!("helper always builds an assistant")
+        };
+        assistant.usage.incomplete = true;
+        Message::Assistant(assistant)
+    }
+
     fn notification_entry(id: &str, body: &str) -> ConversationEntry {
         use aj_agent::message::{TaskNotification, TaskNotificationKind, TaskOutcome};
         ConversationEntry {
@@ -855,6 +874,20 @@ mod tests {
     }
 
     #[test]
+    fn estimate_context_ignores_an_incomplete_usage_anchor() {
+        let messages = [
+            user(&"a".repeat(40)),
+            assistant_with_incomplete_usage(&"b".repeat(40), 100_000),
+        ];
+        let est = estimate_context_tokens(&messages);
+        assert_eq!(est.last_usage_index, None);
+        assert_eq!(
+            est.tokens, 20,
+            "the character heuristic remains planning-only"
+        );
+    }
+
+    #[test]
     fn estimate_conversation_context_ignores_stale_usage_after_compaction() {
         // A compaction at the head: the retained tail's assistant still
         // carries the pre-compaction 100k usage. That anchor is stale
@@ -895,6 +928,25 @@ mod tests {
         assert!(
             (5_000..6_000).contains(&est.tokens),
             "expected ~5k usage anchor, got {}",
+            est.tokens
+        );
+    }
+
+    #[test]
+    fn incomplete_post_compaction_usage_cannot_revive_a_stale_anchor() {
+        let entries = vec![
+            msg_entry("0", user("old request")),
+            msg_entry("1", assistant_with_usage("old reply", 100_000)),
+            compaction_entry("2", "3", "SUMMARY"),
+            msg_entry("3", user("new request")),
+            msg_entry("4", assistant_with_incomplete_usage("new reply", 5_000)),
+        ];
+        let conv = Conversation::from_entries("t".to_string(), entries);
+        let est = estimate_conversation_context(&conv);
+        assert_eq!(est.last_usage_index, None);
+        assert!(
+            est.tokens < 1_000,
+            "the old pre-compaction 100k anchor stayed fenced off: {}",
             est.tokens
         );
     }

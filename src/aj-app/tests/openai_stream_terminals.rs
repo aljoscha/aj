@@ -14,7 +14,7 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, ErrorCategory, Message, ServiceTier, StopReason,
     StreamOptions,
 };
-use aj_session::{ConversationEntryKind, ConversationLog, ConversationPersistence};
+use aj_session::{ConversationEntryKind, ConversationLog, ConversationPersistence, replay};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
@@ -250,7 +250,7 @@ fn response_failed(text: &str, input: u64, output: u64) -> Vec<String> {
     events
 }
 
-fn chat_completed(text: &str, include_usage: bool) -> Vec<String> {
+fn chat_completed(text: &str, usage: Option<(u64, u64)>) -> Vec<String> {
     let mut events = vec![
         serde_json::json!({
             "id": "chatcmpl_1", "object": "chat.completion.chunk", "created": 0,
@@ -268,12 +268,16 @@ fn chat_completed(text: &str, include_usage: bool) -> Vec<String> {
         })
         .to_string(),
     ];
-    if include_usage {
+    if let Some((prompt_tokens, completion_tokens)) = usage {
         events.push(
             serde_json::json!({
                 "id": "chatcmpl_1", "object": "chat.completion.chunk", "created": 0,
                 "model": "gpt-test", "choices": [],
-                "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens
+                }
             })
             .to_string(),
         );
@@ -362,10 +366,22 @@ async fn a_preterminal_responses_failure_retries_once_and_persists_its_partial()
         Some(ErrorCategory::Transient)
     );
     assert_eq!(message_text(&messages[0]), "partial");
+    assert!(messages[0].usage.incomplete);
     assert_eq!(messages[1].stop_reason, StopReason::Stop);
     assert_eq!(message_text(&messages[1]), "recovered");
-    assert_eq!(log.stats().assistant_messages, 2);
+    assert!(!messages[1].usage.incomplete);
+    let stats = log.stats();
+    assert_eq!(stats.assistant_messages, 2);
+    assert!(
+        stats.usage.incomplete,
+        "durable stats count the failed attempt"
+    );
+    assert!(stats.usage_breakdown[0].usage.incomplete);
     assert_eq!(agent.accumulated_usage().total_tokens, 25);
+    assert!(
+        !agent.accumulated_usage().incomplete,
+        "live accumulation still counts only the successful retry"
+    );
 }
 
 #[tokio::test]
@@ -373,12 +389,12 @@ async fn a_chat_finish_before_body_failure_is_not_reissued() {
     let scripts = vec![
         ResponseScript {
             path: "POST /v1/chat/completions",
-            events: chat_completed("complete", false),
+            events: chat_completed("complete", None),
             short_body: true,
         },
         ResponseScript {
             path: "POST /v1/chat/completions",
-            events: chat_completed("duplicate", true),
+            events: chat_completed("duplicate", Some((20, 5))),
             short_body: false,
         },
     ];
@@ -404,12 +420,107 @@ async fn a_chat_finish_before_body_failure_is_not_reissued() {
         events.push(frame.event);
     }
     assert_eq!(event_counts(&events), (0, 1));
+    let message_end = events.iter().find_map(|event| match event {
+        AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
+            Some(Message::Assistant(message)) => Some(message),
+            _ => None,
+        },
+        _ => None,
+    });
+    let message_end =
+        message_end.expect("the successful turn emitted its authoritative MessageEnd");
+    assert!(message_end.usage.incomplete);
+    let usage_update = events.iter().find_map(|event| match event {
+        AgentEvent::UsageUpdate { usage, .. } => Some(usage),
+        _ => None,
+    });
+    let usage_update = usage_update.expect("the successful turn emitted usage");
+    assert!(usage_update.turn_incomplete);
+    assert!(!usage_update.accumulated_incomplete);
+    assert!(agent.accumulated_usage().incomplete);
     let log = log.lock().await;
     let messages = persisted_assistants(&log);
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].stop_reason, StopReason::Stop);
     assert_eq!(message_text(&messages[0]), "complete");
-    assert_eq!(log.stats().assistant_messages, 1);
+    assert!(messages[0].usage.incomplete);
+    let stats = log.stats();
+    assert_eq!(stats.assistant_messages, 1);
+    assert!(stats.usage.incomplete);
+    assert!(stats.usage_breakdown[0].usage.incomplete);
+    let session_id = log.session_id().to_string();
+    drop(log);
+
+    let reloaded = ConversationLog::resume(&persistence, &session_id).expect("reload session");
+    assert!(persisted_assistants(&reloaded)[0].usage.incomplete);
+    let replayed = replay(&reloaded).find_map(|event| match event {
+        AgentEvent::UsageUpdate { usage, .. } => Some(usage),
+        _ => None,
+    });
+    let replayed = replayed.expect("reload replays successful usage");
+    assert!(replayed.turn_incomplete);
+    assert!(!replayed.accumulated_incomplete);
+    assert!(reloaded.stats().usage.incomplete);
+}
+
+#[tokio::test]
+async fn a_chat_reported_zero_is_complete_across_live_and_durable_views() {
+    let server = CountingSseServer::start(vec![ResponseScript {
+        path: "POST /v1/chat/completions",
+        events: chat_completed("complete", Some((0, 0))),
+        short_body: false,
+    }])
+    .await;
+    let model = model("openai-completions", format!("{}/v1", server.base_url));
+    let run_config = run_config(Arc::new(OpenAiCompletionsProvider), model);
+    let root = TempDir::new().expect("session root");
+    let persistence = ConversationPersistence::new(root.path().join("sessions"));
+    let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        agent.prompt("hello".into(), CancellationToken::new()),
+    )
+    .await
+    .expect("reported-zero Chat turn returns")
+    .expect("reported zero is a successful response");
+    assert_eq!(server.request_count(), 1);
+    server.finish().await;
+
+    let mut events = Vec::new();
+    while let Ok(frame) = frames.try_recv() {
+        events.push(frame.event);
+    }
+    assert_eq!(event_counts(&events), (0, 1));
+    let usage_update = events.iter().find_map(|event| match event {
+        AgentEvent::UsageUpdate { usage, .. } => Some(usage),
+        _ => None,
+    });
+    let usage_update = usage_update.expect("reported-zero turn emitted usage");
+    assert!(!usage_update.turn_incomplete);
+    assert!(!usage_update.accumulated_incomplete);
+    assert!(!agent.accumulated_usage().incomplete);
+    assert_eq!(agent.accumulated_usage().total_tokens, 0);
+
+    let log = log.lock().await;
+    let messages = persisted_assistants(&log);
+    assert_eq!(messages.len(), 1);
+    assert!(!messages[0].usage.incomplete);
+    let stats = log.stats();
+    assert!(!stats.usage.incomplete);
+    assert!(!stats.usage_breakdown[0].usage.incomplete);
+    let session_id = log.session_id().to_string();
+    drop(log);
+
+    let reloaded = ConversationLog::resume(&persistence, &session_id).expect("reload session");
+    assert!(!persisted_assistants(&reloaded)[0].usage.incomplete);
+    let replayed = replay(&reloaded).find_map(|event| match event {
+        AgentEvent::UsageUpdate { usage, .. } => Some(usage),
+        _ => None,
+    });
+    let replayed = replayed.expect("reload replays reported-zero usage");
+    assert!(!replayed.turn_incomplete);
+    assert!(!replayed.accumulated_incomplete);
 }
 
 #[tokio::test]
@@ -505,9 +616,11 @@ async fn a_retryable_provider_terminal_persists_spend_but_accumulates_only_succe
     assert_eq!(messages[0].stop_reason, StopReason::Error);
     assert_eq!(message_text(&messages[0]), "failed");
     assert_eq!(messages[0].usage.total_tokens, 14);
+    assert!(!messages[0].usage.incomplete);
     assert!((messages[0].usage.cost.total - 0.000_009).abs() < 1e-12);
     assert_eq!(messages[1].stop_reason, StopReason::Stop);
     assert_eq!(messages[1].usage.total_tokens, 25);
+    assert!(!messages[1].usage.incomplete);
 
     let stats = log.stats();
     assert_eq!(stats.assistant_messages, 2);
@@ -516,4 +629,5 @@ async fn a_retryable_provider_terminal_persists_spend_but_accumulates_only_succe
     assert!((stats.usage.cost.total - 0.000_024).abs() < 1e-12);
     assert_eq!(stats.usage_breakdown.len(), 1);
     assert_eq!(stats.usage_breakdown[0].responses, 2);
+    assert!(!stats.usage.incomplete);
 }

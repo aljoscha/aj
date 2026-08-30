@@ -4229,6 +4229,8 @@ mod tests {
                 turn_cache_write: 0,
                 accumulated_cache_read: 0,
                 turn_cache_read: 0,
+                turn_incomplete: false,
+                accumulated_incomplete: false,
             },
         }));
         let spans = entry_spans(&t.entries()[0], &s);
@@ -7147,6 +7149,8 @@ mod tests {
                     turn_cache_write: 0,
                     accumulated_cache_read: 0,
                     turn_cache_read: 0,
+                    turn_incomplete: false,
+                    accumulated_incomplete: false,
                 },
             },
         );
@@ -7204,6 +7208,8 @@ mod tests {
                     turn_cache_write: 0,
                     accumulated_cache_read: 0,
                     turn_cache_read: 0,
+                    turn_incomplete: false,
+                    accumulated_incomplete: false,
                 },
             },
         );

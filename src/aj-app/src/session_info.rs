@@ -70,6 +70,11 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
         kv("log entries", &stats.total_entries.to_string()),
         InfoRow::Blank,
         InfoRow::Header("Usage".to_string()),
+    ];
+    if stats.usage.incomplete {
+        rows.push(kv("status", "partial (recorded usage only)"));
+    }
+    rows.extend([
         kv("input", &stats.usage.input.to_string()),
         kv("output", &stats.usage.output.to_string()),
         kv("cache read", &stats.usage.cache_read.to_string()),
@@ -77,7 +82,7 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
         kv("total tokens", &stats.usage.total_tokens.to_string()),
         kv("cost", &cost_label(stats.usage.cost.total)),
         kv("of which compaction", &compaction_label(stats)),
-    ];
+    ]);
 
     for bucket in &stats.usage_breakdown {
         rows.push(kv(&bucket_key(bucket), &bucket_value(bucket)));
@@ -159,11 +164,15 @@ fn without_control_characters(value: &str) -> String {
 }
 
 fn bucket_value(bucket: &UsageBucket) -> String {
-    format!(
+    let mut value = format!(
         "{} tokens · {}",
         bucket.usage.total_tokens,
         cost_label(bucket.usage.cost.total)
-    )
+    );
+    if bucket.usage.incomplete {
+        value.push_str(" · partial");
+    }
+    value
 }
 
 /// The compaction share of the session's spend, as runs, tokens and
@@ -234,6 +243,7 @@ mod tests {
                     cache_write: 0.02,
                     total: 0.33,
                 },
+                incomplete: false,
             },
             usage_breakdown: vec![
                 UsageBucket {
@@ -253,6 +263,7 @@ mod tests {
                             cache_write: 0.02,
                             total: 0.30,
                         },
+                        incomplete: false,
                     },
                     responses: 12,
                     unpriced_responses: 0,
@@ -274,6 +285,7 @@ mod tests {
                             cache_write: 0.002,
                             total: 0.03,
                         },
+                        incomplete: false,
                     },
                     responses: 6,
                     unpriced_responses: 0,
@@ -410,6 +422,36 @@ mod tests {
         assert_eq!(
             value_of(&digest(&stats, None), "of which compaction"),
             "(none)"
+        );
+    }
+
+    #[test]
+    fn partial_usage_is_explained_once_and_marks_only_affected_buckets() {
+        let mut stats = sample_stats();
+        stats.usage.incomplete = true;
+        stats.usage_breakdown[0].usage.incomplete = true;
+        let rows = digest(&stats, None);
+
+        let statuses: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                InfoRow::Kv { key, value } if key == "status" => Some(value.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, ["partial (recorded usage only)"]);
+        assert_eq!(
+            value_of(&rows, "anthropic / claude-sonnet-4-5"),
+            "2250 tokens · $0.3000 · partial"
+        );
+        assert_eq!(
+            value_of(&rows, "openai / gpt-5 (work)"),
+            "1500 tokens · $0.0300"
+        );
+        assert_eq!(
+            value_of(&rows, "of which compaction"),
+            "1 run, not recorded",
+            "the exact missing-compaction wording remains"
         );
     }
 

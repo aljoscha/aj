@@ -142,6 +142,7 @@ fn canonical_text_only() -> AssistantMessage {
         cache_write: 0,
         total_tokens: 0,
         cost: Default::default(),
+        incomplete: false,
     };
     msg.stop_reason = StopReason::Stop;
     msg
@@ -171,6 +172,7 @@ fn canonical_tool_call() -> AssistantMessage {
         cache_write: 0,
         total_tokens: 0,
         cost: Default::default(),
+        incomplete: false,
     };
     msg.stop_reason = StopReason::ToolUse;
     msg
@@ -200,6 +202,7 @@ fn canonical_reasoning_text() -> AssistantMessage {
         cache_write: 0,
         total_tokens: 0,
         cost: Default::default(),
+        incomplete: false,
     };
     msg.stop_reason = StopReason::Stop;
     msg

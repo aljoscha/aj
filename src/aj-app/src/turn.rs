@@ -988,14 +988,17 @@ mod tests {
     async fn over_threshold_turn_compacts_once() {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        // Window 1000; the threshold turn reports 900 input tokens
-        // (> 0.85 * 1000). The threshold turn's large user prompt makes
-        // the keep-recent cut land on that user message (a turn start,
-        // so no split), leaving the prior turn as the range to summarize.
+        // Window 1000; the threshold turn records a 900-token lower bound
+        // (> 0.85 * 1000), which is sufficient to compact. The turn's large
+        // user prompt makes the keep-recent cut land on that user message, a
+        // turn start, so no split. That leaves the prior turn as the range to
+        // summarize.
+        let mut threshold_turn = finalized_text_message_with_usage("ok", 900);
+        threshold_turn.usage.incomplete = true;
         let run_config = scripted_run_config_with_window(
             vec![
                 finalized_text_message("first answer"),
-                finalized_text_message_with_usage("ok", 900),
+                threshold_turn,
                 finalized_text_message("SUMMARY of earlier work"),
             ],
             1000,

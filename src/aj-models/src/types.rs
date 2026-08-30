@@ -213,6 +213,17 @@ pub struct Usage {
     pub cache_write: u64,
     pub total_tokens: u64,
     pub cost: UsageCost,
+    /// Whether the provider did not disclose complete final usage for this
+    /// response. The numeric fields remain the recorded subtotal.
+    ///
+    /// Missing means no disclosure gap was recorded, which preserves legacy
+    /// data without claiming that its producer observed complete usage.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub incomplete: bool,
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Usage {
@@ -222,7 +233,8 @@ impl Usage {
     /// by dimension, including `total_tokens` and `cost.total`. A
     /// per-response figure already satisfies `total_tokens == input +
     /// output + cache_read + cache_write`, so summing keeps the aggregate
-    /// internally consistent.
+    /// internally consistent. `incomplete` is sticky: one response with an
+    /// undisclosed remainder makes the aggregate a recorded subtotal.
     pub fn accumulate(&mut self, other: &Usage) {
         self.input += other.input;
         self.output += other.output;
@@ -234,6 +246,7 @@ impl Usage {
         self.cost.cache_read += other.cost.cache_read;
         self.cost.cache_write += other.cost.cache_write;
         self.cost.total += other.cost.total;
+        self.incomplete |= other.incomplete;
     }
 }
 
@@ -899,6 +912,7 @@ mod tests {
             cache_read: 20,
             cache_write: 10,
             total_tokens: 180,
+            incomplete: false,
             cost: UsageCost {
                 input: 0.10,
                 output: 0.20,
@@ -913,6 +927,7 @@ mod tests {
             cache_read: 5,
             cache_write: 15,
             total_tokens: 300,
+            incomplete: true,
             cost: UsageCost {
                 input: 0.25,
                 output: 0.40,
@@ -934,6 +949,46 @@ mod tests {
         assert!((acc.cost.cache_read - 0.025).abs() < 1e-9);
         assert!((acc.cost.cache_write - 0.025).abs() < 1e-9);
         assert!((acc.cost.total - 1.00).abs() < 1e-9);
+        assert!(acc.incomplete, "an earlier disclosure gap stays sticky");
+        acc.accumulate(&Usage::default());
+        assert!(
+            acc.incomplete,
+            "a later complete identity cannot clear the gap"
+        );
+    }
+
+    #[test]
+    fn usage_completeness_is_additive_without_relabeling_legacy_values() {
+        let legacy = serde_json::json!({
+            "input": 12,
+            "output": 3,
+            "cache_read": 4,
+            "cache_write": 5,
+            "total_tokens": 24,
+            "cost": {
+                "input": 0.0,
+                "output": 0.0,
+                "cache_read": 0.0,
+                "cache_write": 0.0,
+                "total": 0.0
+            }
+        });
+        let usage: Usage = serde_json::from_value(legacy.clone()).expect("legacy usage decodes");
+        assert!(!usage.incomplete);
+        assert_eq!(
+            serde_json::to_value(&usage).expect("legacy usage re-encodes"),
+            legacy,
+            "a missing marker stays visually and structurally unchanged"
+        );
+
+        let mut incomplete = usage;
+        incomplete.incomplete = true;
+        assert_eq!(
+            serde_json::to_value(incomplete).expect("incomplete usage encodes")["incomplete"],
+            true
+        );
+        assert!(!Usage::default().incomplete);
+        assert!(!AssistantMessage::empty().usage.incomplete);
     }
 
     #[test]
@@ -982,6 +1037,7 @@ mod tests {
                 cache_write: 5,
                 total_tokens: 165,
                 cost: UsageCost::default(),
+                incomplete: false,
             },
             stop_reason: StopReason::ToolUse,
             error: None,

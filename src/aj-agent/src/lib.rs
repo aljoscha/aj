@@ -1513,6 +1513,8 @@ impl Agent {
                 turn_cache_write: turn_usage.cache_write,
                 accumulated_cache_read: accumulated.cache_read,
                 turn_cache_read: turn_usage.cache_read,
+                turn_incomplete: turn_usage.incomplete,
+                accumulated_incomplete: accumulated.incomplete,
             };
             self.bus
                 .emit(AgentEvent::UsageUpdate {
@@ -6284,6 +6286,7 @@ mod event_protocol_tests {
         sub_report.usage.input = 7;
         sub_report.usage.output = 3;
         sub_report.usage.total_tokens = 10;
+        sub_report.usage.incomplete = true;
         let scripts = vec![
             finalize_script(finalize_tool_use("tu-1", "agent")),
             finalize_script(sub_report),
@@ -6392,6 +6395,7 @@ mod event_protocol_tests {
         let sub_usage = agent.sub_agent_usage();
         let usage = sub_usage.get(&1).expect("usage folded at drain");
         assert_eq!((usage.input, usage.output, usage.total_tokens), (7, 3, 10));
+        assert!(usage.incomplete);
 
         let notice_text = agent
             .messages()

@@ -198,6 +198,12 @@ impl ConversationLog {
                         compactions_with_usage += 1;
                         usage.accumulate(u);
                         compaction_usage.accumulate(u);
+                    } else {
+                        // The checkpoint proves a summarizer ran without a
+                        // recorded subtotal. Keep the absent Option on disk,
+                        // and mark only the computed aggregates partial.
+                        usage.incomplete = true;
+                        compaction_usage.incomplete = true;
                     }
                 }
                 _ => {}
@@ -422,6 +428,7 @@ mod tests {
                 cache_write: costs[3],
                 total: costs[4],
             },
+            incomplete: false,
         }
     }
 
@@ -477,6 +484,7 @@ mod tests {
             ..Usage::default()
         };
         usage.cost.total = 0.25;
+        usage.incomplete = true;
         let (_dir, log) = log_with_compaction(Some(usage));
 
         let stats = log.stats();
@@ -510,6 +518,8 @@ mod tests {
             stats.compaction_usage.cost.total
         );
         assert_eq!(stats.compaction_usage.total_tokens, 40_900);
+        assert!(stats.usage.incomplete);
+        assert!(stats.compaction_usage.incomplete);
         assert_eq!(stats.compactions_with_usage, 1, "its spend is known");
         assert_eq!(
             stats.usage_breakdown.len(),
@@ -517,6 +527,10 @@ mod tests {
             "compaction spend never creates a usage bucket"
         );
         let bucket = &stats.usage_breakdown[0];
+        assert!(
+            !bucket.usage.incomplete,
+            "unattributed compaction spend does not mark an assistant bucket"
+        );
         assert_eq!(
             (
                 bucket.provider.as_str(),
@@ -553,6 +567,9 @@ mod tests {
             stats.usage.cost.total
         );
         assert_eq!(stats.compaction_usage.total_tokens, 0);
+        assert!(stats.usage.incomplete);
+        assert!(stats.compaction_usage.incomplete);
+        assert!(!stats.usage_breakdown[0].usage.incomplete);
     }
 
     /// The digest sums token usage and dollar cost across every assistant
@@ -567,14 +584,28 @@ mod tests {
         head.add_message(AgentMessage::wire(user("hi"))).unwrap();
         head.add_message(AgentMessage::wire(assistant_with_usage(100, 50, 0.10)))
             .unwrap();
-        head.add_message(AgentMessage::wire(assistant_with_usage(200, 80, 0.25)))
-            .unwrap();
+        let mut partial = Usage {
+            input: 200,
+            output: 80,
+            total_tokens: 280,
+            incomplete: true,
+            ..Usage::default()
+        };
+        partial.cost.total = 0.25;
+        head.add_message(AgentMessage::wire(assistant_for(
+            "anthropic",
+            "claude-test",
+            partial,
+        )))
+        .unwrap();
 
         let stats = log.stats();
         assert_eq!(stats.usage.input, 300);
         assert_eq!(stats.usage.output, 130);
         assert_eq!(stats.usage.total_tokens, 430);
         assert!((stats.usage.cost.total - 0.35).abs() < 1e-9);
+        assert!(stats.usage.incomplete);
+        assert!(stats.usage_breakdown[0].usage.incomplete);
     }
 
     /// Usage buckets preserve each response's identity across user branches

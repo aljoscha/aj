@@ -1038,6 +1038,7 @@ impl StreamState {
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
         partial.account = account;
+        partial.usage.incomplete = true;
         Self {
             cost: model.cost.clone(),
             partial,
@@ -1280,6 +1281,7 @@ impl StreamState {
                 apply_usage_delta(&mut self.partial.usage, &usage);
                 self.seal();
                 if delta.stop_reason.is_some() {
+                    self.partial.usage.incomplete = false;
                     self.stop_reason = delta.stop_reason;
                 }
                 if let Some(AStopDetails::Refusal {
@@ -1453,6 +1455,7 @@ fn into_unified_usage(au: &AUsage) -> Usage {
         // it when it seals.
         total_tokens: 0,
         cost: Default::default(),
+        incomplete: true,
     }
 }
 
@@ -1604,6 +1607,10 @@ mod tests {
             .expect("fixture server completes");
 
         assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(
+            terminal.usage.incomplete,
+            "message_stop without final message_delta leaves usage partial"
+        );
     }
 
     #[tokio::test]
@@ -1663,6 +1670,7 @@ mod tests {
             ),
             (12, 0, 4, 2, 18),
         );
+        assert!(terminal.usage.incomplete);
         let expected_cost = 0.000_036 + 0.000_001_2 + 0.000_007_5;
         assert!(
             (terminal.usage.cost.total - expected_cost).abs() < 1e-12,
@@ -2447,6 +2455,7 @@ mod tests {
         let _ = state.process(ServerSentEvent::MessageStart {
             message: empty_a_message(),
         });
+        assert!(state.partial.usage.incomplete);
         let _ = state.process(ServerSentEvent::ContentBlockStart {
             index: 0,
             content_block: AContentBlock::ToolUseBlock {
@@ -2807,6 +2816,10 @@ mod tests {
         assert_eq!(state.partial.usage.cache_write, 2);
         assert_eq!(state.partial.usage.output, 7);
         assert_eq!(state.partial.usage.total_tokens, 25);
+        assert!(
+            state.partial.usage.incomplete,
+            "a nonterminal delta is not final usage evidence"
+        );
         let expected = 0.000_036 + 0.000_105 + 0.000_001_2 + 0.000_007_5;
         assert!(
             (state.partial.usage.cost.total - expected).abs() < 1e-12,
@@ -2835,6 +2848,7 @@ mod tests {
         assert_eq!(state.partial.usage.input, 20);
         assert_eq!(state.partial.usage.output, 9);
         assert_eq!(state.partial.usage.total_tokens, 35);
+        assert!(!state.partial.usage.incomplete);
         let expected = 0.000_06 + 0.000_135 + 0.000_001_2 + 0.000_007_5;
         assert!(
             (state.partial.usage.cost.total - expected).abs() < 1e-12,
@@ -2842,6 +2856,36 @@ mod tests {
             state.partial.usage.cost.total
         );
         assert!(matches!(state.stop_reason, Some(AStopReason::EndTurn)));
+    }
+
+    #[test]
+    fn an_explicit_zero_final_usage_delta_is_complete() {
+        let mut message = empty_a_message();
+        message.usage = AUsage::default();
+        let mut state = StreamState::new(&fake_model());
+        let _ = state.process(ServerSentEvent::MessageStart { message });
+        let _ = state.process(ServerSentEvent::MessageDelta {
+            delta: MessageDelta {
+                stop_reason: Some(AStopReason::EndTurn),
+                stop_sequence: None,
+                container: None,
+                stop_details: None,
+            },
+            usage: AUsageDelta {
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                input_tokens: None,
+                iterations: None,
+                output_tokens: 0,
+                server_tool_use: None,
+            },
+            context_management: None,
+        });
+        let _ = state.process(ServerSentEvent::MessageStop);
+
+        let terminal = state.finalize_or_truncate();
+        assert_eq!(terminal.partial().usage.total_tokens, 0);
+        assert!(!terminal.partial().usage.incomplete);
     }
 
     #[test]

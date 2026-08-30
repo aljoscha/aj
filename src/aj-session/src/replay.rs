@@ -1152,15 +1152,14 @@ impl ReplayState {
                 turn_cache_write: assistant.usage.cache_write,
                 accumulated_cache_read: acc.cache_read,
                 turn_cache_read: assistant.usage.cache_read,
+                turn_incomplete: assistant.usage.incomplete,
+                accumulated_incomplete: acc.incomplete,
             };
             out.push_back(transient(AgentEvent::UsageUpdate {
                 agent_id,
                 usage: turn_usage,
             }));
-            acc.input += assistant.usage.input;
-            acc.output += assistant.usage.output;
-            acc.cache_write += assistant.usage.cache_write;
-            acc.cache_read += assistant.usage.cache_read;
+            acc.accumulate(&assistant.usage);
         }
 
         // Track tool_call blocks so subsequent tool_result entries
@@ -2386,6 +2385,17 @@ mod tests {
         cache_read: u64,
         cache_write: u64,
     ) -> AgentMessage {
+        assistant_msg_with_usage_state(content, input, output, cache_read, cache_write, false)
+    }
+
+    fn assistant_msg_with_usage_state(
+        content: Vec<AssistantContent>,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        incomplete: bool,
+    ) -> AgentMessage {
         AgentMessage::wire(Message::Assistant(AssistantMessage {
             content,
             usage: aj_models::types::Usage {
@@ -2393,6 +2403,7 @@ mod tests {
                 output,
                 cache_read,
                 cache_write,
+                incomplete,
                 ..aj_models::types::Usage::default()
             },
             ..AssistantMessage::empty()
@@ -2412,7 +2423,7 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create log");
         {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(assistant_msg_with_usage(
+            view.add_message(assistant_msg_with_usage_state(
                 vec![AssistantContent::Text(TextContent {
                     text: "first".into(),
                     text_signature: None,
@@ -2421,6 +2432,7 @@ mod tests {
                 50,
                 20,
                 5,
+                true,
             ))
             .expect("turn 1");
             view.add_message(assistant_msg_with_usage(
@@ -2462,6 +2474,8 @@ mod tests {
         assert_eq!(first.accumulated_output, 0);
         assert_eq!(first.accumulated_cache_read, 0);
         assert_eq!(first.accumulated_cache_write, 0);
+        assert!(first.turn_incomplete);
+        assert!(!first.accumulated_incomplete);
 
         let second = turn_usages[1];
         assert_eq!(second.turn_input, 200);
@@ -2475,6 +2489,8 @@ mod tests {
         assert_eq!(second.accumulated_output, 50);
         assert_eq!(second.accumulated_cache_read, 20);
         assert_eq!(second.accumulated_cache_write, 5);
+        assert!(!second.turn_incomplete);
+        assert!(second.accumulated_incomplete);
     }
 
     /// A `Compaction` entry replays as a `CompactionEnd` whose

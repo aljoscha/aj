@@ -931,6 +931,7 @@ mod tests {
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(terminal.usage.total_tokens, 0);
         assert_eq!(terminal.usage.cost.total, 0.0);
+        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
@@ -974,6 +975,7 @@ mod tests {
         assert_eq!(message_text(&terminal), "partial");
         assert_eq!(terminal.usage.total_tokens, 0);
         assert_eq!(terminal.usage.cost.total, 0.0);
+        assert!(terminal.usage.incomplete);
         let error = terminal.error.expect("transport error retained");
         assert_eq!(error.category, ErrorCategory::Transient);
         assert!(
@@ -1023,7 +1025,50 @@ mod tests {
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(message_text(&terminal), "complete");
         assert_eq!(terminal.usage.total_tokens, 2_000_000);
+        assert!(!terminal.usage.incomplete);
         assert!((terminal.usage.cost.total - 7.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn codex_terminal_usage_distinguishes_missing_from_reported_zero() {
+        fn terminal_event(usage: Option<serde_json::Value>) -> ResponseStreamEvent {
+            let mut response = serde_json::json!({
+                "id": "resp_1", "object": "response", "created_at": 0.0,
+                "model": "gpt-5.1", "output": [], "parallel_tool_calls": true,
+                "tools": [], "status": "completed"
+            });
+            if let Some(usage) = usage {
+                response["usage"] = usage;
+            }
+            serde_json::from_value(serde_json::json!({
+                "type": "response.done", "sequence_number": 1, "response": response
+            }))
+            .expect("Codex response.done")
+        }
+
+        let mut missing = StreamState::new_with(
+            API_NAME,
+            &fake_model("gpt-5.1", false),
+            None,
+            CODEX_COST_MULTIPLIER,
+            None,
+        );
+        let _ = missing.process(normalize_codex_event(terminal_event(None)));
+        assert!(missing.finalize_or_truncate().partial().usage.incomplete);
+
+        let mut reported_zero = StreamState::new_with(
+            API_NAME,
+            &fake_model("gpt-5.1", false),
+            None,
+            CODEX_COST_MULTIPLIER,
+            None,
+        );
+        let _ = reported_zero.process(normalize_codex_event(terminal_event(Some(
+            serde_json::json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+        ))));
+        let terminal = reported_zero.finalize_or_truncate();
+        assert_eq!(terminal.partial().usage.total_tokens, 0);
+        assert!(!terminal.partial().usage.incomplete);
     }
 
     #[test]

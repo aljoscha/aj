@@ -849,6 +849,7 @@ impl StreamState {
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
         partial.account = account;
+        partial.usage.incomplete = true;
         Self {
             partial,
             started: false,
@@ -1202,6 +1203,7 @@ impl StreamState {
     fn seal(&mut self) {
         if let Some(usage) = self.usage.as_ref() {
             apply_usage(&mut self.partial.usage, usage);
+            self.partial.usage.incomplete = false;
         }
         finalize_usage(&mut self.partial.usage, &self.cost);
     }
@@ -1968,6 +1970,10 @@ mod tests {
         // (byte stream dropped) must finalize as a retryable transient
         // error, preserving the partial text.
         let mut state = StreamState::new(&fake_model());
+        assert!(
+            state.partial.usage.incomplete,
+            "an issued provider stream starts without final usage evidence"
+        );
         let _ = state.process(delta_chunk(text_delta("partial")));
         assert!(!state.saw_terminal());
         let truncated = state.finalize_or_truncate();
@@ -1991,10 +1997,12 @@ mod tests {
         let _ = state.process(delta_chunk(text_delta("partial")));
         let _ = state.process(finish_chunk(FinishReason::Stop));
         assert!(state.saw_terminal());
-        assert!(matches!(
-            state.finalize_or_truncate(),
-            AssistantMessageEvent::Done { .. }
-        ));
+        let terminal = state.finalize_or_truncate();
+        assert!(matches!(terminal, AssistantMessageEvent::Done { .. }));
+        assert!(
+            terminal.partial().usage.incomplete,
+            "finish_reason without trailing usage is a successful partial subtotal"
+        );
     }
 
     #[test]
@@ -2158,6 +2166,7 @@ mod tests {
         assert!(terminal.error.is_none());
         assert_eq!(message_text(&terminal), "complete");
         assert_eq!(terminal.usage.total_tokens, 0);
+        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
@@ -2187,6 +2196,7 @@ mod tests {
         assert!(terminal.error.is_none());
         assert_eq!(message_text(&terminal), "A");
         assert_eq!(terminal.usage.total_tokens, 120);
+        assert!(!terminal.usage.incomplete);
         let expected = 0.000_075 + 0.000_2 + 0.000_003_125;
         assert!((terminal.usage.cost.total - expected).abs() < 1e-12);
     }

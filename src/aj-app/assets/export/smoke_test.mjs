@@ -46,7 +46,7 @@ const entries = [
         { type: 'tool_call', id: 'c9', name: 'read_file', arguments: { path: '/home/me/future.rs' } },
         { type: 'tool_call', id: 'c4', name: 'agent', arguments: { task: 'investigate' } },
       ],
-      usage: { input: 100, output: 50, cache_read: 0, cache_write: 0, total_tokens: 150, cost: { total: 0.01 } },
+      usage: { input: 100, output: 50, cache_read: 0, cache_write: 0, total_tokens: 150, cost: { total: 0.01 }, incomplete: true },
       stop_reason: 'ToolUse', timestamp: 0 } },
   { id: 'r1', parent_id: 'a1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:03Z',
     message: { role: 'tool_result', tool_call_id: 'c1', tool_name: 'read_file',
@@ -134,6 +134,10 @@ const entries = [
   { id: 'k1', parent_id: 'a3', thread: 'user', type: 'compaction', timestamp: '2024-01-01T00:00:11Z',
     summary: 'earlier turns summarized', first_kept_entry_id: 'a2', tokens_before: 4321,
     usage: { input: 400, output: 99, cache_read: 0, cache_write: 0, total_tokens: 499, cost: { total: 0.25 } } },
+  // The absent usage object is direct evidence that another counted
+  // summarizer run has no recorded subtotal.
+  { id: 'k2', parent_id: 'k1', thread: 'user', type: 'compaction', timestamp: '2024-01-01T00:00:12Z',
+    summary: 'legacy unaccounted compaction', first_kept_entry_id: 'a2', tokens_before: 2000 },
   // A sibling branch off u1 (an edited/retried prompt) to exercise the
   // tree's branch connectors. It is off the active path to a3.
   { id: 'u1b', parent_id: 'u1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:02Z',
@@ -166,71 +170,70 @@ function makeEl(tag) {
   return el;
 }
 
-const elements = {};
-for (const id of ['session-data', 'header-container', 'messages', 'tree-container', 'tree-status',
-  'sidebar', 'sidebar-overlay', 'hamburger', 'sidebar-close', 'tree-search', 'toggle-subagents']) {
-  elements[id] = makeEl('div');
+async function renderData(data) {
+  const elements = {};
+  for (const id of ['session-data', 'header-container', 'messages', 'tree-container', 'tree-status',
+    'sidebar', 'sidebar-overlay', 'hamburger', 'sidebar-close', 'tree-search', 'toggle-subagents']) {
+    elements[id] = makeEl('div');
+  }
+  // Feed the island exactly as the exporter does: gzip-compressed,
+  // base64-encoded. This exercises the renderer's real inflate path.
+  elements['session-data'].textContent = zlib.gzipSync(JSON.stringify(data)).toString('base64');
+
+  // Filter radio buttons, queried by class (not id) exactly as the page
+  // wires them. `default` starts active, matching template.html.
+  const filterButtons = ['default', 'no-tools', 'user-only', 'all'].map((mode) => {
+    const btn = makeEl('button');
+    btn.dataset.filter = mode;
+    if (mode === 'default') btn.classList.add('active');
+    return btn;
+  });
+
+  // The shim does not parse assigned innerHTML. Resolve transcript ids from
+  // the real rendered markup so navigation remains observable.
+  const scrolledTargets = [];
+  const documentShim = {
+    getElementById: (id) => {
+      if (elements[id]) return elements[id];
+      if (!elements['messages'].innerHTML.includes('id="' + id + '"')) return null;
+      const renderedElement = makeEl('div');
+      renderedElement.scrollIntoView = () => scrolledTargets.push(id);
+      return renderedElement;
+    },
+    createElement: (tag) => makeEl(tag),
+    querySelector: () => null,
+    querySelectorAll: (sel) => (sel === '.filter-btn' ? filterButtons : []),
+    addEventListener: () => {},
+  };
+
+  const sandbox = { console, document: documentShim };
+  sandbox.window = sandbox;
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  sandbox.getSelection = () => ({ toString: () => '' });
+  sandbox.setTimeout = (fn) => fn();
+  // Web APIs the data loader needs to inflate the gzip+base64 island. A
+  // fresh vm context has the ECMAScript intrinsics but none of these.
+  sandbox.atob = atob;
+  sandbox.Blob = Blob;
+  sandbox.Response = Response;
+  sandbox.DecompressionStream = DecompressionStream;
+  vm.createContext(sandbox);
+
+  vm.runInContext(read('vendor/marked.min.js'), sandbox, { filename: 'marked.min.js' });
+  vm.runInContext(read('template.js'), sandbox, { filename: 'template.js' });
+
+  const deadline = Date.now() + 3000;
+  while (!elements['messages'].innerHTML && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  if (!elements['messages'].innerHTML) {
+    throw new Error('renderer did not produce output (data load failed?)');
+  }
+  return { elements, filterButtons, scrolledTargets };
 }
-// Feed the island exactly as the exporter does: gzip-compressed,
-// base64-encoded. This exercises the renderer's real inflate path.
-elements['session-data'].textContent = zlib.gzipSync(JSON.stringify(sessionData)).toString('base64');
 
-// Filter radio buttons, queried by class (not id) exactly as the page
-// wires them. `default` starts active, matching template.html.
-const filterButtons = ['default', 'no-tools', 'user-only', 'all'].map((mode) => {
-  const btn = makeEl('button');
-  btn.dataset.filter = mode;
-  if (mode === 'default') btn.classList.add('active');
-  return btn;
-});
-
-// The shim does not parse assigned innerHTML. Resolve transcript ids from the
-// real rendered markup so navigation's getElementById and scroll path remain
-// observable rather than succeeding against a fixed element table.
-const scrolledTargets = [];
-const documentShim = {
-  getElementById: (id) => {
-    if (elements[id]) return elements[id];
-    if (!elements['messages'].innerHTML.includes('id="' + id + '"')) return null;
-    const renderedElement = makeEl('div');
-    renderedElement.scrollIntoView = () => scrolledTargets.push(id);
-    return renderedElement;
-  },
-  createElement: (tag) => makeEl(tag),
-  querySelector: () => null,
-  querySelectorAll: (sel) => (sel === '.filter-btn' ? filterButtons : []),
-  addEventListener: () => {},
-};
-
-const sandbox = { console, document: documentShim };
-sandbox.window = sandbox;
-sandbox.self = sandbox;
-sandbox.globalThis = sandbox;
-sandbox.getSelection = () => ({ toString: () => '' });
-sandbox.setTimeout = (fn) => fn();
-// Web APIs the data loader needs to inflate the gzip+base64 island. A
-// fresh vm context has the ECMAScript intrinsics (Uint8Array, Promise)
-// but none of these, so hand them in from the host.
-sandbox.atob = atob;
-sandbox.Blob = Blob;
-sandbox.Response = Response;
-sandbox.DecompressionStream = DecompressionStream;
-vm.createContext(sandbox);
-
-// Load the real library then the renderer, exactly as the page does.
-vm.runInContext(read('vendor/marked.min.js'), sandbox, { filename: 'marked.min.js' });
-vm.runInContext(read('template.js'), sandbox, { filename: 'template.js' });
-
-// The renderer loads its data asynchronously (inflate is async), so wait
-// for the first render to land before asserting.
-const deadline = Date.now() + 3000;
-while (!elements['messages'].innerHTML && Date.now() < deadline) {
-  await new Promise((r) => setTimeout(r, 10));
-}
-if (!elements['messages'].innerHTML) {
-  console.error('renderer did not produce output (data load failed?)');
-  process.exit(1);
-}
+const { elements, filterButtons, scrolledTargets } = await renderData(sessionData);
 
 const rendered = elements['header-container'].innerHTML + '\n' + elements['messages'].innerHTML;
 
@@ -300,7 +303,14 @@ has('session id', 'smoke-session');
 // that folds message usage alone stops at 101 here and at $0.0100 below.
 has('token totals', '\u2191501');
 has('cost', '$0.2600');
-has('compaction counted', '1 compactions');
+has('compactions counted', '2 compactions');
+check('usage status appears once', rendered.split('partial (recorded usage only)').length - 1 === 1);
+has('usage status label', '<span class="info-label">Usage:</span><span class="info-value">partial (recorded usage only)</span>');
+const completeData = JSON.parse(JSON.stringify(sessionData));
+delete completeData.entries.find((entry) => entry.id === 'a1').message.usage.incomplete;
+completeData.entries = completeData.entries.filter((entry) => entry.id !== 'k2');
+const completeElements = (await renderData(completeData)).elements;
+check('complete legacy header has no usage status', !completeElements['header-container'].innerHTML.includes('partial (recorded usage only)'));
 has('system prompt', 'You are aj.');
 has('download JSONL button', 'download-json-btn');
 has('copy-link button', 'class="copy-link-btn"');

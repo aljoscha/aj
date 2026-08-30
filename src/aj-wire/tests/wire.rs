@@ -425,6 +425,21 @@ fn decoded_agent_event_forwards_known_additions_exactly() {
 }
 
 #[test]
+fn usage_update_completeness_decodes_typed_and_forwards_exactly() {
+    let raw = r#"{"type":"usage_update","agent_id":"main","usage":{"accumulated_input":1,"turn_input":2,"accumulated_output":3,"turn_output":4,"accumulated_cache_write":5,"turn_cache_write":6,"accumulated_cache_read":7,"turn_cache_read":8,"turn_incomplete":true,"accumulated_incomplete":true}}"#;
+    let decoded: DecodedAgentEvent = serde_json::from_str(raw).expect("usage update decodes");
+    let DecodedAgentEvent::Known(known) = &decoded else {
+        panic!("expected known usage event");
+    };
+    let AgentEvent::UsageUpdate { usage, .. } = known.value() else {
+        panic!("expected usage update");
+    };
+    assert!(usage.turn_incomplete);
+    assert!(usage.accumulated_incomplete);
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), raw);
+}
+
+#[test]
 fn decoded_agent_event_forwards_unknown_numbers_exactly() {
     assert_decoded_round_trip::<DecodedAgentEvent>(
         r#"{"type":"future_event","integer":18446744073709551616}"#,
@@ -1529,6 +1544,11 @@ fn message_end_requires_non_null_durable_metadata() {
 fn message_end_decodes_the_account_and_old_frames_without_it() {
     let decode = |json: &str| {
         let decoded: DecodedFrame = serde_json::from_str(json).expect("message_end decodes");
+        assert_eq!(
+            serde_json::from_str::<Value>(&serde_json::to_string(&decoded).unwrap()).unwrap(),
+            serde_json::from_str::<Value>(json).unwrap(),
+            "a decoded known frame forwards its additive fields"
+        );
         let DecodedFrame::Known(frame) = decoded else {
             panic!("expected known frame");
         };
@@ -1544,16 +1564,24 @@ fn message_end_decodes_the_account_and_old_frames_without_it() {
         let Some(aj_models::types::Message::Assistant(message)) = message.as_stored_wire() else {
             panic!("expected assistant message");
         };
-        message.account.clone()
+        (message.account.clone(), message.usage.incomplete)
     };
 
-    let labeled = r#"{"kind":"event","session":"session-1","epoch":"epoch-1","seq":1,"entry_id":"entry-1","event":{"type":"message_end","agent_id":"main","message":{"role":"assistant","content":[],"api":"scripted","provider":"anthropic","model":"claude-test","account":"work","usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"total_tokens":0,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0}},"stop_reason":"Stop","timestamp":10}}}"#;
-    assert_eq!(decode(labeled).as_deref(), Some("work"));
+    let labeled = r#"{"kind":"event","session":"session-1","epoch":"epoch-1","seq":1,"entry_id":"entry-1","event":{"type":"message_end","agent_id":"main","message":{"role":"assistant","content":[],"api":"scripted","provider":"anthropic","model":"claude-test","account":"work","usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"total_tokens":0,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0},"incomplete":true},"stop_reason":"Stop","timestamp":10}}}"#;
+    assert_eq!(decode(labeled), (Some("work".to_string()), true));
+    let mut gateway_frame: DecodedFrame = serde_json::from_str(labeled).unwrap();
+    assert!(gateway_frame.rewrite_session("gateway/session-1").unwrap());
+    let gateway_json = serde_json::to_value(gateway_frame).unwrap();
+    assert_eq!(gateway_json["session"], "gateway/session-1");
+    assert_eq!(
+        gateway_json["event"]["message"]["usage"]["incomplete"], true,
+        "gateway rewriting retains the nested disclosure marker"
+    );
 
     // A literal old frame, not a value built by today's serializer.
     // Only this direction proves a pre-account peer still decodes.
     let old = r#"{"kind":"event","session":"session-1","epoch":"epoch-1","seq":1,"entry_id":"entry-1","event":{"type":"message_end","agent_id":"main","message":{"role":"assistant","content":[],"api":"scripted","provider":"anthropic","model":"claude-test","usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"total_tokens":0,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0}},"stop_reason":"Stop","timestamp":10}}}"#;
-    assert_eq!(decode(old), None);
+    assert_eq!(decode(old), (None, false));
 }
 
 #[test]

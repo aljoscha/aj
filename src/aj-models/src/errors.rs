@@ -490,6 +490,7 @@ mod tests {
             cache_write: 0,
             total_tokens: 205_000,
             cost: UsageCost::default(),
+            incomplete: true,
         };
         // 205_000 > 200_000.
         assert!(is_context_overflow(&msg, Some(200_000)));
@@ -508,6 +509,7 @@ mod tests {
             cache_write: 0,
             total_tokens: 205_000,
             cost: UsageCost::default(),
+            incomplete: false,
         };
         assert!(!is_context_overflow(&msg, Some(200_000)));
     }

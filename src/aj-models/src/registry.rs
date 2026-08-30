@@ -978,6 +978,7 @@ mod tests {
             cache_write: 50_000,
             total_tokens: 0,
             cost: Default::default(),
+            incomplete: false,
         };
         calculate_cost(&model.cost, &mut usage);
         assert!((usage.cost.input - 3.0).abs() < 1e-9);
@@ -1018,6 +1019,7 @@ mod tests {
             cache_write: 0,
             total_tokens: 0,
             cost: Default::default(),
+            incomplete: false,
         };
         calculate_cost(&cost, &mut usage);
         assert!((usage.cost.input - 0.2).abs() < 1e-9);
@@ -1036,6 +1038,7 @@ mod tests {
             cache_write: 30_000,
             total_tokens: 0,
             cost: Default::default(),
+            incomplete: false,
         };
         calculate_cost(&cost, &mut usage);
         assert!((usage.cost.input - 0.4).abs() < 1e-9);
@@ -1056,6 +1059,7 @@ mod tests {
             cache_write: 0,
             total_tokens: 0,
             cost: Default::default(),
+            incomplete: false,
         };
         calculate_cost(&cost, &mut usage);
         assert!((usage.cost.input - 0.272).abs() < 1e-9);
@@ -1097,6 +1101,7 @@ mod tests {
             cache_write: 0,
             total_tokens: 0,
             cost: Default::default(),
+            incomplete: false,
         };
         calculate_cost(&cost, &mut usage);
         assert!((usage.cost.input - 2.5).abs() < 1e-9);
