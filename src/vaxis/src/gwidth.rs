@@ -60,6 +60,10 @@ fn eaw_to_width(cp: u32, eaw: EastAsianWidth) -> i16 {
 }
 
 /// Returns the width of `s` in terminal cells, measured by `method`.
+///
+/// Widths above [`u16::MAX`] saturate at that boundary. Cell geometry uses
+/// `u16`, and wrapping an oversized measurement would make large text appear
+/// narrow or even zero-width to callers.
 pub fn gwidth(s: &str, method: Method) -> u16 {
     match method {
         Method::Unicode => {
@@ -104,7 +108,7 @@ pub fn gwidth(s: &str, method: Method) -> u16 {
                     width = width.max(2);
                 }
 
-                total += width.max(0).unsigned_abs();
+                total = total.saturating_add(width.max(0).unsigned_abs());
             }
             total
         }
@@ -118,7 +122,7 @@ pub fn gwidth(s: &str, method: Method) -> u16 {
                     0x1f3fb..=0x1f3ff => 2,
                     _ => eaw_to_width(cp, vaxis_ucd::east_asian_width(cp)),
                 };
-                total += w.max(0).unsigned_abs();
+                total = total.saturating_add(w.max(0).unsigned_abs());
             }
             total
         }
@@ -126,7 +130,7 @@ pub fn gwidth(s: &str, method: Method) -> u16 {
             // Drop ZWJ joins, then sum the Unicode width of each piece.
             s.split('\u{200d}')
                 .map(|piece| gwidth(piece, Method::Unicode))
-                .sum()
+                .fold(0_u16, u16::saturating_add)
         }
     }
 }
@@ -209,5 +213,18 @@ mod tests {
     fn gwidth_base_letter_with_combining_mark() {
         // 'a' + combining acute accent (NFD form), width 1.
         assert_eq!(gwidth("a\u{0301}", Method::Unicode), 1);
+    }
+
+    #[test]
+    fn gwidth_saturates_when_text_exceeds_u16_cells() {
+        let separate = "😀".repeat(32_768);
+        assert_eq!(gwidth(&separate, Method::Unicode), u16::MAX);
+        assert_eq!(gwidth(&separate, Method::Wcwidth), u16::MAX);
+
+        let joined = ["😀"; 32_768].join("\u{200d}");
+        assert_eq!(grapheme_iterator(&joined).count(), 1);
+        assert_eq!(gwidth(&joined, Method::Unicode), 2);
+        assert_eq!(gwidth(&joined, Method::Wcwidth), u16::MAX);
+        assert_eq!(gwidth(&joined, Method::NoZwj), u16::MAX);
     }
 }

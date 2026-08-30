@@ -672,20 +672,25 @@ impl Vaxis {
                 debug_assert!(cell.char.width > 0);
                 let cols = usize::from(cell.scale.scale) * usize::from(cell.char.width);
                 let rows = usize::from(cell.scale.scale);
+                // Validate row and column independently before flattening.
+                // Horizontal overflow is outside the viewport, not coverage
+                // of the next backing row.
                 for skipped_row in 0..rows {
+                    let covered_row = usize::from(row) + skipped_row;
+                    if covered_row >= usize::from(self.screen_last.height) {
+                        break;
+                    }
                     for skipped_col in 0..cols {
                         if skipped_row == 0 && skipped_col == 0 {
                             continue;
                         }
-                        let skipped_i = (usize::from(row) + skipped_row)
-                            * usize::from(self.screen_last.width)
-                            + (usize::from(col) + skipped_col);
-                        // A scaled cell near the right/bottom edge can index
-                        // past the buffer. Upstream reads out of bounds here; we
-                        // skip instead of panicking on untrusted geometry.
-                        if let Some(covered) = self.screen_last.buf.get_mut(skipped_i) {
-                            covered.skip = true;
+                        let covered_col = usize::from(col) + skipped_col;
+                        if covered_col >= usize::from(self.screen_last.width) {
+                            break;
                         }
+                        let skipped_i =
+                            covered_row * usize::from(self.screen_last.width) + covered_col;
+                        self.screen_last.buf[skipped_i].skip = true;
                     }
                 }
             }
@@ -742,7 +747,8 @@ impl Vaxis {
                         cell.char.grapheme(),
                     )?,
                 }
-                cursor_pos.col = col + (cw * u16::from(scale.scale));
+                // Scaled terminal extent shares the u16 coordinate bound.
+                cursor_pos.col = col.saturating_add(cw.saturating_mul(u16::from(scale.scale)));
                 cursor_pos.row = row;
                 last_style = cell.style;
                 link = cell.link.clone();
@@ -755,7 +761,7 @@ impl Vaxis {
             } else {
                 w.write_all(cell.char.grapheme().as_bytes())?;
             }
-            cursor_pos.col = col + cw;
+            cursor_pos.col = col.saturating_add(cw);
             cursor_pos.row = row;
 
             last_style = cell.style;
@@ -1055,7 +1061,7 @@ impl Vaxis {
             }
 
             w.write_all(cell.char.grapheme().as_bytes())?;
-            cursor_pos.col = col + cw;
+            cursor_pos.col = col.saturating_add(cw);
             cursor_pos.row = row;
 
             last_style = cell.style;
@@ -1617,20 +1623,26 @@ fn start_render<W: Write>(
     Ok(())
 }
 
-/// Advances the render cursor past a `cw`-wide cell: marks the back-buffer cells
-/// the wide glyph covers as `skipped`, then steps `col` and `i` by the width.
+/// Advances the render cursor past a `cw`-wide cell. Terminal cursor movement
+/// retains the measured width, while backing-buffer coverage stops at the end
+/// of the current row.
 fn advance_cell(screen_last: &mut InternalScreen, i: &mut usize, col: &mut u16, cw: u16) {
-    let w = usize::from(cw);
-    let mut j = *i + 1;
-    while j < *i + w {
-        if j >= screen_last.buf.len() {
-            break;
-        }
-        screen_last.buf[j].skipped = true;
-        j += 1;
+    // A measured grapheme may be wider than the viewport. It covers the rest
+    // of this backing row, not unrelated cells that widgets placed on later
+    // rows. The full width still drives `col` so the next loop iteration
+    // observes terminal wrapping and repositions consistently.
+    let row_width = usize::from(screen_last.width).max(1);
+    let row_remaining = row_width - (*i % row_width);
+    let backing_width = usize::from(cw).max(1).min(row_remaining);
+    let backing_end = i.saturating_add(backing_width).min(screen_last.buf.len());
+    for covered in screen_last.buf.iter_mut().take(backing_end).skip(*i + 1) {
+        covered.skipped = true;
     }
-    *col += cw;
-    *i += w;
+    // A render-time measurement can reach u16::MAX. Cursor bookkeeping shares
+    // the screen-coordinate bound rather than wrapping when that cell starts
+    // after column zero.
+    *col = col.saturating_add(cw);
+    *i = backing_end;
 }
 
 /// Emits a kitty image placement command for a cell carrying an [`image`]
@@ -1755,6 +1767,97 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         count(haystack, needle) > 0
+    }
+
+    #[test]
+    fn scaled_coverage_does_not_alias_the_next_backing_row() {
+        let mut vx = Vaxis::new(Options::default());
+        vx.caps.scaled_text = true;
+        let mut output = Vec::new();
+        vx.resize(
+            &mut output,
+            Winsize {
+                rows: 2,
+                cols: 2,
+                x_pixel: 0,
+                y_pixel: 0,
+            },
+        )
+        .expect("resize renderer");
+        output.clear();
+
+        let win = vx.window();
+        win.write_cell(
+            1,
+            0,
+            Cell {
+                char: Character::new("S", 1),
+                scale: Scale {
+                    scale: 2,
+                    ..Scale::default()
+                },
+                ..Cell::default()
+            },
+        );
+        win.write_cell(
+            0,
+            1,
+            Cell {
+                char: Character::new("X", 1),
+                ..Cell::default()
+            },
+        );
+
+        vx.render(&mut output).expect("render scaled edge cell");
+        assert!(
+            contains(&output, b"\x1b]66;s=2:w=1;S\x1b\\"),
+            "the fixture did not enter scaled-text rendering",
+        );
+        assert!(
+            output.contains(&b'X'),
+            "horizontal scale overflow hid the next row's first cell",
+        );
+        assert!(
+            !vx.screen_last.buf[2].skip,
+            "horizontal scale overflow was flattened onto the next row",
+        );
+    }
+
+    #[test]
+    fn scaled_cursor_extent_saturates_at_the_screen_coordinate_limit() {
+        let mut vx = Vaxis::new(Options::default());
+        vx.caps.scaled_text = true;
+        let mut output = Vec::new();
+        vx.resize(
+            &mut output,
+            Winsize {
+                rows: 1,
+                cols: u16::MAX,
+                x_pixel: 0,
+                y_pixel: 0,
+            },
+        )
+        .expect("resize renderer");
+        output.clear();
+        vx.window().write_cell(
+            u16::MAX - 1,
+            0,
+            Cell {
+                char: Character::new("S", 1),
+                scale: Scale {
+                    scale: 2,
+                    ..Scale::default()
+                },
+                ..Cell::default()
+            },
+        );
+
+        vx.render(&mut output).expect("render scaled edge cell");
+        assert!(
+            contains(&output, b"\x1b]66;s=2:w=1;S\x1b\\"),
+            "the fixture did not enter scaled-text rendering",
+        );
+        assert_eq!(vx.state.cursor.col, u16::MAX);
     }
 
     /// The login dialog draws its authorization URL as a run of cells each

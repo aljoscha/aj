@@ -61,7 +61,7 @@ impl RichText {
                 }
                 let mut w: u16 = 0;
                 for cell in &line {
-                    w = w.saturating_add(u16::from(cell.char.width));
+                    w = w.saturating_add(cell.width);
                 }
                 max_width = max_width.max(w);
                 row += 1;
@@ -120,13 +120,12 @@ impl Widget for RichText {
                 }
                 let mut col: u16 = match self.text_align {
                     TextAlign::Left => 0,
-                    TextAlign::Center => (container_size.width - line.width) / 2,
-                    TextAlign::Right => container_size.width - line.width,
+                    TextAlign::Center => container_size.width.saturating_sub(line.width) / 2,
+                    TextAlign::Right => container_size.width.saturating_sub(line.width),
                 };
                 for cell in line.cells {
-                    let width = cell.char.width;
-                    surface.write_cell(col, row, cell);
-                    col += u16::from(width);
+                    surface.write_cell(col, row, cell.cell);
+                    col = col.saturating_add(cell.width);
                 }
                 row += 1;
             }
@@ -137,7 +136,7 @@ impl Widget for RichText {
                 }
                 let mut line_width: u16 = 0;
                 for cell in &line {
-                    line_width = line_width.saturating_add(u16::from(cell.char.width));
+                    line_width = line_width.saturating_add(cell.width);
                 }
                 let mut col: u16 = match self.text_align {
                     TextAlign::Left => 0,
@@ -145,7 +144,7 @@ impl Widget for RichText {
                     TextAlign::Right => container_size.width.saturating_sub(line_width),
                 };
                 for cell in line {
-                    if col + u16::from(cell.char.width) >= container_size.width
+                    if col.saturating_add(cell.width) >= container_size.width
                         && line_width > container_size.width
                         && self.overflow == Overflow::Ellipsis
                     {
@@ -154,16 +153,15 @@ impl Widget for RichText {
                             row,
                             Cell {
                                 char: Character::new("…", 1),
-                                style: cell.style,
+                                style: cell.cell.style,
                                 ..Cell::default()
                             },
                         );
                         col = container_size.width;
                         continue;
                     }
-                    let width = cell.char.width;
-                    surface.write_cell(col, row, cell);
-                    col += u16::from(width);
+                    surface.write_cell(col, row, cell.cell);
+                    col = col.saturating_add(cell.width);
                 }
                 row += 1;
             }
@@ -173,10 +171,22 @@ impl Widget for RichText {
     }
 }
 
+/// A cell and its width for this layout pass.
+///
+/// [`Character::width`] uses zero to request render-time measurement when its
+/// `u8` field cannot represent the measured width. Layout must retain the
+/// `u16`-bounded measurement separately so that sentinel does not move later
+/// cells or change wrapping and container geometry.
+#[derive(Clone)]
+struct LayoutCell {
+    cell: Cell,
+    width: u16,
+}
+
 /// A soft-wrapped line: the laid-out cells that fit and their total width.
 struct SoftLine {
     width: u16,
-    cells: Vec<Cell>,
+    cells: Vec<LayoutCell>,
 }
 
 /// Wraps a sequence of laid-out cells to a maximum width, breaking on spaces
@@ -188,9 +198,9 @@ struct SoftLine {
 /// line is trimmed before wrapping.
 struct SoftwrapIterator {
     ctx: DrawContext,
-    text: Vec<Cell>,
+    text: Vec<LayoutCell>,
     /// The current hard line, a trimmed copy of a slice of `text`.
-    line: Vec<Cell>,
+    line: Vec<LayoutCell>,
     /// Position within `line`.
     index: usize,
     /// Position within `text` for the hard-break walk.
@@ -199,29 +209,36 @@ struct SoftwrapIterator {
 
 impl SoftwrapIterator {
     fn init(spans: &[TextSpan], ctx: &DrawContext) -> SoftwrapIterator {
-        let mut text: Vec<Cell> = Vec::new();
+        let mut text: Vec<LayoutCell> = Vec::new();
         for span in spans {
             for item in ctx.grapheme_iterator(&span.text) {
                 let grapheme = item.bytes(&span.text);
                 if grapheme == "\t" {
-                    let cell = Cell {
-                        char: Character::new(" ", 1),
-                        style: span.style,
-                        link: span.link.clone(),
-                        ..Cell::default()
+                    let cell = LayoutCell {
+                        cell: Cell {
+                            char: Character::new(" ", 1),
+                            style: span.style,
+                            link: span.link.clone(),
+                            ..Cell::default()
+                        },
+                        width: 1,
                     };
                     for _ in 0..8 {
                         text.push(cell.clone());
                     }
                     continue;
                 }
-                let width =
-                    u8::try_from(ctx.string_width(grapheme)).expect("grapheme width fits a u8");
-                text.push(Cell {
-                    char: Character::new(grapheme, width),
-                    style: span.style,
-                    link: span.link.clone(),
-                    ..Cell::default()
+                let width = u16::try_from(ctx.string_width(grapheme))
+                    .expect("DrawContext string widths are u16-bounded");
+                let render_width = u8::try_from(width).unwrap_or(0);
+                text.push(LayoutCell {
+                    cell: Cell {
+                        char: Character::new(grapheme, render_width),
+                        style: span.style,
+                        link: span.link.clone(),
+                        ..Cell::default()
+                    },
+                    width,
                 });
             }
         }
@@ -250,13 +267,13 @@ impl SoftwrapIterator {
     /// draw. Upstream backs up on the iteration it first sees the return, which
     /// underflows `hard_index` on any return not preceded by a full line, and
     /// we deliberately do not reproduce that.
-    fn next_hard_break(&mut self) -> Option<Vec<Cell>> {
+    fn next_hard_break(&mut self) -> Option<Vec<LayoutCell>> {
         if self.hard_index >= self.text.len() {
             return None;
         }
         let start = self.hard_index;
         while self.hard_index < self.text.len() {
-            let grapheme = self.text[self.hard_index].char.grapheme();
+            let grapheme = self.text[self.hard_index].cell.char.grapheme();
             // Grapheme segmentation keeps a `\r\n` pair together (Unicode
             // GB3), so the pair arrives as one cluster and is one break.
             if !matches!(grapheme, "\n" | "\r" | "\r\n") {
@@ -271,7 +288,7 @@ impl SoftwrapIterator {
                 && self
                     .text
                     .get(self.hard_index)
-                    .is_some_and(|cell| cell.char.grapheme() == "\n")
+                    .is_some_and(|cell| cell.cell.char.grapheme() == "\n")
             {
                 self.hard_index += 1;
             }
@@ -285,7 +302,7 @@ impl SoftwrapIterator {
     fn next_wrap(&self) -> usize {
         let mut i = self.index;
         while i < self.line.len() {
-            let grapheme = self.line[i].char.grapheme();
+            let grapheme = self.line[i].cell.char.grapheme();
             if grapheme == " " || grapheme == "\t" {
                 i += 1;
                 continue;
@@ -293,7 +310,7 @@ impl SoftwrapIterator {
             break;
         }
         while i < self.line.len() {
-            let grapheme = self.line[i].char.grapheme();
+            let grapheme = self.line[i].cell.char.grapheme();
             if grapheme == " " || grapheme == "\t" {
                 return i;
             }
@@ -314,7 +331,7 @@ impl SoftwrapIterator {
             None => {
                 let mut width: u16 = 0;
                 for cell in &self.line {
-                    width += u16::from(cell.char.width);
+                    width = width.saturating_add(cell.width);
                 }
                 self.index = self.line.len();
                 return Some(SoftLine {
@@ -329,8 +346,8 @@ impl SoftwrapIterator {
         while self.index < self.line.len() {
             let idx = self.next_wrap();
             // Own the word so we can advance `self.index` while reading it.
-            let word: Vec<Cell> = self.line[self.index..idx].to_vec();
-            let next_width: usize = word.iter().map(|c| usize::from(c.char.width)).sum();
+            let word: Vec<LayoutCell> = self.line[self.index..idx].to_vec();
+            let next_width: usize = word.iter().map(|c| usize::from(c.width)).sum();
 
             if usize::from(cur_width) + next_width > usize::from(max_width) {
                 // Trim leading whitespace to see if the word fits a line alone.
@@ -342,16 +359,21 @@ impl SoftwrapIterator {
                 if trimmed_width > usize::from(max_width) {
                     // Will not fit alone, so pack as many of its cells as fit.
                     for cell in &word {
-                        if usize::from(cur_width) + usize::from(cell.char.width)
-                            > usize::from(max_width)
+                        if usize::from(cur_width) + usize::from(cell.width) > usize::from(max_width)
                         {
+                            // A single cell may be wider than the viewport. Put
+                            // it on its own line so every yielded line advances.
+                            if cur_width == 0 {
+                                cur_width = cell.width;
+                                self.index += 1;
+                            }
                             let end = self.index;
                             return Some(SoftLine {
                                 width: cur_width,
                                 cells: self.line[start..end].to_vec(),
                             });
                         }
-                        cur_width += u16::from(cell.char.width);
+                        cur_width = cur_width.saturating_add(cell.width);
                         self.index += 1;
                     }
                 }
@@ -376,10 +398,10 @@ impl SoftwrapIterator {
 }
 
 /// Returns `cells` with trailing space/tab cells removed.
-fn trim_wsp_right(mut cells: Vec<Cell>) -> Vec<Cell> {
+fn trim_wsp_right(mut cells: Vec<LayoutCell>) -> Vec<LayoutCell> {
     let mut i = cells.len();
     while i > 0 {
-        let grapheme = cells[i - 1].char.grapheme();
+        let grapheme = cells[i - 1].cell.char.grapheme();
         if grapheme == " " || grapheme == "\t" {
             i -= 1;
             continue;
@@ -391,10 +413,10 @@ fn trim_wsp_right(mut cells: Vec<Cell>) -> Vec<Cell> {
 }
 
 /// Returns the length of `cells` after removing leading space/tab cells.
-fn trim_wsp_left_len(cells: &[Cell]) -> usize {
+fn trim_wsp_left_len(cells: &[LayoutCell]) -> usize {
     let mut i = 0;
     while i < cells.len() {
-        let grapheme = cells[i].char.grapheme();
+        let grapheme = cells[i].cell.char.grapheme();
         if grapheme == " " || grapheme == "\t" {
             i += 1;
             continue;
@@ -407,8 +429,10 @@ fn trim_wsp_left_len(cells: &[Cell]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Winsize;
     use crate::cell::Segment;
     use crate::gwidth;
+    use crate::vaxis::{Options as VaxisOptions, Vaxis};
     use crate::vxfw::MaxSize;
 
     fn ctx(max: MaxSize) -> DrawContext {
@@ -424,6 +448,18 @@ mod tests {
             },
             width_method: gwidth::Method::Unicode,
         }
+    }
+
+    fn oversized_wcwidth_grapheme(max_width: Option<u16>) -> (String, DrawContext) {
+        let grapheme = ["😀"; 129].join("\u{200d}");
+        let mut c = ctx(MaxSize {
+            width: max_width,
+            height: None,
+        });
+        c.width_method = gwidth::Method::Wcwidth;
+        assert_eq!(c.grapheme_iterator(&grapheme).count(), 1);
+        assert_eq!(c.string_width(&grapheme), 258);
+        (grapheme, c)
     }
 
     /// The lines a `RichText` breaks `text` into, read off the drawn surface.
@@ -598,5 +634,322 @@ mod tests {
         let surface = rich_text.draw(&c);
         // A word longer than the width is broken every `width` cells.
         assert_eq!(surface.size.height, len / width);
+    }
+
+    #[test]
+    fn oversized_grapheme_width_is_bounded_at_layout_limit() {
+        let grapheme = ["😀"; 32_768].join("\u{200d}");
+        let mut c = ctx(MaxSize {
+            width: None,
+            height: None,
+        });
+        c.width_method = gwidth::Method::Wcwidth;
+        assert_eq!(c.grapheme_iterator(&grapheme).count(), 1);
+        assert_eq!(c.string_width(&grapheme), usize::from(u16::MAX));
+
+        let mut rich_text = RichText::new(vec![Segment {
+            text: grapheme.clone(),
+            ..Segment::default()
+        }]);
+        let surface = rich_text.draw(&c);
+
+        assert_eq!(
+            surface.size,
+            Size {
+                width: u16::MAX,
+                height: 1,
+            }
+        );
+        let cell = surface.read_cell(0, 0);
+        assert_eq!(cell.char.grapheme(), grapheme);
+        assert_eq!(cell.char.width, 0);
+        drop(surface);
+
+        let mut rich_text = RichText::new(vec![Segment {
+            text: format!("{grapheme}X"),
+            ..Segment::default()
+        }]);
+        let surface = rich_text.draw(&c);
+        assert_eq!(
+            surface.size,
+            Size {
+                width: u16::MAX,
+                height: 1,
+            }
+        );
+        assert_eq!(surface.read_cell(0, 0).char.grapheme(), grapheme);
+        drop(surface);
+
+        let rendered = format!("A{grapheme}");
+        let mut clipped_ctx = c;
+        clipped_ctx.max.width = Some(2);
+        let mut rich_text = RichText {
+            softwrap: false,
+            overflow: Overflow::Clip,
+            ..RichText::new(vec![Segment {
+                text: rendered.clone(),
+                ..Segment::default()
+            }])
+        };
+        let surface = rich_text.draw(&clipped_ctx);
+        assert_eq!(
+            surface.size,
+            Size {
+                width: 2,
+                height: 1,
+            }
+        );
+        assert_eq!(surface.read_cell(0, 0).char.grapheme(), "A");
+        assert_eq!(surface.read_cell(1, 0).char.grapheme(), grapheme);
+        assert_eq!(surface.read_cell(1, 0).char.width, 0);
+        let mut vx = Vaxis::new(VaxisOptions::default());
+        let mut output = Vec::new();
+        vx.resize(
+            &mut output,
+            Winsize {
+                rows: 1,
+                cols: 2,
+                x_pixel: 0,
+                y_pixel: 0,
+            },
+        )
+        .expect("resize renderer");
+        output.clear();
+        surface.render(vx.window(), None);
+        vx.render(&mut output).expect("render surface");
+        assert!(
+            output
+                .windows(rendered.len())
+                .any(|window| window == rendered.as_bytes()),
+            "renderer must bound its cursor after a saturated measurement",
+        );
+
+        output.clear();
+        vx.pretty_print(&mut output).expect("pretty-print surface");
+        assert!(
+            output
+                .windows(rendered.len())
+                .any(|window| window == rendered.as_bytes()),
+            "pretty printer must bound its cursor after a saturated measurement",
+        );
+    }
+
+    #[test]
+    fn oversized_grapheme_preserves_layout_width_for_following_cells() {
+        let (grapheme, c) = oversized_wcwidth_grapheme(None);
+        let text = format!("{grapheme}X");
+        assert_eq!(c.grapheme_iterator(&text).count(), 2);
+        assert_eq!(c.string_width(&text), 259);
+
+        for softwrap in [false, true] {
+            let mut rich_text = RichText {
+                softwrap,
+                ..RichText::new(vec![Segment {
+                    text: text.clone(),
+                    ..Segment::default()
+                }])
+            };
+            let surface = rich_text.draw(&c);
+
+            assert_eq!(
+                surface.size,
+                Size {
+                    width: 259,
+                    height: 1,
+                },
+                "softwrap={softwrap}",
+            );
+            let oversized = surface.read_cell(0, 0);
+            assert_eq!(oversized.char.grapheme(), grapheme, "softwrap={softwrap}");
+            assert_eq!(oversized.char.width, 0, "softwrap={softwrap}");
+            let sibling = surface.read_cell(258, 0);
+            assert_eq!(sibling.char.grapheme(), "X", "softwrap={softwrap}");
+            assert_eq!(sibling.char.width, 1, "softwrap={softwrap}");
+        }
+    }
+
+    #[test]
+    fn oversized_grapheme_width_zero_is_remeasured_by_renderer() {
+        let (grapheme, c) = oversized_wcwidth_grapheme(None);
+        let text = format!("{grapheme}X");
+        let mut rich_text = RichText::new(vec![Segment {
+            text,
+            ..Segment::default()
+        }]);
+        let surface = rich_text.draw(&c);
+        let mut vx = Vaxis::new(VaxisOptions::default());
+        let mut output = Vec::new();
+        vx.resize(
+            &mut output,
+            Winsize {
+                rows: 1,
+                cols: 259,
+                x_pixel: 0,
+                y_pixel: 0,
+            },
+        )
+        .expect("resize renderer");
+        output.clear();
+        surface.render(vx.window(), None);
+        vx.render(&mut output).expect("render surface");
+        let rendered = format!("{grapheme}X");
+        assert!(
+            output
+                .windows(rendered.len())
+                .any(|window| window == rendered.as_bytes()),
+            "renderer must remeasure the width-zero grapheme and skip its covered cells",
+        );
+    }
+
+    #[test]
+    fn oversized_grapheme_does_not_cover_the_following_surface_row() {
+        let (grapheme, c) = oversized_wcwidth_grapheme(Some(257));
+        let mut rich_text = RichText::new(vec![Segment {
+            text: format!("{grapheme}X"),
+            ..Segment::default()
+        }]);
+        let surface = rich_text.draw(&c);
+        assert_eq!(
+            surface.size,
+            Size {
+                width: 257,
+                height: 2,
+            }
+        );
+        assert_eq!(surface.read_cell(0, 0).char.grapheme(), grapheme);
+        assert_eq!(surface.read_cell(0, 1).char.grapheme(), "X");
+
+        let mut modes_missing_following_row = Vec::new();
+        for pretty in [false, true] {
+            let mut vx = Vaxis::new(VaxisOptions::default());
+            let mut output = Vec::new();
+            vx.resize(
+                &mut output,
+                Winsize {
+                    rows: 2,
+                    cols: 257,
+                    x_pixel: 0,
+                    y_pixel: 0,
+                },
+            )
+            .expect("resize renderer");
+            output.clear();
+            surface.render(vx.window(), None);
+            if pretty {
+                vx.pretty_print(&mut output).expect("pretty-print surface");
+            } else {
+                vx.render(&mut output).expect("render surface");
+            }
+            assert!(
+                output
+                    .windows(grapheme.len())
+                    .any(|window| window == grapheme.as_bytes()),
+                "the oversized grapheme was not emitted (pretty={pretty})",
+            );
+            if !output.contains(&b'X') {
+                modes_missing_following_row.push(pretty);
+            }
+        }
+        assert!(
+            modes_missing_following_row.is_empty(),
+            "the following surface row was skipped (pretty modes: \
+             {modes_missing_following_row:?})",
+        );
+    }
+
+    #[test]
+    fn oversized_grapheme_wraps_using_private_layout_width() {
+        let (grapheme, c) = oversized_wcwidth_grapheme(Some(258));
+        let mut rich_text = RichText::new(vec![Segment {
+            text: format!("{grapheme}X"),
+            ..Segment::default()
+        }]);
+        let surface = rich_text.draw(&c);
+        assert_eq!(
+            surface.size,
+            Size {
+                width: 258,
+                height: 2,
+            }
+        );
+        assert_eq!(surface.read_cell(0, 0).char.grapheme(), grapheme);
+        assert_eq!(surface.read_cell(0, 0).char.width, 0);
+        assert_eq!(surface.read_cell(0, 1).char.grapheme(), "X");
+
+        let mut rich_text = RichText::new(vec![Segment {
+            text: format!("A{grapheme}"),
+            ..Segment::default()
+        }]);
+        let surface = rich_text.draw(&c);
+        assert_eq!(
+            surface.size,
+            Size {
+                width: 258,
+                height: 2,
+            }
+        );
+        assert_eq!(surface.read_cell(0, 0).char.grapheme(), "A");
+        assert_eq!(surface.read_cell(0, 1).char.grapheme(), grapheme);
+        assert_eq!(surface.read_cell(0, 1).char.width, 0);
+    }
+
+    #[test]
+    fn oversized_grapheme_ellipsis_uses_private_layout_width() {
+        let (grapheme, c) = oversized_wcwidth_grapheme(Some(258));
+        let mut rich_text = RichText {
+            softwrap: false,
+            ..RichText::new(vec![Segment {
+                text: format!("{grapheme}X"),
+                ..Segment::default()
+            }])
+        };
+        let surface = rich_text.draw(&c);
+        assert_eq!(
+            surface.size,
+            Size {
+                width: 258,
+                height: 1,
+            }
+        );
+        assert_eq!(surface.read_cell(0, 0).char.grapheme(), "…");
+    }
+
+    #[test]
+    fn grapheme_wider_than_viewport_advances_and_draws() {
+        let segment = Segment {
+            text: "😀".to_string(),
+            ..Segment::default()
+        };
+        let mut c = ctx(MaxSize {
+            width: Some(1),
+            height: None,
+        });
+        c.width_method = gwidth::Method::Wcwidth;
+        assert_eq!(c.string_width(&segment.text), 2);
+
+        // Inspect progress before calling the real draw surface so a regression
+        // fails immediately instead of driving the unbounded-height loop.
+        let mut iter = SoftwrapIterator::init(std::slice::from_ref(&segment), &c);
+        let line = iter.next().expect("one wrapped line");
+        assert_eq!(line.width, 2);
+        assert_eq!(line.cells.len(), 1);
+        assert!(iter.next().is_none());
+
+        for text_align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            let mut rich_text = RichText {
+                text_align,
+                ..RichText::new(vec![segment.clone()])
+            };
+            let surface = rich_text.draw(&c);
+            assert_eq!(
+                surface.size,
+                Size {
+                    width: 1,
+                    height: 1,
+                },
+                "{text_align:?}",
+            );
+            assert_eq!(surface.read_cell(0, 0).char.grapheme(), "😀");
+        }
     }
 }
