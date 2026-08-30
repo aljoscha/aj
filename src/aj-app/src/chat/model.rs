@@ -979,9 +979,9 @@ impl ChatState {
     /// transcript. The host is authoritative for concluding sub boxes.
     ///
     /// Deliberately kept: `last_usage_origin`. It anchors the trailing usage
-    /// event of a re-served assistant or compaction entry, whose
-    /// own durable frame the cursor invariant drops, so clearing it would
-    /// grow a second usage row on every re-attach.
+    /// event of a re-served assistant entry, whose own durable frame the cursor
+    /// invariant drops, so clearing it would grow a second usage row on every
+    /// re-attach. Compaction usage carries its checkpoint identity directly.
     ///
     /// NOTE: clearing `compaction_phase` costs the phase label of a
     /// compaction that is still running. Nothing re-seeds it: the `state`
