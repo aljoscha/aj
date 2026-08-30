@@ -7767,7 +7767,7 @@ impl ExitBanner {
 #[cfg(test)]
 mod tests {
     use std::io::{PipeWriter, Write};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar};
 
     use aj_app::chat::{EntryKind, NoticeLevel, SubAgentStatus, ToolStatus, reduce};
     use aj_app::session::AgentLifecycle;
@@ -13237,11 +13237,43 @@ mod tests {
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "picker open");
     }
 
-    /// Whether a controlled OAuth flow yields before persistence or returns
-    /// credentials immediately.
+    /// Whether a controlled OAuth flow yields forever or occupies one task poll
+    /// until the test releases it.
     enum LoginGate {
         Waiting,
-        Immediate,
+        NonYielding(Arc<NonYieldingLoginGate>),
+    }
+
+    /// A provider-side operation that cannot observe `JoinHandle::abort` while
+    /// it is running. Releasing it returns credentials in the same task poll,
+    /// allowing the immediately-ready credential lock and synchronous write to
+    /// commit before Tokio can enact the requested cancellation.
+    #[derive(Default)]
+    struct NonYieldingLoginGate {
+        released: StdMutex<bool>,
+        wake: Condvar,
+    }
+
+    impl NonYieldingLoginGate {
+        fn wait(&self) {
+            let mut released = self.released.lock().expect("login gate poisoned");
+            while !*released {
+                released = self.wake.wait(released).expect("login gate poisoned");
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().expect("login gate poisoned") = true;
+            self.wake.notify_all();
+        }
+    }
+
+    struct LoginGateRelease(Arc<NonYieldingLoginGate>);
+
+    impl Drop for LoginGateRelease {
+        fn drop(&mut self) {
+            self.0.release();
+        }
     }
 
     struct LoginTermination(Arc<AtomicBool>);
@@ -13278,7 +13310,7 @@ mod tests {
             self.started.notify_one();
             match &self.gate {
                 LoginGate::Waiting => std::future::pending().await,
-                LoginGate::Immediate => {}
+                LoginGate::NonYielding(gate) => gate.wait(),
             }
             Ok(self.credentials.clone())
         }
@@ -13565,18 +13597,28 @@ mod tests {
         assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
     }
 
-    /// Cancellation processed after reactivation committed joins the completed
-    /// task and reports success rather than contradicting the resolver winner.
-    #[tokio::test]
-    async fn cancel_login_after_reactivation_commit_reports_success() {
+    /// Esc during non-yielding provider work cannot close or report before the
+    /// task terminates. If that work returns credentials and the immediately
+    /// ready persistence path commits, the joined outcome is success. A parent
+    /// picker remains as a sentinel proving the login overlay closes once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drive_loop_esc_during_non_yielding_login_waits_for_committed_success() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut app, _writer, mut world, shell, _root) =
+        let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
         let provider_id = "cancel-reactivate";
         let account = "work";
-        let (started, _terminated) =
-            register_controlled_oauth(&world, provider_id, "new-access", LoginGate::Immediate)
-                .await;
+        let gate = Arc::new(NonYieldingLoginGate::default());
+        // A failed assertion must not strand a runtime worker in the condition
+        // variable while the test runtime tries to shut down.
+        let _release_on_drop = LoginGateRelease(Arc::clone(&gate));
+        let (started, terminated) = register_controlled_oauth(
+            &world,
+            provider_id,
+            "new-access",
+            LoginGate::NonYielding(Arc::clone(&gate)),
+        )
+        .await;
         world
             .auth
             .set_account(
@@ -13600,50 +13642,87 @@ mod tests {
             "fixture default account"
         );
 
-        let (tx, _rx) = unbounded_channel();
-        let mut login_session = None;
-        start_login(
-            &world,
-            &shell,
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenLoginSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "sentinel open");
+        *shell.borrow().auth_request.borrow_mut() = Some(AuthPickerRequest::Login {
+            provider_id: provider_id.to_string(),
+            provider_name: "Controlled OAuth".to_string(),
+        });
+
+        let auth = world.auth.clone();
+        let chat = Rc::clone(&world.chat);
+        let overlays = Rc::clone(&shell.borrow().overlays);
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        writer.write_all(b"x").expect("trigger auth request drain");
+        let mut drive = Box::pin(drive(
             &mut app,
-            &mut login_session,
-            &tx,
-            provider_id.to_string(),
-            "Controlled OAuth".to_string(),
-        );
-        started.notified().await;
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        ));
+
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !login_session
-                .as_ref()
-                .expect("login tracked")
-                .handle
-                .is_finished()
-            {
-                tokio::task::yield_now().await;
+            tokio::select! {
+                () = started.notified() => {}
+                _ = &mut drive => panic!("drive returned before provider start"),
             }
         })
         .await
-        .expect("reactivation task finishes");
-        let committed = world
-            .auth
+        .expect("provider enters non-yielding work");
+        writer.write_all(b"\x1b").expect("cancel login");
+        drop(writer);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut drive)
+                .await
+                .is_err(),
+            "drive returned before the non-yielding login terminated"
+        );
+        assert_eq!(
+            overlays.borrow().depth(),
+            2,
+            "login overlay closed before the termination barrier"
+        );
+        let pending_notices = notices_of(&chat.borrow());
+        assert!(
+            pending_notices.iter().all(|notice| {
+                !notice.contains("Logged in to Controlled OAuth")
+                    && !notice.contains("Login to Controlled OAuth cancelled")
+            }),
+            "login outcome reported before termination: {pending_notices:?}"
+        );
+        assert_eq!(
+            stored_auth_bytes(&auth),
+            Some(before.clone()),
+            "early auth write"
+        );
+        let still_old = auth
             .get_api_key(provider_id, None)
             .await
-            .expect("resolve committed default")
-            .expect("committed default present");
-        assert_eq!(committed.key, "new-access", "commit precondition");
+            .expect("resolve while login remains blocked")
+            .expect("old default remains present");
+        assert_eq!(still_old.key, "old-access", "early resolver change");
         assert_eq!(
-            committed.source,
+            still_old.source,
             CredentialSource::Account(account.to_string()),
-            "commit stayed in the selected default slot"
+            "blocked login changed the selected default slot"
         );
-        login_session
-            .as_ref()
-            .expect("login tracked")
-            .cancel
-            .store(true, Ordering::Relaxed);
 
-        cancel_login(&mut world, &shell, &mut app, &mut login_session).await;
-        assert!(login_session.is_none(), "completed session cleared");
+        gate.release();
+        let exit = tokio::time::timeout(Duration::from_secs(2), &mut drive)
+            .await
+            .expect("drive joins committed login")
+            .expect("drive exits without a fatal error");
+        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
+        drop(drive);
+        assert!(
+            terminated.load(Ordering::Relaxed),
+            "provider did not finish after release"
+        );
 
         let after = stored_auth_bytes(&world.auth).expect("reactivated auth.json");
         assert_ne!(after, before, "reactivation never committed");
@@ -13670,7 +13749,11 @@ mod tests {
             notices.iter().all(|notice| !notice.contains("cancelled")),
             "committed login also reported cancellation: {notices:?}"
         );
-        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "login dialog must close exactly once and leave its parent"
+        );
     }
 
     /// Confirming session info opens a "Loading…" overlay and parks a
