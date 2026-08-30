@@ -311,6 +311,14 @@ delete completeData.entries.find((entry) => entry.id === 'a1').message.usage.inc
 completeData.entries = completeData.entries.filter((entry) => entry.id !== 'k2');
 const completeElements = (await renderData(completeData)).elements;
 check('complete legacy header has no usage status', !completeElements['header-container'].innerHTML.includes('partial (recorded usage only)'));
+const explicitData = JSON.parse(JSON.stringify(sessionData));
+explicitData.entries = explicitData.entries.filter((entry) => entry.id !== 'k2');
+const explicitElements = (await renderData(explicitData)).elements;
+check('explicit incomplete usage marks the header', explicitElements['header-container'].innerHTML.includes('partial (recorded usage only)'));
+const missingCompactionData = JSON.parse(JSON.stringify(sessionData));
+delete missingCompactionData.entries.find((entry) => entry.id === 'a1').message.usage.incomplete;
+const missingCompactionElements = (await renderData(missingCompactionData)).elements;
+check('missing compaction usage marks the header', missingCompactionElements['header-container'].innerHTML.includes('partial (recorded usage only)'));
 has('system prompt', 'You are aj.');
 has('download JSONL button', 'download-json-btn');
 has('copy-link button', 'class="copy-link-btn"');
