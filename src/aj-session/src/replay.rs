@@ -62,7 +62,7 @@
 //!   feeds the sub-agent bracketing below.
 //! - [`ConversationEntryKind::Compaction`][]: an
 //!   [`AgentEvent::CompactionEnd`] marking the boundary, followed by a
-//!   checkpoint usage update when the entry records summarizer spend. This
+//!   [`AgentEvent::CompactionUsageUpdate`] when the entry records summarizer spend. This
 //!   mirrors the live path while keeping the footer occupancy at the reduced
 //!   size. The retained tail's assistant usage is stale. The summarized prefix
 //!   entries still replay in order, so
@@ -572,7 +572,7 @@ struct ReplayState {
     tool_calls: HashMap<String, (String, Value)>,
     /// Per-agent accumulated [`Usage`] running totals, used to
     /// build the `accumulated_*` fields on synthesized
-    /// [`AgentEvent::UsageUpdate`] events. The map starts empty and
+    /// usage-update events. The map starts empty and
     /// grows on demand the first time we see accounted usage for an
     /// [`AgentId`]; the value stored at `agent_id` is the
     /// accumulator *as observed before* the next delta is emitted,
@@ -968,7 +968,7 @@ impl ReplayState {
                     },
                 ));
                 if let Some(usage) = usage {
-                    self.project_usage(agent_id, usage, out);
+                    self.project_usage(agent_id, usage, true, out);
                 }
             }
             ConversationEntryKind::Message { message: agent_msg } => {
@@ -1074,7 +1074,13 @@ impl ReplayState {
 
     /// Emit one usage delta against this projection's pre-add accumulator,
     /// then fold it for the next event. Live accounting uses the same order.
-    fn project_usage(&mut self, agent_id: AgentId, delta: &Usage, out: &mut VecDeque<TaggedEvent>) {
+    fn project_usage(
+        &mut self,
+        agent_id: AgentId,
+        delta: &Usage,
+        checkpoint: bool,
+        out: &mut VecDeque<TaggedEvent>,
+    ) {
         let accumulated = self.usage_accumulators.entry(agent_id).or_default();
         let usage = TokenUsage {
             accumulated_input: accumulated.input,
@@ -1088,7 +1094,12 @@ impl ReplayState {
             turn_incomplete: delta.incomplete,
             accumulated_incomplete: accumulated.incomplete,
         };
-        out.push_back(transient(AgentEvent::UsageUpdate { agent_id, usage }));
+        let event = if checkpoint {
+            AgentEvent::CompactionUsageUpdate { agent_id, usage }
+        } else {
+            AgentEvent::UsageUpdate { agent_id, usage }
+        };
+        out.push_back(transient(event));
         accumulated.accumulate(delta);
     }
 
@@ -1166,7 +1177,7 @@ impl ReplayState {
         // and "reported zero" are the same state, and skipping on zero
         // would drop a `UsageUpdate` the live path did emit.
         if assistant.stop_reason.completed() {
-            self.project_usage(agent_id, &assistant.usage, out);
+            self.project_usage(agent_id, &assistant.usage, false, out);
         }
 
         // Track tool_call blocks so subsequent tool_result entries
@@ -2600,7 +2611,8 @@ mod tests {
         let updates: Vec<&TokenUsage> = events
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::UsageUpdate { usage, .. } => Some(usage),
+                AgentEvent::UsageUpdate { usage, .. }
+                | AgentEvent::CompactionUsageUpdate { usage, .. } => Some(usage),
                 _ => None,
             })
             .collect();
@@ -2608,6 +2620,22 @@ mod tests {
             updates.len(),
             3,
             "two assistants plus only the priced checkpoint"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::UsageUpdate { .. }))
+                .count(),
+            2,
+            "assistant usage keeps the protocol-1 event",
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::CompactionUsageUpdate { .. }))
+                .count(),
+            1,
+            "checkpoint spend uses the additive event",
         );
         let checkpoint = updates.last().expect("checkpoint usage");
         assert_eq!(checkpoint.accumulated_input, 200_000);

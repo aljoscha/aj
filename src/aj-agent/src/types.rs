@@ -2,9 +2,10 @@
 //!
 //! [`TokenUsage`], [`SubAgentUsage`], and [`UsageSummary`] are
 //! structured token-count snapshots the renderer formats.
-//! [`TokenUsage`] rides on [`crate::events::AgentEvent::UsageUpdate`]
-//! after every accounted assistant turn or out-of-band operation; the summary types are
-//! synthesized by the binary at end-of-session.
+//! [`TokenUsage`] rides on [`crate::events::AgentEvent::UsageUpdate`] or
+//! [`crate::events::AgentEvent::CompactionUsageUpdate`] after every accounted
+//! assistant turn or committed compaction. The summary types are synthesized by
+//! the binary at end-of-session.
 
 use serde::{Deserialize, Serialize};
 

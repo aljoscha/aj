@@ -384,6 +384,13 @@ pub enum AgentEvent {
         agent_id: AgentId,
         usage: TokenUsage,
     },
+    /// Cumulative usage for one committed compaction checkpoint. Kept as a
+    /// distinct wire event so protocol-1 clients that predate compaction spend
+    /// ignore it instead of treating the summarizer prompt as assistant context.
+    CompactionUsageUpdate {
+        agent_id: AgentId,
+        usage: TokenUsage,
+    },
 
     // --- Compaction --------------------------------------------------------
     /// Compaction has started for this agent. Renderers show a
@@ -468,6 +475,7 @@ impl AgentEvent {
             | Self::Error { agent_id, .. }
             | Self::StreamRetry { agent_id, .. }
             | Self::UsageUpdate { agent_id, .. }
+            | Self::CompactionUsageUpdate { agent_id, .. }
             | Self::CompactionStart { agent_id, .. }
             | Self::CompactionProgress { agent_id, .. }
             | Self::CompactionEnd { agent_id, .. }

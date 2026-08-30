@@ -588,19 +588,23 @@ impl Agent {
             turn_incomplete: delta.incomplete,
             accumulated_incomplete: accumulated.incomplete,
         };
+        let usage_event = if prerequisite.is_some() {
+            AgentEvent::CompactionUsageUpdate {
+                agent_id: self.agent_id,
+                usage,
+            }
+        } else {
+            AgentEvent::UsageUpdate {
+                agent_id: self.agent_id,
+                usage,
+            }
+        };
         let prerequisite = match prerequisite {
             Some(event) => self.bus.emit(event).await,
             None => Ok(()),
         };
         let delivered = match prerequisite {
-            Ok(()) => {
-                self.bus
-                    .emit(AgentEvent::UsageUpdate {
-                        agent_id: self.agent_id,
-                        usage,
-                    })
-                    .await
-            }
+            Ok(()) => self.bus.emit(usage_event).await,
             Err(err) => Err(err),
         };
         self.session_state.accumulate_usage(delta);
@@ -4397,6 +4401,7 @@ mod event_protocol_tests {
             event_kind: &'static str,
         },
         UsageUpdate(AgentId),
+        CompactionUsageUpdate(AgentId),
         Other(&'static str),
     }
 
@@ -4457,6 +4462,9 @@ mod event_protocol_tests {
                 agent_id, attempt, ..
             } => EventLabel::StreamRetry(*agent_id, *attempt),
             AgentEvent::UsageUpdate { agent_id, .. } => EventLabel::UsageUpdate(*agent_id),
+            AgentEvent::CompactionUsageUpdate { agent_id, .. } => {
+                EventLabel::CompactionUsageUpdate(*agent_id)
+            }
             AgentEvent::TurnEnd { .. } => EventLabel::Other("TurnEnd"),
             AgentEvent::MessageStart { agent_id, message } => EventLabel::Message {
                 agent_id: *agent_id,

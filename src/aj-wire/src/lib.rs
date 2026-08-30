@@ -28,6 +28,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// speak for the hosts behind it.
 pub const ARCHIVE_CAPABILITY: &str = "archive";
 
+/// The capability a host declares when compaction spend is published through
+/// the additive `compaction_usage_update` event. Older clients ignore that
+/// unknown event instead of folding it as assistant-turn context.
+pub const COMPACTION_USAGE_CAPABILITY: &str = "compaction_usage";
+
 /// A creator-selected model, resolved against the receiving host's catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSelection {
@@ -1805,6 +1810,7 @@ fn is_known_event_type(event_type: &str) -> bool {
             | "error"
             | "stream_retry"
             | "usage_update"
+            | "compaction_usage_update"
             | "compaction_start"
             | "compaction_progress"
             | "compaction_end"

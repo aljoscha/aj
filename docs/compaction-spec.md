@@ -485,8 +485,10 @@ changes neither).
 
 Normal assistant terminals and committed compactions share one live accounting
 transition. `account_usage(delta, prerequisite)` snapshots the pre-add
-accumulator, delivers an optional prerequisite, then emits one cumulative
-`UsageUpdate` carrying that snapshot plus `delta`. A rejected prerequisite
+accumulator, delivers an optional prerequisite, then emits one cumulative usage
+event carrying that snapshot plus `delta`. Normal turns use `UsageUpdate`.
+Checkpoint prerequisites use the additive `CompactionUsageUpdate`, which older
+clients ignore instead of treating summarizer input as assistant context. A rejected prerequisite
 suppresses the dependent update so no listener can see checkpoint usage without
 its `CompactionEnd`. The complete `Usage` is still folded into
 `Agent::accumulated_usage` because listener failure cannot erase spend that
@@ -515,7 +517,7 @@ CompactionEnd {
     reason: CompactionReason,
     tokens_before: u64,
     tokens_after: u64,
-    /// Whether a checkpoint-owned UsageUpdate follows this event.
+    /// Whether a checkpoint-owned CompactionUsageUpdate follows this event.
     has_usage: bool,
     summary: Option<String>,
     error: Option<String>,
@@ -624,7 +626,7 @@ Steps:
 6. Compute `tokens_after` (occupancy of the reseeded projection), then pass the
    checkpoint-tagged `CompactionEnd` and `summarizer_usage` to the Agent's
    shared accounting operation. This emits the end followed by one cumulative
-   `UsageUpdate` and updates the shutdown accumulator. A rejected end suppresses
+   `CompactionUsageUpdate` and updates the shutdown accumulator. A rejected end suppresses
    only the dependent update, not the already-incurred accumulator delta.
 7. Return `Compacted { tokens_before, tokens_after, summary }`.
 
@@ -825,7 +827,7 @@ renderer events so a resumed session looks like a live one. The
   compaction (the reduced projection's occupancy). The retained tail's usage
   is stale, so this keeps a resumed footer from showing pre-compaction
   occupancy.
-- One transient cumulative `UsageUpdate` when the checkpoint's `usage` is
+- One transient cumulative `CompactionUsageUpdate` when the checkpoint's `usage` is
   `Some`. It carries the replay accumulator before the compaction plus the
   checkpoint delta, then advances that accumulator. Legacy `usage: None`
   sets `has_usage: false` and projects no spend, so stale-cursor replay leaves
@@ -914,7 +916,7 @@ Log + projection (`aj-session::log`):
 Replay: a `Compaction` entry yields the summary row; the prefix entries
 still replay into scrollback.
 
-Agent (`aj-agent`): `complete_oneshot` emits no `Message*`/`UsageUpdate`
+Agent (`aj-agent`): `complete_oneshot` emits no message or usage event
 and leaves the transcript untouched (scripted provider);
 `reseed_transcript` replaces the transcript. Event serialization cases
 for `CompactionStart`/`End`.

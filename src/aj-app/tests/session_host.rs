@@ -6029,7 +6029,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
             Frame::Event {
                 durability, event, ..
             } => match event.known() {
-                Some(AgentEvent::UsageUpdate { usage, .. })
+                Some(AgentEvent::CompactionUsageUpdate { usage, .. })
                     if usage.turn_input == compaction_total[0] =>
                 {
                     Some((durability, usage))
@@ -6056,6 +6056,15 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
             checkpoint_updates[0].1.turn_cache_read,
         ],
         compaction_total,
+    );
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::UsageUpdate { usage, .. })
+                    if usage.turn_input == compaction_total[0])
+        )),
+        "checkpoint spend never uses the assistant event older clients understand",
     );
 
     let handles = harness
@@ -6395,7 +6404,7 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         !frames.iter().any(|frame| matches!(
             frame,
             Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::UsageUpdate { usage, .. })
+                if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate { usage, .. })
                     if usage.turn_input == summarizer[0])
         )),
         "uncommitted summarizer usage reached the live fold",
@@ -9310,20 +9319,21 @@ async fn an_unreadable_sidecar_does_not_cost_a_live_session_its_archived_bit() {
     harness.host.shutdown().await;
 }
 
-/// The host says it serves the archive route, so a peer can tell a host that
-/// does not know the route from one that refused a request (spec 6.10).
+/// The host advertises each additive protocol-1 behavior it serves.
 #[tokio::test]
-async fn the_host_declares_the_archive_capability() {
+async fn the_host_declares_its_additive_capabilities() {
     let harness = Harness::new(Vec::new());
-    assert!(
-        harness
-            .host
-            .hello()
-            .capabilities
-            .contains(&aj_wire::ARCHIVE_CAPABILITY.to_string()),
-        "hello: {:?}",
-        harness.host.hello(),
-    );
+    let hello = harness.host.hello();
+    let capabilities = &hello.capabilities;
+    for expected in [
+        aj_wire::ARCHIVE_CAPABILITY,
+        aj_wire::COMPACTION_USAGE_CAPABILITY,
+    ] {
+        assert!(
+            capabilities.iter().any(|capability| capability == expected),
+            "missing {expected:?}: {capabilities:?}",
+        );
+    }
     harness.host.shutdown().await;
 }
 

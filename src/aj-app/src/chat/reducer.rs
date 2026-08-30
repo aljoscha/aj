@@ -332,7 +332,8 @@ pub fn reduce(
         }
 
         // ---- Accounted token usage -------------------------------------------
-        AgentEvent::UsageUpdate { agent_id, usage } => {
+        AgentEvent::UsageUpdate { agent_id, usage }
+        | AgentEvent::CompactionUsageUpdate { agent_id, usage } => {
             let origin = state
                 .render
                 .get(&agent_id)

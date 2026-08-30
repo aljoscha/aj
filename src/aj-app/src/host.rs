@@ -60,10 +60,10 @@ use aj_session::{
     normalize_tag, project_suffix, validate_session_env,
 };
 use aj_wire::{
-    ARCHIVE_CAPABILITY, AgentQueue, Cursor, DurableEvent, Frame, Hello, MAX_HOST_NAME_BYTES,
-    ModelSelection, PROTOCOL_VERSION, QueueCounts, QueueState, SessionList, SessionSettings,
-    SessionSummary, SessionTree, TaskDetails, TaskSummary, TaskTable, TreeSegment,
-    normalize_host_name,
+    ARCHIVE_CAPABILITY, AgentQueue, COMPACTION_USAGE_CAPABILITY, Cursor, DurableEvent, Frame,
+    Hello, MAX_HOST_NAME_BYTES, ModelSelection, PROTOCOL_VERSION, QueueCounts, QueueState,
+    SessionList, SessionSettings, SessionSummary, SessionTree, TaskDetails, TaskSummary, TaskTable,
+    TreeSegment, normalize_host_name,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
@@ -772,7 +772,10 @@ impl SessionHost {
     pub fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
-            capabilities: vec![ARCHIVE_CAPABILITY.to_string()],
+            capabilities: vec![
+                ARCHIVE_CAPABILITY.to_string(),
+                COMPACTION_USAGE_CAPABILITY.to_string(),
+            ],
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.host_id.clone(),
             working_directory: Some(self.inner.working_directory.clone()),

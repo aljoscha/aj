@@ -425,8 +425,8 @@ Every frame is in exactly one class:
 
   At most one frame per log entry is durable. An entry can project
   several events (a tool-result entry projects a tool bracket around its
-  `MessageEnd`, and assistant or priced compaction entries project a trailing
-  `UsageUpdate`) and
+  `MessageEnd`, assistant entries project a trailing `UsageUpdate`, and priced
+  compactions project a trailing `CompactionUsageUpdate`) and
   only one of them carries the tag, in both live flow and backfill, so
   that "the cursor is at seq N" stays a statement about entries.
 
@@ -461,7 +461,8 @@ Per session the host maintains:
   compares against, and the last it has **committed**, which is what it
   offers on re-attach. An applied seq is committed once a later durable
   frame or a `caught_up` arrives, because a log entry can project a
-  trailing untagged event (an assistant or compaction entry's `UsageUpdate`) and a
+  trailing untagged event (an assistant `UsageUpdate` or
+  `CompactionUsageUpdate`) and a
   connection that drops in between would otherwise leave the client
   claiming an entry it only partly applied. Offering an older cursor is
   always safe: the server serves one more entry and idempotent
@@ -1127,7 +1128,8 @@ especially with long-lived VMs. Rules:
   one string per feature with the surface it covers (an endpoint, a
   frame kind, an event type) and who advertises
   it: `archive` covers `POST /v1/sessions/{id}/archive` (section
-  6.6), advertised by hosts. A capability is self-description, never
+  6.6), and `compaction_usage` covers the `compaction_usage_update` event.
+  Both are advertised by hosts. A capability is self-description, never
   a gate: probing an endpoint (404 vs 2xx) is a valid fallback check,
   and what a peer does with the list is the peer's business. A
   gateway's `hello` advertises only what the gateway itself serves

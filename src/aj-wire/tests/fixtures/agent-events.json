@@ -222,7 +222,22 @@
     "reason": "overflow",
     "tokens_before": 1000,
     "tokens_after": 250,
+    "has_usage": true,
     "summary": "summary"
+  },
+  {
+    "type": "compaction_usage_update",
+    "agent_id": "main",
+    "usage": {
+      "accumulated_input": 10,
+      "turn_input": 20,
+      "accumulated_output": 30,
+      "turn_output": 40,
+      "accumulated_cache_write": 50,
+      "turn_cache_write": 60,
+      "accumulated_cache_read": 70,
+      "turn_cache_read": 80
+    }
   },
   {
     "type": "queue_update",

@@ -218,7 +218,8 @@ encoded in `EventPump::handle` and the message/tool handlers. Routing is by
 | `ToolExecutionEnd` | Skip `agent`. Build the entry on miss (replay path: no Start seen, args empty), then set `status: Done{is_error}`, `details`, `content`. The build-on-miss branch replicates the live bookkeeping (record `tool_index`, clear `current_assistant`). |
 | `Notice` / `Warning` / `Error` | Append `NoticeEntry` with level `Info` / `Warning` / `Error`. |
 | `StreamRetry` | Append `NoticeEntry{Warning}` with the retry cadence line (the failed attempt's error already rendered from its `MessageEnd`). |
-| `UsageUpdate` | Append or update a `TurnUsage` row keyed to the preceding assistant or compaction checkpoint. Assistant usage folds into `footers.record_turn_usage(id, usage)`. Compaction usage advances cumulative spend but does not replace context occupancy with the summarizer's prompt size. |
+| `UsageUpdate` | Append or update a `TurnUsage` row keyed to the preceding assistant and fold it into `footers.record_turn_usage(id, usage)`. |
+| `CompactionUsageUpdate` | Append or update a `TurnUsage` row keyed to the preceding checkpoint. Advance cumulative spend without replacing context occupancy with the summarizer's prompt size. The distinct additive event is ignored safely by older clients. |
 | `CompactionStart` | `lifecycle.compacting.insert(id)`; the view labels the spinner "Compacting context...". |
 | `CompactionProgress` | Record the phase in `ChatState.compaction_phase` for the view's spinner label (`Summarizing` / `SummarizingTurnPrefix` / `Saving`). No transcript entry. |
 | `CompactionEnd` | `lifecycle.compacting.remove(id)`. On `error`, append `Notice{Warning}` "Compaction failed: ...". On `summary` (success), append `CompactionEntry`, install its durable id as the following usage origin only when `has_usage`, and call `footers.set_context_tokens(id, tokens_after)`. On neither, append `Notice{Info}` "Compaction canceled." |

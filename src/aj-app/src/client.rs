@@ -196,7 +196,7 @@ pub struct SessionClient {
     epoch: Option<String>,
     /// The seq offered on re-attach. It lags `applied` by one durable
     /// frame, because a log entry can project trailing untagged events (an
-    /// assistant or compaction entry's `UsageUpdate`, a tool-result entry's bracket) and
+    /// assistant `UsageUpdate`, a `CompactionUsageUpdate`, or a tool-result entry's bracket) and
     /// a drop in between would otherwise make the client claim an entry it
     /// only half applied.
     committed: Option<u64>,
