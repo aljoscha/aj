@@ -128,7 +128,7 @@ impl Drop for PersistencePermit {
 /// append rather than inferring it at delivery time, which would race the
 /// concurrent appends a background sub-agent makes.
 ///
-/// `CompactionEnd` and its trailing checkpoint `UsageUpdate` are emitted while
+/// `CompactionEnd` and its trailing `CompactionUsageUpdate` are emitted while
 /// the append still holds the log guard. Otherwise another durable append can
 /// land between the checkpoint and those events, making forwarded seqs
 /// non-monotone or replacing the usage row's checkpoint origin. A bus listener

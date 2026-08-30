@@ -459,8 +459,8 @@ pub fn reduce(
                     }
                 }
                 // Refresh occupancy directly to the post-compaction estimate.
-                // The following UsageUpdate accounts summarizer spend and is
-                // deliberately ignored by the occupancy fold above.
+                // The following CompactionUsageUpdate accounts summarizer
+                // spend and is deliberately ignored by the occupancy fold above.
                 state.footers.set_context_tokens(agent_id, tokens_after);
             } else {
                 record_notice(

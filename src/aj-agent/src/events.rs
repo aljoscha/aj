@@ -371,9 +371,8 @@ pub enum AgentEvent {
         error: String,
     },
 
-    /// Cumulative token-usage snapshot, emitted once for each accounted
-    /// assistant turn or committed out-of-band operation. The [`TokenUsage`]
-    /// payload carries both this operation's delta (`turn_*`) and the running totals
+    /// Cumulative token-usage snapshot emitted for each accounted assistant
+    /// turn. The [`TokenUsage`] payload carries both this turn's delta (`turn_*`) and the running totals
     /// (`accumulated_*`, which the agent maintains across operations), so a
     /// renderer can show a usage indicator without re-aggregating from
     /// [`AgentEvent::MessageEnd`] payloads. Distinct from
@@ -422,9 +421,9 @@ pub enum AgentEvent {
     /// - both `None` — the run ended without writing (cancelled before
     ///   the persist step).
     ///
-    /// `has_usage` says a checkpoint-owned [`AgentEvent::UsageUpdate`] follows
-    /// this event. It is false for unsuccessful runs and legacy checkpoints
-    /// whose spend is unknown.
+    /// `has_usage` says a checkpoint-owned
+    /// [`AgentEvent::CompactionUsageUpdate`] follows this event. It is false for
+    /// unsuccessful runs and legacy checkpoints whose spend is unknown.
     ///
     /// Transient — not persisted; the conversation log's compaction
     /// entry is the durable record.

@@ -561,10 +561,11 @@ impl Agent {
 
     /// Account for one successful priced operation in this agent's live total.
     ///
-    /// The emitted [`AgentEvent::UsageUpdate`] carries the accumulator snapshot
-    /// from before `delta`, matching the event shape used by assistant turns.
-    /// When `prerequisite` is present, it is delivered first and a rejected
-    /// prerequisite suppresses the dependent usage event. After delivery is
+    /// The emitted usage event carries the accumulator snapshot from before
+    /// `delta`. Assistant turns emit [`AgentEvent::UsageUpdate`]. A supplied
+    /// checkpoint prerequisite emits [`AgentEvent::CompactionUsageUpdate`] so
+    /// older clients ignore the additive event safely. The prerequisite is
+    /// delivered first, and rejection suppresses the dependent usage event. After delivery is
     /// attempted, `delta` is folded into
     /// [`Agent::accumulated_usage`] even if a listener rejects the event: the
     /// spend already happened and callers must not retry it. Callers that also
