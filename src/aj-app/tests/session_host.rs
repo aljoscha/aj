@@ -6141,6 +6141,97 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     revived.host.shutdown().await;
 }
 
+/// Re-serving a terminal legacy checkpoint must not turn the preceding
+/// assistant's usage into invented checkpoint spend.
+#[tokio::test]
+async fn legacy_compaction_without_usage_stays_unknown_across_an_older_cursor() {
+    fn usage_sources(chat: &ChatState) -> Vec<Option<String>> {
+        chat.transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                aj_app::chat::EntryKind::TurnUsage(usage) => Some(usage.source_entry.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let harness = Harness::new(vec![finalized_text_message_with_usage("answer", 123)]);
+    let session = harness.create().await;
+    let mut warm = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "question").await;
+    warm.pump_until_idle().await;
+
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let checkpoint = {
+        let mut log = handles.log.lock().await;
+        let first_kept = log
+            .entries_in_order()
+            .into_iter()
+            .find(|entry| {
+                matches!(
+                    &entry.entry,
+                    aj_session::ConversationEntryKind::Message { .. }
+                )
+            })
+            .expect("a retained message")
+            .id
+            .clone();
+        log.append_compaction(
+            ThreadFilter::USER,
+            "legacy summary".to_string(),
+            first_kept,
+            123,
+            None,
+            None,
+        )
+        .expect("append legacy checkpoint")
+    };
+
+    let mut client = Client::attach(&harness.host, &session).await;
+    let sources = usage_sources(&client.chat);
+    assert_eq!(sources.len(), 1, "only the assistant owns recorded usage");
+    assert!(
+        !sources
+            .iter()
+            .any(|source| source.as_deref() == Some(checkpoint.id.as_str())),
+        "legacy None does not create a checkpoint usage row",
+    );
+    assert_eq!(
+        client.chat.usage_summary().main_agent_usage.input_tokens,
+        123,
+    );
+
+    let epoch = client.client.cursor().expect("attached cursor").epoch;
+    client
+        .reattach(&harness.host, aj_wire::Cursor { epoch, seq: 0 })
+        .await;
+
+    assert_eq!(usage_sources(&client.chat), sources);
+    assert_eq!(
+        client.chat.usage_summary().main_agent_usage.input_tokens,
+        123,
+    );
+    assert_eq!(
+        client
+            .chat
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter(|entry| matches!(&entry.kind, aj_app::chat::EntryKind::Compaction(_)))
+            .count(),
+        1,
+        "the re-served checkpoint updates its existing row",
+    );
+    harness.host.shutdown().await;
+}
+
 /// A checkpoint append failure after successful summarization cannot publish or
 /// accumulate spend that has no durable owner.
 #[tokio::test]

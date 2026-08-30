@@ -128,11 +128,12 @@ impl Drop for PersistencePermit {
 /// append rather than inferring it at delivery time, which would race the
 /// concurrent appends a background sub-agent makes.
 ///
-/// The emit has to happen while the append still holds the log guard.
-/// Otherwise another durable append can land between the checkpoint and
-/// its event, and the forwarded seqs stop being monotone, which spec
-/// section 5 forbids. A bus listener must therefore not take the log lock
-/// for `CompactionEnd`, or it deadlocks against the emitting append.
+/// `CompactionEnd` and its trailing checkpoint `UsageUpdate` are emitted while
+/// the append still holds the log guard. Otherwise another durable append can
+/// land between the checkpoint and those events, making forwarded seqs
+/// non-monotone or replacing the usage row's checkpoint origin. A bus listener
+/// must therefore not take the log lock for either event in that sequence, or
+/// it deadlocks against the emitting append.
 ///
 /// One slot: at most one compaction runs per session at a time, and a
 /// filed entry is taken by the very next `CompactionEnd`.
@@ -252,11 +253,11 @@ fn persisting_forwarder_inner(
                 let _ = sink.send(TaggedEvent { entry, event });
             } else {
                 // NOTE: this branch must not take the log lock. The
-                // compaction run emits `CompactionEnd` while holding it
-                // (see [`AppendHandoff`]), so locking here would deadlock
-                // against the very append the event belongs to. That same
-                // emit-under-the-guard is what keeps `CompactionEnd`
-                // ordered without a lock of our own.
+                // compaction run emits `CompactionEnd` and its trailing usage
+                // while holding it (see [`AppendHandoff`]), so locking here
+                // would deadlock against the very append the events belong to.
+                // That same emit-under-the-guard keeps them ordered without a
+                // lock of our own.
                 let entry = match &event {
                     AgentEvent::CompactionEnd { .. } => handoff.take(),
                     _ => None,
@@ -1075,6 +1076,7 @@ mod tests {
             reason: aj_agent::events::CompactionReason::Manual,
             tokens_before: 100,
             tokens_after: 10,
+            has_usage: false,
             summary: Some("summary".into()),
             error: None,
         })
@@ -1193,6 +1195,7 @@ mod tests {
             reason: aj_agent::events::CompactionReason::Manual,
             tokens_before: 100,
             tokens_after: 10,
+            has_usage: false,
             summary: Some("earlier".into()),
             error: None,
         })
@@ -1205,6 +1208,7 @@ mod tests {
             reason: aj_agent::events::CompactionReason::Threshold,
             tokens_before: 100,
             tokens_after: 100,
+            has_usage: false,
             summary: None,
             error: Some("boom".into()),
         })

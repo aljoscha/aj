@@ -60,7 +60,7 @@
 //!   log-level creation metadata, not a state transition on any thread.
 //! - [`ConversationEntryKind::SubAgentSpawn`]: no notice; the entry
 //!   feeds the sub-agent bracketing below.
-//! - [`ConversationEntryKind::Compaction`]: an
+//! - [`ConversationEntryKind::Compaction`][]: an
 //!   [`AgentEvent::CompactionEnd`] marking the boundary, followed by a
 //!   checkpoint usage update when the entry records summarizer spend. This
 //!   mirrors the live path while keeping the footer occupancy at the reduced
@@ -962,6 +962,7 @@ impl ReplayState {
                         reason: CompactionReason::Manual,
                         tokens_before: *tokens_before,
                         tokens_after,
+                        has_usage: usage.is_some(),
                         summary: Some(summary.clone()),
                         error: None,
                     },

@@ -484,12 +484,15 @@ changes neither).
 ### 6.3 `Agent::account_usage`
 
 Normal assistant terminals and committed compactions share one live accounting
-transition. `account_usage(delta)` snapshots the pre-add accumulator, emits one
-cumulative `UsageUpdate` carrying that snapshot plus `delta`, then folds the
-complete `Usage` into `Agent::accumulated_usage`. A listener failure does not
-erase spend that already happened, and callers must not retry the operation.
-Compaction invokes it only after the checkpoint append and tagged
-`CompactionEnd` succeed.
+transition. `account_usage(delta, prerequisite)` snapshots the pre-add
+accumulator, delivers an optional prerequisite, then emits one cumulative
+`UsageUpdate` carrying that snapshot plus `delta`. A rejected prerequisite
+suppresses the dependent update so no listener can see checkpoint usage without
+its `CompactionEnd`. The complete `Usage` is still folded into
+`Agent::accumulated_usage` because listener failure cannot erase spend that
+already happened, and callers must not retry the operation. Compaction invokes
+it only after the checkpoint append commits and supplies the tagged
+`CompactionEnd` as the prerequisite.
 
 ### 6.4 Compaction events
 
@@ -512,6 +515,8 @@ CompactionEnd {
     reason: CompactionReason,
     tokens_before: u64,
     tokens_after: u64,
+    /// Whether a checkpoint-owned UsageUpdate follows this event.
+    has_usage: bool,
     summary: Option<String>,
     error: Option<String>,
 },
@@ -616,10 +621,11 @@ Steps:
 5. **Reseed**: re-linearize from the new head → `agent_messages()`
    (now compaction-aware) → `reseed_transcript(...)` on the borrowed
    agent, trimming a trailing failed assistant (below).
-6. Compute `tokens_after` (occupancy of the reseeded projection), emit the
-   checkpoint-tagged `CompactionEnd`, then pass `summarizer_usage` to the
-   Agent's shared accounting operation. This emits one cumulative
-   `UsageUpdate` and updates the shutdown accumulator.
+6. Compute `tokens_after` (occupancy of the reseeded projection), then pass the
+   checkpoint-tagged `CompactionEnd` and `summarizer_usage` to the Agent's
+   shared accounting operation. This emits the end followed by one cumulative
+   `UsageUpdate` and updates the shutdown accumulator. A rejected end suppresses
+   only the dependent update, not the already-incurred accumulator delta.
 7. Return `Compacted { tokens_before, tokens_after, summary }`.
 
 Cancellation (`cancel`) is selected against the `complete_oneshot`
@@ -813,8 +819,8 @@ this session" entry point is needed.
 renderer events so a resumed session looks like a live one. The
 `Compaction` arm of `ReplayState::project_entry` emits:
 
-- `CompactionEnd { reason: Manual, tokens_before, tokens_after, summary:
-  Some(summary), error: None }`, where `tokens_after` is
+- `CompactionEnd { reason: Manual, tokens_before, tokens_after, has_usage,
+  summary: Some(summary), error: None }`, where `tokens_after` is
   `estimate_conversation_context` of the user thread linearized up to the
   compaction (the reduced projection's occupancy). The retained tail's usage
   is stale, so this keeps a resumed footer from showing pre-compaction
@@ -822,7 +828,8 @@ renderer events so a resumed session looks like a live one. The
 - One transient cumulative `UsageUpdate` when the checkpoint's `usage` is
   `Some`. It carries the replay accumulator before the compaction plus the
   checkpoint delta, then advances that accumulator. Legacy `usage: None`
-  projects no spend.
+  sets `has_usage: false` and projects no spend, so stale-cursor replay leaves
+  the preceding accounted source intact.
 
 Crucially, replay's other arms are unaffected: the summarized prefix
 entries are still in the log and `replay` still walks them in order, so

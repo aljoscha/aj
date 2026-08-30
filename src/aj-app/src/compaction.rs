@@ -209,31 +209,31 @@ pub async fn run_compaction(
         agent.reseed_transcript(messages);
 
         handoff.file(checkpoint);
-        // The emit happens under the guard on purpose: a durable append
-        // landing between the checkpoint and its event (a background
-        // sub-agent's `MessageEnd`) would make the forwarded seqs
-        // non-monotone, which spec section 5 forbids. A listener must
-        // therefore not take the log lock for `CompactionEnd`.
+        // Both events happen under the guard on purpose: a durable append
+        // landing between the checkpoint, its CompactionEnd, and its usage
+        // would make the forwarded seqs non-monotone or replace the reducer's
+        // usage origin. A listener must not take the log lock for either event.
+        // account_usage suppresses the dependent update if CompactionEnd fails,
+        // while still retaining spend in the shutdown accumulator.
         if let Err(err) = agent
-            .emit_event(AgentEvent::CompactionEnd {
-                agent_id: AgentId::Main,
-                reason,
-                tokens_before: plan.tokens_before,
-                tokens_after: after,
-                summary: Some(summary),
-                error: None,
-            })
+            .account_usage(
+                &summarizer_usage,
+                Some(AgentEvent::CompactionEnd {
+                    agent_id: AgentId::Main,
+                    reason,
+                    tokens_before: plan.tokens_before,
+                    tokens_after: after,
+                    has_usage: true,
+                    summary: Some(summary),
+                    error: None,
+                }),
+            )
             .await
         {
-            tracing::warn!("failed to emit CompactionEnd: {err}");
-        }
-
-        // The checkpoint is the durable owner of this out-of-band spend.
-        // Account only after its append and tagged CompactionEnd have
-        // completed, while the same guard prevents another main-thread event
-        // from replacing the reducer's checkpoint usage origin in between.
-        if let Err(err) = agent.account_usage(&summarizer_usage).await {
-            tracing::warn!("failed to emit committed compaction usage: {err}");
+            // If a listener rejected CompactionEnd before the tagging forwarder,
+            // clear the undelivered handoff so it cannot tag a later checkpoint.
+            let _ = handoff.take();
+            tracing::warn!("failed to emit committed compaction events: {err}");
         }
         after
     };
@@ -358,6 +358,7 @@ async fn finish_failed(
             reason,
             tokens_before,
             tokens_after: 0,
+            has_usage: false,
             summary: None,
             error: Some(error.clone()),
         })
@@ -383,6 +384,7 @@ async fn finish_canceled(
             reason,
             tokens_before,
             tokens_after: 0,
+            has_usage: false,
             summary: None,
             error: None,
         })

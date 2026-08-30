@@ -563,12 +563,18 @@ impl Agent {
     ///
     /// The emitted [`AgentEvent::UsageUpdate`] carries the accumulator snapshot
     /// from before `delta`, matching the event shape used by assistant turns.
-    /// After delivery is attempted, `delta` is folded into
+    /// When `prerequisite` is present, it is delivered first and a rejected
+    /// prerequisite suppresses the dependent usage event. After delivery is
+    /// attempted, `delta` is folded into
     /// [`Agent::accumulated_usage`] even if a listener rejects the event: the
     /// spend already happened and callers must not retry it. Callers that also
     /// persist the operation must invoke this only after its durable record
     /// commits.
-    pub async fn account_usage(&self, delta: &Usage) -> Result<(), TurnError> {
+    pub async fn account_usage(
+        &self,
+        delta: &Usage,
+        prerequisite: Option<AgentEvent>,
+    ) -> Result<(), TurnError> {
         let accumulated = self.session_state.accumulated_usage();
         let usage = TokenUsage {
             accumulated_input: accumulated.input,
@@ -582,13 +588,21 @@ impl Agent {
             turn_incomplete: delta.incomplete,
             accumulated_incomplete: accumulated.incomplete,
         };
-        let delivered = self
-            .bus
-            .emit(AgentEvent::UsageUpdate {
-                agent_id: self.agent_id,
-                usage,
-            })
-            .await;
+        let prerequisite = match prerequisite {
+            Some(event) => self.bus.emit(event).await,
+            None => Ok(()),
+        };
+        let delivered = match prerequisite {
+            Ok(()) => {
+                self.bus
+                    .emit(AgentEvent::UsageUpdate {
+                        agent_id: self.agent_id,
+                        usage,
+                    })
+                    .await
+            }
+            Err(err) => Err(err),
+        };
         self.session_state.accumulate_usage(delta);
         delivered.map_err(TurnError::Fatal)
     }
@@ -1537,7 +1551,7 @@ impl Agent {
             self.transcript
                 .push(AgentMessage::wire(Message::Assistant(response.clone())));
 
-            self.account_usage(&turn_usage).await?;
+            self.account_usage(&turn_usage, None).await?;
 
             // Execute tool calls if any
             if has_tool_use {
@@ -4686,9 +4700,12 @@ mod event_protocol_tests {
             },
         };
 
-        agent.account_usage(&first).await.expect("first accounting");
         agent
-            .account_usage(&second)
+            .account_usage(&first, None)
+            .await
+            .expect("first accounting");
+        agent
+            .account_usage(&second, None)
             .await
             .expect("second accounting");
 
@@ -4734,7 +4751,7 @@ mod event_protocol_tests {
         };
 
         let error = agent
-            .account_usage(&delta)
+            .account_usage(&delta, None)
             .await
             .expect_err("listener failure remains fatal");
 
@@ -4746,6 +4763,47 @@ mod event_protocol_tests {
         assert_eq!(accumulated.cache_read, 17);
         assert_eq!(accumulated.total_tokens, 48);
         assert!((accumulated.cost.total - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn account_usage_suppresses_the_update_when_its_prerequisite_fails() {
+        let agent = build_agent(Vec::new(), Vec::new());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
+        let _subscription = agent.subscribe(Arc::new(move |event| {
+            recorded.lock().unwrap().push(label(event));
+            let fail = matches!(event, AgentEvent::Notice { .. });
+            Box::pin(async move {
+                if fail {
+                    Err(crate::BoxError::from("injected prerequisite failure"))
+                } else {
+                    Ok(())
+                }
+            })
+        }));
+        let delta = Usage {
+            input: 7,
+            total_tokens: 7,
+            ..Usage::default()
+        };
+
+        let error = agent
+            .account_usage(
+                &delta,
+                Some(AgentEvent::Notice {
+                    agent_id: AgentId::Main,
+                    text: "checkpoint".to_string(),
+                }),
+            )
+            .await
+            .expect_err("prerequisite failure remains fatal");
+
+        assert!(matches!(error, crate::TurnError::Fatal(_)));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [EventLabel::Notice(AgentId::Main, "checkpoint".to_string())]
+        );
+        assert_eq!(agent.accumulated_usage().input, 7);
     }
 
     #[tokio::test]

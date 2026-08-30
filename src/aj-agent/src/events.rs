@@ -415,6 +415,10 @@ pub enum AgentEvent {
     /// - both `None` — the run ended without writing (cancelled before
     ///   the persist step).
     ///
+    /// `has_usage` says a checkpoint-owned [`AgentEvent::UsageUpdate`] follows
+    /// this event. It is false for unsuccessful runs and legacy checkpoints
+    /// whose spend is unknown.
+    ///
     /// Transient — not persisted; the conversation log's compaction
     /// entry is the durable record.
     CompactionEnd {
@@ -422,6 +426,8 @@ pub enum AgentEvent {
         reason: CompactionReason,
         tokens_before: u64,
         tokens_after: u64,
+        #[serde(default)]
+        has_usage: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,6 +638,7 @@ mod tests {
             reason: CompactionReason::Overflow,
             tokens_before: 1200,
             tokens_after: 300,
+            has_usage: true,
             summary: Some("did stuff".into()),
             error: None,
         };
@@ -640,8 +647,26 @@ mod tests {
         assert_eq!(json["reason"], "overflow");
         assert_eq!(json["tokens_before"], 1200);
         assert_eq!(json["tokens_after"], 300);
+        assert_eq!(json["has_usage"], serde_json::Value::Bool(true));
         assert_eq!(json["summary"], "did stuff");
         // `error` is `None`, so it is skipped on the wire.
         assert!(json.get("error").is_none());
+
+        let legacy: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "compaction_end",
+            "agent_id": "main",
+            "reason": "manual",
+            "tokens_before": 100,
+            "tokens_after": 10,
+            "summary": "legacy"
+        }))
+        .expect("an older event without has_usage still decodes");
+        assert!(matches!(
+            legacy,
+            AgentEvent::CompactionEnd {
+                has_usage: false,
+                ..
+            }
+        ));
     }
 }

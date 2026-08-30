@@ -399,6 +399,7 @@ pub fn reduce(
             agent_id,
             tokens_before,
             tokens_after,
+            has_usage,
             summary,
             error,
             ..
@@ -422,8 +423,10 @@ pub fn reduce(
                     None,
                 );
             } else if let Some(summary) = summary {
-                state.render.entry(agent_id).or_default().last_usage_origin =
-                    Some(UsageOrigin::Compaction(entry.cloned()));
+                if has_usage {
+                    state.render.entry(agent_id).or_default().last_usage_origin =
+                        Some(UsageOrigin::Compaction(entry.cloned()));
+                }
                 // A successful compaction appends its checkpoint entry,
                 // and `CompactionEnd` carries no identity of its own, so
                 // that entry is the row's key. The cursor invariant is not
@@ -3051,6 +3054,7 @@ mod tests {
                 reason: CompactionReason::Manual,
                 tokens_before: 1_200,
                 tokens_after: 300,
+                has_usage: true,
                 summary: Some("did stuff".into()),
                 error: None,
             },
@@ -3094,6 +3098,7 @@ mod tests {
                 reason: CompactionReason::Manual,
                 tokens_before: 0,
                 tokens_after: 0,
+                has_usage: false,
                 summary: None,
                 error: Some("summarizer failed".into()),
             },
@@ -3106,6 +3111,7 @@ mod tests {
                 reason: CompactionReason::Manual,
                 tokens_before: 0,
                 tokens_after: 0,
+                has_usage: false,
                 summary: None,
                 error: None,
             },
@@ -3718,6 +3724,7 @@ mod tests {
             reason: CompactionReason::Manual,
             tokens_before: 1_000,
             tokens_after,
+            has_usage: false,
             summary: Some(summary.to_string()),
             error: None,
         }

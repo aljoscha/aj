@@ -459,14 +459,8 @@ impl CanonicalState {
                     .render
                     .get(&agent)
                     .map(|render| CanonicalRender {
-                        last_usage_source: render
-                            .last_usage_origin
-                            .as_ref()
-                            .and_then(|origin| origin.source_entry().map(str::to_string)),
-                        usage_source_is_compaction: render
-                            .last_usage_origin
-                            .as_ref()
-                            .is_some_and(crate::chat::UsageOrigin::is_compaction),
+                        last_usage_source: render.last_usage_source().map(str::to_string),
+                        usage_source_is_compaction: render.usage_source_is_compaction(),
                         tool_calls: render.tool_index.keys().cloned().collect(),
                         messages: render.message_index.keys().cloned().collect(),
                         streaming: render.current_assistant.is_some(),

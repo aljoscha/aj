@@ -22,7 +22,6 @@
 mod model;
 mod reducer;
 
-pub(crate) use model::UsageOrigin;
 pub use model::{
     AgentEntry, AssistantEntry, ChatState, CompactionEntry, Entry, EntryId, EntryKind, NoticeEntry,
     NoticeLevel, SubAgentEntry, SubAgentStatus, TaskInfo, TaskNotificationEntry, ToolEntry,
