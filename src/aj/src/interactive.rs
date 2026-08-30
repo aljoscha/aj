@@ -7767,7 +7767,7 @@ impl ExitBanner {
 #[cfg(test)]
 mod tests {
     use std::io::{PipeWriter, Write};
-    use std::sync::{Arc, Condvar};
+    use std::sync::{Arc, Condvar, OnceLock};
 
     use aj_app::chat::{EntryKind, NoticeLevel, SubAgentStatus, ToolStatus, reduce};
     use aj_app::session::AgentLifecycle;
@@ -13344,6 +13344,23 @@ mod tests {
         (started, terminated)
     }
 
+    /// Per-test storage under a root that outlives every spawned login task.
+    ///
+    /// A failing commit-race assertion may detach the login's `JoinHandle` while
+    /// the provider is inside one non-yielding poll. The task can then reach an
+    /// auth write after the test future unwinds, and that write recreates its
+    /// parent directory. Keeping both guards for the process lifetime prevents
+    /// late work from escaping a lexical `TempDir` cleanup.
+    fn process_lifetime_login_dir() -> &'static TempDir {
+        static ROOT: OnceLock<TempDir> = OnceLock::new();
+        let root = ROOT.get_or_init(|| {
+            TempDir::with_prefix("aj-login-race-").expect("create login race root")
+        });
+        Box::leak(Box::new(
+            TempDir::new_in(root.path()).expect("create login race test directory"),
+        ))
+    }
+
     fn stored_auth_bytes(auth: &AuthStorage) -> Option<Vec<u8>> {
         std::fs::read(auth.path()).ok()
     }
@@ -13603,9 +13620,9 @@ mod tests {
     /// picker remains as a sentinel proving the login overlay closes once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drive_loop_esc_during_non_yielding_login_waits_for_committed_success() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = process_lifetime_login_dir();
         let (mut app, mut writer, mut world, shell, root) =
-            init_app_with_world(&dir, "streaming-text").await;
+            init_app_with_world(dir, "streaming-text").await;
         let provider_id = "cancel-reactivate";
         let account = "work";
         let gate = Arc::new(NonYieldingLoginGate::default());

@@ -21,8 +21,15 @@ set -euo pipefail
 #                    store outlives the test that built it and writes afterwards.
 #                    TempDir adds exactly six random alphanumeric characters to
 #                    the prefix; stores use per-test subdirectories below it.
+#   aj-login-race-XXXXXX
+#                    the OAuth cancellation race deliberately blocks a spawned
+#                    task inside one non-yielding poll. A failing assertion can
+#                    detach that task before its release guard runs, after which
+#                    credential persistence may still recreate its directory.
+#                    Each fixture uses a distinct subdirectory below this root.
 allowed=(
     'aj-usage-[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'
+    'aj-login-race-[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'
 )
 
 scratch="$(mktemp -d)"
