@@ -1513,8 +1513,12 @@ explicit rather than discovered. Supported in connect mode from phase
 2: prompt, steer, cancel, queue withdraw/clear, settings including
 model switch and thinking display, compaction, task kill, and the
 task-output overlay (backed by the per-task read, section 6.7). The
-exit usage banner renders from the client's own event-derived
-accounting rather than a host read. One stated limitation of that
+usage overlay is not supported: its data and reset action use the
+credential store on the machine running the UI, not the session host.
+It refuses before reading that store and names running it on the host
+as the available path. The exit usage banner renders from the client's
+own event-derived accounting rather than a host read. One stated
+limitation of that
 choice: the accounting counts what the client observed under its
 current epoch, so spend on a branch abandoned by a head switch is not
 re-derivable after the reset and the banner under-reports it.
@@ -1544,14 +1548,15 @@ Export's output is a file for the person at the terminal: the host
 renders the document and the client writes it in its own working
 directory.
 
-Status, not design: four gestures still refuse over a connection, in
+Status, not design: five gestures still refuse over a connection, in
 two classes. The session-info overlay and HTML export read host-local
 files no endpoint serves yet. The session selector and prompt-history
-search read this client's own session store, which over a connection
-would answer about the wrong machine, so they refuse instead (the
-sidebar lists a peer's sessions meanwhile, section 9.2, and cross-host
-history is banked, section 13). Each refusal surfaces a clear notice,
-an unsupported action never silently does nothing.
+search read this client's own session store, and the usage overlay
+reads this client's credential store. Over a connection those would
+answer about the wrong machine, so they refuse instead (the sidebar
+lists a peer's sessions meanwhile, section 9.2, and cross-host history
+is banked, section 13). Each refusal surfaces a clear notice, an
+unsupported action never silently does nothing.
 
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer/status line.

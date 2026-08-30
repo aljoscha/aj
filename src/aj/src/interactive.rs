@@ -3309,6 +3309,20 @@ async fn apply_command_action(
         // credential store, the theme snapshot, the shared redraw ping, and
         // the runtime handle it spawns its fetch/consume onto.
         CommandAction::OpenUsageStatus => {
+            // A connected world's credential store belongs to this client,
+            // not the session host the page would appear to describe. Refuse
+            // before cloning it because constructing the overlay starts a
+            // fetch that may refresh and rewrite an expired credential.
+            if world.control.is_remote() {
+                fold_notice(
+                    world,
+                    &remote_unsupported_notice(
+                        "show provider usage",
+                        "it would read this machine's credential store, so run it on the host",
+                    ),
+                );
+                return ActionEffect::Redraw;
+            }
             let handles = shell.borrow().overlay_handles();
             let styles = ContentStyles::from_theme(&shell.borrow().theme.read());
             open_usage_overlay(
@@ -23912,12 +23926,13 @@ mod tests {
     /// A gesture connect mode has no path for folds a notice naming why, rather
     /// than silently doing nothing (spec 9.1).
     ///
-    /// These are the three this arm refuses, all of them about this machine: an
+    /// These are the four this arm refuses, all of them about this machine: an
     /// export writes a file where the log is, the session selector previews
-    /// this process's own store, and prompt history scans that store's logs.
-    /// The session-info overlay refuses too, in its fill rather than here, see
-    /// `spawn_overlay_fetch`. Session switching and creation are no longer
-    /// among them, see `connect_mode_creates_and_switches_sessions`.
+    /// this process's own store, prompt history scans that store's logs, and
+    /// usage reads this process's credential store. The session-info overlay
+    /// refuses too, in its fill rather than here, see `spawn_overlay_fetch`.
+    /// Session switching and creation are no longer among them, see
+    /// `connect_mode_creates_and_switches_sessions`.
     #[tokio::test]
     async fn connect_mode_refuses_the_gestures_about_this_machine() {
         let dir = TempDir::new().expect("tempdir");
@@ -23936,6 +23951,10 @@ mod tests {
             (
                 CommandAction::OpenPromptHistory,
                 "this machine's own session logs",
+            ),
+            (
+                CommandAction::OpenUsageStatus,
+                "this machine's credential store",
             ),
         ] {
             let before = main_notices(&world).len();
@@ -23961,6 +23980,142 @@ mod tests {
             );
         }
         remote.shutdown().await;
+    }
+
+    /// The ownership guard is specific to a connection. A local session and
+    /// its usage overlay share the same credential store, so the production
+    /// gesture still opens the page there.
+    #[tokio::test]
+    async fn local_mode_opens_the_usage_overlay() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await;
+
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
+    }
+
+    /// Usage over a connection must stop before the connecting process's
+    /// credential store can be read. Reads acquire a file lock and therefore
+    /// create a missing parent directory, which gives the refusal a direct
+    /// filesystem observer without starting the usage fetch.
+    #[tokio::test]
+    async fn connect_mode_refuses_usage_before_client_credentials_are_read() {
+        use aj_models::auth::AuthCredential;
+
+        let dir = TempDir::new().expect("tempdir");
+        let host_auth_path = dir.path().join("auth.json");
+        let client_auth_path = dir.path().join("client-auth.json");
+        let host_auth = AuthStorage::new(host_auth_path.clone());
+        host_auth
+            .set(
+                "openai-codex",
+                AuthCredential::ApiKey {
+                    key: "host-credential-sentinel".to_string(),
+                },
+            )
+            .await
+            .expect("seed the host credential");
+
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        world
+            .auth
+            .set(
+                "openai-codex",
+                AuthCredential::ApiKey {
+                    key: "client-credential-sentinel".to_string(),
+                },
+            )
+            .await
+            .expect("seed the client credential");
+
+        let host_before = std::fs::read(&host_auth_path).expect("read host sentinel");
+        let client_before = std::fs::read(&client_auth_path).expect("read client sentinel");
+        assert_ne!(host_before, client_before, "the stores are distinct");
+        assert!(
+            String::from_utf8_lossy(&host_before).contains("host-credential-sentinel"),
+            "the host precondition names its own credential",
+        );
+        assert!(
+            String::from_utf8_lossy(&client_before).contains("client-credential-sentinel"),
+            "the client precondition names its own credential",
+        );
+
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await;
+
+        assert!(matches!(effect, ActionEffect::Redraw));
+
+        // Positively calibrate the read observer, then remove the directory so
+        // the production gesture gets the same lazy store in its armed state.
+        // This root is independent of the remote fixture so evidence from work
+        // polled during fixture shutdown remains observable afterwards.
+        let auth_observer = TempDir::new().expect("auth observer tempdir");
+        let auth_root = auth_observer.path().join("client-auth-must-stay-unread");
+        let unread_auth = AuthStorage::new(auth_root.join("auth.json"));
+        assert!(!auth_root.exists(), "the lazy store starts untouched");
+        assert!(
+            unread_auth
+                .get("openai-codex")
+                .await
+                .expect("calibrate a credential read")
+                .is_none(),
+            "the calibration store is empty",
+        );
+        assert!(
+            auth_root.exists(),
+            "a credential read creates its lock parent"
+        );
+        std::fs::remove_dir_all(&auth_root).expect("re-arm the read observer");
+        world.auth = unread_auth;
+
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await;
+        assert!(matches!(effect, ActionEffect::Redraw));
+
+        let assert_no_credential_harm = |stage: &str| {
+            assert!(
+                !auth_root.exists(),
+                "the connected usage gesture touched the client's credential store {stage}",
+            );
+            assert_eq!(
+                std::fs::read(&client_auth_path).expect("read client store after refusal"),
+                client_before,
+                "the client's credential store was rewritten {stage}",
+            );
+            assert_eq!(
+                std::fs::read(&host_auth_path).expect("read host store after refusal"),
+                host_before,
+                "the host credential store was rewritten {stage}",
+            );
+            assert!(
+                !shell.borrow().overlays.borrow().is_open(),
+                "the read refusal built a usage overlay {stage}",
+            );
+            let notices = main_notices(&world);
+            let refusal = notices.last().expect("the refusal is rendered");
+            assert!(
+                refusal.contains("over a connection")
+                    && refusal.contains("this machine's credential store"),
+                "the refusal does not name the ownership problem {stage}: {notices:?}",
+            );
+            assert!(
+                !notices.iter().any(|notice| {
+                    notice.contains("host-credential-sentinel")
+                        || notice.contains("client-credential-sentinel")
+                }),
+                "a credential was rendered {stage}: {notices:?}",
+            );
+        };
+
+        assert_no_credential_harm("before the scheduler barrier");
+        // A detached read spawned by the gesture may not receive its first poll
+        // until an await after the action returns. Keep every harm observer
+        // armed across both a scheduler turn and fixture shutdown.
+        tokio::task::yield_now().await;
+        assert_no_credential_harm("after the scheduler barrier");
+        remote.shutdown().await;
+        assert_no_credential_harm("after remote shutdown");
     }
 
     /// The refusal is what the keyboard gets, not just what the arm returns:
