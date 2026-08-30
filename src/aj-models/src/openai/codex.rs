@@ -63,7 +63,7 @@ use crate::types::ServiceTier;
 use super::errors::{account_for_client_error, classify_client_error_with};
 use super::responses::{
     CostMultiplierFn, StreamState, convert_messages, empty_partial, error_message,
-    map_service_tier, responses_reasoning_effort, verbosity_text_config,
+    map_service_tier, resolve_service_tier, responses_reasoning_effort, verbosity_text_config,
 };
 #[cfg(any(test, feature = "test-support"))]
 use super::responses::{append_assistant_message, parse_assistant_input_items_with_api};
@@ -529,8 +529,8 @@ fn normalize_response_status_in_value(obj: &mut serde_json::Map<String, Value>) 
 
 /// service-tier cost curve. Same `flex` / `priority` knobs as
 /// the public Responses API, except `gpt-5.5 + priority` uses a 2.5×
-/// multiplier (vs the default 2×). The `default` / `auto` / absent
-/// tier always uses 1×.
+/// multiplier (vs the default 2×). `auto`, `scale`, and no effective
+/// tier use 1×.
 ///
 /// Service-tier resolution follows: the server-echoed tier
 /// wins, except when the server reports `default` after the caller
@@ -542,7 +542,7 @@ pub(crate) fn codex_cost_multiplier(
     server_tier: Option<&OpenAIServiceTier>,
     requested_tier: Option<&OpenAIServiceTier>,
 ) -> f64 {
-    let effective = resolve_codex_service_tier(server_tier, requested_tier);
+    let effective = resolve_service_tier(server_tier, requested_tier);
     match effective {
         Some(OpenAIServiceTier::Flex) => 0.5,
         Some(OpenAIServiceTier::Priority) => {
@@ -553,22 +553,6 @@ pub(crate) fn codex_cost_multiplier(
             }
         }
         _ => 1.0,
-    }
-}
-
-fn resolve_codex_service_tier<'a>(
-    server: Option<&'a OpenAIServiceTier>,
-    requested: Option<&'a OpenAIServiceTier>,
-) -> Option<&'a OpenAIServiceTier> {
-    match (server, requested) {
-        // "response value wins; requested value falls back when
-        // the response reports `default`". Today `OpenAIServiceTier`
-        // doesn't model `default` as a variant — it's either Flex,
-        // Priority, or absent — but we keep the resolver structured
-        // so future expansion fits in one place.
-        (Some(s), _) => Some(s),
-        (None, Some(r)) => Some(r),
-        (None, None) => None,
     }
 }
 
@@ -769,6 +753,59 @@ mod tests {
             context_window: 200_000,
             max_tokens: 16_000,
         }
+    }
+
+    struct PricingCase {
+        name: &'static str,
+        model_id: &'static str,
+        requested_tier: Option<ServiceTier>,
+        server_tier: Option<OpenAIServiceTier>,
+        expected_cost: (f64, f64, f64, f64, f64),
+    }
+
+    fn pricing_model(model_id: &str) -> ModelInfo {
+        let mut model = fake_model(model_id, false);
+        model.cost = ModelCost {
+            input: 2.0,
+            output: 4.0,
+            cache_read: 1.0,
+            cache_write: 8.0,
+            tiers: Vec::new(),
+        };
+        model
+    }
+
+    fn pricing_completed_event(
+        model_id: &str,
+        server_tier: Option<OpenAIServiceTier>,
+    ) -> ResponseStreamEvent {
+        let mut event = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_pricing",
+                "object": "response",
+                "created_at": 0.0,
+                "model": model_id,
+                "output": [],
+                "parallel_tool_calls": true,
+                "tools": [],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 2_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 3_000_000,
+                    "input_tokens_details": {
+                        "cached_tokens": 1_000_000
+                    }
+                }
+            }
+        });
+        if let Some(server_tier) = server_tier {
+            event["response"]["service_tier"] =
+                serde_json::to_value(server_tier).expect("serialize service tier");
+        }
+        serde_json::from_value(event).expect("parse response.completed pricing event")
     }
 
     #[test]
@@ -1187,42 +1224,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_cost_multiplier_default_curve() {
-        assert!((codex_cost_multiplier("gpt-5.1", None, None) - 1.0).abs() < f64::EPSILON);
-        assert!(
-            (codex_cost_multiplier("gpt-5.1", Some(&OpenAIServiceTier::Flex), None) - 0.5).abs()
-                < f64::EPSILON
-        );
-        assert!(
-            (codex_cost_multiplier("gpt-5.1", Some(&OpenAIServiceTier::Priority), None) - 2.0)
-                .abs()
-                < f64::EPSILON
-        );
-    }
-
-    #[test]
-    fn codex_cost_multiplier_gpt_5_5_priority_exception() {
-        assert!(
-            (codex_cost_multiplier("gpt-5.5", Some(&OpenAIServiceTier::Priority), None) - 2.5)
-                .abs()
-                < f64::EPSILON
-        );
-        // Flex isn't subject to the exception.
-        assert!(
-            (codex_cost_multiplier("gpt-5.5", Some(&OpenAIServiceTier::Flex), None) - 0.5).abs()
-                < f64::EPSILON
-        );
-    }
-
-    #[test]
-    fn codex_cost_multiplier_falls_back_to_requested_when_server_silent() {
-        assert!(
-            (codex_cost_multiplier("gpt-5.1", None, Some(&OpenAIServiceTier::Flex)) - 0.5).abs()
-                < f64::EPSILON
-        );
-    }
-
-    #[test]
     fn friendly_message_for_usage_limit_with_plan_and_resets_at_envelope() {
         let now_secs = i64::try_from(
             std::time::SystemTime::now()
@@ -1342,55 +1343,154 @@ mod tests {
         }
     }
 
-    /// The Codex pricing curve reaches the replay path, and not only its
-    /// own unit tests.
-    ///
-    /// Codex and Responses share one `StreamState`, and which curve a
-    /// stream prices against is an injected function pointer
-    /// ([`CODEX_COST_MULTIPLIER`]). The two curves differ in exactly one
-    /// cell: gpt-5.5 on priority is 2.5x here and 2.0x on the Responses
-    /// curve. So this fixture is the only shape that can tell a correct
-    /// injection from the wrong one, and the unit tests above cannot: they
-    /// call the function directly.
     #[test]
-    fn a_replayed_codex_priority_turn_prices_on_the_codex_curve() {
-        let completed: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
-            "type": "response.completed",
-            "response": {
-                "id": "resp_1",
-                "object": "response",
-                "created_at": 0.0,
-                "model": "gpt-5.5",
-                "output": [],
-                "parallel_tool_calls": true,
-                "tools": [],
-                "status": "completed",
-                // The tier the server echoes back, which is what the
-                // curve is resolved from.
-                "service_tier": "priority",
-                "usage": {
-                    "input_tokens": 1_000_000,
-                    "output_tokens": 1_000_000,
-                    "total_tokens": 2_000_000,
-                },
-            },
-            "sequence_number": 1,
-        }))
-        .expect("parse response.completed");
+    fn codex_terminal_tier_pricing_table() {
+        use OpenAIServiceTier::{Auto, Default, Flex, Priority, Scale};
 
-        let msg = replay_sse_events(&fake_model("gpt-5.5", false), [completed], None);
-        assert_eq!(
-            msg.usage.total_tokens, 2_000_000,
-            "the fixture must carry the wire's counts or the price below is priced on nothing"
-        );
-        // 1.0 (input) + 2.0 (output) = $3.00 at full price. The Codex
-        // curve charges gpt-5.5 priority 2.5x, the Responses curve 2.0x,
-        // so $6.00 here means the wrong curve was injected.
-        assert!(
-            (msg.usage.cost.total - 7.5).abs() < 1e-9,
-            "a priority gpt-5.5 turn prices at 2.5x, got {} (6.0 is the Responses curve)",
-            msg.usage.cost.total
-        );
+        let half = (1.0, 2.0, 0.5, 0.0, 3.5);
+        let standard = (2.0, 4.0, 1.0, 0.0, 7.0);
+        let double = (4.0, 8.0, 2.0, 0.0, 14.0);
+        let two_and_a_half = (5.0, 10.0, 2.5, 0.0, 17.5);
+        let cases = [
+            PricingCase {
+                name: "requested flex with default echo",
+                model_id: "gpt-5.5",
+                requested_tier: Some(ServiceTier::Flex),
+                server_tier: Some(Default),
+                expected_cost: half,
+            },
+            PricingCase {
+                name: "requested priority with default echo",
+                model_id: "gpt-5.5",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Default),
+                expected_cost: two_and_a_half,
+            },
+            PricingCase {
+                name: "default echo without request",
+                model_id: "gpt-5.5",
+                requested_tier: None,
+                server_tier: Some(Default),
+                expected_cost: standard,
+            },
+            PricingCase {
+                name: "absent echo and request",
+                model_id: "gpt-5.5",
+                requested_tier: None,
+                server_tier: None,
+                expected_cost: standard,
+            },
+            PricingCase {
+                name: "requested flex without echo",
+                model_id: "gpt-5.5",
+                requested_tier: Some(ServiceTier::Flex),
+                server_tier: None,
+                expected_cost: half,
+            },
+            PricingCase {
+                name: "requested priority without echo",
+                model_id: "gpt-5.5",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: None,
+                expected_cost: two_and_a_half,
+            },
+            PricingCase {
+                name: "explicit flex without request",
+                model_id: "gpt-5.5",
+                requested_tier: None,
+                server_tier: Some(Flex),
+                expected_cost: half,
+            },
+            PricingCase {
+                name: "explicit priority without request",
+                model_id: "gpt-5.5",
+                requested_tier: None,
+                server_tier: Some(Priority),
+                expected_cost: two_and_a_half,
+            },
+            PricingCase {
+                name: "explicit priority overrides flex request",
+                model_id: "gpt-5.5",
+                requested_tier: Some(ServiceTier::Flex),
+                server_tier: Some(Priority),
+                expected_cost: two_and_a_half,
+            },
+            PricingCase {
+                name: "explicit flex overrides priority request",
+                model_id: "gpt-5.5",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Flex),
+                expected_cost: half,
+            },
+            PricingCase {
+                name: "explicit auto overrides priority request",
+                model_id: "gpt-5.5",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Auto),
+                expected_cost: standard,
+            },
+            PricingCase {
+                name: "explicit scale overrides priority request",
+                model_id: "gpt-5.5",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Scale),
+                expected_cost: standard,
+            },
+            PricingCase {
+                name: "near-match model does not use the gpt-5.5 exception",
+                model_id: "gpt-5.5-preview",
+                requested_tier: None,
+                server_tier: Some(Priority),
+                expected_cost: double,
+            },
+        ];
+
+        for case in cases {
+            let mut state = StreamState::new_with(
+                API_NAME,
+                &pricing_model(case.model_id),
+                case.requested_tier,
+                CODEX_COST_MULTIPLIER,
+                None,
+            );
+            let _ = state.process(pricing_completed_event(case.model_id, case.server_tier));
+            let message = match state.finalize_or_truncate() {
+                AssistantMessageEvent::Done {
+                    reason: crate::streaming::DoneReason::Stop,
+                    message,
+                } => message,
+                other => panic!("{}: expected completed Stop, got {other:?}", case.name),
+            };
+            assert_eq!(message.stop_reason, StopReason::Stop, "{}", case.name);
+            assert_eq!(
+                (
+                    message.usage.input,
+                    message.usage.output,
+                    message.usage.cache_read,
+                    message.usage.cache_write,
+                ),
+                (1_000_000, 1_000_000, 1_000_000, 0),
+                "{}: terminal usage categories",
+                case.name
+            );
+            assert_eq!(
+                message.usage.total_tokens, 3_000_000,
+                "{}: terminal total tokens",
+                case.name
+            );
+            assert_eq!(
+                (
+                    message.usage.cost.input,
+                    message.usage.cost.output,
+                    message.usage.cost.cache_read,
+                    message.usage.cost.cache_write,
+                    message.usage.cost.total,
+                ),
+                case.expected_cost,
+                "{}: terminal cost categories",
+                case.name
+            );
+        }
     }
 
     #[test]

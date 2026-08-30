@@ -1439,10 +1439,12 @@ provider; other providers ignore it):
 When a non-default tier is used, the provider multiplies the computed
 `usage.cost.{input, output, cache_read, cache_write, total}` by the
 tier's factor after the base cost calculation in §3.3, before returning
-the final `Usage`. When applying the tier multiplier, use the
-`service_tier` value from `response.completed` if present, falling back
-to the requested tier from `StreamOptions`. The server may assign a
-different tier than requested.
+the final `Usage`. When applying the tier multiplier, an explicit
+non-`"default"` `service_tier` from `response.completed` wins over the
+requested tier. A `"default"` value or an absent response value falls
+back to the requested tier from `StreamOptions`; without a requested
+tier it uses the standard 1× curve. The server may assign a different
+tier than requested.
 
 **Prompt caching:** caching is automatic on the Responses API — no
 key required. The fields below are routing/retention hints that
@@ -1757,10 +1759,10 @@ sourcing) carries over from §7.3.2 unchanged.
 #### 7.4.4 Service Tier Pricing
 
 Same `service_tier` knob as §7.3 with the same effective-tier
-resolution rule (response value wins; requested value falls back
-when the response reports `"default"`). The cost multipliers differ
-slightly because the Codex endpoint's pricing curve is not identical
-to the public Responses API:
+resolution rule (an explicit non-`"default"` response value wins;
+`"default"` or an absent response value falls back to the request).
+The cost multipliers differ slightly because the Codex endpoint's
+pricing curve is not identical to the public Responses API:
 
 | Tier | Wire value | Cost multiplier (default) | Cost multiplier (`gpt-5.5`) |
 |---|---|---|---|

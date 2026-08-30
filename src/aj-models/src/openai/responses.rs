@@ -534,7 +534,22 @@ pub(super) fn responses_cost_multiplier(
     server_tier: Option<&OpenAIServiceTier>,
     requested_tier: Option<&OpenAIServiceTier>,
 ) -> f64 {
-    cost_multiplier_from_tier(server_tier.or(requested_tier))
+    cost_multiplier_from_tier(resolve_service_tier(server_tier, requested_tier))
+}
+
+/// Resolves the service tier that controls Responses pricing.
+///
+/// A terminal `default` echo is the protocol-defined exception to server
+/// authority. It preserves the requested pricing class just like an absent
+/// echo. Every explicit non-Default server tier remains authoritative.
+pub(super) fn resolve_service_tier<'a>(
+    server_tier: Option<&'a OpenAIServiceTier>,
+    requested_tier: Option<&'a OpenAIServiceTier>,
+) -> Option<&'a OpenAIServiceTier> {
+    match server_tier {
+        Some(OpenAIServiceTier::Default) | None => requested_tier,
+        Some(server_tier) => Some(server_tier),
+    }
 }
 
 fn cost_multiplier_from_tier(tier: Option<&OpenAIServiceTier>) -> f64 {
@@ -1538,10 +1553,11 @@ impl StreamState {
 
     /// The service-tier price multiplier for this turn.
     ///
-    /// The tier the server actually served at wins over the one we
-    /// asked for, so this is only final once `final_response` has
-    /// landed. Resolved through the injected `cost_multiplier` because
-    /// Codex prices the same tiers on a different curve.
+    /// An explicit non-Default server tier wins over the requested tier.
+    /// A Default or absent server tier falls back to the request, so this
+    /// is only final once `final_response` has landed. Resolved through
+    /// the injected `cost_multiplier` because Codex prices the same tiers
+    /// on a different curve.
     fn tier_multiplier(&self) -> f64 {
         let server_tier = self
             .final_response
@@ -2340,22 +2356,202 @@ mod tests {
         assert_eq!(thinking.thinking, "live reasoning");
     }
 
-    #[test]
-    fn cost_multiplier_applied() {
-        let mut state = StreamState::new(&fake_model(false), Some(ServiceTier::Flex));
-        // Pre-load token counts. With no terminal response to overwrite
-        // them, finalize prices these against the model's rates and then
-        // scales by the tier multiplier.
-        state.partial.usage.input = 1_000_000;
-        state.partial.usage.output = 1_000_000;
-        state.finish_status = Some(ResponseStatus::Completed);
-        let event = state.finalize();
-        let msg = match event {
-            AssistantMessageEvent::Done { message, .. } => message,
-            other => panic!("expected Done, got {other:?}"),
+    struct PricingCase {
+        name: &'static str,
+        model_id: &'static str,
+        requested_tier: Option<ServiceTier>,
+        server_tier: Option<OpenAIServiceTier>,
+        expected_cost: (f64, f64, f64, f64, f64),
+    }
+
+    fn pricing_model(model_id: &str) -> ModelInfo {
+        let mut model = fake_model(false);
+        model.id = model_id.to_string();
+        model.name = model_id.to_string();
+        model.cost = ModelCost {
+            input: 2.0,
+            output: 4.0,
+            cache_read: 1.0,
+            cache_write: 8.0,
+            tiers: Vec::new(),
         };
-        // 1.25 (input) + 10.0 (output) = 11.25 at full price; flex halves it.
-        assert!((msg.usage.cost.total - 5.625).abs() < 1e-9);
+        model
+    }
+
+    fn pricing_completed_event(
+        model_id: &str,
+        server_tier: Option<OpenAIServiceTier>,
+    ) -> ResponseStreamEvent {
+        let mut event = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_pricing",
+                "object": "response",
+                "created_at": 0.0,
+                "model": model_id,
+                "output": [],
+                "parallel_tool_calls": true,
+                "tools": [],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 2_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 3_000_000,
+                    "input_tokens_details": {
+                        "cached_tokens": 1_000_000
+                    }
+                }
+            }
+        });
+        if let Some(server_tier) = server_tier {
+            event["response"]["service_tier"] =
+                serde_json::to_value(server_tier).expect("serialize service tier");
+        }
+        serde_json::from_value(event).expect("parse response.completed pricing event")
+    }
+
+    #[test]
+    fn responses_terminal_tier_pricing_table() {
+        use OpenAIServiceTier::{Auto, Default, Flex, Priority, Scale};
+
+        let half = (1.0, 2.0, 0.5, 0.0, 3.5);
+        let standard = (2.0, 4.0, 1.0, 0.0, 7.0);
+        let double = (4.0, 8.0, 2.0, 0.0, 14.0);
+        let cases = [
+            PricingCase {
+                name: "requested flex with default echo",
+                model_id: "gpt-pricing-test",
+                requested_tier: Some(ServiceTier::Flex),
+                server_tier: Some(Default),
+                expected_cost: half,
+            },
+            PricingCase {
+                name: "requested priority with default echo",
+                model_id: "gpt-pricing-test",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Default),
+                expected_cost: double,
+            },
+            PricingCase {
+                name: "default echo without request",
+                model_id: "gpt-pricing-test",
+                requested_tier: None,
+                server_tier: Some(Default),
+                expected_cost: standard,
+            },
+            PricingCase {
+                name: "absent echo and request",
+                model_id: "gpt-pricing-test",
+                requested_tier: None,
+                server_tier: None,
+                expected_cost: standard,
+            },
+            PricingCase {
+                name: "requested flex without echo",
+                model_id: "gpt-pricing-test",
+                requested_tier: Some(ServiceTier::Flex),
+                server_tier: None,
+                expected_cost: half,
+            },
+            PricingCase {
+                name: "requested priority without echo",
+                model_id: "gpt-pricing-test",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: None,
+                expected_cost: double,
+            },
+            PricingCase {
+                name: "explicit flex without request",
+                model_id: "gpt-pricing-test",
+                requested_tier: None,
+                server_tier: Some(Flex),
+                expected_cost: half,
+            },
+            PricingCase {
+                name: "explicit priority without request",
+                model_id: "gpt-pricing-test",
+                requested_tier: None,
+                server_tier: Some(Priority),
+                expected_cost: double,
+            },
+            PricingCase {
+                name: "explicit priority overrides flex request",
+                model_id: "gpt-pricing-test",
+                requested_tier: Some(ServiceTier::Flex),
+                server_tier: Some(Priority),
+                expected_cost: double,
+            },
+            PricingCase {
+                name: "explicit flex overrides priority request",
+                model_id: "gpt-pricing-test",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Flex),
+                expected_cost: half,
+            },
+            PricingCase {
+                name: "explicit auto overrides priority request",
+                model_id: "gpt-pricing-test",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Auto),
+                expected_cost: standard,
+            },
+            PricingCase {
+                name: "explicit scale overrides priority request",
+                model_id: "gpt-pricing-test",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Scale),
+                expected_cost: standard,
+            },
+            PricingCase {
+                name: "public responses does not use the codex gpt-5.5 curve",
+                model_id: "gpt-5.5",
+                requested_tier: None,
+                server_tier: Some(Priority),
+                expected_cost: double,
+            },
+        ];
+
+        for case in cases {
+            let mut state = StreamState::new(&pricing_model(case.model_id), case.requested_tier);
+            let _ = state.process(pricing_completed_event(case.model_id, case.server_tier));
+            let message = match state.finalize_or_truncate() {
+                AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message,
+                } => message,
+                other => panic!("{}: expected completed Stop, got {other:?}", case.name),
+            };
+            assert_eq!(message.stop_reason, StopReason::Stop, "{}", case.name);
+            assert_eq!(
+                (
+                    message.usage.input,
+                    message.usage.output,
+                    message.usage.cache_read,
+                    message.usage.cache_write,
+                ),
+                (1_000_000, 1_000_000, 1_000_000, 0),
+                "{}: terminal usage categories",
+                case.name
+            );
+            assert_eq!(
+                message.usage.total_tokens, 3_000_000,
+                "{}: terminal total tokens",
+                case.name
+            );
+            assert_eq!(
+                (
+                    message.usage.cost.input,
+                    message.usage.cost.output,
+                    message.usage.cost.cache_read,
+                    message.usage.cost.cache_write,
+                    message.usage.cost.total,
+                ),
+                case.expected_cost,
+                "{}: terminal cost categories",
+                case.name
+            );
+        }
     }
 
     #[test]
