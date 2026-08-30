@@ -402,6 +402,17 @@ impl<'a> Iterator for SoftwrapIterator<'a> {
                             let grapheme = item.bytes(word);
                             let w = self.ctx.string_width(grapheme);
                             if usize::from(cur_width) + w > usize::from(max) {
+                                // An indivisible grapheme wider than an empty
+                                // line still owns that line. Consuming it is
+                                // the iterator's progress guarantee, while the
+                                // surface clips its cells to the viewport.
+                                if self.index == start {
+                                    self.index += grapheme.len();
+                                    return Some(SoftLine {
+                                        width: u16::try_from(w).expect("grapheme width fits a u16"),
+                                        bytes: &self.line[start..self.index],
+                                    });
+                                }
                                 let end = self.index;
                                 return Some(SoftLine {
                                     width: cur_width,
@@ -542,6 +553,51 @@ mod tests {
     }
 
     #[test]
+    fn softwrap_iterator_each_yield_advances_within_a_hard_line() {
+        let cases: &[(&str, u16, &[(&str, u16)])] = &[
+            ("abcdef", 2, &[("ab", 2), ("cd", 2), ("ef", 2)]),
+            ("a界b", 1, &[("a", 1), ("界", 2), ("b", 1)]),
+            ("界界", 1, &[("界", 2), ("界", 2)]),
+        ];
+
+        for &(text, max_width, expected) in cases {
+            let c = ctx(MaxSize {
+                width: Some(max_width),
+                height: None,
+            });
+            let mut iter = SoftwrapIterator::new(text, &c);
+            let mut previous_index = 0;
+
+            for &(bytes, width) in expected {
+                let line = iter.next().expect("next wrapped line");
+                assert!(
+                    iter.index > previous_index,
+                    "yield {bytes:?} did not consume source bytes from {text:?}"
+                );
+                assert_eq!(line.bytes, bytes);
+                assert_eq!(line.width, width);
+                previous_index = iter.index;
+            }
+            assert!(iter.next().is_none());
+        }
+    }
+
+    #[test]
+    fn softwrap_iterator_keeps_a_grapheme_equal_to_the_viewport_width() {
+        let c = ctx(MaxSize {
+            width: Some(2),
+            height: None,
+        });
+        assert_eq!(c.string_width("界"), 2);
+        let mut iter = SoftwrapIterator::new("界", &c);
+
+        let line = iter.next().expect("exact-width grapheme line");
+        assert_eq!(line.bytes, "界");
+        assert_eq!(line.width, 2);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
     fn line_iterator_lf_breaks() {
         let mut iter = LineIterator::new("Hello, \n world");
         assert_eq!(iter.next(), Some("Hello, "));
@@ -609,5 +665,28 @@ mod tests {
         );
         let last = surface.buffer.last().expect("non-empty buffer");
         assert_eq!(last.char.grapheme(), "…");
+    }
+
+    #[test]
+    fn text_softwrap_draws_a_grapheme_wider_than_an_unbounded_height_viewport() {
+        let c = ctx(MaxSize {
+            width: Some(1),
+            height: None,
+        });
+        assert_eq!(c.string_width("界"), 2, "fixture is one cell too wide");
+        let text: WidgetRef = Rc::new(RefCell::new(Text::new("界")));
+
+        let surface = draw_widget(&text, &c);
+
+        assert_eq!(
+            surface.size,
+            Size {
+                width: 1,
+                height: 1
+            }
+        );
+        assert_eq!(surface.buffer.len(), 1);
+        assert_eq!(surface.buffer[0].char.grapheme(), "界");
+        assert_eq!(surface.buffer[0].char.width, 2);
     }
 }
