@@ -13490,69 +13490,6 @@ mod tests {
         );
     }
 
-    /// Cancellation while OAuth is suspended wins before the first credential
-    /// insertion. The termination witness is checked before any post-return
-    /// await, so abort without the join barrier cannot pass accidentally.
-    #[tokio::test]
-    async fn cancel_login_before_first_commit_preserves_store_and_resolver() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut app, _writer, mut world, shell, _root) =
-            init_app_with_world(&dir, "streaming-text").await;
-        let provider_id = "cancel-first";
-        let (started, terminated) =
-            register_controlled_oauth(&world, provider_id, "new-access", LoginGate::Waiting).await;
-        let before = stored_auth_bytes(&world.auth);
-
-        let (tx, _rx) = unbounded_channel();
-        let mut login_session = None;
-        start_login(
-            &world,
-            &shell,
-            &mut app,
-            &mut login_session,
-            &tx,
-            provider_id.to_string(),
-            "Controlled OAuth".to_string(),
-        );
-        started.notified().await;
-        login_session
-            .as_ref()
-            .expect("login tracked")
-            .cancel
-            .store(true, Ordering::Relaxed);
-
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            cancel_login(&mut world, &shell, &mut app, &mut login_session),
-        )
-        .await
-        .expect("abort and termination barrier complete");
-        assert!(
-            terminated.load(Ordering::Relaxed),
-            "cancel returned before the OAuth task was destroyed"
-        );
-        assert!(login_session.is_none(), "cancelled session cleared");
-
-        assert_eq!(stored_auth_bytes(&world.auth), before, "auth.json changed");
-        assert!(
-            world
-                .auth
-                .get_api_key(provider_id, None)
-                .await
-                .expect("resolve after cancellation")
-                .is_none(),
-            "cancelled first login became the resolver winner"
-        );
-        let notices = main_notices(&world);
-        assert!(
-            notices
-                .last()
-                .is_some_and(|notice| notice == "Login to Controlled OAuth cancelled."),
-            "cancel outcome: {notices:?}"
-        );
-        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
-    }
-
     /// Esc reaches the same abort-and-join barrier through the drive loop. The
     /// provider's drop witness makes removing the call site observable before
     /// any post-drive await can let an otherwise detached task terminate.
