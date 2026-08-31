@@ -13785,6 +13785,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn auth_fetch_draws_exact_limit_legacy_row_at_narrow_overlay_geometry() {
+        let dir = TempDir::new().expect("tempdir");
+        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let label = format!("{}\u{0100}", "a".repeat(10_921));
+        let raw = serde_json::json!({
+            "provider": {
+                "type": "accounts",
+                "default": label.clone(),
+                "accounts": {
+                    (label): { "type": "api_key", "key": "legacy" }
+                }
+            }
+        });
+        std::fs::write(world.auth.path(), serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let mut width_ctx = full_draw_ctx();
+        width_ctx.width_method = vaxis::gwidth::Method::Unicode;
+        shell.borrow_mut().draw(&width_ctx);
+        let (tx, mut rx) = unbounded_channel();
+        spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, &tx);
+        let (kind, rows) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("auth fetch completes")
+            .expect("auth fetch channel remains open");
+        assert_eq!(kind, FetchKind::Auth);
+        let fetched = rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(
+            fetched.contains("[clipped; complete auth row exceeds 65,535-cell terminal limit]"),
+            "{fetched}"
+        );
+        assert!(
+            !fetched.contains("\\u{100}"),
+            "the exact legacy tail reached the row: {fetched}"
+        );
+
+        let handles = shell.borrow().overlay_handles();
+        let mut event_ctx = EventContext::new();
+        let list = crate::content_overlay::open_content_overlay(
+            &handles.stack,
+            &handles.editor,
+            &handles.chrome,
+            "Authentication",
+            crate::content_overlay::loading_rows(),
+            &mut event_ctx,
+        );
+        crate::content_overlay::set_rows(&list, rows);
+        let narrow_ctx = crate::test_support::draw_ctx(5, Some(12));
+        let surface = shell.borrow_mut().draw(&narrow_ctx);
+        assert_eq!(surface.size.width, 5);
+    }
+
     /// Whether a controlled OAuth flow yields forever or occupies one task poll
     /// until the test releases it.
     enum LoginGate {
@@ -14517,6 +14573,22 @@ mod tests {
         app.render(&root).expect("render over-limit confirmation");
         let warning = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(warning.contains("65,535-cell"), "{warning}");
+
+        writer
+            .write_all(b"\x1bOF")
+            .expect("inspect bounded prefix end");
+        let event = app.next_input().await.expect("End event");
+        app.handle_input(event);
+        app.render(&root).expect("render bounded prefix end");
+        let after_end = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            after_end.contains("\\u{61}"),
+            "End blanked the bounded represented prefix: {after_end}"
+        );
+        assert!(
+            after_end.contains("Only a clipped prefix is shown"),
+            "inspection warning disappeared after End: {after_end}"
+        );
 
         writer
             .write_all(b"\r")

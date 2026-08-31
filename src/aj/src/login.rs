@@ -1204,11 +1204,11 @@ impl Widget for AccountConfirmation {
             ctx.consume_and_redraw();
         } else if key.matches(Key::END, Modifiers::empty()) {
             let max_left = self
-                .represented_cells
+                .surface_representation_cells
                 .saturating_sub(usize::from(self.last_width));
-            self.view.borrow_mut().set_scroll_left(
-                u32::try_from(max_left).expect("bounded representation offset fits u32"),
-            );
+            self.view
+                .borrow_mut()
+                .set_scroll_left(u32::try_from(max_left).expect("bounded surface offset fits u32"));
             ctx.consume_and_redraw();
         } else if key.matches(Key::ENTER, Modifiers::empty()) {
             if self.over_limit && !self.acknowledged {
@@ -2104,6 +2104,33 @@ mod tests {
                 account_label,
             })) if provider_id == "provider" && account_label == &raw
         ));
+    }
+
+    #[test]
+    fn over_limit_account_end_stays_within_the_bounded_surface_extent() {
+        let raw = format!("{}\u{1000}", "a".repeat(10_921));
+        let (mut confirmation, _) = confirmation_for(raw);
+        let draw_ctx = crate::test_support::draw_ctx(24, Some(4));
+        let _ = confirmation.draw(&draw_ctx);
+
+        // The complete legacy extent can exceed every scroll offset type, but
+        // only the bounded disclosed prefix belongs to the vaxis surface.
+        confirmation.represented_cells = usize::try_from(u32::MAX).unwrap() + 25;
+        let mut event_ctx = EventContext::new();
+        confirmation.handle_event(
+            &mut event_ctx,
+            &key_event(Key::END, Modifiers::empty(), None),
+        );
+        assert_eq!(
+            confirmation.view.borrow().scroll_left(),
+            u32::try_from(OVER_LIMIT_PREFIX_CELLS - 24).unwrap()
+        );
+        let rows = crate::test_support::rows(&confirmation.draw(&draw_ctx));
+        assert!(
+            rows[0].contains("\\u{61}"),
+            "bounded prefix disappeared: {rows:?}"
+        );
+        assert!(!confirmation.view.borrow().has_more_right());
     }
 
     fn sample_rows() -> Vec<AuthRow> {

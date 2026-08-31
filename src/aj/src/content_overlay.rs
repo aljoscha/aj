@@ -36,6 +36,7 @@ use aj_app::theme::{Theme, ThemeColor};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
 use aj_models::auth::{AccountLabelDisplayMode, display_account_label};
 use aj_session::SessionStats;
+use unicode_segmentation::UnicodeSegmentation;
 use vaxis::cell::{Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
@@ -502,6 +503,56 @@ pub(crate) fn help_rows(styles: &ContentStyles) -> Vec<Row> {
     rows
 }
 
+const AUTH_ROW_CELL_LIMIT: u16 = u16::MAX;
+const AUTH_ROW_CLIPPED_PREFIX_CELLS: usize = 96;
+const AUTH_ROW_CLIPPED_NOTICE: &str =
+    "[clipped; complete auth row exceeds 65,535-cell terminal limit] ";
+
+/// Measure terminal cells without accumulating the complete string in `u16`.
+/// Account representations above the vaxis extent are graphic ASCII, so the
+/// fast path also avoids asking `gwidth` to represent an impossible total.
+fn terminal_cells(text: &str, method: vaxis::gwidth::Method) -> usize {
+    if text.is_ascii() {
+        return text.len();
+    }
+    text.graphemes(true)
+        .map(|grapheme| usize::from(vaxis::gwidth::gwidth(grapheme, method)))
+        .sum()
+}
+
+/// Keep a disclosed prefix of an account representation within its share of
+/// the complete auth row. The raw account remains in storage and action models;
+/// this bounds only the read-only RichText surface.
+fn account_label_for_auth_row(
+    represented: &str,
+    cell_budget: usize,
+    method: vaxis::gwidth::Method,
+) -> String {
+    if terminal_cells(represented, method) <= cell_budget {
+        return represented.to_string();
+    }
+
+    let notice_cells = terminal_cells(AUTH_ROW_CLIPPED_NOTICE, method);
+    if notice_cells > cell_budget {
+        return "[clipped]".chars().take(cell_budget).collect();
+    }
+
+    let prefix_budget = cell_budget
+        .saturating_sub(notice_cells)
+        .min(AUTH_ROW_CLIPPED_PREFIX_CELLS);
+    let mut prefix = String::new();
+    let mut prefix_cells = 0;
+    for grapheme in represented.graphemes(true) {
+        let width = terminal_cells(grapheme, method);
+        if prefix_cells + width > prefix_budget {
+            break;
+        }
+        prefix.push_str(grapheme);
+        prefix_cells += width;
+    }
+    format!("{AUTH_ROW_CLIPPED_NOTICE}{prefix}")
+}
+
 /// Auth-status rows: one per provider/account credential, its default marker,
 /// credential summary, and any secondary detail (e.g. token expiry). Providers
 /// without labeled accounts contribute one provider-only row.
@@ -524,31 +575,6 @@ pub(crate) fn auth_rows(
         .map(|s| s.provider_id.chars().count())
         .max()
         .unwrap_or(0);
-    let represented = statuses
-        .iter()
-        .map(|status| {
-            status.account_label.as_deref().map(|label| {
-                let ordinary = display_account_label(label, AccountLabelDisplayMode::Ordinary);
-                let represented = if ordinary.contains(' ') {
-                    display_account_label(label, AccountLabelDisplayMode::Ascii)
-                } else {
-                    ordinary
-                };
-                if represented.len() > 65_535 {
-                    let prefix = represented.chars().take(96).collect::<String>();
-                    format!("[clipped; exceeds 65,535-cell inspection limit] {prefix}…")
-                } else {
-                    represented
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    let account_w = represented
-        .iter()
-        .filter_map(|label| label.as_ref())
-        .map(|label| usize::from(vaxis::gwidth::gwidth(label, width_method)))
-        .max()
-        .unwrap_or(0);
     // Only rows that carry a detail need a fixed summary column: padding
     // the summary to this width lands every detail value in the same
     // place. A detail-less row leaves its summary unpadded (no trailing
@@ -559,21 +585,71 @@ pub(crate) fn auth_rows(
         .map(|s| s.summary.chars().count())
         .max()
         .unwrap_or(0);
+    let ids = statuses
+        .iter()
+        .map(|status| format!("{id:>id_w$}", id = status.provider_id))
+        .collect::<Vec<_>>();
+    let summaries = statuses
+        .iter()
+        .map(|status| {
+            if status.detail.is_some() {
+                format!("  {summary:<summary_w$}", summary = status.summary)
+            } else {
+                format!("  {summary}", summary = status.summary)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // ListView measures each soft-wrapped RichText child without a height cap.
+    // At a one-cell body width, every cell becomes one row, so budget the shared
+    // account column against the widest complete fixed row before RichText sees
+    // it. This keeps the row count representable in u16 at every terminal width.
+    let account_cell_budget = statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, status)| status.account_label.is_some())
+        .map(|(index, status)| {
+            let detail_cells = status
+                .detail
+                .as_ref()
+                .map(|detail| terminal_cells(&format!("  {detail}"), width_method))
+                .unwrap_or(0);
+            let fixed_cells = terminal_cells(&ids[index], width_method)
+                + 2 // account-column separator
+                + 9 // default marker or matching padding
+                + terminal_cells(&summaries[index], width_method)
+                + detail_cells;
+            usize::from(AUTH_ROW_CELL_LIMIT).saturating_sub(fixed_cells)
+        })
+        .min()
+        .unwrap_or_else(|| usize::from(AUTH_ROW_CELL_LIMIT));
+    let represented = statuses
+        .iter()
+        .map(|status| {
+            status.account_label.as_deref().map(|label| {
+                let ordinary = display_account_label(label, AccountLabelDisplayMode::Ordinary);
+                let represented = if ordinary.contains(' ') {
+                    display_account_label(label, AccountLabelDisplayMode::Ascii)
+                } else {
+                    ordinary
+                };
+                account_label_for_auth_row(&represented, account_cell_budget, width_method)
+            })
+        })
+        .collect::<Vec<_>>();
+    let account_w = represented
+        .iter()
+        .filter_map(|label| label.as_ref())
+        .map(|label| terminal_cells(label, width_method))
+        .max()
+        .unwrap_or(0);
     statuses
         .iter()
         .enumerate()
         .map(|(index, s)| {
-            let summary = if s.detail.is_some() {
-                format!("  {summary:<summary_w$}", summary = s.summary)
-            } else {
-                format!("  {summary}", summary = s.summary)
-            };
-            let mut row = vec![span(
-                format!("{id:>id_w$}", id = s.provider_id),
-                styles.muted,
-            )];
+            let mut row = vec![span(ids[index].clone(), styles.muted)];
             if let Some(label) = &represented[index] {
-                let label_w = usize::from(vaxis::gwidth::gwidth(label, width_method));
+                let label_w = terminal_cells(label, width_method);
                 let padding = " ".repeat(account_w.saturating_sub(label_w));
                 row.push(span(format!("  {label}{padding}"), Style::default()));
                 row.push(span(
@@ -585,7 +661,7 @@ pub(crate) fn auth_rows(
                     styles.muted,
                 ));
             }
-            row.push(span(summary, Style::default()));
+            row.push(span(summaries[index].clone(), Style::default()));
             if let Some(detail) = &s.detail {
                 row.push(span(format!("  {detail}"), styles.muted));
             }
@@ -1072,7 +1148,7 @@ mod tests {
             Method::Unicode,
         ));
         assert!(
-            rows.contains("[clipped; exceeds 65,535-cell inspection limit]"),
+            rows.contains("[clipped; complete auth row exceeds 65,535-cell terminal limit]"),
             "{rows}"
         );
         assert!(
@@ -1083,6 +1159,40 @@ mod tests {
             rows.len() < 512,
             "bounded row grew unexpectedly: {}",
             rows.len()
+        );
+    }
+
+    #[test]
+    fn auth_rows_budget_the_exact_limit_label_against_the_complete_row() {
+        let label = format!("{}\u{0100}", "a".repeat(10_921));
+        let rows = auth_rows(
+            &[ProviderAuthStatus {
+                provider_id: "provider".into(),
+                account_label: Some(label),
+                is_default: true,
+                configured: true,
+                summary: "API key (stored)".into(),
+                detail: Some("legacy credential".into()),
+            }],
+            &test_styles(),
+            Method::Unicode,
+        );
+        let text = rows_text(&rows);
+        assert!(
+            text.contains("[clipped; complete auth row exceeds 65,535-cell terminal limit]"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("\\u{100}"),
+            "the exact-limit tail entered RichText: {text}"
+        );
+        let cells = rows[0]
+            .iter()
+            .map(|segment| terminal_cells(&segment.text, Method::Unicode))
+            .sum::<usize>();
+        assert!(
+            cells <= usize::from(AUTH_ROW_CELL_LIMIT),
+            "complete row has {cells} cells"
         );
     }
 
