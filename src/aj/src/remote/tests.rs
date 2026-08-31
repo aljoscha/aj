@@ -556,11 +556,21 @@ pub(crate) fn scripted_host(
     handles: HostHandles,
     name: Option<&str>,
 ) -> SessionHost {
+    scripted_host_with_run_config(dir, snapshot(provider), handles, name)
+}
+
+/// The shared test-host recipe with an asserted base run config.
+fn scripted_host_with_run_config(
+    dir: &TempDir,
+    run_config: RunConfigSnapshot,
+    handles: HostHandles,
+    name: Option<&str>,
+) -> SessionHost {
     SessionHost::new(HostSetup {
         config: handles.config,
         layers: handles.layers,
         catalog: Arc::new(vec![catalog_model()]),
-        run_config: snapshot(provider),
+        run_config,
         restore: None,
         persistence: ConversationPersistence::new(dir.path().join("sessions")),
         auth: AuthStorage::new(dir.path().join("auth.json")),
@@ -1569,6 +1579,70 @@ async fn both_control_arms_refuse_a_create_meant_for_another_host() {
     );
 
     fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_create_defaults_unstated_thinking_against_the_selected_model() {
+    let dir = TempDir::new().expect("tempdir");
+    let handles = HostHandles::new(&dir);
+    let mut base = snapshot(scripted(Vec::new(), 0, Duration::ZERO));
+    base.thinking = Some(aj_models::ThinkingConfig::XHigh);
+    assert_eq!(base.thinking, Some(aj_models::ThinkingConfig::XHigh));
+    assert_eq!(
+        aj_models::registry::supported_thinking_levels(&base.model_info),
+        vec![aj_models::types::ThinkingLevel::Off],
+        "the selected scripted model accepts only the off default",
+    );
+
+    let host = scripted_host_with_run_config(&dir, base, handles, None);
+    let server = RemoteServer::bind(host.clone(), addr("127.0.0.1:0"), IdentityGate::local())
+        .await
+        .expect("bind a loopback control port");
+    let control = Control::remote(RemoteClient::new(&server.url()).expect("client"));
+
+    for (case, settings, expected_speed) in [
+        ("no creator settings", None, "standard"),
+        (
+            "only an unrelated creator setting",
+            Some(SessionSettings {
+                speed: Some("fast".into()),
+                ..SessionSettings::default()
+            }),
+            "fast",
+        ),
+    ] {
+        let session = control
+            .create(None, settings, None, None, None)
+            .await
+            .unwrap_or_else(|error| panic!("{case} create failed: {error}"));
+        let mut stream = control
+            .attach_all(&[attach(&session)])
+            .await
+            .unwrap_or_else(|error| panic!("{case} attach failed: {error}"));
+        let state = loop {
+            match bounded("the created session's state", stream.recv()).await {
+                ControlFrame::Frame(Frame::State {
+                    session: framed,
+                    settings,
+                    ..
+                }) if framed == session => break settings,
+                ControlFrame::Frame(_) => {}
+                ControlFrame::Lost(error) => panic!("{case} stream failed: {error}"),
+                ControlFrame::Closed => panic!("{case} stream closed before its state"),
+            }
+        };
+        assert_eq!(
+            state.thinking, "off",
+            "{case} inherited xhigh instead of the model-aware off default",
+        );
+        assert_eq!(
+            state.speed, expected_speed,
+            "{case} lost creator provenance on the unrelated axis",
+        );
+    }
+
+    host.shutdown().await;
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
