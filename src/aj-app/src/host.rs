@@ -1822,9 +1822,8 @@ impl SessionHost {
         settings: Option<&SessionSettings>,
     ) -> Result<RunConfigSnapshot, HostError> {
         let mut run = self.inner.base_run_config.clone();
-        let Some(settings) = settings else {
-            return Ok(run);
-        };
+        let default_settings = SessionSettings::default();
+        let settings = settings.unwrap_or(&default_settings);
 
         let speed = match settings.speed.as_deref() {
             Some(name) => speed_from_name(name).ok_or_else(|| {
