@@ -1,5 +1,5 @@
-//! The OAuth login flow: the provider pickers, the login dialog overlay,
-//! and the [`OAuthCallbacks`] driver that streams updates into it.
+//! The OAuth login flow: provider/account action pickers, the login dialog
+//! overlay, and the [`OAuthCallbacks`] driver that streams updates into it.
 //!
 //! Unlike the other overlays (synchronous "confirm parks an outcome, the
 //! host polls it" selectors), an OAuth login is async and long-running:
@@ -936,7 +936,7 @@ fn picker_requests(rows: Vec<AuthRow>) -> HashMap<String, AuthPickerRequest> {
         .collect()
 }
 
-/// Open a provider picker and move focus into its filter (via the caller's
+/// Open an authentication picker and move focus into its filter (via the caller's
 /// refocus event). Confirming a row parks the matching [`AuthPickerRequest`]
 /// in `request_slot` and closes; Esc closes without a request.
 ///
@@ -968,9 +968,9 @@ fn open_auth_picker(
                 *request_c.borrow_mut() = Some(request.clone());
             }
             // A confirmed pick is terminal: tear the whole stack down
-            // (palette and picker) back to the transcript. The host's login
-            // flow then pushes the dialog as the sole overlay. Cancel below
-            // uses `close_top`, which returns to the palette underneath.
+            // (palette and picker) so the host can continue with a login
+            // dialog, account inspection, or direct bare mutation. Cancel
+            // below uses `close_top`, returning to the palette underneath.
             close_all(&stack_c, ctx, &editor_c);
         }));
         let stack_cancel = Rc::clone(stack);
@@ -993,7 +993,7 @@ fn open_auth_picker(
     );
 }
 
-/// Open the `/login` picker over the OAuth providers.
+/// Open the `/login` picker over OAuth provider/account action rows.
 pub(crate) fn open_login_picker(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
@@ -1004,7 +1004,8 @@ pub(crate) fn open_login_picker(
     open_auth_picker(stack, editor, chrome, request_slot, "Log in", rows);
 }
 
-/// Open the `/logout` picker over the providers with a stored credential.
+/// Open the `/logout` picker over stored provider/account rows. Each confirmed
+/// row retains its exact raw removal or default-resolution action.
 pub(crate) fn open_logout_picker(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,

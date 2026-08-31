@@ -502,17 +502,20 @@ pub(crate) fn help_rows(styles: &ContentStyles) -> Vec<Row> {
     rows
 }
 
-/// Auth-status rows: one per provider, its credential summary and any
-/// secondary detail (e.g. token expiry).
+/// Auth-status rows: one per provider/account credential, its default marker,
+/// credential summary, and any secondary detail (e.g. token expiry). Providers
+/// without labeled accounts contribute one provider-only row.
 ///
-/// Each row is three columns: the provider id in `styles.muted`, the summary
-/// in the default style, and the optional detail in `styles.muted`. The
-/// default-styled summary separates the two muted columns, so the detail
-/// reads as its own field without the parentheses `aj` also omits. The id
-/// column is right-aligned and the summary is padded to a shared width on
-/// rows that carry a detail, so every detail value starts at the same column
-/// and lines up.
-pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles) -> Vec<Row> {
+/// Labeled rows add account and default-marker columns between the provider id
+/// and summary. The provider id and secondary detail use `styles.muted`. The
+/// account and summary use the default style. The id column is right-aligned,
+/// account padding follows terminal cell width, and the summary is padded to a
+/// shared width on rows that carry a detail so subsequent columns line up.
+pub(crate) fn auth_rows(
+    statuses: &[ProviderAuthStatus],
+    styles: &ContentStyles,
+    width_method: vaxis::gwidth::Method,
+) -> Vec<Row> {
     if statuses.is_empty() {
         return vec![plain("No providers configured.")];
     }
@@ -543,7 +546,7 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles)
     let account_w = represented
         .iter()
         .filter_map(|label| label.as_ref())
-        .map(|label| label.chars().count())
+        .map(|label| usize::from(vaxis::gwidth::gwidth(label, width_method)))
         .max()
         .unwrap_or(0);
     // Only rows that carry a detail need a fixed summary column: padding
@@ -570,7 +573,9 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles)
                 styles.muted,
             )];
             if let Some(label) = &represented[index] {
-                row.push(span(format!("  {label:<account_w$}"), Style::default()));
+                let label_w = usize::from(vaxis::gwidth::gwidth(label, width_method));
+                let padding = " ".repeat(account_w.saturating_sub(label_w));
+                row.push(span(format!("  {label}{padding}"), Style::default()));
                 row.push(span(
                     if s.is_default {
                         "  default"
@@ -728,6 +733,7 @@ mod tests {
     use aj_models::types::{Usage, UsageCost};
     use aj_session::{SessionSettings, UsageBucket};
     use vaxis::cell::Color;
+    use vaxis::gwidth::Method;
 
     use super::*;
 
@@ -940,6 +946,7 @@ mod tests {
                 },
             ],
             &test_styles(),
+            Method::Unicode,
         ));
         assert!(rows.contains("anthropic"), "{rows}");
         assert!(rows.contains("subscription"), "{rows}");
@@ -969,6 +976,7 @@ mod tests {
                 },
             ],
             &test_styles(),
+            Method::Unicode,
         ));
         assert!(rows.contains("work"), "{rows}");
         assert!(
@@ -1006,6 +1014,7 @@ mod tests {
                 },
             ],
             &test_styles(),
+            Method::Unicode,
         ));
         assert!(rows.contains(&left), "left tail missing: {rows}");
         assert!(rows.contains(&right), "right tail missing: {rows}");
@@ -1037,6 +1046,7 @@ mod tests {
                 },
             ],
             &test_styles(),
+            Method::Unicode,
         ));
         assert!(rows.contains("\\!\\u{61}\\u{20}\\u{62}"), "{rows}");
         assert!(rows.contains("\\u{20}\\u{20}\\u{20}\\u{20}"), "{rows}");
@@ -1059,6 +1069,7 @@ mod tests {
                 detail: None,
             }],
             &test_styles(),
+            Method::Unicode,
         ));
         assert!(
             rows.contains("[clipped; exceeds 65,535-cell inspection limit]"),
@@ -1092,6 +1103,7 @@ mod tests {
                 detail: Some("expires in 1h".into()),
             }],
             &styles,
+            Method::Unicode,
         );
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
@@ -1126,6 +1138,7 @@ mod tests {
                 detail: None,
             }],
             &styles,
+            Method::Unicode,
         );
         assert_eq!(rows[0].len(), 2, "{:?}", rows[0]);
     }
@@ -1157,6 +1170,7 @@ mod tests {
                 },
             ],
             &styles,
+            Method::Unicode,
         );
         assert_eq!(rows.len(), 2);
 
@@ -1183,6 +1197,60 @@ mod tests {
         assert_eq!(rows[0][0].style, styles.muted);
         assert_eq!(rows[0][1].style, Style::default());
         assert_eq!(rows[0][2].style, styles.muted);
+    }
+
+    #[test]
+    fn auth_rows_align_account_columns_with_the_renderer_width_method() {
+        let assert_aligned = |left: &str, right: &str, method| {
+            let rows = auth_rows(
+                &[
+                    ProviderAuthStatus {
+                        provider_id: "provider".into(),
+                        account_label: Some(left.into()),
+                        is_default: false,
+                        configured: true,
+                        summary: "credential".into(),
+                        detail: None,
+                    },
+                    ProviderAuthStatus {
+                        provider_id: "provider".into(),
+                        account_label: Some(right.into()),
+                        is_default: false,
+                        configured: true,
+                        summary: "credential".into(),
+                        detail: None,
+                    },
+                ],
+                &test_styles(),
+                method,
+            );
+            let mut ctx = crate::test_support::draw_ctx(80, Some(1));
+            ctx.width_method = method;
+            let summary_col = |row: &Row| {
+                let widget = row_widgets(std::slice::from_ref(row))
+                    .pop()
+                    .expect("one rendered auth row");
+                let surface = vaxis::vxfw::draw_widget(&widget, &ctx);
+                crate::test_support::flatten(&surface)[0]
+                    .iter()
+                    .position(|cell| cell.char.grapheme() == "c")
+                    .expect("credential summary in rendered row")
+            };
+
+            assert_eq!(
+                summary_col(&rows[0]),
+                summary_col(&rows[1]),
+                "summary columns for {left:?} and {right:?} under {method:?}"
+            );
+        };
+
+        assert_eq!(vaxis::gwidth::gwidth("個人", Method::Unicode), 4);
+        assert_eq!(vaxis::gwidth::gwidth("work", Method::Unicode), 4);
+        assert_aligned("個人", "work", Method::Unicode);
+
+        assert_eq!(vaxis::gwidth::gwidth("👋🏿", Method::Wcwidth), 4);
+        assert_eq!(vaxis::gwidth::gwidth("個", Method::Wcwidth), 2);
+        assert_aligned("👋🏿", "個", Method::Wcwidth);
     }
 
     #[test]

@@ -2284,8 +2284,9 @@ fn inspect_account_action(shell: &Rc<RefCell<Shell>>, app: &mut AsyncApp, action
     app.request_redraw();
 }
 
-/// Apply a confirmed login/logout provider pick. Login mounts the dialog
-/// and spawns the flow; logout is a quick disk write done inline.
+/// Apply a confirmed authentication picker request. Login mounts the dialog
+/// and spawns the flow. Bare logout writes inline, while labeled mutations
+/// route through exact-account inspection and default-removal resolution.
 async fn apply_auth_request(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
@@ -4595,10 +4596,13 @@ async fn apply_setting_change(
 /// `styles` is the content-column tint snapshot for the auth page. It is
 /// `Copy`, so the task captures it directly. See the call site for the
 /// theme-reload staleness note.
+/// `width_method` is the matching render snapshot, so account-column padding
+/// uses the same cell geometry as the frame that paints it.
 fn spawn_overlay_fetch(
     world: &World,
     kind: FetchKind,
     styles: ContentStyles,
+    width_method: vaxis::gwidth::Method,
     tx: &UnboundedSender<(FetchKind, Vec<Row>)>,
 ) {
     let tx = tx.clone();
@@ -4613,7 +4617,11 @@ fn spawn_overlay_fetch(
             }
             let auth = world.auth.clone();
             tokio::spawn(async move {
-                let rows = auth_rows(&aj_app::auth::collect_statuses(&auth).await, &styles);
+                let rows = auth_rows(
+                    &aj_app::auth::collect_statuses(&auth).await,
+                    &styles,
+                    width_method,
+                );
                 let _ = tx.send((FetchKind::Auth, rows));
             });
         }
@@ -4642,6 +4650,21 @@ fn spawn_overlay_fetch(
             });
         }
     }
+}
+
+/// Snapshot the Shell presentation state used by the async overlay fetch.
+/// Auth rows must use the same width method as the frame that renders them.
+fn spawn_shell_overlay_fetch(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    kind: FetchKind,
+    tx: &UnboundedSender<(FetchKind, Vec<Row>)>,
+) {
+    let shell = shell.borrow();
+    let styles = ContentStyles::from_theme(&shell.theme.read());
+    let width_method = shell.width_method();
+    drop(shell);
+    spawn_overlay_fetch(world, kind, styles, width_method, tx);
 }
 
 /// Spawn the prompt-history scan for `scope` on a blocking thread,
@@ -4995,7 +5018,7 @@ pub(crate) struct OverlayHandles {
     pub(crate) session_scan: Rc<RefCell<Option<SessionScan>>>,
     /// Where the session selector parks a confirmed resume request.
     pub(crate) session_request: Rc<RefCell<Option<SessionRequest>>>,
-    /// Where the login/logout picker parks a confirmed provider action.
+    /// Where an authentication picker parks its exact confirmed request.
     pub(crate) auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
     /// Where the session-tag editor parks a confirmed label.
     pub(crate) tag_edit: Rc<RefCell<Option<TagEdit>>>,
@@ -5219,9 +5242,8 @@ struct Shell {
     /// session-selector pick. Drained after each input event; a `Some`
     /// exits the drive loop with the matching [`SessionExit`].
     session_request: Rc<RefCell<Option<SessionRequest>>>,
-    /// A confirmed login/logout provider pick parked by the auth picker,
-    /// drained by the drive loop (which owns the credential store and the
-    /// login task machinery).
+    /// A confirmed authentication request parked by a picker and drained by
+    /// the drive loop, which owns the credential store and login task machinery.
     auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
     /// Where the session-tag editor parks a confirmed label, read by the drive
     /// loop, which owns the control surface the tag command travels over.
@@ -5245,6 +5267,9 @@ struct Shell {
     /// Interior mutability, like the theme handle, so the const-`&self`
     /// restyle path can read them.
     terminal_caps: Cell<TerminalCaps>,
+    /// Width method used by the latest frame. Async auth rows need the same
+    /// method while constructing cell-aligned columns outside the draw call.
+    width_method: Cell<vaxis::gwidth::Method>,
 }
 
 impl Shell {
@@ -5765,6 +5790,7 @@ impl Shell {
             branch_anchor,
             image_store,
             terminal_caps: Cell::new(TerminalCaps::default()),
+            width_method: Cell::new(vaxis::gwidth::Method::Unicode),
         }
     }
 
@@ -5840,8 +5866,7 @@ impl Shell {
         self.session_request.borrow_mut().take()
     }
 
-    /// Collect a confirmed login/logout provider pick parked by the auth
-    /// picker, if any.
+    /// Collect an exact authentication request parked by a picker, if any.
     fn take_auth_request(&self) -> Option<AuthPickerRequest> {
         self.auth_request.borrow_mut().take()
     }
@@ -5906,6 +5931,10 @@ impl Shell {
     /// `restyle` path (e.g. the login dialog) that must honor the same caps.
     fn terminal_caps(&self) -> TerminalCaps {
         self.terminal_caps.get()
+    }
+
+    fn width_method(&self) -> vaxis::gwidth::Method {
+        self.width_method.get()
     }
 
     /// Rebuild every style struct from the current theme, for a runtime
@@ -6001,6 +6030,7 @@ impl Shell {
 
 impl Widget for Shell {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        self.width_method.set(ctx.width_method);
         // Draw through the keymap controller so its identity sits on
         // the focus path between the Shell and everything below. The
         // scrim and the top overlay are appended to the controller's
@@ -7509,15 +7539,15 @@ async fn drive(
                                 });
                                 app.request_redraw();
                             } else {
-                                // NOTE: Snapshot the content-column tints at
-                                // fetch time. A theme hot-reload while the
-                                // overlay is open won't re-tint its rows, the
-                                // overlay re-tints on next open. This matches the
-                                // chrome, which is also snapshotted at open.
-                                // Acceptable for a transient read-only overlay.
-                                let styles =
-                                    ContentStyles::from_theme(&shell.borrow().theme.read());
-                                spawn_overlay_fetch(world, fetch.kind, styles, &fetch_tx);
+                                // Presentation state is snapshotted at fetch
+                                // time. A theme reload re-tints on next open,
+                                // matching the overlay chrome.
+                                spawn_shell_overlay_fetch(
+                                    world,
+                                    shell,
+                                    fetch.kind,
+                                    &fetch_tx,
+                                );
                                 pending_fills.push((fetch.kind, fetch.list));
                             }
                         }
@@ -7578,9 +7608,8 @@ async fn drive(
                                 anchor: None,
                             });
                         }
-                        // A confirmed login/logout provider pick from the
-                        // auth picker. Bind out of the borrow first so no
-                        // RefCell ref is held across the await inside.
+                        // A confirmed authentication request from a picker.
+                        // Bind out first so no RefCell ref crosses the await.
                         let auth_request = shell.borrow().take_auth_request();
                         if let Some(request) = auth_request {
                             apply_auth_request(
@@ -13698,6 +13727,64 @@ mod tests {
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "picker open");
     }
 
+    #[tokio::test]
+    async fn auth_fetch_aligns_accounts_with_the_shells_active_width_method() {
+        let dir = TempDir::new().expect("tempdir");
+        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let provider_id = "width-status";
+        for label in ["👋🏿", "個"] {
+            world
+                .auth
+                .insert_account(
+                    provider_id,
+                    label,
+                    AuthCredential::ApiKey {
+                        key: format!("{label}-key"),
+                    },
+                )
+                .await
+                .expect("seed labeled account");
+        }
+
+        for method in [
+            vaxis::gwidth::Method::Unicode,
+            vaxis::gwidth::Method::Wcwidth,
+        ] {
+            let mut ctx = full_draw_ctx();
+            ctx.width_method = method;
+            shell.borrow_mut().draw(&ctx);
+            assert_eq!(shell.borrow().width_method(), method, "draw snapshot");
+
+            let (tx, mut rx) = unbounded_channel();
+            spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, &tx);
+            let (kind, rows) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("auth fetch completes")
+                .expect("auth fetch channel remains open");
+            assert_eq!(kind, FetchKind::Auth);
+            let rows = rows
+                .into_iter()
+                .filter(|row| row.iter().any(|segment| segment.text.contains(provider_id)))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2, "one row per exact account");
+
+            let summary_col = |row: &Row| {
+                let text: WidgetRef =
+                    Rc::new(RefCell::new(vaxis::vxfw::RichText::new(row.clone())));
+                let surface = draw_widget(&text, &ctx);
+                crate::test_support::flatten(&surface)[0]
+                    .iter()
+                    .position(|cell| cell.char.grapheme() == "A")
+                    .expect("API-key summary in rendered row")
+            };
+            assert_eq!(
+                summary_col(&rows[0]),
+                summary_col(&rows[1]),
+                "fetched account columns under {method:?}"
+            );
+        }
+    }
+
     /// Whether a controlled OAuth flow yields forever or occupies one task poll
     /// until the test releases it.
     enum LoginGate {
@@ -14912,6 +14999,93 @@ mod tests {
                 .unwrap(),
             Some(AuthCredential::ApiKey { key }) if key == "personal-key"
         ));
+    }
+
+    /// Adding an account to a configured provider must retain labeled-insert
+    /// intent across the real account prompt and controlled OAuth completion.
+    #[tokio::test]
+    async fn login_request_new_account_preserves_existing_account_and_inserts_typed_label() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        let provider_id = "new-account-login";
+        register_controlled_oauth(&world, provider_id, "work-access", LoginGate::Ready).await;
+        world
+            .auth
+            .insert_account(
+                provider_id,
+                "personal",
+                AuthCredential::ApiKey {
+                    key: "personal-key".to_string(),
+                },
+            )
+            .await
+            .expect("seed existing personal account");
+
+        let (tx, mut rx) = unbounded_channel();
+        let mut login_session = None;
+        apply_auth_request(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            AuthPickerRequest::Login {
+                provider_id: provider_id.to_string(),
+                provider_name: "Controlled OAuth".to_string(),
+                target: LoginTarget::NewAccount,
+            },
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("configured provider reaches the account-name prompt")
+            .expect("login dialog redraw channel remains open");
+        let prompt = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(prompt.contains("Account name"), "account prompt: {prompt}");
+
+        writer.write_all(b"work\r").expect("type account label");
+        for _ in 0..5 {
+            let event = tokio::time::timeout(Duration::from_secs(1), app.next_input())
+                .await
+                .expect("typed account-label input arrives")
+                .expect("account-label input");
+            app.handle_input(event);
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            &mut login_session.as_mut().expect("login session").handle,
+        )
+        .await
+        .expect("typed account label reaches controlled OAuth");
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "labeled login failed after account input: {result:?}"
+        );
+        finish_login(&mut world, &shell, &mut app, &mut login_session, result);
+
+        assert!(matches!(
+            world
+                .auth
+                .get_account(provider_id, "personal")
+                .await
+                .unwrap(),
+            Some(AuthCredential::ApiKey { key }) if key == "personal-key"
+        ));
+        assert!(matches!(
+            world.auth.get_account(provider_id, "work").await.unwrap(),
+            Some(AuthCredential::OAuth(credentials)) if credentials.access == "work-access"
+        ));
+        let accounts = world
+            .auth
+            .accounts(provider_id)
+            .await
+            .expect("read account set")
+            .expect("labeled account set");
+        assert_eq!(accounts.default, "personal", "existing default preserved");
+        assert_eq!(accounts.accounts.len(), 2, "one exact account inserted");
     }
 
     /// Esc reaches the same abort-and-join barrier through the drive loop. The
@@ -21416,8 +21590,7 @@ mod tests {
         );
 
         let (tx, mut rx) = unbounded_channel();
-        let styles = ContentStyles::from_theme(&shell.borrow().theme.read());
-        spawn_overlay_fetch(&world, FetchKind::SessionInfo, styles, &tx);
+        spawn_shell_overlay_fetch(&world, &shell, FetchKind::SessionInfo, &tx);
         let (kind, rows) = rx.recv().await.expect("the fetch delivered rows");
         assert_eq!(kind, FetchKind::SessionInfo);
 

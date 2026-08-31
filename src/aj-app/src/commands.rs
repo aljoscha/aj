@@ -74,7 +74,7 @@ pub const COMMANDS: &[Command] = &[
         name: "login",
         title: "login",
         category: "auth",
-        description: "Log in to a provider via OAuth (browser flow).",
+        description: "Add or replace a provider OAuth account.",
         action_id: None,
         action: CommandAction::OpenLoginSelector,
     },
@@ -82,7 +82,7 @@ pub const COMMANDS: &[Command] = &[
         name: "logout",
         title: "logout",
         category: "auth",
-        description: "Remove a provider's stored credentials.",
+        description: "Inspect and remove a stored account or credential.",
         action_id: None,
         action: CommandAction::OpenLogoutSelector,
     },
@@ -98,7 +98,7 @@ pub const COMMANDS: &[Command] = &[
         name: "auth",
         title: "status",
         category: "auth",
-        description: "Show authentication status for each provider.",
+        description: "Show authentication status for each provider and account.",
         action_id: None,
         action: CommandAction::OpenAuthStatus,
     },
@@ -280,18 +280,21 @@ pub enum CommandAction {
     /// affects the current session only. Use the settings window to
     /// change the default for new sessions.
     OpenModelSelector,
-    /// Open the OAuth login provider picker. On confirm the host
-    /// starts the provider's browser login flow in a dialog overlay.
+    /// Open the OAuth provider/account picker. Adding an account opens the login
+    /// dialog, which prompts for a label before OAuth begins when the provider
+    /// is already configured. Replacing a labeled account first requires exact
+    /// account inspection.
     OpenLoginSelector,
-    /// Open the logout provider picker (only providers with stored
-    /// credentials are listed). On confirm the host removes the
-    /// chosen provider's `auth.json` entry.
+    /// Open the logout account picker over stored credentials. A selected
+    /// account is inspected before removal. Removing a default account with
+    /// siblings requires choosing a replacement default or explicitly removing
+    /// the complete provider account set.
     OpenLogoutSelector,
     /// Open the labeled-account picker for changing a provider's store
     /// default. The confirmed exact raw account is inspected before mutation.
     OpenDefaultAccountSelector,
-    /// Open the read-only authentication-status overlay listing each
-    /// provider's credential method and source.
+    /// Open the read-only authentication-status overlay. It lists provider-level
+    /// credential sources and one row per stored account, marking the default.
     OpenAuthStatus,
     /// Open the read-only usage overlay listing each provider's plan
     /// usage and rate-limit windows. The reports load asynchronously

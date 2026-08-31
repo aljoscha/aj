@@ -30,11 +30,11 @@ use aj_models::oauth::OAuthAuthInfo;
 /// `auth.json` is computed at display time.
 const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openrouter"];
 
-/// A provider's resolved authentication status, ready to render.
+/// One provider-level or labeled-account authentication row, ready to render.
 ///
-/// `summary` describes the *method and source* that would win the
-/// resolution chain (runtime override, then stored key, then stored
-/// OAuth, then env). `detail` carries secondary info such as an OAuth
+/// For a provider-level row, `summary` describes the method and source that
+/// wins the resolution chain. For an account row, it describes that exact
+/// stored credential. `detail` carries secondary information such as an OAuth
 /// token's remaining lifetime.
 #[derive(Debug, Clone)]
 pub struct ProviderAuthStatus {
@@ -173,10 +173,11 @@ fn account_status(
     }
 }
 
-/// Build status rows for every provider worth showing: the
-/// [`KNOWN_PROVIDERS`] set, every registered OAuth provider, and any
-/// provider with a stored `auth.json` entry. Sorted by id for a
-/// stable overlay order.
+/// Build status rows for every provider worth showing: the [`KNOWN_PROVIDERS`]
+/// set, every registered OAuth provider, and any provider with a stored
+/// `auth.json` entry. A provider contributes its provider-level source when one
+/// exists and one row per labeled account. Rows are sorted by provider id, then
+/// account label.
 pub async fn collect_statuses(auth: &AuthStorage) -> Vec<ProviderAuthStatus> {
     let oauth = auth.oauth_provider_ids().await;
 
