@@ -56,8 +56,8 @@ use aj_models::registry::{ModelInfo, default_thinking_level, validate_thinking_l
 use aj_models::types::{Speed, UserContent};
 use aj_models::{speed_from_name, thinking_config_from_name, verbosity_from_name};
 use aj_session::{
-    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, LockHolder, SessionLock,
-    normalize_tag, project_suffix, validate_session_env,
+    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, LockHolder,
+    PersistenceFailure, SessionLock, normalize_tag, project_suffix, validate_session_env,
 };
 use aj_wire::{
     ARCHIVE_CAPABILITY, AgentQueue, COMPACTION_USAGE_CAPABILITY, Cursor, DurableEvent, Frame,
@@ -110,6 +110,29 @@ const HOST_ABORT_GRACE: Duration = Duration::from_secs(10);
 /// and another process in the same directory waits that much longer for a
 /// session this one is done with, which is the failure this exists to fix.
 pub const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(30);
+
+/// The `error` frame code a session's stream carries when its conversation
+/// log refused a write and the materialization ended over it (spec 6.5). A
+/// client re-asks for the session at once: the host rebuilds it from disk.
+pub const PERSISTENCE_FAILED_CODE: &str = "persistence_failed";
+
+/// The one sentence a client sees for a fused log. A session with a canonical
+/// log on disk reopens; one whose first publication failed has nothing to
+/// reopen, so the user is sent to a new session instead.
+pub(crate) fn persistence_failure_message(failure: &PersistenceFailure) -> String {
+    if failure.can_reopen() {
+        format!(
+            "Saving this session failed: {failure}. To protect its history, AJ stopped the \
+             session and will not save more work to it. Free disk space, then reopen the \
+             session. The interrupted action may need to be retried."
+        )
+    } else {
+        format!(
+            "Saving this session failed: {failure}. The message you just sent was not \
+             recorded. Fix the storage problem, then start a new session and resend it."
+        )
+    }
+}
 
 /// How often the host re-probes the sessions it publishes as locked.
 ///
@@ -1909,7 +1932,23 @@ impl SessionHost {
     ) -> Result<Arc<LiveSession>, HostError> {
         if let Some(id) = id {
             if let Some(entry) = sessions.get(id) {
-                return Ok(Arc::clone(&entry.session));
+                if !entry.session.is_draining() {
+                    return Ok(Arc::clone(&entry.session));
+                }
+                // A draining entry under the map is a materialization ending
+                // over a fused log (a release or shutdown holds the map for
+                // its whole teardown, so neither is observable here). It is
+                // as good as absent: join its owner, which is what releases
+                // the session lock, and rebuild from disk below.
+                let entry = sessions
+                    .remove(id)
+                    .expect("the entry is ours: the map has been held throughout");
+                let _ = entry.driver.await;
+                self.inner
+                    .session_stops
+                    .lock()
+                    .expect("session stops mutex poisoned")
+                    .remove(id);
             }
             if !self.on_disk(id)? {
                 return Err(HostError::UnknownSession(id.to_string()));
@@ -1966,7 +2005,7 @@ impl SessionHost {
         };
 
         let handoff = AppendHandoff::default();
-        let events = core.install_persisting_forwarder(&handoff);
+        let (events, persistence_failure) = core.install_persisting_forwarder(&handoff).await;
         // One small read, on a path that has just read the whole log. From
         // here the session answers its own label out of memory, so no
         // directory refresh ever reaches the sidecar for it (spec 6.8). A
@@ -2025,6 +2064,7 @@ impl SessionHost {
             Arc::clone(&self.inner.shared),
             events,
             requests,
+            persistence_failure,
         );
         // Synchronize the terminal check with shutdown's abort snapshot. If
         // shutdown wins, this materialization drops its lock and core without
@@ -2548,6 +2588,12 @@ fn spawn_idle_sweeper(inner: &Arc<HostInner>) {
             let now = Instant::now();
             let mut due = Vec::new();
             for session in &held {
+                // A session whose driver ended on its own (a fused log) has
+                // nothing to wait a grace for: `release_if_idle` reaps it.
+                if session.driver_gone() {
+                    due.push(session.id().to_string());
+                    continue;
+                }
                 if !live::releasable(session, fanout) {
                     idle_since.remove(session.id());
                     continue;

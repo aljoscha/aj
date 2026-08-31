@@ -259,11 +259,19 @@ Responsibilities:
   consistent), quiesce background tasks, flush log buffers, close
   client streams. Remote clients of a departed host simply lose the
   connection, through a gateway the sessions surface as unreachable.
-- A turn's fatal error belongs to its session, not to the host. It
-  surfaces as an error frame on that session's stream and the session
-  stays live. A host serving several sessions must not exit because one
-  of them hit a disk failure, and the local TUI attached to it should
-  show the error rather than quit.
+- A conversation-log persistence error is terminal for that live
+  materialization: the log refuses every later write, so nothing can
+  append after the uncertain one. The host publishes one `error` frame
+  with code `persistence_failed` on every stream attached to the session,
+  detaches the session from those streams, and tears it down through the
+  ordinary driver path. The stream itself stays open. A later attach or
+  command rematerializes the session from disk. Other sessions and the
+  host stay live. If the failure hit a session's first publication, there
+  is no canonical log to reopen: the error says the submitted message was
+  not recorded and directs the user to start a new session instead, and
+  the id it was given answers `unknown_session` from then on.
+  Fatal turn failures that do not compromise persistence remain scoped to
+  the turn and do not tear down the session.
 
 The local TUI becomes the first client of this interface, attached
 in-process through direct handles and channels, not through HTTP. It
@@ -312,8 +320,8 @@ request, 404 unknown session/task/entry, or an endpoint the peer does
 not serve (code `unknown_endpoint`, the answer a capability probe
 reads, section 6.10), 409 conflict (busy refusal, lock
 conflict, or a request the host cannot serve such as a model it has no
-credentials for), 500 the host failed internally, 503 upstream host
-unreachable (gateway only).
+credentials for), 500 `internal` for host failures, and 503 upstream
+host unreachable (gateway only).
 
 ### 6.2 Sessions and addressing
 
@@ -661,6 +669,15 @@ Client application rules:
   with the bit already false and no transition left to see. Either
   edge re-asks, whichever fires first.
 
+  A session whose live conversation log failed (`persistence_failed`)
+  re-asks as soon as that frame folds. The host marks the failed owner
+  draining before publishing the frame and treats a draining owner as
+  absent, joining it before rebuilding from disk, so the re-ask lands on a
+  fresh materialization. A directory edge is no use here: a durable
+  session stays listed throughout. This immediate edge belongs only to
+  `persistence_failed`. Unknown and locked refusals keep their directory
+  rules and never become retry loops.
+
   There is a third clause for `locked`, derived from the latest row
   alone. `list` is lossy-coalescible (section 6.4), and the rise and
   fall are seconds apart by design, so the held snapshot can be
@@ -713,7 +730,7 @@ viewed agent to that parameter:
 
 | Command | Body | Semantics |
 |---|---|---|
-| `POST /v1/sessions` | optional settings, optional first prompt, optional tag | Create a session in the host's working directory. Settings resolution per section 8. Creating the session is what either happens or does not: the settings, the prompt and the tag are validated before a log exists, so a refusal leaves nothing behind. The tag and the first prompt are applied afterwards, under the session's own lock, and are best-effort: one that does not land still answers 200 with the id, plus an `incomplete` field carrying the host's words for what did not stick, so the client retags rather than creating a second session. A minted session is never deleted to make an error tidier. |
+| `POST /v1/sessions` | optional settings, optional first prompt, optional tag | Create a session in the host's working directory. Settings resolution per section 8. Creating the session is what either happens or does not: the settings, the prompt and the tag are validated before a log exists, so a refusal leaves nothing behind. The tag and the first prompt are applied afterwards, under the session's own lock, and are best-effort: one that does not land still answers 200 with the id, plus an `incomplete` field carrying the host's words for what did not stick, so the client retags rather than creating a second session. A first prompt whose persistence fails does so on the stream, as `persistence_failed` (section 5), after the id was answered. A minted session is never deleted to make an error tidier. |
 | `.../{id}/prompt` | text or content blocks | Exactly `handle_submit`: run a turn if idle, queue follow-up if busy. |
 | `.../{id}/steer` | text, optional agent | Queue steering (or promote pending follow-up when text is empty), as today. |
 | `.../{id}/cancel` | optional agent | Cancel the targeted agent through the mechanism that owns its run: its driven turn, a detached sub-agent's background task, or the existing foreground-sub-agent-cancels-main cascade. An inconsistent running mark with no owning turn or task is 409. An idle or already-completed target is accepted. |

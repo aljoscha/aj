@@ -8240,6 +8240,7 @@ mod tests {
     use aj_app::test_support::CanonicalState;
     use aj_models::auth::{AuthCredential, CredentialSource};
     use aj_models::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
+    use aj_session::{AppendFault, AppendFaultFixture};
     use async_trait::async_trait;
     use tempfile::TempDir;
     use tokio::sync::Notify;
@@ -11657,26 +11658,33 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// A turn's fatal error belongs to its session, not to this client (spec
-    /// section 5): it shows up as an error row and the session stays usable,
-    /// where the pre-host drive loop ended the session on it.
-    ///
-    /// The fault is a log that cannot be opened: the first punctuating append
-    /// creates the file with `create_new`, so a path that is already taken
-    /// makes that append fail inside the inline persistence listener, which is
-    /// exactly a fatal turn error.
+    /// A persistence failure ends the materialization under this client (spec
+    /// section 5): the storage error shows up as an error row, the client owes
+    /// a re-attach at once, and the loop's ordinary rejoin lands on a fresh
+    /// materialization of the same session, which then runs the next prompt.
     #[tokio::test]
-    async fn a_fatal_turn_error_shows_an_error_and_keeps_the_session_usable() {
+    async fn a_persistence_failure_re_attaches_a_fresh_materialization() {
         let dir = TempDir::new().expect("tempdir");
-        let mut world = scripted_world(&dir, "streaming-text").await;
-        let log_path = dir
-            .path()
-            .join("sessions")
-            .join(format!("{}.jsonl", world.session()));
-        std::fs::write(&log_path, "").expect("take the path the log wants");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let failed_session = world.session().to_string();
+        let failed_log = Arc::clone(&world.handles().log);
+        let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+        fault
+            .install(&mut *world.handles().log.lock().await)
+            .expect("install zero-write fault");
 
         handle_submit(&mut world, "hi".to_string()).await;
-        settle(&mut world).await;
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while !world.directory.needs_reattach() {
+            assert!(
+                Instant::now() < deadline,
+                "the storage error never reached the client"
+            );
+            if !fold_ready_frames(&mut world) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
         let errors: Vec<String> = world
             .chat
             .borrow()
@@ -11691,21 +11699,26 @@ mod tests {
                 _ => None,
             })
             .collect();
+        assert_eq!(errors.len(), 1, "one error row: {errors:?}");
         assert!(
-            errors.iter().any(|text| text.starts_with("IO error")),
-            "the failed append surfaced as an error row: {errors:?}",
+            errors[0].starts_with("Saving this session failed:"),
+            "the failed append surfaced as the actionable error row: {errors:?}",
         );
 
-        // Still usable: once the fault clears, the next prompt runs a turn.
-        std::fs::remove_file(&log_path).expect("clear the fault");
+        let _ = drive_resume(&mut world, &shell)
+            .await
+            .expect("the loop's ordinary rejoin");
+        assert_eq!(world.session(), failed_session);
+        assert!(
+            !Arc::ptr_eq(&failed_log, &world.handles().log),
+            "the rejoin reused the fused ConversationLog"
+        );
         install_busy_script(world.handles());
         handle_submit(&mut world, "again".to_string()).await;
-        fold_ready_frames(&mut world);
-        assert!(world.client().working(), "the session survived the error");
         settle(&mut world).await;
         assert!(
             user_rows(&world).iter().any(|text| text == "again"),
-            "and the second prompt ran: {:?}",
+            "the rematerialized session ran the prompt: {:?}",
             user_rows(&world),
         );
         shut_down(&world).await;
@@ -11931,6 +11944,7 @@ mod tests {
                         caught: CatchUp::Caught,
                         ..
                     } => {
+                        refresh_local_handles(world, shell).await?;
                         fold_notice(world, reattached_notice(&world.control));
                         pending = None;
                     }

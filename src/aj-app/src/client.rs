@@ -24,6 +24,7 @@ use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_wire::{AgentQueue, Cursor, DecodedAgentEvent, Frame, QueueState, TaskTable};
 
 use crate::chat::{ChatState, Redraw, reduce};
+use crate::host::PERSISTENCE_FAILED_CODE;
 use crate::session::AgentLifecycle;
 
 /// Why a session is withheld, which names the edge in the peer's directory
@@ -466,12 +467,15 @@ impl SessionClient {
                 // either way, and a code this build has never heard of has to
                 // behave like the refusals it knows (spec 6.6).
                 //
-                // Spec section 5 reserves the kind for a turn's fatal error too,
-                // on a session that stays live. Nothing emits that today, and
-                // the day something does it arrives on the unknown-code path and
-                // tears the attachment down over a turn that failed. Telling
-                // that kind from a refusal is the branch this arm still owes.
+                // A materialization that ended over a fused log is the one
+                // code that owes no waiting: the host rebuilds the session
+                // from disk on the next ask (spec 6.5), so the obligation is
+                // taken back at once instead of waiting for a directory edge
+                // the row may never show (a durable session stays listed).
                 self.drop_attachment(Refusal::from_code(&code, lock_generation), message.clone());
+                if code == PERSISTENCE_FAILED_CODE {
+                    self.owe_reattach();
+                }
                 // The message verbatim, which spec 6.6 makes sufficient on its
                 // own, so a code this build has never heard of still reads.
                 reduce(
@@ -1153,6 +1157,34 @@ mod tests {
         assert!(
             !client.needs_reattach(),
             "the re-attach the reset asked for would be refused again",
+        );
+    }
+
+    /// A materialization that ended over a fused log drops the attachment
+    /// like any refusal, but owes the re-ask at once (spec 6.5): the host
+    /// rebuilds the session from disk on that ask, and the row stays listed
+    /// throughout, so no directory edge would ever fire.
+    #[test]
+    fn a_persistence_failure_re_asks_at_once() {
+        let (mut client, mut chat) = attached();
+
+        let _ = client.apply(
+            &mut chat,
+            refusal(
+                SESSION,
+                PERSISTENCE_FAILED_CODE,
+                "Saving this session failed: no space left on device.",
+            ),
+        );
+
+        assert!(client.needs_reattach(), "the re-ask is owed immediately");
+        assert_eq!(client.cursor(), None, "the failed epoch is let go of");
+        assert!(
+            errors(&chat)
+                .iter()
+                .any(|text| text.starts_with("Saving this session failed:")),
+            "the message reaches the transcript: {:?}",
+            errors(&chat)
         );
     }
 

@@ -33,15 +33,17 @@ use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::tool::{TaskId, TaskStatus};
 use aj_models::types::UserContent;
 use aj_session::{
-    EntryRef, SessionMetadata, TaggedEvent, ThreadFilter, repair_interrupted_tool_uses,
+    EntryRef, PersistenceFailure, SessionMetadata, TaggedEvent, ThreadFilter,
+    repair_interrupted_tool_uses,
 };
 use aj_wire::{DurableEvent, Frame};
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot;
 
 use crate::host::live::{self, LiveSession, ReleaseOutcome, ReleasedRow, Request, settings_of};
 use crate::host::{
-    Command, CommandOutcome, HeadTarget, HostError, HostShared, QueueOp, SettingsAxis,
-    SettingsChange, mint_epoch,
+    Command, CommandOutcome, HeadTarget, HostError, HostShared, PERSISTENCE_FAILED_CODE, QueueOp,
+    SettingsAxis, SettingsChange, mint_epoch, persistence_failure_message,
 };
 use crate::session::AgentLifecycle;
 use crate::settings::ConfirmOutcome;
@@ -97,6 +99,15 @@ pub(crate) struct Driver {
     lifecycle: AgentLifecycle,
     events: UnboundedReceiver<TaggedEvent>,
     requests: UnboundedReceiver<Request>,
+    /// Fired once by the conversation log when a write fails and fuses it
+    /// (see `ConversationLog::install_failure_signal`). The log reports from
+    /// the fuse itself, so a failure inside a detached task's append reaches
+    /// this task the same way a foreground turn's does.
+    persistence_failure: oneshot::Receiver<PersistenceFailure>,
+    /// Set once the failure above has been consumed, so the receiver is never
+    /// polled again and a turn that failed on that same write does not report
+    /// the storage error a second time.
+    persistence_failed: bool,
 }
 
 impl Driver {
@@ -105,6 +116,7 @@ impl Driver {
         shared: Arc<HostShared>,
         events: UnboundedReceiver<TaggedEvent>,
         requests: UnboundedReceiver<Request>,
+        persistence_failure: oneshot::Receiver<PersistenceFailure>,
     ) -> Self {
         let turns = Turns::with_handoff(session.handoff.clone());
         Self {
@@ -114,6 +126,8 @@ impl Driver {
             lifecycle: AgentLifecycle::default(),
             events,
             requests,
+            persistence_failure,
+            persistence_failed: false,
         }
     }
 
@@ -121,6 +135,17 @@ impl Driver {
         loop {
             tokio::select! {
                 biased;
+
+                // A fused log first: nothing this task could do for a request
+                // is safe once the log refuses to append, and the client owes
+                // the storage error before any refusal of its own.
+                failure = &mut self.persistence_failure, if !self.persistence_failed => {
+                    self.persistence_failed = true;
+                    if let Ok(failure) = failure {
+                        self.stop_for_persistence(failure).await;
+                        return;
+                    }
+                }
 
                 // Requests first: a command's refusal has to reflect the
                 // state as of now, and the event arm can be arbitrarily
@@ -337,6 +362,9 @@ impl Driver {
             // from the turn's terminal `MessageEnd`, so re-reporting it
             // would float it above events still queued behind us.
             Err(TurnError::Recoverable(_)) => {}
+            // The turn that tripped the fuse fails on the same error the
+            // storage frame already carries.
+            Err(TurnError::Fatal(_)) if self.persistence_failed => {}
             Err(TurnError::Fatal(err)) => {
                 self.publish_event(
                     None,
@@ -1102,6 +1130,29 @@ impl Driver {
     }
 
     // -- teardown --------------------------------------------------------
+
+    /// End this materialization after its log fused: tell every attached
+    /// client once, detach them, and tear down the way a shutdown does.
+    ///
+    /// The error frame is what makes a client let go of this materialization
+    /// and ask for the session again (spec 6.5), and the ask rebuilds it from
+    /// disk because the host treats a draining entry as absent. Detaching
+    /// after the frame keeps later teardown frames (a cancelled turn's notice,
+    /// the final state) off streams that have already been told the session is
+    /// gone, and lets the idle sweeper reap this entry.
+    async fn stop_for_persistence(&mut self, failure: PersistenceFailure) {
+        self.session.start_draining();
+        let epoch = self.session.status().epoch.clone();
+        self.shared.fanout.publish(Frame::Error {
+            session: self.session.id().to_string(),
+            epoch: Some(epoch),
+            code: PERSISTENCE_FAILED_CODE.to_string(),
+            message: persistence_failure_message(&failure),
+            lock_generation: None,
+        });
+        self.shared.fanout.detach_all(self.session.id());
+        self.wind_down().await;
+    }
 
     /// Cancel the session's turns and let them wind themselves down, then
     /// quiesce background tasks and flush the log.

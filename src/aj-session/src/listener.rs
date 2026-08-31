@@ -10,9 +10,10 @@
 //! [`MessageEnd`] event into one `ConversationView::add_message`
 //! call.
 //!
-//! Because the bus awaits each listener inline, the listener
-//! returning `Err` aborts the run with a fatal turn error, so a
-//! failed write stops the turn rather than silently losing a message.
+//! Because the bus awaits each listener inline, the listener returning `Err`
+//! aborts that run. A hosted log also reports its first terminal write failure
+//! to the session driver from the fuse itself, so listener and direct writes
+//! share one signal and a detached run cannot leave the materialization live.
 //!
 //! Sub-agent first-entry anchoring is the listener's responsibility
 //! too: when the agent emits
@@ -37,14 +38,13 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
-use aj_agent::BoxError;
 use aj_agent::bus::Listener;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::message::AgentMessage;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::log::{ConversationLog, ConversationView, EntryRef, ThreadFilter};
+use crate::log::{ConversationError, ConversationLog, ConversationView, EntryRef, ThreadFilter};
 use crate::replay::TaggedEvent;
 
 #[derive(Default)]
@@ -333,7 +333,10 @@ fn appends(event: &AgentEvent) -> bool {
 
 /// Write whatever `event` persists and return the appended entry, or
 /// `None` for an event that persists nothing.
-fn persist(log: &mut ConversationLog, event: &AgentEvent) -> Result<Option<EntryRef>, BoxError> {
+fn persist(
+    log: &mut ConversationLog,
+    event: &AgentEvent,
+) -> Result<Option<EntryRef>, ConversationError> {
     match event {
         AgentEvent::SubAgentStart {
             parent,
@@ -343,14 +346,16 @@ fn persist(log: &mut ConversationLog, event: &AgentEvent) -> Result<Option<Entry
             settings,
         } => {
             let AgentId::Sub(child_n) = child else {
-                return Err(format!("SubAgentStart with non-Sub child {child:?}").into());
+                return Err(ConversationError::InvalidAppend(format!(
+                    "SubAgentStart with non-Sub child {child:?}"
+                )));
             };
             // Anchor the spawn root at the main thread's current
             // head. A sub-agent cannot spawn a sub-agent (the
             // `agent` tool is removed from its toolset), so the
             // parent is always the main thread.
             let parent_head = log.head().cloned().ok_or_else(|| {
-                BoxError::from(format!(
+                ConversationError::InvalidAppend(format!(
                     "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
                 ))
             })?;
@@ -378,7 +383,7 @@ fn persist_message(
     log: &mut ConversationLog,
     agent_id: AgentId,
     message: AgentMessage,
-) -> Result<EntryRef, BoxError> {
+) -> Result<EntryRef, ConversationError> {
     let mut view = match agent_id {
         // A `None` head is fine here: the user thread can be empty on a
         // fresh log (only the system-prompt root exists yet), and
@@ -388,7 +393,7 @@ fn persist_message(
             let head = log
                 .latest_leaf(ThreadFilter::subagent(n))
                 .ok_or_else(|| {
-                    BoxError::from(format!(
+                    ConversationError::InvalidAppend(format!(
                         "persistence listener: sub-agent {n} thread has no head entry; was SubAgentStart emitted?"
                     ))
                 })?;
@@ -396,7 +401,7 @@ fn persist_message(
         }
     };
 
-    Ok(view.add_message(message)?)
+    view.add_message(message)
 }
 
 #[cfg(test)]
@@ -420,6 +425,7 @@ mod tests {
     use crate::log::{
         ConversationEntry, ConversationEntryKind, ConversationLog, ConversationView, EntryRef,
         ThreadFilter,
+        test_support::{AppendFault, AppendFaultFixture},
     };
     use crate::persistence::ConversationPersistence;
     use crate::replay::TaggedEvent;
@@ -517,6 +523,50 @@ mod tests {
             after_admitted,
             "a listener invocation beginning after close cannot append"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_forwarder_append_signals_the_owner_after_fusing_the_shared_log() {
+        let (_dir, log) = fresh_log();
+        {
+            let mut guard = log.lock().await;
+            ConversationView::user(&mut guard)
+                .add_message(user_msg("materialize"))
+                .expect("initial punctuation");
+        }
+        let fault = AppendFaultFixture::new(AppendFault::ShortWrite(19));
+        fault
+            .install(&mut *log.lock().await)
+            .expect("install append fault");
+        let fence = PersistenceFence::default();
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let (failure_signal, mut failures) = tokio::sync::oneshot::channel();
+        log.lock().await.install_failure_signal(failure_signal);
+        let listener =
+            fenced_persisting_forwarder(Arc::clone(&log), AppendHandoff::default(), tx, fence);
+        let event = AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: user_msg("fails partially"),
+        };
+
+        listener(&event).await.expect_err("first append fails");
+        let reported = failures.try_recv().expect("first failure signal");
+        let fused = log
+            .lock()
+            .await
+            .write_failure()
+            .cloned()
+            .expect("log fused before listener returned");
+        assert_eq!(
+            reported, fused,
+            "the signal carries the log's exact first failure"
+        );
+        let writes = fault.writes();
+
+        listener(&event)
+            .await
+            .expect_err("later append sees the fuse");
+        assert_eq!(fault.writes(), writes, "later listener touched descriptor");
     }
 
     fn count_string(value: &serde_json::Value, target: &str) -> usize {

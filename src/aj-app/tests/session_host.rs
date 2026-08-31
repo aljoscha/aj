@@ -33,7 +33,10 @@ use aj_models::types::{
     AssistantContent, AssistantError, AssistantMessage, ErrorCategory, StopReason, ToolCall,
     UserContent,
 };
-use aj_session::{ConversationLog, ConversationPersistence, SessionLock, ThreadFilter};
+use aj_session::{
+    AppendFault, AppendFaultFixture, ConversationLog, ConversationPersistence, SessionLock,
+    ThreadFilter,
+};
 use aj_wire::{Frame, ModelSelection, SessionSettings, SessionSummary};
 use tempfile::TempDir;
 use tracing_subscriber::fmt::MakeWriter;
@@ -7265,71 +7268,317 @@ async fn a_panicked_turn_leaves_the_session_idle() {
     harness.host.shutdown().await;
 }
 
-/// A turn's fatal error belongs to its session, not to the host (spec
-/// section 5): it surfaces as an error frame on that session's stream, the
-/// session stays live and usable, and another session on the same host is
-/// untouched by it.
+/// A conversation-log write failure ends the materialization (spec section
+/// 5): the attached client receives one `persistence_failed` error and re-asks
+/// for the session, the failed owner releases the session lock, and the re-ask
+/// rebuilds the session from disk with a fresh log, which repairs the torn
+/// tail, tells the opening client so, and saves later work durably.
 ///
-/// The fault is a log that cannot be opened. The first punctuating append
-/// creates the file with `create_new`, so a path that is already taken makes
-/// that append fail, and the append runs inside an inline bus listener whose
-/// error is exactly a fatal turn error.
+/// The fault wraps a real `O_APPEND` descriptor and leaves a physical partial
+/// record, so this exercises the production path rather than a helper that
+/// reports failure without first fusing the shared log.
 #[tokio::test]
-async fn a_fatal_turn_error_stays_inside_its_session() {
-    let harness = Harness::new(Vec::new());
-    let broken = harness.create().await;
-    let healthy = harness.create().await;
-    harness
-        .install_script(&broken, vec![finalized_text_message("recovered")])
-        .await;
-    harness
-        .install_script(&healthy, vec![finalized_text_message("all fine here")])
-        .await;
-    let mut broken_client = Client::attach(&harness.host, &broken).await;
-    let mut healthy_client = Client::attach(&harness.host, &healthy).await;
-
-    let log_path = harness
+async fn a_persistence_failure_ends_the_materialization_and_a_reopen_rebuilds_it() {
+    let harness = Harness::new(vec![
+        finalized_text_message("baseline answer"),
+        finalized_text_message("answer after recovery"),
+    ]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "materialize the baseline").await;
+    let first = only(client.pump_until_idle().await, &session);
+    assert_eq!(assistant_text(&first), "baseline answer");
+    let path = harness
         .persistence
         .sessions_dir()
-        .join(format!("{broken}.jsonl"));
-    std::fs::write(&log_path, "").expect("take the path the log wants");
+        .join(format!("{session}.jsonl"));
+    let baseline = std::fs::read(&path).expect("read baseline bytes");
+    assert!(baseline.ends_with(b"\n"), "the baseline log is clean");
 
-    harness.prompt(&broken, "hi").await;
-    let frames = broken_client.pump_until_idle().await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let fused_log = Arc::clone(&handles.log);
+    let fault = AppendFaultFixture::new(AppendFault::ShortWrite(200));
+    fault
+        .install(&mut *handles.log.lock().await)
+        .expect("install short-write fault");
+    drop(handles);
 
-    let reported = errors(&frames);
+    harness
+        .prompt(
+            &session,
+            "this prompt is interrupted mid-write, so it must be longer than the \
+             bytes the short write lets through",
+        )
+        .await;
+    let failed = frames_until(&mut client.stream, "the storage error", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    let failed = only(failed, &session);
+    match failed.last() {
+        Some(Frame::Error { code, message, .. }) => {
+            assert_eq!(code, "persistence_failed");
+            assert!(
+                message.starts_with("Saving this session failed:")
+                    && message.contains("reopen the session"),
+                "actionable storage error: {message}"
+            );
+        }
+        other => panic!("expected the storage error frame, got {other:?}"),
+    }
     assert!(
-        reported.iter().any(|text| text.starts_with("IO error")),
-        "the failed append surfaced as an error frame: {reported:?}",
+        errors(&failed).is_empty(),
+        "the failed turn must not report the same error a second time: {:?}",
+        errors(&failed)
     );
+    for frame in failed {
+        let _ = client.client.apply(&mut client.chat, frame);
+    }
     assert!(
-        !reported.iter().any(|text| text.contains("panicked")),
-        "and as the turn's own error rather than a dead task: {reported:?}",
+        client.client.needs_reattach(),
+        "the client re-asks for the session at once"
     );
 
-    // The host kept serving: the other session runs its turn.
-    harness.prompt(&healthy, "you ok?").await;
-    healthy_client.pump_until_idle().await;
+    bounded("advisory-lock release after the failed owner ends", async {
+        while SessionLock::is_held(&harness.persistence, &session).expect("probe lock") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let torn = std::fs::read(&path).expect("read torn bytes");
     assert_eq!(
-        assistant_rows(&healthy_client.chat, AgentId::Main),
-        vec!["all fine here".to_string()],
-        "a fatal error in one session does not touch another",
+        torn.len(),
+        baseline.len() + 200,
+        "the partial record is the sole undelimited tail"
     );
-    assert!(
-        errors(&broken_client.drain_into_fold()).is_empty(),
-        "and the other session's turn earned no error of its own",
+    assert_eq!(&torn[..baseline.len()], &baseline[..]);
+    assert_eq!(
+        fault.writes(),
+        2,
+        "one partial write and its failed continuation, nothing after the fuse"
     );
 
-    // And the failed session is still live: once the fault clears, the next
-    // prompt runs a turn rather than finding a session the host tore down.
-    std::fs::remove_file(&log_path).expect("clear the fault");
-    harness.prompt(&broken, "again").await;
-    broken_client.pump_until_idle().await;
+    // The re-ask: the same id rematerializes from disk under the ordinary
+    // lock rather than reusing the fused object, and the reopen removes
+    // exactly the torn tail.
+    let mut reopened = Client::attach(&harness.host, &session).await;
+    let reopened_handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("rematerialized session");
     assert!(
-        assistant_rows(&broken_client.chat, AgentId::Main)
-            .iter()
-            .any(|text| text == "recovered"),
-        "the session survived its own fatal turn error",
+        !Arc::ptr_eq(&fused_log, &reopened_handles.log),
+        "the reconnect must not reuse the fused log"
+    );
+    drop(reopened_handles);
+    assert!(
+        SessionLock::is_held(&harness.persistence, &session).expect("probe lock"),
+        "the rematerialization holds the ordinary session lock"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read repaired bytes"),
+        baseline,
+        "the repair removed exactly the torn tail"
+    );
+
+    // A later prompt is durable in the repaired file.
+    harness.prompt(&session, "run after recovery").await;
+    let after = only(until_idle(&mut reopened.stream).await, &session);
+    assert_eq!(assistant_text(&after), "answer after recovery");
+    let final_bytes = std::fs::read(&path).expect("read post-recovery bytes");
+    assert!(final_bytes.starts_with(&baseline));
+    assert!(final_bytes.len() > baseline.len());
+    assert!(final_bytes.ends_with(b"\n"));
+    harness.host.shutdown().await;
+}
+
+/// A detached task's failed append reaches the owner the same way a
+/// foreground turn's does, because the log reports from the fuse itself, and
+/// it ends only its own materialization: another session on the host keeps
+/// working and its bytes are untouched.
+#[tokio::test]
+async fn a_detached_writers_persistence_failure_ends_only_its_session() {
+    let harness =
+        Harness::with_provider(scripted(detached_sub_turn(), 1, Duration::from_millis(20)));
+    let affected = harness.create().await;
+    let healthy = harness.create().await;
+    harness
+        .install_script(
+            &healthy,
+            vec![
+                finalized_text_message("healthy baseline"),
+                finalized_text_message("healthy answer"),
+            ],
+        )
+        .await;
+    let mut affected_client = Client::attach(&harness.host, &affected).await;
+    let mut healthy_client = Client::attach(&harness.host, &healthy).await;
+    harness.prompt(&healthy, "write the healthy baseline").await;
+    let baseline_frames = only(until_idle(&mut healthy_client.stream).await, &healthy);
+    assert_eq!(assistant_text(&baseline_frames), "healthy baseline");
+    let healthy_path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{healthy}.jsonl"));
+    let healthy_baseline = std::fs::read(&healthy_path).expect("read healthy baseline bytes");
+
+    harness
+        .prompt(&affected, "run the detached persistence fault")
+        .await;
+    bounded("the child to outlive its parent turn", async {
+        loop {
+            let list = harness.host.sessions().await.expect("sessions");
+            let parent_idle = list
+                .sessions
+                .iter()
+                .find(|row| row.id == affected)
+                .is_some_and(|row| !row.working);
+            if parent_idle && running_agent_task(&harness, &affected).await.is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    let affected_handles = harness
+        .host
+        .local_handles(&affected)
+        .await
+        .expect("affected live session");
+    let affected_tasks = affected_handles.task_registry.clone();
+    let fault = AppendFaultFixture::new(AppendFault::ShortWrite(23));
+    fault
+        .install(&mut *affected_handles.log.lock().await)
+        .expect("install real append fault");
+    drop(affected_handles);
+
+    let failed = frames_until(&mut affected_client.stream, "the storage error", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    let failed = only(failed, &affected);
+    match failed.last() {
+        Some(Frame::Error { code, message, .. }) => {
+            assert_eq!(code, "persistence_failed");
+            assert!(
+                message.starts_with("Saving this session failed:"),
+                "actionable storage error: {message}"
+            );
+        }
+        other => panic!("expected the storage error frame, got {other:?}"),
+    }
+
+    bounded("affected task reap and advisory-lock release", async {
+        loop {
+            let reaped = affected_tasks
+                .snapshot()
+                .iter()
+                .all(|task| task.status != TaskStatus::Running);
+            let unlocked = !SessionLock::is_held(&harness.persistence, &affected)
+                .expect("probe affected lock");
+            if reaped && unlocked {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let writes_after_teardown = fault.writes();
+    assert_eq!(
+        writes_after_teardown, 2,
+        "one partial write and its failed continuation"
+    );
+    let affected_path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{affected}.jsonl"));
+    let torn_bytes = std::fs::read(&affected_path).expect("read faulted session bytes");
+    assert!(
+        !torn_bytes.ends_with(b"\n"),
+        "the fixture did not leave the physical partial record the fuse contains"
+    );
+    assert_eq!(
+        std::fs::read(&healthy_path).expect("re-read healthy baseline bytes"),
+        healthy_baseline,
+        "failed-session teardown changed another session's durable bytes"
+    );
+
+    harness.prompt(&healthy, "keep going").await;
+    let healthy_frames = only(until_idle(&mut healthy_client.stream).await, &healthy);
+    assert_eq!(assistant_text(&healthy_frames), "healthy answer");
+    assert_eq!(
+        fault.writes(),
+        writes_after_teardown,
+        "other-session work never touches the fused descriptor"
+    );
+    assert_eq!(
+        std::fs::read(&affected_path).expect("re-read faulted session bytes"),
+        torn_bytes,
+        "healthy-session work appended after the affected torn tail"
+    );
+    harness.host.shutdown().await;
+}
+
+/// A session whose very first publication fails has no canonical log to
+/// reopen. The error says so, sends the user to a new session, and the id it
+/// was given is unknown from then on.
+#[tokio::test]
+async fn a_failed_first_publication_says_the_message_was_not_recorded() {
+    let harness = Harness::new(vec![finalized_text_message("never persisted")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    fault
+        .install_initial(&mut *handles.log.lock().await)
+        .expect("install initial-publication fault");
+    drop(handles);
+
+    harness.prompt(&session, "the first prompt").await;
+    let failed = frames_until(&mut client.stream, "the storage error", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    match only(failed, &session).last() {
+        Some(Frame::Error { code, message, .. }) => {
+            assert_eq!(code, "persistence_failed");
+            assert!(
+                message.contains("was not recorded") && message.contains("start a new session"),
+                "the first-publication message: {message}"
+            );
+        }
+        other => panic!("expected the storage error frame, got {other:?}"),
+    }
+    assert!(
+        !harness
+            .persistence
+            .sessions_dir()
+            .join(format!("{session}.jsonl"))
+            .exists(),
+        "a failed first publication installs no canonical log"
+    );
+    let refused = bounded(
+        "the re-ask to be refused",
+        harness.host.attach(&[attach_request(&session)]),
+    )
+    .await;
+    let mut refused = refused.expect("an attach answers refusals on its stream");
+    let frame = bounded("the refusal frame", refused.recv())
+        .await
+        .expect("the stream carries the refusal");
+    assert!(
+        matches!(&frame, Frame::Error { code, .. } if code == "unknown_session"),
+        "an unsaved session is unknown afterwards: {frame:?}"
     );
     harness.host.shutdown().await;
 }

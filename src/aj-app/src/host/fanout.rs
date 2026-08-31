@@ -418,6 +418,19 @@ impl Fanout {
         }
     }
 
+    /// Take `session` off every subscriber's attach set, keeping what is
+    /// already queued for it.
+    ///
+    /// For a session whose materialization is ending under its clients: the
+    /// frame that tells them so is already queued and must still reach them,
+    /// while nothing published after this call may. Clearing the attach set is
+    /// also what lets the release path see the session as unused.
+    pub(crate) fn detach_all(&self, session: &str) {
+        for subscriber in self.lock().subscribers.values_mut() {
+            subscriber.attached.remove(session);
+        }
+    }
+
     /// Fan `frame` out to every subscriber.
     pub(crate) fn publish(&self, frame: Frame) {
         self.lock()
@@ -434,18 +447,23 @@ impl Fanout {
     }
 
     /// Switches a session to live delivery and filters duplicate durables.
+    ///
+    /// Only for a session the subscriber is still attached to: a block whose
+    /// session was detached while it was being served ([`Self::detach_all`])
+    /// must not reattach it.
     pub(crate) fn finish_block(&self, id: SubscriberId, session: &str, boundary: u64) {
         let mut state = self.lock();
         let Some(subscriber) = state.subscribers.get_mut(&id) else {
             return;
         };
+        let Some(attach) = subscriber.attached.get_mut(session) else {
+            return;
+        };
+        *attach = AttachState::Live { boundary };
         subscriber.live.retain(|frame| {
             frame.session() != Some(session)
                 || !frame.durable_seq().is_some_and(|seq| seq <= boundary)
         });
-        subscriber
-            .attached
-            .insert(session.to_string(), AttachState::Live { boundary });
     }
 
     /// Ask every attach-block producer to stop before session teardown begins.
@@ -1091,6 +1109,38 @@ mod tests {
             !fanout.attached(SESSION),
             "and the stream is no longer counted as holding it",
         );
+        assert!(fanout.attached(OTHER));
+    }
+
+    /// A session whose materialization ends under its clients is taken off
+    /// every stream, but what was already queued for it stays: the error that
+    /// says why is published just before, and must still arrive. Nothing
+    /// published after reaches the stream, and a block still being served for
+    /// the session cannot reattach it when it completes.
+    #[test]
+    fn detaching_a_session_everywhere_keeps_what_was_queued_and_admits_nothing_later() {
+        let fanout = Fanout::default();
+        let (live, mut live_rx, _c1) = fanout.register(&[SESSION.to_string()]);
+        fanout.finish_block(live, SESSION, 0);
+        let (attaching, mut attaching_rx, _c2) =
+            fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        fanout.finish_block(attaching, OTHER, 0);
+        fanout.publish(refusal("persistence_failed"));
+
+        fanout.detach_all(SESSION);
+
+        fanout.publish(reliable("after"));
+        fanout.publish(other(reliable("someone else's session")));
+        // The block for `SESSION` completes late on the attaching stream.
+        fanout.finish_block(attaching, SESSION, 0);
+        fanout.publish(reliable("after the late block"));
+        assert_eq!(drained(&mut live_rx), vec!["error persistence_failed"]);
+        assert_eq!(
+            drained(&mut attaching_rx),
+            vec!["error persistence_failed", "warning someone else's session"],
+            "the other session's traffic is untouched",
+        );
+        assert!(!fanout.attached(SESSION));
         assert!(fanout.attached(OTHER));
     }
 

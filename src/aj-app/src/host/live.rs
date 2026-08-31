@@ -294,6 +294,13 @@ impl LiveSession {
         self.draining.load(Ordering::Acquire)
     }
 
+    /// Whether the driver has returned without the host asking it to, which
+    /// only a fused log (or a panic) leaves behind. Such an entry serves
+    /// nothing and is reaped rather than released.
+    pub(crate) fn driver_gone(&self) -> bool {
+        self.requests.is_closed()
+    }
+
     /// Whether the session has anything queued for `agent`.
     pub(crate) fn has_queued(&self, agent: AgentId) -> bool {
         self.core.message_queues.has_pending(agent)

@@ -25,8 +25,8 @@ use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, StreamOptions};
 use aj_session::{
-    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, PersistenceFence,
-    TaggedEvent, fenced_persisting_forwarder, persistence_listener,
+    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, PersistenceFailure,
+    PersistenceFence, TaggedEvent, fenced_persisting_forwarder, persistence_listener,
 };
 use anyhow::Result;
 use tokio::sync::Mutex as TokioMutex;
@@ -474,8 +474,9 @@ impl SessionCore {
         (handle, rx)
     }
 
-    /// Replace the plain persistence listener with the tagging forwarder
-    /// and return the tagged event stream.
+    /// Replace the plain persistence listener with the tagging forwarder and
+    /// return its tagged event stream plus the one-shot storage-failure signal
+    /// the owning driver ends the materialization on.
     ///
     /// This is how a session host takes ownership of the session's
     /// durability: the forwarder both writes the log and hands every
@@ -486,18 +487,23 @@ impl SessionCore {
     ///
     /// Call this before the first turn. Between [`Self::build`] and here
     /// nothing emits (seeding is silent), so no event is lost.
-    pub fn install_persisting_forwarder(
+    pub async fn install_persisting_forwarder(
         &mut self,
         handoff: &AppendHandoff,
-    ) -> UnboundedReceiver<TaggedEvent> {
+    ) -> (
+        UnboundedReceiver<TaggedEvent>,
+        tokio::sync::oneshot::Receiver<PersistenceFailure>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (failure_signal, failures) = tokio::sync::oneshot::channel();
+        self.log.lock().await.install_failure_signal(failure_signal);
         self.persistence_handle = self.subscriptions.subscribe(fenced_persisting_forwarder(
             Arc::clone(&self.log),
             handoff.clone(),
             tx,
             self.persistence_fence.clone(),
         ));
-        rx
+        (rx, failures)
     }
 
     /// Resolve an `AgentId` to its live handle: the main agent for
