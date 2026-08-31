@@ -10280,13 +10280,19 @@ async fn a_driven_foreground_turn_is_part_of_session_cleanup_ownership() {
 /// session owner, so neither can outlive the advisory lock.
 #[tokio::test(start_paused = true)]
 async fn forced_driver_abort_reaps_foreground_bash_before_releasing_the_lock() {
+    let process_dir = TempDir::new().expect("process tempdir");
+    let pid_path = process_dir.path().join("foreground-bash.pid");
+    let command = format!(
+        "trap '' TERM; printf '%s' $$ > '{}'; while :; do sleep 1; done",
+        pid_path.display()
+    );
     let harness = Harness::with_provider(scripted(
         vec![calling(
             "running until host cutoff",
             "call-bash",
             "bash",
             serde_json::json!({
-                "command": "trap '' TERM; while :; do sleep 1; done",
+                "command": command,
                 "description": "ignore TERM until forced cleanup"
             }),
         )],
@@ -10323,6 +10329,25 @@ async fn forced_driver_abort_reaps_foreground_bash_before_releasing_the_lock() {
         },
     )
     .await;
+    // Tokio time is paused while the fixture process uses the OS scheduler.
+    // Yield both so the pid handshake cannot be satisfied by a timer advancing
+    // before the command has actually entered its TERM-immune loop.
+    for _ in 0..400 {
+        if std::fs::metadata(&pid_path).is_ok_and(|metadata| metadata.len() > 0) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        tokio::task::yield_now().await;
+    }
+    let pid: u32 = std::fs::read_to_string(&pid_path)
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("foreground Bash did not publish its pid at {pid_path:?}"));
+    assert!(
+        PathBuf::from(format!("/proc/{pid}")).exists(),
+        "the process must be live before shutdown or the reap assertion measures nothing"
+    );
     let handles = harness
         .host
         .local_handles(&session)
@@ -10377,13 +10402,26 @@ async fn forced_driver_abort_reaps_foreground_bash_before_releasing_the_lock() {
         "foreground process cleanup retains the advisory lock"
     );
 
-    tokio::time::advance(Duration::from_secs(3)).await;
-    for _ in 0..40 {
-        tokio::task::yield_now().await;
+    // Advance the async grace in small steps while giving the real child and
+    // kernel wait path CPU between them. A single jump can expire the logical
+    // post-KILL bound before the OS has scheduled the kill and reap at all.
+    for _ in 0..30 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        std::thread::sleep(Duration::from_millis(2));
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        if shutdown.is_finished() {
+            break;
+        }
     }
     shutdown.await.expect("shutdown task");
     assert!(handles.task_registry.quiesce(Duration::ZERO).await);
     assert!(command.await.expect("command task").is_err());
+    assert!(
+        !PathBuf::from(format!("/proc/{pid}")).exists(),
+        "shutdown released ownership before the foreground command reached reaped terminal state"
+    );
     let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
         .expect("try_acquire")
         .expect("foreground process reap releases the session owner");

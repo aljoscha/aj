@@ -51,6 +51,9 @@
 //!   survive and only the tool's own descriptors are released. A
 //!   descendant that left the group (`setsid`) is out of reach of all
 //!   of this, which is what the capture drain below bounds.
+//!   Every post-`SIGKILL` wait has its own [`KILL_GRACE`] bound. If the
+//!   kernel cannot make the leader reapable within it, the guard releases
+//!   the child handle, capture readers, and session cleanup lease together.
 //!
 //!   Timeout runs through the `select!` loop's own arm. Cancellation
 //!   mostly does not: the driver drops this future instead of polling
@@ -432,7 +435,7 @@ async fn rtk_hook_check_with_timeout(
             return None;
         }
     };
-    drop(guard.disarm());
+    guard.release();
     if !status.success() {
         return None;
     }
@@ -708,16 +711,30 @@ impl ToolDefinition for BashTool {
 
         // Cancel/timeout paths: signal the whole process group so any
         // shell-spawned grandchildren die with the parent.
-        if matches!(outcome_kind, ChildExit::Cancelled | ChildExit::TimedOut) {
-            terminate_process_group(guard.child_mut(), child_pid).await;
-        }
+        let capture_released = if matches!(outcome_kind, ChildExit::Cancelled | ChildExit::TimedOut)
+        {
+            guard.terminate_user_command().await == ProcessTermination::OwnershipReleased
+        } else {
+            false
+        };
 
         // The reader tasks own the pipe read ends, and their streams end
         // only at EOF, which needs every write end closed. The kill
         // above does not reach a descendant that left the group, so
         // every exit reason drains under the same bound.
-        let capture_end =
-            drain_capture(stdout_reader, stderr_reader, &capture_error, child_pid).await;
+        let capture_end = drain_capture(
+            stdout_reader,
+            stderr_reader,
+            &capture_error,
+            child_pid,
+            capture_released,
+        )
+        .await;
+        let capture_end = if capture_released {
+            CaptureEnd::ReapReleased
+        } else {
+            capture_end
+        };
         let capture_error = capture_error.lock().unwrap().clone();
 
         // Finalize per-stream: apply truncate_tail to the rolling tail
@@ -753,7 +770,7 @@ impl ToolDefinition for BashTool {
 
         // The command has ended and its capture is closed, so there is
         // nothing left for a drop to tear down.
-        drop(guard.disarm());
+        guard.release();
 
         let mut wire = build_wire_content(
             &stdout_str,
@@ -1029,10 +1046,13 @@ fn record_capture_error(error_slot: &Mutex<Option<String>>, error: String) {
 async fn await_reader(
     reader: &mut Option<tokio::task::JoinHandle<()>>,
     capture_error: &Mutex<Option<String>>,
+    cancellation_expected: bool,
 ) {
     if let Some(handle) = reader.as_mut() {
         if let Err(error) = handle.await {
-            record_capture_error(capture_error, format!("capture reader task: {error}"));
+            if !(cancellation_expected && error.is_cancelled()) {
+                record_capture_error(capture_error, format!("capture reader task: {error}"));
+            }
         }
         // Clearing the slot is what keeps a later drain round from
         // polling a handle that already returned, which panics.
@@ -1048,6 +1068,9 @@ enum CaptureEnd {
     /// A straggler still held a pipe when the drain expired, so the
     /// pipes were taken back and the output may be incomplete.
     Cut,
+    /// A killed command remained unavailable to reap, so its process and
+    /// capture ownership were released at the reap boundary.
+    ReapReleased,
 }
 
 /// Escalation step for signalling a command's process group.
@@ -1071,14 +1094,14 @@ enum GroupSignal {
 /// needs every write end closed, and a descendant that left the group
 /// holds one just as well as one that stayed.
 ///
-/// The escalation keys on EOF rather than on the child, because the
-/// caller has already reaped it and [`Child::wait`] would hand back
-/// the cached status without waiting at all.
+/// The escalation keys on EOF rather than on the child, because the caller has
+/// either reaped it or exhausted the bounded reap and released its handle.
 async fn drain_capture(
     stdout_reader: tokio::task::JoinHandle<()>,
     stderr_reader: tokio::task::JoinHandle<()>,
     capture_error: &Mutex<Option<String>>,
     pgid: i32,
+    reader_cancellation_expected: bool,
 ) -> CaptureEnd {
     let mut stdout_reader = Some(stdout_reader);
     let mut stderr_reader = Some(stderr_reader);
@@ -1088,6 +1111,7 @@ async fn drain_capture(
         &mut stderr_reader,
         capture_error,
         CAPTURE_DRAIN_GRACE,
+        reader_cancellation_expected,
     )
     .await
     {
@@ -1104,6 +1128,7 @@ async fn drain_capture(
         &mut stderr_reader,
         capture_error,
         CAPTURE_DRAIN_GRACE,
+        reader_cancellation_expected,
     )
     .await
     {
@@ -1113,6 +1138,7 @@ async fn drain_capture(
             &mut stderr_reader,
             capture_error,
             CAPTURE_CLOSE_GRACE,
+            reader_cancellation_expected,
         )
         .await;
     }
@@ -1135,11 +1161,12 @@ async fn drain_round(
     stderr_reader: &mut Option<tokio::task::JoinHandle<()>>,
     capture_error: &Mutex<Option<String>>,
     budget: Duration,
+    reader_cancellation_expected: bool,
 ) -> bool {
     let _ = tokio::time::timeout(budget, async {
         tokio::join!(
-            await_reader(stdout_reader, capture_error),
-            await_reader(stderr_reader, capture_error),
+            await_reader(stdout_reader, capture_error, reader_cancellation_expected),
+            await_reader(stderr_reader, capture_error, reader_cancellation_expected),
         );
     })
     .await;
@@ -1157,6 +1184,24 @@ fn capture_cut_trailer() -> String {
          run_in_background for work that should outlive the call.",
         CAPTURE_DRAIN_GRACE.as_secs(),
     )
+}
+
+/// Explain capture released with a command that remained unavailable to reap.
+fn reap_release_trailer() -> String {
+    format!(
+        "Output capture was cut short: the command leader was still unavailable to reap {}s \
+         after its process group was killed, so its process and pipes were released. The output \
+         above may be incomplete.",
+        KILL_GRACE.as_secs(),
+    )
+}
+
+fn capture_end_trailer(capture_end: CaptureEnd) -> Option<String> {
+    match capture_end {
+        CaptureEnd::Closed => None,
+        CaptureEnd::Cut => Some(capture_cut_trailer()),
+        CaptureEnd::ReapReleased => Some(reap_release_trailer()),
+    }
 }
 
 /// [`TaskOutputSource`] over a background bash task's shared stream
@@ -1254,7 +1299,7 @@ async fn drive_background_bash(task: BackgroundBash) {
     // `None` forces the leading-edge emit so the TUI cell shows the
     // running command immediately.
     let mut last_totals: Option<(u64, u64)> = None;
-    let process_status = loop {
+    let (process_status, capture_released) = loop {
         let now = Instant::now();
         if now.duration_since(last_update) >= UPDATE_DEBOUNCE {
             let totals = (
@@ -1291,11 +1336,12 @@ async fn drive_background_bash(task: BackgroundBash) {
             // deliberately not wired in — outliving the turn is the
             // point.
             _ = cancel.cancelled() => {
-                terminate_process_group(process.child_mut(), child_pid).await;
-                break TaskStatus::Killed;
+                let capture_released = process.terminate_user_command().await
+                    == ProcessTermination::OwnershipReleased;
+                break (TaskStatus::Killed, capture_released);
             }
             res = process.child_mut().wait() => {
-                break TaskStatus::Exited(res.ok().and_then(|s| s.code()));
+                break (TaskStatus::Exited(res.ok().and_then(|s| s.code())), false);
             }
             _ = tokio::time::sleep(UPDATE_DEBOUNCE) => {}
         }
@@ -1304,7 +1350,19 @@ async fn drive_background_bash(task: BackgroundBash) {
     // The task is over, so the same bound applies one level down: a
     // straggler holding the pipes would otherwise keep the notice from
     // ever rendering and the registry row from ever settling.
-    let capture_end = drain_capture(stdout_reader, stderr_reader, &capture_error, child_pid).await;
+    let capture_end = drain_capture(
+        stdout_reader,
+        stderr_reader,
+        &capture_error,
+        child_pid,
+        capture_released,
+    )
+    .await;
+    let capture_end = if capture_released {
+        CaptureEnd::ReapReleased
+    } else {
+        capture_end
+    };
     let capture_error = capture_error.lock().unwrap().clone();
     let status = background_terminal_status(process_status, capture_error.is_some());
 
@@ -1335,9 +1393,9 @@ async fn drive_background_bash(task: BackgroundBash) {
     if let Some(error) = capture_error {
         body.push_str(&format!("\nOutput capture failed: {error}"));
     }
-    if capture_end == CaptureEnd::Cut {
+    if let Some(trailer) = capture_end_trailer(capture_end) {
         body.push('\n');
-        body.push_str(&capture_cut_trailer());
+        body.push_str(&trailer);
     }
     if !body.ends_with('\n') {
         body.push('\n');
@@ -1356,8 +1414,9 @@ async fn drive_background_bash(task: BackgroundBash) {
     };
     events.finished(status, notice).await;
     // Every cancellation or panic above keeps the guard armed. Only a fully
-    // reported driver relinquishes the already-reaped child.
-    drop(process.disarm());
+    // reported driver relinquishes the reaped child or completed bounded
+    // ownership release.
+    process.release();
 }
 
 /// Human-readable terminal-status phrase shared by completion notices
@@ -1536,11 +1595,11 @@ fn build_wire_content(
             wire.push_str(&format!("Command timed out after {} seconds", timeout_secs));
         }
     }
-    if capture_end == CaptureEnd::Cut {
+    if let Some(trailer) = capture_end_trailer(capture_end) {
         if !wire.is_empty() && !wire.ends_with('\n') {
             wire.push('\n');
         }
-        wire.push_str(&capture_cut_trailer());
+        wire.push_str(&trailer);
     }
     wire
 }
@@ -1716,6 +1775,12 @@ enum ProcessTeardown {
     Immediate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessTermination {
+    Reaped,
+    OwnershipReleased,
+}
+
 impl ProcessGuard {
     /// Take ownership of a freshly spawned user-command child.
     ///
@@ -1781,12 +1846,38 @@ impl ProcessGuard {
             .extend(readers);
     }
 
-    /// Hand the command's lifetime back to the caller.
-    fn disarm(&mut self) -> Child {
-        self.armed
-            .take()
-            .expect("the guard is disarmed exactly once")
-            .child
+    /// Release process, capture, and cleanup ownership after every async step
+    /// that needs it has completed.
+    fn release(&mut self) {
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+        for reader in &armed.readers {
+            reader.abort();
+        }
+    }
+
+    /// Give a user command its TERM grace, escalate to KILL, and retain
+    /// ownership until either the leader is reaped or the reap bound expires.
+    ///
+    /// On expiry the capture handles, child, and cleanup lease are released in
+    /// this method's synchronous tail. Cancellation can therefore only occur
+    /// while the still-armed guard owns all three.
+    async fn terminate_user_command(&mut self) -> ProcessTermination {
+        let reaped = {
+            let armed = self
+                .armed
+                .as_mut()
+                .expect("the guard stays armed through command termination");
+            debug_assert!(matches!(armed.teardown, ProcessTeardown::Graceful));
+            terminate_process_group(&mut armed.child, armed.pgid).await
+        };
+        if reaped {
+            ProcessTermination::Reaped
+        } else {
+            self.release();
+            ProcessTermination::OwnershipReleased
+        }
     }
 
     /// Kill an optional helper's group and make a bounded attempt to reap its
@@ -1801,12 +1892,9 @@ impl ProcessGuard {
         debug_assert!(matches!(armed.teardown, ProcessTeardown::Immediate));
         signal_process_group(armed.pgid, GroupSignal::Kill);
         reap_child_bounded(&mut armed.child).await;
-        for reader in &armed.readers {
-            reader.abort();
-        }
         // Every await is complete. Taking the process now releases the cleanup
         // lease without leaving a cancellation point between ownership moves.
-        self.armed.take();
+        self.release();
     }
 
     fn expect_armed(&self) -> &ArmedProcess {
@@ -1930,10 +2018,12 @@ async fn reap_killed_process(armed: ArmedProcess) {
 
 /// Reap a killed child when the kernel makes it available, without allowing an
 /// uninterruptible wait to retain the caller's cleanup ownership indefinitely.
-async fn reap_child_bounded(child: &mut Child) {
-    if child.id().is_some() {
-        let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
-    }
+async fn reap_child_bounded(child: &mut Child) -> bool {
+    child.id().is_none()
+        || matches!(
+            tokio::time::timeout(KILL_GRACE, child.wait()).await,
+            Ok(Ok(_))
+        )
 }
 
 /// Send one signal to a command's process group.
@@ -1964,38 +2054,42 @@ fn signal_process_group(pgid: i32, signal: GroupSignal) {
     let _ = signal;
 }
 
-/// Terminate the child's whole process group and reap the child.
+/// Terminate the child's whole process group and make a bounded reap attempt.
 ///
 /// Sends `SIGTERM` to the group first so the command (and any
 /// descendants the shell forked) can run their cleanup handlers, then
 /// waits up to [`KILL_GRACE`] for the leader to exit before escalating
-/// to an unconditional `SIGKILL`. Returns once the child has been
-/// reaped, so the handle never outlives the call.
+/// to an unconditional `SIGKILL`. Returns `false` only when the post-KILL reap
+/// bound expires. The armed caller then releases its child, capture handles,
+/// and cleanup lease together.
 ///
 /// Only for a child that is still running: the grace window keys on
 /// [`Child::wait`], which returns the cached status instantly once the
 /// child has been reaped. [`drain_capture`] is what signals a group
 /// after that point.
 #[cfg(unix)]
-async fn terminate_process_group(child: &mut Child, pgid: i32) {
+async fn terminate_process_group(child: &mut Child, pgid: i32) -> bool {
     signal_process_group(pgid, GroupSignal::Term);
-    if tokio::time::timeout(KILL_GRACE, child.wait())
-        .await
-        .is_err()
-    {
-        // Still alive after the grace window: escalate and reap.
-        signal_process_group(pgid, GroupSignal::Kill);
-        let _ = child.wait().await;
+    if matches!(
+        tokio::time::timeout(KILL_GRACE, child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        return true;
     }
+    // A child still alive after the grace window, or one whose wait could not
+    // establish an exit, gets an unconditional escalation. Bound the reap
+    // independently because SIGKILL remains pending in uninterruptible I/O.
+    signal_process_group(pgid, GroupSignal::Kill);
+    reap_child_bounded(child).await
 }
 
 #[cfg(not(unix))]
-async fn terminate_process_group(child: &mut Child, _pgid: i32) {
+async fn terminate_process_group(child: &mut Child, _pgid: i32) -> bool {
     // Process-group semantics are Unix-only; elsewhere we kill just the
     // immediate child and accept that shell-forked grandchildren may
     // leak.
     let _ = child.start_kill();
-    let _ = child.wait().await;
+    reap_child_bounded(child).await
 }
 
 #[cfg(test)]
@@ -2471,6 +2565,192 @@ mod tests {
             nix::sys::signal::Signal::SIGKILL,
         );
         wait_until(|| !process_is_live(pid), "the terminate fixture to stop").await;
+        fixture.disarm();
+    }
+
+    /// A direct command can remain unavailable to `wait` after SIGKILL while
+    /// the kernel finishes an uninterruptible operation. The TERM grace and
+    /// post-KILL reap windows still end with one synchronous release of the
+    /// child, capture readers, and session cleanup lease.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_command_reap_bound_releases_capture_and_cleanup_ownership() {
+        let sleep = host_executable("sleep");
+        let child = Command::new(sleep)
+            .arg("30")
+            .spawn()
+            .expect("spawn unavailable direct-command fixture");
+        let pid: i32 = child
+            .id()
+            .expect("fixture pid")
+            .try_into()
+            .expect("fixture pid fits i32");
+        let mut fixture = FixtureProcess(Some(pid));
+        let registry = TaskRegistry::default();
+        let stdout_reader = tokio::spawn(std::future::pending::<()>());
+        let stderr_reader = tokio::spawn(std::future::pending::<()>());
+        let mut guard = ProcessGuard {
+            armed: Some(ArmedProcess {
+                child,
+                // No process group owns this id, so neither signal makes the
+                // live fixture reapable. That models a post-SIGKILL kernel wait
+                // without placing the test process in uninterruptible I/O.
+                pgid: i32::MAX,
+                _cleanup: registry.track_cleanup(),
+                teardown: ProcessTeardown::Graceful,
+                readers: vec![stdout_reader.abort_handle(), stderr_reader.abort_handle()],
+            }),
+        };
+
+        assert!(
+            process_is_live(pid),
+            "the fixture must be live before its unavailable reap is modelled"
+        );
+        let result = tokio::time::timeout(
+            KILL_GRACE + KILL_GRACE + Duration::from_secs(1),
+            guard.terminate_user_command(),
+        )
+        .await
+        .expect("direct-command termination exceeded both of its bounds");
+        assert_eq!(result, ProcessTermination::OwnershipReleased);
+        assert!(
+            process_is_live(pid),
+            "the unavailable child exited, so the reap bound was not exercised"
+        );
+        for (stream, reader) in [("stdout", stdout_reader), ("stderr", stderr_reader)] {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), reader)
+                    .await
+                    .unwrap_or_else(|_| panic!("{stream} reader release was not bounded"))
+                    .unwrap_err()
+                    .is_cancelled(),
+                "{stream} reader completed instead of being released with capture ownership"
+            );
+        }
+        assert!(
+            registry.quiesce(Duration::ZERO).await,
+            "the direct-command reap bound retained its session cleanup lease"
+        );
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        wait_until(
+            || !Path::new(&format!("/proc/{pid}")).exists(),
+            "the observed fixture process to reach reaped terminal state",
+        )
+        .await;
+        fixture.disarm();
+    }
+
+    /// The detached driver uses the same direct-command termination boundary.
+    /// Its terminal registry row is not enough: quiescence also requires the
+    /// driver record, capture readers, and process cleanup lease to be gone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelled_background_command_settles_after_an_unavailable_reap() {
+        let sleep = host_executable("sleep");
+        let child = Command::new(sleep)
+            .arg("30")
+            .spawn()
+            .expect("spawn unavailable background-command fixture");
+        let pid: i32 = child
+            .id()
+            .expect("fixture pid")
+            .try_into()
+            .expect("fixture pid fits i32");
+        let mut fixture = FixtureProcess(Some(pid));
+        let mut ctx = DummyToolContext::default();
+        let registry = ctx.task_registry();
+        let stdout_reader = tokio::spawn(std::future::pending::<()>());
+        let stderr_reader = tokio::spawn(std::future::pending::<()>());
+        let stdout_observer = stdout_reader.abort_handle();
+        let stderr_observer = stderr_reader.abort_handle();
+        let process = ProcessGuard {
+            armed: Some(ArmedProcess {
+                child,
+                pgid: i32::MAX,
+                _cleanup: registry.track_cleanup(),
+                teardown: ProcessTeardown::Graceful,
+                readers: vec![stdout_reader.abort_handle(), stderr_reader.abort_handle()],
+            }),
+        };
+        let stdout_state = Arc::new(Mutex::new(StreamState::new()));
+        let stderr_state = Arc::new(Mutex::new(StreamState::new()));
+        let spill_dir = TempDir::new().expect("spill tempdir");
+        let spill_path = spill_dir.path().join("background.log");
+        std::fs::write(&spill_path, []).expect("create spill fixture");
+        let kind = TaskKind::Bash {
+            command: "unavailable reap fixture".to_string(),
+        };
+        let StartedTask {
+            id,
+            cancel,
+            events,
+            driver,
+        } = ctx.start_background_task(
+            kind,
+            "unavailable reap fixture".to_string(),
+            Arc::new(BashTaskOutput {
+                stdout: Arc::clone(&stdout_state),
+                stderr: Arc::clone(&stderr_state),
+                spill_path: spill_path.clone(),
+            }),
+        );
+        driver.spawn(drive_background_bash(BackgroundBash {
+            process,
+            child_pid: pid,
+            stdout_reader,
+            stderr_reader,
+            stdout_state,
+            stderr_state,
+            capture_error: Arc::new(Mutex::new(None)),
+            spill_path,
+            command: "unavailable reap fixture".to_string(),
+            task_id: id,
+            cancel,
+            events,
+        }));
+
+        assert!(registry.kill(id), "cancel the live background driver");
+        assert!(
+            registry
+                .quiesce(KILL_GRACE + KILL_GRACE + Duration::from_secs(1))
+                .await,
+            "the background driver exceeded the direct-command ownership bound"
+        );
+        assert_eq!(registry.status(id), Some(TaskStatus::Killed));
+        assert!(
+            stdout_observer.is_finished() && stderr_observer.is_finished(),
+            "background capture outlived terminal driver ownership"
+        );
+        let notices = registry.drain_notices(aj_agent::events::AgentId::Main);
+        assert_eq!(notices.len(), 1, "the cancelled driver reports once");
+        let notice = &notices[0].body;
+        assert!(
+            notice.contains(&reap_release_trailer()),
+            "the notice names the reap boundary that cut capture: {notice:?}"
+        );
+        assert!(
+            !notice.contains("Output capture failed") && !notice.contains(&capture_cut_trailer()),
+            "expected reader cancellation was reported as a capture failure or pipe-holder cut: \
+             {notice:?}"
+        );
+        assert!(
+            process_is_live(pid),
+            "the unavailable background child exited, so the reap bound was not exercised"
+        );
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        wait_until(
+            || !Path::new(&format!("/proc/{pid}")).exists(),
+            "the observed background fixture to reach reaped terminal state",
+        )
+        .await;
         fixture.disarm();
     }
 
@@ -3170,12 +3450,21 @@ mod tests {
     /// long before the command's natural runtime. Without escalation the
     /// whole group would shrug off the `SIGTERM` and run for the full
     /// timeout.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn cancellation_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let dir = TempDir::new().expect("tempdir");
+        let pid_path = dir.path().join("command.pid");
         let (mut ctx, _updates) = RecordingCtx::new();
+        let registry = ctx.task_registry();
         let token = ctx.cancellation();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+        let ready = pid_path.clone();
+        let canceller = tokio::spawn(async move {
+            wait_until(
+                || std::fs::metadata(&ready).is_ok_and(|metadata| metadata.len() > 0),
+                "the cancellation fixture to publish its pid",
+            )
+            .await;
             token.cancel();
         });
 
@@ -3187,7 +3476,10 @@ mod tests {
                     // `trap '' TERM` makes the shell ignore SIGTERM; the
                     // loop keeps it (and thus the group) alive until the
                     // escalation SIGKILL lands.
-                    command: "trap '' TERM; while true; do sleep 0.2; done".to_string(),
+                    command: format!(
+                        "trap '' TERM; printf '%s' $$ > '{}'; while true; do sleep 0.2; done",
+                        pid_path.display()
+                    ),
                     timeout: 60,
                     description: "test sigkill escalation".to_string(),
                     run_in_background: false,
@@ -3195,7 +3487,9 @@ mod tests {
             )
             .await
             .expect("execute");
+        canceller.await.expect("cancellation fixture");
         let elapsed = start.elapsed();
+        let pid = read_pid(&pid_path);
 
         // We waited out the grace window (proving SIGTERM alone did not
         // end it) but still finished far short of the 60s timeout.
@@ -3216,16 +3510,32 @@ mod tests {
         }
         let wire = extract_text(&outcome.content);
         assert!(wire.contains("Command cancelled"), "wire: {wire:?}");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "cancellation returned before its command leader was reaped"
+        );
+        assert!(
+            registry.quiesce(Duration::ZERO).await,
+            "cancellation returned with process cleanup still owned"
+        );
     }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn timeout_kills_command_and_marks_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let pid_path = dir.path().join("command.pid");
         let mut ctx = DummyToolContext::default();
+        let registry = ctx.task_registry();
         let start = Instant::now();
         let outcome = BashTool::default()
             .execute(
                 &mut ctx,
                 BashInput {
-                    command: "sleep 30".to_string(),
+                    command: format!(
+                        "trap '' TERM; printf '%s' $$ > '{}'; while true; do sleep 0.2; done",
+                        pid_path.display()
+                    ),
                     timeout: 1,
                     description: "test timeout".to_string(),
                     run_in_background: false,
@@ -3234,10 +3544,15 @@ mod tests {
             .await
             .expect("execute");
         let elapsed = start.elapsed();
+        let pid = read_pid(&pid_path);
 
         assert!(
-            elapsed < Duration::from_secs(5),
-            "timeout should not exceed 5s, took {elapsed:?}"
+            elapsed >= Duration::from_secs(1) + KILL_GRACE,
+            "timeout did not preserve the command's TERM grace, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "timeout and process teardown should remain bounded, took {elapsed:?}"
         );
         assert!(outcome.is_error);
         match &outcome.details {
@@ -3250,6 +3565,14 @@ mod tests {
         assert!(
             wire.contains("Command timed out after 1 seconds"),
             "wire: {wire:?}"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "timeout returned before its command leader was reaped"
+        );
+        assert!(
+            registry.quiesce(Duration::ZERO).await,
+            "timeout returned with process cleanup still owned"
         );
     }
 
