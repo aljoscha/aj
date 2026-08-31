@@ -4,26 +4,26 @@
 //! flag plumbing) and the agent (per-request key fetch) hit when they
 //! need a provider's bearer token. It owns:
 //!
-//! - **Persistence.** Credentials live in `~/.aj/auth.json` as a flat
-//!   `{ provider_id: AuthCredential }` map. Each mutation is performed
-//!   under a sidecar lockfile so two `aj` processes can't clobber each
-//!   other's writes when refreshing tokens at the same time.
+//! - **Persistence.** Credentials live in `~/.aj/auth.json` keyed by provider.
+//!   Each value is either one bare credential or a labeled account set. Each
+//!   mutation runs under a sidecar lockfile so two `aj` processes cannot
+//!   clobber each other's writes when refreshing tokens at the same time.
 //! - **Runtime overrides.** A CLI `--api-key` flag bypasses the file
 //!   entirely; that path lives in memory and is never written.
 //! - **OAuth provider registry.** The two OAuth flows we ship
 //!   ([`AnthropicOAuth`], [`OpenAIOAuth`]) are looked up by id when a
 //!   refresh is needed, so the storage layer can mint new access
 //!   tokens without the caller knowing about provider specifics.
-//! - **Resolution chain.** [`AuthStorage::get_api_key`] walks the
-//!   priority list: runtime override, then stored API key, then
-//!   stored OAuth (auto-refreshing if expired), then env vars. A
-//!   stored credential wins over the environment, so a deliberate
-//!   login stays authoritative and a stray exported key can't shadow
-//!   it. The explicit per-run override is the runtime `--api-key`.
+//! - **Resolution chain.** [`AuthStorage::get_api_key`] walks the priority list:
+//!   runtime override, then the selected stored credential (bare or account,
+//!   API key or auto-refreshed OAuth), then environment variables. A stored
+//!   credential wins over the environment, so a deliberate login stays
+//!   authoritative and a stray exported key cannot shadow it. The explicit
+//!   per-run override is the runtime `--api-key`.
 //!
-//! The on-disk shape is the same `{ "type": "...", ... }` discriminated
-//! union the rest of the project uses, so `auth.json` stays easy to
-//! eyeball and migrations stay simple.
+//! Every on-disk provider value is a `{ "type": "...", ... }` discriminated
+//! union, so bare credentials and account sets remain explicit and migrations
+//! stay simple.
 
 use std::collections::HashMap;
 use std::io;
@@ -332,8 +332,8 @@ pub enum AuthError {
     /// default would move what unlabeled resolution bills against.
     #[error("the selected account is provider {provider:?}'s default; set another default first")]
     RemovingDefault { provider: String, label: String },
-    /// An account label the store refuses (empty, or one that would
-    /// collide with the name a bare entry adopts on conversion).
+    /// An account label that fails the shared creation policy, including its
+    /// normalization, Unicode repertoire, grapheme, spacing, and length rules.
     #[error("invalid account label: {0}")]
     InvalidLabel(String),
     /// Insert-only account creation named an exact key already occupied in

@@ -15006,9 +15006,9 @@ mod tests {
     #[tokio::test]
     async fn login_request_new_account_preserves_existing_account_and_inserts_typed_label() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut app, mut writer, mut world, shell, _root) =
+        let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
-        let provider_id = "new-account-login";
+        let provider_id = "0-new-account-login";
         register_controlled_oauth(&world, provider_id, "work-access", LoginGate::Ready).await;
         world
             .auth
@@ -15022,6 +15022,32 @@ mod tests {
             .await
             .expect("seed existing personal account");
 
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenLoginSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        app.post_app_event(UserEvent {
+            name: REFOCUS_OVERLAY_EVENT.to_string(),
+            data: None,
+        });
+        app.render(&root).expect("render login picker focus path");
+        writer.write_all(b"\r").expect("confirm add-account row");
+        let confirm = tokio::time::timeout(Duration::from_secs(1), app.next_input())
+            .await
+            .expect("picker confirmation input arrives")
+            .expect("picker confirmation input");
+        app.handle_input(confirm);
+        let request = shell
+            .borrow()
+            .take_auth_request()
+            .expect("provider add-account row parks a request");
+        assert!(matches!(
+            &request,
+            AuthPickerRequest::Login {
+                provider_id: selected,
+                target: LoginTarget::NewAccount,
+                ..
+            } if selected == provider_id
+        ));
+
         let (tx, mut rx) = unbounded_channel();
         let mut login_session = None;
         apply_auth_request(
@@ -15030,11 +15056,7 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            AuthPickerRequest::Login {
-                provider_id: provider_id.to_string(),
-                provider_name: "Controlled OAuth".to_string(),
-                target: LoginTarget::NewAccount,
-            },
+            request,
         )
         .await;
 

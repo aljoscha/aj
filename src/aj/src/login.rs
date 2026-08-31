@@ -1130,6 +1130,11 @@ impl Widget for AccountConfirmation {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
         debug_assert!(!self.text.borrow().softwrap);
         debug_assert!(self.surface_representation_cells <= ACCOUNT_INSPECTION_CELL_LIMIT);
+        if !self.over_limit {
+            let represented_cells = ctx.string_width(&self.text.borrow().text);
+            self.represented_cells = represented_cells;
+            self.surface_representation_cells = represented_cells;
+        }
         let size = ctx.max.size();
         self.last_width = size.width.max(1);
         let warning_rows = if self.over_limit { 2 } else { 1 };
@@ -2014,6 +2019,32 @@ mod tests {
         assert!(rows.contains(raw), "logical source order changed: {rows:?}");
         assert!(!rows.contains('\u{2068}'), "vaxis must not inject FSI");
         assert!(!rows.contains('\u{2069}'), "vaxis must not inject PDI");
+    }
+
+    #[test]
+    fn account_confirmation_end_uses_the_active_width_method() {
+        let raw = format!("{}個", "👋🏿".repeat(31));
+        assert!(
+            validate_account_label(&raw).is_ok(),
+            "creation-valid fixture"
+        );
+        let (mut confirmation, _) = confirmation_for(raw);
+        let mut ctx = crate::test_support::draw_ctx(10, Some(4));
+        ctx.width_method = vaxis::gwidth::Method::Wcwidth;
+        let _ = confirmation.draw(&ctx);
+        assert_eq!(confirmation.represented_cells, 126);
+
+        let mut event_ctx = EventContext::new();
+        confirmation.handle_event(
+            &mut event_ctx,
+            &key_event(Key::END, Modifiers::empty(), None),
+        );
+        let tail = crate::test_support::rows(&confirmation.draw(&ctx)).join("\n");
+        assert!(
+            tail.contains('個'),
+            "End reaches the final grapheme: {tail:?}"
+        );
+        assert!(!confirmation.view.borrow().has_more_right());
     }
 
     #[test]
