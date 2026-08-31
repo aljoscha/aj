@@ -774,8 +774,10 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyle
 ///
 /// Ordinary digest fields are folded to one line at this render boundary.
 /// Environment pairs retain their typed row until here, where both sides are
-/// quoted and escaped to an ASCII-only representation. This keeps every valid
-/// pair distinguishable and leaves no terminal-active text for [`RichText`].
+/// quoted and escaped to an ASCII-only representation. Long representations
+/// are split into numbered continuation rows before they reach [`RichText`].
+/// This keeps every valid pair distinguishable and terminal-inert while
+/// bounding the work and height of each unbounded [`ListView`] child.
 pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<Row> {
     let tag = tag.map(crate::text::one_line);
     let rows = aj_app::session_info::digest(stats, tag.as_deref());
@@ -789,23 +791,53 @@ pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<
         })
         .max()
         .unwrap_or(0);
-    rows.iter()
-        .map(|row| match row {
-            aj_app::session_info::InfoRow::Header(title) => plain(title.as_str()),
+    let mut rendered = Vec::new();
+    for row in rows {
+        match row {
+            aj_app::session_info::InfoRow::Header(title) => rendered.push(plain(title)),
             aj_app::session_info::InfoRow::Kv { key, value } => {
-                let key = crate::text::one_line(key);
-                let value = crate::text::one_line(value);
-                plain(format!("  {key:<key_width$}  {value}"))
+                let key = crate::text::one_line(&key);
+                let value = crate::text::one_line(&value);
+                rendered.push(plain(format!("  {key:<key_width$}  {value}")));
             }
             aj_app::session_info::InfoRow::Env { key, value } => {
-                let key = quoted_env_text(key);
-                let value = quoted_env_text(value);
-                plain(format!("  {key}={value}"))
+                rendered.extend(environment_rows(&key, &value));
             }
             // A single space, not the empty string: an empty `RichText`
             // row collapses to zero height in the `ListView`, which would
             // erase the gap between sections. One space forces a line.
-            aj_app::session_info::InfoRow::Blank => plain(" "),
+            aj_app::session_info::InfoRow::Blank => rendered.push(plain(" ")),
+        }
+    }
+    rendered
+}
+
+/// Maximum escaped pair payload carried by one environment continuation row.
+///
+/// `ListView` measures each child without a height bound. `RichText` currently
+/// scans the remaining word for each narrow soft-wrapped line, so bounding the
+/// child makes measurement linear in the complete pair size and keeps every
+/// child's height far below `u16::MAX`, even at a one-cell content width.
+const ENV_ROW_PAYLOAD_CELLS: usize = 256;
+
+/// Render one lossless escaped pair as one row, or numbered continuation rows.
+/// Concatenating the payload after each `[part/total] ` prefix recovers exactly
+/// the same `"key"="value"` representation as the single-row form.
+fn environment_rows(key: &str, value: &str) -> Vec<Row> {
+    let representation = format!("{}={}", quoted_env_text(key), quoted_env_text(value));
+    debug_assert!(representation.is_ascii());
+    let total = representation.len().div_ceil(ENV_ROW_PAYLOAD_CELLS);
+    if total == 1 {
+        return vec![plain(format!("  {representation}"))];
+    }
+
+    representation
+        .as_bytes()
+        .chunks(ENV_ROW_PAYLOAD_CELLS)
+        .enumerate()
+        .map(|(part, chunk)| {
+            let payload = std::str::from_utf8(chunk).expect("escaped environment text is ASCII");
+            plain(format!("  [{}/{total}] {payload}", part + 1))
         })
         .collect()
 }
@@ -849,6 +881,41 @@ mod tests {
     /// Join a set of rows into one plain-text blob for `.contains(...)`.
     fn rows_text(rows: &[Row]) -> String {
         rows.iter().map(row_text).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Recover one escaped environment pair from its single row or numbered
+    /// continuation rows. `start` is a prefix of the escaped pair payload.
+    fn continued_env_text(rows: &[String], start: &str) -> String {
+        fn continuation(row: &str) -> Option<(usize, usize, &str)> {
+            let rest = row.strip_prefix("  [")?;
+            let (label, payload) = rest.split_once("] ")?;
+            let (part, total) = label.split_once('/')?;
+            Some((part.parse().ok()?, total.parse().ok()?, payload))
+        }
+        let at = rows
+            .iter()
+            .position(|row| {
+                row.strip_prefix("  ")
+                    .is_some_and(|payload| payload.starts_with(start))
+                    || continuation(row).is_some_and(|(_, _, payload)| payload.starts_with(start))
+            })
+            .unwrap_or_else(|| panic!("no environment row starts with {start:?}"));
+        let Some((part, total, first)) = continuation(&rows[at]) else {
+            return rows[at]
+                .strip_prefix("  ")
+                .expect("single environment row is indented")
+                .to_string();
+        };
+        assert_eq!(part, 1, "the first matching continuation starts the pair");
+        let mut joined = String::from(first);
+        for (offset, row) in rows[at + 1..at + total].iter().enumerate() {
+            let (part, found_total, payload) =
+                continuation(row).expect("the pair continues on numbered rows");
+            assert_eq!(part, offset + 2, "continuation order");
+            assert_eq!(found_total, total, "continuation total");
+            joined.push_str(payload);
+        }
+        joined
     }
 
     /// Distinct muted/heading tints so a column left at the default fg
@@ -1806,9 +1873,88 @@ mod tests {
             id_with_env, &id_without_env,
             "environment layout must not change ordinary digest padding",
         );
+        assert_eq!(
+            continued_env_text(
+                &texts[env + 1..activity - 1],
+                &format!("\"{}", &long_key[..16])
+            ),
+            format!(
+                "{}={}",
+                quoted_env_text(&long_key),
+                quoted_env_text("long-key-value")
+            ),
+            "numbered continuation rows preserve the complete long pair",
+        );
+    }
+
+    /// Valid environment text at and beyond the `u16` child-height boundary is
+    /// split before the real list measures it. Every escaped byte stays
+    /// reconstructable, and both ends of the list remain drawable at the
+    /// one-cell body width that maximizes soft-wrapped height.
+    #[test]
+    fn valid_u16_boundary_environment_text_remains_drawable_and_complete() {
+        let at_boundary = "A".repeat(65_529);
+        let beyond_boundary = "B".repeat(131_100);
+        let env = std::collections::BTreeMap::from([
+            (at_boundary.clone(), String::new()),
+            (beyond_boundary.clone(), String::new()),
+        ]);
+        aj_session::validate_session_env(&env).expect("both unbounded pairs are valid");
+        let mut stats = sample_stats();
+        stats.session_env = Some(env);
+
+        let rows = session_info_rows(&stats, None);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        let env = texts
+            .iter()
+            .position(|row| row == "Env")
+            .expect("Env section");
+        let activity = texts
+            .iter()
+            .position(|row| row == "Activity")
+            .expect("Activity section");
+        let env_rows = &rows[env + 1..activity - 1];
+        let env_texts = &texts[env + 1..activity - 1];
+
+        for text in env_texts {
+            let payload = text.split_once("] ").map_or_else(
+                || text.strip_prefix("  ").expect("environment indent"),
+                |(_, p)| p,
+            );
+            assert!(
+                payload.len() <= ENV_ROW_PAYLOAD_CELLS,
+                "one list child exceeded the fixed payload bound: {}",
+                payload.len(),
+            );
+            assert!(text.is_ascii(), "terminal-active text reached a child");
+        }
+        for key in [&at_boundary, &beyond_boundary] {
+            assert_eq!(
+                continued_env_text(env_texts, &format!("\"{}", &key[..16])),
+                format!("{}={}", quoted_env_text(key), quoted_env_text("")),
+                "the complete pair survives continuation rows",
+            );
+        }
+
+        let mut narrow = draw_ctx(2, 8);
+        narrow.width_method = vaxis::gwidth::Method::Wcwidth;
+        let mut overlay = ContentOverlay::new(env_rows.to_vec());
+        let top = overlay.draw(&narrow);
+        assert!(!top.children.is_empty(), "the first continuation is drawn");
         assert!(
-            texts.iter().any(|row| row.contains(&long_key)),
-            "the long key remains complete on its own independently wrapped row",
+            overlay.list.borrow().item_top_line(1)
+                > u64::try_from(ENV_ROW_PAYLOAD_CELLS).expect("payload bound fits u64"),
+            "the real list measured its first child at a one-cell body width",
+        );
+        overlay.list.borrow_mut().scroll_to_bottom();
+        let bottom = overlay.draw(&narrow);
+        assert!(
+            !bottom.children.is_empty(),
+            "the last continuation is drawn"
+        );
+        assert!(
+            overlay.list.borrow().is_at_bottom(),
+            "the tail remains reachable"
         );
     }
 
