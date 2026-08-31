@@ -3424,11 +3424,16 @@ async fn a_peer_from_the_outer_global_allow_occurrence_can_connect() {
     ])
     .expect("serve arguments parse");
     let whois = FakeWhois::resolving(user_peer("alice@github"));
-    let fixture = Fixture::with_gate(IdentityGate::tailscale(args.allow, whois.resolver())).await;
+    let (fixture, inferences) = Fixture::with_gate(
+        IdentityGate::tailscale(args.allow, whois.resolver()),
+        Vec::new(),
+    )
+    .await;
 
     let hello = fixture.client.hello().await;
     let asked = whois.asked();
     fixture.shutdown().await;
+    inferences.assert_consumed_exactly(0);
 
     hello.expect("the peer named only before serve reaches the real control port");
     assert!(
