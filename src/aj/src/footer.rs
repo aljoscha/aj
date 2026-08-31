@@ -145,6 +145,15 @@ impl Widget for FooterLine {
         // parts joined with `  ·  `. Softwrap off: a long cwd or model
         // name truncates with an ellipsis instead of wrapping, which
         // would grow the footer and push the editor up a row.
+        //
+        // A part that resolves empty is dropped rather than joined: a
+        // separator marks a boundary between two rendered values, so a part
+        // with no text would render as a doubled separator around nothing.
+        // An unknown value is absent, not blank. The filter sits at the join
+        // rather than at each push because this is a property of footer
+        // composition, so it must hold for every part regardless of which
+        // producers can currently yield one.
+        parts.retain(|part| part.iter().any(|span| !span.text.is_empty()));
         let mut spans = vec![span(" ".to_string(), dim)];
         for (i, part) in parts.into_iter().enumerate() {
             if i > 0 {
@@ -204,11 +213,20 @@ mod tests {
         status: StatusState,
         task_registry: TaskRegistry,
     ) -> FooterLine {
+        footer_with_cwd(chat, status, task_registry, "/home/user/proj")
+    }
+
+    fn footer_with_cwd(
+        chat: Rc<RefCell<ChatState>>,
+        status: StatusState,
+        task_registry: TaskRegistry,
+        cwd: &str,
+    ) -> FooterLine {
         FooterLine::new(
             chat,
             Rc::new(RefCell::new(status)),
             styles(),
-            "/home/user/proj".into(),
+            cwd.into(),
             Some(task_registry),
         )
     }
@@ -467,12 +485,41 @@ mod tests {
         assert_eq!(grid[0][19].char.grapheme(), "…", "ellipsis at the edge");
     }
 
-    /// Empty-model-line degenerate state still renders the cwd (the
-    /// part list is never empty, so the footer is never blank).
+    /// The cwd appears exactly when it is non-empty, and never as an empty
+    /// segment. A known cwd is rendered; an unknown one is absent rather than
+    /// contributing a blank segment, so the join emits separators only
+    /// between rendered values.
     #[test]
-    fn footer_always_shows_the_cwd() {
+    fn footer_renders_no_empty_segment() {
         let mut f = footer(chat_with_window(0), StatusState::default());
         let r = draw_rows(&mut f, 80);
-        assert!(r[0].contains("/home/user/proj"), "{r:?}");
+        assert!(
+            r[0].contains("/home/user/proj"),
+            "a known cwd is still shown: {r:?}",
+        );
+
+        let mut f = footer_with_cwd(
+            chat_with_window(200_000),
+            StatusState::default(),
+            TaskRegistry::default(),
+            "",
+        );
+        f.chat
+            .borrow_mut()
+            .footers_mut()
+            .record_turn_usage(AgentId::Main, &usage(12_345));
+        let r = draw_rows(&mut f, 80);
+        assert_eq!(
+            r[0], " opus high  ·  12k/200k (6.2%)",
+            "an unknown cwd is absent, not a blank segment: {r:?}",
+        );
+        assert!(
+            !r[0].contains("·  ·") && !r[0].contains("·   ·"),
+            "no doubled separator: {r:?}",
+        );
+        assert!(
+            !r[0].trim_end().ends_with('·') && !r[0].trim_start().starts_with('·'),
+            "no leading or trailing separator: {r:?}",
+        );
     }
 }
