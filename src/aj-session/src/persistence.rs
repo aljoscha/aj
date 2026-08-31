@@ -237,11 +237,47 @@ impl ConversationPersistence {
     /// one `stat` per file found, never a `stat` per session in the store. A
     /// directory that does not exist reads empty, which is what makes an axis
     /// no session has used cost a single failed `read_dir`.
+    ///
+    /// Display semantics: a file whose stat fails for any reason is dropped,
+    /// because a listing that loses one row is still worth rendering. A caller
+    /// whose control flow turns on the answer wants the strict
+    /// `archived_ids` sweep instead, which cannot afford that.
     pub(crate) fn session_files(
         &self,
         dir: &Path,
         extension: &str,
     ) -> Result<Vec<(String, fs::Metadata)>, ConversationError> {
+        let mut found = Vec::new();
+        for (session_id, path) in self.sidecar_candidates(dir, extension)? {
+            let Ok(metadata) = fs::metadata(&path) else {
+                // Vanished since the directory read, or unreadable; either
+                // way this axis would rather lose the row than the listing.
+                continue;
+            };
+            // A directory named like one of these files is not one, and
+            // offering it would cost a failed open at every enumeration for
+            // the life of the store: the read fails, so nothing is cached, so
+            // it is tried again next time.
+            if !metadata.is_file() {
+                continue;
+            }
+            found.push((session_id, metadata));
+        }
+        Ok(found)
+    }
+
+    /// Every path under `dir` that is named like a per-session `extension`
+    /// sidecar, with the session id its stem carries.
+    ///
+    /// One directory read and no `stat`: this is only the question of what a
+    /// name claims to be, which is the half both the display sweep and the
+    /// strict sweep agree on. What a caller does about a file that will not
+    /// stat is the half they differ on, so it is left to them.
+    fn sidecar_candidates(
+        &self,
+        dir: &Path,
+        extension: &str,
+    ) -> Result<Vec<(String, PathBuf)>, ConversationError> {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -259,20 +295,40 @@ impl ConversationPersistence {
             if !crate::id::is_valid_session_id(session_id) {
                 continue;
             }
-            let Ok(metadata) = fs::metadata(&path) else {
-                // Vanished since the directory read.
-                continue;
-            };
-            // A directory named like one of these files is not one, and
-            // offering it would cost a failed open at every enumeration for
-            // the life of the store: the read fails, so nothing is cached, so
-            // it is tried again next time.
-            if !metadata.is_file() {
-                continue;
-            }
-            found.push((session_id.to_string(), metadata));
+            found.push((session_id.to_string(), path));
         }
         Ok(found)
+    }
+
+    /// The id of every archived session, for a caller whose control flow turns
+    /// on the answer.
+    ///
+    /// The strict counterpart to the display sweep. Archiving is recorded by a
+    /// sidecar's existence, so this needs no timestamp and opens nothing: one
+    /// directory read plus one `stat` per sidecar found.
+    ///
+    /// What it will not do is report a session unarchived because the store
+    /// could not be read. A sidecar that is gone by the time it is stat-ed was
+    /// unarchived as of this read, which is an answer. Any other stat failure,
+    /// a permission denial, an I/O error, a symlink loop, is not an answer,
+    /// and reporting it as one would hand back the session the store was told
+    /// to put away.
+    fn archived_ids(&self) -> Result<HashSet<String>, ConversationError> {
+        let mut archived = HashSet::new();
+        for (session_id, path) in self.sidecar_candidates(&self.meta_dir(), ARCHIVED_SIDECAR)? {
+            match fs::metadata(&path) {
+                // A directory named like a sidecar is not one, exactly as the
+                // display sweep treats it.
+                Ok(metadata) => {
+                    if metadata.is_file() {
+                        archived.insert(session_id);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(archived)
     }
 
     /// The label of every tagged session in the store, keyed by session id.
@@ -509,9 +565,30 @@ impl ConversationPersistence {
     }
 
     /// Get the latest conversation session ID, if any exist.
+    ///
+    /// Archived sessions are passed over. Archiving puts a session away
+    /// without closing it, so an explicit id still resumes one; this is the
+    /// branch that picks a session nobody named, which is where "put away"
+    /// has to mean something. Same rule as bare `aj connect`, which filters
+    /// the peer's rows for the same reason. The filter belongs here rather
+    /// than in [`Self::list_sessions`], because every listing depends on the
+    /// unfiltered read, and it costs one directory read for the whole store
+    /// rather than a `stat` per session.
+    ///
+    /// The archive set is read through the strict `archived_ids` sweep rather
+    /// than the display one. That is the difference between
+    /// control flow and rendering. A listing may lose the archived bit and
+    /// still be worth showing, so the display path drops a sidecar it cannot
+    /// stat. Here the bit decides which session the user gets, so the same
+    /// silence would hand back a session the store was told to put away.
+    /// Absence of archiving is an answer; absence of knowledge is raised.
     pub fn get_latest_session_id(&self) -> Result<Option<String>, ConversationError> {
         let sessions = self.list_sessions()?;
-        Ok(sessions.first().map(|t| t.session_id.clone()))
+        let archived = self.archived_ids()?;
+        Ok(sessions
+            .iter()
+            .find(|metadata| !archived.contains(&metadata.session_id))
+            .map(|metadata| metadata.session_id.clone()))
     }
 
     /// List sessions with rich per-session previews — first user
@@ -1477,6 +1554,221 @@ mod tests {
         assert_eq!(
             persistence.is_current_format("2000-01-01-00-00-00-000"),
             Some(false),
+        );
+    }
+
+    /// Restores a path's permissions when it goes out of scope.
+    ///
+    /// A test that drops permission bits and restores them at the end leaves
+    /// the directory unsearchable if an assertion between the two panics, and
+    /// then the `TempDir` cannot be removed either. Ownership is the fix: the
+    /// restore rides on unwinding.
+    #[cfg(unix)]
+    struct PermissionGuard {
+        path: PathBuf,
+        restore: fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl PermissionGuard {
+        /// Drop every permission bit on `path`, restoring on drop.
+        fn seal(path: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let restore = fs::metadata(path)
+                .expect("stat before sealing")
+                .permissions();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000))
+                .expect("drop the permission bits");
+            Self {
+                path: path.to_path_buf(),
+                restore,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PermissionGuard {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.path, self.restore.clone());
+        }
+    }
+
+    /// The default pick passes over an archived session, and archiving is not
+    /// closing: the row still lists, the bit is reversible, and only the pick
+    /// filters. Bare `aj connect` already reads its peer's rows this way, and
+    /// this is the local analogue.
+    #[test]
+    fn the_default_pick_passes_over_an_archived_session() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "older", "hi");
+        let older = log.session_id().to_string();
+        drop(log);
+
+        // The younger log is written by hand rather than minted: ids come from
+        // the clock, so two creates inside one test can collide, and the
+        // enumeration orders by id. Copying a real log keeps it past the
+        // format gate.
+        let newer = "2999-01-01-00-00-00-000";
+        std::fs::copy(
+            persistence.sessions_dir().join(format!("{older}.jsonl")),
+            persistence.sessions_dir().join(format!("{newer}.jsonl")),
+        )
+        .expect("write a younger log");
+
+        assert_eq!(
+            persistence.get_latest_session_id().expect("pick"),
+            Some(newer.to_string()),
+            "the younger session is the default pick",
+        );
+
+        persistence.write_archived(newer, true).expect("archive");
+        assert_eq!(
+            persistence.get_latest_session_id().expect("pick"),
+            Some(older.clone()),
+            "archiving the younger one hands the pick to the older",
+        );
+        assert_eq!(
+            persistence.list_sessions().expect("list").len(),
+            2,
+            "and the listing still lists both, because only the pick filters",
+        );
+
+        persistence.write_archived(newer, false).expect("unarchive");
+        assert_eq!(
+            persistence.get_latest_session_id().expect("pick"),
+            Some(newer.to_string()),
+            "clearing the bit hands the pick back",
+        );
+
+        persistence.write_archived(newer, true).expect("archive");
+        persistence.write_archived(&older, true).expect("archive");
+        assert_eq!(
+            persistence.get_latest_session_id().expect("pick"),
+            None,
+            "with every session put away the pick is empty, as against an empty store",
+        );
+    }
+
+    /// An archive set that cannot be read is not an empty archive set.
+    ///
+    /// The unnamed pick is control flow, so a lost archived bit does not
+    /// degrade the answer, it inverts it: the session the store was told to
+    /// put away is exactly the one handed back. A listing may show the bit
+    /// wrong and still be worth showing, which is why the display helper
+    /// swallows the failure and this branch may not.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_pick_raises_when_the_archive_set_cannot_be_read() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "older", "hi");
+        let older = log.session_id().to_string();
+        drop(log);
+        let newer = "2999-01-01-00-00-00-000";
+        std::fs::copy(
+            persistence.sessions_dir().join(format!("{older}.jsonl")),
+            persistence.sessions_dir().join(format!("{newer}.jsonl")),
+        )
+        .expect("write a younger log");
+        persistence.write_archived(newer, true).expect("archive");
+
+        let meta = persistence.meta_dir();
+        let pick = {
+            let _sealed = PermissionGuard::seal(&meta);
+            if fs::read_dir(&meta).is_ok() {
+                // Root ignores the read bit, so the failure this test is about
+                // cannot be produced. Skipping beats asserting something that
+                // cannot fail.
+                return;
+            }
+            persistence.get_latest_session_id()
+        };
+
+        assert!(
+            pick.is_err(),
+            "an unreadable archive set must raise rather than hand back {newer}: {pick:?}",
+        );
+
+        assert_eq!(
+            persistence.get_latest_session_id().expect("pick"),
+            Some(older),
+            "and the pick is answerable again once the set can be read",
+        );
+    }
+
+    /// A sidecar the store cannot stat is not a sidecar that is gone.
+    ///
+    /// The directory read succeeding is not the whole answer: the archived bit
+    /// is one `stat` per sidecar, and a permission denial or an I/O error
+    /// there loses exactly the bit that decides which session the user gets.
+    /// Only `NotFound` means the sidecar vanished between the read and the
+    /// stat, which is a session unarchived as of this read.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_pick_raises_when_one_sidecar_cannot_be_stat_ed() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "older", "hi");
+        let older = log.session_id().to_string();
+        drop(log);
+        let newer = "2999-01-01-00-00-00-000";
+        std::fs::copy(
+            persistence.sessions_dir().join(format!("{older}.jsonl")),
+            persistence.sessions_dir().join(format!("{newer}.jsonl")),
+        )
+        .expect("write a younger log");
+        persistence.write_archived(newer, true).expect("archive");
+
+        // The sidecar is replaced by a symlink into a directory that cannot be
+        // searched, so `meta/` still reads and only this entry's stat fails.
+        // A dangling symlink would be NotFound, which is the case that
+        // legitimately means "gone".
+        let sidecar = persistence
+            .meta_dir()
+            .join(format!("{newer}.{ARCHIVED_SIDECAR}"));
+        let vault = persistence.sessions_dir().join("vault");
+        std::fs::create_dir(&vault).expect("vault");
+        let hidden = vault.join("target");
+        std::fs::write(&hidden, b"").expect("target");
+        std::fs::remove_file(&sidecar).expect("drop the real sidecar");
+        std::os::unix::fs::symlink(&hidden, &sidecar).expect("symlink the sidecar");
+        let _sealed = PermissionGuard::seal(&vault);
+        if fs::metadata(&sidecar).is_ok() {
+            // Root ignores the search bit, so the failure this test is about
+            // cannot be produced. Skipping beats asserting something that
+            // cannot fail.
+            return;
+        }
+
+        let pick = persistence.get_latest_session_id();
+        assert!(
+            pick.is_err(),
+            "a sidecar that cannot be stat-ed must raise rather than read as unarchived: {pick:?}",
+        );
+    }
+
+    /// A store that has archived nothing is not a store that cannot answer.
+    ///
+    /// The same read distinguishes the two: no `meta/` directory means
+    /// nothing has been put away, which is an answer rather than a failure,
+    /// and it is the state every store starts in.
+    #[test]
+    fn the_default_pick_answers_when_no_session_was_ever_archived() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "only", "hi");
+        let only = log.session_id().to_string();
+        drop(log);
+
+        assert!(
+            !persistence.meta_dir().exists(),
+            "the fixture has never archived, so the directory is absent",
+        );
+        assert_eq!(
+            persistence.get_latest_session_id().expect("pick"),
+            Some(only),
         );
     }
 

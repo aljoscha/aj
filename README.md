@@ -64,8 +64,8 @@ you run `aj` in:
 
 ```bash
 aj list-sessions       # list this project's sessions
-aj continue            # resume the most recent session
-aj continue <id>       # resume a specific session
+aj continue            # resume the most recent session that is not archived
+aj continue <id>       # resume a specific session, archived or not
 ```
 
 You can also resume a session or start a fresh one from the command palette.
