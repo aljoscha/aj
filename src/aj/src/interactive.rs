@@ -1142,10 +1142,10 @@ fn directory_tag(world: &World, session: &str) -> Option<String> {
 /// and the id, or the id alone.
 ///
 /// Both, where there is a tag. The tag is how the user knows the session and
-/// the id is what they act on afterwards (`aj continue <id>`), so a refusal
-/// that dropped the id would leave nothing to recover with. An untagged
-/// session's only name is its id, and showing it twice would be naming the
-/// subject twice.
+/// the id identifies the exact target. How the id is used depends on the
+/// control surface: a local id can be continued locally, while a connected
+/// id must be passed back unchanged to the same peer. An untagged session's
+/// only name is its id, and showing it twice would name the subject twice.
 fn session_subject(session: &str, tag: Option<&str>) -> String {
     match tag {
         Some(tag) => format!("{tag} ({session})"),
@@ -1192,11 +1192,24 @@ fn created_session_failure(session: &str, partial: Option<&str>, reason: &str) -
 }
 
 /// Report a selected session that this client did not reach through Caught.
-fn selected_session_failure(session: &str, tag: Option<&str>, reason: &str) -> String {
-    format!(
+/// A remote id is opaque to this process's local store, so its recovery command
+/// reconnects to the same peer rather than promising a local continuation.
+fn selected_session_failure(
+    session: &str,
+    tag: Option<&str>,
+    reason: &str,
+    reconnect_url: Option<&str>,
+) -> String {
+    let mut message = format!(
         "Can't follow {}: {reason}. It remains selected.",
         session_subject(session, tag)
-    )
+    );
+    if let Some(url) = reconnect_url {
+        message.push_str(&format!(
+            " To return to it later, reconnect to {url} and select session {session}."
+        ));
+    }
+    message
 }
 
 /// A user-requested transition whose success and usability wait for the
@@ -1645,9 +1658,12 @@ fn fail_pending_transition(
                     &format!("This client could not follow the selected session: {reason}"),
                 );
             }
-            shell
-                .borrow()
-                .show_toast(selected_session_failure(&session, tag.as_deref(), &reason));
+            shell.borrow().show_toast(selected_session_failure(
+                &session,
+                tag.as_deref(),
+                &reason,
+                world.control.base_url(),
+            ));
         }
         PendingTransition::Head { branching, prompt } => {
             let restored_prompt = prompt.is_some();
@@ -7803,6 +7819,30 @@ mod tests {
     #[test]
     fn strikethrough_wraps_input_in_sgr_markers() {
         assert_eq!(strikethrough("row"), "\x1b[9mrow\x1b[29m");
+    }
+
+    #[test]
+    fn a_connected_session_subject_points_back_to_its_peer() {
+        let session = "gateway-host:remote-session";
+        let subject = session_subject(session, Some("fix-auth"));
+        assert_eq!(subject, "fix-auth (gateway-host:remote-session)");
+        assert_eq!(
+            selected_session_failure(session, Some("fix-auth"), "the host is busy", None),
+            "Can't follow fix-auth (gateway-host:remote-session): the host is busy. It remains \
+             selected.",
+            "local failures keep their local recovery wording",
+        );
+        assert_eq!(
+            selected_session_failure(
+                session,
+                Some("fix-auth"),
+                "the host is busy",
+                Some("http://gateway.example"),
+            ),
+            "Can't follow fix-auth (gateway-host:remote-session): the host is busy. It remains \
+             selected. To return to it later, reconnect to http://gateway.example and select \
+             session gateway-host:remote-session.",
+        );
     }
 
     fn empty_chat() -> Rc<RefCell<ChatState>> {
@@ -21539,7 +21579,6 @@ mod tests {
         let previous = world.session().to_string();
         let target = "selected-refused-target".to_string();
         let reason = "the target is held by the peer named here";
-        let expected_toast = format!("Can't follow {target}: {reason}. It remains selected.");
         let peer = WarmPeer::start(
             vec![
                 list_of(&[&previous, &target]),
@@ -21548,6 +21587,11 @@ mod tests {
             Duration::from_millis(20),
         )
         .await;
+        let expected_toast = format!(
+            "Can't follow {target}: {reason}. It remains selected. To return to it later, \
+             reconnect to {} and select session {target}.",
+            peer.url,
+        );
         redirect_to(&mut world, &peer, Duration::from_secs(5));
 
         let (mut app, writer, _root) = app_over(&shell).await;
