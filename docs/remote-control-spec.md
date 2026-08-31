@@ -740,7 +740,7 @@ viewed agent to that parameter:
 | `.../{id}/tag` | tag string, empty clears | Set the session's tag: session-scoped display metadata (section 6.8), a single trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
 | `.../{id}/archive` | `{archived: bool}`, absent reads false | Set or clear the session's archived bit: session-scoped display metadata (section 6.8). `false` unarchives, so one route serves both directions. Materializes like any command, so the session lock covers the sidecar write and a rival writer's lock refuses it like any command (section 5). Nothing else refuses it: the bit has no lifecycle meaning, so a busy refusal like the head switch's below would be exactly the coupling it must not acquire, and a session working through a turn takes it and goes on working. The bit lands on the session's row through the ordinary debounced `list` path (section 6.8). Not in the protocol-1 baseline, arrives with the `archive` capability (section 6.10). |
 | `.../{id}/head` | target: an entry id, or `{before: <entry_id>}` | Switch the session head. 409 while working or tasks live. Clears queues, new epoch, `reset` frame. The `before` shape resolves any named entry to its parent server-side, atomically with the switch. An unknown entry is 404, an entry with no parent is refused. Its consumer is the branch-from-a-message gesture (replace the message rather than append after it), but the contract is deliberately not restricted to user-thread entries: every head `before` can reach is reachable through the plain entry shape already, so a restriction would police nothing. |
-| `.../{id}/tasks/{task_id}/kill` | — | Kill a background task. |
+| `.../{id}/tasks/{task_id}/kill` | `{}` (absent or blank is equivalent) | Kill a background task. This is the protocol's empty-object JSON command, so any field or non-object value is refused before the task is touched. |
 
 Gateway-only additions are in section 7. Session creation through a
 gateway takes a target host, because hosts are bound to working
@@ -1103,21 +1103,47 @@ never be silently dropped for a connected client.
 Both ends of every connection are aj, but versions will skew,
 especially with long-lived VMs. Rules:
 
-- `GET /v1/hello` carries `protocol` (integer, starts at 1) and
-  `capabilities` (list of strings). The protocol integer only bumps on
-  breaking changes, which we intend never to make. Everything else is
-  additive and capability-advertised.
-- Servers ignore unknown JSON fields in requests. Clients ignore
-  unknown fields in frames and responses.
-- Unknown tolerance lives at the wire boundary, never in the domain
-  enum. `AgentEvent` stays closed (every consumer relies on its
-  exhaustive matches and its `agent_id()` contract, which an unknown
-  variant cannot honor) and gains strict deserialization of its known
-  variants. `aj-wire` wraps decoding for events and for frames: a
-  known type decodes strictly (a malformed known event is an error,
-  not a downgrade to unknown), an unknown type retains its tag and
-  complete raw JSON. Unknown events and frames never reach the local
-  event bus or the reducer.
+- `GET /v1/hello` carries `protocol` and `capabilities`. Protocol 1 is
+  the released generation whose servers ignore unknown request
+  fields. Protocol 2 is the strict-command generation. The exact
+  version check is the migration boundary: a protocol-2 client sends
+  no create or command after a protocol-1 hello, and a gateway opens no
+  link to a host whose checked hello failed. Mixed generations are
+  unavailable rather than semantically degraded. Hosts and gateways
+  roll before clients. There is no dual-stack mode, versioned route
+  family, or strictness capability.
+- Every protocol-defined JSON command has a closed schema in protocol
+  2. The component that owns the command's effect rejects unknown
+  fields recursively before session creation, materialization, queue
+  mutation, cancellation, task kill, enrollment, or other dispatch.
+  This includes nested settings, model selections, prompt objects, and
+  structured prompt content. Existing defaults for omitted known
+  optional fields do not change.
+- A JSON command with no fields has an empty-object schema. An absent
+  body, ASCII whitespace, and `{}` are equivalent. An object containing
+  a field and every non-object JSON value are malformed. This rule does
+  not turn a bodyless HTTP method into a JSON command. Header handling,
+  read queries, and event-attachment queries keep their existing rules.
+- An unknown field is an ordinary malformed schema. The receiver
+  answers HTTP 400 with `invalid_request` before effects. Its human
+  message is generic and contains no offending field or path. Clients
+  surface the refusal and do not retry after stripping a field. The
+  prose is not a new stable distinction.
+- New command fields roll receiver first. Once every receiver knows an
+  optional field, clients may send it. Older protocol-2 clients omit it
+  and continue to work. A stale protocol-2 receiver refuses it instead
+  of executing a smaller command. Endpoint identity and protocol
+  version are assumed not to regress between checked hello and later
+  requests.
+- Observation decoding remains additive. Clients ignore unknown fields
+  in hello, success responses, error envelopes, reads, directory rows,
+  frames, and known events. Unknown tolerance lives at the wire
+  boundary, never in the domain enum. `AgentEvent` stays closed because
+  consumers rely on exhaustive matches and its `agent_id()` contract.
+  `aj-wire` wraps decoding for events and frames: a malformed known
+  type is an error rather than a downgrade to unknown, while an unknown
+  type retains its tag and complete raw JSON. Unknown events and frames
+  never reach the local event bus or reducer.
 - Client handling of unknowns: an unknown nested event is skipped
   before the reducer, but its envelope still applies, the epoch
   filter runs and a durable unknown event advances the cursor
@@ -1132,19 +1158,20 @@ especially with long-lived VMs. Rules:
   is not required. An unknown frame with no top-level `session` field
   is host-scoped and forwarded as is. This is what lets an
   older gateway sit between newer hosts and newer clients.
-- The same discipline governs a gateway editing a request or response
-  body (create's `host` field going up, the session id coming back)
-  **and any wire object a gateway re-emits under its own name, the
-  merged directory's rows included**: parse only the top level, keep
-  every other value as raw JSON, edit
-  the named fields, re-emit structurally unchanged. A typed decode
-  and re-encode would silently drop a newer client's fields or refuse
-  a body an older gateway cannot parse, reintroducing exactly the
-  version ceiling this section exists to prevent. A row merge is not
-  exempt because it is a merge: the gateway reads the fields it
-  routes on and rewrites the ones it owns (id, `host`,
-  `unreachable`), everything else passes through raw. This applies to
-  every body-editing route, present and future.
+- Strictness belongs to the authoritative effect owner, not every HTTP
+  hop. A gateway keeps per-session methods, queries, and body bytes
+  opaque and lets the destination host validate them. Its create route
+  parses only the raw top-level object, reads and rewrites `host`, and
+  preserves every other value. The destination host's refusal travels
+  back with its status, code, message, and unrelated fields intact,
+  apart from the established session-id namespace rewrite where an
+  error names one. Gateway-owned JSON commands such as host enrollment
+  are strict at the gateway.
+- The same raw discipline governs every wire object a gateway re-emits
+  under its own name, merged directory rows included. Parse only the
+  top level, keep every other value as raw JSON, edit named fields, and
+  re-emit structurally unchanged. A row merge reads the fields it
+  routes on and rewrites only `id`, `host`, and `unreachable`.
 - New endpoints, frame kinds, and event types arrive with a capability
   string. New means relative to a released baseline: protocol 1
   implies the whole section 6 surface as it stands at first release,
@@ -1164,8 +1191,9 @@ especially with long-lived VMs. Rules:
   refusal, the sanctioned fallback above.
 - The pinned-shape tests in `events.rs` extend to round-trip tests:
   serialize-deserialize must be identity on the wire-visible parts,
-  and decoding must survive forward-compat fixtures (extra fields,
-  unknown variants, unknown frame kinds).
+  observation decoding must survive forward-compat fixtures, and
+  request-context tests must refuse top-level and nested additions
+  before effects.
 
 ### 6.11 Securing the control port
 
@@ -1345,7 +1373,13 @@ Enrollment: static host addresses from the gateway config file, plus
 dynamic enrollment (VMs it provisions, or explicit
 `POST /v1/hosts {address}`). `GET /v1/hosts` lists, `DELETE
 /v1/hosts/{id}` removes. Enrolled hosts persist in gateway state so
-restarts recover the full set.
+restarts recover the full set. Dynamic enrollment completes a checked
+protocol-2 hello before adding or recording the host. Configured and
+remembered hosts already have a durable reason to exist, so an
+unreachable or incompatible hello leaves the enrollment in place but
+disconnected. Reconnect does not settle a new identity, mark it
+connected, publish it as reachable, or route a command until a
+protocol-2 hello succeeds.
 
 Gateway configuration is a TOML file (`--config <file>`, defaulting to
 `~/.aj/gateway.toml`): a list of static host addresses, and a
@@ -1785,12 +1819,15 @@ about ordering). The layers:
 
 1. **Wire tests**: strict round-trip identity for every known event
    variant and frame kind, pinned JSON fixtures both directions,
-   extra unknown fields ignored on known types, malformed known
+   extra unknown fields ignored on known observation types, malformed known
    events fail decoding rather than degrading to unknown, unknown
    event types and frame kinds decode into the raw-retaining wrappers
    and re-serialize unchanged, durable unknown events keep their
    envelope so cursor progression works, entry-id backfill into
-   decoded message ids.
+   decoded message ids. Request-context fixtures cover every command
+   root, nested settings, model selection, prompt alternatives and
+   structured content, while shared observation models remain
+   tolerant.
 2. **Reducer equivalence** (the core correctness property). The
    comparison operates on a **canonical form** of `ChatState`: a
    projection defined in test support that covers transcript entries
@@ -1846,7 +1883,9 @@ about ordering). The layers:
    splice-scoped on every edge: a reset is a statement about broken
    continuity and only an attachment has continuity, so each client
    gets them for exactly the sessions it attached, and unattached
-   sessions speak through the list (section 6.5).
+   sessions speak through the list (section 6.5). Counted incompatible
+   peers prove dynamic enrollment is not recorded, durable enrollments
+   remain disconnected, and no request routes after a failed hello.
 6. **Provisioning**: the local-process backend runs the full
    provision-enroll-create-prompt-destroy cycle in CI (it spawns real
    `aj serve` binaries with the scripted provider), including bundle
@@ -1870,7 +1909,10 @@ attach refusal (a dead or locked id answered by an `error` frame
 while the same stream's other sessions serve, through a gateway
 included), and the
 identity gate (loopback-only refusal in `local` mode, accept and
-reject paths in `tailscale` mode against a faked whois resolver).
+reject paths in `tailscale` mode against a faked whois resolver), and
+closed JSON command schemas through every real host route and gateway
+enrollment. Defaultable command probes assert that misspellings neither
+mint nor clear, queue, cancel, compact, kill, or dispatch inference.
 
 ## 12. Phasing
 

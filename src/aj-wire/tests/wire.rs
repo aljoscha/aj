@@ -1,14 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+use aj_models::types::UserContent;
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent,
-    DecodedFrame, DirectoryHost, EnrollHostRequest, ErrorResponse, Frame, HeadRequest, Hello,
-    HostList, HostNameError, HostSource, HostSummary, MAX_HOST_NAME_BYTES, MergedDirectory,
-    ModelSelection, PromptInput, PromptRequest, QueueCounts, QueueOperation, QueueOutcome,
-    QueueRequest, QueueState, RawObject, SessionCreated, SessionList, SessionSettings,
-    SessionSummary, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
-    VmList, normalize_host_name,
+    DecodedFrame, DirectoryHost, EmptyRequest, EnrollHostRequest, ErrorResponse, Frame,
+    HeadRequest, Hello, HostList, HostNameError, HostSource, HostSummary, MAX_HOST_NAME_BYTES,
+    MergedDirectory, ModelSelection, PROTOCOL_VERSION, PromptInput, PromptRequest, QueueCounts,
+    QueueOperation, QueueOutcome, QueueRequest, QueueState, RawObject, SessionCreated, SessionList,
+    SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest, TagRequest,
+    TaskDetails, TaskTable, VmList, decode_request, normalize_host_name,
 };
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -52,6 +53,11 @@ const FRAME_KINDS: &[&str] = &[
     "vms",
 ];
 
+#[test]
+fn strict_commands_are_protocol_generation_two() {
+    assert_eq!(PROTOCOL_VERSION, 2);
+}
+
 /// Frames in the shapes that make the session reader's and the rewrite's rules
 /// observable: a known and an unknown kind, host-scoped and session-scoped, a
 /// payload carrying a `session` of its own, a duplicated key, a key spelled
@@ -81,19 +87,13 @@ fn fixture(name: &str) -> Value {
 
 #[test]
 fn command_request_shapes_are_pinned() {
-    let prompt: PromptRequest = serde_json::from_value(json!({
-        "text": "hello",
-        "future_field": true
-    }))
-    .unwrap();
+    let prompt: PromptRequest = decode_request(br#"{"text":"hello"}"#).unwrap();
     assert_eq!(prompt.agent, None);
     assert!(matches!(prompt.input, PromptInput::Text { ref text } if text == "hello"));
 
-    let blocks: PromptRequest = serde_json::from_value(json!({
-        "agent": {"sub": 2},
-        "content": [{"type":"text","text":"structured"}]
-    }))
-    .unwrap();
+    let blocks: PromptRequest =
+        decode_request(br#"{"agent":{"sub":2},"content":[{"type":"text","text":"structured"}]}"#)
+            .unwrap();
     assert_eq!(blocks.agent, Some(AgentId::Sub(2)));
     assert!(matches!(blocks.input, PromptInput::Content { ref content } if content.len() == 1));
 
@@ -141,11 +141,107 @@ fn command_request_shapes_are_pinned() {
         serde_json::to_value(HeadRequest::before("entry-7")).unwrap(),
         json!({"before":"entry-7"})
     );
-    // Both shapes decode, and an unknown field is ignored as spec 6.10 asks.
     assert_eq!(
-        serde_json::from_value::<HeadRequest>(json!({"before":"entry-7","junk":1})).unwrap(),
+        decode_request::<HeadRequest>(br#"{"before":"entry-7"}"#).unwrap(),
         HeadRequest::before("entry-7"),
     );
+}
+
+#[test]
+fn request_context_rejects_unknown_fields_recursively() {
+    for (shape, rejected) in [
+        (
+            "create top level",
+            decode_request::<CreateSessionRequest>(br#"{"future":true}"#).is_err(),
+        ),
+        (
+            "create settings",
+            decode_request::<CreateSessionRequest>(
+                br#"{"settings":{"thinking":"high","future":true}}"#,
+            )
+            .is_err(),
+        ),
+        (
+            "model selection",
+            decode_request::<CreateSessionRequest>(
+                br#"{"settings":{"model":{"api":"openai","name":"gpt","future":true}}}"#,
+            )
+            .is_err(),
+        ),
+        (
+            "create text prompt",
+            decode_request::<CreateSessionRequest>(br#"{"prompt":{"text":"hello","future":true}}"#)
+                .is_err(),
+        ),
+        (
+            "structured prompt block",
+            decode_request::<PromptRequest>(
+                br#"{"content":[{"type":"text","text":"hello","future":true}]}"#,
+            )
+            .is_err(),
+        ),
+        (
+            "agent target",
+            decode_request::<PromptRequest>(br#"{"agent":{"sub":2,"future":true},"text":"hello"}"#)
+                .is_err(),
+        ),
+        (
+            "settings change",
+            decode_request::<SettingsRequest>(br#"{"thinking":"high","future":true}"#).is_err(),
+        ),
+    ] {
+        assert!(rejected, "{shape} accepted an unknown field");
+    }
+
+    assert!(decode_request::<SteerRequest>(br#"{"text":"now","future":true}"#).is_err());
+    assert!(decode_request::<CancelRequest>(br#"{"future":true}"#).is_err());
+    assert!(decode_request::<QueueRequest>(br#"{"op":"clear","future":true}"#).is_err());
+    assert!(decode_request::<CompactRequest>(br#"{"future":true}"#).is_err());
+    assert!(decode_request::<TagRequest>(br#"{"tag":"keep","future":true}"#).is_err());
+    assert!(decode_request::<ArchiveRequest>(br#"{"archived":true,"future":true}"#).is_err());
+    assert!(decode_request::<HeadRequest>(br#"{"entry":"e","future":true}"#).is_err());
+    assert!(decode_request::<EmptyRequest>(br#"{"future":true}"#).is_err());
+    assert!(
+        decode_request::<EnrollHostRequest>(br#"{"address":"host:6161","future":true}"#).is_err()
+    );
+}
+
+#[test]
+fn empty_object_commands_accept_blank_or_empty_objects_only() {
+    for body in [b"".as_slice(), b" \n\t".as_slice(), b"{}".as_slice()] {
+        decode_request::<EmptyRequest>(body)
+            .unwrap_or_else(|error| panic!("{body:?} did not decode: {error}"));
+    }
+    for body in [b"null".as_slice(), b"[]".as_slice(), b"1".as_slice()] {
+        assert!(
+            decode_request::<EmptyRequest>(body).is_err(),
+            "{body:?} decoded as an empty-object command",
+        );
+    }
+}
+
+#[test]
+fn unknown_field_diagnostics_do_not_repeat_peer_text() {
+    let field = "\u{1b}[31m\\\"\u{202e}future\n";
+    let mut body = json!({"text": "hello"});
+    body.as_object_mut()
+        .expect("the request is an object")
+        .insert(field.to_string(), json!(true));
+    let body = serde_json::to_vec(&body).unwrap();
+    let error = decode_request::<PromptRequest>(&body).expect_err("the field is unknown");
+    assert_eq!(error.to_string(), "malformed request body");
+    assert!(!error.to_string().contains(field));
+}
+
+#[test]
+fn shared_observation_content_remains_additively_decodable() {
+    let content: UserContent = serde_json::from_value(json!({
+        "type": "text",
+        "text": "hello",
+        "future_observation_field": {"nested": true}
+    }))
+    .expect("an observation keeps the existing unknown-field tolerance");
+    assert!(matches!(content, UserContent::Text(_)));
 }
 
 fn selected_model() -> ModelSelection {
@@ -2018,21 +2114,19 @@ fn an_archive_request_carries_one_bool_and_defaults_to_unarchiving() {
         json!({"archived": true}),
     );
     assert_eq!(
-        serde_json::from_value::<ArchiveRequest>(json!({})).unwrap(),
+        decode_request::<ArchiveRequest>(b"{}").unwrap(),
         ArchiveRequest::default(),
     );
     assert!(!ArchiveRequest::default().archived);
     assert!(
-        serde_json::from_value::<ArchiveRequest>(json!({"archived": false, "extra": 1}))
-            .is_ok_and(|request| !request.archived),
-        "a field this build has no type for is ignored (spec 6.10)",
+        decode_request::<ArchiveRequest>(br#"{"archived":false,"extra":1}"#).is_err(),
+        "a closed command cannot silently unarchive after dropping intent",
     );
 }
 
 /// The enrollment request: one address and nothing else, which is all an
 /// operator hands a gateway (spec 7.1). An address is required, because a
-/// gateway cannot dial what it was not told, and a field a newer client sends
-/// alongside it is ignored (spec 6.10).
+/// gateway cannot dial what it was not told.
 #[test]
 fn an_enrollment_request_carries_one_address() {
     assert_eq!(
@@ -2043,16 +2137,17 @@ fn an_enrollment_request_carries_one_address() {
         json!({"address": "100.64.0.2:6161"}),
     );
     assert_eq!(
-        serde_json::from_value::<EnrollHostRequest>(json!({
-            "address": "http://100.64.0.2:6161",
-            "added_later": {"resources": 2}
-        }))
-        .expect("an addition a newer client sends is ignored")
-        .address,
+        decode_request::<EnrollHostRequest>(br#"{"address":"http://100.64.0.2:6161"}"#)
+            .expect("the known enrollment schema decodes")
+            .address,
         "http://100.64.0.2:6161",
     );
     assert!(
-        serde_json::from_value::<EnrollHostRequest>(json!({})).is_err(),
+        decode_request::<EnrollHostRequest>(br#"{"address":"host:6161","added_later":1}"#).is_err(),
+        "gateway-owned enrollment is a closed command",
+    );
+    assert!(
+        decode_request::<EnrollHostRequest>(b"{}").is_err(),
         "a gateway cannot dial an address it was never given",
     );
 }
