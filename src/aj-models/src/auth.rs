@@ -26,7 +26,7 @@
 //! stay simple.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
@@ -387,6 +387,11 @@ struct State {
 /// runtime-override map and OAuth registry. The on-disk file is the
 /// authoritative store; every read/write hits it directly so two
 /// `AuthStorage` instances in the same process stay consistent.
+///
+/// The configured path must be absolute and its immediate parent is
+/// storage-owned. On Unix every locked access enforces mode 0700 on that
+/// directory and mode 0600 on an existing file. The auth path itself must not
+/// be a symbolic link.
 #[derive(Clone)]
 pub struct AuthStorage {
     /// Path to `auth.json` (typically `~/.aj/auth.json`).
@@ -1313,30 +1318,126 @@ fn migrate_legacy_openai_oauth(data: &mut AuthData) {
     );
 }
 
-/// Write `data` to `auth.json`, creating the parent directory if
-/// missing. On Unix the file is created with mode 0600 and the parent
-/// with 0700 so a stray `world-readable` doesn't leak credentials.
+/// Write `data` to `auth.json` through a private same-directory temporary file.
+///
+/// On Unix the containing directory and any existing destination are made
+/// private before the temporary file receives credential bytes. The completed
+/// file atomically replaces the destination. A failed write leaves the prior
+/// store intact, and process interruption leaves either the prior or replacement
+/// version rather than a partially rewritten destination. This does not claim
+/// power-loss durability, which requires syncing both the file and directory.
 fn write_auth_file(path: &Path, data: &AuthData) -> Result<(), AuthError> {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o700);
-                let _ = std::fs::set_permissions(parent, perms);
-            }
-        }
-    }
-
     let content = serde_json::to_string_pretty(data).map_err(AuthError::Serialize)?;
-    std::fs::write(path, content)?;
+    replace_auth_file(path, content.as_bytes(), |file, bytes| {
+        file.write_all(bytes)
+    })
+}
+
+/// Replace `path` only after `write` succeeds.
+///
+/// The byte writer is separate from publication so any write error drops the
+/// private temporary file while the destination remains unchanged.
+fn replace_auth_file(
+    path: &Path,
+    content: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> io::Result<()>,
+) -> Result<(), AuthError> {
+    prepare_auth_parent(path)?;
+    make_existing_auth_file_private(path)?;
+
+    let parent = storage_parent(path)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("auth.json");
+    let prefix = format!(".{file_name}.tmp-");
+    let mut replacement = tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempfile_in(parent)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
+        replacement.as_file().set_permissions(perms)?;
+    }
+
+    write(replacement.as_file_mut(), content)?;
+    replacement
+        .persist(path)
+        .map_err(|error| AuthError::Io(error.error))?;
+
+    Ok(())
+}
+
+/// The directory in which both the destination and its replacement live.
+/// A relative path is ambiguous because lexical forms such as `./auth.json`
+/// could make hardening its parent alter a caller-owned working directory.
+fn storage_parent(path: &Path) -> io::Result<&Path> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "auth storage path must be absolute",
+        ));
+    }
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "auth storage path must have an explicit parent directory",
+            )
+        })
+}
+
+/// Create the auth directory and, on Unix, repair permissive mode bits before
+/// any credential file is opened.
+fn prepare_auth_parent(path: &Path) -> io::Result<()> {
+    let parent = storage_parent(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(parent)?;
+
+    Ok(())
+}
+
+/// Reject symbolic links and non-files. On Unix, repair a permissive existing
+/// destination before replacement. A missing destination is the normal
+/// first-write case. Every other metadata or permission error is part of the
+/// caller-visible storage result.
+fn make_existing_auth_file_private(path: &Path) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "auth storage path must not be a symbolic link",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "auth storage path must name a regular file",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
 
     Ok(())
@@ -1379,19 +1480,20 @@ impl FileLock {
     async fn acquire(target_path: &Path) -> Result<Self, AuthError> {
         let lock_path = lock_path_for(target_path);
 
-        // Make sure the parent exists so `create_dir(lock_path)` has
-        // somewhere to land. Ignored on success/already-exists.
-        if let Some(parent) = lock_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+        // The lock is the first filesystem object an auth operation creates.
+        // Harden its parent before creating it so the lock path cannot open a
+        // process-default-permission window ahead of the credential write.
+        prepare_auth_parent(target_path)?;
 
         let start = std::time::Instant::now();
         let mut backoff = INITIAL_BACKOFF;
         loop {
-            match std::fs::create_dir(&lock_path) {
-                Ok(()) => return Ok(Self { path: lock_path }),
+            match create_lock_dir(&lock_path) {
+                Ok(()) => {
+                    let lock = Self { path: lock_path };
+                    make_existing_auth_file_private(target_path)?;
+                    return Ok(lock);
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     if try_steal_stale_lock(&lock_path, STALE_LOCK_AGE) {
                         // Try again immediately after stealing; if a
@@ -1409,6 +1511,19 @@ impl FileLock {
             }
         }
     }
+}
+
+/// Create a lock directory that is private from its first observable mode.
+fn create_lock_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+
+    #[cfg(not(unix))]
+    std::fs::create_dir(path)
 }
 
 impl Drop for FileLock {
@@ -1479,6 +1594,17 @@ mod tests {
         let dir = TempDir::with_prefix(format!("aj-auth-test-{tag}-")).expect("create temp dir");
         let path = dir.path().join("auth.json");
         (dir, path)
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path)
+            .expect("read fixture metadata")
+            .permissions()
+            .mode()
+            & 0o777
     }
 
     struct TestCallbacks;
@@ -2271,6 +2397,305 @@ mod tests {
         listed.sort();
         let expected: Vec<String> = (0..10u8).map(|i| format!("p{i}")).collect();
         assert_eq!(listed, expected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_write_creates_a_private_parent_and_file() {
+        let root =
+            TempDir::with_prefix("aj-auth-test-private-create-").expect("create scratch root");
+        let parent = root.path().join("credentials");
+        let path = parent.join("auth.json");
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+
+        storage
+            .insert_bare(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "first-secret".into(),
+                },
+            )
+            .await
+            .expect("write first credential");
+
+        assert_eq!(mode(&parent), 0o700);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_acquisition_creates_private_state_before_the_auth_file_exists() {
+        let root = TempDir::with_prefix("aj-auth-test-private-lock-").expect("create scratch root");
+        let parent = root.path().join("credentials");
+        let path = parent.join("auth.json");
+        let lock_path = lock_path_for(&path);
+
+        let lock = FileLock::acquire(&path).await.expect("acquire auth lock");
+        assert_eq!(mode(&parent), 0o700);
+        assert_eq!(mode(&lock_path), 0o700);
+        assert!(!path.exists(), "lock acquisition created the auth file");
+        drop(lock);
+        assert!(
+            !lock_path.exists(),
+            "lock guard did not release its directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_auth_paths_are_rejected_before_lock_creation() {
+        for path in [
+            PathBuf::from("aj-auth-relative-path-must-be-rejected.json"),
+            PathBuf::from("./aj-auth-dot-path-must-be-rejected.json"),
+        ] {
+            let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+            assert!(matches!(
+                storage.list().await,
+                Err(AuthError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+            ));
+            assert!(!path.exists());
+            assert!(!lock_path_for(&path).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_repairs_a_permissive_parent_and_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            TempDir::with_prefix("aj-auth-test-private-repair-").expect("create scratch root");
+        let parent = root.path().join("credentials");
+        let path = parent.join("auth.json");
+        std::fs::create_dir(&parent).expect("create permissive parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+            .expect("make parent permissive");
+        std::fs::write(
+            &path,
+            r#"{"existing":{"type":"api_key","key":"old-secret"}}"#,
+        )
+        .expect("seed existing credentials");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("make auth file permissive");
+
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+        storage
+            .insert_bare(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "new-secret".into(),
+                },
+            )
+            .await
+            .expect("replace through private storage boundary");
+
+        assert_eq!(mode(&parent), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        let stored = std::fs::read_to_string(&path).expect("read repaired credentials");
+        assert!(stored.contains("old-secret"));
+        assert!(stored.contains("new-secret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_locked_read_repairs_a_permissive_parent_and_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::with_prefix("aj-auth-test-private-read-").expect("create scratch root");
+        let parent = root.path().join("credentials");
+        let path = parent.join("auth.json");
+        std::fs::create_dir(&parent).expect("create permissive parent");
+        std::fs::write(
+            &path,
+            r#"{"anthropic":{"type":"api_key","key":"existing-secret"}}"#,
+        )
+        .expect("seed existing credentials");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+            .expect("make parent permissive");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("make auth file permissive");
+
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+        assert_eq!(
+            storage.list().await.expect("read through storage boundary"),
+            ["anthropic"]
+        );
+        assert_eq!(mode(&parent), 0o700);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn an_injected_partial_write_preserves_the_prior_complete_store() {
+        let (_dir, path) = scratch_path("atomic-failure");
+        let previous = br#"{"provider":{"type":"api_key","key":"complete-old-secret"}}"#;
+        std::fs::write(&path, previous).expect("seed prior complete store");
+
+        let result = replace_auth_file(
+            &path,
+            br#"{"provider":{"type":"api_key","key":"replacement-secret"}}"#,
+            |file, bytes| {
+                file.write_all(&bytes[..bytes.len() / 2])?;
+                Err(io::Error::other("injected auth write failure"))
+            },
+        );
+
+        assert!(
+            matches!(result, Err(AuthError::Io(error)) if error.to_string() == "injected auth write failure")
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read store after failed replacement"),
+            previous
+        );
+        let entries = std::fs::read_dir(path.parent().expect("auth parent"))
+            .expect("list auth parent")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read auth parent entries");
+        assert_eq!(entries.len(), 1, "failed replacement left a temp file");
+        assert_eq!(entries[0].path(), path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_replacement_is_private_before_writing_and_replaces_the_inode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            TempDir::with_prefix("aj-auth-test-atomic-success-").expect("create scratch root");
+        let parent = root.path().join("credentials");
+        let path = parent.join("auth.json");
+        let prior_link = root.path().join("prior-auth.json");
+        let previous = b"complete-old-secret";
+        let replacement = b"complete-new-secret";
+        std::fs::create_dir(&parent).expect("create auth parent");
+        std::fs::write(&path, previous).expect("seed prior store");
+        std::fs::hard_link(&path, &prior_link).expect("retain prior inode");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+            .expect("make parent permissive");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("make auth file permissive");
+
+        replace_auth_file(&path, replacement, |file, bytes| {
+            assert_eq!(mode(&parent), 0o700);
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(
+                file.metadata().expect("temp metadata").permissions().mode() & 0o777,
+                0o600
+            );
+
+            let temporary = std::fs::read_dir(&parent)
+                .expect("list replacement directory")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read replacement entries")
+                .into_iter()
+                .map(|entry| entry.path())
+                .filter(|entry| entry != &path)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                temporary.len(),
+                1,
+                "replacement must use one same-directory temp file"
+            );
+            assert!(
+                temporary[0]
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".auth.json.tmp-"))
+            );
+
+            file.write_all(bytes)
+        })
+        .expect("atomically replace auth store");
+
+        assert_eq!(std::fs::read(&path).expect("read replacement"), replacement);
+        assert_eq!(
+            std::fs::read(&prior_link).expect("read retained prior inode"),
+            previous,
+            "replacement wrote through the destination instead of swapping it"
+        );
+        assert_eq!(mode(&parent), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        let entries = std::fs::read_dir(&parent)
+            .expect("list final auth parent")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read final auth entries");
+        assert_eq!(entries.len(), 1, "successful replacement left a temp file");
+        assert_eq!(entries[0].path(), path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_storage_mutation_replaces_the_destination_inode() {
+        let root =
+            TempDir::with_prefix("aj-auth-test-storage-replacement-").expect("create scratch root");
+        let parent = root.path().join("credentials");
+        let path = parent.join("auth.json");
+        let prior_link = root.path().join("prior-auth.json");
+        let previous = br#"{"existing":{"type":"api_key","key":"old-secret"}}"#;
+        std::fs::create_dir(&parent).expect("create auth parent");
+        std::fs::write(&path, previous).expect("seed prior store");
+        std::fs::hard_link(&path, &prior_link).expect("retain prior inode");
+
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+        storage
+            .insert_bare(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "new-secret".into(),
+                },
+            )
+            .await
+            .expect("mutate auth storage");
+
+        assert_eq!(
+            std::fs::read(&prior_link).expect("read retained prior inode"),
+            previous,
+            "AuthStorage rewrote the destination inode in place"
+        );
+        let stored = std::fs::read_to_string(&path).expect("read replacement store");
+        assert!(stored.contains("old-secret"));
+        assert!(stored.contains("new-secret"));
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symbolic_auth_path_is_rejected_and_releases_the_lock() {
+        use std::os::unix::fs::symlink;
+
+        let (_dir, path) = scratch_path("permission-failure");
+        let target = path.with_file_name("target.json");
+        let previous = br#"{"provider":{"type":"api_key","key":"existing-secret"}}"#;
+        std::fs::write(&target, previous).expect("seed symlink target");
+        symlink(&target, &path).expect("create auth path symlink");
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+        let result = storage.list().await;
+
+        assert!(matches!(
+            result,
+            Err(AuthError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read unchanged symlink target"),
+            previous
+        );
+        assert!(
+            !lock_path_for(&path).exists(),
+            "symlink rejection leaked the acquired lock"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_parent_permission_failure_is_surfaced() {
+        let storage =
+            AuthStorage::with_providers(PathBuf::from("/proc/self/status"), HashMap::new());
+
+        assert!(matches!(storage.list().await, Err(AuthError::Io(_))));
     }
 
     /// `try_steal_stale_lock` should leave fresh locks alone but
