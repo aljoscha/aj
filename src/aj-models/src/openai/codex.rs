@@ -42,7 +42,7 @@ use openai_sdk::types::responses::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::cancel::{SelectOutcome, select_cancel, select_cancel_after_poll};
+use crate::cancel::{RequestSelectOutcome, SelectOutcome, select_cancel, select_request};
 use crate::oauth::openai::extract_account_id;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, validate_thinking_level};
@@ -232,22 +232,9 @@ async fn run_stream_inner(
         }
     }
 
-    if options
-        .cancel
-        .as_ref()
-        .is_some_and(|token| token.is_cancelled())
-    {
-        producer.push(AssistantMessageEvent::aborted(empty_partial(
-            API_NAME,
-            model,
-            credential.account.as_deref(),
-        )));
-        return Ok(());
-    }
-
-    // Crossing into the client request future is the issuance boundary. From
-    // here until final protocol usage arrives, a terminal carries only a
-    // recorded subtotal, including handshake cancellation or failure.
+    // The client request future's first poll is the issuance boundary.
+    // Cancellation before that poll remains complete zero. After it, the
+    // terminal carries only a recorded subtotal until final usage arrives.
     let mut state = StreamState::new_with(
         API_NAME,
         model,
@@ -255,14 +242,14 @@ async fn run_stream_inner(
         CODEX_COST_MULTIPLIER,
         credential.account.clone(),
     );
-    let mut sse = match select_cancel_after_poll(
+    let mut sse = match select_request(
         options.cancel.as_ref(),
         client.codex_responses_stream(request),
     )
     .await
     {
-        SelectOutcome::Ready(Ok(sse)) => sse,
-        SelectOutcome::Ready(Err(err)) => {
+        RequestSelectOutcome::Ready(Ok(sse)) => sse,
+        RequestSelectOutcome::Ready(Err(err)) => {
             let account = account_for_client_error(&err, credential.account.as_deref());
             let error = classify_codex_client_error(&err);
             let terminal = if client_error_was_issued(&err) {
@@ -273,7 +260,15 @@ async fn run_stream_inner(
             producer.push(terminal);
             return Ok(());
         }
-        SelectOutcome::Cancelled => {
+        RequestSelectOutcome::CancelledBeforePoll => {
+            producer.push(AssistantMessageEvent::aborted(empty_partial(
+                API_NAME,
+                model,
+                credential.account.as_deref(),
+            )));
+            return Ok(());
+        }
+        RequestSelectOutcome::CancelledAfterPoll => {
             producer.push(state.cancelled());
             return Ok(());
         }
@@ -738,7 +733,8 @@ mod tests {
     use crate::registry::{InputModality, ModelCost};
     use crate::types::{
         ApiKeyResolver, AssistantContent, AssistantMessage as UnifiedAssistantMessage,
-        CacheRetention, Message as UnifiedMessage, TextContent, ToolCall, UserContent, UserMessage,
+        CacheRetention, Message as UnifiedMessage, OnPayload, TextContent, ToolCall, UserContent,
+        UserMessage,
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -969,6 +965,28 @@ mod tests {
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert!(terminal.usage.incomplete);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_the_codex_request_poll_stays_complete_zero() {
+        let server =
+            crate::provider_test_support::openai_error_server("POST /codex/responses").await;
+        let mut model = fake_model("gpt-5.1", false);
+        model.base_url = server.base_url.clone();
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut options = labeled_options(token.clone());
+        options.on_payload = Some(OnPayload::new(move |_| token.cancel()));
+        let stream = OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("pre-request cancellation emits terminal");
+        let requests = server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(!terminal.usage.incomplete);
+        assert_eq!(requests, 0, "cancellation precedes request issuance");
     }
 
     #[tokio::test]

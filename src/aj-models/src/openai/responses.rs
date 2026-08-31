@@ -33,7 +33,7 @@ use openai_sdk::types::responses::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cancel::{SelectOutcome, select_cancel, select_cancel_after_poll};
+use crate::cancel::{RequestSelectOutcome, SelectOutcome, select_cancel, select_request};
 use crate::errors::classify_openai_stream_failure;
 use crate::openai::errors::{
     account_for_client_error, classify_client_error, client_error_was_issued,
@@ -272,33 +272,18 @@ async fn run_stream_inner(
         }
     }
 
-    if options
-        .cancel
-        .as_ref()
-        .is_some_and(|token| token.is_cancelled())
-    {
-        producer.push(AssistantMessageEvent::aborted(empty_partial(
-            API_NAME,
-            model,
-            credential.account.as_deref(),
-        )));
-        return Ok(());
-    }
-
-    // Crossing into the client request future is the issuance boundary. From
-    // here until final protocol usage arrives, a terminal carries only a
-    // recorded subtotal, including handshake cancellation or failure.
+    // The client request future's first poll is the issuance boundary.
+    // Cancellation before that poll remains complete zero. After it, the
+    // terminal carries only a recorded subtotal until final usage arrives.
     let mut state = StreamState::new_with_account(
         model,
         options.service_tier.clone(),
         credential.account.clone(),
     );
     let mut sse =
-        match select_cancel_after_poll(options.cancel.as_ref(), client.responses_stream(request))
-            .await
-        {
-            SelectOutcome::Ready(Ok(sse)) => sse,
-            SelectOutcome::Ready(Err(err)) => {
+        match select_request(options.cancel.as_ref(), client.responses_stream(request)).await {
+            RequestSelectOutcome::Ready(Ok(sse)) => sse,
+            RequestSelectOutcome::Ready(Err(err)) => {
                 let account = account_for_client_error(&err, credential.account.as_deref());
                 let error = classify_client_error(&err);
                 let terminal = if client_error_was_issued(&err) {
@@ -309,7 +294,15 @@ async fn run_stream_inner(
                 producer.push(terminal);
                 return Ok(());
             }
-            SelectOutcome::Cancelled => {
+            RequestSelectOutcome::CancelledBeforePoll => {
+                producer.push(AssistantMessageEvent::aborted(empty_partial(
+                    API_NAME,
+                    model,
+                    credential.account.as_deref(),
+                )));
+                return Ok(());
+            }
+            RequestSelectOutcome::CancelledAfterPoll => {
                 producer.push(state.cancelled());
                 return Ok(());
             }
@@ -1807,7 +1800,9 @@ fn finalize_usage(usage: &mut crate::types::Usage, cost: &ModelCost, tier_multip
 mod tests {
     use super::*;
     use crate::registry::InputModality;
-    use crate::types::{ApiKeyResolver, Message as UnifiedMessage, UserContent, UserMessage};
+    use crate::types::{
+        ApiKeyResolver, Message as UnifiedMessage, OnPayload, UserContent, UserMessage,
+    };
     use tokio_util::sync::CancellationToken;
 
     fn fake_model(reasoning: bool) -> ModelInfo {
@@ -2684,6 +2679,27 @@ mod tests {
         assert_eq!(terminal.usage.total_tokens, 0);
         assert!(terminal.usage.incomplete);
         assert_eq!(requests, 1, "one inference issues one HTTP request");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_the_responses_request_poll_stays_complete_zero() {
+        let server = crate::provider_test_support::openai_error_server("POST /v1/responses").await;
+        let mut model = fake_model(false);
+        model.base_url = format!("{}/v1", server.base_url);
+        let token = CancellationToken::new();
+        let mut options = labeled_options(token.clone());
+        options.on_payload = Some(OnPayload::new(move |_| token.cancel()));
+        let stream = OpenAiResponsesProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("pre-request cancellation emits terminal");
+        let requests = server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(!terminal.usage.incomplete);
+        assert_eq!(requests, 0, "cancellation precedes request issuance");
     }
 
     #[tokio::test]

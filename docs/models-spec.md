@@ -247,16 +247,20 @@ existing shape. `Usage::accumulate` sums every numeric field and ORs
 `incomplete`; a later complete response cannot clear an earlier disclosure
 gap.
 
-A provider request enters `incomplete: true` when its client request future is
-issued. This includes cancellation, transport failure, and API failure while
-establishing the streaming response. Local failures before issuance, such as
-authentication, option validation, malformed request construction, and an
-already-cancelled call, remain the complete-zero identity. The marker clears
-only on that protocol's complete final usage evidence: the requested trailing
-usage chunk for Chat Completions, `response.usage` on the first Responses or
-Codex lifecycle terminal, or Anthropic's final usage-bearing `message_delta`.
-The presence of evidence, not nonzero token values, decides completeness.
-Missing usage never causes a poll, retry, or replacement estimate.
+A provider request enters `incomplete: true` when its client request future
+receives its first poll, since that poll may issue the request upstream. A
+cancellation that wins before the first poll drops the unissued future and
+remains complete zero. Cancellation after the first poll remains partial,
+including cancellation while establishing the streaming response. A client
+error that establishes the request failed during local construction can still
+retain the complete-zero identity. Authentication and option validation also
+remain local complete-zero failures. Other transport and API failures after
+issuance remain partial. The marker clears only on that protocol's complete
+final usage evidence: the requested trailing usage chunk for Chat Completions,
+`response.usage` on the first Responses or Codex lifecycle terminal, or
+Anthropic's final usage-bearing `message_delta`. The presence of evidence, not
+nonzero token values, decides completeness. Missing usage never causes a poll,
+retry, or replacement estimate.
 
 ### 1.4 Tool Definition
 

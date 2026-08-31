@@ -19,7 +19,7 @@ use anthropic_sdk::messages::{
 use futures::StreamExt;
 use serde_json::Value;
 
-use crate::cancel::{SelectOutcome, select_cancel, select_cancel_after_poll};
+use crate::cancel::{RequestSelectOutcome, SelectOutcome, select_cancel, select_request};
 use crate::errors::{
     classify_anthropic_error, classify_anthropic_stop_reason, parse_retry_after, transport_error,
 };
@@ -171,28 +171,14 @@ async fn run_stream_inner(
         }
     }
 
-    if options
-        .cancel
-        .as_ref()
-        .is_some_and(|token| token.is_cancelled())
-    {
-        producer.push(AssistantMessageEvent::aborted(empty_partial(
-            model,
-            credential.account.as_deref(),
-        )));
-        return Ok(());
-    }
-
-    // Crossing into the client request future is the issuance boundary. From
-    // here until final protocol usage arrives, a terminal carries only a
-    // recorded subtotal, including handshake cancellation or failure.
+    // The client request future's first poll is the issuance boundary.
+    // Cancellation before that poll remains complete zero. After it, the
+    // terminal carries only a recorded subtotal until final usage arrives.
     let mut state = StreamState::new_with_account(model, credential.account.clone());
     let mut sse =
-        match select_cancel_after_poll(options.cancel.as_ref(), client.messages_stream(request))
-            .await
-        {
-            SelectOutcome::Ready(Ok(sse)) => sse,
-            SelectOutcome::Ready(Err(err)) => {
+        match select_request(options.cancel.as_ref(), client.messages_stream(request)).await {
+            RequestSelectOutcome::Ready(Ok(sse)) => sse,
+            RequestSelectOutcome::Ready(Err(err)) => {
                 let account = account_for_client_error(&err, credential.account.as_deref());
                 let error = classify_client_error(&err);
                 let terminal = if client_error_was_issued(&err) {
@@ -203,7 +189,14 @@ async fn run_stream_inner(
                 producer.push(terminal);
                 return Ok(());
             }
-            SelectOutcome::Cancelled => {
+            RequestSelectOutcome::CancelledBeforePoll => {
+                producer.push(AssistantMessageEvent::aborted(empty_partial(
+                    model,
+                    credential.account.as_deref(),
+                )));
+                return Ok(());
+            }
+            RequestSelectOutcome::CancelledAfterPoll => {
                 producer.push(state.cancelled());
                 return Ok(());
             }
@@ -1518,8 +1511,8 @@ mod tests {
     use super::*;
     use crate::registry::{InputModality, ModelCost, ReasoningOption};
     use crate::types::{
-        ApiKeyResolver, AssistantContent, Message, ThinkingContent, ToolCall, UserContent,
-        UserMessage,
+        ApiKeyResolver, AssistantContent, Message, OnPayload, ThinkingContent, ToolCall,
+        UserContent, UserMessage,
     };
     use anthropic_sdk::messages::{Message as AMessage, MessageDelta, MessageType};
     use tokio_util::sync::CancellationToken;
@@ -1822,6 +1815,27 @@ mod tests {
             .expect("provider stream terminates");
         assert_eq!(terminal.account, None);
         assert!(!terminal.usage.incomplete);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_the_anthropic_request_poll_stays_complete_zero() {
+        let server = crate::provider_test_support::openai_error_server("POST /v1/messages").await;
+        let mut model = fake_model();
+        model.base_url = server.base_url.clone();
+        let token = CancellationToken::new();
+        let mut options = labeled_options(Some(token.clone()));
+        options.on_payload = Some(OnPayload::new(move |_| token.cancel()));
+        let stream = AnthropicProvider.stream(&model, &Context::new("system"), &options);
+
+        let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
+            .await
+            .expect("pre-request cancellation emits terminal");
+        let requests = server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(!terminal.usage.incomplete);
+        assert_eq!(requests, 0, "cancellation precedes request issuance");
     }
 
     #[tokio::test]
