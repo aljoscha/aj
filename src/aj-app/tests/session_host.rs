@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings, CompactionPhase};
 use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
 use aj_app::chat::ChatState;
 use aj_app::client::SessionClient;
@@ -29,7 +29,10 @@ use aj_app::test_support::{
 use aj_conf::{Config, ConfigLayer, ConfigThinkingDisplay};
 use aj_models::auth::AuthStorage;
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
-use aj_models::types::{AssistantContent, AssistantMessage, StopReason, ToolCall, UserContent};
+use aj_models::types::{
+    AssistantContent, AssistantError, AssistantMessage, ErrorCategory, StopReason, ToolCall,
+    UserContent,
+};
 use aj_session::{ConversationLog, ConversationPersistence, SessionLock, ThreadFilter};
 use aj_wire::{Frame, ModelSelection, SessionSettings, SessionSummary};
 use tempfile::TempDir;
@@ -5923,6 +5926,318 @@ async fn compaction_is_refused_while_busy() {
     harness.host.shutdown().await;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CompactionAccountingSnapshot {
+    log_len: usize,
+    compactions: usize,
+    compactions_with_usage: usize,
+    durable_usage: [u64; 4],
+    durable_usage_incomplete: bool,
+    durable_compaction_usage: [u64; 4],
+    durable_compaction_usage_incomplete: bool,
+    live_rows: Vec<(Option<String>, [u64; 8], [bool; 2])>,
+    live_total: [u64; 4],
+    live_incomplete: bool,
+    host_total: [u64; 4],
+    host_incomplete: bool,
+}
+
+fn usage_dimensions(usage: &aj_models::types::Usage) -> [u64; 4] {
+    [
+        usage.input,
+        usage.output,
+        usage.cache_write,
+        usage.cache_read,
+    ]
+}
+
+fn summary_dimensions(summary: &aj_agent::types::UsageSummary) -> [u64; 4] {
+    [
+        summary.main_agent_usage.input_tokens,
+        summary.main_agent_usage.output_tokens,
+        summary.main_agent_usage.cache_write_tokens,
+        summary.main_agent_usage.cache_read_tokens,
+    ]
+}
+
+async fn compaction_accounting_snapshot(
+    harness: &Harness,
+    session: &str,
+    client: &Client,
+) -> CompactionAccountingSnapshot {
+    let handles = harness
+        .host
+        .local_handles(session)
+        .await
+        .expect("live session");
+    let (log_len, compactions, compactions_with_usage, durable_usage, durable_compaction_usage) = {
+        let log = handles.log.lock().await;
+        let stats = log.stats();
+        (
+            log.len(),
+            stats.compactions,
+            stats.compactions_with_usage,
+            stats.usage,
+            stats.compaction_usage,
+        )
+    };
+    let live_rows = client
+        .chat
+        .transcript(AgentId::Main)
+        .expect("main transcript")
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            aj_app::chat::EntryKind::TurnUsage(row) => Some((
+                row.source_entry.clone(),
+                [
+                    row.usage.accumulated_input,
+                    row.usage.turn_input,
+                    row.usage.accumulated_output,
+                    row.usage.turn_output,
+                    row.usage.accumulated_cache_write,
+                    row.usage.turn_cache_write,
+                    row.usage.accumulated_cache_read,
+                    row.usage.turn_cache_read,
+                ],
+                [row.usage.accumulated_incomplete, row.usage.turn_incomplete],
+            )),
+            _ => None,
+        })
+        .collect();
+    let live = client.chat.usage_summary();
+    let host = harness
+        .host
+        .usage(session)
+        .await
+        .expect("usage read")
+        .expect("live usage");
+
+    CompactionAccountingSnapshot {
+        log_len,
+        compactions,
+        compactions_with_usage,
+        durable_usage: usage_dimensions(&durable_usage),
+        durable_usage_incomplete: durable_usage.incomplete,
+        durable_compaction_usage: usage_dimensions(&durable_compaction_usage),
+        durable_compaction_usage_incomplete: durable_compaction_usage.incomplete,
+        live_rows,
+        live_total: summary_dimensions(&live),
+        live_incomplete: live.incomplete,
+        host_total: summary_dimensions(&host),
+        host_incomplete: host.incomplete,
+    }
+}
+
+fn priced_compaction_message(text: &str, usage: [u64; 4]) -> AssistantMessage {
+    let mut message = finalized_text_message(text);
+    message.usage.input = usage[0];
+    message.usage.output = usage[1];
+    message.usage.cache_write = usage[2];
+    message.usage.cache_read = usage[3];
+    message.usage.total_tokens = usage.into_iter().sum();
+    message
+}
+
+fn unsuccessful_summary(stop_reason: StopReason, error: &str, usage: [u64; 4]) -> AssistantMessage {
+    let mut message = priced_compaction_message("uncommitted summary", usage);
+    message.stop_reason = stop_reason;
+    if matches!(message.stop_reason, StopReason::Error) {
+        message.error = Some(AssistantError::new(ErrorCategory::InvalidRequest, error));
+    }
+    message
+}
+
+async fn prime_compaction_accounting_case(
+    mut summarizer_messages: Vec<AssistantMessage>,
+    keep_recent: u64,
+) -> (Harness, String, Client, CompactionAccountingSnapshot) {
+    let first = [10, 20, 30, 40];
+    let second = [100, 200, 300, 400];
+    let mut messages = vec![
+        priced_compaction_message("first answer", first),
+        priced_compaction_message(&format!("second answer {}", "X".repeat(4_000)), second),
+    ];
+    messages.append(&mut summarizer_messages);
+    let harness = Harness::new(messages);
+    harness
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .compact_keep_recent = keep_recent;
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "one").await;
+    client.pump_until_idle().await;
+    harness.prompt(&session, "two").await;
+    client.pump_until_idle().await;
+
+    let before = compaction_accounting_snapshot(&harness, &session, &client).await;
+    assert_eq!(before.compactions, 0, "the fixture starts pre-checkpoint");
+    assert_eq!(before.live_rows.len(), 2, "two ordinary usage rows");
+    assert_eq!(before.durable_usage, [110, 220, 330, 440]);
+    assert_eq!(before.live_total, [110, 220, 330, 440]);
+    assert_eq!(before.host_total, [110, 220, 330, 440]);
+    (harness, session, client, before)
+}
+
+fn assert_unsuccessful_summary_frames(
+    frames: &[Frame],
+    expected_error: Option<&str>,
+    expect_prefix_call: bool,
+) {
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::CompactionStart { .. }))
+        )),
+        "the fixture entered compaction",
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| matches!(
+                frame,
+                Frame::Event { event, .. }
+                    if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate { .. }))
+            ))
+            .count(),
+        0,
+        "an unsuccessful summary has no accounted checkpoint usage",
+    );
+    assert_eq!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::CompactionProgress {
+                    phase: CompactionPhase::SummarizingTurnPrefix,
+                    ..
+                }))
+        )),
+        expect_prefix_call,
+        "the fixture's split-turn precondition changed",
+    );
+
+    let ends: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Event {
+                durability, event, ..
+            } => match event.known() {
+                Some(AgentEvent::CompactionEnd {
+                    has_usage,
+                    summary,
+                    error,
+                    ..
+                }) => Some((durability, has_usage, summary, error)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends.len(), 1, "one terminal compaction event");
+    let (durability, has_usage, summary, error) = ends[0];
+    assert!(durability.is_none(), "an unsuccessful end is not durable");
+    assert!(!has_usage, "an unsuccessful end promises no usage update");
+    assert!(summary.is_none(), "an unsuccessful end owns no checkpoint");
+    match expected_error {
+        Some(expected) => assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains(expected)),
+            "failed summary reports its error: {error:?}",
+        ),
+        None => assert!(error.is_none(), "cancellation is a neutral end"),
+    }
+}
+
+/// A no-op compaction must not manufacture accounting while reporting that the
+/// current conversation already fits.
+#[tokio::test]
+async fn nothing_to_compact_leaves_every_usage_surface_unchanged() {
+    let (harness, session, mut client, before) =
+        prime_compaction_accounting_case(Vec::new(), u64::MAX).await;
+    harness
+        .host
+        .command(&session, Command::Compact { instructions: None })
+        .await
+        .expect("compact accepted");
+    let frames = client.pump_until_idle().await;
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        Frame::Event { event, .. }
+            if matches!(event.known(), Some(AgentEvent::Notice { text, .. })
+                if text.contains("Nothing to compact"))
+    )));
+    assert!(!frames.iter().any(|frame| matches!(
+        frame,
+        Frame::Event { event, .. }
+            if matches!(event.known(), Some(AgentEvent::CompactionStart { .. }
+                | AgentEvent::CompactionUsageUpdate { .. }))
+    )));
+    let after = compaction_accounting_snapshot(&harness, &session, &client).await;
+    assert_eq!(after, before);
+    harness.host.shutdown().await;
+}
+
+/// Failure and cancellation on the first summarizer call write and account
+/// nothing, even when the terminal provider message carries nonzero usage.
+#[tokio::test]
+async fn first_unsuccessful_summary_leaves_every_usage_surface_unchanged() {
+    for (stop_reason, error) in [
+        (StopReason::Error, Some("first summary failed")),
+        (StopReason::Aborted, None),
+    ] {
+        let terminal = unsuccessful_summary(
+            stop_reason,
+            error.unwrap_or("first summary canceled"),
+            [1_000, 2_000, 3_000, 4_000],
+        );
+        let (harness, session, mut client, before) =
+            prime_compaction_accounting_case(vec![terminal], 100).await;
+        harness
+            .host
+            .command(&session, Command::Compact { instructions: None })
+            .await
+            .expect("compact accepted");
+        let frames = client.pump_until_idle().await;
+        assert_unsuccessful_summary_frames(&frames, error, false);
+        let after = compaction_accounting_snapshot(&harness, &session, &client).await;
+        assert_eq!(after, before);
+        harness.host.shutdown().await;
+    }
+}
+
+/// A successful first summary remains uncommitted spend when the required
+/// split-turn summary fails or is canceled before checkpoint persistence.
+#[tokio::test]
+async fn unsuccessful_split_summary_leaves_every_usage_surface_unchanged() {
+    for (stop_reason, error) in [
+        (StopReason::Error, Some("split summary failed")),
+        (StopReason::Aborted, None),
+    ] {
+        let summary = priced_compaction_message("SUMMARY", [1_000, 2_000, 3_000, 4_000]);
+        let terminal = unsuccessful_summary(
+            stop_reason,
+            error.unwrap_or("split summary canceled"),
+            [10_000, 20_000, 30_000, 40_000],
+        );
+        let (harness, session, mut client, before) =
+            prime_compaction_accounting_case(vec![summary, terminal], 100).await;
+        harness
+            .host
+            .command(&session, Command::Compact { instructions: None })
+            .await
+            .expect("compact accepted");
+        let frames = client.pump_until_idle().await;
+        assert_unsuccessful_summary_frames(&frames, error, true);
+        let after = compaction_accounting_snapshot(&harness, &session, &client).await;
+        assert_eq!(after, before);
+        harness.host.shutdown().await;
+    }
+}
+
 /// Committed compaction spend reaches the live client and shutdown accumulator
 /// once, while the checkpoint remains its durable owner across reattachment.
 #[tokio::test]
@@ -5935,15 +6250,6 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         message.usage.cache_read = usage[3];
         message.usage.total_tokens = usage.into_iter().sum();
         message
-    }
-
-    fn summary_usage(summary: &aj_agent::types::UsageSummary) -> [u64; 4] {
-        [
-            summary.main_agent_usage.input_tokens,
-            summary.main_agent_usage.output_tokens,
-            summary.main_agent_usage.cache_write_tokens,
-            summary.main_agent_usage.cache_read_tokens,
-        ]
     }
 
     fn usage_sources(chat: &ChatState) -> Vec<Option<String>> {
@@ -5972,7 +6278,11 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     let summary = [1_000, 2_000, 3_000, 4_000];
     let prefix = [10_000, 20_000, 30_000, 40_000];
     let compaction_total = [11_000, 22_000, 33_000, 44_000];
-    let session_total = [11_110, 22_220, 33_330, 44_440];
+    let compacted_total = [11_110, 22_220, 33_330, 44_440];
+    let later = [10, 1, 5, 70];
+    let final_total = [11_120, 22_221, 33_335, 44_510];
+    let mut prefix_response = priced("PREFIX", prefix);
+    prefix_response.usage.incomplete = true;
     let harness = Harness::new(vec![
         priced("first answer", normal_first),
         priced(
@@ -5980,7 +6290,8 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
             normal_second,
         ),
         priced("SUMMARY", summary),
-        priced("PREFIX", prefix),
+        prefix_response,
+        priced("later answer", later),
     ]);
     harness
         .config
@@ -6063,6 +6374,8 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         ],
         compaction_total,
     );
+    assert!(checkpoint_updates[0].2.turn_incomplete);
+    assert!(!checkpoint_updates[0].2.accumulated_incomplete);
     assert!(
         !frames.iter().any(|frame| matches!(
             frame,
@@ -6102,6 +6415,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         ],
         compaction_total,
     );
+    assert!(checkpoint_usage.incomplete);
     let stats = log.stats();
     assert_eq!(
         [
@@ -6112,6 +6426,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         ],
         compaction_total,
     );
+    assert!(stats.compaction_usage.incomplete);
     assert_eq!(
         [
             stats.usage.input,
@@ -6119,40 +6434,124 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
             stats.usage.cache_write,
             stats.usage.cache_read,
         ],
-        session_total,
+        compacted_total,
     );
+    assert!(stats.usage.incomplete);
     drop(log);
 
-    assert_eq!(summary_usage(&client.chat.usage_summary()), session_total);
+    let live_usage = client.chat.usage_summary();
+    assert_eq!(summary_dimensions(&live_usage), compacted_total);
+    assert!(live_usage.incomplete);
     let host_usage = harness
         .host
         .usage(&session)
         .await
         .expect("usage read")
         .expect("live usage");
-    assert_eq!(summary_usage(&host_usage), session_total);
-    let after_sources = usage_sources(&client.chat);
-    assert_eq!(after_sources.len(), 3, "one usage row per accounted source");
-    assert_eq!(&after_sources[..2], before_sources.as_slice());
+    assert_eq!(summary_dimensions(&host_usage), compacted_total);
+    assert!(host_usage.incomplete);
+    let compacted_sources = usage_sources(&client.chat);
     assert_eq!(
-        after_sources[2].as_deref(),
+        compacted_sources.len(),
+        3,
+        "one usage row per accounted source",
+    );
+    assert_eq!(&compacted_sources[..2], before_sources.as_slice());
+    assert_eq!(
+        compacted_sources[2].as_deref(),
         Some(durability.entry_id.as_str()),
         "compaction spend belongs to the checkpoint rather than the assistant",
     );
     assert_eq!(compaction_rows(&client.chat), 1);
 
-    client.reattach(&harness.host, older_cursor).await;
+    harness.prompt(&session, "after compaction").await;
+    let later_frames = client.pump_until_idle().await;
+    let (later_id, later_usage) = later_frames
+        .iter()
+        .fold((None, None), |(id, usage), frame| match frame {
+            Frame::Event {
+                durability: Some(durability),
+                event,
+                ..
+            } if matches!(
+                event.known(),
+                Some(AgentEvent::MessageEnd { message, .. })
+                    if matches!(
+                        message.as_stored_wire(),
+                        Some(aj_models::types::Message::Assistant(_))
+                    )
+            ) =>
+            {
+                (Some(durability.entry_id.clone()), usage)
+            }
+            Frame::Event { event, .. } => match event.known() {
+                Some(AgentEvent::UsageUpdate { usage: seen, .. })
+                    if seen.turn_input == later[0] =>
+                {
+                    (id, Some(seen.clone()))
+                }
+                _ => (id, usage),
+            },
+            _ => (id, usage),
+        });
+    let later_id = later_id.expect("the later assistant has durable identity");
+    let later_usage = later_usage.expect("the later assistant reports usage");
+    assert!(!later_usage.turn_incomplete);
+    assert!(later_usage.accumulated_incomplete);
+    let final_live_usage = client.chat.usage_summary();
+    assert_eq!(summary_dimensions(&final_live_usage), final_total);
+    assert!(final_live_usage.incomplete);
+    let final_host_usage = harness
+        .host
+        .usage(&session)
+        .await
+        .expect("usage read")
+        .expect("live usage");
+    assert_eq!(summary_dimensions(&final_host_usage), final_total);
+    assert!(final_host_usage.incomplete);
+    let final_stats = handles.log.lock().await.stats();
+    assert_eq!(usage_dimensions(&final_stats.usage), final_total);
+    assert!(final_stats.usage.incomplete);
+
+    let after_sources = usage_sources(&client.chat);
+    assert_eq!(after_sources.len(), 4, "one usage row per accounted source");
+    assert_eq!(&after_sources[..3], compacted_sources.as_slice());
+    assert_eq!(after_sources[3].as_deref(), Some(later_id.as_str()));
+
+    let reattached = client.reattach(&harness.host, older_cursor).await;
+    assert!(reattached.iter().any(|frame| matches!(
+        frame,
+        Frame::Event { event, .. }
+            if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate {
+                checkpoint_id,
+                usage,
+                ..
+            }) if checkpoint_id == &durability.entry_id && usage.turn_incomplete)
+    )));
     assert_eq!(usage_sources(&client.chat), after_sources);
     assert_eq!(compaction_rows(&client.chat), 1);
-    assert_eq!(summary_usage(&client.chat.usage_summary()), session_total);
+    let reattached_usage = client.chat.usage_summary();
+    assert_eq!(summary_dimensions(&reattached_usage), final_total);
+    assert!(reattached_usage.incomplete);
 
     let stale_cursor = client.client.cursor().expect("old host cursor");
     harness.host.shutdown().await;
     let revived = harness.revive(Vec::new());
-    client.reattach(&revived.host, stale_cursor).await;
+    let replayed = client.reattach(&revived.host, stale_cursor).await;
+    assert!(replayed.iter().any(|frame| matches!(
+        frame,
+        Frame::Event { event, .. }
+            if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate {
+                checkpoint_id,
+                usage,
+                ..
+            }) if checkpoint_id == &durability.entry_id && usage.turn_incomplete)
+    )));
     assert_eq!(usage_sources(&client.chat), after_sources);
     assert_eq!(compaction_rows(&client.chat), 1);
-    assert_eq!(summary_usage(&client.chat.usage_summary()), session_total);
+    let replayed_usage = client.chat.usage_summary();
+    assert_eq!(summary_dimensions(&replayed_usage), final_total);
+    assert!(replayed_usage.incomplete);
     revived.host.shutdown().await;
 }
 
@@ -6178,7 +6577,8 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
     let summary = [1_000, 2_000, 3_000, 4_000];
     let prefix = [10_000, 20_000, 30_000, 40_000];
     let checkpoint_total = [11_000, 22_000, 33_000, 44_000];
-    let later = [10, 1, 0, 70];
+    let later = [10, 1, 5, 70];
+    let session_total = [11_120, 22_221, 33_335, 44_510];
     let harness = Harness::new(vec![
         priced("first answer", first),
         priced(&format!("second answer {}", "X".repeat(4_000)), second),
@@ -6369,6 +6769,12 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
     for frame in released {
         let _ = client.apply(&mut chat, frame);
     }
+    assert_eq!(
+        summary_dimensions(&chat.usage_summary()),
+        session_total,
+        "the released stale checkpoint update does not become the current total",
+    );
+    assert!(!chat.usage_summary().incomplete);
 
     let usage_rows: Vec<_> = chat
         .transcript(AgentId::Main)
@@ -6395,12 +6801,23 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         checkpoint_total,
         "the retained frame carries the checkpoint spend",
     );
+    assert!(!checkpoint_rows[0].usage.turn_incomplete);
     let assistant = usage_rows
         .iter()
         .find(|row| row.source_entry.as_deref() == Some(later_id.as_str()))
         .expect("later assistant usage row");
-    assert_eq!(assistant.usage.turn_input, later[0]);
-    assert_eq!(assistant.usage.turn_cache_read, later[3]);
+    assert_eq!(
+        [
+            assistant.usage.turn_input,
+            assistant.usage.turn_output,
+            assistant.usage.turn_cache_write,
+            assistant.usage.turn_cache_read,
+        ],
+        later,
+        "the later assistant keeps its complete usage delta",
+    );
+    assert!(!assistant.usage.turn_incomplete);
+    assert!(!assistant.usage.accumulated_incomplete);
     assert_eq!(
         chat.footers().context_usage(AgentId::Main).tokens,
         Some(later[0] + later[2] + later[3]),
@@ -6416,6 +6833,22 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         1,
         "the filtered duplicate does not append a second checkpoint row",
     );
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let stats = handles.log.lock().await.stats();
+    assert!(!stats.compaction_usage.incomplete);
+    assert!(!stats.usage.incomplete);
+    let host_usage = harness
+        .host
+        .usage(&session)
+        .await
+        .expect("usage read")
+        .expect("live usage");
+    assert_eq!(summary_dimensions(&host_usage), session_total);
+    assert!(!host_usage.incomplete);
     harness.host.shutdown().await;
 }
 
@@ -6563,15 +6996,6 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         message
     }
 
-    fn summary_usage(summary: &aj_agent::types::UsageSummary) -> [u64; 4] {
-        [
-            summary.main_agent_usage.input_tokens,
-            summary.main_agent_usage.output_tokens,
-            summary.main_agent_usage.cache_write_tokens,
-            summary.main_agent_usage.cache_read_tokens,
-        ]
-    }
-
     fn durable_usage(log: &ConversationLog) -> [u64; 4] {
         let usage = &log.stats().usage;
         [
@@ -6602,14 +7026,14 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
     client.pump_until_idle().await;
 
     let before_rows = client.chat.usage_summary();
-    assert_eq!(summary_usage(&before_rows), before_total);
+    assert_eq!(summary_dimensions(&before_rows), before_total);
     let before_host = harness
         .host
         .usage(&session)
         .await
         .expect("usage read")
         .expect("live usage");
-    assert_eq!(summary_usage(&before_host), before_total);
+    assert_eq!(summary_dimensions(&before_host), before_total);
     let handles = harness
         .host
         .local_handles(&session)
@@ -6695,14 +7119,17 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         original_durable,
         "the session log stayed unchanged",
     );
-    assert_eq!(summary_usage(&client.chat.usage_summary()), before_total);
+    assert_eq!(
+        summary_dimensions(&client.chat.usage_summary()),
+        before_total
+    );
     let after_host = harness
         .host
         .usage(&session)
         .await
         .expect("usage read")
         .expect("live usage");
-    assert_eq!(summary_usage(&after_host), before_total);
+    assert_eq!(summary_dimensions(&after_host), before_total);
     harness.host.shutdown().await;
 }
 
