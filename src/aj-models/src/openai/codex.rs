@@ -65,7 +65,7 @@ use super::errors::{
 };
 use super::responses::{
     CostMultiplierFn, StreamState, convert_messages, empty_partial, error_message,
-    map_service_tier, resolve_service_tier, responses_reasoning_effort, verbosity_text_config,
+    map_service_tier, responses_reasoning_effort, verbosity_text_config,
 };
 #[cfg(any(test, feature = "test-support"))]
 use super::responses::{append_assistant_message, parse_assistant_input_items_with_api};
@@ -539,20 +539,14 @@ fn normalize_response_status_in_value(obj: &mut serde_json::Map<String, Value>) 
 
 /// service-tier cost curve. Same `flex` / `priority` knobs as
 /// the public Responses API, except `gpt-5.5 + priority` uses a 2.5×
-/// multiplier (vs the default 2×). `auto`, `scale`, and no effective
-/// tier use 1×.
-///
-/// Service-tier resolution follows: the server-echoed tier
-/// wins, except when the server reports `default` after the caller
-/// asked for `flex` or `priority`. In that case we apply pricing as
-/// if the request had succeeded (the server still serves the response
-/// but reports the standard tier).
+/// multiplier (vs the default 2×). `default`, `auto`, `scale`, and no
+/// effective tier use 1×. A server-echoed tier wins over the request.
 pub(crate) fn codex_cost_multiplier(
     model_id: &str,
     server_tier: Option<&OpenAIServiceTier>,
     requested_tier: Option<&OpenAIServiceTier>,
 ) -> f64 {
-    let effective = resolve_service_tier(server_tier, requested_tier);
+    let effective = server_tier.or(requested_tier);
     match effective {
         Some(OpenAIServiceTier::Flex) => 0.5,
         Some(OpenAIServiceTier::Priority) => {
@@ -1478,18 +1472,18 @@ mod tests {
         let two_and_a_half = (5.0, 10.0, 2.5, 0.0, 17.5);
         let cases = [
             PricingCase {
-                name: "requested flex with default echo",
+                name: "default echo overrides flex request",
                 model_id: "gpt-5.5",
                 requested_tier: Some(ServiceTier::Flex),
                 server_tier: Some(Default),
-                expected_cost: half,
+                expected_cost: standard,
             },
             PricingCase {
-                name: "requested priority with default echo",
+                name: "default echo overrides priority request",
                 model_id: "gpt-5.5",
                 requested_tier: Some(ServiceTier::Priority),
                 server_tier: Some(Default),
-                expected_cost: two_and_a_half,
+                expected_cost: standard,
             },
             PricingCase {
                 name: "default echo without request",

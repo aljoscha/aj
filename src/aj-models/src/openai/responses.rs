@@ -544,22 +544,7 @@ pub(super) fn responses_cost_multiplier(
     server_tier: Option<&OpenAIServiceTier>,
     requested_tier: Option<&OpenAIServiceTier>,
 ) -> f64 {
-    cost_multiplier_from_tier(resolve_service_tier(server_tier, requested_tier))
-}
-
-/// Resolves the service tier that controls Responses pricing.
-///
-/// A terminal `default` echo is the protocol-defined exception to server
-/// authority. It preserves the requested pricing class just like an absent
-/// echo. Every explicit non-Default server tier remains authoritative.
-pub(super) fn resolve_service_tier<'a>(
-    server_tier: Option<&'a OpenAIServiceTier>,
-    requested_tier: Option<&'a OpenAIServiceTier>,
-) -> Option<&'a OpenAIServiceTier> {
-    match server_tier {
-        Some(OpenAIServiceTier::Default) | None => requested_tier,
-        Some(server_tier) => Some(server_tier),
-    }
+    cost_multiplier_from_tier(server_tier.or(requested_tier))
 }
 
 fn cost_multiplier_from_tier(tier: Option<&OpenAIServiceTier>) -> f64 {
@@ -1007,8 +992,7 @@ fn reasoning_display_text(
 ///   `gpt-5.5` exception keys off this).
 /// - `server_tier` — `response.service_tier` echoed back by the server.
 /// - `requested_tier` — the tier requested by the caller (used as a
-///   fallback when the server doesn't echo, and as the "intended" tier
-///   when the server echoes `default` despite the request).
+///   fallback when the server doesn't echo one).
 pub(super) type CostMultiplierFn = fn(
     model_id: &str,
     server_tier: Option<&OpenAIServiceTier>,
@@ -1564,11 +1548,10 @@ impl StreamState {
 
     /// The service-tier price multiplier for this turn.
     ///
-    /// An explicit non-Default server tier wins over the requested tier.
-    /// A Default or absent server tier falls back to the request, so this
-    /// is only final once `final_response` has landed. Resolved through
-    /// the injected `cost_multiplier` because Codex prices the same tiers
-    /// on a different curve.
+    /// The tier the server actually served at wins over the one we asked
+    /// for, so this is only final once `final_response` has landed.
+    /// Resolved through the injected `cost_multiplier` because Codex prices
+    /// the same tiers on a different curve.
     fn tier_multiplier(&self) -> f64 {
         let server_tier = self
             .final_response
@@ -2434,18 +2417,18 @@ mod tests {
         let double = (4.0, 8.0, 2.0, 0.0, 14.0);
         let cases = [
             PricingCase {
-                name: "requested flex with default echo",
+                name: "default echo overrides flex request",
                 model_id: "gpt-pricing-test",
                 requested_tier: Some(ServiceTier::Flex),
                 server_tier: Some(Default),
-                expected_cost: half,
+                expected_cost: standard,
             },
             PricingCase {
-                name: "requested priority with default echo",
+                name: "default echo overrides priority request",
                 model_id: "gpt-pricing-test",
                 requested_tier: Some(ServiceTier::Priority),
                 server_tier: Some(Default),
-                expected_cost: double,
+                expected_cost: standard,
             },
             PricingCase {
                 name: "default echo without request",
