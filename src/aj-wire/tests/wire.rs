@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
-use aj_models::types::UserContent;
+use aj_models::types::{ImageContent, TextContent, UserContent};
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent,
     DecodedFrame, DirectoryHost, EmptyRequest, EnrollHostRequest, ErrorResponse, Frame,
     HeadRequest, Hello, HostList, HostNameError, HostSource, HostSummary, MAX_HOST_NAME_BYTES,
     MergedDirectory, ModelSelection, PROTOCOL_VERSION, PromptInput, PromptRequest, QueueCounts,
-    QueueOperation, QueueOutcome, QueueRequest, QueueState, RawObject, SessionCreated, SessionList,
-    SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest, TagRequest,
-    TaskDetails, TaskTable, VmList, decode_request, normalize_host_name,
+    QueueOperation, QueueOutcome, QueueRequest, QueueState, RawObject, RequestBody, SessionCreated,
+    SessionList, SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest,
+    TagRequest, TaskDetails, TaskTable, VmList, decode_request, normalize_host_name,
 };
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -145,6 +145,87 @@ fn command_request_shapes_are_pinned() {
         decode_request::<HeadRequest>(br#"{"before":"entry-7"}"#).unwrap(),
         HeadRequest::before("entry-7"),
     );
+}
+
+fn assert_public_request_round_trip<T>(request: T)
+where
+    T: RequestBody + serde::Serialize,
+{
+    let encoded = serde_json::to_vec(&request).expect("the public request serializer");
+    let decoded = decode_request::<T>(&encoded).expect("the closed request codec accepts it");
+    assert_eq!(
+        serde_json::to_value(decoded).expect("the decoded request serializes"),
+        serde_json::to_value(request).expect("the original request serializes"),
+    );
+}
+
+/// The strict companions deliberately duplicate the public serialization
+/// surface. Every command and nested variant with data therefore crosses the
+/// public serializer and the closed decoder here, so adding or dropping a
+/// field on only one side is observable.
+#[test]
+fn every_public_command_serializer_is_accepted_by_the_closed_codec() {
+    let content = || {
+        vec![
+            UserContent::Text(TextContent {
+                text: "signed text".into(),
+                text_signature: Some("opaque-signature".into()),
+            }),
+            UserContent::Image(ImageContent {
+                data: "aW1hZ2U=".into(),
+                mime_type: "image/png".into(),
+            }),
+        ]
+    };
+
+    assert_public_request_round_trip(CreateSessionRequest {
+        host: Some("workstation".into()),
+        settings: Some(session_settings()),
+        prompt: Some(PromptInput::Content { content: content() }),
+        tag: Some("strict requests".into()),
+    });
+    assert_public_request_round_trip(PromptRequest {
+        agent: Some(AgentId::Sub(7)),
+        input: PromptInput::Text {
+            text: "continue".into(),
+        },
+    });
+    assert_public_request_round_trip(PromptRequest {
+        agent: Some(AgentId::Main),
+        input: PromptInput::Content { content: content() },
+    });
+    assert_public_request_round_trip(SteerRequest {
+        text: "turn left".into(),
+        agent: Some(AgentId::Sub(8)),
+    });
+    assert_public_request_round_trip(CancelRequest {
+        agent: Some(AgentId::Main),
+    });
+    assert_public_request_round_trip(QueueRequest {
+        op: QueueOperation::Remove,
+        agent: Some(AgentId::Sub(9)),
+    });
+    assert_public_request_round_trip(QueueRequest {
+        op: QueueOperation::Clear,
+        agent: None,
+    });
+    assert_public_request_round_trip(CompactRequest {
+        instructions: Some("keep the protocol decisions".into()),
+    });
+    assert_public_request_round_trip(SettingsRequest {
+        agent: Some(AgentId::Sub(10)),
+        change: session_settings(),
+    });
+    assert_public_request_round_trip(TagRequest {
+        tag: "reviewed".into(),
+    });
+    assert_public_request_round_trip(ArchiveRequest { archived: true });
+    assert_public_request_round_trip(HeadRequest::entry("entry-1"));
+    assert_public_request_round_trip(HeadRequest::before("entry-2"));
+    assert_public_request_round_trip(EmptyRequest {});
+    assert_public_request_round_trip(EnrollHostRequest {
+        address: "https://host.example:6161".into(),
+    });
 }
 
 #[test]

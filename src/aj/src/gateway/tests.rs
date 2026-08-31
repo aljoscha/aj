@@ -1728,6 +1728,48 @@ async fn a_per_session_request_travels_opaque_through_the_gateway() {
     recorder.stop();
 }
 
+/// Existing host-owned commands use the same opaque wildcard as future ones.
+/// The additive field and number literals make typed validation or a JSON
+/// decode-and-reencode pass observable before the request reaches the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_known_per_session_command_stays_opaque_through_the_gateway() {
+    let recorder = Recorder::start("recorder").await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![recorder.address.clone()],
+    )
+    .await;
+    fixture.until_connected("recorder").await;
+    let body = br#"{"text":"host owned","future":{"n":1e400,"exact":18446744073709551616}}"#;
+
+    let response = fixture
+        .http
+        .post(format!(
+            "{}/v1/sessions/recorder:s-1/prompt?mode=newer&mode=exact",
+            fixture.server.url()
+        ))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.as_slice())
+        .send()
+        .await
+        .expect("the known host-owned command");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        recorder.proxied(),
+        vec![ProxiedRequest {
+            method: reqwest::Method::POST,
+            route: "s-1/prompt".to_string(),
+            query: Some("mode=newer&mode=exact".to_string()),
+            content_type: Some("application/json".to_string()),
+            body: body.to_vec(),
+        }],
+    );
+
+    fixture.shutdown().await;
+    recorder.stop();
+}
+
 // ---------------------------------------------------------------------------
 // A host that is not there (spec 6.8's `unreachable`, 6.1's 503)
 // ---------------------------------------------------------------------------

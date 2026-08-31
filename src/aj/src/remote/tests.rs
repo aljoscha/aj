@@ -1882,9 +1882,10 @@ async fn a_command_with_no_body_is_accepted() {
     fixture.shutdown().await;
 }
 
-/// Every registered JSON command reaches the same request-context decoder.
-/// A missing session makes bypassing that decoder observable as a 404, while a
-/// tolerant create would mint a session before the test reads the store.
+/// The router's current JSON command inventory is spelled out here and each
+/// route reaches the same request-context decoder. A missing session makes a
+/// decoder bypass observable as a 404, while a tolerant create would mint a
+/// session before the test reads the store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_host_json_command_refuses_unknown_fields_before_dispatch() {
     let fixture = Fixture::new(Vec::new()).await;
@@ -1941,7 +1942,6 @@ async fn every_host_json_command_refuses_unknown_fields_before_dispatch() {
         ),
     ];
 
-    let mut refusals = Vec::new();
     for (route, body) in &commands {
         let response = reqwest::Client::new()
             .post(format!("{base}/v1/{route}"))
@@ -1954,11 +1954,6 @@ async fn every_host_json_command_refuses_unknown_fields_before_dispatch() {
             .json()
             .await
             .unwrap_or_else(|error| panic!("{route} returned no protocol error: {error}"));
-        refusals.push((route, status, error));
-    }
-
-    assert_eq!(refusals.len(), commands.len(), "the route census drifted");
-    for (route, status, error) in refusals {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {error:?}");
         assert_eq!(error.code, "invalid_request", "{route}");
         assert_eq!(error.message, "malformed request body", "{route}");
