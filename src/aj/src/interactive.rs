@@ -1684,13 +1684,9 @@ fn fail_pending_transition(
                 toast.push_str(" Your message is back in the editor.");
             }
             let (error, warning) = match failure.refusal() {
-                Some((reason, Refusal::Locked { .. })) => (
+                Some((reason, refusal)) => (
                     Some(reason.to_string()),
-                    aj_app::directory::WITHHELD_LOCKED_NOTICE.to_string(),
-                ),
-                Some((reason, Refusal::Other)) => (
-                    Some(reason.to_string()),
-                    aj_app::directory::WITHHELD_NOTICE.to_string(),
+                    aj_app::directory::withheld_notice(refusal).to_string(),
                 ),
                 None => {
                     let warning = format!(
@@ -8240,6 +8236,7 @@ mod tests {
     use aj_app::test_support::CanonicalState;
     use aj_models::auth::{AuthCredential, CredentialSource};
     use aj_models::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
+    use aj_session::{AppendFault, AppendFaultFixture};
     use async_trait::async_trait;
     use tempfile::TempDir;
     use tokio::sync::Notify;
@@ -11657,26 +11654,32 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// A turn's fatal error belongs to its session, not to this client (spec
-    /// section 5): it shows up as an error row and the session stays usable,
-    /// where the pre-host drive loop ended the session on it.
-    ///
-    /// The fault is a log that cannot be opened: the first punctuating append
-    /// creates the file with `create_new`, so a path that is already taken
-    /// makes that append fail inside the inline persistence listener, which is
-    /// exactly a fatal turn error.
+    /// A persistence-fatal turn shows its actionable error, closes the affected
+    /// stream, and rematerializes through the ordinary local reattach path.
     #[tokio::test]
-    async fn a_fatal_turn_error_shows_an_error_and_keeps_the_session_usable() {
+    async fn a_persistence_fatal_turn_reattaches_a_fresh_materialization() {
         let dir = TempDir::new().expect("tempdir");
-        let mut world = scripted_world(&dir, "streaming-text").await;
-        let log_path = dir
-            .path()
-            .join("sessions")
-            .join(format!("{}.jsonl", world.session()));
-        std::fs::write(&log_path, "").expect("take the path the log wants");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let failed_session = world.session().to_string();
+        let failed_log = Arc::clone(&world.handles().log);
+        let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+        fault
+            .install(&mut *world.handles().log.lock().await)
+            .expect("install zero-write fault");
 
         handle_submit(&mut world, "hi".to_string()).await;
-        settle(&mut world).await;
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            assert!(Instant::now() < deadline, "the failed stream never closed");
+            match world.stream_mut().recv().await {
+                ControlFrame::Frame(frame) => {
+                    let _ = world.directory.apply(&mut world.chat.borrow_mut(), frame);
+                }
+                ControlFrame::Closed => break,
+                ControlFrame::Lost(error) => panic!("local stream failed unexpectedly: {error}"),
+            }
+        }
         let errors: Vec<String> = world
             .chat
             .borrow()
@@ -11692,20 +11695,26 @@ mod tests {
             })
             .collect();
         assert!(
-            errors.iter().any(|text| text.starts_with("IO error")),
+            errors
+                .iter()
+                .any(|text| text.starts_with("Saving this session failed:")),
             "the failed append surfaced as an error row: {errors:?}",
         );
 
-        // Still usable: once the fault clears, the next prompt runs a turn.
-        std::fs::remove_file(&log_path).expect("clear the fault");
+        let _ = drive_resume(&mut world, &shell)
+            .await
+            .expect("ordinary local reattach");
+        assert_eq!(world.session(), failed_session);
+        assert!(
+            !Arc::ptr_eq(&failed_log, &world.handles().log),
+            "reattach reused the fused ConversationLog"
+        );
         install_busy_script(world.handles());
         handle_submit(&mut world, "again".to_string()).await;
-        fold_ready_frames(&mut world);
-        assert!(world.client().working(), "the session survived the error");
         settle(&mut world).await;
         assert!(
             user_rows(&world).iter().any(|text| text == "again"),
-            "and the second prompt ran: {:?}",
+            "the rematerialized session ran the prompt: {:?}",
             user_rows(&world),
         );
         shut_down(&world).await;
@@ -11931,6 +11940,7 @@ mod tests {
                         caught: CatchUp::Caught,
                         ..
                     } => {
+                        refresh_local_handles(world, shell).await?;
                         fold_notice(world, reattached_notice(&world.control));
                         pending = None;
                     }

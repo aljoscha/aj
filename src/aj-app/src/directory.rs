@@ -74,10 +74,16 @@ pub const WITHHELD_LOCKED_NOTICE: &str = "Nothing is following this session now.
                                           holds it, and it re-attaches by itself if the peer \
                                           reports that writer letting go.";
 
+/// What to tell an action that observes a persistence-failed attachment.
+pub const WITHHELD_PERSISTENCE_NOTICE: &str = "Nothing is following this session now. It is \
+                                               re-attaching through the stopped session's \
+                                               replacement.";
+
 /// What to tell the user about a refusal, which is what will end it.
-fn withheld_notice(refusal: Refusal) -> &'static str {
+pub fn withheld_notice(refusal: Refusal) -> &'static str {
     match refusal {
         Refusal::Locked { .. } => WITHHELD_LOCKED_NOTICE,
+        Refusal::PersistenceFailed => WITHHELD_PERSISTENCE_NOTICE,
         Refusal::Other => WITHHELD_NOTICE,
     }
 }
@@ -250,7 +256,7 @@ impl SessionDirectory {
         let Some(session) = frame.session() else {
             return self.apply_host_frame(frame);
         };
-        let evaluates_current_row = matches!(&frame, Frame::Error { code, .. } if code == "locked");
+        let folds_refusal = matches!(&frame, Frame::Error { .. });
         let Some(index) = self
             .attached
             .iter()
@@ -276,7 +282,7 @@ impl SessionDirectory {
         // one place that decides what a refusal is rather than matching the
         // frame kind a second time.
         let asked_now = attached.client.withheld();
-        let current_refusal = evaluates_current_row
+        let current_refusal = folds_refusal
             .then_some(asked_now)
             .flatten()
             .filter(|refusal| matches!(refusal, Refusal::Locked { .. }));
@@ -1833,16 +1839,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_persistence_failed_session_rejoins_when_its_shared_stream_stays_live() {
+        let (mut directory, mut focused_chat) = two_sessions();
+        let both_live = vec![row(FOCUSED, false, 1), row(OTHER, false, 1)];
+        let _ = directory.apply(&mut focused_chat, list(both_live.clone()));
+
+        let _ = directory.apply(&mut focused_chat, refusal(FOCUSED, "persistence_failed"));
+        assert_eq!(
+            directory.client().withheld(),
+            None,
+            "the terminal frame left the session waiting on a coalescible directory edge",
+        );
+        assert!(
+            directory.client().needs_reattach(),
+            "another client can rematerialize before a cold row is published, so the terminal frame itself must ask for replacement",
+        );
+        let _ = directory.apply(&mut focused_chat, list(both_live));
+        assert!(
+            directory.client().needs_reattach(),
+            "an unchanged live row withdrew the replacement already owed",
+        );
+
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![cold_row(FOCUSED), row(OTHER, false, 1)]),
+        );
+
+        assert!(
+            directory.client().needs_reattach(),
+            "the failed materialization was released while another attachment kept the stream open, but no edge asks for its replacement",
+        );
+        assert!(
+            directory
+                .client_for(OTHER)
+                .expect("the healthy sibling")
+                .holds_attachment(),
+            "recovering the failed session dropped its healthy sibling",
+        );
+
+        directory.expect_attach(|session| session == FOCUSED);
+        assert!(
+            !directory.client().needs_reattach(),
+            "arming the replacement did not discharge its one re-attach obligation",
+        );
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![cold_row(FOCUSED), row(OTHER, false, 1)]),
+        );
+        assert!(
+            !directory.client().needs_reattach(),
+            "the same cold snapshot re-fired an edge whose replacement is already armed",
+        );
+    }
+
+    #[test]
+    fn a_persistence_failed_refusal_rejoins_from_an_already_cold_row() {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string());
+        let mut focused_chat = chat();
+        let _ = directory.apply(&mut focused_chat, list(vec![cold_row(FOCUSED)]));
+
+        let _ = directory.apply(&mut focused_chat, refusal(FOCUSED, "persistence_failed"));
+
+        assert!(
+            directory.client().needs_reattach(),
+            "a gateway's cold snapshot arrived before the terminal refusal, but the refusal did not ask for replacement",
+        );
+    }
+
+    #[test]
+    fn an_unknown_code_does_not_re_ask_when_a_row_goes_cold() {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string());
+        let mut focused_chat = chat();
+        let _ = directory.apply(&mut focused_chat, list(vec![row(FOCUSED, false, 1)]));
+        let _ = directory.apply(&mut focused_chat, refusal(FOCUSED, "future_storage_answer"));
+
+        let _ = directory.apply(&mut focused_chat, list(vec![cold_row(FOCUSED)]));
+
+        assert!(
+            !directory.client().needs_reattach(),
+            "an unknown refusal became an immediate retry when its row went cold",
+        );
+    }
+
     /// What a refusal costs is folded once, and the sentence names what will
     /// end it. Not the same sentence for both edges: a locked session's row does
     /// not leave the peer's list while the hold lasts, so a user told to watch
     /// for its return is watching for something that will not happen.
     ///
-    /// Both codes in one body, and each arm asserts the OTHER sentence is
-    /// absent. Comparing only against the constant the implementation folds
-    /// pins nothing about what the constant says: give the two the same text
-    /// and every assertion still holds while every locked refusal misdirects
-    /// the user.
+    /// Both directory-waiting codes share one body, and each arm asserts the
+    /// other sentence is absent. Comparing only against the constant the
+    /// implementation folds pins nothing about what the constant says.
     #[test]
     fn a_refusal_notice_names_the_edge_that_will_end_it() {
         for (code, expected, wrong) in [
@@ -1860,11 +1947,15 @@ mod tests {
             );
             assert!(
                 !folded.iter().any(|text| text == wrong),
-                "the {code} refusal folded the other edge's sentence too, so \
-                 the two say the same thing and one of them is a lie: \
+                "the {code} refusal folded another edge's sentence too, so \
+                 two say the same thing and one of them is a lie: \
                  {folded:?}",
             );
         }
+        assert_eq!(
+            withheld_notice(Refusal::PersistenceFailed),
+            WITHHELD_PERSISTENCE_NOTICE,
+        );
     }
 
     /// Nothing that resumes asking leaves a session marked refused. The

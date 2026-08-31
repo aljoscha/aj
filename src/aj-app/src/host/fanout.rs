@@ -7,9 +7,9 @@
 //! producer awaits its separate capacity-one channel, so HTTP backpressure
 //! paces a large backfill without ever stalling a session driver.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
 use aj_agent::events::{AgentEvent, AgentId};
@@ -26,7 +26,7 @@ const DEFAULT_LIVE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).expect("non-z
 /// Identity of one attached subscriber within a host.
 pub(crate) type SubscriberId = u64;
 
-/// A subscriber's view of one session it attached.
+/// Where one registered session's promised block stands.
 enum AttachState {
     /// The attach block has not been written yet, so live frames are held
     /// to keep the block contiguous and ordered on this stream.
@@ -43,11 +43,40 @@ enum AttachState {
     /// the backfill this stream was served, so it is dropped rather than
     /// re-delivered.
     Live { boundary: u64 },
+    /// This materialization ended before its block could complete. The session
+    /// stays registered until terminal delivery removes it, but no producer may
+    /// restore it to live delivery.
+    Stopped,
+}
+
+/// One session registered on a subscriber.
+///
+/// The block stop is a child of the stream-wide stop token. Ending this session
+/// wakes only its producer, while shutdown and eviction still stop every block
+/// on the stream.
+struct SessionAttach {
+    state: AttachState,
+    materialization: Option<u64>,
+    block_stop: CancellationToken,
+}
+
+/// Generation-bound authority to produce and complete one attach block.
+pub(crate) struct AttachBlock {
+    subscriber: SubscriberId,
+    session: String,
+    materialization: u64,
+    block_stop: CancellationToken,
+}
+
+impl AttachBlock {
+    pub(crate) fn stopped(&self) -> &CancellationToken {
+        &self.block_stop
+    }
 }
 
 struct Subscriber {
     live: LiveSender,
-    attached: HashMap<String, AttachState>,
+    attached: HashMap<String, SessionAttach>,
     /// The latest directory this subscriber's queue accepted.
     ///
     /// Per subscriber, because queue admission is the comparison point. A
@@ -101,7 +130,11 @@ impl Subscriber {
             // connection, not to a session, so no attach state gates them.
             return self.live.offer(frame.clone());
         };
-        match self.attached.get_mut(session) {
+        match self
+            .attached
+            .get_mut(session)
+            .map(|attached| &mut attached.state)
+        {
             None => {
                 // A session this stream did not name produces nothing but its
                 // row in `list` frames (spec 6.5). Its events would apply to
@@ -125,6 +158,7 @@ impl Subscriber {
                 }
                 self.live.offer(frame.clone())
             }
+            Some(AttachState::Stopped) => Offered::Dropped,
         }
     }
 }
@@ -166,6 +200,7 @@ fn lossy_key(frame: &Frame) -> Option<LossyKey> {
 struct LiveQueueState {
     frames: VecDeque<Frame>,
     closed: bool,
+    terminal_sessions: HashSet<String>,
 }
 
 struct LiveQueue {
@@ -191,6 +226,7 @@ fn live_channel(capacity: NonZeroUsize) -> (LiveSender, LiveReceiver, Cancellati
         state: StdMutex::new(LiveQueueState {
             frames: VecDeque::with_capacity(capacity.get()),
             closed: false,
+            terminal_sessions: HashSet::new(),
         }),
         ready: Notify::new(),
         block_stop,
@@ -218,12 +254,22 @@ enum Offered {
 }
 
 impl LiveSender {
+    fn block_stop_child(&self) -> CancellationToken {
+        self.0.block_stop.child_token()
+    }
+
     /// Queues a frame without blocking. Reliable overflow closes the stream.
     fn offer(&self, frame: Frame) -> Offered {
         let key = lossy_key(&frame);
         let mut state = self.0.state.lock().expect("live queue mutex poisoned");
         if state.closed {
             return Offered::Evicted;
+        }
+        if frame
+            .session()
+            .is_some_and(|session| state.terminal_sessions.contains(session))
+        {
+            return Offered::Dropped;
         }
         if let Some(key) = key {
             if let Some(index) = state
@@ -259,11 +305,43 @@ impl LiveSender {
             .retain(|frame| keep(frame));
     }
 
+    /// Queue a session's terminal frame even when ordinary capacity is spent.
+    ///
+    /// Each attached session can contribute at most one. Temporarily exceeding
+    /// the ordinary bound preserves every earlier reliable frame and every
+    /// actionable reason a shared stream is about to close.
+    fn offer_terminal(&self, frame: Frame) -> bool {
+        let mut state = self.0.state.lock().expect("live queue mutex poisoned");
+        if state.closed {
+            return false;
+        }
+        let session = frame
+            .session()
+            .expect("a terminal frame names its session")
+            .to_string();
+        if !state.terminal_sessions.insert(session) {
+            return false;
+        }
+        state.frames.push_back(frame);
+        drop(state);
+        self.0.ready.notify_one();
+        true
+    }
+
     fn close(&self) {
         let mut state = self.0.state.lock().expect("live queue mutex poisoned");
         state.closed = true;
         drop(state);
         self.0.block_stop.cancel();
+        self.0.ready.notify_waiters();
+    }
+
+    /// Close after any attach block already being produced reaches its normal
+    /// boundary. Queued live frames remain readable after that block.
+    fn close_after_block(&self) {
+        let mut state = self.0.state.lock().expect("live queue mutex poisoned");
+        state.closed = true;
+        drop(state);
         self.0.ready.notify_waiters();
     }
 
@@ -328,6 +406,35 @@ pub(crate) struct Fanout {
     live_capacity: NonZeroUsize,
 }
 
+/// The exact client streams that received one session's terminal frame.
+pub(crate) struct SessionStreams {
+    fanout: Arc<Fanout>,
+    session: String,
+    materialization: u64,
+    recipients: Vec<SubscriberId>,
+    completed: bool,
+}
+
+impl SessionStreams {
+    pub(crate) fn close(mut self) {
+        self.close_all();
+    }
+
+    fn close_all(&mut self) {
+        if !self.completed {
+            self.fanout
+                .complete_terminal(&self.session, self.materialization, &self.recipients);
+            self.completed = true;
+        }
+    }
+}
+
+impl Drop for SessionStreams {
+    fn drop(&mut self) {
+        self.close_all();
+    }
+}
+
 struct FanoutState {
     /// Terminal once set. Keeping this under the registry lock makes a close
     /// atomic with every registration that could otherwise follow it.
@@ -371,7 +478,16 @@ impl Fanout {
         let (live, receiver, cancelled) = live_channel(self.live_capacity);
         let attached = sessions
             .iter()
-            .map(|session| (session.clone(), AttachState::Attaching))
+            .map(|session| {
+                (
+                    session.clone(),
+                    SessionAttach {
+                        state: AttachState::Attaching,
+                        materialization: None,
+                        block_stop: live.block_stop_child(),
+                    },
+                )
+            })
             .collect();
         let mut state = self.lock();
         if state.closed {
@@ -406,8 +522,11 @@ impl Fanout {
     /// a bound this client never asked to spend and could evict it over traffic
     /// it never asked for.
     pub(crate) fn detach(&self, id: SubscriberId, session: &str) {
-        if let Some(subscriber) = self.lock().subscribers.get_mut(&id) {
-            subscriber.attached.remove(session);
+        let stopped = if let Some(subscriber) = self.lock().subscribers.get_mut(&id) {
+            let stopped = subscriber
+                .attached
+                .remove(session)
+                .map(|attached| attached.block_stop);
             // Anything already queued for it goes too. Resolving a session
             // takes a moment (a materialization reads its log), and another
             // client can make it live in that window, so the registration this
@@ -415,6 +534,129 @@ impl Fanout {
             subscriber
                 .live
                 .retain(|frame| frame.session() != Some(session));
+            stopped
+        } else {
+            None
+        };
+        if let Some(stopped) = stopped {
+            stopped.cancel();
+        }
+    }
+
+    /// Bind one registered attach to the materialization it resolved.
+    ///
+    /// Both draining checks happen under the same fanout lock terminal
+    /// publication needs. Since the driver sets `draining` before taking that
+    /// lock, either this binding belongs to the outgoing generation and receives
+    /// its error, or it is removed before that error can be published.
+    pub(crate) fn bind_if_live(
+        &self,
+        id: SubscriberId,
+        session: &str,
+        materialization: u64,
+        is_draining: impl Fn() -> bool,
+    ) -> Option<AttachBlock> {
+        let mut state = self.lock();
+        let Some(subscriber) = state.subscribers.get_mut(&id) else {
+            return None;
+        };
+        if is_draining() {
+            return None;
+        }
+        let attached = subscriber.attached.get_mut(session)?;
+        attached.materialization = Some(materialization);
+        if is_draining() {
+            attached.materialization = None;
+            return None;
+        }
+        Some(AttachBlock {
+            subscriber: id,
+            session: session.to_string(),
+            materialization,
+            block_stop: attached.block_stop.clone(),
+        })
+    }
+
+    /// Publish a terminal frame and capture exactly the streams that accepted
+    /// it under the same registry lock. Registrations after this point neither
+    /// miss a promised frame nor get closed as if they had received it.
+    pub(crate) fn publish_terminal(
+        self: &Arc<Self>,
+        frame: Frame,
+        materialization: u64,
+    ) -> SessionStreams {
+        let session = frame
+            .session()
+            .expect("a terminal persistence frame names its session")
+            .to_string();
+        let mut recipients = Vec::new();
+        let mut stopped = Vec::new();
+        {
+            let mut state = self.lock();
+            state.subscribers.retain(|id, subscriber| {
+                let bound = subscriber
+                    .attached
+                    .get(&session)
+                    .is_some_and(|attached| attached.materialization == Some(materialization));
+                if !bound {
+                    return true;
+                }
+                let retained = subscriber.live.offer_terminal(frame.clone());
+                if retained {
+                    recipients.push(*id);
+                    let attached = subscriber
+                        .attached
+                        .get_mut(&session)
+                        .expect("the matching attachment remains registered");
+                    attached.state = AttachState::Stopped;
+                    stopped.push(attached.block_stop.clone());
+                }
+                retained
+            });
+        }
+        for stopped in stopped {
+            stopped.cancel();
+        }
+        SessionStreams {
+            fanout: Arc::clone(self),
+            session,
+            materialization,
+            recipients,
+            completed: false,
+        }
+    }
+
+    fn complete_terminal(&self, session: &str, materialization: u64, recipients: &[SubscriberId]) {
+        let mut close = Vec::new();
+        let mut stopped = Vec::new();
+        {
+            let mut state = self.lock();
+            for id in recipients {
+                let Some(subscriber) = state.subscribers.get_mut(id) else {
+                    continue;
+                };
+                if !subscriber
+                    .attached
+                    .get(session)
+                    .is_some_and(|attached| attached.materialization == Some(materialization))
+                {
+                    continue;
+                }
+                let attached = subscriber
+                    .attached
+                    .remove(session)
+                    .expect("the matching attachment remains registered");
+                stopped.push(attached.block_stop);
+                if subscriber.attached.is_empty() {
+                    close.push(subscriber.live.clone());
+                }
+            }
+        }
+        for stopped in stopped {
+            stopped.cancel();
+        }
+        for stream in close {
+            stream.close_after_block();
         }
     }
 
@@ -433,27 +675,65 @@ impl Fanout {
             .retain(|_, subscriber| subscriber.offer_list(&sessions));
     }
 
-    /// Switches a session to live delivery and filters duplicate durables.
-    pub(crate) fn finish_block(&self, id: SubscriberId, session: &str, boundary: u64) {
+    /// Switch a generation-bound block to live delivery and filter duplicates.
+    ///
+    /// Completion never inserts state. Terminal cleanup and completion
+    /// linearize under the registry lock, so a producer that resumes after its
+    /// generation was removed cannot recreate the attachment.
+    pub(crate) fn finish_block(&self, block: &AttachBlock, boundary: u64) -> bool {
         let mut state = self.lock();
-        let Some(subscriber) = state.subscribers.get_mut(&id) else {
-            return;
+        let Some(subscriber) = state.subscribers.get_mut(&block.subscriber) else {
+            return false;
         };
+        let valid = subscriber
+            .attached
+            .get(&block.session)
+            .is_some_and(|attached| {
+                attached.materialization == Some(block.materialization)
+                    && matches!(attached.state, AttachState::Attaching)
+                    && !attached.block_stop.is_cancelled()
+            });
+        if !valid {
+            return false;
+        }
         subscriber.live.retain(|frame| {
-            frame.session() != Some(session)
+            frame.session() != Some(block.session.as_str())
                 || !frame.durable_seq().is_some_and(|seq| seq <= boundary)
         });
-        subscriber
+        let attached = subscriber
             .attached
-            .insert(session.to_string(), AttachState::Live { boundary });
+            .get_mut(&block.session)
+            .expect("the generation was validated under the registry lock");
+        attached.state = AttachState::Live { boundary };
+        true
     }
 
-    /// Ask every attach-block producer to stop before session teardown begins.
-    /// A fully completed block sequence remains readable and continues into
-    /// its live queue; an aborted partial sequence ends at its channel close.
+    /// Ask every attach-block producer to stop before host-wide teardown. An
+    /// aborted attachment continues into its live queue, where it receives a
+    /// later terminal persistence error or the queue's final close.
     pub(crate) fn stop_blocks(&self) {
         for subscriber in self.lock().subscribers.values() {
             subscriber.live.stop_block();
+        }
+    }
+
+    /// Stop block producers for one materialization only after its driver has
+    /// had the chance to queue a terminal persistence error.
+    pub(crate) fn stop_session_blocks(&self, session: &str, materialization: u64) {
+        let mut stopped = Vec::new();
+        {
+            for subscriber in self.lock().subscribers.values_mut() {
+                let Some(attached) = subscriber.attached.get_mut(session) else {
+                    continue;
+                };
+                if attached.materialization == Some(materialization) {
+                    attached.state = AttachState::Stopped;
+                    stopped.push(attached.block_stop.clone());
+                }
+            }
+        }
+        for stopped in stopped {
+            stopped.cancel();
         }
     }
 
@@ -501,29 +781,9 @@ pub struct Attachment {
     block: Receiver<Frame>,
     block_done: bool,
     live: LiveReceiver,
-    block_complete: AttachBlockCompletion,
     cancelled: CancellationToken,
     attached: Vec<String>,
     fanout: Arc<Fanout>,
-}
-
-/// Shared producer result for deciding whether a closed block channel is a
-/// complete prefix or an aborted partial block.
-#[derive(Clone)]
-pub(crate) struct AttachBlockCompletion(Arc<AtomicBool>);
-
-impl AttachBlockCompletion {
-    fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
-    }
-
-    pub(crate) fn finish(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    fn is_finished(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
 }
 
 impl Attachment {
@@ -541,20 +801,18 @@ impl Attachment {
         cancelled: CancellationToken,
         attached: Vec<String>,
         fanout: Arc<Fanout>,
-    ) -> (Self, Sender<Frame>, AttachBlockCompletion) {
+    ) -> (Self, Sender<Frame>) {
         let (block_tx, block) = channel(1);
-        let block_complete = AttachBlockCompletion::new();
         let attachment = Self {
             id,
             block,
             block_done: false,
             live,
-            block_complete: block_complete.clone(),
             cancelled,
             attached,
             fanout,
         };
-        (attachment, block_tx, block_complete)
+        (attachment, block_tx)
     }
 
     /// The sessions this stream was served an attach block for.
@@ -581,9 +839,9 @@ impl Attachment {
             if next.is_some() {
                 return next;
             }
-            if !self.block_complete.is_finished() {
-                return None;
-            }
+            // An aborted block still transitions to live delivery. Its owner
+            // either queued a terminal persistence error or closes the queue
+            // during teardown, so EOF cannot overtake that error.
             self.block_done = true;
         }
         tokio::select! {
@@ -605,9 +863,6 @@ impl Attachment {
                 Ok(frame) => return Some(frame),
                 Err(TryRecvError::Empty) => return None,
                 Err(TryRecvError::Disconnected) => {
-                    if !self.block_complete.is_finished() {
-                        return None;
-                    }
                     self.block_done = true;
                 }
             }
@@ -646,6 +901,7 @@ mod tests {
     /// The second session of the multi-session tests.
     const OTHER: &str = "session-2";
     const EPOCH: &str = "epoch-1";
+    const MATERIALIZATION: u64 = 1;
 
     fn durable(seq: u64) -> Frame {
         Frame::Event {
@@ -825,6 +1081,20 @@ mod tests {
             .len()
     }
 
+    /// Bind and complete one ordinary test block. Tests about generation races
+    /// keep their permits explicitly instead.
+    fn finish(fanout: &Fanout, id: SubscriberId, session: &str, boundary: u64) {
+        let materialization = if session == SESSION {
+            MATERIALIZATION
+        } else {
+            MATERIALIZATION + 1
+        };
+        let block = fanout
+            .bind_if_live(id, session, materialization, || false)
+            .expect("the test block binds");
+        assert!(fanout.finish_block(&block, boundary));
+    }
+
     /// Reliable live frames collect while a block is produced. Lossy frames
     /// are dropped, and duplicate durable frames are removed at transition.
     #[test]
@@ -836,7 +1106,7 @@ mod tests {
         fanout.publish(reliable("held"));
         fanout.publish(lossy(1));
 
-        fanout.finish_block(id, SESSION, 5);
+        finish(&fanout, id, SESSION, 5);
 
         assert_eq!(
             drained(&mut rx),
@@ -852,7 +1122,7 @@ mod tests {
     fn a_live_stream_filters_durable_frames_at_or_below_its_boundary() {
         let fanout = Fanout::default();
         let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
-        fanout.finish_block(id, SESSION, 5);
+        finish(&fanout, id, SESSION, 5);
 
         fanout.publish(durable(4));
         fanout.publish(durable(5));
@@ -860,6 +1130,198 @@ mod tests {
         fanout.publish(durable(6));
 
         assert_eq!(drained(&mut rx), vec!["warning after", "durable 6"]);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_frame_survives_spent_capacity_before_eof() {
+        let fanout = Arc::new(Fanout::new(NonZeroUsize::new(1)));
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        finish(&fanout, id, SESSION, 0);
+        fanout.publish(reliable("already queued"));
+
+        let streams = fanout.publish_terminal(reliable("storage failed"), MATERIALIZATION);
+        fanout.publish(reliable("too late"));
+        streams.close();
+
+        assert_eq!(
+            drained(&mut rx),
+            vec!["warning already queued", "warning storage failed"],
+            "the terminal reason is admitted once beyond the ordinary bound"
+        );
+        assert!(
+            rx.recv().await.is_none(),
+            "terminal queue closes after its frames"
+        );
+    }
+
+    #[test]
+    fn an_unbound_attach_is_not_terminalized_by_the_generation_it_never_resolved() {
+        let fanout = Arc::new(Fanout::default());
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+
+        fanout
+            .publish_terminal(reliable("old generation failed"), MATERIALIZATION)
+            .close();
+        let replacement = fanout
+            .bind_if_live(id, SESSION, MATERIALIZATION + 1, || false)
+            .expect("the registration remains available for replacement binding");
+        assert!(fanout.finish_block(&replacement, 0));
+        fanout.publish(Frame::Event {
+            session: SESSION.to_string(),
+            epoch: "replacement-epoch".to_string(),
+            durability: None,
+            event: AgentEvent::Warning {
+                agent_id: AgentId::Main,
+                text: "replacement is live".to_string(),
+            }
+            .into(),
+        });
+
+        assert_eq!(drained(&mut rx), vec!["warning replacement is live"]);
+        let state = rx.0.state.lock().expect("live queue mutex poisoned");
+        assert!(!state.closed && state.terminal_sessions.is_empty());
+    }
+
+    #[test]
+    fn outgoing_block_stop_does_not_cancel_an_unbound_replacement_attach() {
+        let fanout = Fanout::default();
+        let (id, rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let block_stop = rx.block_stop_token();
+
+        fanout.stop_session_blocks(SESSION, MATERIALIZATION);
+        assert!(
+            !block_stop.is_cancelled(),
+            "the outgoing owner canceled an unbound replacement"
+        );
+        let replacement = fanout
+            .bind_if_live(id, SESSION, MATERIALIZATION + 1, || false)
+            .expect("the replacement binds");
+        fanout.stop_session_blocks(SESSION, MATERIALIZATION);
+        assert!(
+            !block_stop.is_cancelled(),
+            "the outgoing owner canceled a bound replacement"
+        );
+        fanout.stop_session_blocks(SESSION, MATERIALIZATION + 1);
+        assert!(
+            replacement.stopped().is_cancelled(),
+            "the bound owner can stop its own block"
+        );
+        assert!(
+            !block_stop.is_cancelled(),
+            "a session stop must not become stream-wide"
+        );
+    }
+
+    #[test]
+    fn one_sessions_block_stop_does_not_cancel_another_sessions_block() {
+        let fanout = Fanout::default();
+        let (id, rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        let block_stop = rx.block_stop_token();
+        let failed = fanout
+            .bind_if_live(id, SESSION, MATERIALIZATION, || false)
+            .expect("the failed session binds");
+        let healthy = fanout
+            .bind_if_live(id, OTHER, MATERIALIZATION + 1, || false)
+            .expect("the healthy session binds");
+
+        fanout.stop_session_blocks(SESSION, MATERIALIZATION);
+
+        assert!(
+            !block_stop.is_cancelled(),
+            "stopping one failed session also canceled the healthy session's promised attach block",
+        );
+        assert!(failed.stopped().is_cancelled());
+        assert!(!healthy.stopped().is_cancelled());
+        assert!(
+            !fanout.finish_block(&failed, 0),
+            "a canceled failed-generation block completed anyway",
+        );
+        assert!(
+            fanout.finish_block(&healthy, 0),
+            "the healthy sibling could not complete its promised block",
+        );
+    }
+
+    #[test]
+    fn a_late_block_completion_cannot_restore_a_terminalized_generation() {
+        let fanout = Arc::new(Fanout::default());
+        let (id, _rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        let failed = fanout
+            .bind_if_live(id, SESSION, MATERIALIZATION, || false)
+            .expect("the failed session binds");
+        let healthy = fanout
+            .bind_if_live(id, OTHER, MATERIALIZATION + 1, || false)
+            .expect("the healthy session binds");
+        assert!(fanout.finish_block(&healthy, 0));
+
+        fanout
+            .publish_terminal(reliable("failed"), MATERIALIZATION)
+            .close();
+        assert!(
+            !fanout.finish_block(&failed, 0),
+            "the stale generation completed after terminal cleanup",
+        );
+
+        assert!(
+            !fanout.attached(SESSION),
+            "the old producer restored attachment state after terminal cleanup removed its generation",
+        );
+        assert!(
+            fanout.attached(OTHER),
+            "terminal cleanup removed the sibling"
+        );
+    }
+
+    #[test]
+    fn a_shared_stream_keeps_each_sessions_terminal_error() {
+        let fanout = Arc::new(Fanout::default());
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        finish(&fanout, id, SESSION, 0);
+        finish(&fanout, id, OTHER, 0);
+
+        let first = fanout.publish_terminal(reliable("first failed"), MATERIALIZATION);
+        first.close();
+        let second = fanout.publish_terminal(
+            Frame::Event {
+                session: OTHER.to_string(),
+                epoch: EPOCH.to_string(),
+                durability: None,
+                event: AgentEvent::Warning {
+                    agent_id: AgentId::Main,
+                    text: "second failed".to_string(),
+                }
+                .into(),
+            },
+            MATERIALIZATION + 1,
+        );
+        second.close();
+
+        assert_eq!(
+            drained(&mut rx),
+            vec!["warning first failed", "warning second failed"]
+        );
+    }
+
+    #[test]
+    fn binding_that_observes_drain_on_its_second_check_stays_unbound() {
+        let fanout = Arc::new(Fanout::default());
+        let (id, rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let checks = AtomicU64::new(0);
+
+        assert!(
+            fanout
+                .bind_if_live(id, SESSION, MATERIALIZATION, || {
+                    checks.fetch_add(1, Ordering::Relaxed) > 0
+                })
+                .is_none(),
+            "a drain beginning during binding withdraws the old generation"
+        );
+        fanout
+            .publish_terminal(reliable("old generation failed"), MATERIALIZATION)
+            .close();
+
+        let state = rx.0.state.lock().expect("live queue mutex poisoned");
+        assert!(state.frames.is_empty() && !state.closed && state.terminal_sessions.is_empty());
     }
 
     /// One directory row, enough to tell two payloads apart.
@@ -904,7 +1366,7 @@ mod tests {
     fn a_dropped_directory_is_offered_again() {
         let fanout = Fanout::new(NonZeroUsize::new(2));
         let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
+        finish(&fanout, id, SESSION, 0);
 
         // The client is not reading, so its queue fills with frames that may
         // not be dropped.
@@ -1025,8 +1487,8 @@ mod tests {
 
         // Two live sessions with different boundaries, which is the case a
         // shared one gets wrong.
-        fanout.finish_block(id, SESSION, 5);
-        fanout.finish_block(id, OTHER, 1);
+        finish(&fanout, id, SESSION, 5);
+        finish(&fanout, id, OTHER, 1);
 
         fanout.publish(durable(5));
         fanout.publish(durable(6));
@@ -1072,8 +1534,8 @@ mod tests {
     fn a_detached_session_leaves_nothing_of_itself_on_the_stream() {
         let fanout = Fanout::default();
         let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
-        fanout.finish_block(id, OTHER, 0);
+        finish(&fanout, id, SESSION, 0);
+        finish(&fanout, id, OTHER, 0);
         // Live before the attach that named it got as far as refusing it.
         fanout.publish(reliable("caught in the window"));
         fanout.publish(other(reliable("someone else's session")));
@@ -1105,7 +1567,7 @@ mod tests {
         let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
         fanout.publish(refusal("unknown_session"));
 
-        fanout.finish_block(id, SESSION, 0);
+        finish(&fanout, id, SESSION, 0);
 
         assert_eq!(
             drained(&mut rx),
@@ -1115,7 +1577,7 @@ mod tests {
 
         let fanout = Fanout::new(NonZeroUsize::new(2));
         let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
+        finish(&fanout, id, SESSION, 0);
         fanout.publish(reliable("one"));
         fanout.publish(reliable("two"));
 
@@ -1138,7 +1600,7 @@ mod tests {
             session: SESSION.to_string(),
         });
 
-        fanout.finish_block(id, SESSION, 0);
+        finish(&fanout, id, SESSION, 0);
 
         assert_eq!(drained(&mut rx), vec!["warning held", "reset"]);
     }
@@ -1149,7 +1611,7 @@ mod tests {
     fn lossy_replacement_moves_to_the_queue_tail() {
         let fanout = Fanout::new(NonZeroUsize::new(3));
         let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
+        finish(&fanout, id, SESSION, 0);
 
         fanout.publish(reliable("before"));
         fanout.publish(lossy(1));
@@ -1168,7 +1630,7 @@ mod tests {
     fn live_overflow_drops_lossy_and_evicts_on_reliable() {
         let fanout = Fanout::new(NonZeroUsize::new(2));
         let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
+        finish(&fanout, id, SESSION, 0);
         fanout.publish(reliable("one"));
         fanout.publish(reliable("two"));
         assert_eq!(
@@ -1205,7 +1667,7 @@ mod tests {
     fn a_durable_frame_is_neither_coalesced_nor_dropped() {
         let fanout = Fanout::new(NonZeroUsize::new(2));
         let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
+        finish(&fanout, id, SESSION, 0);
 
         fanout.publish(durable(1));
         fanout.publish(durable(2));
@@ -1234,8 +1696,8 @@ mod tests {
     fn coalescing_discriminates_by_what_a_snapshot_is_about() {
         let fanout = Fanout::default();
         let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
-        fanout.finish_block(id, OTHER, 0);
+        finish(&fanout, id, SESSION, 0);
+        finish(&fanout, id, OTHER, 0);
 
         fanout.publish(lossy(1));
         fanout.publish(other(lossy(2)));
@@ -1279,7 +1741,7 @@ mod tests {
     fn attachment_is_producer_paced_and_reads_the_block_before_live() {
         let fanout = Arc::new(Fanout::default());
         let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
-        let (mut attachment, block_tx, block_complete) = Attachment::new(
+        let (mut attachment, block_tx) = Attachment::new(
             id,
             live,
             cancelled,
@@ -1300,7 +1762,6 @@ mod tests {
             attachment.try_recv().is_none(),
             "live frames stay behind an unfinished block",
         );
-        block_complete.finish();
         drop(block_tx);
         assert!(matches!(attachment.try_recv(), Some(Frame::Event { .. })));
     }
@@ -1316,7 +1777,7 @@ mod tests {
     async fn a_parked_stream_is_woken_by_a_frame_and_ended_by_a_close() {
         let fanout = Arc::new(Fanout::default());
         let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
+        finish(&fanout, id, SESSION, 0);
 
         // Published from another task, after this one has parked on `recv`: the
         // sleep can only elapse while this task is waiting, so the frame has to
@@ -1374,7 +1835,7 @@ mod tests {
     fn dropping_an_attachment_deregisters_it() {
         let fanout = Arc::new(Fanout::default());
         let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
-        let (attachment, _block_tx, _block_complete) = Attachment::new(
+        let (attachment, _block_tx) = Attachment::new(
             id,
             live,
             cancelled,

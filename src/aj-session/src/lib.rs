@@ -62,10 +62,12 @@ pub use listener::{
     persisting_forwarder,
 };
 pub use lock::{LockHolder, LockMetadata, SessionLock};
+#[cfg(any(test, feature = "test-support"))]
+pub use log::test_support::{AppendFault, AppendFaultFixture};
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
-    EntryId, EntryRef, LogSnapshot, SessionEnvError, SessionSettings, ThreadFilter, ThreadKind,
-    validate_session_env,
+    EntryId, EntryRef, LogSnapshot, PersistenceFailure, PersistenceFailureSignal, SessionEnvError,
+    SessionSettings, ThreadFilter, ThreadKind, persistence_failure_channel, validate_session_env,
 };
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview, SidecarMetadata};
 pub use prompt_history::{

@@ -56,8 +56,8 @@ use aj_models::registry::{ModelInfo, default_thinking_level, validate_thinking_l
 use aj_models::types::{Speed, UserContent};
 use aj_models::{speed_from_name, thinking_config_from_name, verbosity_from_name};
 use aj_session::{
-    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, LockHolder, SessionLock,
-    normalize_tag, project_suffix, validate_session_env,
+    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, LockHolder,
+    PersistenceFailure, SessionLock, normalize_tag, project_suffix, validate_session_env,
 };
 use aj_wire::{
     ARCHIVE_CAPABILITY, AgentQueue, COMPACTION_USAGE_CAPABILITY, Cursor, DurableEvent, Frame,
@@ -72,7 +72,7 @@ use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::host::driver::Driver;
+use crate::host::driver::{Driver, DriverExit};
 use crate::host::live::{LiveSession, ReleaseOutcome, Request, SessionStatus, settings_of};
 use crate::host::store::ColdSessions;
 use crate::session::{SessionCore, SessionEntry, SessionSpec, SubAgentOverrides};
@@ -138,9 +138,9 @@ const HOST_ID_FILE: &str = "host-id";
 /// Typed because callers branch on it: a network server maps the variants
 /// onto the status vocabulary of spec 6.1. 400 for [`Self::Invalid`], 404
 /// for the unknown cases, 409 for [`Self::Conflict`], [`Self::Locked`] and
-/// [`Self::Unsupported`], 500 for [`Self::Internal`]. (503 is the gateway's
-/// alone: it means an upstream host is unreachable, which a host cannot say
-/// about itself.)
+/// [`Self::Unsupported`], and 500 for [`Self::Persistence`] or
+/// [`Self::Internal`]. (503 is the gateway's alone: it means an upstream host
+/// is unreachable, which a host cannot say about itself.)
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error("unknown session {0}")]
@@ -184,6 +184,9 @@ pub enum HostError {
     /// one attach, an entry id whose role cannot be a head.
     #[error("{0}")]
     Invalid(String),
+    /// A request could not complete because session storage became terminal.
+    #[error("{0}")]
+    Persistence(String),
     #[error("internal host error: {0}")]
     Internal(#[source] BoxError),
 }
@@ -205,6 +208,7 @@ impl HostError {
             Self::Locked { .. } => "locked",
             Self::Unsupported(_) => "unsupported",
             Self::Invalid(_) => "invalid_request",
+            Self::Persistence(_) => "persistence_failed",
             Self::Internal(_) => "internal",
         }
     }
@@ -227,9 +231,10 @@ impl HostError {
 
 /// Why a create did not deliver everything that was asked of it.
 ///
-/// Creating the session is the operation that either happens or does not.
-/// Applying a label and submitting a first prompt happen *after* the session
-/// exists, so their failure cannot un-create it.
+/// A create without a first prompt is complete once its live session is minted.
+/// A prompt-bearing create stays provisional until that exact prompt reaches a
+/// canonical log. Failure before that boundary removes the unpublished owner
+/// and is a refusal, while a later tag failure is incomplete creation.
 ///
 /// Typed because callers branch on the distinction, and on nothing finer: a
 /// [`Self::Refused`] create did not happen, a [`Self::Incomplete`] one did.
@@ -237,8 +242,9 @@ impl HostError {
 /// with it but show it.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateError {
-    /// Nothing was minted. The request was refused before a log existed, so
-    /// it left no discoverable session behind.
+    /// No usable session remains. The request was refused before creation, or
+    /// first publication failed and ordinary teardown removed the unsaved
+    /// materialization.
     #[error(transparent)]
     Refused(#[from] HostError),
     /// The session was minted. See [`PartialCreate`].
@@ -249,16 +255,18 @@ pub enum CreateError {
 /// A create that minted its session and could not apply everything asked of
 /// it afterwards.
 ///
-/// The session named exists, is live and is in the host's directory. The id
-/// travels as a field rather than only in the message, because that is what
-/// a caller acts on: it attaches the session and retries the step that did
-/// not land, rather than creating a second session.
+/// The session named exists and is addressable in the host's directory. It is
+/// normally live. A persistence failure after canonical first publication may
+/// already have returned it to a cold row, which remains recoverable by id. The
+/// id travels as a field rather than only in the message, because that is what a
+/// caller acts on: it attaches the session and retries the step that did not
+/// land, rather than creating a second session.
 #[derive(Debug, thiserror::Error)]
 #[error("session {session} created, {step} not applied: {source}")]
 pub struct PartialCreate {
     /// The session the create minted, which the caller acts on.
     pub session: String,
-    /// What did not land, worded for the message ("tag", "first prompt").
+    /// What did not land, worded for the message.
     step: &'static str,
     #[source]
     source: BoxError,
@@ -270,16 +278,6 @@ impl PartialCreate {
         Self {
             session,
             step: "tag",
-            source: Box::new(source),
-        }
-    }
-
-    /// The first prompt was not taken, so the session is idle rather than
-    /// working.
-    fn prompt(session: String, source: HostError) -> Self {
-        Self {
-            session,
-            step: "first prompt",
             source: Box::new(source),
         }
     }
@@ -499,7 +497,7 @@ pub struct AttachRequest {
 /// sessions were named, so a client reads one answer per session and can tell
 /// which of them it is waiting for.
 enum Serving {
-    Block(AttachRequest, Arc<LiveSession>),
+    Block(AttachRequest, Arc<LiveSession>, fanout::AttachBlock),
     Refusal(Frame),
 }
 
@@ -567,9 +565,20 @@ pub(crate) struct HostShared {
 /// The session map, held.
 type SessionMap<'a> = tokio::sync::MutexGuard<'a, HashMap<String, LiveEntry>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationState {
+    /// A create whose prompt publication and tag attempt have not completed.
+    /// The host owns it for shutdown, but no directory or direct lookup may
+    /// disclose it. A tag-only create uses the same state briefly so its first
+    /// published row cannot precede its tag attempt.
+    PendingCreate,
+    Published,
+}
+
 /// One live session plus the task driving it.
 struct LiveEntry {
     session: Arc<LiveSession>,
+    publication: PublicationState,
     /// Awaited whenever the session is torn down, at shutdown or on release.
     /// This outer owner retains the session's advisory lock through detached
     /// task reaping and persistence fencing, so joining it is what releases the
@@ -628,6 +637,44 @@ struct ShutdownState {
     complete: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Default)]
+pub struct PersistenceCleanupGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+/// Pause one prompt-bearing create after its first-prompt request is queued and
+/// the global session map is released, but before the driver outcome is folded.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Default)]
+pub struct FirstPublicationGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FirstPublicationGate {
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PersistenceCleanupGate {
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
 struct HostInner {
     shared: Arc<HostShared>,
     persistence: ConversationPersistence,
@@ -642,6 +689,12 @@ struct HostInner {
     /// session-map lock. Shutdown can cancel detached work and abort drivers
     /// even when a release is holding that map.
     session_stops: StdMutex<HashMap<String, SessionStop>>,
+    #[cfg(any(test, feature = "test-support"))]
+    persistence_cleanup_gate: StdMutex<Option<PersistenceCleanupGate>>,
+    #[cfg(any(test, feature = "test-support"))]
+    first_publication_gate: StdMutex<Option<FirstPublicationGate>>,
+    #[cfg(any(test, feature = "test-support"))]
+    next_initial_fault: StdMutex<Option<aj_session::AppendFaultFixture>>,
     /// Wall clock and monotonic clock read at the same moment, for
     /// projecting a task's `Instant` onto wall time (see [`wall_clock`]).
     /// Read once per host rather than per call, so the same task's start
@@ -739,6 +792,12 @@ impl SessionHost {
             name,
             sessions: TokioMutex::new(HashMap::new()),
             session_stops: StdMutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            persistence_cleanup_gate: StdMutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            first_publication_gate: StdMutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            next_initial_fault: StdMutex::new(None),
             clock_anchor: (Utc::now(), Instant::now()),
             idle_grace: idle_grace.unwrap_or(DEFAULT_IDLE_GRACE),
             shut_down: AtomicBool::new(false),
@@ -817,15 +876,16 @@ impl SessionHost {
     /// log is created, so a request this host refuses
     /// ([`CreateError::Refused`]) leaves no discoverable empty session behind.
     ///
-    /// The tag and the prompt are applied once the session is live, through
-    /// the same commands a later relabelling or prompt takes, so they land
-    /// under the session's own lock. They are best-effort: a step that fails
-    /// on its own terms, a store that will not take the sidecar write, say,
-    /// is not a failed create. The answer is a [`PartialCreate`] naming the
-    /// session, which is live and in the directory, and what did not land
-    /// ("session <id> created, tag not applied: <reason>"), so the caller
-    /// retags rather than creating a second session. A minted session is
-    /// durable user state and is never deleted to make an error tidier.
+    /// A prompt-bearing create is private until that prompt publishes the
+    /// canonical log. Its driver owns the publication outcome, so the host can
+    /// release the global session map while waiting. The optional tag is
+    /// applied afterwards, which makes a tag without a canonical session
+    /// structurally impossible. A tag failure then returns [`PartialCreate`]
+    /// with the durable id so the caller can retag instead of creating twice.
+    /// If the first prompt is refused, its turn ends before publication, or
+    /// persistence fails before publication, ordinary teardown removes the
+    /// unpublished owner and the response discloses no id. Canonical first
+    /// publication makes the id recoverable even if a later append fails.
     pub async fn create_with(
         &self,
         settings: Option<SessionSettings>,
@@ -843,22 +903,169 @@ impl SessionHost {
             validate_session_env(env)
                 .map_err(|err| HostError::Invalid(format!("session env: {err}")))?;
         }
-        let session = self.mint(settings.as_ref(), session_env).await?;
-        if tag.is_some() {
-            if let Err(err) = self.command(&session, Command::Tag { tag }).await {
-                return Err(PartialCreate::tag(session, err).into());
-            }
-        }
-        if let Some(content) = prompt {
-            let prompt = Command::Prompt {
-                agent: AgentId::Main,
-                content,
+        let run_config = self.resolve_creator_settings(settings.as_ref())?;
+        // The host owns the stateful transaction. Dropping an HTTP request
+        // detaches this join but cannot strand an invisible live session and
+        // its advisory lock.
+        let host = self.clone();
+        tokio::spawn(async move {
+            host.create_validated(run_config, prompt, tag, session_env)
+                .await
+        })
+        .await
+        .map_err(|err| HostError::Internal(format!("create task ended abnormally: {err}").into()))?
+    }
+
+    async fn create_validated(
+        &self,
+        run_config: RunConfigSnapshot,
+        prompt: Option<Vec<UserContent>>,
+        tag: Option<String>,
+        session_env: Option<BTreeMap<String, String>>,
+    ) -> Result<String, CreateError> {
+        let private = prompt.is_some() || tag.is_some();
+        let mut sessions = self.inner.sessions.lock().await;
+        let live = self
+            .materialize(
+                &mut sessions,
+                None,
+                Some(run_config),
+                session_env,
+                if private {
+                    PublicationState::PendingCreate
+                } else {
+                    PublicationState::Published
+                },
+            )
+            .await?;
+        let session = live.id().to_string();
+        let first_log = Arc::clone(&live.core.log);
+        let publication = prompt.map(|content| {
+            let (reply, outcome) = oneshot::channel();
+            let sent = live.send(Request::FirstPrompt { content, reply });
+            (outcome, sent)
+        });
+        if publication.is_none() {
+            // A tag-only create has no canonical first-prompt boundary that can
+            // make an id recoverable after teardown. Keep the map through the
+            // bounded tag command and visibility transition so shutdown cannot
+            // leave a sidecar whose refused response disclosed no id.
+            let tag_error = if tag.is_some() {
+                send_live_command(&live, Command::Tag { tag }).await.err()
+            } else {
+                None
             };
-            if let Err(err) = self.command(&session, prompt).await {
-                return Err(PartialCreate::prompt(session, err).into());
+            if private {
+                let entry = sessions
+                    .get_mut(&session)
+                    .expect("the tag-only create remains under the held map");
+                debug_assert!(Arc::ptr_eq(&entry.session, &live));
+                entry.publication = PublicationState::Published;
             }
+            drop(sessions);
+            if private {
+                self.inner.shared.fanout.mark_list_dirty();
+            }
+            return match tag_error {
+                Some(err) => Err(PartialCreate::tag(session, err).into()),
+                None => Ok(session),
+            };
         }
-        Ok(session)
+
+        // The request is queued ahead of any release. From here until the
+        // bounded publish-or-owner-exit answer, the explicit pending state is
+        // what hides the id rather than a global lock.
+        drop(sessions);
+
+        #[cfg(any(test, feature = "test-support"))]
+        let gate = self
+            .inner
+            .first_publication_gate
+            .lock()
+            .expect("first publication gate mutex poisoned")
+            .take();
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+
+        let (outcome, sent) = publication.expect("the tag-only path returned above");
+        let result = if sent {
+            wait_for_first_publication(&first_log, outcome).await
+        } else {
+            Err(HostError::Internal(
+                "session driver is gone before the first prompt".into(),
+            ))
+        };
+        if let Err(err) = result {
+            self.discard_pending_create(&session, &live).await;
+            return Err(CreateError::Refused(err));
+        }
+
+        // A sidecar is attempted only after the prompt-bearing create has a
+        // canonical log. Failure can therefore name a recoverable session and
+        // can never leave an unreachable tag for an unsaved id.
+        let tag_error = if tag.is_some() {
+            send_live_command(&live, Command::Tag { tag }).await.err()
+        } else {
+            None
+        };
+        self.publish_pending_create(&session, &live).await;
+        match tag_error {
+            Some(err) => Err(PartialCreate::tag(session, err).into()),
+            None => Ok(session),
+        }
+    }
+
+    /// Reveal the exact prompt-bearing create after its canonical publication
+    /// and tag attempt have completed.
+    async fn publish_pending_create(&self, session: &str, live: &Arc<LiveSession>) {
+        let mut sessions = self.inner.sessions.lock().await;
+        let exact_pending = sessions.get(session).is_some_and(|entry| {
+            Arc::ptr_eq(&entry.session, live)
+                && entry.publication == PublicationState::PendingCreate
+        });
+        // A later append can fail after the first user message published but
+        // before the creator applies its tag. Persistence teardown may already
+        // have moved that durable session to the cold directory or let another
+        // client rematerialize it. Either owner names the same recoverable log,
+        // so a mismatch still discloses the id rather than creating a duplicate.
+        if exact_pending {
+            let entry = sessions
+                .get_mut(session)
+                .expect("the exact pending create was checked under the map");
+            entry.publication = PublicationState::Published;
+        }
+        drop(sessions);
+        self.inner.shared.fanout.mark_list_dirty();
+    }
+
+    /// Tear down an unpublished create without exposing its id.
+    ///
+    /// The established owner join is intentionally awaited under the map. The
+    /// unbounded publication wait happens before this with the map released,
+    /// while this bounded teardown keeps shutdown from observing neither the
+    /// entry nor the task that still owns its advisory lock.
+    async fn discard_pending_create(&self, session: &str, live: &Arc<LiveSession>) {
+        live.request_shutdown();
+        let mut sessions = self.inner.sessions.lock().await;
+        let ours = sessions.get(session).is_some_and(|entry| {
+            entry.publication == PublicationState::PendingCreate
+                && Arc::ptr_eq(&entry.session, live)
+        });
+        if !ours {
+            return;
+        }
+        let entry = sessions
+            .remove(session)
+            .expect("the pending create identity was checked under the map");
+        let _ = entry.driver.await;
+        self.inner
+            .session_stops
+            .lock()
+            .expect("session stops mutex poisoned")
+            .remove(session);
     }
 
     /// Mint a session with `settings` resolved against this host's catalog
@@ -875,7 +1082,13 @@ impl SessionHost {
         let run_config = self.resolve_creator_settings(settings)?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
-            .materialize(&mut sessions, None, Some(run_config), session_env)
+            .materialize(
+                &mut sessions,
+                None,
+                Some(run_config),
+                session_env,
+                PublicationState::Published,
+            )
             .await?;
         Ok(live.id().to_string())
     }
@@ -965,10 +1178,35 @@ impl SessionHost {
         let mut serving = Vec::with_capacity(requests.len());
         let mut attached = Vec::with_capacity(requests.len());
         for request in requests {
-            match self.live(&request.session).await {
-                Ok(session) => {
+            let resolved = loop {
+                match self.live(&request.session).await {
+                    Ok(session) => {
+                        if let Some(block) = self.inner.shared.fanout.bind_if_live(
+                            id,
+                            &request.session,
+                            session.materialization(),
+                            || session.is_draining(),
+                        ) {
+                            break Ok((session, block));
+                        }
+                        if cancelled.is_cancelled() {
+                            break Err(HostError::Conflict {
+                                reason: "the attach stream closed during materialization"
+                                    .to_string(),
+                            });
+                        }
+                        // The owner entered drain between map resolution and
+                        // generation binding. Retry through `live` so the block
+                        // is built from its replacement rather than mixing an
+                        // outgoing terminal frame with a new epoch.
+                    }
+                    Err(err) => break Err(err),
+                }
+            };
+            match resolved {
+                Ok((session, block)) => {
                     attached.push(request.session.clone());
-                    serving.push(Serving::Block(request.clone(), session));
+                    serving.push(Serving::Block(request.clone(), session, block));
                 }
                 Err(err) => {
                     // Off the attach set again: this host may hold the session
@@ -996,7 +1234,7 @@ impl SessionHost {
         if let Err(err) = self.enumerate().await {
             tracing::warn!("could not re-read the session store for an attach: {err}");
         }
-        let (attachment, block_tx, block_complete) = Attachment::new(
+        let (attachment, block_tx) = Attachment::new(
             id,
             live_frames,
             cancelled.clone(),
@@ -1008,22 +1246,21 @@ impl SessionHost {
         // against its boundary, which is the atomicity the doc promises.
         let host = self.clone();
         tokio::spawn(async move {
-            let mut completed = true;
             for item in serving {
                 let served = match item {
-                    Serving::Block(request, session) => {
-                        host.serve_block(id, &request, &session, &block_tx, &stopped)
+                    Serving::Block(request, session, block) => {
+                        host.serve_block(&request, &session, &block_tx, &block)
                             .await
                     }
                     Serving::Refusal(frame) => send_block_frame(&block_tx, &stopped, frame).await,
                 };
-                if !served {
-                    completed = false;
-                    break;
+                // A session-local stop invalidates only that block. The serial
+                // producer must continue with its siblings, each of which was
+                // promised its own State and CaughtUp pair. Stream teardown or
+                // a dropped receiver still ends the producer wholesale.
+                if !served && (cancelled.is_cancelled() || stopped.is_cancelled()) {
+                    return;
                 }
-            }
-            if completed {
-                block_complete.finish();
             }
         });
         Ok(attachment)
@@ -1083,14 +1320,25 @@ impl SessionHost {
         // cold cache is a leaf, so nesting its lock under the map cannot invert
         // an order.
         let sessions = self.inner.sessions.lock().await;
+        let private: HashSet<String> = sessions
+            .iter()
+            .filter(|(_, entry)| entry.publication == PublicationState::PendingCreate)
+            .map(|(id, _)| id.clone())
+            .collect();
         let live: Vec<Arc<LiveSession>> = sessions
             .values()
+            .filter(|entry| entry.publication == PublicationState::Published)
             .map(|entry| Arc::clone(&entry.session))
             .collect();
         let cold = self.inner.cold.rows();
         drop(sessions);
         let mut summaries: BTreeMap<String, SessionSummary> = cold
             .into_iter()
+            // Enumeration scans outside the map lock. A create can enter the
+            // map and publish its file after that scan snapshots live ids, so a
+            // stale cold row may coexist with its private entry. The map is the
+            // visibility authority and suppresses that row until publication.
+            .filter(|session| !private.contains(&session.id))
             .map(|session| {
                 (
                     session.id.clone(),
@@ -1152,6 +1400,56 @@ impl SessionHost {
         self.inner.cold.directory_reads()
     }
 
+    /// Whether the host retains independent stop controls for this live
+    /// generation. Persistence-failure reconnect tests use this to catch an
+    /// outgoing cleanup deleting its replacement's shutdown authority.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_session_stop(&self, session: &str) -> bool {
+        self.inner
+            .session_stops
+            .lock()
+            .expect("session stops mutex poisoned")
+            .contains_key(session)
+    }
+
+    /// Pause the next failed-generation cleanup before it takes the session
+    /// map, so a test can deterministically install a replacement generation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pause_next_persistence_cleanup(&self) -> PersistenceCleanupGate {
+        let gate = PersistenceCleanupGate::default();
+        *self
+            .inner
+            .persistence_cleanup_gate
+            .lock()
+            .expect("persistence cleanup gate mutex poisoned") = Some(gate.clone());
+        gate
+    }
+
+    /// Pause the next prompt-bearing create after it has released the session
+    /// map. Tests use the hold to prove unrelated host operations and directory
+    /// reads remain live while the private transaction awaits its driver.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pause_next_first_publication(&self) -> FirstPublicationGate {
+        let gate = FirstPublicationGate::default();
+        *self
+            .inner
+            .first_publication_gate
+            .lock()
+            .expect("first publication gate mutex poisoned") = Some(gate.clone());
+        gate
+    }
+
+    /// Fault the staging writer of the next created session before any prompt
+    /// can reach its provider.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fault_next_initial_publication(&self, fault: aj_session::AppendFaultFixture) {
+        *self
+            .inner
+            .next_initial_fault
+            .lock()
+            .expect("initial fault mutex poisoned") = Some(fault);
+    }
+
     /// How many times the host has read its session store's `meta/` directory.
     ///
     /// The other half of the enumeration's directory cost (spec 6.8). A
@@ -1172,6 +1470,28 @@ impl SessionHost {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn published_directory(&self) -> SessionList {
         self.directory().await
+    }
+
+    /// The one private create currently in the map, for visibility-race tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn pending_create_id_for_test(&self) -> Option<String> {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .find(|(_, entry)| entry.publication == PublicationState::PendingCreate)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Populate the cold cache without excluding live ids. This stages the
+    /// stale scan that can finish after a private create enters the map.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cache_all_sessions_as_cold_for_test(&self) -> Result<(), HostError> {
+        self.inner
+            .cold
+            .enumerate(|_| false)
+            .map_err(|err| HostError::Internal(Box::new(err)))
     }
 
     /// Hold the live-session map until `release`, exposing entry through
@@ -1493,10 +1813,9 @@ impl SessionHost {
 
     async fn shutdown_owned(&self) {
         let _finish = ShutdownFinish(&self.inner);
-        // Cancel before a driver's advisory lock can be released. The producer
-        // may finish computation over a snapshot it already owns, but every
-        // later log acquisition and send prefers cancellation, so it cannot
-        // read from or emit through a rival writer.
+        // Stop backfill work before it can outlive the owner. An incomplete
+        // attachment continues onto its live queue, so a final-flush storage
+        // error still reaches it before host-wide close.
         self.inner.shared.fanout.stop_blocks();
         let deadline = tokio::time::Instant::now() + HOST_SHUTDOWN_GRACE;
         let graceful_deadline = deadline - HOST_ABORT_GRACE;
@@ -1559,6 +1878,7 @@ impl SessionHost {
                 session,
                 driver,
                 stop,
+                publication: _,
             } = entry;
             let id = session.id().to_string();
             pending_reapers.insert(id.clone());
@@ -1656,6 +1976,9 @@ impl SessionHost {
         let Some(entry) = sessions.get(session) else {
             return false;
         };
+        if entry.publication == PublicationState::PendingCreate {
+            return false;
+        }
         let (reply, outcome) = oneshot::channel();
         let answer = if entry.session.send(Request::Release { reply }) {
             outcome.await.ok()
@@ -1746,7 +2069,13 @@ impl SessionHost {
         validate_session_id(session)?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
-            .materialize(&mut sessions, Some(session), None, None)
+            .materialize(
+                &mut sessions,
+                Some(session),
+                None,
+                None,
+                PublicationState::Published,
+            )
             .await?;
         Ok((sessions, live))
     }
@@ -1762,6 +2091,9 @@ impl SessionHost {
         self.alive()?;
         validate_session_id(session)?;
         if let Some(entry) = self.inner.sessions.lock().await.get(session) {
+            if entry.publication == PublicationState::PendingCreate {
+                return Err(HostError::UnknownSession(session.to_string()));
+            }
             return Ok(Some(Arc::clone(&entry.session)));
         }
         if !self.on_disk(session)? {
@@ -1906,10 +2238,28 @@ impl SessionHost {
         id: Option<&str>,
         create_run_config: Option<RunConfigSnapshot>,
         create_session_env: Option<BTreeMap<String, String>>,
+        publication: PublicationState,
     ) -> Result<Arc<LiveSession>, HostError> {
         if let Some(id) = id {
             if let Some(entry) = sessions.get(id) {
-                return Ok(Arc::clone(&entry.session));
+                if entry.publication == PublicationState::PendingCreate {
+                    return Err(HostError::UnknownSession(id.to_string()));
+                }
+                if !entry.session.is_draining() && !entry.driver.is_finished() {
+                    return Ok(Arc::clone(&entry.session));
+                }
+            }
+            if let Some(stopped) = sessions.remove(id) {
+                // A persistence-failed owner normally removes itself through
+                // its host cleanup task. A reconnect can arrive while that
+                // owner is still draining, so it takes and joins the exact old
+                // entry here before acquiring a fresh materialization's lock.
+                let _ = stopped.driver.await;
+                self.inner
+                    .session_stops
+                    .lock()
+                    .expect("session stops mutex poisoned")
+                    .remove(id);
             }
             if !self.on_disk(id)? {
                 return Err(HostError::UnknownSession(id.to_string()));
@@ -1959,6 +2309,23 @@ impl SessionHost {
             self.inner.shared.restore.as_ref(),
         )
         .map_err(|err| HostError::Internal(err.into()))?;
+        #[cfg(any(test, feature = "test-support"))]
+        let initial_fault = id
+            .is_none()
+            .then(|| {
+                self.inner
+                    .next_initial_fault
+                    .lock()
+                    .expect("initial fault mutex poisoned")
+                    .take()
+            })
+            .flatten();
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(fault) = initial_fault {
+            fault
+                .install_initial(&mut *core.log.lock().await)
+                .map_err(|err| HostError::Internal(Box::new(err)))?;
+        }
         let session_id = core.session_id.clone();
         let lock = match claimed {
             Some(lock) => lock,
@@ -1966,7 +2333,8 @@ impl SessionHost {
         };
 
         let handoff = AppendHandoff::default();
-        let events = core.install_persisting_forwarder(&handoff);
+        let (events, persistence_failures, draining) =
+            core.install_persisting_forwarder(&handoff).await;
         // One small read, on a path that has just read the whole log. From
         // here the session answers its own label out of memory, so no
         // directory refresh ever reaches the sidecar for it (spec 6.8). A
@@ -2019,11 +2387,18 @@ impl SessionHost {
         };
         drop(log);
         let (requests_tx, requests) = unbounded_channel();
-        let session = Arc::new(LiveSession::new(core, handoff, status, requests_tx));
+        let session = Arc::new(LiveSession::new(
+            core,
+            handoff,
+            status,
+            requests_tx,
+            draining,
+        ));
         let driver = Driver::new(
             Arc::clone(&session),
             Arc::clone(&self.inner.shared),
             events,
+            persistence_failures,
             requests,
         );
         // Synchronize the terminal check with shutdown's abort snapshot. If
@@ -2049,16 +2424,29 @@ impl SessionHost {
             tasks: task_registry.clone(),
         };
         let owner_session = session_id.clone();
+        let owner_materialization = session.materialization();
+        let owner_live = Arc::clone(&session);
+        let owner_host = Arc::downgrade(&self.inner);
+        let owner_fanout = Arc::clone(&self.inner.shared.fanout);
         let handle = tokio::spawn(async move {
-            if let Err(err) = inner.await
-                && !err.is_cancelled()
-            {
-                tracing::warn!(
-                    session = owner_session,
-                    phase = "session driver join",
-                    "session driver ended abnormally: {err}"
-                );
-            }
+            let exit = match inner.await {
+                Ok(exit) => exit,
+                Err(err) => {
+                    if !err.is_cancelled() {
+                        tracing::warn!(
+                            session = owner_session,
+                            phase = "session driver join",
+                            "session driver ended abnormally: {err}"
+                        );
+                    }
+                    DriverExit::Ordinary
+                }
+            };
+            // The driver has completed its final flush and queued any terminal
+            // storage error. Stop block producers before task/fence/lock
+            // ownership can end, so an incomplete block can drain that reason
+            // but can never continue through a rival materialization.
+            owner_fanout.stop_session_blocks(&owner_session, owner_materialization);
             if !crate::shutdown_background_tasks_owned(&task_registry).await {
                 tracing::warn!(
                     session = owner_session,
@@ -2068,6 +2456,64 @@ impl SessionHost {
             }
             persistence_fence.close().await;
             drop(lock);
+            if let DriverExit::PersistenceFailed(streams) = exit {
+                let Some(inner) = owner_host.upgrade() else {
+                    streams.close();
+                    return;
+                };
+                // This task is stored inside the map entry it must remove, so
+                // the cleanup runs after this owner returns. A concurrent idle
+                // release may already hold the map while joining us; either
+                // path removes the same entry under that one lock.
+                tokio::spawn(async move {
+                    #[cfg(any(test, feature = "test-support"))]
+                    let cleanup_gate = inner
+                        .persistence_cleanup_gate
+                        .lock()
+                        .expect("persistence cleanup gate mutex poisoned")
+                        .take();
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some(gate) = cleanup_gate {
+                        gate.entered.notify_one();
+                        gate.release.notified().await;
+                    }
+                    let removed = {
+                        let mut sessions = inner.sessions.lock().await;
+                        let ours = sessions
+                            .get(&owner_session)
+                            .is_some_and(|entry| Arc::ptr_eq(&entry.session, &owner_live));
+                        let removed = ours.then(|| sessions.remove(&owner_session)).flatten();
+                        if removed.is_some() {
+                            // Nested under the session map just like
+                            // materialization's insertion, so a replacement
+                            // cannot install its stop handle between removal
+                            // of the old map entry and removal of the old stop.
+                            inner
+                                .session_stops
+                                .lock()
+                                .expect("session stops mutex poisoned")
+                                .remove(&owner_session);
+                        }
+                        removed
+                    };
+                    // These are exactly the streams that accepted the error
+                    // before teardown. A reconnect registered afterwards is
+                    // neither closed nor falsely promised that old frame.
+                    streams.close();
+                    if removed.is_some() {
+                        inner.shared.fanout.mark_list_dirty();
+                        if !inner.shut_down.load(Ordering::Acquire) {
+                            let host = SessionHost { inner };
+                            if let Err(err) = host.enumerate().await {
+                                tracing::warn!(
+                                    session = owner_session,
+                                    "could not re-read the store after persistence failure: {err}"
+                                );
+                            }
+                        }
+                    }
+                });
+            }
         });
         session_stops.insert(session_id.clone(), stop.clone());
         drop(session_stops);
@@ -2077,6 +2523,7 @@ impl SessionHost {
                 session: Arc::clone(&session),
                 driver: handle,
                 stop,
+                publication,
             },
         );
         // Here rather than at the callers: a session goes live through
@@ -2103,12 +2550,12 @@ impl SessionHost {
     /// Serve one session's attach block on `id`'s stream.
     async fn serve_block(
         &self,
-        id: fanout::SubscriberId,
         request: &AttachRequest,
         session: &Arc<LiveSession>,
         block: &Sender<Frame>,
-        stopped: &CancellationToken,
+        attachment: &fanout::AttachBlock,
     ) -> bool {
+        let stopped = attachment.stopped();
         // The snapshot and the epoch are read under the log lock, because a
         // head switch moves both under it: reading them separately could
         // pair the old projection with the new epoch.
@@ -2272,10 +2719,9 @@ impl SessionHost {
                 return false;
             }
         }
-        self.inner
-            .shared
-            .fanout
-            .finish_block(id, session.id(), boundary);
+        if !self.inner.shared.fanout.finish_block(attachment, boundary) {
+            return false;
+        }
 
         // `working` and `settings` were read before the projection, and a
         // change during it was held and dropped as lossy. One more `state`
@@ -2286,6 +2732,62 @@ impl SessionHost {
             status.working != working_seen || status.settings != settings_seen
         });
         true
+    }
+}
+
+async fn send_live_command(
+    live: &Arc<LiveSession>,
+    command: Command,
+) -> Result<CommandOutcome, HostError> {
+    let (reply, outcome) = oneshot::channel();
+    if !live.send(Request::Command { command, reply }) {
+        return Err(HostError::Internal("session driver is gone".into()));
+    }
+    outcome
+        .await
+        .map_err(|_| HostError::Internal("session driver dropped the request".into()))?
+}
+
+async fn wait_for_first_publication(
+    log: &Arc<TokioMutex<ConversationLog>>,
+    owner: oneshot::Receiver<Result<(), HostError>>,
+) -> Result<(), HostError> {
+    let owner = owner.await;
+    let log = log.lock().await;
+    // Durability wins over every later condition. The canonical first message
+    // may be followed immediately by a failure or by the turn ending, neither
+    // of which can make that publication disappear.
+    if log.is_durable() {
+        return Ok(());
+    }
+    if let Some(failure) = log.write_failure() {
+        return Err(persistence_host_error(failure));
+    }
+    owner.unwrap_or_else(|_| {
+        Err(HostError::Internal(
+            "the session owner ended before the first prompt reached storage".into(),
+        ))
+    })
+}
+
+pub(crate) fn persistence_host_error(failure: &PersistenceFailure) -> HostError {
+    HostError::Persistence(persistence_failure_message(failure))
+}
+
+pub(crate) fn persistence_failure_message(failure: &PersistenceFailure) -> String {
+    if failure.can_reopen() {
+        format!(
+            "Saving this session failed: {failure}. To protect its history, AJ stopped \
+             the session and will not save more work to it. Free disk space, then reopen \
+             the session. The interrupted action may need to be retried."
+        )
+    } else {
+        format!(
+            "Saving this session failed: {failure}. To protect its history, AJ stopped \
+             the session. This session could not be saved, and the message you just sent was \
+             not recorded. Fix the storage problem, then start a new session and resend the \
+             message."
+        )
     }
 }
 
@@ -2664,6 +3166,74 @@ fn spawn_list_publisher(inner: &Arc<HostInner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn first_publication_success_outranks_a_later_write_failure() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let root = log
+            .set_system_prompt("system".to_string())
+            .expect("system prompt");
+        let first = aj_agent::message::AgentMessage::wire(aj_models::types::Message::User(
+            aj_models::types::UserMessage::text("first"),
+        ));
+        let head = log
+            .append(
+                Some(root.id),
+                aj_session::ThreadKind::User,
+                None,
+                aj_session::ConversationEntryKind::Message { message: first },
+            )
+            .expect("first publication");
+        let fault = aj_session::AppendFaultFixture::new(aj_session::AppendFault::WriteZero);
+        fault.install(&mut log).expect("install write-zero");
+        let second = aj_agent::message::AgentMessage::wire(aj_models::types::Message::User(
+            aj_models::types::UserMessage::text("second"),
+        ));
+        log.append(
+            Some(head.id),
+            aj_session::ThreadKind::User,
+            None,
+            aj_session::ConversationEntryKind::Message { message: second },
+        )
+        .expect_err("later write fails");
+        let log = Arc::new(TokioMutex::new(log));
+        let (owner, outcome) = oneshot::channel();
+        owner
+            .send(Err(HostError::Internal("turn ended".into())))
+            .expect("the waiter remains present");
+
+        wait_for_first_publication(&log, outcome)
+            .await
+            .expect("canonical first publication remains authoritative");
+    }
+
+    #[tokio::test]
+    async fn first_publication_owner_exit_is_a_terminal_outcome() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("system".to_string())
+            .expect("seed the private log without publishing it");
+        let log = Arc::new(TokioMutex::new(log));
+        let (owner, outcome) = oneshot::channel::<Result<(), HostError>>();
+        drop(owner);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_first_publication(&log, outcome),
+        )
+        .await
+        .expect("owner exit is a bounded publication outcome")
+        .expect_err("owner exit cannot leave the create waiting forever");
+
+        assert_eq!(err.code(), "internal");
+        assert!(
+            err.to_string().contains("owner ended"),
+            "the result names the owner-exit boundary: {err}",
+        );
+    }
 
     /// The name a host falls back to is its whole working directory, written
     /// the way a person writes it. Not its last segments: how deep two clones

@@ -776,7 +776,7 @@ impl From<HostError> for ApiError {
             HostError::Conflict { .. } | HostError::Locked { .. } | HostError::Unsupported(_) => {
                 StatusCode::CONFLICT
             }
-            HostError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            HostError::Persistence(_) | HostError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         if status == StatusCode::INTERNAL_SERVER_ERROR {
             tracing::warn!("the host failed internally: {err}");

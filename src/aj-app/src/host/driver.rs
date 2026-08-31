@@ -31,17 +31,19 @@ use std::time::Duration;
 use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::tool::{TaskId, TaskStatus};
-use aj_models::types::UserContent;
+use aj_models::types::{Message, UserContent};
 use aj_session::{
-    EntryRef, SessionMetadata, TaggedEvent, ThreadFilter, repair_interrupted_tool_uses,
+    ConversationError, EntryRef, PersistenceFailure, SessionMetadata, TaggedEvent, ThreadFilter,
+    repair_interrupted_tool_uses,
 };
 use aj_wire::{DurableEvent, Frame};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::host::fanout::SessionStreams;
 use crate::host::live::{self, LiveSession, ReleaseOutcome, ReleasedRow, Request, settings_of};
 use crate::host::{
     Command, CommandOutcome, HeadTarget, HostError, HostShared, QueueOp, SettingsAxis,
-    SettingsChange, mint_epoch,
+    SettingsChange, mint_epoch, persistence_host_error,
 };
 use crate::session::AgentLifecycle;
 use crate::settings::ConfirmOutcome;
@@ -96,7 +98,18 @@ pub(crate) struct Driver {
     turns: Turns,
     lifecycle: AgentLifecycle,
     events: UnboundedReceiver<TaggedEvent>,
+    persistence_failures: UnboundedReceiver<PersistenceFailure>,
     requests: UnboundedReceiver<Request>,
+    stopping_for_persistence: bool,
+    /// The private creator waiting for the first main-user entry to become
+    /// canonical. At most one because an unpublished session accepts no other
+    /// caller and the request itself refuses a busy agent.
+    first_publication: Option<tokio::sync::oneshot::Sender<Result<(), HostError>>>,
+}
+
+pub(crate) enum DriverExit {
+    Ordinary,
+    PersistenceFailed(SessionStreams),
 }
 
 impl Driver {
@@ -104,6 +117,7 @@ impl Driver {
         session: Arc<LiveSession>,
         shared: Arc<HostShared>,
         events: UnboundedReceiver<TaggedEvent>,
+        persistence_failures: UnboundedReceiver<PersistenceFailure>,
         requests: UnboundedReceiver<Request>,
     ) -> Self {
         let turns = Turns::with_handoff(session.handoff.clone());
@@ -113,21 +127,37 @@ impl Driver {
             turns,
             lifecycle: AgentLifecycle::default(),
             events,
+            persistence_failures,
             requests,
+            stopping_for_persistence: false,
+            first_publication: None,
         }
     }
 
-    pub(crate) async fn run(mut self) {
+    pub(crate) async fn run(mut self) -> DriverExit {
         loop {
             tokio::select! {
                 biased;
 
-                // Requests first: a command's refusal has to reflect the
-                // state as of now, and the event arm can be arbitrarily
-                // busy during a streaming turn.
+                Some(failure) = self.persistence_failures.recv() => {
+                    let streams = self.stop_for_persistence(failure).await;
+                    return DriverExit::PersistenceFailed(streams);
+                }
+
+                // After the terminal storage signal, requests come first: a
+                // command's refusal has to reflect the state as of now, and
+                // the event arm can be arbitrarily busy during a streaming
+                // turn. Storage failure is the exception because the fused
+                // session must accept no more mutation.
                 request = self.requests.recv() => {
                     if matches!(&request, Some(Request::Shutdown) | None) {
                         self.session.start_draining();
+                        let failure = self.wind_down().await;
+                        if let Some(failure) = failure {
+                            let streams = self.publish_persistence_failure(&failure);
+                            return DriverExit::PersistenceFailed(streams);
+                        }
+                        return DriverExit::Ordinary;
                     }
                     // A client that keeps commands in flight would
                     // otherwise starve the two arms below for as long as it
@@ -135,11 +165,63 @@ impl Driver {
                     // turn would be reaped. Catching up here also makes the
                     // refusal below reflect the events already in the
                     // channel rather than the state before them.
-                    self.catch_up();
+                    let failure = match self.write_failure().await {
+                        Some(failure) => Some(failure),
+                        None => self.catch_up().await,
+                    };
+                    if let Some(failure) = failure {
+                        self.session.start_draining();
+                        match request {
+                            Some(Request::Command { reply, .. }) => {
+                                let _ = reply.send(Err(persistence_host_error(&failure)));
+                            }
+                            Some(Request::FirstPrompt { reply, .. }) => {
+                                let _ = reply.send(Err(persistence_host_error(&failure)));
+                            }
+                            Some(Request::Release { reply }) => {
+                                let _ = reply.send(ReleaseOutcome::Declined);
+                            }
+                            Some(Request::Shutdown) | None => {}
+                        }
+                        let streams = self.stop_for_persistence(failure).await;
+                        return DriverExit::PersistenceFailed(streams);
+                    }
                     match request {
                         Some(Request::Command { command, reply }) => {
+                            let writes_log_directly =
+                                matches!(&command, Command::Settings(_) | Command::Head { .. });
                             let outcome = self.command(command).await;
+                            // Direct log writers (settings and branch
+                            // flush/repair) return here instead
+                            // of passing through the persistence listener's
+                            // signal. Settings deliberately keep a live change
+                            // even when its log record fails, so their command
+                            // can be accepted while the log is fused.
+                            let failure = if writes_log_directly {
+                                self.write_failure().await
+                            } else {
+                                None
+                            };
+                            if failure.is_some() {
+                                self.session.start_draining();
+                            }
                             let _ = reply.send(outcome);
+                            if let Some(failure) = failure {
+                                let streams = self.stop_for_persistence(failure).await;
+                                return DriverExit::PersistenceFailed(streams);
+                            }
+                        }
+                        Some(Request::FirstPrompt { content, reply }) => {
+                            debug_assert!(
+                                self.first_publication.is_none(),
+                                "one private create owns the unpublished session",
+                            );
+                            match self.prompt(AgentId::Main, content) {
+                                Ok(_) => self.first_publication = Some(reply),
+                                Err(err) => {
+                                    let _ = reply.send(Err(err));
+                                }
+                            }
                         }
                         // Judged here, after the catch-up above, so a command
                         // or an event that arrived before this request has
@@ -152,25 +234,73 @@ impl Driver {
                             };
                             let Some(row) = row else {
                                 let _ = reply.send(ReleaseOutcome::Declined);
+                                if let Some(failure) = self.write_failure().await {
+                                    let streams = self.stop_for_persistence(failure).await;
+                                    return DriverExit::PersistenceFailed(streams);
+                                }
                                 continue;
                             };
-                            self.wind_down().await;
+                            let failure = self.wind_down().await;
                             let _ = reply.send(ReleaseOutcome::Released { row });
-                            return;
+                            if let Some(failure) = failure {
+                                let streams = self.publish_persistence_failure(&failure);
+                                return DriverExit::PersistenceFailed(streams);
+                            }
+                            return DriverExit::Ordinary;
                         }
-                        // The host asked us to stop, or dropped the session.
-                        Some(Request::Shutdown) | None => {
-                            self.wind_down().await;
-                            return;
-                        }
+                        // Handled above, before any unbounded log acquisition.
+                        Some(Request::Shutdown) | None => unreachable!(),
                     }
                 },
 
                 Some(tagged) = self.events.recv() => self.on_event(tagged),
 
-                joined = self.turns.join_next() => self.on_join(joined),
+                joined = self.turns.join_next() => {
+                    if let Some(failure) = self.write_failure().await {
+                        self.session.start_draining();
+                        self.stopping_for_persistence = true;
+                        self.on_join(joined);
+                        let streams = self.stop_for_persistence(failure).await;
+                        return DriverExit::PersistenceFailed(streams);
+                    }
+                    self.on_join(joined);
+                },
             }
         }
+    }
+
+    async fn write_failure(&self) -> Option<PersistenceFailure> {
+        self.session.core.log.lock().await.write_failure().cloned()
+    }
+
+    fn finish_first_publication(&mut self, outcome: Result<(), HostError>) {
+        if let Some(reply) = self.first_publication.take() {
+            let _ = reply.send(outcome);
+        }
+    }
+
+    async fn stop_for_persistence(&mut self, failure: PersistenceFailure) -> SessionStreams {
+        self.session.start_draining();
+        self.stopping_for_persistence = true;
+        self.finish_first_publication(Err(persistence_host_error(&failure)));
+        let streams = self.publish_persistence_failure(&failure);
+        let _ = self.wind_down().await;
+        streams
+    }
+
+    fn publish_persistence_failure(&self, failure: &PersistenceFailure) -> SessionStreams {
+        let epoch = self.session.status().epoch.clone();
+        let error = persistence_host_error(failure);
+        self.shared.fanout.publish_terminal(
+            Frame::Error {
+                session: self.session.id().to_string(),
+                epoch: Some(epoch),
+                code: error.code().to_string(),
+                message: error.to_string(),
+                lock_generation: None,
+            },
+            self.session.materialization(),
+        )
     }
 
     /// Make progress on the arms the request arm's priority skips: publish
@@ -180,11 +310,20 @@ impl Driver {
     /// Events before joins, because a turn's own events precede its join and
     /// the frames this task emits at reap time (a swept sub's `AgentEnd`, a
     /// cancellation notice) belong after them.
-    fn catch_up(&mut self) {
-        self.drain_events();
+    async fn catch_up(&mut self) -> Option<PersistenceFailure> {
+        while let Ok(tagged) = self.events.try_recv() {
+            if let Some(failure) = self.write_failure().await {
+                return Some(failure);
+            }
+            self.on_event(tagged);
+        }
         while let Some(joined) = self.turns.try_join_next() {
+            if let Some(failure) = self.write_failure().await {
+                return Some(failure);
+            }
             self.on_join(joined);
         }
+        None
     }
 
     // -- events ----------------------------------------------------------
@@ -194,6 +333,14 @@ impl Driver {
     /// and start a wake if the event earned one.
     fn on_event(&mut self, tagged: TaggedEvent) {
         let TaggedEvent { entry, event } = tagged;
+        let first_publication = entry.is_some()
+            && matches!(
+                &event,
+                AgentEvent::MessageEnd {
+                    agent_id: AgentId::Main,
+                    message,
+                } if matches!(message.as_stored_wire(), Some(Message::User(_)))
+            );
         // Captured off a borrow, because `publish_event` below takes the
         // event by value. The wake it decides on has to wait until after
         // `apply_lifecycle`: `Turns::spawn_wake` refuses a busy owner, and
@@ -210,6 +357,9 @@ impl Driver {
         };
         self.apply_lifecycle(&event);
         self.publish_event(entry, event);
+        if first_publication {
+            self.finish_first_publication(Ok(()));
+        }
         self.refresh_state();
         self.shared.fanout.mark_list_dirty();
         if !self.session.is_draining()
@@ -271,6 +421,11 @@ impl Driver {
     /// reap swept, wake on queued work, and surface the outcome.
     fn on_join(&mut self, joined: Joined) {
         let Joined { agent, outcome } = joined;
+        if agent == AgentId::Main {
+            self.finish_first_publication(Err(HostError::Internal(
+                "the first prompt ended before its user message reached session storage".into(),
+            )));
+        }
         for idled in self
             .turns
             .reap(&mut self.lifecycle, &self.session.core.task_registry, agent)
@@ -338,13 +493,15 @@ impl Driver {
             // would float it above events still queued behind us.
             Err(TurnError::Recoverable(_)) => {}
             Err(TurnError::Fatal(err)) => {
-                self.publish_event(
-                    None,
-                    AgentEvent::Error {
-                        agent_id: agent,
-                        text: format!("{err}"),
-                    },
-                );
+                if !self.stopping_for_persistence {
+                    self.publish_event(
+                        None,
+                        AgentEvent::Error {
+                            agent_id: agent,
+                            text: format!("{err}"),
+                        },
+                    );
+                }
             }
         }
         self.refresh_state();
@@ -973,7 +1130,7 @@ impl Driver {
             // The abandoned branch's buffered non-punctuation entries
             // belong to it, so they must reach disk before the head moves
             // off them.
-            log.flush_pending().map_err(internal)?;
+            log.flush_pending().map_err(conversation_error)?;
             // Resolved here rather than at the caller, under the same lock
             // that moves the head: a parent read outside it could be
             // superseded by an append before the switch lands (spec 6.6).
@@ -1005,7 +1162,7 @@ impl Driver {
                 aj_session::ConversationError::InvalidHead(_) => {
                     HostError::UnknownEntry(target.named().to_string())
                 }
-                other => internal(other),
+                other => conversation_error(other),
             })?;
             for agent in self.session.core.message_queues.queued_agents() {
                 self.session.core.message_queues.clear(agent);
@@ -1013,7 +1170,7 @@ impl Driver {
             }
             let head = log.head().cloned().expect("set_head installed one");
             let conversation = log.linearize(&head, ThreadFilter::USER);
-            repair_interrupted_tool_uses(&mut log, &conversation).map_err(internal)?;
+            repair_interrupted_tool_uses(&mut log, &conversation).map_err(conversation_error)?;
             let head = log.head().cloned().expect("repair keeps a head");
             let conversation = log.linearize(&head, ThreadFilter::USER);
             // The branch records its own settings, so restoring them
@@ -1116,13 +1273,23 @@ impl Driver {
     /// [`Self::row_for_release`]), so on that path this one finds nothing
     /// pending. It still takes the log lock, which a long-running reader can
     /// hold, and a release is waited on with the host's session map held.
-    async fn wind_down(&mut self) {
+    async fn wind_down(&mut self) -> Option<PersistenceFailure> {
         self.session.start_draining();
         self.turns.cancel_all();
+        let mut persistence_failure = None;
         let grace = tokio::time::sleep(TURN_DRAIN_GRACE);
         tokio::pin!(grace);
         while !self.turns.is_empty() {
             tokio::select! {
+                biased;
+                Some(failure) = self.persistence_failures.recv(), if persistence_failure.is_none() => {
+                    // The listener reports before its turn can join. Taking
+                    // the signal first suppresses that turn's raw fatal error;
+                    // the single actionable storage error is published after
+                    // this ordinary drain completes.
+                    self.stopping_for_persistence = true;
+                    persistence_failure = Some(failure);
+                }
                 joined = self.turns.join_next() => self.on_join(joined),
                 Some(tagged) = self.events.recv() => self.on_event(tagged),
                 () = &mut grace => {
@@ -1150,7 +1317,12 @@ impl Driver {
         // Buffered non-punctuation entries (the state records, spawn
         // roots) are lost with the process otherwise: nothing else forces
         // them out.
-        match tokio::time::timeout(LOG_FLUSH_GRACE, self.session.core.log.lock()).await {
+        let flush_failure = match tokio::time::timeout(
+            LOG_FLUSH_GRACE,
+            self.session.core.log.lock(),
+        )
+        .await
+        {
             Ok(mut log) => {
                 if let Err(err) = log.flush_pending() {
                     tracing::warn!(
@@ -1158,6 +1330,9 @@ impl Driver {
                         phase = "log flush",
                         "failed to flush the conversation log at teardown: {err}"
                     );
+                    err.persistence_failure().cloned()
+                } else {
+                    None
                 }
             }
             Err(_) => {
@@ -1166,8 +1341,10 @@ impl Driver {
                     phase = "log flush",
                     "the conversation log remained locked through the flush grace; pending entries were not flushed"
                 );
+                None
             }
-        }
+        };
+        persistence_failure.or(flush_failure)
     }
 
     /// The row a release has to hand the store, or `None` when the session may
@@ -1264,4 +1441,14 @@ fn agent_label(agent: AgentId) -> String {
 
 fn internal(err: impl std::error::Error + Send + Sync + 'static) -> HostError {
     HostError::Internal(Box::new(err))
+}
+
+/// Preserve terminal conversation-log failures as the protocol's
+/// `persistence_failed` class. Graph, validation, and serialization failures
+/// remain internal because they do not fuse the live log or start teardown.
+fn conversation_error(err: ConversationError) -> HostError {
+    match err.persistence_failure() {
+        Some(failure) => persistence_host_error(failure),
+        None => internal(err),
+    }
 }

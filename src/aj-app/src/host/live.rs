@@ -12,8 +12,8 @@
 //! against each other, see [`LiveSession::publish_state`].
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex as StdMutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Instant;
 
 use aj_agent::events::{AgentId, AgentSettings};
@@ -28,6 +28,8 @@ use crate::host::{Command, CommandOutcome, HostError};
 use crate::session::SessionCore;
 use crate::session_setup::RunConfigSnapshot;
 
+static NEXT_MATERIALIZATION: AtomicU64 = AtomicU64::new(1);
+
 /// What a session's driver accepts. Every mutation goes through here, so
 /// the driver is the single writer of the turn set, the lifecycle, and the
 /// published status, and no command can race a turn's own bookkeeping.
@@ -35,6 +37,16 @@ pub(crate) enum Request {
     Command {
         command: Command,
         reply: oneshot::Sender<Result<CommandOutcome, HostError>>,
+    },
+    /// Submit a new session's first prompt and answer only when its user
+    /// message reached the canonical log or the owning turn ended without it.
+    ///
+    /// The delayed reply lets creation release the global session map while it
+    /// waits without losing the outcome that decides whether the private id is
+    /// safe to reveal.
+    FirstPrompt {
+        content: Vec<aj_models::types::UserContent>,
+        reply: oneshot::Sender<Result<(), HostError>>,
     },
     /// Wind the session down: cancel its turns through the graceful path,
     /// quiesce background tasks, flush the log. The driver returns
@@ -209,7 +221,10 @@ pub(crate) struct LiveSession {
     requests: UnboundedSender<Request>,
     /// Set before shutdown is queued, so work becoming ready behind an
     /// in-flight command cannot start another turn while the request waits.
-    draining: AtomicBool,
+    draining: Arc<AtomicBool>,
+    /// Process-unique identity of this in-memory owner. Unlike the wire epoch,
+    /// it does not move on a head switch.
+    materialization: u64,
 }
 
 impl LiveSession {
@@ -218,18 +233,24 @@ impl LiveSession {
         handoff: AppendHandoff,
         status: SessionStatus,
         requests: UnboundedSender<Request>,
+        draining: Arc<AtomicBool>,
     ) -> Self {
         Self {
             core,
             handoff,
             status: StdMutex::new(status),
             requests,
-            draining: AtomicBool::new(false),
+            draining,
+            materialization: NEXT_MATERIALIZATION.fetch_add(1, Ordering::Relaxed),
         }
     }
 
     pub(crate) fn id(&self) -> &str {
         &self.core.session_id
+    }
+
+    pub(crate) fn materialization(&self) -> u64 {
+        self.materialization
     }
 
     /// The published status. Never hold this across an await, and never

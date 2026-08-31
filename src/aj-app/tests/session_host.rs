@@ -33,7 +33,10 @@ use aj_models::types::{
     AssistantContent, AssistantError, AssistantMessage, ErrorCategory, StopReason, ToolCall,
     UserContent,
 };
-use aj_session::{ConversationLog, ConversationPersistence, SessionLock, ThreadFilter};
+use aj_session::{
+    AppendFault, AppendFaultFixture, ConversationLog, ConversationPersistence, SessionLock,
+    ThreadFilter,
+};
 use aj_wire::{Frame, ModelSelection, SessionSettings, SessionSummary};
 use tempfile::TempDir;
 use tracing_subscriber::fmt::MakeWriter;
@@ -507,12 +510,16 @@ fn notice(frames: &[Frame], text: &str) -> bool {
         .any(|event| matches!(event, AgentEvent::Notice { text: seen, .. } if seen == text))
 }
 
-/// The text of every `Error` event in `frames`.
+/// The text of every terminal frame or ordinary event error in `frames`.
 fn errors(frames: &[Frame]) -> Vec<String> {
-    events(frames)
-        .into_iter()
-        .filter_map(|event| match event {
-            AgentEvent::Error { text, .. } => Some(text.clone()),
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Error { message, .. } => Some(message.clone()),
+            Frame::Event { event, .. } => match event.known() {
+                Some(AgentEvent::Error { text, .. }) => Some(text.clone()),
+                _ => None,
+            },
             _ => None,
         })
         .collect()
@@ -846,6 +853,142 @@ async fn a_created_session_runs_a_turn_and_publishes_its_frames() {
     assert!(
         seqs.windows(2).all(|pair| pair[0] < pair[1]),
         "live durable seqs are strictly increasing: {seqs:?}",
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_with_prompt_waits_for_first_publication_and_reports_unsaved_message() {
+    let harness = Harness::new(Vec::new());
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    harness.host.fault_next_initial_publication(fault.clone());
+
+    let error = harness
+        .host
+        .create_with(
+            None,
+            Some(vec![UserContent::text("first message")]),
+            Some("must-not-survive".to_string()),
+            None,
+        )
+        .await
+        .expect_err("first publication failure rejects create");
+
+    let CreateError::Refused(HostError::Persistence(message)) = error else {
+        panic!("unexpected create result: {error:?}");
+    };
+    assert!(message.contains("the message you just sent was not recorded"));
+    assert!(message.contains("start a new session"));
+    assert_eq!(fault.writes(), 1, "first publication stopped at write-zero");
+    assert!(
+        harness
+            .host
+            .sessions()
+            .await
+            .expect("session list")
+            .sessions
+            .is_empty(),
+        "the error response cannot race a discoverable unsaved id"
+    );
+    let meta = harness.persistence.sessions_dir().join("meta");
+    let sidecars = if meta.is_dir() {
+        std::fs::read_dir(&meta).expect("read tag sidecars").count()
+    } else {
+        0
+    };
+    assert_eq!(
+        sidecars, 0,
+        "a tag written before failed publication would leave an unreachable sidecar",
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn first_publication_wait_releases_the_global_session_map() {
+    let harness = Harness::new(vec![finalized_text_message("created")]);
+    let existing = harness.create().await;
+    let gate = harness.host.pause_next_first_publication();
+    let host = harness.host.clone();
+    let creating = tokio::spawn(async move {
+        host.create_with(
+            None,
+            Some(vec![UserContent::text("first message")]),
+            None,
+            None,
+        )
+        .await
+    });
+    bounded("the private create to release the map", gate.entered()).await;
+
+    let pending = harness
+        .host
+        .pending_create_id_for_test()
+        .await
+        .expect("the gated create remains private");
+    let canonical = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{pending}.jsonl"));
+    bounded("the first prompt's canonical file", async {
+        while !canonical.is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    harness
+        .host
+        .cache_all_sessions_as_cold_for_test()
+        .expect("stage a stale cold scan");
+    assert!(
+        harness
+            .host
+            .published_directory()
+            .await
+            .sessions
+            .iter()
+            .all(|session| session.id != pending),
+        "a stale cold scan disclosed the pending id before its tag attempt and response",
+    );
+
+    let during = bounded("an unrelated directory read", harness.host.sessions())
+        .await
+        .expect("the directory remains available");
+    assert_eq!(
+        during
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![existing.as_str()],
+        "the pending id leaked, or the established session disappeared",
+    );
+    bounded(
+        "an unrelated session command",
+        harness.host.command(
+            &existing,
+            Command::Tag {
+                tag: Some("still-responsive".to_string()),
+            },
+        ),
+    )
+    .await
+    .expect("the map is not held by first publication");
+
+    gate.release();
+    let created = bounded("the private create result", creating)
+        .await
+        .expect("the create task")
+        .expect("the first message published");
+    assert!(
+        harness
+            .host
+            .sessions()
+            .await
+            .expect("sessions")
+            .sessions
+            .iter()
+            .any(|session| session.id == created),
+        "the id did not become visible after the transaction completed",
     );
     harness.host.shutdown().await;
 }
@@ -1197,6 +1340,54 @@ async fn a_tag_the_store_will_not_take_leaves_the_session_created() {
             .expect("read the sidecar")
             .as_deref(),
         Some("fix-auth"),
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn tag_failure_does_not_skip_a_create_requests_first_prompt() {
+    let harness = Harness::new(Vec::new());
+    let meta = harness.persistence.sessions_dir().join("meta");
+    std::fs::write(&meta, b"not a directory").expect("block the sidecar directory");
+
+    let err = harness
+        .host
+        .create_with(
+            None,
+            Some(vec![UserContent::text("first message must be recorded")]),
+            Some("fix-auth".to_string()),
+            None,
+        )
+        .await
+        .expect_err("the sidecar write cannot land");
+    let CreateError::Incomplete(partial) = err else {
+        panic!("unexpected create result: {err}");
+    };
+    let canonical = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{}.jsonl", partial.session));
+
+    assert!(
+        canonical.exists(),
+        "the response disclosed a created session but returned before attempting and publishing its requested first prompt",
+    );
+    let reopened = ConversationLog::resume(&harness.persistence, &partial.session)
+        .expect("the disclosed session has a canonical log");
+    let recorded = reopened.entries_in_order().into_iter().any(|entry| {
+        let aj_session::ConversationEntryKind::Message { message } = &entry.entry else {
+            return false;
+        };
+        let Some(aj_models::types::Message::User(user)) = message.as_stored_wire() else {
+            return false;
+        };
+        user.content.iter().any(|block| {
+            matches!(block, UserContent::Text(text) if text.text == "first message must be recorded")
+        })
+    });
+    assert!(
+        recorded,
+        "file existence is insufficient: the exact requested first prompt did not publish",
     );
     harness.host.shutdown().await;
 }
@@ -5321,6 +5512,662 @@ const CHILD_ANSWER: &str = "a child answer streamed one character at a time, at 
                             so that the run it belongs to is still going when the parent \
                             turn that spawned it has already finished its own";
 
+/// A detached listener's failed append must end only its materialization.
+///
+/// The fault wraps a real `O_APPEND` descriptor and leaves a physical partial
+/// record. The error signal is therefore proving the production path, not a
+/// helper that reports failure without first fusing the shared log.
+#[tokio::test]
+async fn detached_persistence_failure_tears_down_only_its_hosted_session() {
+    let harness =
+        Harness::with_provider(scripted(detached_sub_turn(), 1, Duration::from_millis(20)));
+    let affected = harness.create().await;
+    let healthy = harness.create().await;
+    harness
+        .install_script(
+            &healthy,
+            vec![
+                finalized_text_message("healthy baseline"),
+                finalized_text_message("healthy answer"),
+            ],
+        )
+        .await;
+    let mut affected_client = Client::attach(&harness.host, &affected).await;
+    let mut healthy_client = Client::attach(&harness.host, &healthy).await;
+    harness.prompt(&healthy, "write the healthy baseline").await;
+    let baseline_frames = only(until_idle(&mut healthy_client.stream).await, &healthy);
+    assert_eq!(assistant_text(&baseline_frames), "healthy baseline");
+    let healthy_path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{healthy}.jsonl"));
+    let healthy_baseline = std::fs::read(&healthy_path).expect("read healthy baseline bytes");
+
+    harness
+        .prompt(&affected, "run the detached persistence fault")
+        .await;
+    bounded("the child to outlive its parent turn", async {
+        loop {
+            let list = harness.host.sessions().await.expect("sessions");
+            let parent_idle = list
+                .sessions
+                .iter()
+                .find(|row| row.id == affected)
+                .is_some_and(|row| !row.working);
+            if parent_idle && running_agent_task(&harness, &affected).await.is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    let affected_handles = harness
+        .host
+        .local_handles(&affected)
+        .await
+        .expect("affected live session");
+    let affected_tasks = affected_handles.task_registry.clone();
+    let fault = AppendFaultFixture::new(AppendFault::ShortWrite(23));
+    fault
+        .install(&mut *affected_handles.log.lock().await)
+        .expect("install real append fault");
+
+    let failed_frames = bounded("storage error followed by affected stream EOF", async {
+        let mut frames = Vec::new();
+        while let Some(frame) = affected_client.stream.recv().await {
+            frames.push(frame);
+        }
+        frames
+    })
+    .await;
+    let failed_frames = only(failed_frames, &affected);
+    let storage_errors = errors(&failed_frames);
+    assert_eq!(storage_errors.len(), 1, "one owner-visible failure");
+    assert!(
+        storage_errors[0].starts_with("Saving this session failed:"),
+        "actionable storage error: {storage_errors:?}"
+    );
+    assert!(
+        storage_errors[0].contains("AJ stopped the session")
+            && storage_errors[0].contains("reopen the session"),
+        "the error names containment: {storage_errors:?}"
+    );
+    assert!(
+        !events(&failed_frames)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TaskEnd { .. })),
+        "the owner signal must terminalize delivery before TaskEnd could wake an alternate stop path"
+    );
+
+    bounded("affected task reap and advisory-lock release", async {
+        loop {
+            let reaped = affected_tasks
+                .snapshot()
+                .iter()
+                .all(|task| task.status != TaskStatus::Running);
+            let unlocked = !SessionLock::is_held(&harness.persistence, &affected)
+                .expect("probe affected lock");
+            if reaped && unlocked {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let writes_after_teardown = fault.writes();
+    assert_eq!(
+        writes_after_teardown, 2,
+        "one partial write and its failed continuation"
+    );
+    let affected_path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{affected}.jsonl"));
+    let torn_bytes = std::fs::read(&affected_path).expect("read faulted session bytes");
+    assert!(
+        !torn_bytes.ends_with(b"\n"),
+        "the fixture did not leave the physical partial record the fuse contains"
+    );
+    assert_eq!(
+        std::fs::read(&healthy_path).expect("re-read healthy baseline bytes"),
+        healthy_baseline,
+        "failed-session teardown changed another session's durable bytes"
+    );
+
+    harness.prompt(&healthy, "keep going").await;
+    let healthy_frames = only(until_idle(&mut healthy_client.stream).await, &healthy);
+    assert_eq!(assistant_text(&healthy_frames), "healthy answer");
+    assert_eq!(
+        fault.writes(),
+        writes_after_teardown,
+        "other-session work never touches the fused descriptor"
+    );
+    assert_eq!(
+        std::fs::read(&affected_path).expect("re-read faulted session bytes"),
+        torn_bytes,
+        "healthy-session work appended after the affected torn tail"
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn foreground_persistence_failure_uses_the_same_single_stop_path() {
+    let harness = Harness::new(vec![
+        finalized_text_message("first answer"),
+        finalized_text_message("answer after rematerialization"),
+    ]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "materialize the log").await;
+    let first = only(until_idle(&mut client.stream).await, &session);
+    assert_eq!(assistant_text(&first), "first answer");
+
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let cleanup_gate = harness.host.pause_next_persistence_cleanup();
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    fault
+        .install(&mut *handles.log.lock().await)
+        .expect("install zero-write fault");
+
+    harness.prompt(&session, "this prompt cannot persist").await;
+    let frames = frames_until(&mut client.stream, "foreground storage error", |frame| {
+        matches!(
+            frame,
+            Frame::Error { message, .. }
+                if message.starts_with("Saving this session failed:")
+        )
+    })
+    .await;
+    let storage_errors = errors(&only(frames, &session));
+    assert_eq!(storage_errors.len(), 1, "foreground failure reported once");
+    assert!(storage_errors[0].starts_with("Saving this session failed:"));
+    assert_eq!(fault.writes(), 1, "write-zero fused on the first syscall");
+
+    // Reconnect while the failed owner is still winding down. The attach must
+    // join and replace that draining materialization, not reuse its fused log,
+    // and the old cleanup must close only the stream that received its error.
+    bounded(
+        "failed owner cleanup to reach its map boundary",
+        cleanup_gate.entered(),
+    )
+    .await;
+    let mut reopened = Client::attach(&harness.host, &session).await;
+    cleanup_gate.release();
+    bounded("the old errored stream to close", async {
+        while client.stream.recv().await.is_some() {}
+    })
+    .await;
+    assert!(
+        harness.host.has_session_stop(&session),
+        "outgoing cleanup deleted the replacement generation's stop controls"
+    );
+    harness
+        .prompt(&session, "run after rematerialization")
+        .await;
+    let after = only(until_idle(&mut reopened.stream).await, &session);
+    assert_eq!(assistant_text(&after), "answer after rematerialization");
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistence_error_survives_an_attach_block_already_in_progress() {
+    let harness = Harness::new(vec![finalized_text_message("first answer")]);
+    let session = harness.create().await;
+    let mut live = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "materialize the log").await;
+    let _ = until_idle(&mut live.stream).await;
+
+    // Registration precedes projection, and the block channel has capacity
+    // one. Not reading parks this subscriber in AttachState::Attaching while
+    // the persistence failure and teardown happen.
+    let mut attaching = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("second attach starts");
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    fault
+        .install(&mut *handles.log.lock().await)
+        .expect("install zero-write fault");
+    harness
+        .prompt(&session, "fail while the block is parked")
+        .await;
+
+    let frames = bounded("parked block transition, terminal error, then EOF", async {
+        let mut frames = Vec::new();
+        while let Some(frame) = attaching.recv().await {
+            frames.push(frame);
+        }
+        frames
+    })
+    .await;
+    let caught = frames
+        .iter()
+        .position(|frame| matches!(frame, Frame::CaughtUp { .. }));
+    let error = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                Frame::Error { message, .. }
+                    if message.starts_with("Saving this session failed:")
+            )
+        })
+        .expect("terminal storage error was delivered");
+    if let Some(caught) = caught {
+        assert!(
+            caught < error,
+            "a completed block precedes its terminal error"
+        );
+    }
+    assert_eq!(errors(&only(frames, &session)).len(), 1);
+    bounded("the original live stream to close", async {
+        while live.stream.recv().await.is_some() {}
+    })
+    .await;
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistence_failure_racing_shutdown_publishes_one_storage_error() {
+    let harness = Harness::new(vec![finalized_text_message("first answer")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "materialize the log").await;
+    let _ = until_idle(&mut client.stream).await;
+    {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let mut cfg = handles
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned");
+        cfg.provider = scripted(
+            vec![finalized_text_message(
+                "a deliberately slow answer that shutdown cancels before completion",
+            )],
+            1,
+            Duration::from_millis(20),
+        );
+    }
+    harness
+        .prompt(&session, "start the turn shutdown will cancel")
+        .await;
+    let _ = frames_until(
+        &mut client.stream,
+        "the assistant stream to start",
+        |frame| {
+            matches!(
+                frame,
+                Frame::Event { event, .. }
+                    if matches!(event.known(), Some(AgentEvent::MessageUpdate { .. }))
+            )
+        },
+    )
+    .await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    fault
+        .install(&mut *handles.log.lock().await)
+        .expect("install zero-write fault");
+
+    let host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { host.shutdown().await });
+    let frames = bounded("shutdown storage error followed by EOF", async {
+        let mut frames = Vec::new();
+        while let Some(frame) = client.stream.recv().await {
+            frames.push(frame);
+        }
+        frames
+    })
+    .await;
+    shutdown.await.expect("shutdown task");
+    let reported = errors(&only(frames, &session));
+    assert_eq!(
+        reported.len(),
+        1,
+        "shutdown must not publish raw plus actionable errors"
+    );
+    assert!(reported[0].starts_with("Saving this session failed:"));
+}
+
+#[tokio::test]
+async fn final_teardown_flush_failure_still_publishes_the_storage_error() {
+    let harness = Harness::new(vec![finalized_text_message("first answer")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "materialize the log").await;
+    let _ = until_idle(&mut client.stream).await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    {
+        let mut log = handles.log.lock().await;
+        log.append_model_change(ThreadFilter::USER, "provider", "model")
+            .expect("pending setting");
+    }
+    let fault = AppendFaultFixture::new(AppendFault::Flush);
+    fault
+        .install(&mut *handles.log.lock().await)
+        .expect("install flush fault");
+    let mut attaching = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach block starts before teardown flush");
+
+    let host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { host.shutdown().await });
+    let frames = bounded("final-flush storage error followed by EOF", async {
+        let mut frames = Vec::new();
+        while let Some(frame) = client.stream.recv().await {
+            frames.push(frame);
+        }
+        frames
+    })
+    .await;
+    shutdown.await.expect("shutdown task");
+    let reported = errors(&only(frames, &session));
+    assert_eq!(
+        reported.len(),
+        1,
+        "final flush failure is user-visible once"
+    );
+    assert!(reported[0].starts_with("Saving this session failed:"));
+    let attached_frames = bounded("aborted block terminal error followed by EOF", async {
+        let mut frames = Vec::new();
+        while let Some(frame) = attaching.recv().await {
+            frames.push(frame);
+        }
+        frames
+    })
+    .await;
+    let attached_errors = errors(&only(attached_frames, &session));
+    assert_eq!(
+        attached_errors.len(),
+        1,
+        "the final-flush error survives block cancellation"
+    );
+    assert_eq!(fault.writes(), 1);
+    assert_eq!(fault.flushes(), 1);
+}
+
+#[tokio::test]
+async fn direct_head_flush_failure_stops_before_moving_the_head() {
+    let harness = Harness::new(vec![finalized_text_message("first answer")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "materialize the log").await;
+    let _ = until_idle(&mut client.stream).await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let (target, head_before_switch) = {
+        let mut log = handles.log.lock().await;
+        let target = log.head().cloned().expect("message head");
+        log.append_model_change(ThreadFilter::USER, "provider", "model")
+            .expect("stage pending state entry");
+        let head_before_switch = log.head().cloned().expect("state entry head");
+        (target, head_before_switch)
+    };
+    let fault = AppendFaultFixture::new(AppendFault::Flush);
+    fault
+        .install(&mut *handles.log.lock().await)
+        .expect("install flush fault");
+
+    let outcome = harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(target),
+            },
+        )
+        .await;
+    let command_error = outcome.expect_err("failed direct flush is returned");
+    assert!(
+        matches!(command_error, HostError::Persistence(_)),
+        "the direct writer disagrees with its terminal persistence frame: {command_error:?}",
+    );
+    assert_eq!(command_error.code(), "persistence_failed");
+    let command_message = command_error.to_string();
+    let frames = bounded(
+        "direct-writer storage error followed by stream EOF",
+        async {
+            let mut frames = Vec::new();
+            while let Some(frame) = client.stream.recv().await {
+                frames.push(frame);
+            }
+            frames
+        },
+    )
+    .await;
+    let frames = only(frames, &session);
+    let terminal: Vec<(&str, &str)> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Error { code, message, .. } => Some((code.as_str(), message.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        terminal,
+        vec![("persistence_failed", command_message.as_str())],
+        "the command result and stream frame must use one storage-failure vocabulary",
+    );
+    let log = handles.log.lock().await;
+    assert_eq!(
+        log.head(),
+        Some(&head_before_switch),
+        "the failed flush must not move the branch head"
+    );
+    assert!(
+        log.write_failure().is_some(),
+        "direct failure fused the log"
+    );
+    drop(log);
+    assert_eq!(fault.writes(), 1, "one pending line was written");
+    assert_eq!(fault.flushes(), 1, "the failing flush ran once");
+    harness.host.shutdown().await;
+}
+
+/// Canceling one failed session's blocked backfill must continue the serial
+/// producer through every sibling block the stream promised.
+#[tokio::test]
+async fn a_failed_attach_block_does_not_cancel_its_healthy_siblings_block() {
+    let harness = Harness::new(vec![
+        finalized_text_message("first answer"),
+        finalized_text_message("second answer"),
+    ]);
+    let failed = harness.create().await;
+    let healthy = harness.create().await;
+    let mut failed_setup = Client::attach(&harness.host, &failed).await;
+    harness.prompt(&failed, "materialize the failed log").await;
+    let _ = until_idle(&mut failed_setup.stream).await;
+    drop(failed_setup);
+    let failed_handles = harness
+        .host
+        .local_handles(&failed)
+        .await
+        .expect("the failed session is live");
+    let target = {
+        let mut log = failed_handles.log.lock().await;
+        let target = log.head().cloned().expect("message head");
+        log.append_model_change(ThreadFilter::USER, "provider", "model")
+            .expect("stage a pending state entry");
+        target
+    };
+    let fault = AppendFaultFixture::new(AppendFault::Flush);
+    fault
+        .install(&mut *failed_handles.log.lock().await)
+        .expect("install the direct flush fault");
+
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&failed), attach_request(&healthy)])
+        .await
+        .expect("one stream promises both blocks");
+    let first = bounded("the failed session's opening State", stream.recv())
+        .await
+        .expect("the promised block begins");
+    assert!(
+        matches!(&first, Frame::State { session, .. } if session == &failed),
+        "the failed session was not the serial producer's first block: {first:?}",
+    );
+    // The capacity-one producer can now advance into that session's backfill
+    // while the client deliberately stops draining it.
+    let err = harness
+        .host
+        .command(
+            &failed,
+            Command::Head {
+                target: HeadTarget::Entry(target),
+            },
+        )
+        .await
+        .expect_err("the direct flush fails");
+    assert_eq!(err.code(), "persistence_failed");
+
+    let baseline = frames_until(
+        &mut stream,
+        "the healthy sibling's caught-up boundary",
+        |frame| matches!(frame, Frame::CaughtUp { session, .. } if session == &healthy),
+    )
+    .await;
+    assert!(
+        baseline
+            .iter()
+            .any(|frame| matches!(frame, Frame::State { session, .. } if session == &healthy)),
+        "the sibling received CaughtUp without its promised State baseline: {baseline:?}",
+    );
+    let terminal = frames_until(
+        &mut stream,
+        "the failed session's terminal error",
+        |frame| {
+            matches!(frame, Frame::Error { session, code, .. }
+            if session == &failed && code == "persistence_failed")
+        },
+    )
+    .await;
+    assert!(
+        terminal
+            .iter()
+            .all(|frame| !matches!(frame, Frame::Error { session, .. } if session == &healthy)),
+        "the failed block terminalized its healthy sibling: {terminal:?}",
+    );
+
+    harness.prompt(&healthy, "still attached").await;
+    let later = frames_until(&mut stream, "later live output from the healthy sibling", |frame| {
+        matches!(frame, Frame::Event { session, durability: Some(_), .. } if session == &healthy)
+    })
+    .await;
+    assert!(
+        later
+            .iter()
+            .any(|frame| matches!(frame, Frame::Event { session, .. } if session == &healthy)),
+        "the sibling had a baseline but was not left live",
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn persistence_terminal_binding_survives_a_head_switch_epoch() {
+    let harness = Harness::new(vec![finalized_text_message("first answer")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "materialize the log").await;
+    let _ = until_idle(&mut client.stream).await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let head = handles
+        .log
+        .lock()
+        .await
+        .head()
+        .cloned()
+        .expect("message head");
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(head),
+            },
+        )
+        .await
+        .expect("head switch succeeds");
+    let switched = frames_until(&mut client.stream, "head switch reset", |frame| {
+        matches!(frame, Frame::Reset { .. })
+    })
+    .await;
+    for frame in switched {
+        let _ = client.client.apply(&mut client.chat, frame);
+    }
+
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    fault
+        .install(&mut *handles.log.lock().await)
+        .expect("install zero-write fault");
+    harness
+        .prompt(&session, "fail under the switched epoch")
+        .await;
+    let frames = bounded("switched-epoch storage error followed by EOF", async {
+        let mut frames = Vec::new();
+        while let Some(frame) = client.stream.recv().await {
+            frames.push(frame);
+        }
+        frames
+    })
+    .await;
+    let frames = only(frames, &session);
+    let reported = errors(&frames);
+    assert_eq!(reported.len(), 1);
+    assert!(reported[0].starts_with("Saving this session failed:"));
+    for frame in frames {
+        let _ = client.client.apply(&mut client.chat, frame);
+    }
+    assert!(
+        client
+            .chat
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .any(|entry| matches!(
+                &entry.kind,
+                aj_app::chat::EntryKind::Notice(notice)
+                    if notice.level == aj_app::chat::NoticeLevel::Error
+                        && notice.text.starts_with("Saving this session failed:")
+            )),
+        "the epoch-independent terminal frame folded into the real client"
+    );
+    harness.host.shutdown().await;
+}
+
 /// Which gesture ends the detached run.
 #[derive(Clone, Copy, Debug)]
 enum EndDetached {
@@ -7133,6 +7980,56 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
     harness.host.shutdown().await;
 }
 
+#[tokio::test]
+async fn compaction_checkpoint_failure_enters_persistence_teardown() {
+    let harness = Harness::new(vec![
+        finalized_text_message("first answer"),
+        finalized_text_message("second answer"),
+        finalized_text_message("SUMMARY of the earlier work"),
+    ]);
+    harness
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .compact_keep_recent = 10;
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "one").await;
+    let _ = until_idle(&mut client.stream).await;
+    harness
+        .prompt(&session, &format!("two {}", "X".repeat(2000)))
+        .await;
+    let _ = until_idle(&mut client.stream).await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    fault
+        .install(&mut *handles.log.lock().await)
+        .expect("install zero-write fault");
+
+    harness
+        .host
+        .command(&session, Command::Compact { instructions: None })
+        .await
+        .expect("manual compaction starts");
+    let frames = bounded("compaction storage error followed by EOF", async {
+        let mut frames = Vec::new();
+        while let Some(frame) = client.stream.recv().await {
+            frames.push(frame);
+        }
+        frames
+    })
+    .await;
+    let reported = errors(&only(frames, &session));
+    assert_eq!(reported.len(), 1);
+    assert!(reported[0].starts_with("Saving this session failed:"));
+    assert_eq!(fault.writes(), 1, "checkpoint write fused immediately");
+    harness.host.shutdown().await;
+}
+
 /// A blank prompt is refused rather than sent as an empty user message,
 /// matching the local submit gesture's refusal.
 #[tokio::test]
@@ -7265,23 +8162,19 @@ async fn a_panicked_turn_leaves_the_session_idle() {
     harness.host.shutdown().await;
 }
 
-/// A turn's fatal error belongs to its session, not to the host (spec
-/// section 5): it surfaces as an error frame on that session's stream, the
-/// session stays live and usable, and another session on the same host is
-/// untouched by it.
+/// A persistence-fatal turn ends its session, not its host (spec section 5):
+/// it surfaces as the actionable storage error before that session's stream
+/// closes, while another session on the same host remains usable.
 ///
 /// The fault is a log that cannot be opened. The first punctuating append
 /// creates the file with `create_new`, so a path that is already taken makes
 /// that append fail, and the append runs inside an inline bus listener whose
 /// error is exactly a fatal turn error.
 #[tokio::test]
-async fn a_fatal_turn_error_stays_inside_its_session() {
+async fn a_persistence_fatal_turn_tears_down_only_its_session() {
     let harness = Harness::new(Vec::new());
     let broken = harness.create().await;
     let healthy = harness.create().await;
-    harness
-        .install_script(&broken, vec![finalized_text_message("recovered")])
-        .await;
     harness
         .install_script(&healthy, vec![finalized_text_message("all fine here")])
         .await;
@@ -7295,17 +8188,33 @@ async fn a_fatal_turn_error_stays_inside_its_session() {
     std::fs::write(&log_path, "").expect("take the path the log wants");
 
     harness.prompt(&broken, "hi").await;
-    let frames = broken_client.pump_until_idle().await;
+    let frames = bounded("failed session error and EOF", async {
+        let mut frames = Vec::new();
+        while let Some(frame) = broken_client.stream.recv().await {
+            frames.push(frame);
+        }
+        frames
+    })
+    .await;
 
     let reported = errors(&frames);
+    assert_eq!(reported.len(), 1, "the failed append is reported once");
+    assert!(reported[0].starts_with("Saving this session failed:"));
     assert!(
-        reported.iter().any(|text| text.starts_with("IO error")),
-        "the failed append surfaced as an error frame: {reported:?}",
+        reported[0].contains("the message you just sent was not recorded")
+            && reported[0].contains("start a new session"),
+        "first publication names the unsaved prompt and honest recovery: {reported:?}"
     );
     assert!(
         !reported.iter().any(|text| text.contains("panicked")),
         "and as the turn's own error rather than a dead task: {reported:?}",
     );
+    bounded("failed session lock release", async {
+        while SessionLock::is_held(&harness.persistence, &broken).expect("probe broken lock") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
 
     // The host kept serving: the other session runs its turn.
     harness.prompt(&healthy, "you ok?").await;
@@ -7314,22 +8223,6 @@ async fn a_fatal_turn_error_stays_inside_its_session() {
         assistant_rows(&healthy_client.chat, AgentId::Main),
         vec!["all fine here".to_string()],
         "a fatal error in one session does not touch another",
-    );
-    assert!(
-        errors(&broken_client.drain_into_fold()).is_empty(),
-        "and the other session's turn earned no error of its own",
-    );
-
-    // And the failed session is still live: once the fault clears, the next
-    // prompt runs a turn rather than finding a session the host tore down.
-    std::fs::remove_file(&log_path).expect("clear the fault");
-    harness.prompt(&broken, "again").await;
-    broken_client.pump_until_idle().await;
-    assert!(
-        assistant_rows(&broken_client.chat, AgentId::Main)
-            .iter()
-            .any(|text| text == "recovered"),
-        "the session survived its own fatal turn error",
     );
     harness.host.shutdown().await;
 }
@@ -11940,12 +12833,11 @@ async fn shutdown_closes_an_attach_block_waiting_on_the_log() {
     })
     .await;
 
-    let ended = tokio::time::timeout(Duration::from_millis(100), stream.recv())
-        .await
-        .expect("shutdown stops the blocked producer before winding the driver down");
     assert!(
-        ended.is_none(),
-        "an aborted partial attach block ends at EOF"
+        tokio::time::timeout(Duration::from_millis(100), stream.recv())
+            .await
+            .is_err(),
+        "an aborted block waits for a possible terminal persistence error"
     );
     assert!(
         !shutdown.is_finished(),
@@ -11962,6 +12854,12 @@ async fn shutdown_closes_an_attach_block_waiting_on_the_log() {
     bounded("host shutdown", shutdown)
         .await
         .expect("shutdown task");
+    assert!(
+        bounded("the aborted block to reach final EOF", stream.recv())
+            .await
+            .is_none(),
+        "an ordinary shutdown with no storage error ends at EOF"
+    );
     let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
         .expect("try_acquire")
         .expect("shutdown released the advisory lock after stopping the block");

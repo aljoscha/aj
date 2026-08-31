@@ -463,9 +463,11 @@ pub async fn confirm_thinking_for_main(
     }
 }
 
-/// Split an append result into the entry it produced and the note to show
-/// when it failed. A failed record is not fatal: the change is live for
-/// this session, it just will not survive a resume.
+/// Split an append result into the entry it produced and the note to show when
+/// it failed. Pre-persistence failures leave the live setting in place with the
+/// note. A persistence I/O failure has already fused the log, and the hosted
+/// driver observes that state after this confirmation and tears the session
+/// down rather than treating the note as recoverable.
 fn record(
     appended: Result<EntryRef, aj_session::ConversationError>,
 ) -> (Option<EntryRef>, Option<String>) {

@@ -23,11 +23,15 @@
 //! helpers (`last_message`, `messages`, etc.) the binary uses to
 //! decide thinking efforts and resume state.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use aj_agent::events::AgentSettings;
@@ -43,6 +47,9 @@ use crate::tool_details::{compact_message, expand_message};
 pub enum ConversationError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// The first persistence failure permanently fused this live log.
+    #[error("conversation log write failed: {0}")]
+    WriteFailed(#[from] PersistenceFailure),
     #[error("JSON parsing error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("conversation log is corrupt: {0}")]
@@ -55,6 +62,157 @@ pub enum ConversationError {
     /// could not name a log in this store and is never turned into a path.
     #[error("{0:?} is not a session id")]
     InvalidSessionId(String),
+}
+
+impl ConversationError {
+    /// The terminal persistence failure carried by this error, when any.
+    pub fn persistence_failure(&self) -> Option<&PersistenceFailure> {
+        match self {
+            Self::WriteFailed(failure) => Some(failure),
+            _ => None,
+        }
+    }
+}
+
+/// The first I/O failure that made one live conversation log unsafe to write.
+///
+/// Clones share the original `std::io::Error`, so the listener and driver can
+/// report the same OS failure without reopening or retrying the descriptor.
+#[derive(Clone, Debug)]
+pub struct PersistenceFailure(Arc<PersistenceFailureInner>);
+
+#[derive(Debug)]
+struct PersistenceFailureInner {
+    error: std::io::Error,
+    durable_log: bool,
+}
+
+impl PartialEq for PersistenceFailure {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PersistenceFailure {}
+
+impl PersistenceFailure {
+    fn new(error: std::io::Error, durable_log: bool) -> Self {
+        Self(Arc::new(PersistenceFailureInner { error, durable_log }))
+    }
+
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.0.error.kind()
+    }
+
+    /// Whether this live object had an installed canonical log before failure.
+    pub fn can_reopen(&self) -> bool {
+        self.0.durable_log
+    }
+}
+
+impl std::fmt::Display for PersistenceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.error.fmt(f)
+    }
+}
+
+impl std::error::Error for PersistenceFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0.error)
+    }
+}
+
+/// Cloneable sending half of one session driver's first-write-failure signal.
+#[derive(Clone)]
+pub struct PersistenceFailureSignal {
+    sent: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::UnboundedSender<PersistenceFailure>,
+    #[cfg(test)]
+    after_report: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl PersistenceFailureSignal {
+    pub(crate) fn report(&self, failure: PersistenceFailure) {
+        // This is the intake gate the hosted driver reads. Set before the
+        // notification and while the failing writer still owns the log mutex.
+        self.draining.store(true, Ordering::Release);
+        if self
+            .sent
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.tx.send(failure);
+            #[cfg(test)]
+            if let Some(after_report) = &self.after_report {
+                after_report();
+            }
+        }
+    }
+}
+
+/// Build the one-shot storage-failure signal owned by one hosted session.
+pub fn persistence_failure_channel() -> (
+    PersistenceFailureSignal,
+    tokio::sync::mpsc::UnboundedReceiver<PersistenceFailure>,
+    Arc<AtomicBool>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let draining = Arc::new(AtomicBool::new(false));
+    (
+        PersistenceFailureSignal {
+            sent: Arc::new(AtomicBool::new(false)),
+            draining: Arc::clone(&draining),
+            tx,
+            #[cfg(test)]
+            after_report: None,
+        },
+        rx,
+        draining,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn persistence_failure_channel_with_hook(
+    after_report: Arc<dyn Fn() + Send + Sync>,
+) -> (
+    PersistenceFailureSignal,
+    tokio::sync::mpsc::UnboundedReceiver<PersistenceFailure>,
+    Arc<AtomicBool>,
+) {
+    let (mut signal, receiver, draining) = persistence_failure_channel();
+    signal.after_report = Some(after_report);
+    (signal, receiver, draining)
+}
+
+enum AppendWriter {
+    File(File),
+    #[cfg(any(test, feature = "test-support"))]
+    Faulting(test_support::FaultingAppendWriter),
+}
+
+impl Write for AppendWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => file.write(bytes),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Faulting(writer) => writer.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::File(file) => file.flush(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Faulting(writer) => writer.flush(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WriteState {
+    Writable,
+    WriteFailed(PersistenceFailure),
 }
 
 /// Why a session environment map cannot be recorded or executed.
@@ -679,6 +837,12 @@ pub struct LogSnapshot {
 /// truncate at most the last line, which [ConversationLog::resume] drops with a
 /// warning before reopening the log for append.
 ///
+/// A returned persistence error permanently fuses this live object. The
+/// uncertain record and every unattempted record remain owned in memory for
+/// diagnostics, but this descriptor is never retried and no later graph or head
+/// mutation is accepted. Recovery belongs to a newly opened object under the
+/// session's ordinary lock.
+///
 /// Concurrent writers are tolerated rather than locked out: the same session
 /// can be resumed in two processes at once (`aj continue <id>` twice). Entry
 /// ids are random (see `mint_id`), so the two writers practically never mint
@@ -700,24 +864,24 @@ pub struct ConversationLog {
     /// from the outset). Keeping creation lazy means a session the user
     /// abandons before typing anything leaves no file in the sessions
     /// directory.
-    file: Option<File>,
+    file: Option<AppendWriter>,
     /// Pre-serialized lines for entries that have been [Self::append]ed
     /// in memory but whose persistence is deferred until the next
     /// "punctuation" append (see [`ConversationEntryKind::is_punctuation`]).
     /// Retained in order until the next punctuation is successfully
     /// published. Resume initialises this empty: anything on disk is already
     /// committed, by definition.
-    pending_writes: Vec<String>,
-    #[cfg(test)]
-    initial_publication_fault: Option<InitialPublicationFault>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InitialPublicationFault {
-    Write,
-    Flush,
-    Install,
+    pending_writes: VecDeque<String>,
+    /// A persistence error is terminal for this live object. The descriptor is
+    /// retained for teardown ownership but is never touched again.
+    write_state: WriteState,
+    /// Installed only by a hosted composition. The log reports from `fuse`, so
+    /// listener appends and direct driver writers share one notification edge.
+    failure_signal: Option<PersistenceFailureSignal>,
+    /// Wakes a create request waiting for its first canonical publication.
+    persistence_changed: Arc<tokio::sync::Notify>,
+    #[cfg(any(test, feature = "test-support"))]
+    initial_publication_writer_fault: Option<test_support::AppendFaultFixture>,
 }
 
 #[cfg(test)]
@@ -969,9 +1133,12 @@ impl ConversationLog {
             },
             path,
             file: None,
-            pending_writes: Vec::new(),
-            #[cfg(test)]
-            initial_publication_fault: None,
+            pending_writes: VecDeque::new(),
+            write_state: WriteState::Writable,
+            failure_signal: None,
+            persistence_changed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            initial_publication_writer_fault: None,
         })
     }
 
@@ -1207,11 +1374,14 @@ impl ConversationLog {
                 head: None,
             },
             path,
-            file: Some(file),
+            file: Some(AppendWriter::File(file)),
             // Anything on disk is by definition already committed.
-            pending_writes: Vec::new(),
-            #[cfg(test)]
-            initial_publication_fault: None,
+            pending_writes: VecDeque::new(),
+            write_state: WriteState::Writable,
+            failure_signal: None,
+            persistence_changed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            initial_publication_writer_fault: None,
         };
         // Recover the head from the last-written user entry. The most
         // recently appended entry is always on the branch that was last
@@ -1274,6 +1444,7 @@ impl ConversationLog {
         agent_id: Option<usize>,
         entry: ConversationEntryKind,
     ) -> Result<EntryRef, ConversationError> {
+        self.ensure_writable()?;
         // Cheap invariant checks. Panics here would indicate an agent-side
         // bug; prefer surfacing as errors.
         match thread {
@@ -1369,21 +1540,17 @@ impl ConversationLog {
 
         let json = serde_json::to_string(&record)?;
 
-        if record.entry.is_punctuation() {
-            if let Some(file) = self.file.as_mut() {
-                // Later appends retain the existing per-line contract. Pass
-                // each entry as one buffer (line plus newline) to narrow the
-                // concurrent-writer interleaving window.
-                let queued: Vec<String> = self.pending_writes.drain(..).collect();
-                for line in &queued {
-                    file.write_all(format!("{line}\n").as_bytes())?;
-                }
-                file.write_all(format!("{json}\n").as_bytes())?;
+        let punctuation = record.entry.is_punctuation();
+        self.pending_writes.push_back(json);
+        if punctuation {
+            let persisted = if self.file.is_some() {
+                self.write_pending_lines()
             } else {
-                self.publish_initial(&json)?;
+                self.publish_initial()
+            };
+            if let Err(error) = persisted {
+                return Err(self.fuse(error));
             }
-        } else {
-            self.pending_writes.push(json);
         }
 
         self.core.order.push(id.clone());
@@ -1409,31 +1576,30 @@ impl ConversationLog {
     /// only when the canonical path remains absent. The staging descriptor is
     /// opened with `O_APPEND` and retained after installation, preserving the
     /// existing concurrent-writer contract without a post-commit reopen gap.
-    fn publish_initial(&mut self, punctuation: &str) -> Result<(), ConversationError> {
+    fn publish_initial(&mut self) -> std::io::Result<()> {
         let mut image = String::new();
         for line in &self.pending_writes {
             image.push_str(line);
             image.push('\n');
         }
-        image.push_str(punctuation);
-        image.push('\n');
 
-        let (stage_path, mut stage) = self.create_initial_stage()?;
+        let (stage_path, stage) = self.create_initial_stage()?;
+        #[cfg(any(test, feature = "test-support"))]
+        let mut stage = match &self.initial_publication_writer_fault {
+            Some(fault) => AppendWriter::Faulting(fault.writer(stage)),
+            None => AppendWriter::File(stage),
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let mut stage = AppendWriter::File(stage);
         let publish = (|| -> std::io::Result<()> {
-            #[cfg(test)]
-            self.inject_initial_publication_fault(InitialPublicationFault::Write)?;
             stage.write_all(image.as_bytes())?;
             #[cfg(test)]
             initial_publication_checkpoint("written");
 
-            #[cfg(test)]
-            self.inject_initial_publication_fault(InitialPublicationFault::Flush)?;
             stage.flush()?;
             #[cfg(test)]
             initial_publication_checkpoint("flushed");
 
-            #[cfg(test)]
-            self.inject_initial_publication_fault(InitialPublicationFault::Install)?;
             #[cfg(test)]
             initial_publication_checkpoint("installing");
             fs::hard_link(&stage_path, &self.path)?;
@@ -1452,7 +1618,7 @@ impl ConversationLog {
                     "could not remove failed initial-publication stage: {cleanup}"
                 );
             }
-            return Err(err.into());
+            return Err(err);
         }
 
         // The canonical hard link is the commit. A cleanup failure can leave
@@ -1466,16 +1632,17 @@ impl ConversationLog {
         }
         self.pending_writes.clear();
         self.file = Some(stage);
+        self.persistence_changed.notify_waiters();
         Ok(())
     }
 
     /// Create one same-directory staging file outside the `.jsonl` namespace.
-    fn create_initial_stage(&self) -> Result<(PathBuf, File), ConversationError> {
+    fn create_initial_stage(&self) -> std::io::Result<(PathBuf, File)> {
         let dir = self.path.parent().ok_or_else(|| {
-            ConversationError::Io(std::io::Error::new(
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("session path {} has no parent", self.path.display()),
-            ))
+            )
         })?;
         for _ in 0..1000 {
             let path = dir.join(format!(
@@ -1486,34 +1653,57 @@ impl ConversationLog {
             match OpenOptions::new().create_new(true).append(true).open(&path) {
                 Ok(file) => return Ok((path, file)),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(err),
             }
         }
-        Err(ConversationError::Io(std::io::Error::new(
+        Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
                 "could not mint an initial-publication stage for {}",
                 self.session_id()
             ),
-        )))
+        ))
     }
 
-    #[cfg(test)]
-    fn inject_initial_publication_fault(
-        &self,
-        fault: InitialPublicationFault,
-    ) -> std::io::Result<()> {
-        if self.initial_publication_fault == Some(fault) {
-            return Err(std::io::Error::other(format!(
-                "injected initial-publication {fault:?} failure"
-            )));
+    /// Write every owned line through the retained append descriptor. A line
+    /// leaves `pending_writes` only after `write_all` completed for that line.
+    fn write_pending_lines(&mut self) -> std::io::Result<()> {
+        while let Some(line) = self.pending_writes.front() {
+            let framed = format!("{line}\n");
+            self.file
+                .as_mut()
+                .expect("a durable log retains its writer")
+                .write_all(framed.as_bytes())?;
+            self.pending_writes.pop_front();
         }
         Ok(())
     }
 
-    #[cfg(test)]
-    fn set_initial_publication_fault(&mut self, fault: Option<InitialPublicationFault>) {
-        self.initial_publication_fault = fault;
+    fn ensure_writable(&self) -> Result<(), ConversationError> {
+        match &self.write_state {
+            WriteState::Writable => Ok(()),
+            WriteState::WriteFailed(failure) => {
+                Err(ConversationError::WriteFailed(failure.clone()))
+            }
+        }
+    }
+
+    fn fuse(&mut self, error: std::io::Error) -> ConversationError {
+        let failure = PersistenceFailure::new(error, self.file.is_some());
+        self.write_state = WriteState::WriteFailed(failure.clone());
+        if let Some(signal) = &self.failure_signal {
+            signal.report(failure.clone());
+        }
+        self.persistence_changed.notify_waiters();
+        ConversationError::WriteFailed(failure)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn set_initial_publication_writer_fault(
+        &mut self,
+        fault: Option<test_support::AppendFaultFixture>,
+    ) {
+        self.initial_publication_writer_fault = fault;
     }
 
     /// Mint a fresh entry id: a random 128-bit value as 32 hex digits,
@@ -1555,6 +1745,7 @@ impl ConversationLog {
     /// [`ConversationError::InvalidHead`], whose message is fit to
     /// surface to the user.
     pub fn set_head(&mut self, id: EntryId) -> Result<(), ConversationError> {
+        self.ensure_writable()?;
         let entry = self.core.entries.get(&id).ok_or_else(|| {
             ConversationError::InvalidHead(format!("entry {id} is not in this session's log"))
         })?;
@@ -1585,17 +1776,55 @@ impl ConversationLog {
     /// property (a session that only ever buffered a system prompt leaves
     /// nothing on disk). The buffered lines stay in memory in that case.
     pub fn flush_pending(&mut self) -> Result<(), ConversationError> {
+        self.ensure_writable()?;
         if self.file.is_none() || self.pending_writes.is_empty() {
             return Ok(());
         }
-        let queued: Vec<String> = self.pending_writes.drain(..).collect();
-        // The file is present (checked above), so write directly rather than
-        // through `ensure_open`, which would otherwise create one.
-        let file = self.file.as_mut().expect("file present, checked above");
-        for line in &queued {
-            file.write_all(format!("{line}\n").as_bytes())?;
+        let mut completed = 0;
+        let persisted = {
+            let file = self.file.as_mut().expect("file present, checked above");
+            let result = (|| -> std::io::Result<()> {
+                for line in &self.pending_writes {
+                    file.write_all(format!("{line}\n").as_bytes())?;
+                    completed += 1;
+                }
+                file.flush()
+            })();
+            result
+        };
+        if let Err(error) = persisted {
+            // A write failure leaves its uncertain line and everything after
+            // it owned. A flush failure leaves every line owned because the
+            // writer did not confirm the complete buffered operation.
+            if completed < self.pending_writes.len() {
+                self.pending_writes.drain(..completed);
+            }
+            return Err(self.fuse(error));
         }
+        self.pending_writes.clear();
         Ok(())
+    }
+
+    /// The first persistence error that fused this live object, if any.
+    pub fn write_failure(&self) -> Option<&PersistenceFailure> {
+        match &self.write_state {
+            WriteState::Writable => None,
+            WriteState::WriteFailed(failure) => Some(failure),
+        }
+    }
+
+    /// Install the hosted driver's one-shot failure sender before the first
+    /// live event. A construction-time failure is reported immediately.
+    pub fn install_failure_signal(&mut self, signal: PersistenceFailureSignal) {
+        if let Some(failure) = self.write_failure().cloned() {
+            signal.report(failure);
+        }
+        self.failure_signal = Some(signal);
+    }
+
+    /// Notification shared with a caller waiting for first publication.
+    pub fn persistence_changed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.persistence_changed)
     }
 
     /// A cloneable image of the entry tree, for reads that should not
@@ -1714,6 +1943,7 @@ impl ConversationLog {
     /// punctuation append (typically the first user message). A log
     /// that never sees a punctuation append leaves no file behind.
     pub fn set_system_prompt(&mut self, text: String) -> Result<EntryRef, ConversationError> {
+        self.ensure_writable()?;
         if !self.core.order.is_empty() {
             return Err(ConversationError::InvalidAppend(
                 "system prompt can only be set on an empty log".to_string(),
@@ -1821,6 +2051,7 @@ impl ConversationLog {
         details: Option<crate::compaction::CompactionDetails>,
         usage: Option<aj_models::types::Usage>,
     ) -> Result<EntryRef, ConversationError> {
+        self.ensure_writable()?;
         if !self.core.entries.contains_key(&first_kept_entry_id) {
             return Err(ConversationError::InvalidAppend(format!(
                 "compaction first_kept_entry_id {first_kept_entry_id} not found in log"
@@ -1971,6 +2202,177 @@ impl<'a> ConversationView<'a> {
         self.head
             .clone()
             .or_else(|| self.log.system_prompt_id().cloned())
+    }
+}
+
+/// Deterministic regular-file append faults for composed persistence tests.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::*;
+
+    /// The descriptor operation one fixture interrupts.
+    #[derive(Clone, Copy, Debug)]
+    pub enum AppendFault {
+        /// Return `Ok(0)` before writing any bytes. `write_all` converts this to
+        /// `ErrorKind::WriteZero`.
+        WriteZero,
+        /// Append exactly this many bytes, then fail the continuation write.
+        ShortWrite(usize),
+        /// Complete this many writer calls, append a prefix on the next call,
+        /// then fail its continuation.
+        ShortWriteAfter {
+            complete_writes: usize,
+            bytes: usize,
+        },
+        /// Accept every write and fail the following flush.
+        Flush,
+    }
+
+    #[derive(Default)]
+    struct FaultState {
+        writes: usize,
+        flushes: usize,
+    }
+
+    /// Owns the fault plan and descriptor-touch counters for one test.
+    #[derive(Clone)]
+    pub struct AppendFaultFixture {
+        fault: AppendFault,
+        state: Arc<std::sync::Mutex<FaultState>>,
+    }
+
+    impl AppendFaultFixture {
+        pub fn new(fault: AppendFault) -> Self {
+            Self {
+                fault,
+                state: Arc::new(std::sync::Mutex::new(FaultState::default())),
+            }
+        }
+
+        /// Replace a materialized log's writer with a wrapper around a newly
+        /// opened `O_APPEND` descriptor for that same regular file.
+        pub fn install(&self, log: &mut ConversationLog) -> std::io::Result<()> {
+            log.ensure_writable().map_err(std::io::Error::other)?;
+            if !log.path.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "fault fixture requires a materialized regular session file",
+                ));
+            }
+            let file = OpenOptions::new().append(true).open(&log.path)?;
+            log.file = Some(AppendWriter::Faulting(self.writer(file)));
+            Ok(())
+        }
+
+        /// Apply this writer to the staging descriptor of the next first
+        /// publication. The canonical path remains absent until that operation.
+        pub fn install_initial(&self, log: &mut ConversationLog) -> std::io::Result<()> {
+            log.ensure_writable().map_err(std::io::Error::other)?;
+            if log.file.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "initial fault requires an unmaterialized log",
+                ));
+            }
+            log.set_initial_publication_writer_fault(Some(self.clone()));
+            Ok(())
+        }
+
+        pub(super) fn writer(&self, file: File) -> FaultingAppendWriter {
+            FaultingAppendWriter {
+                file,
+                fault: self.fault,
+                state: Arc::clone(&self.state),
+            }
+        }
+
+        pub fn writes(&self) -> usize {
+            self.state.lock().expect("fault state poisoned").writes
+        }
+
+        pub fn flushes(&self) -> usize {
+            self.state.lock().expect("fault state poisoned").flushes
+        }
+    }
+
+    pub(super) struct FaultingAppendWriter {
+        file: File,
+        fault: AppendFault,
+        state: Arc<std::sync::Mutex<FaultState>>,
+    }
+
+    impl Write for FaultingAppendWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let call = {
+                let mut state = self.state.lock().expect("fault state poisoned");
+                state.writes += 1;
+                state.writes
+            };
+            match (self.fault, call) {
+                (AppendFault::WriteZero, 1) => Ok(0),
+                (AppendFault::ShortWrite(limit), 1) => {
+                    let written = limit.min(bytes.len());
+                    self.file.write_all(&bytes[..written])?;
+                    Ok(written)
+                }
+                (AppendFault::ShortWrite(_), 2) => Err(std::io::Error::other(
+                    "injected append continuation failure",
+                )),
+                (
+                    AppendFault::ShortWriteAfter {
+                        complete_writes, ..
+                    },
+                    n,
+                ) if n <= complete_writes => {
+                    self.file.write_all(bytes)?;
+                    Ok(bytes.len())
+                }
+                (
+                    AppendFault::ShortWriteAfter {
+                        complete_writes,
+                        bytes: limit,
+                    },
+                    n,
+                ) if n == complete_writes + 1 => {
+                    let written = limit.min(bytes.len());
+                    self.file.write_all(&bytes[..written])?;
+                    Ok(written)
+                }
+                (
+                    AppendFault::ShortWriteAfter {
+                        complete_writes, ..
+                    },
+                    n,
+                ) if n == complete_writes + 2 => Err(std::io::Error::other(
+                    "injected append continuation failure",
+                )),
+                (
+                    AppendFault::WriteZero
+                    | AppendFault::ShortWrite(_)
+                    | AppendFault::ShortWriteAfter { .. },
+                    _,
+                ) => Err(std::io::Error::other(
+                    "fused writer was touched after its first failure",
+                )),
+                (AppendFault::Flush, _) => {
+                    self.file.write_all(bytes)?;
+                    Ok(bytes.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let call = {
+                let mut state = self.state.lock().expect("fault state poisoned");
+                state.flushes += 1;
+                state.flushes
+            };
+            if matches!(self.fault, AppendFault::Flush) && call == 1 {
+                Err(std::io::Error::other("injected append flush failure"))
+            } else {
+                self.file.flush()
+            }
+        }
     }
 }
 
@@ -2285,6 +2687,327 @@ mod tests {
             vec![model_id, thinking_id],
             "both flushed settings entries are on disk in append order after resume"
         );
+    }
+
+    fn assert_fused_mutations_refuse_without_touching_writer(
+        log: &mut ConversationLog,
+        first: &ConversationError,
+        fixture: &test_support::AppendFaultFixture,
+    ) {
+        let writes = fixture.writes();
+        let flushes = fixture.flushes();
+        let len = log.len();
+        let head = log.head().cloned().expect("materialized fixture head");
+        let pending = log.pending_writes.clone();
+        let expected = first.to_string();
+        let first_failure = first
+            .persistence_failure()
+            .expect("first error carries persistence identity");
+
+        for later in [
+            log.append_model_change(ThreadFilter::USER, "other", "other")
+                .expect_err("append after fuse"),
+            log.flush_pending().expect_err("flush fast path after fuse"),
+            log.set_head(head.clone())
+                .expect_err("head mutation after fuse"),
+        ] {
+            assert!(matches!(later, ConversationError::WriteFailed(_)));
+            assert_eq!(
+                later.to_string(),
+                expected,
+                "the first error remains authority"
+            );
+            assert_eq!(
+                later.persistence_failure(),
+                Some(first_failure),
+                "later failures must share the exact first error"
+            );
+        }
+        assert_eq!(log.len(), len, "a refused mutation changed the graph");
+        assert_eq!(
+            log.head(),
+            Some(&head),
+            "a refused mutation changed the head"
+        );
+        assert_eq!(
+            log.pending_writes, pending,
+            "a refused mutation changed pending ownership"
+        );
+        assert_eq!(fixture.writes(), writes, "a refused mutation wrote again");
+        assert_eq!(
+            fixture.flushes(),
+            flushes,
+            "a refused mutation flushed again"
+        );
+    }
+
+    fn graph_state(log: &ConversationLog) -> (Vec<EntryId>, Option<EntryId>, serde_json::Value) {
+        (
+            log.core.order.clone(),
+            log.head().cloned(),
+            serde_json::to_value(log.entries_in_order()).expect("graph serializes"),
+        )
+    }
+
+    fn assert_graph_state(
+        log: &ConversationLog,
+        expected: &(Vec<EntryId>, Option<EntryId>, serde_json::Value),
+    ) {
+        assert_eq!(
+            log.core.order, expected.0,
+            "append order changed on failure"
+        );
+        assert_eq!(log.head(), expected.1.as_ref(), "head changed on failure");
+        assert_eq!(
+            serde_json::to_value(log.entries_in_order()).expect("faulted graph serializes"),
+            expected.2,
+            "an existing entry changed on failure"
+        );
+    }
+
+    #[test]
+    fn zero_and_partial_current_appends_fuse_before_later_mutation() {
+        for (fault, expected_growth, expected_kind) in [
+            (
+                test_support::AppendFault::WriteZero,
+                0,
+                std::io::ErrorKind::WriteZero,
+            ),
+            (
+                test_support::AppendFault::ShortWrite(17),
+                17,
+                std::io::ErrorKind::Other,
+            ),
+        ] {
+            let (_dir, persistence, session_id, _) = resume_fixture();
+            let mut log = ConversationLog::resume(&persistence, &session_id).expect("resume");
+            let path = log.path().to_path_buf();
+            let before_bytes = std::fs::read(&path).expect("read before fault");
+            let before_len = log.len();
+            let before_head = log.head().cloned();
+            let before_order = log.core.order.clone();
+            let before_entries =
+                serde_json::to_value(log.entries_in_order()).expect("fixture graph serializes");
+            let fixture = test_support::AppendFaultFixture::new(fault);
+            fixture.install(&mut log).expect("install append fault");
+
+            let error = punctuation(&mut log, "current punctuation")
+                .expect_err("the current append must fail");
+
+            assert_eq!(
+                error
+                    .persistence_failure()
+                    .expect("typed persistence failure")
+                    .kind(),
+                expected_kind
+            );
+            assert!(
+                error
+                    .persistence_failure()
+                    .expect("typed persistence failure")
+                    .can_reopen(),
+                "the durable fixture retains an ordinary reopen path"
+            );
+            assert_eq!(
+                log.len(),
+                before_len,
+                "failed punctuation entered the graph"
+            );
+            assert_eq!(
+                log.head(),
+                before_head.as_ref(),
+                "failed punctuation moved the head"
+            );
+            assert_eq!(
+                log.core.order, before_order,
+                "failed punctuation changed append order"
+            );
+            assert_eq!(
+                serde_json::to_value(log.entries_in_order()).expect("faulted graph serializes"),
+                before_entries,
+                "failed punctuation changed an existing entry"
+            );
+            assert_eq!(
+                log.pending_writes.len(),
+                1,
+                "failed punctuation lost pending ownership"
+            );
+            let retained_line = log
+                .pending_writes
+                .front()
+                .expect("failed current record retained");
+            let retained: ConversationEntry =
+                serde_json::from_str(retained_line).expect("retained current record JSON");
+            assert_eq!(retained.parent_id, before_head);
+            assert_eq!(retained.thread, ThreadKind::User);
+            assert_eq!(retained.agent_id, None);
+            let ConversationEntryKind::Message { message } = retained.entry else {
+                panic!("retained current record is not a message");
+            };
+            assert_eq!(
+                serde_json::to_value(message).expect("retained message serializes"),
+                serde_json::to_value(user_text("current punctuation"))
+                    .expect("expected message serializes")
+            );
+            let mut expected_bytes = before_bytes.clone();
+            expected_bytes.extend_from_slice(
+                &retained_line.as_bytes()
+                    [..usize::try_from(expected_growth).expect("growth fits usize")],
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("read faulted current bytes"),
+                expected_bytes,
+                "the real file contains the exact current-record prefix"
+            );
+            assert_fused_mutations_refuse_without_touching_writer(&mut log, &error, &fixture);
+        }
+    }
+
+    #[test]
+    fn pending_write_failure_releases_only_completed_record_ownership() {
+        let (_dir, persistence, session_id, _) = resume_fixture();
+        let mut log = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        log.append_model_change(ThreadFilter::USER, "provider", "model")
+            .expect("first pending record");
+        log.append_thinking_change(ThreadFilter::USER, "high")
+            .expect("second pending record");
+        assert_eq!(log.pending_writes.len(), 2);
+        let path = log.path().to_path_buf();
+        let before_bytes = std::fs::read(&path).expect("read before pending fault");
+        let owned = log.pending_writes.clone();
+        let graph = graph_state(&log);
+        let fixture =
+            test_support::AppendFaultFixture::new(test_support::AppendFault::ShortWriteAfter {
+                complete_writes: 1,
+                bytes: 13,
+            });
+        fixture.install(&mut log).expect("install append fault");
+
+        let error = log
+            .flush_pending()
+            .expect_err("the second pending write must fail");
+
+        assert!(matches!(error, ConversationError::WriteFailed(_)));
+        assert_graph_state(&log, &graph);
+        assert_eq!(fixture.writes(), 3, "complete, partial, then error");
+        assert_eq!(
+            log.pending_writes,
+            VecDeque::from([owned[1].clone()]),
+            "the uncertain second record remains owned while the complete first one advances"
+        );
+        let mut expected = before_bytes;
+        expected.extend_from_slice(format!("{}\n", owned[0]).as_bytes());
+        expected.extend_from_slice(&owned[1].as_bytes()[..13]);
+        assert_eq!(
+            std::fs::read(&path).expect("read partial pending bytes"),
+            expected,
+            "the regular file contains one complete line and the exact next-line prefix"
+        );
+        assert_fused_mutations_refuse_without_touching_writer(&mut log, &error, &fixture);
+    }
+
+    #[test]
+    fn pending_flush_failure_keeps_every_record_owned() {
+        let (_dir, persistence, session_id, _) = resume_fixture();
+        let mut log = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        log.append_model_change(ThreadFilter::USER, "provider", "model")
+            .expect("first pending record");
+        log.append_thinking_change(ThreadFilter::USER, "high")
+            .expect("second pending record");
+        let path = log.path().to_path_buf();
+        let before_bytes = std::fs::read(&path).expect("read before flush fault");
+        let owned = log.pending_writes.clone();
+        let graph = graph_state(&log);
+        let fixture = test_support::AppendFaultFixture::new(test_support::AppendFault::Flush);
+        fixture.install(&mut log).expect("install flush fault");
+
+        let error = log
+            .flush_pending()
+            .expect_err("the pending flush must fail");
+
+        assert!(matches!(error, ConversationError::WriteFailed(_)));
+        assert_graph_state(&log, &graph);
+        assert_eq!(fixture.writes(), 2);
+        assert_eq!(fixture.flushes(), 1);
+        assert_eq!(
+            log.pending_writes, owned,
+            "a failed flush keeps the whole uncertain batch owned"
+        );
+        let mut expected = before_bytes;
+        for line in &log.pending_writes {
+            expected.extend_from_slice(format!("{line}\n").as_bytes());
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("read flush-failed bytes"),
+            expected,
+            "the flush failed only after every owned line reached the real file"
+        );
+        assert_fused_mutations_refuse_without_touching_writer(&mut log, &error, &fixture);
+    }
+
+    #[test]
+    fn punctuation_failure_advances_only_fully_written_pending_records() {
+        let (_dir, persistence, session_id, _) = resume_fixture();
+        let mut log = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        log.append_model_change(ThreadFilter::USER, "provider", "model")
+            .expect("first pending record");
+        log.append_thinking_change(ThreadFilter::USER, "high")
+            .expect("second pending record");
+        let path = log.path().to_path_buf();
+        let before_bytes = std::fs::read(&path).expect("read before punctuation fault");
+        let owned = log.pending_writes.clone();
+        let before_len = log.len();
+        let before_head = log.head().cloned();
+        let graph = graph_state(&log);
+        let fixture =
+            test_support::AppendFaultFixture::new(test_support::AppendFault::ShortWriteAfter {
+                complete_writes: 1,
+                bytes: 13,
+            });
+        fixture.install(&mut log).expect("install append fault");
+
+        let error = punctuation(&mut log, "current punctuation")
+            .expect_err("a pending line fails before current punctuation");
+
+        assert!(matches!(error, ConversationError::WriteFailed(_)));
+        assert_graph_state(&log, &graph);
+        assert_eq!(
+            log.len(),
+            before_len,
+            "failed punctuation entered the graph"
+        );
+        assert_eq!(log.head(), before_head.as_ref());
+        assert_eq!(log.pending_writes.len(), 2);
+        assert_eq!(
+            log.pending_writes.front(),
+            Some(&owned[1]),
+            "the partially written second record remains first in ownership"
+        );
+        let retained_current: ConversationEntry = serde_json::from_str(
+            log.pending_writes
+                .back()
+                .expect("failed current record retained"),
+        )
+        .expect("retained current record JSON");
+        assert_eq!(retained_current.parent_id, before_head);
+        assert_eq!(retained_current.thread, ThreadKind::User);
+        assert_eq!(retained_current.agent_id, None);
+        let ConversationEntryKind::Message { message } = retained_current.entry else {
+            panic!("retained current record is not a message");
+        };
+        assert_eq!(
+            serde_json::to_value(message).expect("retained message serializes"),
+            serde_json::to_value(user_text("current punctuation"))
+                .expect("expected message serializes")
+        );
+        let mut expected = before_bytes;
+        expected.extend_from_slice(format!("{}\n", owned[0]).as_bytes());
+        expected.extend_from_slice(&owned[1].as_bytes()[..13]);
+        assert_eq!(
+            std::fs::read(&path).expect("read partial punctuation bytes"),
+            expected
+        );
+        assert_fused_mutations_refuse_without_touching_writer(&mut log, &error, &fixture);
     }
 
     #[test]
@@ -3326,66 +4049,92 @@ mod tests {
     }
 
     #[test]
-    fn surfaced_initial_publication_failures_keep_the_complete_prefix_retryable() {
-        for fault in [
-            InitialPublicationFault::Write,
-            InitialPublicationFault::Flush,
-            InitialPublicationFault::Install,
+    fn surfaced_initial_publication_failures_fuse_without_losing_owned_records() {
+        for (name, block_real_open, writer_fault, expected_calls) in [
+            ("open", true, None, None),
+            (
+                "write",
+                false,
+                Some(test_support::AppendFaultFixture::new(
+                    test_support::AppendFault::WriteZero,
+                )),
+                Some((1, 0)),
+            ),
+            (
+                "flush",
+                false,
+                Some(test_support::AppendFaultFixture::new(
+                    test_support::AppendFault::Flush,
+                )),
+                Some((1, 1)),
+            ),
         ] {
             let dir = fresh_sessions_dir();
             let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-            let (mut log, env) = seeded_env_log(&persistence);
+            let (mut log, _env) = seeded_env_log(&persistence);
+            if block_real_open {
+                let not_a_directory = dir.path().join("not-a-directory");
+                std::fs::write(&not_a_directory, b"fixture-owned blocker")
+                    .expect("create real open blocker");
+                log.path = not_a_directory.join("session.jsonl");
+            }
             let canonical = log.path().to_path_buf();
             let prefix_len = log.len();
             let pending_len = log.pending_writes.len();
+            let prefix_head = log.head().cloned();
+            let prefix_order = log.core.order.clone();
+            let prefix_entries =
+                serde_json::to_value(log.entries_in_order()).expect("creation graph serializes");
 
-            log.set_initial_publication_fault(Some(fault));
+            log.set_initial_publication_writer_fault(writer_fault.clone());
             let err = punctuation(&mut log, "first")
                 .expect_err("the selected initial-publication operation fails");
-            assert!(matches!(err, ConversationError::Io(_)), "{fault:?}: {err}");
-            assert!(!canonical.exists(), "{fault:?}: canonical target escaped");
+            assert!(
+                matches!(err, ConversationError::WriteFailed(_)),
+                "{name}: {err}"
+            );
+            assert!(
+                !err.persistence_failure()
+                    .expect("typed persistence failure")
+                    .can_reopen(),
+                "{name}: first publication has no canonical log to reopen"
+            );
+            if let (Some(fault), Some((writes, flushes))) = (&writer_fault, expected_calls) {
+                assert_eq!(fault.writes(), writes, "{name}: real write calls");
+                assert_eq!(fault.flushes(), flushes, "{name}: real flush calls");
+            }
+            assert!(!canonical.exists(), "{name}: canonical target escaped");
+            assert_eq!(log.len(), prefix_len, "{name}: punctuation entered memory");
+            assert_eq!(log.head(), prefix_head.as_ref(), "{name}: head changed");
+            assert_eq!(log.core.order, prefix_order, "{name}: order changed");
             assert_eq!(
-                log.len(),
-                prefix_len,
-                "{fault:?}: punctuation entered memory"
+                serde_json::to_value(log.entries_in_order()).expect("faulted graph serializes"),
+                prefix_entries,
+                "{name}: existing graph changed"
             );
             assert_eq!(
                 log.pending_writes.len(),
-                pending_len,
-                "{fault:?}: creation prefix was drained"
+                pending_len + 1,
+                "{name}: creation prefix or failed punctuation lost ownership"
             );
-            assert!(
-                stage_paths(dir.path()).is_empty(),
-                "{fault:?}: stage leaked"
-            );
+            assert!(stage_paths(dir.path()).is_empty(), "{name}: stage leaked");
 
-            log.set_initial_publication_fault(None);
-            punctuation(&mut log, "retry").expect("same-log retry publishes");
-            let session_id = log.session_id().to_string();
-            drop(log);
-            let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume retry");
-            assert_eq!(resumed.session_env(), Some(&env), "{fault:?}: env changed");
+            log.set_initial_publication_writer_fault(None);
+            let later = punctuation(&mut log, "retry")
+                .expect_err("a fused live log never retries uncertain bytes");
+            assert_eq!(later.to_string(), err.to_string(), "{name}");
             assert_eq!(
-                resumed
-                    .entries_in_order()
-                    .iter()
-                    .filter(|entry| matches!(entry.entry, ConversationEntryKind::EnvChange { .. }))
-                    .count(),
-                1,
-                "{fault:?}: retry duplicated env identity"
+                later.persistence_failure(),
+                err.persistence_failure(),
+                "{name}: retry did not return the same first failure"
             );
-            assert!(
-                matches!(
-                    resumed.entries_in_order().last().map(|entry| &entry.entry),
-                    Some(ConversationEntryKind::Message { .. })
-                ),
-                "{fault:?}: published image does not end in punctuation"
-            );
+            assert!(!canonical.exists(), "{name}: retry touched the store");
+            assert_eq!(log.pending_writes.len(), pending_len + 1, "{name}");
         }
     }
 
     #[test]
-    fn initial_publication_never_replaces_a_rival_target_and_can_retry() {
+    fn initial_publication_never_replaces_a_rival_target_or_retries_after_failure() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let (mut log, env) = seeded_env_log(&persistence);
@@ -3394,14 +4143,16 @@ mod tests {
         std::fs::write(&canonical, sentinel).expect("install rival target");
 
         let err = punctuation(&mut log, "blocked").expect_err("no-replace install refuses");
-        assert!(matches!(err, ConversationError::Io(_)), "{err}");
+        assert!(matches!(err, ConversationError::WriteFailed(_)), "{err}");
         assert_eq!(std::fs::read(&canonical).expect("rival bytes"), sentinel);
         assert_eq!(log.session_env(), Some(&env));
         assert!(stage_paths(dir.path()).is_empty(), "failed stage leaked");
 
         std::fs::remove_file(&canonical).expect("remove test-owned rival");
-        punctuation(&mut log, "retry").expect("retry after rival leaves");
-        assert!(canonical.is_file());
+        let later = punctuation(&mut log, "retry")
+            .expect_err("the failed live log cannot publish after the rival leaves");
+        assert_eq!(later.to_string(), err.to_string());
+        assert!(!canonical.exists(), "a refused retry recreated the target");
     }
 
     #[test]

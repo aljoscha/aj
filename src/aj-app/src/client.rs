@@ -53,6 +53,13 @@ pub enum Refusal {
         /// this conflict is over.
         generation: Option<u64>,
     },
+    /// The `persistence_failed` code: the live materialization is already
+    /// draining, so the frame itself asks for its replacement.
+    ///
+    /// This is distinct from [`Self::Other`]. A durable failed session stays
+    /// listed, and another client can replace it before a cold row is published,
+    /// so no directory transition is guaranteed to remain observable.
+    PersistenceFailed,
     /// Every other code, the ones this build has never heard of included: the
     /// row's return to the list is the edge, and nothing else. An unknown
     /// refusal behaves like the refusals this build knows rather than like the
@@ -67,12 +74,12 @@ impl Refusal {
     /// Unknown codes deliberately use [`Self::Other`], whose recovery waits for
     /// the session row to leave and return instead of assuming lock semantics.
     pub fn from_code(code: &str, lock_generation: Option<u64>) -> Self {
-        if code == "locked" {
-            Self::Locked {
+        match code {
+            "locked" => Self::Locked {
                 generation: lock_generation,
-            }
-        } else {
-            Self::Other
+            },
+            "persistence_failed" => Self::PersistenceFailed,
+            _ => Self::Other,
         }
     }
 
@@ -81,7 +88,7 @@ impl Refusal {
     pub(crate) fn generation(self) -> Option<u64> {
         match self {
             Self::Locked { generation } => generation,
-            Self::Other => None,
+            Self::PersistenceFailed | Self::Other => None,
         }
     }
 }
@@ -466,11 +473,10 @@ impl SessionClient {
                 // either way, and a code this build has never heard of has to
                 // behave like the refusals it knows (spec 6.6).
                 //
-                // Spec section 5 reserves the kind for a turn's fatal error too,
-                // on a session that stays live. Nothing emits that today, and
-                // the day something does it arrives on the unknown-code path and
-                // tears the attachment down over a turn that failed. Telling
-                // that kind from a refusal is the branch this arm still owes.
+                // Persistence failure uses this epoch-independent shape because
+                // it terminalizes the attachment and the failed materialization.
+                // Its code intentionally follows the same drop path as every
+                // refusal while the message reduces to the visible error row.
                 self.drop_attachment(Refusal::from_code(&code, lock_generation), message.clone());
                 // The message verbatim, which spec 6.6 makes sufficient on its
                 // own, so a code this build has never heard of still reads.
@@ -722,15 +728,13 @@ impl SessionClient {
     /// the next `state` frame to arrive would be taken for the block this
     /// refusal replaced.
     ///
-    /// Withdrawing the re-attach obligation is half a rule, and the other half
-    /// is not here. Asking again immediately is noise, because nothing has
-    /// changed since the refusal, and never asking again strands the client on a
-    /// session whose host was only restarting. So the obligation is withdrawn
-    /// *until the peer's own directory says the answer can have changed*, which
-    /// is `SessionDirectory`'s to notice, and it puts the obligation back
-    /// ([`Self::owe_reattach`]). `refusal` is what tells it which edge to watch.
-    /// Spec 6.5 permits the later attach that costs a full backfill. What it
-    /// does not ask for is a retry loop.
+    /// Directory-waiting refusals withdraw the re-attach obligation until the
+    /// peer's own rows say the answer can have changed. `persistence_failed` is
+    /// the exception: the host enters drain mode before emitting it and joins
+    /// that owner before replacement, so this frame is already the safe edge.
+    /// Waiting for another row would be lossy because replacement can coalesce
+    /// live through cold back to live. Spec 6.5 permits the resulting full
+    /// backfill. Unknown and locked refusals still never become retry loops.
     ///
     /// Deliberately not what a `reset` does. That one says continuity broke on a
     /// session the server still has, so its obligation stands and is discharged
@@ -744,8 +748,17 @@ impl SessionClient {
             reset.retry();
         }
         self.refusal_error = Some(message);
-        self.needs_reattach = false;
-        self.withheld = Some(refusal);
+        if matches!(refusal, Refusal::PersistenceFailed) {
+            // The host marks the failed owner draining before publishing this
+            // frame, and materialization joins a draining owner before replacing
+            // it. Re-asking now therefore cannot bind the failed generation.
+            // Waiting for a cold row is unsafe because another client can
+            // rematerialize first and coalesce the directory from live to live.
+            self.owe_reattach();
+        } else {
+            self.needs_reattach = false;
+            self.withheld = Some(refusal);
+        }
     }
 
     /// Adopt the epoch of the attach block this client asked for, and

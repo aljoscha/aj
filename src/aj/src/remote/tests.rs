@@ -48,7 +48,7 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, Context, SimpleStreamOptions, StopReason, StreamOptions,
     ToolCall,
 };
-use aj_session::{ConversationPersistence, ThreadFilter};
+use aj_session::{AppendFault, AppendFaultFixture, ConversationPersistence, ThreadFilter};
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedFrame,
     ErrorResponse, Frame, HeadRequest, ModelSelection, PROTOCOL_VERSION, PromptInput,
@@ -1409,6 +1409,50 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
     fixture.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_waits_for_first_publication_and_refuses_an_unsaved_prompt() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    fixture.host.fault_next_initial_publication(fault.clone());
+
+    let error = fixture
+        .client
+        .create_session(CreateSessionRequest {
+            prompt: Some(PromptInput::Text {
+                text: "first message".to_string(),
+            }),
+            ..CreateSessionRequest::default()
+        })
+        .await
+        .expect_err("unsaved create is an HTTP failure");
+
+    let RemoteError::Status {
+        status,
+        code,
+        message,
+        ..
+    } = error
+    else {
+        panic!("unexpected remote error: {error:?}");
+    };
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(code.as_deref(), Some("persistence_failed"));
+    assert!(message.contains("the message you just sent was not recorded"));
+    assert!(message.contains("start a new session"));
+    assert_eq!(fault.writes(), 1);
+    assert!(
+        fixture
+            .client
+            .sessions()
+            .await
+            .expect("session list")
+            .sessions
+            .is_empty(),
+        "HTTP failure cannot race a discoverable unsaved id"
+    );
+    fixture.shutdown().await;
+}
+
 /// A create may name the host it is for, and a host serves exactly one
 /// working directory (spec 6.6): an absent field and this host's own id are
 /// both a create for here, and any other host's id is refused rather than
@@ -1979,8 +2023,8 @@ async fn a_session_is_created_with_its_label() {
     fixture.shutdown().await;
 }
 
-/// A label the store will not write does not fail the create it was asked
-/// for: the session exists, so the route answers 200 with its id and says
+/// A label the store will not write does not skip a requested first prompt.
+/// The canonical session exists, so the route answers 200 with its id and says
 /// what did not land, and the client retags rather than creating a second
 /// session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1994,6 +2038,9 @@ async fn a_label_the_store_cannot_write_still_answers_a_created_session() {
     let created = fixture
         .client
         .create_session(CreateSessionRequest {
+            prompt: Some(PromptInput::Text {
+                text: "first message must be recorded".to_string(),
+            }),
             tag: Some("fix-auth".to_string()),
             ..CreateSessionRequest::default()
         })
@@ -2015,8 +2062,10 @@ async fn a_label_the_store_cannot_write_still_answers_a_created_session() {
             .expect("the sessions read")
             .sessions
             .iter()
-            .any(|entry| entry.id == created.id && entry.live),
-        "the session the create minted is live and in the directory",
+            .any(|entry| {
+                entry.id == created.id && entry.live && entry.last_seq.is_some_and(|seq| seq > 0)
+            }),
+        "the disclosed session is live and its requested prompt is canonical",
     );
     assert_eq!(
         remote_tag(&fixture, &created.id).await,
@@ -2343,6 +2392,66 @@ async fn a_head_switch_is_refused_with_409_while_a_turn_runs() {
         .expect_err("an unknown entry is refused");
     assert_eq!(err.status(), Some(StatusCode::NOT_FOUND));
     assert_eq!(err.code(), Some("unknown_entry"));
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_head_persistence_failure_uses_one_http_and_stream_error() {
+    let fixture = Fixture::new(vec![finalized_text_message("first answer")]).await;
+    let session = fixture.create().await;
+    let mut remote = fixture.remote(&session).await;
+    fixture.prompt(&session, "materialize the log").await;
+    remote.settle().await;
+    let handles = fixture
+        .host
+        .local_handles(&session)
+        .await
+        .expect("the session remains live");
+    let target = {
+        let mut log = handles.log.lock().await;
+        let target = log.head().cloned().expect("message head");
+        log.append_model_change(ThreadFilter::USER, "provider", "model")
+            .expect("stage a pending state entry");
+        target
+    };
+    let fault = AppendFaultFixture::new(AppendFault::Flush);
+    fault
+        .install(&mut *handles.log.lock().await)
+        .expect("install the direct flush fault");
+
+    let error = fixture
+        .client
+        .command(&session, &RemoteCommand::Head(HeadRequest::entry(target)))
+        .await
+        .expect_err("the direct persistence failure crosses HTTP");
+    let RemoteError::Status {
+        status,
+        code,
+        message,
+        ..
+    } = error
+    else {
+        panic!("unexpected remote error: {error:?}");
+    };
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(code.as_deref(), Some("persistence_failed"));
+
+    let frames = remote
+        .pump_until("the matching terminal persistence frame", |frame| {
+            matches!(frame, Frame::Error { .. })
+        })
+        .await;
+    let Frame::Error {
+        code: frame_code,
+        message: frame_message,
+        ..
+    } = frames.last().expect("the terminal frame")
+    else {
+        unreachable!("the stop predicate accepts only an error frame")
+    };
+    assert_eq!(frame_code, "persistence_failed");
+    assert_eq!(frame_message, &message);
+
     fixture.shutdown().await;
 }
 
