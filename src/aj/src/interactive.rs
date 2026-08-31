@@ -25549,7 +25549,7 @@ mod tests {
         let client_auth_path = dir.path().join("client-auth.json");
         let host_auth = AuthStorage::new(host_auth_path.clone());
         host_auth
-            .set(
+            .insert_bare(
                 "openai-codex",
                 AuthCredential::ApiKey {
                     key: "host-credential-sentinel".to_string(),
@@ -25562,7 +25562,7 @@ mod tests {
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
         world
             .auth
-            .set(
+            .insert_bare(
                 "openai-codex",
                 AuthCredential::ApiKey {
                     key: "client-credential-sentinel".to_string(),
