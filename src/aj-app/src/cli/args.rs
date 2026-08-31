@@ -561,18 +561,22 @@ pub enum PrintFormat {
 pub enum Command {
     /// List existing conversation sessions for this project.
     ListSessions,
-    /// Continue a conversation session (latest if no id given).
+    /// Continue a conversation session (latest unarchived one if no id
+    /// given).
     ///
     /// Accepts optional positional launch input after the session id:
     /// `aj continue ID <args...>` resumes the session and auto-submits
     /// the args (messages and `@file` attachments) as the next turn.
     /// With no session id, the latest session for the current project
-    /// is resumed; supplying input without a session id is ambiguous,
-    /// so callers wanting "latest + prompt" should pass the session id
-    /// explicitly (e.g. via `aj list-sessions`).
+    /// that is not archived is resumed; supplying input without a session
+    /// id is ambiguous, so callers wanting "latest + prompt" should pass
+    /// the session id explicitly (e.g. via `aj list-sessions`).
     Continue {
-        /// Conversation ID to continue. If absent, the latest
-        /// session for this project is resumed.
+        /// Conversation ID to continue. If absent, the latest session for
+        /// this project that is not archived is resumed. Naming one works
+        /// whatever its archived bit says, and `aj list-sessions` shows
+        /// archived rows, so its first row can differ from the unnamed
+        /// pick.
         session_id: Option<String>,
         /// Launch input for the resumed run, interpreted exactly like
         /// the top-level [`Args::prompt`]: a mix of `@file` attachments
