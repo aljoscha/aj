@@ -101,24 +101,26 @@ pub struct Args {
     /// `@file` attachment (its contents are wrapped in a `<file>` block
     /// and images are attached inline) or a message; the messages are
     /// joined and combined with the file content into a single launch
-    /// turn, which both print and interactive mode auto-submit. See
-    /// [`crate::cli::initial_input`] for the full rules.
+    /// turn, which both print and interactive mode auto-submit.
+    // The full rules live in `crate::cli::initial_input`. That reference is
+    // for readers of this file: clap renders the doc comment above into
+    // `--help`, where a rustdoc link is just brackets around a private name.
     pub prompt: Vec<String>,
 
-    /// Replace the live model with a scripted fake that replays a
-    /// canned
-    /// [`AssistantMessageEvent`](aj_models::streaming::AssistantMessageEvent)
-    /// sequence. Useful for eyeballing how the TUI / print mode
-    /// renders thinking blocks, tool calls, errors, and the like,
+    /// Replace the live model with a scripted fake that replays a canned
+    /// assistant-event sequence. Useful for eyeballing how the TUI / print
+    /// mode renders thinking blocks, tool calls, errors, and the like,
     /// without spending a real API round-trip.
     ///
     /// The argument is the demo name. Pass `--scripted help` (or any
     /// unknown name) to see the catalog. When set the binary skips
     /// registry-driven provider construction entirely and registers a
-    /// [`ScriptedProvider`](aj_models::scripted::ScriptedProvider)
-    /// in its place; every other code path (TUI, persistence, tools,
-    /// commands) runs unchanged so the eyeball test exercises
-    /// the real surface.
+    /// scripted provider in its place; every other code path (TUI,
+    /// persistence, tools, commands) runs unchanged so the eyeball test
+    /// exercises the real surface.
+    // The sequence is `aj_models::streaming::AssistantMessageEvent` and the
+    // stand-in is `aj_models::scripted::ScriptedProvider`. Named here rather
+    // than above because clap renders that text into `--help`.
     #[arg(long)]
     pub scripted: Option<String>,
 
@@ -550,8 +552,10 @@ pub enum PrintFormat {
     /// scrollback, minus colour and progressive updates.
     #[default]
     Text,
-    /// One JSONL [`aj_agent::events::AgentEvent`] per line. Stable
-    /// shape suitable for piping into another process.
+    /// One JSONL agent event per line. Stable shape suitable for piping
+    /// into another process.
+    // The event is `aj_agent::events::AgentEvent`. Named here rather than
+    // above because clap renders that text into `--help`.
     Json,
 }
 
@@ -578,9 +582,9 @@ pub enum Command {
         /// archived rows, so its first row can differ from the unnamed
         /// pick.
         session_id: Option<String>,
-        /// Launch input for the resumed run, interpreted exactly like
-        /// the top-level [`Args::prompt`]: a mix of `@file` attachments
-        /// and messages, auto-submitted as the next turn.
+        /// Launch input for the resumed run, interpreted exactly like the
+        /// top-level launch input: a mix of `@file` attachments and
+        /// messages, auto-submitted as the next turn.
         prompt: Vec<String>,
     },
     /// Refresh the user model catalog at `~/.aj/models.json` from
@@ -631,11 +635,13 @@ pub enum Command {
         /// A create is all it can point at, and it is resolved on every run
         /// that carries it, so a stale or misspelled value is refused rather
         /// than dropped. A run that ends up attaching an existing session
-        /// reports [`HOST_WITHOUT_A_CREATE`], as `--tag` does.
+        /// reports that the flag had nothing to point at, as `--tag` does.
+        // That report is the `HOST_WITHOUT_A_CREATE` constant. Named here
+        // rather than above because clap renders that text into `--help`.
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
         /// Launch input for the attached session, interpreted exactly like
-        /// the top-level [`Args::prompt`]: a mix of `@file` attachments and
+        /// the top-level launch input: a mix of `@file` attachments and
         /// messages, auto-submitted as the next turn.
         prompt: Vec<String>,
     },
@@ -933,6 +939,59 @@ mod tests {
         );
         assert!(!help.contains("Construct this type through"), "{help}");
         assert!(!help.contains("<Args as clap::Parser>"), "{help}");
+    }
+
+    /// Rendered help is prose for someone at a shell, so it must name no Rust
+    /// item.
+    ///
+    /// Doc comments on clap-visible fields are the help text, which makes any
+    /// rustdoc link or path in them leak into the terminal. The rendered help
+    /// is asserted directly, because these reach a user only through clap's
+    /// rendering: a doc comment can be edited, or a new field added, without
+    /// any other subject noticing.
+    ///
+    /// Both halves earn their place. The named symbols pin the exact
+    /// identifiers that have been visible here, and the syntactic checks
+    /// catch the next one, since the failure is a shape rather than a
+    /// vocabulary.
+    #[test]
+    fn long_help_names_no_rust_item() {
+        let help = Args::command().render_long_help().to_string();
+        for symbol in [
+            "crate::cli::initial_input",
+            "AssistantMessageEvent",
+            "ScriptedProvider",
+            "aj_agent::events::AgentEvent",
+            "Args::prompt",
+            "HOST_WITHOUT_A_CREATE",
+        ] {
+            assert!(
+                !help.contains(symbol),
+                "rendered help names the Rust item {symbol}: {help}"
+            );
+        }
+        assert!(
+            !help.contains("::"),
+            "rendered help contains Rust path syntax: {help}"
+        );
+        // A bracketed token is clap's own placeholder vocabulary (`[OPTIONS]`,
+        // `[SESSION_ID]`) or an annotation carrying spaces (`[env: AJ_ALLOW=]`).
+        // A rustdoc link is neither: it is a bare Rust item, so it is the only
+        // bracketed token that is CamelCase or a path.
+        for token in help
+            .split('[')
+            .skip(1)
+            .filter_map(|rest| rest.split_once(']'))
+            .map(|(token, _)| token)
+        {
+            let rust_item = !token.contains(char::is_whitespace)
+                && token.starts_with(char::is_uppercase)
+                && token.contains(char::is_lowercase);
+            assert!(
+                !rust_item,
+                "rendered help links the Rust item [{token}]: {help}"
+            );
+        }
     }
 
     #[test]
