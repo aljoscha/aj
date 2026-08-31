@@ -2072,6 +2072,15 @@ async fn nested_unknown_fields_are_refused_by_real_host_routes() {
                 "prompt": {"text": "do not run", "future": true}
             }),
         ),
+        (
+            "sessions".to_string(),
+            serde_json::json!({
+                "prompt": {
+                    "content": [{"type": "text", "text": "do not run"}],
+                    "future": true
+                }
+            }),
+        ),
         (format!("sessions/{missing}/prompt"), structured),
         (
             format!("sessions/{missing}/settings"),
@@ -2153,6 +2162,24 @@ async fn defaultable_unknown_fields_leave_session_state_untouched() {
         (
             "prompt",
             serde_json::json!({"text": "do not run", "agennt": {"sub": 2}}),
+        ),
+        (
+            "prompt",
+            serde_json::json!({
+                "content": [{"type": "text", "text": "do not run"}],
+                "agennt": {"sub": 2}
+            }),
+        ),
+        (
+            "prompt",
+            serde_json::json!({
+                "content": [{
+                    "type": "image",
+                    "data": "aW1hZ2U=",
+                    "mime_type": "image/png",
+                    "future": true
+                }]
+            }),
         ),
         (
             "compact",
@@ -2305,6 +2332,7 @@ async fn the_tag_route_sets_and_clears_a_label() {
     for clearing in [
         serde_json::json!({"tag": ""}),
         serde_json::json!({"tag": "   "}),
+        serde_json::json!({}),
     ] {
         post_tag(&fixture, &session, serde_json::json!({"tag": "again"})).await;
         assert_eq!(
