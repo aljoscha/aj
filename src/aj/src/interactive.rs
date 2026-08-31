@@ -13811,19 +13811,16 @@ mod tests {
             .expect("auth fetch completes")
             .expect("auth fetch channel remains open");
         assert_eq!(kind, FetchKind::Auth);
+        let rows = rows
+            .into_iter()
+            .filter(|row| row.iter().any(|segment| segment.text.trim() == "provider"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "the legacy row is the measured list child");
         let fetched = rows
             .iter()
             .flat_map(|row| row.iter())
             .map(|segment| segment.text.as_str())
             .collect::<String>();
-        assert!(
-            fetched.contains("[clipped; complete auth row exceeds 65,535-cell terminal limit]"),
-            "{fetched}"
-        );
-        assert!(
-            !fetched.contains("\\u{100}"),
-            "the exact legacy tail reached the row: {fetched}"
-        );
 
         let handles = shell.borrow().overlay_handles();
         let mut event_ctx = EventContext::new();
@@ -13836,9 +13833,19 @@ mod tests {
             &mut event_ctx,
         );
         crate::content_overlay::set_rows(&list, rows);
-        let narrow_ctx = crate::test_support::draw_ctx(5, Some(12));
+        // Four overlay-chrome columns and the vertical scrollbar leave the
+        // RichText row exactly one content column at this width.
+        let narrow_ctx = crate::test_support::draw_ctx(6, Some(12));
         let surface = shell.borrow_mut().draw(&narrow_ctx);
-        assert_eq!(surface.size.width, 5);
+        assert_eq!(surface.size.width, 6);
+        assert!(
+            fetched.contains("[clipped; complete auth row exceeds 65,535-cell terminal limit]"),
+            "{fetched}"
+        );
+        assert!(
+            !fetched.contains("\\u{100}"),
+            "the exact legacy tail reached the row: {fetched}"
+        );
     }
 
     /// Whether a controlled OAuth flow yields forever or occupies one task poll
