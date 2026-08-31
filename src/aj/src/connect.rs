@@ -292,7 +292,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::remote::tests::{HostHandles, addr, bounded, scripted, scripted_host};
+    use crate::remote::tests::{
+        HostHandles, addr, bounded, counted_protocol_peer, scripted, scripted_host,
+    };
     use crate::remote::{IdentityGate, RemoteServer};
 
     fn args(argv: &[&str]) -> Args {
@@ -435,6 +437,30 @@ mod tests {
             std::fs::read_to_string(sentinel).expect("the exact child test ran"),
             "observed",
         );
+    }
+
+    #[tokio::test]
+    async fn connect_sends_nothing_after_a_protocol_one_hello() {
+        let (url, requests, serving) = counted_protocol_peer(1, "protocol-one").await;
+        let parsed = args(&["aj", "connect", &url, "--new"]);
+        let launch = parsed.connect_launch().expect("connect launch");
+
+        let error = match connect(&parsed, &Config::default(), &nothing_stated(), &launch).await {
+            Ok(_) => panic!("protocol 1 connected to this client"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("protocol 1")
+                && format!("{error:#}").contains("speaks 2"),
+            "the mismatch was not surfaced: {error:#}",
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "connect sent a read, create, or command after the failed hello",
+        );
+        serving.abort();
     }
 
     /// A real host behind a real loopback control port, with the [`Control`] a

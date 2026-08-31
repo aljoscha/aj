@@ -35,7 +35,8 @@ use tempfile::TempDir;
 use super::*;
 use crate::gateway::naming::SessionAddress;
 use crate::remote::tests::{
-    FakeWhois, HostHandles, addr, bounded, canned_server, scripted, scripted_host,
+    FakeWhois, HostHandles, addr, bounded, canned_server, counted_protocol_peer, scripted,
+    scripted_host,
 };
 use crate::remote::{IdentityGate, RemoteClient, RemoteCommand, RemoteEvents, RemoteServer};
 
@@ -1570,6 +1571,34 @@ async fn a_prompt_runs_on_the_owning_host_alone() {
     right.stop().await;
 }
 
+/// The gateway owns only create routing. A host-owned field this gateway does
+/// not know reaches the destination, whose closed schema refuses it before
+/// minting. Together with the recorder test, this distinguishes forwarding
+/// from either dropping or locally rejecting the field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosts_unknown_create_field_is_refused_through_the_gateway() {
+    let mut host = Upstream::start().await;
+    let fixture = Fixture::new(&[&host]).await;
+    fixture.until_connected(&host.host_id()).await;
+
+    let response = fixture
+        .create(r#"{"future":{"n":18446744073709551616}}"#)
+        .await;
+
+    let status = response.status();
+    let error: ErrorResponse = response.json().await.expect("the host's protocol error");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error:?}");
+    assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.message, "malformed request body");
+    assert!(
+        host.session_ids().await.is_empty(),
+        "the host minted after dropping the unknown field",
+    );
+
+    fixture.shutdown().await;
+    host.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_id_no_namespace_can_hold_is_a_404() {
     let mut host = Upstream::start().await;
@@ -1645,6 +1674,54 @@ async fn a_proxied_error_body_names_the_session_this_gateways_way() {
     assert_eq!(
         body["hint"], "look it up",
         "as does a field this gateway has no name for: {body}",
+    );
+
+    fixture.shutdown().await;
+    recorder.stop();
+}
+
+/// Per-session routes are opaque to the gateway. A method and route this build
+/// does not know, a query it cannot interpret, and raw JSON it cannot represent
+/// all reach the destination without typed decoding or re-encoding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_per_session_request_travels_opaque_through_the_gateway() {
+    let recorder = Recorder::start("recorder").await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![recorder.address.clone()],
+    )
+    .await;
+    fixture.until_connected("recorder").await;
+    let body = br#"{"future":{"n":1e400,"exact":18446744073709551616}}"#;
+
+    let response = fixture
+        .http
+        .request(
+            reqwest::Method::PATCH,
+            format!(
+                "{}/v1/sessions/recorder:s-1/future/command?mode=newer&mode=exact",
+                fixture.server.url()
+            ),
+        )
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/vnd.aj-future+json",
+        )
+        .body(body.as_slice())
+        .send()
+        .await
+        .expect("the proxied request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        recorder.proxied(),
+        vec![ProxiedRequest {
+            method: reqwest::Method::PATCH,
+            route: "s-1/future/command".to_string(),
+            query: Some("mode=newer&mode=exact".to_string()),
+            content_type: Some("application/vnd.aj-future+json".to_string()),
+            body: body.to_vec(),
+        }],
     );
 
     fixture.shutdown().await;
@@ -2066,6 +2143,202 @@ async fn enrolling_something_that_is_not_a_host_is_refused() {
     assert_eq!(code, "unknown_host");
 
     fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_enrollment_refuses_unknown_fields_before_recording() {
+    let mut host = Upstream::start().await;
+    let fixture = Fixture::new(&[]).await;
+    let state = fixture.state.path().join("hosts.json");
+    let unknown = "\u{1b}[31m\u{202e}future\n";
+    let mut body = serde_json::json!({"address": host.address()});
+    body.as_object_mut()
+        .expect("the enrollment is an object")
+        .insert(unknown.to_string(), serde_json::json!(true));
+
+    let response = fixture
+        .http
+        .post(format!("{}/v1/hosts", fixture.server.url()))
+        .json(&body)
+        .send()
+        .await
+        .expect("the enrollment request");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = response.json().await.expect("the protocol error");
+    assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.message, "malformed request body");
+    assert!(!error.message.contains(unknown));
+    assert!(
+        fixture.hosts().await.hosts.is_empty(),
+        "the rejected enrollment entered the directory",
+    );
+    let recorded = std::fs::read_to_string(state).unwrap_or_default();
+    assert!(
+        !recorded.contains(&host.address()),
+        "the rejected enrollment was persisted: {recorded}",
+    );
+
+    fixture.shutdown().await;
+    host.stop().await;
+}
+
+/// Protocol-1 dynamic enrollment fails before persistence. Configuration and
+/// remembered state have different ownership: they remain durable, but a failed
+/// hello cannot settle identity, publish reachability, or earn any routed
+/// request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
+    let (dynamic_url, dynamic_requests, dynamic_server) =
+        counted_protocol_peer(1, "old-dynamic").await;
+    let dynamic = Fixture::new(&[]).await;
+
+    let response = dynamic.enroll(&dynamic_url).await;
+    let (status, code, message) = refusal(response).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{message}");
+    assert_eq!(code, "host_unreachable");
+    assert!(message.contains("protocol 1") && message.contains("speaks 2"));
+    assert!(
+        dynamic.hosts().await.hosts.is_empty(),
+        "a failed dynamic handshake still enrolled the host",
+    );
+    let recorded =
+        std::fs::read_to_string(dynamic.state.path().join("hosts.json")).unwrap_or_default();
+    assert!(
+        !recorded.contains(&dynamic_url),
+        "a failed dynamic handshake was persisted: {recorded}",
+    );
+    assert_eq!(dynamic_requests.load(Ordering::SeqCst), 0);
+    dynamic.shutdown().await;
+    dynamic_server.abort();
+
+    let (configured_url, configured_requests, configured_server) =
+        counted_protocol_peer(1, "old-configured").await;
+    let configured_address = HostAddress::parse(&configured_url).expect("a host address");
+    let configured_state = TempDir::new().expect("state");
+    std::fs::write(
+        configured_state.path().join("hosts.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "configured_ids": [{
+                "address": configured_url,
+                "host_id": "configured-record"
+            }]
+        }))
+        .expect("the configured identity encodes"),
+    )
+    .expect("seed configured identity");
+    let configured = Fixture::over(configured_state, vec![configured_address.clone()]).await;
+    let configured_summary = configured
+        .until_hosts("the protocol mismatch to be reported", |hosts| {
+            hosts
+                .hosts
+                .iter()
+                .find(|host| host.address == configured_address.to_string())
+                .filter(|host| host.error.is_some())
+                .cloned()
+        })
+        .await;
+    assert_eq!(configured_summary.source, HostSource::Config);
+    assert_eq!(configured_summary.id.as_deref(), Some("configured-record"));
+    assert!(!configured_summary.connected);
+    assert!(
+        configured_summary
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("protocol 1") && error.contains("speaks 2")),
+        "unexpected mismatch: {configured_summary:?}",
+    );
+    let configured_directory = configured
+        .client
+        .sessions()
+        .await
+        .expect("the configured directory");
+    assert!(
+        configured_directory
+            .hosts
+            .iter()
+            .any(|host| { host.id.as_deref() == Some("configured-record") && host.unreachable }),
+        "the incompatible configured enrollment disappeared: {configured_directory:?}",
+    );
+    let (status, code, _) =
+        refusal(configured.create(r#"{"host":"configured-record"}"#).await).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(code, "host_unreachable");
+    assert_eq!(configured_requests.load(Ordering::SeqCst), 0);
+
+    let configured = configured.restart().await;
+    assert!(
+        configured
+            .hosts()
+            .await
+            .hosts
+            .iter()
+            .any(|host| { host.id.as_deref() == Some("configured-record") && !host.connected })
+    );
+    assert_eq!(configured_requests.load(Ordering::SeqCst), 0);
+    configured.shutdown().await;
+    configured_server.abort();
+
+    let (remembered_url, remembered_requests, remembered_server) =
+        counted_protocol_peer(1, "old-remembered").await;
+    let state = TempDir::new().expect("state");
+    std::fs::write(
+        state.path().join("hosts.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "hosts": [{
+                "address": remembered_url,
+                "host_id": "remembered"
+            }]
+        }))
+        .expect("the remembered state encodes"),
+    )
+    .expect("seed remembered state");
+    let remembered = Fixture::over(state, Vec::new()).await;
+    let remembered_summary = remembered
+        .until_hosts("the remembered mismatch to be reported", |hosts| {
+            hosts
+                .hosts
+                .iter()
+                .find(|host| host.id.as_deref() == Some("remembered"))
+                .filter(|host| host.error.is_some())
+                .cloned()
+        })
+        .await;
+    assert_eq!(remembered_summary.source, HostSource::Dynamic);
+    assert!(!remembered_summary.connected);
+    let remembered_directory = remembered
+        .client
+        .sessions()
+        .await
+        .expect("the remembered directory");
+    assert!(
+        remembered_directory
+            .hosts
+            .iter()
+            .any(|host| { host.id.as_deref() == Some("remembered") && host.unreachable }),
+        "the incompatible remembered enrollment disappeared: {remembered_directory:?}",
+    );
+    let (status, code, _) = refusal(remembered.create(r#"{"host":"remembered"}"#).await).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(code, "host_unreachable");
+    let recorded = std::fs::read_to_string(remembered.state.path().join("hosts.json"))
+        .expect("the remembered state remains");
+    assert!(recorded.contains("remembered"));
+    assert_eq!(remembered_requests.load(Ordering::SeqCst), 0);
+
+    let remembered = remembered.restart().await;
+    assert!(
+        remembered
+            .hosts()
+            .await
+            .hosts
+            .iter()
+            .any(|host| host.id.as_deref() == Some("remembered") && !host.connected),
+        "the remembered enrollment did not survive restart",
+    );
+    assert_eq!(remembered_requests.load(Ordering::SeqCst), 0);
+    remembered.shutdown().await;
+    remembered_server.abort();
 }
 
 /// A host reporting an id this gateway cannot namespace with is refused where it
@@ -3120,6 +3393,37 @@ async fn the_forwarded_create_names_the_target_in_its_own_vocabulary() {
     recorder.stop();
 }
 
+/// A destination host owns create validation and every field of its refusal.
+/// This stand-in returns the generic strict-schema 400 with an additive field
+/// this gateway does not know, so the body can be compared byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosts_unknown_field_create_refusal_travels_back_whole() {
+    let recorder = Recorder::start("recorder").await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![recorder.address.clone()],
+    )
+    .await;
+    fixture.until_connected("recorder").await;
+    let sent = format!(r#"{{"{REFUSED_CREATE_FIELD}":true}}"#);
+
+    let response = fixture.create(&sent).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.text().await.expect("the refusal body"),
+        REFUSED_CREATE_BODY,
+        "the gateway decoded or rewrote the destination host's 400",
+    );
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&recorder.recorded()).expect("the forwarded create");
+    assert_eq!(forwarded[REFUSED_CREATE_FIELD], serde_json::json!(true));
+    assert_eq!(forwarded["host"], serde_json::json!("recorder"));
+
+    fixture.shutdown().await;
+    recorder.stop();
+}
+
 /// A create for a host whose control connection is down is refused even though
 /// that host's port would answer it: what a client is told about a host (an
 /// unreachable row) and what a create on it does have to agree.
@@ -3241,6 +3545,17 @@ async fn a_create_body_that_repeats_a_key_is_the_hosts_to_refuse() {
 /// The one route a [`Recorder`] refuses, so a test can watch an error body cross
 /// the proxy.
 const REFUSED_ROUTE: &str = "refuse";
+const REFUSED_CREATE_FIELD: &str = "unknown_to_host";
+const REFUSED_CREATE_BODY: &str = r#"{"code":"invalid_request","message":"malformed request body","future":{"n":18446744073709551616}}"#;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProxiedRequest {
+    method: reqwest::Method,
+    route: String,
+    query: Option<String>,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
 
 /// A stand-in host that keeps the create bodies it is sent.
 struct Recorder {
@@ -3249,7 +3564,7 @@ struct Recorder {
     /// The query string of every create it was sent, `None` for one that carried
     /// none.
     create_queries: Arc<StdMutex<Vec<Option<String>>>>,
-    proxied: Arc<StdMutex<Vec<String>>>,
+    proxied: Arc<StdMutex<Vec<ProxiedRequest>>>,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -3274,7 +3589,7 @@ impl Recorder {
         let creates: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let create_queries: Arc<StdMutex<Vec<Option<String>>>> =
             Arc::new(StdMutex::new(Vec::new()));
-        let proxied: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let proxied: Arc<StdMutex<Vec<ProxiedRequest>>> = Arc::new(StdMutex::new(Vec::new()));
         let hello = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "capabilities": [],
@@ -3317,15 +3632,27 @@ impl Recorder {
                         let creates = Arc::clone(&creates);
                         let create_queries = Arc::clone(&create_queries);
                         async move {
+                            use axum::response::IntoResponse;
+
                             create_queries
                                 .lock()
                                 .expect("the queries mutex is poisoned")
                                 .push(uri.query().map(str::to_string));
                             let mut held = creates.lock().expect("the creates mutex is poisoned");
+                            let refuse = body.contains(REFUSED_CREATE_FIELD);
                             held.push(body);
-                            axum::Json(
-                                serde_json::json!({"id": format!("recorded-{}", held.len())}),
-                            )
+                            if refuse {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    [(reqwest::header::CONTENT_TYPE, "application/json")],
+                                    REFUSED_CREATE_BODY,
+                                )
+                                    .into_response();
+                            }
+                            axum::Json(serde_json::json!({
+                                "id": format!("recorded-{}", held.len())
+                            }))
+                            .into_response()
                         }
                     }
                 }),
@@ -3334,16 +3661,29 @@ impl Recorder {
                 "/v1/sessions/{id}/{*rest}",
                 axum::routing::any({
                     let proxied = Arc::clone(&proxied);
-                    move |path: axum::extract::Path<(String, String)>| {
+                    move |method: reqwest::Method,
+                          uri: axum::http::Uri,
+                          headers: axum::http::HeaderMap,
+                          path: axum::extract::Path<(String, String)>,
+                          body: axum::body::Bytes| {
                         let proxied = Arc::clone(&proxied);
                         async move {
                             use axum::response::IntoResponse;
 
                             let axum::extract::Path((id, rest)) = path;
-                            proxied
-                                .lock()
-                                .expect("the proxied mutex is poisoned")
-                                .push(format!("{id}/{rest}"));
+                            let content_type = headers
+                                .get(reqwest::header::CONTENT_TYPE)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string);
+                            proxied.lock().expect("the proxied mutex is poisoned").push(
+                                ProxiedRequest {
+                                    method,
+                                    route: format!("{id}/{rest}"),
+                                    query: uri.query().map(str::to_string),
+                                    content_type,
+                                    body: body.to_vec(),
+                                },
+                            );
                             // One route refuses, in the shape spec 6.6 gives an
                             // error about a session: the id in the host's own
                             // vocabulary, plus a field of its own.
@@ -3380,8 +3720,8 @@ impl Recorder {
         }
     }
 
-    /// Every proxied session route this recorder was sent, as `id/rest`.
-    fn proxied(&self) -> Vec<String> {
+    /// Every proxied session request this recorder was sent.
+    fn proxied(&self) -> Vec<ProxiedRequest> {
         self.proxied
             .lock()
             .expect("the proxied mutex is poisoned")

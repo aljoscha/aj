@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aj_app::host::AttachRequest;
-use aj_wire::{Cursor, EnrollHostRequest, ErrorResponse, RawObject};
+use aj_wire::{Cursor, EnrollHostRequest, ErrorResponse, RawObject, RequestBody, decode_request};
 use axum::body::{Body as AxumBody, Bytes};
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
 use axum::http::{Method, StatusCode, header};
@@ -35,7 +35,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get};
 use axum::{Json, Router, middleware};
 use futures::Stream;
-use serde::de::DeserializeOwned;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -731,14 +730,14 @@ fn named_host(body: &RawObject) -> Result<Option<String>, ApiError> {
 
 /// A JSON request body with the protocol's error shape for a malformed one.
 ///
-/// An absent or blank body reads as `{}`. The twin of the host's own extractor:
-/// the two servers share no state, and spec 6.1's `{code, message}` is what both
-/// of them owe a client.
+/// The twin of the host's own extractor. `aj-wire` owns the closed request
+/// schema and blank-body rule, while each HTTP server maps the failure to spec
+/// 6.1's `{code, message}` envelope.
 struct Body<T>(T);
 
 impl<S, T> FromRequest<S> for Body<T>
 where
-    T: DeserializeOwned,
+    T: RequestBody,
     S: Send + Sync,
 {
     type Rejection = ApiError;
@@ -747,14 +746,9 @@ where
         let bytes = Bytes::from_request(request, state)
             .await
             .map_err(|err| ApiError::invalid(err.body_text()))?;
-        let bytes = if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
-            Bytes::from_static(b"{}")
-        } else {
-            bytes
-        };
-        serde_json::from_slice(&bytes)
+        decode_request(&bytes)
             .map(Self)
-            .map_err(|err| ApiError::invalid(format!("malformed request body: {err}")))
+            .map_err(|err| ApiError::invalid(err.to_string()))
     }
 }
 

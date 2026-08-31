@@ -1769,6 +1769,27 @@ async fn the_reads_answer_tasks_queue_and_tree() {
         .expect("the queue read");
     assert_eq!(pending.queues.len(), 1, "the read sees the pending message");
 
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session}/queue",
+            fixture.server.url()
+        ))
+        .json(&serde_json::json!({"op": "clear", "future": true}))
+        .send()
+        .await
+        .expect("queue clear with an unknown field");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !fixture
+            .client
+            .queue(&session)
+            .await
+            .expect("the queue after refusal")
+            .queues
+            .is_empty(),
+        "the queue was cleared before its unknown field was refused",
+    );
+
     let withdrawn = fixture
         .client
         .command(
@@ -1814,6 +1835,31 @@ async fn the_task_read_answers_a_live_task_and_404s_an_unknown_one() {
         .expect("the task read");
     assert_eq!(details.id, task.id);
 
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session}/tasks/{}/kill",
+            fixture.server.url(),
+            task.id,
+        ))
+        .json(&serde_json::json!({"future": true}))
+        .send()
+        .await
+        .expect("kill with an unknown field");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = response.json().await.expect("the protocol error");
+    assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.message, "malformed request body");
+    assert_eq!(
+        fixture
+            .client
+            .task(&session, task.id)
+            .await
+            .expect("the refused kill left the task readable")
+            .status,
+        aj_agent::tool::TaskStatus::Running,
+        "a task-kill body was ignored after dispatch",
+    );
+
     let err = fixture
         .client
         .task(&session, 9999)
@@ -1830,11 +1876,20 @@ async fn the_task_read_answers_a_live_task_and_404s_an_unknown_one() {
     assert_eq!(err.status(), Some(StatusCode::NOT_FOUND));
     assert_eq!(err.code(), Some("unknown_task"));
 
-    fixture
-        .client
-        .command(&session, &RemoteCommand::KillTask(task.id))
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session}/tasks/{}/kill",
+            fixture.server.url(),
+            task.id,
+        ))
+        .send()
         .await
-        .expect("killing a live task is accepted");
+        .expect("kill with a blank body");
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "a blank body is the empty JSON command",
+    );
 
     // A path segment that is not a task id answers the protocol's error
     // shape rather than the framework's own rejection.
@@ -1868,6 +1923,343 @@ async fn a_command_with_no_body_is_accepted() {
         .expect("post with no body");
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    fixture.shutdown().await;
+}
+
+/// Every registered JSON command reaches the same request-context decoder.
+/// A missing session makes bypassing that decoder observable as a 404, while a
+/// tolerant create would mint a session before the test reads the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_host_json_command_refuses_unknown_fields_before_dispatch() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let before = fixture
+        .host
+        .sessions()
+        .await
+        .expect("the initial directory")
+        .sessions
+        .len();
+    let base = fixture.server.url();
+    let missing = "no-such-session";
+    let commands = [
+        ("sessions".to_string(), serde_json::json!({"future": true})),
+        (
+            format!("sessions/{missing}/prompt"),
+            serde_json::json!({"text": "do not run", "future": true}),
+        ),
+        (
+            format!("sessions/{missing}/steer"),
+            serde_json::json!({"text": "do not queue", "future": true}),
+        ),
+        (
+            format!("sessions/{missing}/cancel"),
+            serde_json::json!({"future": true}),
+        ),
+        (
+            format!("sessions/{missing}/queue"),
+            serde_json::json!({"op": "clear", "future": true}),
+        ),
+        (
+            format!("sessions/{missing}/compact"),
+            serde_json::json!({"future": true}),
+        ),
+        (
+            format!("sessions/{missing}/settings"),
+            serde_json::json!({"thinking": "off", "future": true}),
+        ),
+        (
+            format!("sessions/{missing}/tag"),
+            serde_json::json!({"tag": "do-not-store", "future": true}),
+        ),
+        (
+            format!("sessions/{missing}/archive"),
+            serde_json::json!({"archived": true, "future": true}),
+        ),
+        (
+            format!("sessions/{missing}/head"),
+            serde_json::json!({"entry": "not-an-entry", "future": true}),
+        ),
+        (
+            format!("sessions/{missing}/tasks/1/kill"),
+            serde_json::json!({"future": true}),
+        ),
+    ];
+
+    let mut refusals = Vec::new();
+    for (route, body) in &commands {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/{route}"))
+            .json(body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{route} did not answer: {error}"));
+        let status = response.status();
+        let error: ErrorResponse = response
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("{route} returned no protocol error: {error}"));
+        refusals.push((route, status, error));
+    }
+
+    assert_eq!(refusals.len(), commands.len(), "the route census drifted");
+    for (route, status, error) in refusals {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {error:?}");
+        assert_eq!(error.code, "invalid_request", "{route}");
+        assert_eq!(error.message, "malformed request body", "{route}");
+    }
+    assert_eq!(
+        fixture
+            .host
+            .sessions()
+            .await
+            .expect("the final directory")
+            .sessions
+            .len(),
+        before,
+        "an unknown-only create minted a session",
+    );
+
+    // The task-kill route is the empty-object JSON command. Other JSON values
+    // are malformed rather than alternate spellings of `{}`.
+    for body in ["null", "[]", "1"] {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/sessions/{missing}/tasks/1/kill"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("the empty-object command answers");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let error: ErrorResponse = response.json().await.expect("the protocol error");
+        assert_eq!(error.code, "invalid_request", "{body}");
+    }
+
+    fixture.shutdown().await;
+}
+
+/// Nested request schemas are closed too. The deliberately wrong target and
+/// missing session keep these probes effect-free if only a top-level validator
+/// survives, while their expected 400 proves the nested decoder ran first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_unknown_fields_are_refused_by_real_host_routes() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let base = fixture.server.url();
+    let missing = "no-such-session";
+    let terminal_key = "\u{1b}[31m\\\"\u{202e}future\n";
+    let mut structured = serde_json::json!({
+        "content": [{"type": "text", "text": "do not run"}]
+    });
+    structured["content"][0]
+        .as_object_mut()
+        .expect("the content block is an object")
+        .insert(terminal_key.to_string(), serde_json::json!(true));
+    let probes = [
+        (
+            "sessions".to_string(),
+            serde_json::json!({
+                "host": "not-this-host",
+                "settings": {"thinking": "off", "future": true}
+            }),
+        ),
+        (
+            "sessions".to_string(),
+            serde_json::json!({
+                "host": "not-this-host",
+                "settings": {
+                    "model": {"api": "openai", "name": "gpt-catalog", "future": true}
+                }
+            }),
+        ),
+        (
+            "sessions".to_string(),
+            serde_json::json!({
+                "host": "not-this-host",
+                "prompt": {"text": "do not run", "future": true}
+            }),
+        ),
+        (format!("sessions/{missing}/prompt"), structured),
+        (
+            format!("sessions/{missing}/settings"),
+            serde_json::json!({
+                "model": {"api": "openai", "name": "gpt-catalog", "future": true}
+            }),
+        ),
+    ];
+
+    for (route, body) in probes {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/{route}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{route} did not answer: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{route}: {body}"
+        );
+        let error: ErrorResponse = response.json().await.expect("the protocol error");
+        assert_eq!(error.code, "invalid_request", "{route}: {body}");
+        assert_eq!(error.message, "malformed request body", "{route}: {body}");
+        assert!(
+            !error.message.contains(terminal_key),
+            "peer text reached the diagnostic: {error:?}",
+        );
+    }
+
+    assert!(
+        fixture
+            .host
+            .sessions()
+            .await
+            .expect("the directory")
+            .sessions
+            .is_empty(),
+        "a nested-unknown create minted a session",
+    );
+    fixture.shutdown().await;
+}
+
+/// Misspellings on defaultable commands must not turn into smaller commands.
+/// The read-back and inference counter observe the state where that harm lands,
+/// not only the 400 returned by the extractor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn defaultable_unknown_fields_leave_session_state_untouched() {
+    let (fixture, inference) = Fixture::with_gate(
+        IdentityGate::local(),
+        vec![
+            finalized_text_message("prompt should not run"),
+            finalized_text_message("compact should not run"),
+        ],
+    )
+    .await;
+    let session = fixture.create().await;
+    fixture
+        .client
+        .command(
+            &session,
+            &RemoteCommand::Tag(TagRequest {
+                tag: "keep-me".to_string(),
+            }),
+        )
+        .await
+        .expect("seed the tag");
+    fixture
+        .client
+        .command(
+            &session,
+            &RemoteCommand::Archive(ArchiveRequest { archived: true }),
+        )
+        .await
+        .expect("seed the archive bit");
+
+    let base = fixture.server.url();
+    for (route, body) in [
+        (
+            "prompt",
+            serde_json::json!({"text": "do not run", "agennt": {"sub": 2}}),
+        ),
+        (
+            "compact",
+            serde_json::json!({"instruction": "do not summarize"}),
+        ),
+        (
+            "steer",
+            serde_json::json!({"text": "do not run", "future": true}),
+        ),
+        (
+            "settings",
+            serde_json::json!({"thinking": "high", "future": true}),
+        ),
+        ("tag", serde_json::json!({"taq": "clear-by-default"})),
+        ("archive", serde_json::json!({"archive": false})),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/sessions/{session}/{route}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("the command answers");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{route}: {body}"
+        );
+    }
+
+    tokio::time::sleep(QUIET).await;
+    inference.assert_attempts(0);
+    let handles = fixture
+        .host
+        .local_handles(&session)
+        .await
+        .expect("the session remains live");
+    assert!(
+        handles
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned")
+            .thinking
+            .is_none(),
+        "the settings change landed before its unknown field was refused",
+    );
+    let row = fixture
+        .client
+        .sessions()
+        .await
+        .expect("the session list")
+        .sessions
+        .into_iter()
+        .find(|row| row.id == session)
+        .expect("the seeded session");
+    assert_eq!(row.tag.as_deref(), Some("keep-me"));
+    assert!(row.archived, "a misspelled archive field cleared the bit");
+
+    fixture.shutdown().await;
+}
+
+/// A misspelled cancellation target must not fall back to Main. The streamed
+/// answer is intentionally slow so the rejected request arrives while Main is
+/// working, and the complete durable answer proves no cancellation raced ahead
+/// of the decode failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_cancel_field_does_not_cancel_main() {
+    let expected = "the answer reaches its end";
+    let fixture = Fixture::with_provider(scripted(
+        vec![finalized_text_message(expected)],
+        1,
+        Duration::from_millis(20),
+    ))
+    .await;
+    let session = fixture.create().await;
+    let mut remote = fixture.remote(&session).await;
+    fixture.prompt(&session, "answer slowly").await;
+    remote
+        .pump_until("Main to start working", |frame| {
+            matches!(frame, Frame::State { working: true, .. })
+        })
+        .await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session}/cancel",
+            fixture.server.url()
+        ))
+        .json(&serde_json::json!({"agennt": "main"}))
+        .send()
+        .await
+        .expect("the cancel request answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = response.json().await.expect("the protocol error");
+    assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.message, "malformed request body");
+
+    remote.settle().await;
+    assert_eq!(
+        assistant_texts(&remote.canonical()),
+        vec![expected.to_string()],
+        "Main was cancelled after the misspelled target defaulted",
+    );
     fixture.shutdown().await;
 }
 
@@ -3126,6 +3518,50 @@ pub(crate) async fn canned_server(
         let _ = axum::serve(listener, app).await;
     });
     (format!("http://{bound}"), serving)
+}
+
+/// A peer whose hello names `protocol`, counting every request after the
+/// handshake. Callers use the count to prove an incompatible peer receives no
+/// create, command, read, or event-attachment request.
+pub(crate) async fn counted_protocol_peer(
+    protocol: u32,
+    host_id: &str,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use axum::routing::{any, get};
+
+    let hello = serde_json::json!({
+        "protocol": protocol,
+        "capabilities": [],
+        "app_version": "0",
+        "host_id": host_id,
+    });
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route(
+            "/v1/hello",
+            get(move || {
+                let hello = hello.clone();
+                async move { axum::Json(hello) }
+            }),
+        )
+        .fallback(any({
+            let requests = Arc::clone(&requests);
+            move || {
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+        .await
+        .expect("bind");
+    let bound = listener.local_addr().expect("local addr");
+    let serving = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{bound}"), requests, serving)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

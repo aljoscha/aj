@@ -202,7 +202,7 @@ installed ember before building on it.
 
 Tests first: pinned JSON fixtures for every `AgentEvent` variant
 (reuse/extend the existing shape tests as the source of truth),
-strict round-trip identity tests, extra-unknown-fields-ignored and
+strict round-trip identity tests, observation-extra-fields-ignored and
 malformed-known-event-fails cases, wrapper fixtures (unknown event
 `type` and unknown frame `kind` decode into the raw-retaining
 wrappers and re-serialize unchanged, durable unknown events keep

@@ -29,9 +29,10 @@ use aj_conf::ConfigVerbosity;
 use aj_models::{speed_from_name, thinking_config_from_name};
 use aj_session::normalize_tag;
 use aj_wire::{
-    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, ErrorResponse,
-    Frame, HeadRequest, PromptRequest, QueueOperation, QueueOutcome, QueueRequest, SessionCreated,
-    SessionSettings, SettingsRequest, SteerRequest, TagRequest,
+    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, EmptyRequest,
+    ErrorResponse, Frame, HeadRequest, PromptRequest, QueueOperation, QueueOutcome, QueueRequest,
+    RequestBody, SessionCreated, SessionSettings, SettingsRequest, SteerRequest, TagRequest,
+    decode_request,
 };
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
@@ -42,7 +43,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use futures::Stream;
-use serde::de::DeserializeOwned;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -300,6 +300,7 @@ async fn task(
 async fn kill_task(
     State(state): State<Arc<ServerState>>,
     Path((session, task)): Path<(String, String)>,
+    Body(_request): Body<EmptyRequest>,
 ) -> Result<Response, ApiError> {
     let task = task_id(&task)?;
     accepted(
@@ -706,14 +707,14 @@ fn settings_change(
 
 /// A JSON request body with the protocol's error shape for a malformed one.
 ///
-/// An absent or blank body reads as `{}`, so a command whose fields are all
-/// optional (cancel, compact) can be sent without one. A body missing a
-/// required field still fails as a malformed request.
+/// An absent or blank body reads as `{}`. Unknown fields are refused
+/// recursively by `aj-wire` before the handler can materialize or mutate a
+/// session.
 struct Body<T>(T);
 
 impl<S, T> FromRequest<S> for Body<T>
 where
-    T: DeserializeOwned,
+    T: RequestBody,
     S: Send + Sync,
 {
     type Rejection = ApiError;
@@ -722,14 +723,9 @@ where
         let bytes = Bytes::from_request(request, state)
             .await
             .map_err(|err| ApiError::invalid(err.body_text()))?;
-        let bytes = if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
-            Bytes::from_static(b"{}")
-        } else {
-            bytes
-        };
-        serde_json::from_slice(&bytes)
+        decode_request(&bytes)
             .map(Self)
-            .map_err(|err| ApiError::invalid(format!("malformed request body: {err}")))
+            .map_err(|err| ApiError::invalid(err.to_string()))
     }
 }
 
