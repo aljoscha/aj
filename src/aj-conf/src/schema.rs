@@ -559,7 +559,7 @@ const MAX_SIDEBAR_COLS: u16 = 200;
 /// verbosity = "low"
 /// theme = "dark"
 /// disabled_tools = ["todo_read", "todo_write"]
-/// disabled_skills = ["tmux-subagents"]
+/// disabled_skills = ["example-skill"]
 /// show_thinking_block = false
 /// ```
 #[derive(Debug, Clone)]
