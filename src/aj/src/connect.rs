@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use aj_app::cli::args::{Args, ConnectLaunch, ConnectSession};
 use aj_conf::{Config, ConfigLayer};
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
-use aj_wire::{DirectoryHost, Hello, ModelSelection, SessionSettings};
+use aj_wire::{DirectoryHost, Hello, ModelSelection, SessionList, SessionSettings};
 use anyhow::{Context, Result, anyhow};
 
 use crate::control::{Control, ControlError};
@@ -68,18 +68,47 @@ pub(crate) async fn connect(
     // and the flag is this client's own input to validate (spec 6.6).
     let tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
     let session_env = args.launch_env().map_err(|err| anyhow!("--env: {err}"))?;
+    let session = launch.session();
+    // A gateway needs its directory to validate `--host`, so fetch that before
+    // host resolution. A plain host validates the same flag from hello first.
+    // Named and latest session selection then fill the snapshot only when host
+    // validation did not already fetch it. This preserves which invalid input
+    // wins while sharing one generation between both decisions.
+    let mut directory = if launch.host().is_some() && hello.working_directory.is_none() {
+        Some(read_directory(&control).await?)
+    } else {
+        None
+    };
     let host = match launch.host() {
-        Some(named) => resolve_named_host(&control, &hello, named).await?,
+        Some(named) => resolve_named_host(&hello, named, directory.as_ref())?,
         None => None,
     };
-    let (session, created) =
-        resolve_session(&control, launch.session(), host, settings, tag, session_env).await?;
+    if directory.is_none() && matches!(session, ConnectSession::Named(_) | ConnectSession::Latest) {
+        directory = Some(read_directory(&control).await?);
+    }
+    let (session, created) = resolve_session(
+        &control,
+        session,
+        directory.as_ref(),
+        host,
+        settings,
+        tag,
+        session_env,
+    )
+    .await?;
     Ok(Connected {
         control,
         session,
         working_directory,
         created,
     })
+}
+
+async fn read_directory(control: &Control) -> Result<SessionList> {
+    control
+        .sessions()
+        .await
+        .context("could not read the host's session list")
 }
 
 /// The full id of the host `--host` named, refused before the terminal is
@@ -94,13 +123,13 @@ pub(crate) async fn connect(
 /// A gateway's candidates are the hosts it publishes (spec 7.1). `None` when it
 /// publishes none, because then there is nowhere to create at all and the
 /// gateway's own refusal says so better than one invented here.
-async fn resolve_named_host(
-    control: &Control,
+fn resolve_named_host(
     hello: &Hello,
     named: &str,
+    directory: Option<&SessionList>,
 ) -> Result<Option<String>> {
-    let hosts = match &hello.working_directory {
-        Some(_) => vec![DirectoryHost {
+    if hello.working_directory.is_some() {
+        let host = DirectoryHost {
             id: Some(hello.host_id.clone()),
             address: None,
             // The host named itself in this handshake, and this row stands in
@@ -108,19 +137,19 @@ async fn resolve_named_host(
             name: hello.name.clone(),
             working_directory: hello.working_directory.clone(),
             unreachable: false,
-        }],
-        None => {
-            control
-                .sessions()
-                .await
-                .context("could not read the host's session list")?
-                .hosts
-        }
-    };
+        };
+        return resolve_host(std::slice::from_ref(&host), named)
+            .map(Some)
+            .map_err(|err| anyhow!("--host: {err}"));
+    }
+
+    let hosts = &directory
+        .expect("gateway host resolution requires the directory snapshot")
+        .hosts;
     if hosts.is_empty() {
         return Ok(None);
     }
-    resolve_host(&hosts, named)
+    resolve_host(hosts, named)
         .map(Some)
         .map_err(|err| anyhow!("--host: {err}"))
 }
@@ -135,6 +164,7 @@ async fn resolve_named_host(
 async fn resolve_session(
     control: &Control,
     session: ConnectSession<'_>,
+    directory: Option<&SessionList>,
     host: Option<String>,
     settings: Option<SessionSettings>,
     tag: Option<String>,
@@ -142,10 +172,7 @@ async fn resolve_session(
 ) -> Result<(String, bool)> {
     match session {
         ConnectSession::Named(id) => {
-            let list = control
-                .sessions()
-                .await
-                .context("could not read the host's session list")?;
+            let list = directory.expect("named session resolution requires the directory snapshot");
             if list.sessions.iter().any(|summary| summary.id == id) {
                 Ok((id.to_string(), false))
             } else {
@@ -157,10 +184,8 @@ async fn resolve_session(
             true,
         )),
         ConnectSession::Latest => {
-            let list = control
-                .sessions()
-                .await
-                .context("could not read the host's session list")?;
+            let list =
+                directory.expect("latest session resolution requires the directory snapshot");
             // Most recently modified, with the id as the tie-break: ids are
             // minted as timestamps, so the higher one is the younger session.
             // An archived session is one its user is done with, and this is
@@ -588,6 +613,7 @@ mod tests {
         let (session, created) = resolve_session(
             &control,
             launch.session(),
+            None,
             None,
             None,
             None,
