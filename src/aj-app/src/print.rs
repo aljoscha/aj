@@ -1046,6 +1046,189 @@ mod tests {
         );
     }
 
+    /// Bare `continue` in print mode takes the latest session that is not
+    /// archived, and reaching that arm at all takes an option between the
+    /// launch input and the subcommand.
+    ///
+    /// `aj --print hello --scripted D continue` is the shape: a recognized
+    /// option after the top-level positional reopens subcommand matching, so
+    /// the launch input is non-empty and `continue` still parses with an empty
+    /// session slot. Without an option in that position clap fills the slot
+    /// from the first positional, which is what
+    /// `treats_lone_continue_positional_as_session_id` pins.
+    ///
+    /// The composed contract, which the default pick alone cannot show: the
+    /// archived newest row is passed over, the older unarchived row receives
+    /// the turn, and no fresh session is minted to hide the difference.
+    #[tokio::test(start_paused = true)]
+    async fn bare_print_continue_resumes_the_newest_unarchived_session() {
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+
+        run_capture(
+            &persistence,
+            &["--print", "--scripted", "streaming-text", "hello"],
+        )
+        .await;
+        let older = persistence
+            .get_latest_session_id()
+            .expect("read latest session")
+            .expect("a session was written");
+
+        // Minted by hand rather than driven, because ids come from the clock
+        // and two runs inside one test can collide. Copying the real log keeps
+        // it past the format gate.
+        let newer = "2999-01-01-00-00-00-000";
+        let log_path = |id: &str| persistence.sessions_dir().join(format!("{id}.jsonl"));
+        std::fs::copy(log_path(&older), log_path(newer)).expect("a younger session");
+        persistence.write_archived(newer, true).expect("archive it");
+
+        let entries = |id: &str| {
+            ConversationLog::resume(&persistence, id)
+                .expect("resume for inspection")
+                .entries_in_order()
+                .len()
+        };
+        let older_before = entries(&older);
+        let newer_before = entries(newer);
+
+        run_capture(
+            &persistence,
+            &[
+                "--print",
+                "hello again",
+                "--scripted",
+                "streaming-text",
+                "continue",
+            ],
+        )
+        .await;
+
+        assert!(
+            entries(&older) > older_before,
+            "the newest unarchived session received the turn",
+        );
+        assert_eq!(
+            entries(newer),
+            newer_before,
+            "the archived session was passed over, not resumed",
+        );
+        assert_eq!(
+            persistence.list_sessions().expect("list").len(),
+            2,
+            "no fresh session was minted, which would hide a wrong pick",
+        );
+    }
+
+    /// With every session archived, bare `continue` in print mode has nothing
+    /// to resume, and print mode is one-shot with no readline to fall back on,
+    /// so it is a hard error rather than a fresh session.
+    #[tokio::test(start_paused = true)]
+    async fn bare_print_continue_refuses_when_every_session_is_archived() {
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let auth_dir = TempDir::new().expect("auth tempdir");
+        let cwd = TempDir::new().expect("cwd tempdir");
+
+        run_capture(
+            &persistence,
+            &["--print", "--scripted", "streaming-text", "hello"],
+        )
+        .await;
+        let only = persistence
+            .get_latest_session_id()
+            .expect("read latest session")
+            .expect("a session was written");
+        persistence.write_archived(&only, true).expect("archive it");
+
+        let error = run_inner(
+            parse(&[
+                "--print",
+                "hello again",
+                "--scripted",
+                "streaming-text",
+                "continue",
+            ]),
+            Config::default(),
+            AuthStorage::new(auth_dir.path().join("auth.json")),
+            persistence.clone(),
+            cwd.path().to_path_buf(),
+            Arc::new(Mutex::new(Vec::<u8>::new())),
+            None,
+        )
+        .await
+        .err()
+        .expect("nothing to resume once every session is archived");
+        assert!(
+            format!("{error:#}").contains("no conversation sessions to resume"),
+            "the archived session is passed over, not resumed: {error:#}"
+        );
+        assert_eq!(
+            persistence.list_sessions().expect("list").len(),
+            1,
+            "and the refusal minted nothing",
+        );
+    }
+
+    /// Naming an archived session resumes it in print mode: archiving puts a
+    /// session away without closing it, so an explicit id is still the way
+    /// back in.
+    #[tokio::test(start_paused = true)]
+    async fn print_resumes_an_archived_session_when_the_id_is_named() {
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+
+        run_capture(
+            &persistence,
+            &["--print", "--scripted", "streaming-text", "hello"],
+        )
+        .await;
+        let id = persistence
+            .get_latest_session_id()
+            .expect("read latest session")
+            .expect("a session was written");
+        persistence.write_archived(&id, true).expect("archive it");
+
+        assert_eq!(
+            persistence.get_latest_session_id().expect("read the store"),
+            None,
+            "the store's unnamed pick passes the archived session over",
+        );
+
+        let entries = || {
+            ConversationLog::resume(&persistence, &id)
+                .expect("resume for inspection")
+                .entries_in_order()
+                .len()
+        };
+        let before = entries();
+
+        run_capture(
+            &persistence,
+            &[
+                "--print",
+                "--scripted",
+                "streaming-text",
+                "continue",
+                &id,
+                "more",
+            ],
+        )
+        .await;
+
+        // A scripted reply alone would survive minting a fresh session, so the
+        // assertion is that this log grew and no second one appeared.
+        assert!(
+            entries() > before,
+            "the named archived session received the turn",
+        );
+        assert_eq!(
+            persistence.list_sessions().expect("list").len(),
+            1,
+            "and no fresh session was minted",
+        );
+    }
+
     /// An illegal label refuses the run before a log is minted.
     #[tokio::test(start_paused = true)]
     async fn an_illegal_tag_refuses_a_print_run_and_creates_nothing() {

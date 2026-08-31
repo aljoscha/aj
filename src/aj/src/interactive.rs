@@ -217,11 +217,45 @@ struct World {
 }
 
 /// Which session the process opens with.
+#[derive(Debug, PartialEq, Eq)]
 enum StartupSession {
     /// Mint a fresh one.
     Create,
     /// Resume the identified one from disk.
     Resume(String),
+}
+
+/// Which session the command line opens, before anything is minted or
+/// attached.
+///
+/// A named session is resumed as named, including one that has been
+/// archived: archiving puts a session away without closing it, so naming it
+/// is still the way back in. Unnamed resume takes the default pick, which
+/// passes archived sessions over, and interactive mode has a readline to fall
+/// back on, so an empty store degrades to a fresh session rather than
+/// failing. Reading the store can still fail, and that is raised rather than
+/// treated as an empty store.
+fn startup_session(
+    command: Option<&CliCommand>,
+    persistence: &ConversationPersistence,
+) -> Result<StartupSession> {
+    Ok(match command {
+        Some(CliCommand::Continue {
+            session_id: Some(id),
+            prompt: _,
+        }) => StartupSession::Resume(id.clone()),
+        Some(CliCommand::Continue {
+            session_id: None,
+            prompt: _,
+        }) => match persistence.get_latest_session_id()? {
+            Some(latest) => StartupSession::Resume(latest),
+            None => {
+                eprintln!("No latest conversation to resume; starting a fresh session.");
+                StartupSession::Create
+            }
+        },
+        _ => StartupSession::Create,
+    })
 }
 
 /// Build the session world: the host, the session it opens with, and the
@@ -248,23 +282,7 @@ async fn build_world(
 
     // `aj continue` with neither an explicit id nor a latest session
     // on disk degrades to a fresh session, matching `aj`.
-    let startup = match &args.command {
-        Some(CliCommand::Continue {
-            session_id: Some(id),
-            prompt: _,
-        }) => StartupSession::Resume(id.clone()),
-        Some(CliCommand::Continue {
-            session_id: None,
-            prompt: _,
-        }) => match persistence.get_latest_session_id()? {
-            Some(latest) => StartupSession::Resume(latest),
-            None => {
-                eprintln!("No latest conversation to resume; starting a fresh session.");
-                StartupSession::Create
-            }
-        },
-        _ => StartupSession::Create,
-    };
+    let startup = startup_session(args.command.as_ref(), persistence)?;
 
     let ComposedHost {
         host,
@@ -8257,6 +8275,147 @@ mod tests {
         assert_eq!(strikethrough("row"), "\x1b[9mrow\x1b[29m");
     }
 
+    /// Restores a path's permissions when it goes out of scope.
+    ///
+    /// A test that drops permission bits and restores them at the end leaves
+    /// the directory unsearchable if an assertion between the two panics, and
+    /// then the `TempDir` cannot be removed either. Ownership is the fix: the
+    /// restore rides on unwinding.
+    #[cfg(unix)]
+    struct PermissionGuard {
+        path: std::path::PathBuf,
+        restore: std::fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl PermissionGuard {
+        /// Drop every permission bit on `path`, restoring on drop.
+        fn seal(path: &std::path::Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let restore = std::fs::metadata(path)
+                .expect("stat before sealing")
+                .permissions();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
+                .expect("drop the permission bits");
+            Self {
+                path: path.to_path_buf(),
+                restore,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PermissionGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.restore.clone());
+        }
+    }
+
+    /// One listable session in `persistence`, returning its id.
+    ///
+    /// The listing reads each session's first line to tell the current format
+    /// from the old one, so a log with nothing written is not a session it
+    /// lists, and a store seeded that way would read empty for reasons that
+    /// have nothing to do with what a test is asking about.
+    fn seed_session(persistence: &ConversationPersistence) -> String {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{Message, UserMessage};
+        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+
+        let mut log = ConversationLog::create(persistence).expect("create");
+        log.set_system_prompt("system".to_string())
+            .expect("system prompt");
+        let root = log.system_prompt_id().cloned().expect("system prompt id");
+        log.append(
+            Some(root),
+            ThreadKind::User,
+            None,
+            ConversationEntryKind::Message {
+                message: AgentMessage::wire(Message::User(UserMessage::text("a prompt"))),
+            },
+        )
+        .expect("a prompt");
+        log.session_id().to_string()
+    }
+
+    /// Bare `aj continue` passes over an archived session, and interactive
+    /// mode has a readline to fall back on, so putting every session away
+    /// starts a fresh one rather than failing. Naming an archived session
+    /// still resumes it.
+    ///
+    /// This is the composed outcome the default pick alone cannot show: the
+    /// same empty pick that starts a session here is a hard error in print
+    /// mode, which is one-shot.
+    #[test]
+    fn bare_continue_starts_fresh_when_the_only_session_is_archived() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let id = seed_session(&persistence);
+
+        let bare = Some(CliCommand::Continue {
+            session_id: None,
+            prompt: Vec::new(),
+        });
+        assert_eq!(
+            startup_session(bare.as_ref(), &persistence).expect("resolve"),
+            StartupSession::Resume(id.clone()),
+            "the unarchived session is the unnamed pick",
+        );
+
+        persistence.write_archived(&id, true).expect("archive");
+        assert_eq!(
+            startup_session(bare.as_ref(), &persistence).expect("resolve"),
+            StartupSession::Create,
+            "with the only session put away, bare continue starts a fresh one",
+        );
+
+        let named = Some(CliCommand::Continue {
+            session_id: Some(id.clone()),
+            prompt: Vec::new(),
+        });
+        assert_eq!(
+            startup_session(named.as_ref(), &persistence).expect("resolve"),
+            StartupSession::Resume(id),
+            "naming an archived session still resumes it: archiving is not closing",
+        );
+    }
+
+    /// A store that cannot be read is not a store with nothing in it, so
+    /// startup raises instead of silently opening a fresh session and leaving
+    /// the user's work out of reach.
+    #[cfg(unix)]
+    #[test]
+    fn bare_continue_raises_when_the_archive_set_cannot_be_read() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let id = seed_session(&persistence);
+        persistence.write_archived(&id, true).expect("archive");
+
+        let meta = dir.path().join("sessions").join("meta");
+        let resolved = {
+            let _sealed = PermissionGuard::seal(&meta);
+            if std::fs::read_dir(&meta).is_ok() {
+                // Root ignores the read bit, so the failure this test is about
+                // cannot be produced. Skipping beats asserting something that
+                // cannot fail.
+                return;
+            }
+            startup_session(
+                Some(&CliCommand::Continue {
+                    session_id: None,
+                    prompt: Vec::new(),
+                }),
+                &persistence,
+            )
+        };
+
+        assert!(
+            resolved.is_err(),
+            "an unreadable store raises rather than opening a fresh session: {resolved:?}",
+        );
+    }
+
     #[test]
     fn a_connected_session_subject_points_back_to_its_peer() {
         let session = "gateway-host:remote-session";
@@ -9770,6 +9929,106 @@ mod tests {
             Some("fix-auth".to_string()),
         );
         shut_down(&world).await;
+    }
+
+    /// Bare `aj continue` opens the newest session that is not archived, all
+    /// the way through the composed build.
+    ///
+    /// The policy is unit-tested at `startup_session`, but a regression in how
+    /// `build_world` consumes its answer would survive that. This drives real
+    /// argv into the real composed path and asks the built world which session
+    /// it opened.
+    #[tokio::test]
+    async fn bare_continue_opens_the_newest_unarchived_session_through_the_composed_build() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = store_in(&dir);
+        let older = seed_session(&persistence);
+        // Minted by hand rather than created, because ids come from the clock
+        // and two creates inside one test can collide.
+        let newer = "2999-01-01-00-00-00-000";
+        let log_path = |id: &str| persistence.sessions_dir().join(format!("{id}.jsonl"));
+        std::fs::copy(log_path(&older), log_path(newer)).expect("a younger session");
+        persistence.write_archived(newer, true).expect("archive it");
+
+        let world = world_from_argv(&dir, &["aj", "--scripted", "streaming-text", "continue"])
+            .await
+            .expect("build world");
+        // Captured before teardown and asserted after it: a failing assertion
+        // must not panic past `shut_down`, because the host's owner task is
+        // what reaps, fences persistence and releases the advisory lock.
+        let opened = world.session().to_string();
+        shut_down(&world).await;
+        assert_eq!(
+            opened, older,
+            "the archived younger session was passed over",
+        );
+    }
+
+    /// With every session archived, bare `aj continue` opens a fresh one:
+    /// interactive mode has a readline to fall back on, so an empty pick is a
+    /// new session rather than a failure.
+    #[tokio::test]
+    async fn bare_continue_creates_through_the_composed_build_when_all_are_archived() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = store_in(&dir);
+        let only = seed_session(&persistence);
+        persistence.write_archived(&only, true).expect("archive it");
+
+        let world = world_from_argv(&dir, &["aj", "--scripted", "streaming-text", "continue"])
+            .await
+            .expect("build world");
+        let opened = world.session().to_string();
+        shut_down(&world).await;
+        assert_ne!(opened, only, "the archived session was not resumed");
+    }
+
+    /// A store that cannot be read fails the run rather than opening a fresh
+    /// session, through the real composed build.
+    ///
+    /// This is the harm the strict archive read exists to prevent, and it is
+    /// the one outcome the policy test cannot pin: `build_world` could consume
+    /// the error instead of propagating it, and every success-path subject
+    /// would stay green while an unreadable store silently minted a new
+    /// session and left the user's work out of reach.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bare_continue_fails_through_the_composed_build_when_the_store_cannot_be_read() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = store_in(&dir);
+        let only = seed_session(&persistence);
+        persistence.write_archived(&only, true).expect("archive it");
+
+        let meta = dir.path().join("sessions").join("meta");
+        let _sealed = PermissionGuard::seal(&meta);
+        if std::fs::read_dir(&meta).is_ok() {
+            // Root ignores the read bit, so the failure this test is about
+            // cannot be produced. Skipping beats asserting something that
+            // cannot fail.
+            return;
+        }
+
+        match world_from_argv(&dir, &["aj", "--scripted", "streaming-text", "continue"]).await {
+            Err(_) => {
+                assert_eq!(
+                    std::fs::read_dir(dir.path().join("sessions"))
+                        .expect("the sessions directory is still readable")
+                        .filter_map(|entry| entry.ok())
+                        .filter(|entry| entry.path().extension().and_then(|s| s.to_str())
+                            == Some("jsonl"))
+                        .count(),
+                    1,
+                    "the refused run minted no session",
+                );
+            }
+            // Torn down before failing: a World that should not exist still
+            // owns a host whose task reaps, fences persistence and releases
+            // the advisory lock.
+            Ok(world) => {
+                let opened = world.session().to_string();
+                shut_down(&world).await;
+                panic!("an unreadable store opened session {opened} instead of failing");
+            }
+        }
     }
 
     /// A local interactive run carries `--thinking` through the real composed
