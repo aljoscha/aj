@@ -1191,6 +1191,18 @@ impl SessionHost {
         let _ = release.await;
     }
 
+    /// Offer one frame through the production live fan-out.
+    ///
+    /// Composed attach tests use this seam to place a delayed forwarder
+    /// delivery after subscriber registration while the same durable event is
+    /// already present in the attach snapshot. The frame still crosses the
+    /// real attaching-state drop rule, live queue, boundary filter, and
+    /// post-`CaughtUp` release.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn publish_live_frame_for_test(&self, frame: Frame) {
+        self.inner.shared.fanout.publish(frame);
+    }
+
     /// How many times the host has read its session store's `locks/`
     /// directory.
     ///

@@ -6156,6 +6156,269 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     revived.host.shutdown().await;
 }
 
+/// A compaction usage update is a one-shot frame, not a cumulative painting
+/// snapshot. When its durable checkpoint is both in an attach backfill and
+/// queued live, fan-out filters the duplicate end at the boundary but must
+/// retain the update behind `CaughtUp`.
+#[tokio::test]
+async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
+    fn priced(text: &str, usage: [u64; 4]) -> AssistantMessage {
+        let mut message = finalized_text_message(text);
+        message.usage.input = usage[0];
+        message.usage.output = usage[1];
+        message.usage.cache_write = usage[2];
+        message.usage.cache_read = usage[3];
+        message.usage.total_tokens = usage.into_iter().sum();
+        message
+    }
+
+    const SENTINEL: &str = "attach-release-sentinel";
+    let first = [10, 20, 30, 40];
+    let second = [100, 200, 300, 400];
+    let summary = [1_000, 2_000, 3_000, 4_000];
+    let prefix = [10_000, 20_000, 30_000, 40_000];
+    let checkpoint_total = [11_000, 22_000, 33_000, 44_000];
+    let later = [10, 1, 0, 70];
+    let harness = Harness::new(vec![
+        priced("first answer", first),
+        priced(&format!("second answer {}", "X".repeat(4_000)), second),
+        priced("SUMMARY", summary),
+        priced("PREFIX", prefix),
+        priced("later answer", later),
+    ]);
+    harness
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .compact_keep_recent = 100;
+    let session = harness.create().await;
+    let mut warm = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "one").await;
+    warm.pump_until_idle().await;
+    harness.prompt(&session, "two").await;
+    warm.pump_until_idle().await;
+    harness
+        .host
+        .command(&session, Command::Compact { instructions: None })
+        .await
+        .expect("compact on an idle session");
+    let compacted = warm.pump_until_idle().await;
+    let checkpoint_end = compacted
+        .iter()
+        .find(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::CompactionEnd { summary: Some(_), .. }))
+        ))
+        .cloned()
+        .expect("the durable checkpoint end");
+    let checkpoint_usage = compacted
+        .iter()
+        .find(|frame| {
+            matches!(
+                frame,
+                Frame::Event { event, .. }
+                    if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate { usage, .. })
+                        if usage.turn_input == checkpoint_total[0])
+            )
+        })
+        .cloned()
+        .expect("the checkpoint usage update");
+    let checkpoint_id = match &checkpoint_usage {
+        Frame::Event { event, .. } => match event.known() {
+            Some(AgentEvent::CompactionUsageUpdate { checkpoint_id, .. }) => checkpoint_id.clone(),
+            other => panic!("checkpoint usage frame changed kind: {other:?}"),
+        },
+        other => panic!("checkpoint usage changed frame kind: {other:?}"),
+    };
+    let (checkpoint_seq, checkpoint_end_id) = match &checkpoint_end {
+        Frame::Event {
+            durability: Some(durability),
+            ..
+        } => (durability.seq, durability.entry_id.clone()),
+        other => panic!("checkpoint end is not durable: {other:?}"),
+    };
+    assert_eq!(
+        checkpoint_end_id, checkpoint_id,
+        "both halves identify the same checkpoint",
+    );
+
+    harness.prompt(&session, "after compaction").await;
+    let later_frames = warm.pump_until_idle().await;
+    let (later_seq, later_id) = later_frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::Event {
+                durability: Some(durability),
+                event,
+                ..
+            } if matches!(
+                event.known(),
+                Some(AgentEvent::MessageEnd { message, .. })
+                    if matches!(
+                        message.as_stored_wire(),
+                        Some(aj_models::types::Message::Assistant(_))
+                    )
+            ) =>
+            {
+                Some((durability.seq, durability.entry_id.clone()))
+            }
+            _ => None,
+        })
+        .expect("the later assistant has durable identity");
+
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    let mut client = SessionClient::new(session.clone());
+    let mut chat = ChatState::new(settings(), 200_000, Arc::new(Vec::new()));
+    client.expect_attach();
+    let opening = bounded("the attach opening state", stream.recv())
+        .await
+        .expect("the block opens");
+    let (epoch, boundary) = match &opening {
+        Frame::State {
+            epoch, last_seq, ..
+        } => (epoch.clone(), *last_seq),
+        other => panic!("attach block opened with {other:?}"),
+    };
+    assert!(
+        checkpoint_seq <= boundary,
+        "the attach snapshot includes the checkpoint it must de-duplicate",
+    );
+    assert!(
+        later_seq <= boundary,
+        "the same snapshot includes the later assistant pair",
+    );
+    let _ = client.apply(&mut chat, opening);
+
+    // Reading only the opening frame leaves the capacity-one block producer
+    // parked inside its backfill. These offers therefore cross Fanout while
+    // this subscriber is still Attaching. `finish_block` must later remove the
+    // duplicate durable end and retain the one-shot usage update.
+    harness
+        .host
+        .publish_live_frame_for_test(checkpoint_end.clone());
+    harness
+        .host
+        .publish_live_frame_for_test(checkpoint_usage.clone());
+    harness.host.publish_live_frame_for_test(Frame::Event {
+        session: session.clone(),
+        epoch,
+        durability: None,
+        event: AgentEvent::Notice {
+            agent_id: AgentId::Main,
+            text: SENTINEL.to_string(),
+        }
+        .into(),
+    });
+
+    let block = frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    for frame in &block {
+        let _ = client.apply(&mut chat, frame.clone());
+    }
+    assert_eq!(
+        block
+            .iter()
+            .filter(|frame| matches!(
+                frame,
+                Frame::Event { event, .. }
+                    if matches!(event.known(), Some(AgentEvent::CompactionEnd { .. }))
+            ))
+            .count(),
+        1,
+        "the checkpoint appears once in the backfill",
+    );
+
+    let released = frames_until(&mut stream, "the post-caught-up sentinel", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::Notice { text, .. }) if text == SENTINEL)
+        )
+    })
+    .await;
+    assert!(
+        !released.iter().any(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::CompactionEnd { .. }))
+        )),
+        "finish_block filters the queued durable duplicate",
+    );
+    assert_eq!(
+        released
+            .iter()
+            .filter(|frame| matches!(
+                frame,
+                Frame::Event { event, .. }
+                    if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate {
+                        checkpoint_id: seen,
+                        ..
+                    }) if seen == &checkpoint_id)
+            ))
+            .count(),
+        1,
+        "the checkpoint's one-shot usage crosses the real attach release",
+    );
+    for frame in released {
+        let _ = client.apply(&mut chat, frame);
+    }
+
+    let usage_rows: Vec<_> = chat
+        .transcript(AgentId::Main)
+        .expect("main transcript")
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            aj_app::chat::EntryKind::TurnUsage(usage) => Some(usage),
+            _ => None,
+        })
+        .collect();
+    let checkpoint_rows: Vec<_> = usage_rows
+        .iter()
+        .filter(|row| row.source_entry.as_deref() == Some(checkpoint_id.as_str()))
+        .collect();
+    assert_eq!(checkpoint_rows.len(), 1, "one usage row per checkpoint");
+    assert_eq!(
+        [
+            checkpoint_rows[0].usage.turn_input,
+            checkpoint_rows[0].usage.turn_output,
+            checkpoint_rows[0].usage.turn_cache_write,
+            checkpoint_rows[0].usage.turn_cache_read,
+        ],
+        checkpoint_total,
+        "the retained frame carries the checkpoint spend",
+    );
+    let assistant = usage_rows
+        .iter()
+        .find(|row| row.source_entry.as_deref() == Some(later_id.as_str()))
+        .expect("later assistant usage row");
+    assert_eq!(assistant.usage.turn_input, later[0]);
+    assert_eq!(assistant.usage.turn_cache_read, later[3]);
+    assert_eq!(
+        chat.footers().context_usage(AgentId::Main).tokens,
+        Some(later[0] + later[2] + later[3]),
+        "checkpoint spend never replaces later assistant occupancy",
+    );
+    assert_eq!(
+        chat.transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.kind, aj_app::chat::EntryKind::Compaction(_)))
+            .count(),
+        1,
+        "the filtered duplicate does not append a second checkpoint row",
+    );
+    harness.host.shutdown().await;
+}
+
 /// Re-serving a terminal legacy checkpoint must not turn the preceding
 /// assistant's usage into invented checkpoint spend.
 #[tokio::test]
