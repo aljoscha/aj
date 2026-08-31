@@ -1828,7 +1828,7 @@ fn head_refusal(branching: bool, err: &ControlError) -> String {
     } else if err.unknown_entry() {
         "Can't switch: that branch is no longer in this session.".to_string()
     } else {
-        format!("Failed to branch the conversation: {err}")
+        format!("Failed to branch the conversation: {}", peer_refusal(err))
     }
 }
 
@@ -3228,7 +3228,10 @@ async fn apply_archive(world: &mut World, archived: bool) {
         Err(err) if err.unknown_endpoint() => {
             fold_notice(world, "This host does not support archiving sessions.");
         }
-        Err(err) => fold_notice(world, &format!("Could not archive the session: {err}")),
+        Err(err) => fold_notice(
+            world,
+            &format!("Could not archive the session: {}", peer_refusal(&err)),
+        ),
     }
 }
 
@@ -3243,7 +3246,10 @@ async fn apply_tag_edit(world: &mut World, edit: TagEdit) {
         .command(world.session(), Command::Tag { tag: edit.tag })
         .await
     {
-        fold_notice(world, &format!("Could not set the session tag: {err}"));
+        fold_notice(
+            world,
+            &format!("Could not set the session tag: {}", peer_refusal(&err)),
+        );
     }
 }
 
@@ -3488,7 +3494,10 @@ async fn apply_command_action(
         CommandAction::OpenSessionTree => match open_tree_overlay(world, shell).await {
             Ok(_) => ActionEffect::OpenedOverlay,
             Err(err) => {
-                fold_notice(world, &format!("Could not read the session tree: {err}"));
+                fold_notice(
+                    world,
+                    &format!("Could not read the session tree: {}", peer_refusal(&err)),
+                );
                 ActionEffect::Redraw
             }
         },
@@ -20358,6 +20367,135 @@ mod tests {
             "the refusal does not name what the user asked for: {notices:?}",
         );
         remote.shutdown().await;
+    }
+
+    async fn refusal_feedback(
+        world: &mut World,
+        shell: &Rc<RefCell<Shell>>,
+        app: &mut AsyncApp,
+    ) -> Vec<String> {
+        let mut feedback = Vec::with_capacity(4);
+        let toast_count = toast_lines(shell).len();
+        branch_focused_session(
+            app,
+            shell,
+            world,
+            HeadTarget::Entry("irrelevant-entry".to_string()),
+            None,
+        )
+        .await;
+        let toasts = toast_lines(shell);
+        assert_eq!(
+            toasts.len(),
+            toast_count + 1,
+            "one head refusal toast: {toasts:?}"
+        );
+        feedback.push(toasts.last().expect("the head refusal toast").clone());
+
+        let notice_count = main_notices(world).len();
+        apply_archive(world, true).await;
+        let notices = main_notices(world);
+        assert_eq!(
+            notices.len(),
+            notice_count + 1,
+            "one archive notice: {notices:?}"
+        );
+        feedback.push(notices.last().expect("the archive notice").clone());
+
+        let notice_count = notices.len();
+        apply_tag_edit(
+            world,
+            TagEdit {
+                tag: Some("new-tag".to_string()),
+            },
+        )
+        .await;
+        let notices = main_notices(world);
+        assert_eq!(
+            notices.len(),
+            notice_count + 1,
+            "one tag notice: {notices:?}"
+        );
+        feedback.push(notices.last().expect("the tag notice").clone());
+
+        let notice_count = notices.len();
+        assert!(matches!(
+            apply_command(world, shell, CommandAction::OpenSessionTree).await,
+            ActionEffect::Redraw
+        ));
+        let notices = main_notices(world);
+        assert_eq!(
+            notices.len(),
+            notice_count + 1,
+            "one tree notice: {notices:?}"
+        );
+        feedback.push(notices.last().expect("the tree notice").clone());
+        feedback
+    }
+
+    /// Each ruled surface presents the peer's own sentence in both modes. The
+    /// remote half crosses real HTTP routes and begins as `RemoteError::Status`;
+    /// the local half reaches the same four fallbacks as `HostError::UnknownSession`.
+    #[tokio::test]
+    async fn four_status_refusals_match_their_local_user_facing_seams() {
+        const SESSION: &str = "recognizable-refusal";
+        const REASON: &str = "unknown session recognizable-refusal";
+
+        let local_dir = TempDir::new().expect("local tempdir");
+        let (mut local, local_shell, mut local_app, _writer, _root) =
+            world_shell_app(&local_dir, "streaming-text", default_layers()).await;
+        let local_session = local.directory.rename_focused(SESSION.to_string());
+        let expected = refusal_feedback(&mut local, &local_shell, &mut local_app).await;
+        assert_eq!(
+            expected,
+            [
+                format!("Failed to branch the conversation: {REASON}"),
+                format!("Could not archive the session: {REASON}"),
+                format!("Could not set the session tag: {REASON}"),
+                format!("Could not read the session tree: {REASON}"),
+            ],
+        );
+        local.directory.rename_focused(local_session);
+        let toast_count = toast_lines(&local_shell).len();
+        branch_focused_session(
+            &mut local_app,
+            &local_shell,
+            &mut local,
+            HeadTarget::Before("missing-entry".to_string()),
+            None,
+        )
+        .await;
+        let toasts = toast_lines(&local_shell);
+        assert_eq!(
+            &toasts[toast_count..],
+            ["Can't branch: that message is no longer in this session."],
+            "the specialized unknown-entry wording must stay ahead of the fallback",
+        );
+        shut_down(&local).await;
+
+        let remote_dir = TempDir::new().expect("remote tempdir");
+        let peer = RemoteHost::start(&remote_dir, "streaming-text").await;
+        let (mut remote, remote_shell) = connect_world_and_shell(&remote_dir, &peer, &[]).await;
+        let (mut remote_app, _writer, _root) = app_over(&remote_shell).await;
+        let remote_session = remote.directory.rename_focused(SESSION.to_string());
+
+        let actual = refusal_feedback(&mut remote, &remote_shell, &mut remote_app).await;
+
+        assert_eq!(actual, expected, "local and remote refusal text diverged");
+        for message in &actual {
+            assert!(
+                message.ends_with(REASON),
+                "the peer's sentence was lost: {message}"
+            );
+            for wrapper in ["the host answered", "the peer answered", "404", "Not Found"] {
+                assert!(
+                    !message.contains(wrapper),
+                    "transport wrapper {wrapper:?} reached the user: {message}",
+                );
+            }
+        }
+        remote.directory.rename_focused(remote_session);
+        peer.shutdown().await;
     }
 
     /// The strip's reveal, every byte of it real: an archived row is out of
