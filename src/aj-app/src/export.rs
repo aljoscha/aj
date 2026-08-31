@@ -110,7 +110,8 @@ impl Serialize for ExportEntry<'_> {
         if !project_details {
             return entry.serialize(serializer);
         }
-        let Some(details) = resolve_tool_details(raw_details, &result.content) else {
+        let Some(details) = resolve_tool_details(raw_details, &result.tool_name, &result.content)
+        else {
             return entry.serialize(serializer);
         };
 

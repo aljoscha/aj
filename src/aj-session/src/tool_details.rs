@@ -57,7 +57,7 @@ fn compact_tool_result(result: &mut ToolResultMessage) {
     ) else {
         return;
     };
-    let Some(content_text) = concatenated_text(&result.content) else {
+    let Some(content_text) = referenced_body(&result.tool_name, &result.content) else {
         return;
     };
 
@@ -106,7 +106,7 @@ pub(crate) fn expand_message(mut message: AgentMessage) -> AgentMessage {
     let Some(raw) = result.details.as_ref() else {
         return message;
     };
-    let Some(details) = resolve_text_reference(raw, &result.content) else {
+    let Some(details) = resolve_text_reference(raw, &result.tool_name, &result.content) else {
         return message;
     };
     if let Ok(details) = serde_json::to_value(details) {
@@ -115,18 +115,27 @@ pub(crate) fn expand_message(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
-/// Resolves persisted tool details against their model-facing content.
+/// Resolves persisted tool details against their tool and model-facing content.
 ///
 /// Exact text body references are hydrated first. Every other value, including
 /// a valid inline text object with an unrelated `body_ref` field, falls through
 /// to ordinary `ToolDetails` deserialization. A malformed marker-only value or
 /// non-text content returns `None`, allowing callers to use their existing
 /// content fallback without panicking.
-pub fn resolve_tool_details(raw: &Value, content: &[UserContent]) -> Option<ToolDetails> {
-    resolve_text_reference(raw, content).or_else(|| serde_json::from_value(raw.clone()).ok())
+pub fn resolve_tool_details(
+    raw: &Value,
+    tool_name: &str,
+    content: &[UserContent],
+) -> Option<ToolDetails> {
+    resolve_text_reference(raw, tool_name, content)
+        .or_else(|| serde_json::from_value(raw.clone()).ok())
 }
 
-fn resolve_text_reference(raw: &Value, content: &[UserContent]) -> Option<ToolDetails> {
+fn resolve_text_reference(
+    raw: &Value,
+    tool_name: &str,
+    content: &[UserContent],
+) -> Option<ToolDetails> {
     let object = raw.as_object()?;
     if object.len() != 3
         || object.get("kind").and_then(Value::as_str) != Some("text")
@@ -144,7 +153,7 @@ fn resolve_text_reference(raw: &Value, content: &[UserContent]) -> Option<ToolDe
         return None;
     }
     let append_newline = body_ref.get("append_newline")?.as_bool()?;
-    let mut body = concatenated_text(content)?;
+    let mut body = referenced_body(tool_name, content)?;
     if append_newline {
         body.push('\n');
     }
@@ -163,6 +172,53 @@ fn concatenated_text(content: &[UserContent]) -> Option<String> {
         }
     }
     Some(text)
+}
+
+/// Reconstructs the display body represented by a `content_text` marker.
+///
+/// `read_file` sends absolute line numbers to the model but resets the display
+/// gutter to one. The tool name is part of the reference contract because the
+/// persisted marker deliberately stores no second copy or transformation flag.
+fn referenced_body(tool_name: &str, content: &[UserContent]) -> Option<String> {
+    let content = concatenated_text(content)?;
+    if tool_name == "read_file" {
+        read_file_display_body(&content).or(Some(content))
+    } else {
+        Some(content)
+    }
+}
+
+fn read_file_display_body(content: &str) -> Option<String> {
+    let (numbered_lines, footer) = match content.split_once("\n\n") {
+        Some((numbered_lines, footer)) => (numbered_lines, Some(footer)),
+        None => (content, None),
+    };
+    if numbered_lines.is_empty() {
+        return None;
+    }
+
+    let mut display = String::with_capacity(content.len());
+    let mut first_line = None;
+    for (index, line) in numbered_lines.split('\n').enumerate() {
+        let (gutter, text) = line.split_once(": ")?;
+        let number = gutter.trim_start().parse::<usize>().ok()?;
+        if number == 0 || gutter != format!("{number:>5}") {
+            return None;
+        }
+        let first = *first_line.get_or_insert(number);
+        if number != first.checked_add(index)? {
+            return None;
+        }
+        if index > 0 {
+            display.push('\n');
+        }
+        display.push_str(&format!("{:>5}: {text}", index + 1));
+    }
+    if let Some(footer) = footer {
+        display.push_str("\n\n");
+        display.push_str(footer);
+    }
+    Some(display)
 }
 
 #[cfg(test)]
@@ -230,6 +286,57 @@ mod tests {
         compact(&mut result);
 
         assert_eq!(result.details, Some(reference(true)));
+    }
+
+    #[test]
+    fn compacts_and_expands_renumbered_read_file_body_exactly() {
+        let lines: Vec<_> = (1..=30).map(|line| format!("payload {line}")).collect();
+        let content = format!(
+            "{}\n\n[70 more lines in file. Use offset=100030 to continue.]",
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| format!("{}: {line}", index + 100_000))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let body = format!(
+            "{}\n\n[70 more lines in file. Use offset=100030 to continue.]\n",
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| format!("{:>5}: {line}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let original_details = json!({"kind": "text", "summary": "read_file x", "body": body});
+        let mut result = result(vec![UserContent::text(content)], original_details.clone());
+
+        compact(&mut result);
+        assert_eq!(result.details, Some(reference(true)));
+
+        let expanded = expand_message(AgentMessage::wire(Message::ToolResult(result)));
+        let Some(Message::ToolResult(result)) = expanded.as_stored_wire() else {
+            panic!("expected expanded tool result");
+        };
+        assert_eq!(result.details.as_ref(), Some(&original_details));
+    }
+
+    #[test]
+    fn keeps_unowned_or_nonsequential_line_gutters_inline() {
+        let display = "    1: alpha\n    2: beta\n".repeat(10);
+        for (tool_name, content) in [
+            ("bash", "   41: alpha\n   42: beta\n".repeat(10)),
+            ("read_file", "   41: alpha\n   43: beta\n".repeat(10)),
+        ] {
+            let details = json!({"kind": "text", "summary": "read_file x", "body": display});
+            let mut result = result(vec![UserContent::text(content)], details.clone());
+            result.tool_name = tool_name.to_string();
+
+            compact(&mut result);
+
+            assert_eq!(result.details, Some(details), "tool {tool_name}");
+        }
     }
 
     #[test]
@@ -309,7 +416,8 @@ mod tests {
 
         compact(&mut result);
         let reference = result.details.expect("body compacted");
-        let hydrated = resolve_tool_details(&reference, &result.content).expect("valid reference");
+        let hydrated = resolve_tool_details(&reference, &result.tool_name, &result.content)
+            .expect("valid reference");
 
         match hydrated {
             ToolDetails::Text { summary, body } => {
@@ -329,8 +437,9 @@ mod tests {
             "body_ref": {"source": "content_text", "append_newline": "yes"},
         });
 
-        let resolved = resolve_tool_details(&mixed, &[UserContent::text("model body")])
-            .expect("inline text details remain valid");
+        let resolved =
+            resolve_tool_details(&mixed, "read_file", &[UserContent::text("model body")])
+                .expect("inline text details remain valid");
         match resolved {
             ToolDetails::Text { summary, body } => {
                 assert_eq!(summary, "inline summary");
@@ -348,6 +457,8 @@ mod tests {
             "body_ref": {"source": "future_content", "append_newline": false},
         });
 
-        assert!(resolve_tool_details(&malformed, &[UserContent::text("body")]).is_none());
+        assert!(
+            resolve_tool_details(&malformed, "read_file", &[UserContent::text("body")]).is_none()
+        );
     }
 }

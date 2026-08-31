@@ -1202,7 +1202,7 @@ impl ReplayState {
         // `ToolDetails` deserialization for every other shape. Missing or
         // malformed details fall back to the model-facing content.
         let result = match tr.details.as_ref() {
-            Some(value) => resolve_tool_details(value, &tr.content)
+            Some(value) => resolve_tool_details(value, &tr.tool_name, &tr.content)
                 .unwrap_or_else(|| text_fallback(&tool_name, &tr.content)),
             None => text_fallback(&tool_name, &tr.content),
         };

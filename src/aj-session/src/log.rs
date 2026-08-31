@@ -2862,8 +2862,22 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("set sp");
 
-        let content = "persisted model-facing content\n".repeat(40);
-        let body = format!("{content}\n");
+        let lines: Vec<_> = (1..=40).map(|line| format!("line {line}")).collect();
+        let content = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| format!("{:>5}: {line}", index + 41))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!(
+            "{}\n",
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| format!("{:>5}: {line}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         let live_message =
             detailed_text_tool_result("tu-1", "read_file", &content, "read_file large.txt", &body);
         {
