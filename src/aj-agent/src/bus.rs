@@ -68,6 +68,16 @@ pub struct EventBus {
     inner: Arc<BusInner>,
 }
 
+/// Subscription-only capability for an [`EventBus`].
+///
+/// A component that only observes an Agent receives this handle rather than an
+/// [`EventBus`] clone, so it can add and remove listeners without acquiring an
+/// event-emission path around the Agent's typed state transitions.
+#[derive(Clone)]
+pub struct EventSubscriptions {
+    inner: Arc<BusInner>,
+}
+
 impl Default for EventBus {
     fn default() -> Self {
         Self::new()
@@ -91,15 +101,13 @@ impl EventBus {
     /// listener returns `Err`, later listeners do not run for that
     /// event and the error is returned from [`EventBus::emit`].
     pub fn subscribe(&self, listener: Listener) -> SubscriptionHandle {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .listeners
-            .lock()
-            .expect("event bus listeners mutex poisoned")
-            .push(Slot { id, listener });
-        SubscriptionHandle {
-            inner: Arc::downgrade(&self.inner),
-            id,
+        subscribe(&self.inner, listener)
+    }
+
+    /// Return a cloneable handle that can subscribe but cannot emit.
+    pub fn subscriptions(&self) -> EventSubscriptions {
+        EventSubscriptions {
+            inner: Arc::clone(&self.inner),
         }
     }
 
@@ -120,7 +128,9 @@ impl EventBus {
     /// complete sequence before the next listener starts. If listener `N`
     /// rejects an event, every earlier listener has already received the whole
     /// sequence and no later listener runs. Registrations and removals during
-    /// delivery affect only subsequent bus operations.
+    /// delivery affect only subsequent bus operations. Separate `emit` or
+    /// `emit_sequence` futures are not globally serialized by the bus; callers
+    /// that require one history serialize their own operations.
     pub async fn emit_sequence(&self, events: &[AgentEvent]) -> Result<(), BoxError> {
         let listeners = self.listener_snapshot();
         for listener in listeners {
@@ -151,6 +161,26 @@ impl EventBus {
             .lock()
             .expect("event bus listeners mutex poisoned")
             .len()
+    }
+}
+
+impl EventSubscriptions {
+    /// Register a listener and return a handle whose drop removes it.
+    pub fn subscribe(&self, listener: Listener) -> SubscriptionHandle {
+        subscribe(&self.inner, listener)
+    }
+}
+
+fn subscribe(inner: &Arc<BusInner>, listener: Listener) -> SubscriptionHandle {
+    let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+    inner
+        .listeners
+        .lock()
+        .expect("event bus listeners mutex poisoned")
+        .push(Slot { id, listener });
+    SubscriptionHandle {
+        inner: Arc::downgrade(inner),
+        id,
     }
 }
 

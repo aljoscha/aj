@@ -34,8 +34,8 @@ use aj_models::types::{
     ToolDefinition as UnifiedToolDefinition, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 
-use crate::bus::{EventBus, Listener, SubscriptionHandle};
-use crate::events::{AgentEvent, AgentId, AgentSettings, SubAgentConclusion};
+use crate::bus::{EventBus, EventSubscriptions, Listener, SubscriptionHandle};
+use crate::events::{AgentEvent, AgentId, AgentSettings, CompactionReason, SubAgentConclusion};
 use crate::message::{AgentMessage, TaskNotification, TaskNotificationKind, TaskOutcome};
 use crate::projection::transcript_to_messages;
 use crate::queue::{MessageQueues, PendingKind};
@@ -181,6 +181,24 @@ pub fn delivered_report(conclusion: SubAgentConclusion, report: &str) -> String 
         SubAgentConclusion::Truncated => format!("{report}\n\n{SUBAGENT_TRUNCATION_NOTE}"),
         SubAgentConclusion::Completed | SubAgentConclusion::Failed => report.to_string(),
     }
+}
+
+/// Selects the protocol transition emitted for one accounted usage delta.
+///
+/// Assistant terminals emit one [`AgentEvent::UsageUpdate`]. A committed
+/// compaction emits its successful [`AgentEvent::CompactionEnd`] and
+/// self-identifying [`AgentEvent::CompactionUsageUpdate`] to one stable
+/// listener cohort. Failed and canceled operations do not enter this boundary.
+#[derive(Debug)]
+pub enum UsageAccounting {
+    AssistantTerminal,
+    CommittedCompaction {
+        checkpoint_id: String,
+        reason: CompactionReason,
+        tokens_before: u64,
+        tokens_after: u64,
+        summary: String,
+    },
 }
 
 pub struct Agent {
@@ -406,7 +424,7 @@ impl Agent {
     /// [`AgentId::Sub`]. Must be called before any turn runs;
     /// subscriptions registered on the bus that's about to be
     /// replaced are silently dropped.
-    pub fn set_bus(&mut self, bus: EventBus) {
+    fn set_bus(&mut self, bus: EventBus) {
         self.bus = bus;
     }
 
@@ -499,16 +517,35 @@ impl Agent {
         self.bus.subscribe(listener)
     }
 
-    /// Emit one event on the agent's bus.
+    /// Emit one non-accounting event on the agent's bus.
     ///
     /// Lets the host drive out-of-band lifecycle events that the agent
-    /// loop itself doesn't produce — today, the
-    /// [`AgentEvent::CompactionStart`] / [`AgentEvent::CompactionEnd`]
-    /// markers around a host-driven compaction. Listeners are awaited
-    /// inline (a failing listener maps to [`TurnError::Fatal`]), exactly
-    /// like the agent's own emits, so the event reaches the renderer and
-    /// any out-of-process sinks in order.
+    /// loop itself doesn't produce, including compaction progress and
+    /// unsuccessful terminal events. Usage updates and a successful
+    /// checkpoint end belong exclusively to [`Self::account_usage`], which
+    /// couples their delivery to the accumulator transition. Listeners are
+    /// awaited inline (a failing listener maps to [`TurnError::Fatal`]),
+    /// exactly like the agent's own emits, so the event reaches the renderer
+    /// and any out-of-process sinks in order.
     pub async fn emit_event(&self, event: AgentEvent) -> Result<(), TurnError> {
+        if matches!(
+            &event,
+            AgentEvent::UsageUpdate { .. }
+                | AgentEvent::CompactionUsageUpdate { .. }
+                | AgentEvent::CompactionEnd {
+                    has_usage: true,
+                    ..
+                }
+                | AgentEvent::CompactionEnd {
+                    summary: Some(_),
+                    error: None,
+                    ..
+                }
+        ) {
+            return Err(TurnError::Fatal(BoxError::from(
+                "accounting events must be emitted through Agent::account_usage",
+            )));
+        }
         self.bus.emit(event).await.map_err(TurnError::Fatal)
     }
 
@@ -546,9 +583,9 @@ impl Agent {
         (handle, rx)
     }
 
-    /// Borrow the agent's internal event bus.
-    pub fn bus(&self) -> &EventBus {
-        &self.bus
+    /// Return a cloneable subscription-only handle for this agent's event bus.
+    pub fn event_subscriptions(&self) -> EventSubscriptions {
+        self.bus.subscriptions()
     }
 
     pub fn current_turn(&self) -> usize {
@@ -559,67 +596,64 @@ impl Agent {
         self.session_state.accumulated_usage()
     }
 
-    /// Account for one successful assistant turn and emit its usage update.
+    /// Fold one completed operation into this agent's usage and emit its
+    /// corresponding usage event.
     ///
-    /// The update carries the accumulator snapshot from before `delta`.
-    /// Accounting itself is synchronous and precedes the listener await, so
-    /// cancellation or listener failure cannot erase spend already incurred.
-    pub async fn account_usage(&self, delta: &Usage) -> Result<(), TurnError> {
-        let usage = self.account_usage_delta(delta);
-        self.bus
-            .emit(AgentEvent::UsageUpdate {
-                agent_id: self.agent_id,
-                usage,
-            })
-            .await
-            .map_err(TurnError::Fatal)
-    }
-
-    /// Account for one committed compaction and emit its checkpoint event plus
-    /// self-identifying usage update to one stable listener cohort.
+    /// The payload carries the accumulator snapshot from before `delta`, and
+    /// the complete delta is folded under one state lock before listener
+    /// delivery begins. The exclusive receiver serializes that fold with its
+    /// emission, so two operations cannot publish duplicate or reordered
+    /// cumulative snapshots. Cancellation or listener failure cannot erase
+    /// spend already incurred.
     ///
-    /// `delta` is folded synchronously before the first listener await because
-    /// the durable checkpoint already owns the spend. Each earlier successful
-    /// listener receives both events even if a later listener rejects the
-    /// prerequisite. Callers must invoke this only after the checkpoint append
-    /// commits.
-    pub async fn account_compaction_usage(
-        &self,
+    /// Callers selecting [`UsageAccounting::CommittedCompaction`] must invoke
+    /// this only after the checkpoint append commits. Its end and usage update
+    /// are delivered through one listener snapshot, with each earlier
+    /// successful listener receiving the complete pair before a later listener
+    /// can reject it.
+    pub async fn account_usage(
+        &mut self,
         delta: &Usage,
-        checkpoint_id: String,
-        prerequisite: AgentEvent,
+        accounting: UsageAccounting,
     ) -> Result<(), TurnError> {
-        let usage = self.account_usage_delta(delta);
-        self.bus
-            .emit_sequence(&[
-                prerequisite,
-                AgentEvent::CompactionUsageUpdate {
-                    agent_id: self.agent_id,
-                    checkpoint_id,
-                    usage,
-                },
-            ])
-            .await
-            .map_err(TurnError::Fatal)
-    }
-
-    /// Build a pre-add cumulative payload and synchronously retain its delta.
-    fn account_usage_delta(&self, delta: &Usage) -> TokenUsage {
-        let accumulated = self.session_state.accumulated_usage();
-        let usage = TokenUsage {
-            accumulated_input: accumulated.input,
-            turn_input: delta.input,
-            accumulated_output: accumulated.output,
-            turn_output: delta.output,
-            accumulated_cache_write: accumulated.cache_write,
-            turn_cache_write: delta.cache_write,
-            accumulated_cache_read: accumulated.cache_read,
-            turn_cache_read: delta.cache_read,
-            turn_incomplete: delta.incomplete,
-            accumulated_incomplete: accumulated.incomplete,
+        let usage = self.session_state.account_usage(delta);
+        let delivered = match accounting {
+            UsageAccounting::AssistantTerminal => {
+                self.bus
+                    .emit(AgentEvent::UsageUpdate {
+                        agent_id: self.agent_id,
+                        usage,
+                    })
+                    .await
+            }
+            UsageAccounting::CommittedCompaction {
+                checkpoint_id,
+                reason,
+                tokens_before,
+                tokens_after,
+                summary,
+            } => {
+                self.bus
+                    .emit_sequence(&[
+                        AgentEvent::CompactionEnd {
+                            agent_id: self.agent_id,
+                            reason,
+                            tokens_before,
+                            tokens_after,
+                            has_usage: true,
+                            summary: Some(summary),
+                            error: None,
+                        },
+                        AgentEvent::CompactionUsageUpdate {
+                            agent_id: self.agent_id,
+                            checkpoint_id,
+                            usage,
+                        },
+                    ])
+                    .await
+            }
         };
-        self.session_state.accumulate_usage(delta);
-        usage
+        delivered.map_err(TurnError::Fatal)
     }
 
     /// Snapshot of the per-sub-agent accumulated [`Usage`] map. The
@@ -1566,7 +1600,8 @@ impl Agent {
             self.transcript
                 .push(AgentMessage::wire(Message::Assistant(response.clone())));
 
-            self.account_usage(&turn_usage).await?;
+            self.account_usage(&turn_usage, UsageAccounting::AssistantTerminal)
+                .await?;
 
             // Execute tool calls if any
             if has_tool_use {
@@ -2937,8 +2972,24 @@ impl SessionState {
         self.lock().accumulated_usage.clone()
     }
 
-    fn accumulate_usage(&self, delta: &Usage) {
-        self.lock().accumulated_usage.accumulate(delta);
+    /// Build one pre-add event payload and fold its complete delta atomically.
+    fn account_usage(&self, delta: &Usage) -> TokenUsage {
+        let mut inner = self.lock();
+        let accumulated = &inner.accumulated_usage;
+        let usage = TokenUsage {
+            accumulated_input: accumulated.input,
+            turn_input: delta.input,
+            accumulated_output: accumulated.output,
+            turn_output: delta.output,
+            accumulated_cache_write: accumulated.cache_write,
+            turn_cache_write: delta.cache_write,
+            accumulated_cache_read: accumulated.cache_read,
+            turn_cache_read: delta.cache_read,
+            turn_incomplete: delta.incomplete,
+            accumulated_incomplete: accumulated.incomplete,
+        };
+        inner.accumulated_usage.accumulate(delta);
+        usage
     }
 
     fn next_sub_agent_id(&self) -> usize {
@@ -4090,14 +4141,15 @@ mod event_protocol_tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::bus::listener_from_sync;
-    use crate::events::{AgentEvent, AgentId, SubAgentConclusion};
+    use crate::events::{AgentEvent, AgentId, CompactionReason, SubAgentConclusion};
     use crate::message::{AgentMessage, TaskNotification, TaskNotificationKind, TaskOutcome};
     use crate::queue::MessageQueues;
     use crate::tool::{
         ErasedToolDefinition, TaskId, TaskKind, TaskNotice, TaskStatus, ToolContext,
         ToolDefinition, ToolDetails, ToolOutcome,
     };
-    use crate::{Agent, AgentSeed, TaskRegistry};
+    use crate::types::TokenUsage;
+    use crate::{Agent, AgentSeed, TaskRegistry, UsageAccounting};
 
     /// Trivial tool that returns a fixed string. Implements the
     /// [`ToolDefinition`] trait so the test exercises the same
@@ -4412,6 +4464,15 @@ mod event_protocol_tests {
             event_kind: &'static str,
         },
         UsageUpdate(AgentId),
+        CompactionEnd {
+            agent_id: AgentId,
+            reason: CompactionReason,
+            tokens_before: u64,
+            tokens_after: u64,
+            has_usage: bool,
+            summary: Option<String>,
+            error: Option<String>,
+        },
         CompactionUsageUpdate(AgentId, String),
         Other(&'static str),
     }
@@ -4502,7 +4563,23 @@ mod event_protocol_tests {
             AgentEvent::TaskEnd { .. } => EventLabel::Other("TaskEnd"),
             AgentEvent::CompactionStart { .. } => EventLabel::Other("CompactionStart"),
             AgentEvent::CompactionProgress { .. } => EventLabel::Other("CompactionProgress"),
-            AgentEvent::CompactionEnd { .. } => EventLabel::Other("CompactionEnd"),
+            AgentEvent::CompactionEnd {
+                agent_id,
+                reason,
+                tokens_before,
+                tokens_after,
+                has_usage,
+                summary,
+                error,
+            } => EventLabel::CompactionEnd {
+                agent_id: *agent_id,
+                reason: *reason,
+                tokens_before: *tokens_before,
+                tokens_after: *tokens_after,
+                has_usage: *has_usage,
+                summary: summary.clone(),
+                error: error.clone(),
+            },
         }
     }
 
@@ -4654,6 +4731,7 @@ mod event_protocol_tests {
             cache_read: 40,
             total_tokens: 100,
             cost: UsageCost::default(),
+            incomplete: false,
         };
         let agent = build_agent(vec![finalize_script(response)], Vec::new());
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -4689,14 +4767,96 @@ mod event_protocol_tests {
     }
 
     #[tokio::test]
-    async fn account_usage_emits_pre_add_snapshots_and_accumulates_every_dimension() {
+    async fn out_of_band_emission_rejects_accounting_events() {
+        fn usage() -> TokenUsage {
+            TokenUsage {
+                accumulated_input: 0,
+                turn_input: 1,
+                accumulated_output: 0,
+                turn_output: 2,
+                accumulated_cache_write: 0,
+                turn_cache_write: 3,
+                accumulated_cache_read: 0,
+                turn_cache_read: 4,
+                turn_incomplete: false,
+                accumulated_incomplete: false,
+            }
+        }
+
         let agent = build_agent(Vec::new(), Vec::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&observed);
+        let _subscription = agent.subscribe(listener_from_sync(move |event| {
+            recorded.lock().unwrap().push(label(event));
+        }));
+        let accounting_events = [
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: usage(),
+            },
+            AgentEvent::CompactionUsageUpdate {
+                agent_id: AgentId::Main,
+                checkpoint_id: "checkpoint".to_string(),
+                usage: usage(),
+            },
+            AgentEvent::CompactionEnd {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Manual,
+                tokens_before: 200,
+                tokens_after: 100,
+                has_usage: true,
+                summary: Some("summary".to_string()),
+                error: None,
+            },
+            AgentEvent::CompactionEnd {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Manual,
+                tokens_before: 200,
+                tokens_after: 100,
+                has_usage: false,
+                summary: Some("legacy summary".to_string()),
+                error: None,
+            },
+        ];
+
+        for event in accounting_events {
+            let error = agent
+                .emit_event(event)
+                .await
+                .expect_err("accounting has one typed emission boundary");
+            assert!(matches!(error, crate::TurnError::Fatal(_)));
+        }
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "a rejected accounting event reached listeners",
+        );
+
+        agent
+            .emit_event(AgentEvent::CompactionEnd {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Manual,
+                tokens_before: 200,
+                tokens_after: 0,
+                has_usage: false,
+                summary: None,
+                error: Some("summary failed".to_string()),
+            })
+            .await
+            .expect("an unsuccessful host lifecycle event is allowed");
+        assert_eq!(observed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn account_usage_keeps_one_pre_add_chain_across_assistant_and_compaction() {
+        let mut agent = build_agent(Vec::new(), Vec::new());
         let updates = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&updates);
-        let _subscription = agent.subscribe(listener_from_sync(move |event| {
-            if let AgentEvent::UsageUpdate { usage, .. } = event {
+        let _subscription = agent.subscribe(listener_from_sync(move |event| match event {
+            AgentEvent::UsageUpdate { usage, .. }
+            | AgentEvent::CompactionUsageUpdate { usage, .. } => {
                 recorded.lock().unwrap().push(usage.clone());
             }
+            _ => {}
         }));
         let first = Usage {
             input: 1,
@@ -4708,6 +4868,7 @@ mod event_protocol_tests {
                 total: 0.5,
                 ..UsageCost::default()
             },
+            incomplete: false,
         };
         let second = Usage {
             input: 10,
@@ -4719,16 +4880,45 @@ mod event_protocol_tests {
                 total: 1.5,
                 ..UsageCost::default()
             },
+            incomplete: false,
+        };
+        let third = Usage {
+            input: 100,
+            output: 200,
+            cache_write: 300,
+            cache_read: 400,
+            total_tokens: 1_000,
+            cost: UsageCost {
+                total: 2.5,
+                ..UsageCost::default()
+            },
+            incomplete: false,
         };
 
-        agent.account_usage(&first).await.expect("first accounting");
         agent
-            .account_usage(&second)
+            .account_usage(&first, UsageAccounting::AssistantTerminal)
             .await
-            .expect("second accounting");
+            .expect("first accounting");
+        agent
+            .account_usage(
+                &second,
+                UsageAccounting::CommittedCompaction {
+                    checkpoint_id: "checkpoint-2".to_string(),
+                    reason: CompactionReason::Manual,
+                    tokens_before: 200,
+                    tokens_after: 100,
+                    summary: "summary".to_string(),
+                },
+            )
+            .await
+            .expect("compaction accounting");
+        agent
+            .account_usage(&third, UsageAccounting::AssistantTerminal)
+            .await
+            .expect("third accounting");
 
         let updates = updates.lock().unwrap();
-        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.len(), 3);
         assert_eq!(updates[0].accumulated_input, 0);
         assert_eq!(updates[0].turn_input, 1);
         assert_eq!(updates[1].accumulated_input, 1);
@@ -4739,20 +4929,28 @@ mod event_protocol_tests {
         assert_eq!(updates[1].turn_cache_write, 30);
         assert_eq!(updates[1].accumulated_cache_read, 4);
         assert_eq!(updates[1].turn_cache_read, 40);
+        assert_eq!(updates[2].accumulated_input, 11);
+        assert_eq!(updates[2].turn_input, 100);
+        assert_eq!(updates[2].accumulated_output, 22);
+        assert_eq!(updates[2].turn_output, 200);
+        assert_eq!(updates[2].accumulated_cache_write, 33);
+        assert_eq!(updates[2].turn_cache_write, 300);
+        assert_eq!(updates[2].accumulated_cache_read, 44);
+        assert_eq!(updates[2].turn_cache_read, 400);
         drop(updates);
 
         let accumulated = agent.accumulated_usage();
-        assert_eq!(accumulated.input, 11);
-        assert_eq!(accumulated.output, 22);
-        assert_eq!(accumulated.cache_write, 33);
-        assert_eq!(accumulated.cache_read, 44);
-        assert_eq!(accumulated.total_tokens, 110);
-        assert!((accumulated.cost.total - 2.0).abs() < f64::EPSILON);
+        assert_eq!(accumulated.input, 111);
+        assert_eq!(accumulated.output, 222);
+        assert_eq!(accumulated.cache_write, 333);
+        assert_eq!(accumulated.cache_read, 444);
+        assert_eq!(accumulated.total_tokens, 1_110);
+        assert!((accumulated.cost.total - 4.5).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
     async fn account_usage_keeps_spend_when_event_delivery_fails() {
-        let agent = build_agent(Vec::new(), Vec::new());
+        let mut agent = build_agent(Vec::new(), Vec::new());
         let _subscription = agent.subscribe(Arc::new(|_| {
             Box::pin(async { Err(crate::BoxError::from("injected usage listener failure")) })
         }));
@@ -4766,10 +4964,11 @@ mod event_protocol_tests {
                 total: 0.25,
                 ..UsageCost::default()
             },
+            incomplete: false,
         };
 
         let error = agent
-            .account_usage(&delta)
+            .account_usage(&delta, UsageAccounting::AssistantTerminal)
             .await
             .expect_err("listener failure remains fatal");
 
@@ -4785,7 +4984,7 @@ mod event_protocol_tests {
 
     #[tokio::test]
     async fn compaction_accounting_completes_earlier_listener_pairs_before_failure() {
-        let agent = build_agent(Vec::new(), Vec::new());
+        let mut agent = build_agent(Vec::new(), Vec::new());
         let first_events = Arc::new(Mutex::new(Vec::new()));
         let first_recorded = Arc::clone(&first_events);
         let _first = agent.subscribe(listener_from_sync(move |event| {
@@ -4795,7 +4994,7 @@ mod event_protocol_tests {
         let second_recorded = Arc::clone(&second_events);
         let _second = agent.subscribe(Arc::new(move |event| {
             second_recorded.lock().unwrap().push(label(event));
-            let fail = matches!(event, AgentEvent::Notice { .. });
+            let fail = matches!(event, AgentEvent::CompactionEnd { .. });
             Box::pin(async move {
                 if fail {
                     Err(crate::BoxError::from("injected prerequisite failure"))
@@ -4811,12 +5010,14 @@ mod event_protocol_tests {
         };
 
         let error = agent
-            .account_compaction_usage(
+            .account_usage(
                 &delta,
-                "checkpoint-7".to_string(),
-                AgentEvent::Notice {
-                    agent_id: AgentId::Main,
-                    text: "checkpoint".to_string(),
+                UsageAccounting::CommittedCompaction {
+                    checkpoint_id: "checkpoint-7".to_string(),
+                    reason: CompactionReason::Manual,
+                    tokens_before: 200,
+                    tokens_after: 100,
+                    summary: "checkpoint".to_string(),
                 },
             )
             .await
@@ -4826,14 +5027,30 @@ mod event_protocol_tests {
         assert_eq!(
             first_events.lock().unwrap().as_slice(),
             [
-                EventLabel::Notice(AgentId::Main, "checkpoint".to_string()),
+                EventLabel::CompactionEnd {
+                    agent_id: AgentId::Main,
+                    reason: CompactionReason::Manual,
+                    tokens_before: 200,
+                    tokens_after: 100,
+                    has_usage: true,
+                    summary: Some("checkpoint".to_string()),
+                    error: None,
+                },
                 EventLabel::CompactionUsageUpdate(AgentId::Main, "checkpoint-7".to_string()),
             ],
             "the earlier listener receives the complete pair"
         );
         assert_eq!(
             second_events.lock().unwrap().as_slice(),
-            [EventLabel::Notice(AgentId::Main, "checkpoint".to_string())],
+            [EventLabel::CompactionEnd {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Manual,
+                tokens_before: 200,
+                tokens_after: 100,
+                has_usage: true,
+                summary: Some("checkpoint".to_string()),
+                error: None,
+            }],
             "the rejecting listener receives no dependent event"
         );
         assert_eq!(agent.accumulated_usage().input, 7);
@@ -4841,7 +5058,7 @@ mod event_protocol_tests {
 
     #[tokio::test]
     async fn committed_compaction_accounting_survives_future_cancellation() {
-        let agent = build_agent(Vec::new(), Vec::new());
+        let mut agent = build_agent(Vec::new(), Vec::new());
         let listener_entered = Arc::new(tokio::sync::Notify::new());
         let entered = Arc::clone(&listener_entered);
         let _subscription = agent.subscribe(Arc::new(move |_| {
@@ -4861,13 +5078,16 @@ mod event_protocol_tests {
                 total: 0.25,
                 ..UsageCost::default()
             },
+            incomplete: false,
         };
-        let mut accounting = Box::pin(agent.account_compaction_usage(
+        let mut accounting = Box::pin(agent.account_usage(
             &delta,
-            "checkpoint-7".to_string(),
-            AgentEvent::Notice {
-                agent_id: AgentId::Main,
-                text: "checkpoint".to_string(),
+            UsageAccounting::CommittedCompaction {
+                checkpoint_id: "checkpoint-7".to_string(),
+                reason: CompactionReason::Manual,
+                tokens_before: 200,
+                tokens_after: 100,
+                summary: "checkpoint".to_string(),
             },
         ));
 

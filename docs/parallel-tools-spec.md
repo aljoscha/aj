@@ -81,7 +81,7 @@ pub struct SessionState {
     working_directory: PathBuf,          // read-only after construction
     todo_list: Vec<TodoItem>,            // read/write by todo tools
     turn_counter: usize,                 // loop-private (mutated by execute_turn)
-    accumulated_usage: Usage,            // loop-private
+    accumulated_usage: Usage,            // folded by Agent::account_usage
     sub_agent_counter: usize,            // bumped by spawn_agent
     sub_agent_usage: HashMap<usize, Usage>, // written by spawn_agent / notice drain
 }
@@ -90,8 +90,10 @@ pub struct SessionState {
 The fields tools touch through `ToolContext` are `working_directory`
 (read), `todo_list` (read/write), `sub_agent_counter` (bump via
 `next_sub_agent_id`), and `sub_agent_usage` (insert via
-`record_sub_agent_usage`). `turn_counter` and `accumulated_usage` are
-mutated only by the run loop under `&mut self`.
+`record_sub_agent_usage`). `turn_counter` is mutated by the run loop.
+`accumulated_usage` is folded only through the exclusive
+`Agent::account_usage(&mut self, ...)` transition used by successful assistant
+terminals and committed compactions.
 
 ---
 
@@ -123,10 +125,10 @@ operation.
   to replace the direct `self.session_state.turn_counter += 1`
   (`lib.rs:1015`).
 - `accumulated_usage(&self) -> Usage` — **returns owned** (was `&Usage`);
-  `Usage` is a handful of `u64`s, cloning is trivial. Add
-  `accumulate_usage(&self, delta: &Usage)` to replace the direct
-  `accumulate_usage(&mut self.session_state.accumulated_usage, …)`
-  (`lib.rs:1336`) and the field reads at `lib.rs:1319-1326`.
+  `Usage` is a handful of numeric fields, so cloning is trivial. The private
+  accounting helper builds the pre-add `TokenUsage` payload and folds its delta
+  under one lock. The public `Agent::account_usage` receiver is exclusive, which
+  serializes that state transition with its awaited event delivery.
 - `sub_agent_usage(&self) -> HashMap<usize, Usage>` — **returns owned**
   (was `&HashMap`).
 
@@ -136,13 +138,11 @@ lock is per-handle and held only for trivial ops, so contention is a
 non-issue.
 
 `Agent` keeps a `SessionState` field; its public delegating accessors
-(`Agent::accumulated_usage`, `Agent::sub_agent_usage`, `lib.rs:432`,
-`440`) change their return types from `&T` to owned `T`. The one
+(`Agent::accumulated_usage`, `Agent::sub_agent_usage`) return owned values. The one
 external caller, `build_usage_summary_from_parts` in
-`src/aj/src/modes/interactive/shutdown.rs:31`, takes the values
-by reference at the call site, so adapt it to bind the owned values
-first (or change the helper to take by value). Tests in `lib.rs` that
-call `agent.sub_agent_usage()` adapt to the owned return.
+`src/aj-app/src/shutdown.rs`, takes the owned values by reference at the
+call site. Tests in `lib.rs` that call `agent.sub_agent_usage()` use the owned
+return.
 
 > NOTE: This puts `turn_counter` / `accumulated_usage` behind the same
 > lock even though only the loop touches them. That is deliberate — one
@@ -359,7 +359,7 @@ Integration / regression:
 - `src/aj-agent/src/lib.rs`
   - `SessionState` → handle (`Arc<Mutex<SessionStateInner>>`), `&self`
     accessors, owned returns for `accumulated_usage` / `sub_agent_usage`,
-    `bump_turn_counter`, `accumulate_usage`.
+    `bump_turn_counter`, and the atomic `account_usage` fold.
   - `SessionContextWrapper.session_ctx` → owned `SessionState` handle;
     `spawn_agent` body uses the handle.
   - `execute_tool` → `&self`.
@@ -374,7 +374,7 @@ Integration / regression:
   which already exists.
 - `src/aj-tools/src/tools/agent.rs` — description warning; fix stale
   module comment.
-- `src/aj/src/modes/interactive/shutdown.rs` — adapt to owned
+- `src/aj-app/src/shutdown.rs` — consume the owned
   `accumulated_usage` / `sub_agent_usage` returns.
 
 `futures` is already a dependency of `aj-agent` (`Cargo.toml:11`), so

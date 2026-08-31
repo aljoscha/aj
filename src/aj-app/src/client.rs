@@ -1686,6 +1686,8 @@ mod tests {
                 turn_cache_write: 0,
                 accumulated_cache_read: 0,
                 turn_cache_read: 0,
+                turn_incomplete: false,
+                accumulated_incomplete: false,
             },
         };
         let assistant = WireAssistantMessage {
@@ -1720,6 +1722,8 @@ mod tests {
                 turn_cache_write: 0,
                 accumulated_cache_read: 0,
                 turn_cache_read: 70,
+                turn_incomplete: false,
+                accumulated_incomplete: false,
             },
         };
 

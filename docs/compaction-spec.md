@@ -62,8 +62,10 @@ aj-session::replay       replay arm mapping a `Compaction` entry onto
                          renderer events.
 
 aj-agent                 generic mechanisms only: `Agent::complete_oneshot`
-                         (bus-silent completion) and `Agent::reseed_transcript`;
-                         the `CompactionStart` / `CompactionEnd` events.
+                         (bus-silent completion), `Agent::reseed_transcript`,
+                         and the exclusive `Agent::account_usage` transition;
+                         the `CompactionStart`, `CompactionEnd`, and
+                         `CompactionUsageUpdate` events.
 
 aj-conf                  `auto_compact` + `compact_threshold` config
                          options; `ValueKind::Number`.
@@ -423,7 +425,7 @@ It does **not** call the model — summary generation is the host's job
 
 ## 6. Agent runtime additions (`aj-agent`)
 
-The agent gains three generic mechanisms and two events. Nothing
+The agent gains three generic mechanisms and three events. Nothing
 compaction-specific (no prompts, no thresholds) lives in `aj-agent`.
 
 ### 6.1 `Agent::complete_oneshot`
@@ -484,13 +486,37 @@ changes neither).
 ### 6.3 `Agent::account_usage`
 
 Normal assistant terminals and committed compactions share one live accounting
-transition. It snapshots the pre-add accumulator and synchronously folds the
-complete `Usage` before awaiting any listener, so cancellation or listener
-failure cannot erase spend that already happened. Normal turns then emit
-`UsageUpdate`.
+transition. Its public API is exclusive and typed:
 
-Committed compactions call `account_compaction_usage` only after the checkpoint
-append succeeds. It delivers the tagged `CompactionEnd` and a
+```rust
+pub enum UsageAccounting {
+    AssistantTerminal,
+    CommittedCompaction {
+        checkpoint_id: String,
+        reason: CompactionReason,
+        tokens_before: u64,
+        tokens_after: u64,
+        summary: String,
+    },
+}
+
+pub async fn account_usage(
+    &mut self,
+    delta: &Usage,
+    accounting: UsageAccounting,
+) -> Result<(), TurnError>;
+```
+
+The transition snapshots the pre-add accumulator and folds the complete `Usage`
+under one state lock before awaiting any listener. Its `&mut self` receiver keeps
+that fold and its event delivery in one linear Agent history, so concurrent legal
+callers cannot publish duplicate or reordered cumulative snapshots. Cancellation
+or listener failure cannot erase spend that already happened. Assistant terminals
+select `AssistantTerminal` and emit `UsageUpdate`.
+
+Only a committed checkpoint selects `CommittedCompaction`, after its append
+succeeds. The Agent constructs the successful tagged `CompactionEnd` itself, so
+the caller cannot substitute an arbitrary prerequisite, then delivers it with
 `CompactionUsageUpdate` through one `EventBus::emit_sequence` operation. The bus
 snapshots one listener cohort and gives each listener both events in order before
 advancing to the next. An earlier successful listener therefore keeps the whole
@@ -503,7 +529,7 @@ context.
 
 ### 6.4 Compaction events
 
-Add to `AgentEvent` (`aj-agent/src/events.rs`), both carrying `agent_id`:
+Add to `AgentEvent` (`aj-agent/src/events.rs`), all carrying `agent_id`:
 
 ```rust
 /// Compaction has started for this agent. Renderers show a
@@ -538,13 +564,15 @@ CompactionUsageUpdate {
 ```
 
 `CompactionReason` is `Manual | Threshold | Overflow` (serde
-`snake_case`). These are emitted by the host (it owns orchestration) via
-`Agent`-exposed bus access; since the binary already holds the agent, it
-emits them by calling a small `Agent::emit_event`-style passthrough, or
-by routing through the existing pump as synthetic events. Concretely we
-reuse the pump path (`world.pump.handle(tui, &event)`) for the live
-indicator and add `CompactionStart`/`CompactionEnd` arms to the pump and
-to `--format json` output.
+`snake_case`). The host owns orchestration and emits `CompactionStart`,
+`CompactionProgress`, and unsuccessful `CompactionEnd` through the Agent's
+non-accounting `emit_event` passthrough. A successful checkpoint end and both
+usage-update variants are rejected there and belong only to the exclusive
+`Agent::account_usage` transition. Components that need to observe events after
+the Agent is shared retain an `EventSubscriptions` capability, not an emitter.
+Concretely we reuse the pump path (`world.pump.handle(tui, &event)`) for the live
+indicator and add `CompactionStart`/`CompactionEnd` arms to the pump and to
+`--format json` output.
 
 NOTE: keeping these events serializable preserves the `--format json`
 contract (the locked
@@ -637,10 +665,11 @@ Steps:
    (now compaction-aware) → `reseed_transcript(...)` on the borrowed
    agent, trimming a trailing failed assistant (below).
 6. Compute `tokens_after` (occupancy of the reseeded projection), file the
-   checkpoint's append handoff under an owning guard, then pass its id, the
-   checkpoint-tagged `CompactionEnd`, and `summarizer_usage` to the Agent's
-   shared accounting operation. Accounting is folded synchronously before the
-   first listener await. One stable-cohort bus operation emits the end followed
+   checkpoint's append handoff under an owning guard, then pass its id, terminal
+   fields, and `summarizer_usage` through
+   `Agent::account_usage(CommittedCompaction { .. })`. Accounting is folded
+   synchronously before the first listener await. The Agent constructs the
+   successful `CompactionEnd`; one stable-cohort bus operation emits it followed
    by one cumulative self-identifying `CompactionUsageUpdate`. Dropping the
    in-flight future clears an unconsumed handoff through its owner guard.
 7. Return `Compacted { tokens_before, tokens_after, summary }`.

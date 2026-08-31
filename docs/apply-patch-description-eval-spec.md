@@ -266,9 +266,10 @@ messages.
 
 An evaluator event collector sums usage from every assistant `MessageEnd`
 within an attempt, including terminal error and aborted messages. It does not use
-`Agent::accumulated_usage`, which only accounts for successful turns. An attempt
-that observes a provider failure remains in immutable artifacts but cannot enter
-a completion marker, pilot reduction, or main inference. Record:
+`Agent::accumulated_usage`, which accounts for successful assistant terminals and
+committed compactions but excludes failed and aborted assistant terminals. An
+attempt that observes a provider failure remains in immutable artifacts but
+cannot enter a completion marker, pilot reduction, or main inference. Record:
 
 - input tokens
 - output tokens

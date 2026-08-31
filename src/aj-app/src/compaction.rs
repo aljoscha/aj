@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use aj_agent::events::{AgentEvent, AgentId, CompactionPhase, CompactionReason};
 use aj_agent::message::AgentMessage;
-use aj_agent::{Agent, TurnError};
+use aj_agent::{Agent, TurnError, UsageAccounting};
 use aj_models::types::{AssistantContent, AssistantMessage, Message, StopReason, Usage};
 use aj_session::compaction as planning;
 use aj_session::{AppendHandoff, ConversationLog, ThreadFilter};
@@ -217,17 +217,14 @@ pub async fn run_compaction(
         // so attach filtering can safely retain it on its own. A listener must
         // not take the log lock for either event.
         if let Err(err) = agent
-            .account_compaction_usage(
+            .account_usage(
                 &summarizer_usage,
-                checkpoint_id,
-                AgentEvent::CompactionEnd {
-                    agent_id: AgentId::Main,
+                UsageAccounting::CommittedCompaction {
+                    checkpoint_id,
                     reason,
                     tokens_before: plan.tokens_before,
                     tokens_after: after,
-                    has_usage: true,
-                    summary: Some(summary),
-                    error: None,
+                    summary,
                 },
             )
             .await

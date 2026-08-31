@@ -4438,14 +4438,14 @@ mod tests {
         let entry = "e-checkpoint".to_string();
         let mut checkpoint_usage = token_usage([900, 0, 0, 0]);
         checkpoint_usage.turn_incomplete = true;
-        let _ = reduce(
+        apply(
             &mut s,
             &mut life,
-            AgentEvent::UsageUpdate {
+            AgentEvent::CompactionUsageUpdate {
                 agent_id: AgentId::Main,
+                checkpoint_id: entry,
                 usage: checkpoint_usage,
             },
-            Some(&entry),
         );
         assert_eq!(
             s.footers().context_usage(AgentId::Main),

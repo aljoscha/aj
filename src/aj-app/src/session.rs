@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use aj_agent::bus::{EventBus, SubscriptionHandle};
+use aj_agent::bus::{EventSubscriptions, SubscriptionHandle};
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
@@ -248,10 +248,10 @@ pub struct SessionCore {
     /// Shared because a submit handler spawns a task that holds it
     /// across `agent.prompt(...).await`.
     pub agent: Arc<TokioMutex<Agent>>,
-    /// Clone of the agent's event bus, captured before the agent was
-    /// shared. Subscribing through it needs no agent lock, which matters
-    /// because a turn holds that lock for its whole duration.
-    bus: EventBus,
+    /// Subscription-only handle for the agent's event bus, captured before the
+    /// agent was shared. Subscribing through it needs no agent lock, which
+    /// matters because a turn holds that lock for its whole duration.
+    subscriptions: EventSubscriptions,
     /// The environment the agent was built against: base prompt,
     /// AGENTS.md/CLAUDE.md context files, discovered skills, working
     /// directory. The runtime takes only the assembled prompt, so the
@@ -434,11 +434,11 @@ impl SessionCore {
 
         let log = Arc::new(TokioMutex::new(log));
         let persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
-        let bus = agent.bus().clone();
+        let subscriptions = agent.event_subscriptions();
 
         let core = SessionCore {
             agent: Arc::new(TokioMutex::new(agent)),
-            bus,
+            subscriptions,
             env,
             registry,
             task_registry,
@@ -457,18 +457,20 @@ impl SessionCore {
     /// Subscribe a channel sink to the session's event bus.
     ///
     /// The returned handle owns the subscription: dropping it detaches the
-    /// sink. Goes through the retained bus clone, so it needs no agent
+    /// sink. Goes through the retained subscription handle, so it needs no agent
     /// lock and is safe to call while a turn holds the agent.
     pub fn subscribe_channel(&self) -> (SubscriptionHandle, UnboundedReceiver<AgentEvent>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = self.bus.subscribe(aj_agent::bus::listener_from_sync(
-            move |event: &AgentEvent| {
-                // A hung-up receiver is the consumer losing interest, not
-                // an agent-level error: dropping the event keeps the turn
-                // making progress.
-                let _ = tx.send(event.clone());
-            },
-        ));
+        let handle = self
+            .subscriptions
+            .subscribe(aj_agent::bus::listener_from_sync(
+                move |event: &AgentEvent| {
+                    // A hung-up receiver is the consumer losing interest, not
+                    // an agent-level error: dropping the event keeps the turn
+                    // making progress.
+                    let _ = tx.send(event.clone());
+                },
+            ));
         (handle, rx)
     }
 
@@ -489,7 +491,7 @@ impl SessionCore {
         handoff: &AppendHandoff,
     ) -> UnboundedReceiver<TaggedEvent> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.persistence_handle = self.bus.subscribe(fenced_persisting_forwarder(
+        self.persistence_handle = self.subscriptions.subscribe(fenced_persisting_forwarder(
             Arc::clone(&self.log),
             handoff.clone(),
             tx,
