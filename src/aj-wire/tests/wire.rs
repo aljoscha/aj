@@ -255,9 +255,30 @@ fn request_context_rejects_unknown_fields_recursively() {
                 .is_err(),
         ),
         (
+            "create content prompt root",
+            decode_request::<CreateSessionRequest>(
+                br#"{"prompt":{"content":[{"type":"text","text":"hello"}],"future":true}}"#,
+            )
+            .is_err(),
+        ),
+        (
+            "command content prompt root",
+            decode_request::<PromptRequest>(
+                br#"{"content":[{"type":"text","text":"hello"}],"agennt":{"sub":2}}"#,
+            )
+            .is_err(),
+        ),
+        (
             "structured prompt block",
             decode_request::<PromptRequest>(
                 br#"{"content":[{"type":"text","text":"hello","future":true}]}"#,
+            )
+            .is_err(),
+        ),
+        (
+            "image prompt block",
+            decode_request::<PromptRequest>(
+                br#"{"content":[{"type":"image","data":"aW1hZ2U=","mime_type":"image/png","future":true}]}"#,
             )
             .is_err(),
         ),
@@ -298,6 +319,15 @@ fn empty_object_commands_accept_blank_or_empty_objects_only() {
             decode_request::<EmptyRequest>(body).is_err(),
             "{body:?} decoded as an empty-object command",
         );
+    }
+}
+
+#[test]
+fn defaultable_commands_accept_blank_or_empty_objects() {
+    for body in [b"".as_slice(), b" \n\t".as_slice(), b"{}".as_slice()] {
+        let tag = decode_request::<TagRequest>(body)
+            .unwrap_or_else(|error| panic!("{body:?} did not decode: {error}"));
+        assert_eq!(tag, TagRequest::default());
     }
 }
 
