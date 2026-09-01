@@ -1893,19 +1893,50 @@ mod tests {
     /// one-cell body width that maximizes soft-wrapped height.
     #[test]
     fn valid_u16_boundary_environment_text_remains_drawable_and_complete() {
-        // Reordering equal-sized payloads must change the reconstructed pair,
-        // so every chunk carries a repeating phase rather than uniform text.
-        let at_boundary: String = (b'A'..=b'J').map(char::from).cycle().take(65_529).collect();
-        let beyond_boundary: String = (b'K'..=b'T')
-            .map(char::from)
-            .cycle()
-            .take(131_100)
-            .collect();
+        fn chunk_distinct_key(len: usize, tag: char) -> String {
+            let mut key = String::with_capacity(len);
+            let mut block = 0;
+            while key.len() < len {
+                let marker = format!("{tag}{block:06X}");
+                let fill =
+                    char::from(b'a' + u8::try_from(block % 26).expect("block remainder fits u8"));
+                key.push_str(&marker);
+                key.extend(std::iter::repeat_n(
+                    fill,
+                    ENV_ROW_PAYLOAD_CELLS - marker.len(),
+                ));
+                block += 1;
+            }
+            key.truncate(len);
+            key
+        }
+
+        let at_boundary = chunk_distinct_key(65_529, 'A');
+        let beyond_boundary = chunk_distinct_key(131_100, 'K');
         let env = std::collections::BTreeMap::from([
             (at_boundary.clone(), String::new()),
             (beyond_boundary.clone(), String::new()),
         ]);
         aj_session::validate_session_env(&env).expect("both unbounded pairs are valid");
+        // The opening quote offsets payload boundaries by one byte from the key
+        // blocks. Assert the resulting chunks are still pairwise distinct so a
+        // reorder cannot hide behind equal fixture text.
+        for key in [&at_boundary, &beyond_boundary] {
+            let represented = format!("{}={}", quoted_env_text(key), quoted_env_text(""));
+            let chunks = represented
+                .as_bytes()
+                .chunks(ENV_ROW_PAYLOAD_CELLS)
+                .collect::<Vec<_>>();
+            let unique = chunks
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                unique.len(),
+                chunks.len(),
+                "every payload chunk is distinct"
+            );
+        }
         let mut stats = sample_stats();
         stats.session_env = Some(env);
 
