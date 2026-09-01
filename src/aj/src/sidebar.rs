@@ -2690,6 +2690,7 @@ mod tests {
             id: Some("builder-2".to_string()),
             address: Some("10.0.0.8:7777".to_string()),
             name: None,
+            working_directory: None,
             unreachable: true,
         };
         let lines = folded(&[], &[learned("builder-1", false), both], 20);
@@ -2793,12 +2794,14 @@ mod tests {
             id: None,
             address: None,
             name: None,
+            working_directory: None,
             unreachable: true,
         };
         let blank = DirectoryHost {
             id: Some(String::new()),
             address: Some(String::new()),
             name: Some(String::new()),
+            working_directory: None,
             unreachable: true,
         };
         for entry in [nameless, blank] {
@@ -2825,6 +2828,7 @@ mod tests {
                 id: Some(String::new()),
                 address: None,
                 name: None,
+                working_directory: None,
                 unreachable: true,
             },
         ];
@@ -3782,6 +3786,7 @@ mod tests {
             id: Some(id.to_string()),
             address: None,
             name: None,
+            working_directory: None,
             unreachable,
         }
     }
@@ -3801,6 +3806,7 @@ mod tests {
             id: None,
             address: Some(address.to_string()),
             name: None,
+            working_directory: None,
             unreachable: true,
         }
     }

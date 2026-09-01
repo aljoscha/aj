@@ -133,6 +133,13 @@ impl Upstream {
             .expect("a host names itself, from its working directory if nothing else")
     }
 
+    fn working_directory(&self) -> std::path::PathBuf {
+        self.host
+            .hello()
+            .working_directory
+            .expect("a host reports the directory it serves")
+    }
+
     /// A namespaced id for one of this host's sessions, as a gateway client
     /// addresses it.
     fn namespaced(&self, session: &str) -> String {
@@ -1120,12 +1127,14 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
             id: Some(down.host_id()),
             address: None,
             name: Some(down.host_name()),
+            working_directory: None,
             unreachable: true,
         },
         DirectoryHost {
             id: Some(up.host_id()),
             address: None,
             name: Some(up.host_name()),
+            working_directory: Some(up.working_directory()),
             unreachable: false,
         },
     ];
@@ -1226,12 +1235,14 @@ async fn a_downed_hosts_name_survives_a_gateway_restart() {
             id: Some(configured.host_id()),
             address: None,
             name: Some("~/work/umber/aj".to_string()),
+            working_directory: None,
             unreachable: true,
         },
         DirectoryHost {
             id: Some(dynamic.host_id()),
             address: None,
             name: Some("~/workshop".to_string()),
+            working_directory: None,
             unreachable: true,
         },
     ];
@@ -1356,12 +1367,14 @@ async fn a_configured_host_that_never_answered_is_named_by_its_address() {
                 // A host that has never answered has said nothing about itself,
                 // so there is no name to republish for it either.
                 name: None,
+                working_directory: None,
                 unreachable: true,
             },
             DirectoryHost {
                 id: Some(up.host_id()),
                 address: None,
                 name: Some(up.host_name()),
+                working_directory: Some(up.working_directory()),
                 unreachable: false,
             },
         ],
@@ -1424,6 +1437,56 @@ async fn a_second_hosts_sessions_join_the_directory_on_enrollment() {
     assert!(
         ids.contains(&left.namespaced(&session)) && ids.contains(&right.namespaced(&other)),
         "one row per session, from both hosts: {ids:?}",
+    );
+
+    fixture.shutdown().await;
+    left.stop().await;
+    right.stop().await;
+}
+
+/// Each host row carries that host's own directory from its upstream hello.
+///
+/// Two real hosts are essential: filling every row from gateway-local state, or
+/// copying one host's report across the merge, can satisfy a single-row
+/// assertion. The paths come from independent temp roots and are asserted
+/// against the hosts directly, before the gateway has any say in them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_host_row_carries_its_upstream_hello_directory() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let expected = BTreeMap::from([
+        (left.host_id(), left.working_directory()),
+        (right.host_id(), right.working_directory()),
+    ]);
+    assert_ne!(
+        left.working_directory(),
+        right.working_directory(),
+        "the fixture must distinguish the two upstream reports",
+    );
+    let fixture = Fixture::new(&[&left, &right]).await;
+
+    let published = fixture
+        .until("both hosts to be named in the merged directory", |list| {
+            (list.hosts.len() == 2 && list.hosts.iter().all(|host| host.id.is_some()))
+                .then(|| list.hosts.clone())
+        })
+        .await;
+    let observed: BTreeMap<_, _> = published
+        .into_iter()
+        .map(|host| {
+            (
+                host.id.expect("a settled host has an id"),
+                host.working_directory,
+            )
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        expected
+            .into_iter()
+            .map(|(id, directory)| (id, Some(directory)))
+            .collect(),
+        "the gateway republishes each upstream hello rather than its own state",
     );
 
     fixture.shutdown().await;
@@ -2193,6 +2256,7 @@ async fn a_remembered_host_the_configuration_names_too_keeps_its_id() {
             id: Some("remembered".to_string()),
             address: None,
             name: None,
+            working_directory: None,
             unreachable: true,
         }],
         "and a client's group for it is named by that id rather than by an \
@@ -4447,6 +4511,7 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
             id: Some("staying".to_string()),
             address: None,
             name: None,
+            working_directory: None,
             unreachable: false,
         }],
         "a host that is not enrolled is not a group either, and the one that is \

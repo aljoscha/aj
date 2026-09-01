@@ -1361,18 +1361,21 @@ fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
             id: Some("workstation".to_string()),
             address: None,
             name: Some("~/work/lewitt/aj".to_string()),
+            working_directory: Some("/home/lewitt/work/aj".into()),
             unreachable: false,
         },
         DirectoryHost {
             id: Some("laptop".to_string()),
             address: None,
             name: None,
+            working_directory: None,
             unreachable: true,
         },
         DirectoryHost {
             id: None,
             address: Some("http://100.64.0.9:6161".to_string()),
             name: None,
+            working_directory: None,
             unreachable: true,
         },
     ];
@@ -1415,6 +1418,17 @@ fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
     let older: Frame = serde_json::from_value(json!({"kind": "list", "sessions": []}))
         .expect("a frame with no hosts key decodes");
     assert!(matches!(older, Frame::List { hosts, .. } if hosts.is_empty()));
+
+    let older_host: DirectoryHost = serde_json::from_value(json!({
+        "id": "workstation",
+        "name": "~/work/lewitt/aj",
+        "unreachable": false
+    }))
+    .expect("an older gateway host row without a directory decodes");
+    assert_eq!(
+        older_host.working_directory, None,
+        "an absent additive field is unknown rather than a refusal or a placeholder",
+    );
 }
 
 /// The directory a gateway composes is one value serving two places: the
@@ -1438,12 +1452,14 @@ fn a_merged_directory_writes_the_read_and_the_frame_from_one_value() {
                 id: Some("left".to_string()),
                 address: None,
                 name: None,
+                working_directory: None,
                 unreachable: false,
             },
             DirectoryHost {
                 id: Some("right".to_string()),
                 address: None,
                 name: None,
+                working_directory: None,
                 unreachable: true,
             },
         ],
