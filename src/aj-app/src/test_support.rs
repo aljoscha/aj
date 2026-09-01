@@ -841,7 +841,8 @@ mod tests {
     }
 
     /// Negative control for the exported full-form assertion boundary. The
-    /// task row is durable state, so no equality tier may erase the difference.
+    /// task table is a real [`CanonicalState`] axis, so deleting it produces
+    /// unequal values for the wrapper to reject.
     #[test]
     #[should_panic(expected = "canonical states differ (negative control)")]
     fn the_canonical_assertion_rejects_a_real_task_difference() {
@@ -853,8 +854,10 @@ mod tests {
         assert_canonical_eq(&left, &right, "negative control");
     }
 
-    /// Negative control for the exported fault-tier assertion boundary. Tasks
-    /// survive the transient mask, so this difference must still be rejected.
+    /// Negative control for the exported fault-tier assertion boundary. A live
+    /// re-attach refetches the authoritative task table separately, while the
+    /// convergent mask removes unrecoverable transcript artifacts, so task
+    /// state remains an equality axis after masking.
     #[test]
     #[should_panic(expected = "convergent tiers differ (negative control)")]
     fn the_convergent_assertion_rejects_a_real_task_difference() {
