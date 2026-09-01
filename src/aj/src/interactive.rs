@@ -1780,8 +1780,8 @@ async fn branch_focused_session(
         // One toast for one failed gesture. The refusal names the action, so
         // the restoration is a clause on it rather than a second toast that
         // names the same failure again. It stays a separate sentence because
-        // the fallback arm of `head_refusal` ends in an opaque `{err}` whose
-        // punctuation we do not control.
+        // the fallback arm of `head_refusal` ends in opaque peer refusal text
+        // whose punctuation we do not control.
         let mut refusal = head_refusal(branching, &err);
         // The head did not move, so the prompt would run against the branch
         // the user meant to leave. Restore it verbatim instead; it is
@@ -14056,20 +14056,18 @@ mod tests {
         (started, terminated)
     }
 
-    /// Per-test storage under a root that outlives every spawned login task.
+    /// Per-test storage under a root that outlives every spawned test task.
     ///
-    /// A failing commit-race assertion may detach the login's `JoinHandle` while
-    /// the provider is inside one non-yielding poll. The task can then reach an
-    /// auth write after the test future unwinds, and that write recreates its
-    /// parent directory. Keeping both guards for the process lifetime prevents
+    /// A panic may detach an owner's `JoinHandle` while its task can still reach
+    /// persisted state. Keeping both guards for the process lifetime prevents
     /// late work from escaping a lexical `TempDir` cleanup.
-    fn process_lifetime_login_dir() -> &'static TempDir {
+    fn process_lifetime_test_dir() -> &'static TempDir {
         static ROOT: OnceLock<TempDir> = OnceLock::new();
         let root = ROOT.get_or_init(|| {
-            TempDir::with_prefix("aj-login-race-").expect("create login race root")
+            TempDir::with_prefix("aj-task-lifetime-").expect("create process test root")
         });
         Box::leak(Box::new(
-            TempDir::new_in(root.path()).expect("create login race test directory"),
+            TempDir::new_in(root.path()).expect("create process-lifetime test directory"),
         ))
     }
 
@@ -15370,7 +15368,7 @@ mod tests {
     /// picker remains as a sentinel proving the login overlay closes once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drive_loop_esc_during_non_yielding_login_waits_for_committed_success() {
-        let dir = process_lifetime_login_dir();
+        let dir = process_lifetime_test_dir();
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(dir, "streaming-text").await;
         let provider_id = "cancel-reactivate";
@@ -20369,13 +20367,76 @@ mod tests {
         remote.shutdown().await;
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct FeedbackObservation {
+        toast_delta: isize,
+        notice_delta: isize,
+        toasts: Vec<String>,
+        notices: Vec<String>,
+    }
+
+    impl FeedbackObservation {
+        fn toast(message: String) -> Self {
+            Self {
+                toast_delta: 1,
+                notice_delta: 0,
+                toasts: vec![message],
+                notices: Vec::new(),
+            }
+        }
+
+        fn notice(message: String) -> Self {
+            Self {
+                toast_delta: 0,
+                notice_delta: 1,
+                toasts: Vec::new(),
+                notices: vec![message],
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FeedbackCounts {
+        toasts: usize,
+        notices: usize,
+    }
+
+    fn feedback_counts(world: &World, shell: &Rc<RefCell<Shell>>) -> FeedbackCounts {
+        FeedbackCounts {
+            toasts: toast_lines(shell).len(),
+            notices: main_notices(world).len(),
+        }
+    }
+
+    fn feedback_since(
+        world: &World,
+        shell: &Rc<RefCell<Shell>>,
+        before: FeedbackCounts,
+    ) -> FeedbackObservation {
+        let toasts = toast_lines(shell);
+        let notices = main_notices(world);
+        FeedbackObservation {
+            toast_delta: isize::try_from(toasts.len()).expect("toast count fits isize")
+                - isize::try_from(before.toasts).expect("toast count fits isize"),
+            notice_delta: isize::try_from(notices.len()).expect("notice count fits isize")
+                - isize::try_from(before.notices).expect("notice count fits isize"),
+            toasts: toasts.get(before.toasts..).unwrap_or_default().to_vec(),
+            notices: notices.get(before.notices..).unwrap_or_default().to_vec(),
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RefusalFeedback {
+        actions: [FeedbackObservation; 4],
+        tree_redrew: bool,
+    }
+
     async fn refusal_feedback(
         world: &mut World,
         shell: &Rc<RefCell<Shell>>,
         app: &mut AsyncApp,
-    ) -> Vec<String> {
-        let mut feedback = Vec::with_capacity(4);
-        let toast_count = toast_lines(shell).len();
+    ) -> RefusalFeedback {
+        let before = feedback_counts(world, shell);
         branch_focused_session(
             app,
             shell,
@@ -20384,25 +20445,13 @@ mod tests {
             None,
         )
         .await;
-        let toasts = toast_lines(shell);
-        assert_eq!(
-            toasts.len(),
-            toast_count + 1,
-            "one head refusal toast: {toasts:?}"
-        );
-        feedback.push(toasts.last().expect("the head refusal toast").clone());
+        let head = feedback_since(world, shell, before);
 
-        let notice_count = main_notices(world).len();
+        let before = feedback_counts(world, shell);
         apply_archive(world, true).await;
-        let notices = main_notices(world);
-        assert_eq!(
-            notices.len(),
-            notice_count + 1,
-            "one archive notice: {notices:?}"
-        );
-        feedback.push(notices.last().expect("the archive notice").clone());
+        let archive = feedback_since(world, shell, before);
 
-        let notice_count = notices.len();
+        let before = feedback_counts(world, shell);
         apply_tag_edit(
             world,
             TagEdit {
@@ -20410,27 +20459,36 @@ mod tests {
             },
         )
         .await;
-        let notices = main_notices(world);
-        assert_eq!(
-            notices.len(),
-            notice_count + 1,
-            "one tag notice: {notices:?}"
-        );
-        feedback.push(notices.last().expect("the tag notice").clone());
+        let tag = feedback_since(world, shell, before);
 
-        let notice_count = notices.len();
-        assert!(matches!(
+        let before = feedback_counts(world, shell);
+        let tree_redrew = matches!(
             apply_command(world, shell, CommandAction::OpenSessionTree).await,
             ActionEffect::Redraw
-        ));
-        let notices = main_notices(world);
-        assert_eq!(
-            notices.len(),
-            notice_count + 1,
-            "one tree notice: {notices:?}"
         );
-        feedback.push(notices.last().expect("the tree notice").clone());
-        feedback
+        let tree = feedback_since(world, shell, before);
+
+        RefusalFeedback {
+            actions: [head, archive, tag, tree],
+            tree_redrew,
+        }
+    }
+
+    async fn missing_entry_feedback(
+        world: &mut World,
+        shell: &Rc<RefCell<Shell>>,
+        app: &mut AsyncApp,
+    ) -> FeedbackObservation {
+        let before = feedback_counts(world, shell);
+        branch_focused_session(
+            app,
+            shell,
+            world,
+            HeadTarget::Before("missing-entry".to_string()),
+            None,
+        )
+        .await;
+        feedback_since(world, shell, before)
     }
 
     /// Each ruled surface presents the peer's own sentence in both modes. The
@@ -20441,48 +20499,52 @@ mod tests {
         const SESSION: &str = "recognizable-refusal";
         const REASON: &str = "unknown session recognizable-refusal";
 
-        let local_dir = TempDir::new().expect("local tempdir");
+        let local_dir = process_lifetime_test_dir();
         let (mut local, local_shell, mut local_app, _writer, _root) =
-            world_shell_app(&local_dir, "streaming-text", default_layers()).await;
+            world_shell_app(local_dir, "streaming-text", default_layers()).await;
         let local_session = local.directory.rename_focused(SESSION.to_string());
-        let expected = refusal_feedback(&mut local, &local_shell, &mut local_app).await;
-        assert_eq!(
-            expected,
-            [
-                format!("Failed to branch the conversation: {REASON}"),
-                format!("Could not archive the session: {REASON}"),
-                format!("Could not set the session tag: {REASON}"),
-                format!("Could not read the session tree: {REASON}"),
-            ],
-        );
+        let local_feedback = refusal_feedback(&mut local, &local_shell, &mut local_app).await;
         local.directory.rename_focused(local_session);
-        let toast_count = toast_lines(&local_shell).len();
-        branch_focused_session(
-            &mut local_app,
-            &local_shell,
-            &mut local,
-            HeadTarget::Before("missing-entry".to_string()),
-            None,
-        )
-        .await;
-        let toasts = toast_lines(&local_shell);
-        assert_eq!(
-            &toasts[toast_count..],
-            ["Can't branch: that message is no longer in this session."],
-            "the specialized unknown-entry wording must stay ahead of the fallback",
-        );
+        let local_missing = missing_entry_feedback(&mut local, &local_shell, &mut local_app).await;
         shut_down(&local).await;
 
-        let remote_dir = TempDir::new().expect("remote tempdir");
-        let peer = RemoteHost::start(&remote_dir, "streaming-text").await;
-        let (mut remote, remote_shell) = connect_world_and_shell(&remote_dir, &peer, &[]).await;
+        let remote_dir = process_lifetime_test_dir();
+        let peer = RemoteHost::start(remote_dir, "streaming-text").await;
+        let (mut remote, remote_shell) = connect_world_and_shell(remote_dir, &peer, &[]).await;
         let (mut remote_app, _writer, _root) = app_over(&remote_shell).await;
         let remote_session = remote.directory.rename_focused(SESSION.to_string());
+        let remote_feedback = refusal_feedback(&mut remote, &remote_shell, &mut remote_app).await;
+        remote.directory.rename_focused(remote_session);
+        let remote_missing =
+            missing_entry_feedback(&mut remote, &remote_shell, &mut remote_app).await;
+        peer.shutdown().await;
 
-        let actual = refusal_feedback(&mut remote, &remote_shell, &mut remote_app).await;
+        let expected = RefusalFeedback {
+            actions: [
+                FeedbackObservation::toast(format!("Failed to branch the conversation: {REASON}")),
+                FeedbackObservation::notice(format!("Could not archive the session: {REASON}")),
+                FeedbackObservation::notice(format!("Could not set the session tag: {REASON}")),
+                FeedbackObservation::notice(format!("Could not read the session tree: {REASON}")),
+            ],
+            tree_redrew: true,
+        };
+        assert_eq!(local_feedback, expected, "local refusal feedback");
+        assert_eq!(remote_feedback, expected, "remote refusal feedback");
 
-        assert_eq!(actual, expected, "local and remote refusal text diverged");
-        for message in &actual {
+        let specialized = FeedbackObservation::toast(
+            "Can't branch: that message is no longer in this session.".to_string(),
+        );
+        assert_eq!(local_missing, specialized, "local unknown-entry refusal");
+        assert_eq!(
+            remote_missing, specialized,
+            "remote unknown-entry refusal must stay ahead of the fallback"
+        );
+
+        for message in remote_feedback
+            .actions
+            .iter()
+            .flat_map(|observation| observation.toasts.iter().chain(&observation.notices))
+        {
             assert!(
                 message.ends_with(REASON),
                 "the peer's sentence was lost: {message}"
@@ -20494,8 +20556,6 @@ mod tests {
                 );
             }
         }
-        remote.directory.rename_focused(remote_session);
-        peer.shutdown().await;
     }
 
     /// The strip's reveal, every byte of it real: an archived row is out of

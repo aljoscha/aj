@@ -542,6 +542,21 @@ impl RemoteEvents {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_status_refusal_preserves_its_raw_transport_diagnostic() {
+        let err = RemoteError::Status {
+            status: StatusCode::CONFLICT,
+            code: Some("locked".to_string()),
+            message: "held by another writer".to_string(),
+            body: r#"{"code":"locked","message":"held by another writer"}"#.to_string(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "the host answered 409 Conflict: held by another writer"
+        );
+    }
+
     /// Spec 6.6: codes arrive error by error, an envelope with only a `message`
     /// is a complete error, and an unknown code renders as its message verbatim.
     /// So both fields are read on their own, and a body that is no envelope at

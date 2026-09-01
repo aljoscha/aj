@@ -14,7 +14,9 @@ fi
 case "${SCRATCH_FIXTURE:-clean}" in
     clean) ;;
     allowed)
-        mkdir -p "$TMPDIR/aj-usage-A1b2C3"
+        mkdir -p \
+            "$TMPDIR/aj-usage-A1b2C3" \
+            "$TMPDIR/aj-task-lifetime-D4e5F6"
         ;;
     lexical)
         mkdir -p \
@@ -72,7 +74,7 @@ allowed_stdout="$fixture/allowed-stdout"
 allowed_stderr="$fixture/allowed-stderr"
 if ! SCRATCH_FIXTURE=allowed PATH="$fixture/cargo-bin:$PATH" \
     "$repo/scripts/check-test-scratch.sh" >"$allowed_stdout" 2>"$allowed_stderr"; then
-    echo "error: scratch guard rejected its process-lifetime usage root" >&2
+    echo "error: scratch guard rejected a process-lifetime root" >&2
     exit 1
 fi
 if ! grep -Fqx "ok: the suite left no scratch residue" "$allowed_stdout"; then
@@ -122,4 +124,4 @@ if ! grep -Fqx "  aj-usage-A1b2C3" "$fixture/newline-stderr"; then
 fi
 
 echo "ok: scratch guard rejects residue scan failures"
-echo "ok: scratch guard allows only the process-lifetime usage root"
+echo "ok: scratch guard allows only named process-lifetime roots"
