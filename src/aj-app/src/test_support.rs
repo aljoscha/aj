@@ -840,6 +840,34 @@ mod tests {
         CanonicalState::of_reduced(&chat, &lifecycle)
     }
 
+    /// Negative control for the exported full-form assertion boundary. The
+    /// task row is durable state, so no equality tier may erase the difference.
+    #[test]
+    #[should_panic(expected = "canonical states differ (negative control)")]
+    fn the_canonical_assertion_rejects_a_real_task_difference() {
+        let left = folded(None);
+        let mut right = left.clone();
+        right.tasks.clear();
+        assert_ne!(left, right, "the fixture supplies unequal states");
+
+        assert_canonical_eq(&left, &right, "negative control");
+    }
+
+    /// Negative control for the exported fault-tier assertion boundary. Tasks
+    /// survive the transient mask, so this difference must still be rejected.
+    #[test]
+    #[should_panic(expected = "convergent tiers differ (negative control)")]
+    fn the_convergent_assertion_rejects_a_real_task_difference() {
+        let left = folded(None);
+        let mut right = left.clone();
+        right.tasks.clear();
+        let left = left.convergent();
+        let right = right.convergent();
+        assert_ne!(left, right, "the fixture difference survives the mask");
+
+        assert_convergent_eq(&left, &right, "negative control");
+    }
+
     /// The property the fault-injection sweep rests on: a client that was
     /// disconnected across a transient notice's only delivery window lands
     /// where a client that got it lands, once both are masked.
