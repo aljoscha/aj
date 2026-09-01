@@ -33,6 +33,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+aj-tools = { path = "../aj-tools/", features = ["testing"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The moved print-mode tests use `#[tokio::test(start_paused = true)]`,

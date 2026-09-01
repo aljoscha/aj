@@ -321,6 +321,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_content_text_marker_keeps_absolute_read_file_gutters() {
+        let content = "   41: alpha\n   42: beta";
+        let mut result = result(vec![UserContent::text(content)], reference(true));
+        result.tool_name = "read_file".to_string();
+
+        let expanded = expand_message(AgentMessage::wire(Message::ToolResult(result)));
+        let Some(Message::ToolResult(result)) = expanded.as_stored_wire() else {
+            panic!("expected tool result");
+        };
+        let details = result.details.as_ref().expect("expanded details");
+
+        assert_eq!(details["body"], format!("{content}\n"));
+        assert!(details.get("body_ref").is_none());
+    }
+
+    #[test]
     fn inline_text_with_a_malformed_body_ref_keeps_its_body() {
         let mixed = json!({
             "kind": "text",
