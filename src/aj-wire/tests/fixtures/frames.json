@@ -87,7 +87,12 @@
       }
     ],
     "hosts": [
-      { "id": "workstation", "name": "~/work/lewitt/aj", "unreachable": false },
+      {
+        "id": "workstation",
+        "name": "~/work/lewitt/aj",
+        "working_directory": "/home/lewitt/work/aj",
+        "unreachable": false
+      },
       { "id": "laptop", "unreachable": true },
       { "address": "http://100.64.0.9:6161", "unreachable": true }
     ]

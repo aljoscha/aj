@@ -169,8 +169,15 @@ struct World {
     /// gesture connect mode refuses outright.
     local: Option<LocalHandles>,
     /// The directory the focused session runs in: this process's own for a
-    /// local run, the host's (from `hello`) for a connection.
+    /// local run, a direct host's from `hello`, or a gateway host's from the
+    /// focused session's directory row.
     working_directory: PathBuf,
+    /// Whether focus chooses the working directory from the peer's host rows.
+    ///
+    /// True exactly when the remote hello omitted its endpoint directory, which
+    /// is the protocol's gateway discriminator. Direct and local hosts serve one
+    /// directory themselves, so their value stays fixed across session focus.
+    working_directory_follows_focus: bool,
     /// Where this client stands with its host. Mirrored into the status chrome
     /// by [`sync_status`].
     connection: Connection,
@@ -330,6 +337,7 @@ async fn build_world(
         reads_retry: Retry::default(),
         local: Some(handles),
         working_directory: env.working_directory.clone(),
+        working_directory_follows_focus: false,
         connection: Connection::Connected,
         resume: None,
         transition: None,
@@ -468,6 +476,7 @@ async fn build_connect_world(
         working_directory,
         created,
     } = connected;
+    let working_directory_follows_focus = working_directory.is_none();
     let mut directory = SessionDirectory::new(session.clone());
     // No run config to seed from: the block's opening `state` frame carries
     // the host's own settings and lands before the first paint.
@@ -482,6 +491,7 @@ async fn build_connect_world(
         // The host's directory, not ours: the session runs there, and its
         // `@file` completions and tool output all name paths on that machine.
         working_directory: working_directory.unwrap_or_default(),
+        working_directory_follows_focus,
         connection: Connection::Connected,
         resume: None,
         transition: None,
@@ -497,6 +507,7 @@ async fn build_connect_world(
     };
     fold_attach_block(&mut world).await;
     refresh_client_reads(&mut world).await;
+    world.sync_working_directory();
 
     fold_startup_diagnostics(&mut world, diagnostics, &keybinding_problems);
     if args.listen.is_some() {
@@ -625,6 +636,28 @@ impl World {
     /// The focused session's fold, mutably.
     fn client_mut(&mut self) -> &mut SessionClient {
         self.directory.client_mut()
+    }
+
+    /// Follow the focused gateway session to the working directory its host row
+    /// publishes.
+    ///
+    /// An old gateway or a row whose host is unknown resolves to the empty path.
+    /// The footer's generic empty-part rule decides how that absence renders.
+    /// Direct and local hosts keep the endpoint-level value they started with.
+    fn sync_working_directory(&mut self) -> bool {
+        if !self.working_directory_follows_focus {
+            return false;
+        }
+        let working_directory = self
+            .directory
+            .focused_working_directory()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        if self.working_directory == working_directory {
+            return false;
+        }
+        self.working_directory = working_directory;
+        true
     }
 
     /// Give up on the focused session's attach block with the local reason its
@@ -1475,6 +1508,7 @@ fn focus_session(
         .focus(&mut world.chat.borrow_mut(), &session, || {
             minted.expect("a session focused for the first time was minted a transcript")
         });
+    world.sync_working_directory();
     world.client_mut().owe_reattach();
     world.connection = Connection::Reconnecting;
     world.resume = Some(Resume::selected());
@@ -5294,10 +5328,8 @@ impl Shell {
             }));
         }
         // Install the `@`-file autocomplete provider on the editor, rooted at
-        // the session's working directory. The cwd is per-process and stable
-        // across session switches, and the editor persists across session
-        // rebinds (`rebind` swaps only session-scoped handles, never the
-        // editor), so the provider is set once here and never reinstalled.
+        // the working directory known when this shell is constructed. The
+        // provider owns the path itself.
         // Typing `/` at the empty prompt still opens the command palette (see
         // `on_palette_trigger` below). There is no `/`- or `#`-completion
         // provider, only `@`-file completion.
@@ -6005,10 +6037,18 @@ impl Shell {
         *self.settings_ui.borrow_mut() = None;
         *self.task_view.borrow_mut() = None;
         self.rebind_handles(world);
+        self.rebind_working_directory(world);
         self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.session());
+        self.transcript.borrow_mut().reset_to_tail();
+    }
+
+    /// Repoint the chrome that names the focused session's host directory.
+    fn rebind_working_directory(&mut self, world: &World) {
+        self.footer
+            .borrow_mut()
+            .set_working_directory(world.working_directory.display().to_string());
         self.window_title =
             aj_app::session::window_title(APP_TITLE, world.session(), &world.working_directory);
-        self.transcript.borrow_mut().reset_to_tail();
     }
 
     /// Point the chrome that reads a session's own handles at the ones the
@@ -7230,6 +7270,14 @@ async fn drive(
         // already buffered when the loop is re-entered to be answered from rows
         // that predate the switch, and a stepping chord would name the session
         // just landed on.
+        if world.sync_working_directory() {
+            shell.borrow_mut().rebind_working_directory(world);
+            app.post_app_event(UserEvent {
+                name: SET_TITLE_EVENT.to_string(),
+                data: None,
+            });
+            app.request_redraw();
+        }
         sync_sidebar(world, shell);
         // An accepted-Head recovery replaced the projection off the frame arm.
         // Retire terminal image ids before that epoch draws, since entry ids
@@ -19712,8 +19760,39 @@ mod tests {
             RemoteHost { host, server }
         }
 
+        /// A scripted host whose served working directory is `dir`, rather than
+        /// the test process's ambient directory.
+        async fn at_directory(dir: &TempDir) -> RemoteHost {
+            let provider = crate::remote::tests::scripted(
+                vec![aj_app::test_support::finalized_text_message("done")],
+                0,
+                Duration::ZERO,
+            );
+            let host = crate::remote::tests::scripted_host(
+                dir,
+                provider,
+                crate::remote::tests::HostHandles::new(dir),
+                None,
+            );
+            let server = crate::remote::RemoteServer::bind(
+                host.clone(),
+                "127.0.0.1:0".parse().expect("a loopback address"),
+                crate::remote::IdentityGate::local(),
+            )
+            .await
+            .expect("bind a loopback control port");
+            RemoteHost { host, server }
+        }
+
         fn url(&self) -> String {
             self.server.url()
+        }
+
+        fn working_directory(&self) -> PathBuf {
+            self.host
+                .hello()
+                .working_directory
+                .expect("a host reports the directory it serves")
         }
 
         /// Host first: an attached stream ends when the host closes it.
@@ -19844,6 +19923,7 @@ mod tests {
         argv: &[&str],
     ) -> (World, Rc<RefCell<Shell>>) {
         let world = connect_world_at(dir, url, argv).await;
+        let working_directory = world.working_directory.clone();
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
@@ -19851,7 +19931,7 @@ mod tests {
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             world.session(),
-            PathBuf::from("/tmp"),
+            working_directory,
         )));
         (world, shell)
     }
@@ -20642,18 +20722,21 @@ mod tests {
                 id: Some("builder-1".to_string()),
                 address: None,
                 name: None,
+                working_directory: None,
                 unreachable: false,
             },
             aj_wire::DirectoryHost {
                 id: Some("laptop".to_string()),
                 address: None,
                 name: None,
+                working_directory: None,
                 unreachable: true,
             },
             aj_wire::DirectoryHost {
                 id: None,
                 address: Some("10.0.0.7:7777".to_string()),
                 name: None,
+                working_directory: None,
                 unreachable: true,
             },
         ];
@@ -20695,6 +20778,7 @@ mod tests {
                 id: Some("builder-2".to_string()),
                 address: None,
                 name: None,
+                working_directory: None,
                 unreachable: false,
             },
         ];
@@ -20761,6 +20845,7 @@ mod tests {
             id: Some(id.to_string()),
             address: None,
             name: Some(name.to_string()),
+            working_directory: None,
             unreachable: false,
         };
         let redraw = world.directory.apply(
@@ -22675,6 +22760,7 @@ mod tests {
     async fn connect_mode_prompt_streams_the_hosts_answer() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let host_directory = remote.working_directory();
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
 
         // A fresh host holds nothing, so bare connect created the session.
@@ -22685,6 +22771,10 @@ mod tests {
         assert!(
             footer.contains("streaming-text"),
             "the footer shows the host's settings: {footer}"
+        );
+        assert!(
+            footer.contains(&host_directory.display().to_string()),
+            "direct connect keeps taking its directory from the peer hello: {footer}",
         );
 
         assert!(handle_submit(&mut world, "hello".to_string()).await);
@@ -27463,6 +27553,163 @@ mod tests {
         gateway.until_sessions(1).await;
         let (world, shell) = connect_world_and_shell_at(client, &gateway.url(), &[]).await;
         (gateway, ids, world, shell)
+    }
+
+    /// A gateway client shows the focused session's host directory, and moving
+    /// focus across hosts moves it.
+    ///
+    /// This crosses both real loopback routes. Each host reports a distinct
+    /// temp root in its hello, the gateway republishes those reports in host
+    /// rows, the client folds the two-host directory, and the composed footer is
+    /// read after each focus. Looking at `World` alone would miss a footer that
+    /// kept the construction-time string.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_gateway_footer_follows_focus_across_host_directories() {
+        let (left_dir, right_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::at_directory(&left_dir).await;
+        let right = RemoteHost::at_directory(&right_dir).await;
+        left.host.create().await.expect("a left session");
+        right.host.create().await.expect("a right session");
+        let gateway = RemoteGateway::over(&[&left, &right]).await;
+        gateway.until_sessions(2).await;
+
+        let directories = BTreeMap::from([
+            (left.host.hello().host_id, left.working_directory()),
+            (right.host.hello().host_id, right.working_directory()),
+        ]);
+        assert_ne!(
+            directories.values().next(),
+            directories.values().nth(1),
+            "the fixture must make a copied directory observable",
+        );
+        let (mut world, shell) = connect_world_and_shell_at(&client_dir, &gateway.url(), &[]).await;
+        assert_eq!(
+            world.directory.rows().len(),
+            2,
+            "the real client fold holds one row from each host",
+        );
+        let expected_for = |session: &str| {
+            let host = world
+                .directory
+                .rows()
+                .iter()
+                .find(|row| row.id == session)
+                .and_then(|row| row.host.as_deref())
+                .unwrap_or_else(|| panic!("{session} has a grouped row"));
+            directories
+                .get(host)
+                .cloned()
+                .unwrap_or_else(|| panic!("{host} is one of the two hosts"))
+        };
+        let first = world.session().to_string();
+        let second = world
+            .directory
+            .rows()
+            .iter()
+            .find(|row| row.id != first)
+            .map(|row| row.id.clone())
+            .expect("the other host's session");
+        let first_directory = expected_for(&first);
+        let second_directory = expected_for(&second);
+        assert_ne!(
+            first_directory, second_directory,
+            "focus moves between different hosts",
+        );
+        let before = footer_row(&shell);
+        assert!(
+            before.contains(&first_directory.display().to_string()),
+            "the initial focused host reaches the footer: {before:?}",
+        );
+
+        {
+            let (mut app, _writer, _root) = app_over(&shell).await;
+            assert!(matches!(
+                apply_focus_request(
+                    &mut app,
+                    &shell,
+                    &mut world,
+                    FocusRequest::Resume(second.clone()),
+                )
+                .await,
+                Focus::Moved,
+            ));
+        }
+        assert_eq!(world.session(), second);
+        let after = footer_row(&shell);
+        assert!(
+            after.contains(&second_directory.display().to_string()),
+            "the new host directory follows focus into the footer: {after:?}",
+        );
+        assert!(
+            !after.contains(&first_directory.display().to_string()),
+            "the outgoing host directory left the footer: {after:?}",
+        );
+
+        // A later hello for the same focused host republishes only the host
+        // metadata in a list frame. Stage that fold after the focus gesture has
+        // completed, then enter the real drive loop. Its pre-paint mirror is the
+        // only path that can move this news into the already-built footer.
+        let focused_host = world
+            .directory
+            .rows()
+            .iter()
+            .find(|row| row.id == second)
+            .and_then(|row| row.host.clone())
+            .expect("the focused session has a host");
+        let refreshed_directory = client_dir.path().join("after-host-reconnect");
+        let mut hosts = world.directory.hosts().to_vec();
+        hosts
+            .iter_mut()
+            .find(|host| host.id.as_deref() == Some(&focused_host))
+            .expect("the focused host has a directory row")
+            .working_directory = Some(refreshed_directory.clone());
+        let redraw = world.directory.apply(
+            &mut world.chat.borrow_mut(),
+            aj_wire::Frame::List {
+                sessions: world.directory.rows().to_vec(),
+                hosts,
+            },
+        );
+        assert!(redraw.0, "the changed host metadata is news");
+        let stale = footer_row(&shell);
+        assert!(
+            stale.contains(&second_directory.display().to_string())
+                && !stale.contains(&refreshed_directory.display().to_string()),
+            "the fold alone does not reach presentation, or the loop path would be vacuous: \
+             {stale:?}",
+        );
+
+        let observed_shell = Rc::clone(&shell);
+        let expected = refreshed_directory.display().to_string();
+        let (exit, refreshed) = drive_until(&mut world, &shell, move |writer| async move {
+            let rendered = poll_for(|| {
+                let row = footer_row(&observed_shell);
+                row.contains(&expected).then_some(row)
+            })
+            .await;
+            drop(writer);
+            rendered
+        })
+        .await;
+        match exit {
+            Ok(SessionExit::Quit) => {}
+            Ok(_) => panic!("the input EOF ended the drive loop with a session request"),
+            Err(err) => panic!("the drive loop failed: {err}"),
+        }
+        let refreshed = refreshed.expect("the drive loop never refreshed the footer cwd");
+        assert!(
+            !refreshed.contains(&second_directory.display().to_string()),
+            "the same-focus update retained the stale directory: {refreshed:?}",
+        );
+
+        drop(world);
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
     }
 
     /// The loop's own parts, so a test can call `drive` the way `run` does.

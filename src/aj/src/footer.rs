@@ -36,7 +36,7 @@ pub(crate) struct FooterLine {
     chat: Rc<RefCell<ChatState>>,
     status: Rc<RefCell<StatusState>>,
     styles: Rc<TranscriptStyles>,
-    /// Working-directory display string, fixed for the session.
+    /// Working-directory display string for the focused session's host.
     cwd: String,
     /// The session's task registry, read for the viewed agent's queued
     /// notices. Session-scoped, so a session switch replaces it
@@ -68,6 +68,11 @@ impl FooterLine {
     /// Point the footer at another session's task registry.
     pub(crate) fn set_task_registry(&mut self, task_registry: Option<TaskRegistry>) {
         self.task_registry = task_registry;
+    }
+
+    /// Show the focused session's host working directory.
+    pub(crate) fn set_working_directory(&mut self, cwd: String) {
+        self.cwd = cwd;
     }
 
     /// Notices queued for `owner` in the session's registry, zero when there

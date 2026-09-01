@@ -14,6 +14,7 @@
 //! keeps a newer host's row a newer host's row (spec 6.10).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_app::host::AttachRequest;
@@ -72,6 +73,14 @@ struct Enrollment {
     /// different name keeps its sessions and changes its label. `None` for a
     /// host that reported none and for one that has never answered.
     name: Option<String>,
+    /// The directory the host serves, from its latest handshake in this
+    /// gateway process.
+    ///
+    /// Unlike identity and the display name this is not gateway state: a host
+    /// that has not answered since a restart reports it as unknown until its
+    /// link returns. Persisting another copy would add a stale path where the
+    /// upstream hello is already the authority.
+    working_directory: Option<PathBuf>,
     /// The rows of this host's own last `list` frame, with its own ids.
     rows: Vec<Row>,
     connected: bool,
@@ -122,22 +131,26 @@ impl Enrollment {
 
 /// What a host said about itself when this gateway last spoke to it (spec 6.1).
 ///
-/// The two arrive in one handshake and are not interchangeable: the id rules
-/// identity and namespaces the host's sessions, the name is a label that
-/// follows the latest contact. Carried together so that a gateway learning one
-/// cannot forget the other, and built only by the constructors below, so a name
-/// that reached a client through this gateway satisfies
+/// The three arrive in one handshake and are not interchangeable: the id rules
+/// identity and namespaces the host's sessions, the name is a label, and the
+/// working directory is per-host presentation state. The latter two follow the
+/// latest contact. Carried together so that the gateway cannot accidentally
+/// source one from its own endpoint state, and built only by the constructors
+/// below, so a name that reached a client through this gateway satisfies
 /// [`normalize_host_name`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Reported {
     host_id: String,
     name: Option<String>,
+    working_directory: Option<PathBuf>,
 }
 
 impl Reported {
     /// What the host at the other end of `hello` says it is.
     pub(crate) fn of(hello: &Hello) -> Self {
-        Self::new(&hello.host_id, hello.name.as_deref())
+        let mut reported = Self::new(&hello.host_id, hello.name.as_deref());
+        reported.working_directory = hello.working_directory.clone();
+        reported
     }
 
     /// A contact's report of an id and a name, from a handshake or from this
@@ -153,6 +166,10 @@ impl Reported {
             // hands the name on to clients that paint it, so it is applied here,
             // at the one place a peer's word for itself enters.
             name: name.and_then(|name| normalize_host_name(name).ok().flatten()),
+            // `new` also rebuilds a report from persisted identity metadata,
+            // which deliberately has no cached working directory. Only `of`,
+            // the constructor over a live hello, fills this field.
+            working_directory: None,
         }
     }
 
@@ -269,16 +286,17 @@ impl Withdrawn {
 #[derive(Debug)]
 pub(crate) enum Adopted {
     /// The host told this gateway something it did not hold: an id, where it had
-    /// none for that host, or a different name for itself. Either belongs in the
-    /// gateway's record.
+    /// none for that host, or different host metadata. The id and name belong in
+    /// the gateway's record, while the working directory belongs only in the
+    /// live directory.
     ///
-    /// One variant for both because neither owes a client anything beyond the
+    /// One variant for these changes because none owes a client anything beyond the
     /// directory it is about to read. That is also why only [`Self::Replaced`]
     /// is worth a log line: a replacement ends streams and an operator reading
-    /// back from a client's reset needs the sentence, while a relabelling shows
-    /// up on the very header it changed.
+    /// back from a client's reset needs the sentence, while metadata changes
+    /// show up in the directory they changed.
     Learned,
-    /// It answered to the id and the name this enrollment already had.
+    /// It answered with the id and host metadata this enrollment already had.
     Unchanged,
     /// A configured host answered under a different id, so the store this
     /// gateway was namespacing is gone and the identity that named it went with
@@ -290,8 +308,9 @@ pub(crate) enum Adopted {
 /// What settling a reported identity against an enrollment amounts to, worked
 /// out before anything is applied.
 ///
-/// A contact carries two things, so this answers for both: what it does to the
-/// identity this gateway serves, and whether the label it republishes changes.
+/// A contact carries three things, so this answers for all of them: what it does
+/// to the identity this gateway serves, and whether either host fact it
+/// republishes changes.
 /// Worked out in one place, so the record a settlement is written from and the
 /// set it then mutates cannot disagree about either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,13 +318,22 @@ struct Settling {
     identity: Identity,
     /// Whether the host reports a name other than the one held for it.
     renames: bool,
+    /// Whether the host reports a working directory other than the one held for
+    /// it. This is published but not persisted.
+    moves_directory: bool,
 }
 
 impl Settling {
     /// Whether applying this changes anything at all. A contact that changes
-    /// nothing is not written down and not published: a link's every redial
-    /// reaches here, and `list` is cumulative (spec 6.8).
+    /// nothing is neither recorded nor published: a link's every redial reaches
+    /// here, and `list` is cumulative (spec 6.8).
     fn changes(self) -> bool {
+        self.record_changes() || self.moves_directory
+    }
+
+    /// Whether applying this changes the persisted identity record. The
+    /// working directory is intentionally live handshake state only.
+    fn record_changes(self) -> bool {
         self.identity != Identity::Unchanged || self.renames
     }
 }
@@ -492,9 +520,13 @@ impl Directory {
                 address: taken.clone(),
             });
         }
-        let (host_id, name) = match reported {
-            Some(reported) => (Some(reported.host_id), reported.name),
-            None => (None, None),
+        let (host_id, name, working_directory) = match reported {
+            Some(reported) => (
+                Some(reported.host_id),
+                reported.name,
+                reported.working_directory,
+            ),
+            None => (None, None, None),
         };
         hosts.insert(
             address,
@@ -502,6 +534,7 @@ impl Directory {
                 source,
                 host_id,
                 name,
+                working_directory,
                 rows: Vec::new(),
                 connected: false,
                 error: None,
@@ -554,13 +587,14 @@ impl Directory {
     /// followed by fresh contact, which is why the caller is handed a
     /// [`Withdrawn`] to finish.
     ///
-    /// The name is not identity and is settled without any of that: it follows
-    /// the latest contact, so a host that restarted under a different one keeps
-    /// its sessions and changes what a client's header reads.
+    /// The name and working directory are not identity and are settled without
+    /// any of that. They follow the latest contact, so a host that restarted
+    /// under different metadata keeps its sessions and changes what a client
+    /// reads.
     ///
-    /// Answering what was settled is what tells the caller there is something to
-    /// write down: an id is learned by speaking to the host, so this is the only
-    /// place a configured host's ever gets settled.
+    /// Answering what was settled also tells the caller whether any client-
+    /// visible metadata changed. [`Self::record_adopting`] separately answers
+    /// whether the persisted identity record changed.
     pub(crate) fn adopt(
         &self,
         address: &HostAddress,
@@ -589,6 +623,7 @@ impl Directory {
         });
         enrollment.host_id = Some(reported.host_id.clone());
         enrollment.name = reported.name.clone();
+        enrollment.working_directory = reported.working_directory.clone();
         self.publish(&hosts);
         Ok(match replaced {
             Some(withdrawn) => Adopted::Replaced(withdrawn),
@@ -814,8 +849,9 @@ impl Directory {
         record(&hosts, None)
     }
 
-    /// The same as it would stand once the host at `address` had settled
-    /// `reported`, mutating nothing, or `None` when there is nothing to settle.
+    /// The same as it would stand once the persisted part of `reported` had
+    /// settled at `address`, mutating nothing. `None` means the id and name are
+    /// unchanged, even when live-only metadata still needs adoption.
     ///
     /// This is what makes an adoption write-ahead, exactly as
     /// [`Self::record_without`] makes a withdrawal one: the record is written
@@ -832,7 +868,7 @@ impl Directory {
         reported: &Reported,
     ) -> Result<Option<Recorded>, DirectoryError> {
         let hosts = self.lock();
-        if !settling(&hosts, address, reported)?.changes() {
+        if !settling(&hosts, address, reported)?.record_changes() {
             return Ok(None);
         }
         Ok(Some(record(&hosts, Some((address, reported)))))
@@ -963,11 +999,13 @@ fn settling(
             address: address.clone(),
         })?;
     let renames = enrollment.name != reported.name;
+    let moves_directory = enrollment.working_directory != reported.working_directory;
     let known = match enrollment.host_id.as_deref() {
         Some(known) if known == id => {
             return Ok(Settling {
                 identity: Identity::Unchanged,
                 renames,
+                moves_directory,
             });
         }
         // A dynamic enrollment is the record of the host it shook hands with, so
@@ -998,6 +1036,7 @@ fn settling(
             None => Identity::Learned,
         },
         renames,
+        moves_directory,
     })
 }
 
@@ -1052,6 +1091,7 @@ fn merge(hosts: &BTreeMap<HostAddress, Enrollment>) -> MergedDirectory {
             // enrollment rather than off a live hello: this is what keeps an
             // unreachable host's header readable, here and across a restart.
             name: enrollment.name.clone(),
+            working_directory: enrollment.working_directory.clone(),
             unreachable: !enrollment.connected,
         });
         // A host that has never answered has no id to namespace with, so its
@@ -1359,6 +1399,7 @@ mod tests {
                 id: None,
                 address: Some(address.to_string()),
                 name: None,
+                working_directory: None,
                 unreachable: true,
             }],
             "a client has a group to render, and nothing in the id position: an \
@@ -1397,6 +1438,7 @@ mod tests {
                 id: Some("learned".to_string()),
                 address: None,
                 name: None,
+                working_directory: None,
                 unreachable: true,
             }],
             "and its group is keyed by that id, with no address left to label by",
@@ -1611,6 +1653,7 @@ mod tests {
                 id: Some("after".to_string()),
                 address: None,
                 name: None,
+                working_directory: None,
                 unreachable: true,
             }],
             "the group is the new identity's, and nothing about that one is \
@@ -2064,6 +2107,7 @@ mod tests {
                 id: Some("left".to_string()),
                 address: None,
                 name: Some("~/workshop".to_string()),
+                working_directory: None,
                 unreachable: false,
             }],
             "and the merged directory republishes the latest name under the id \

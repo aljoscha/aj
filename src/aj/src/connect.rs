@@ -29,9 +29,9 @@ use crate::remote::RemoteClient;
 pub(crate) struct Connected {
     pub(crate) control: Control,
     pub(crate) session: String,
-    /// The host's working directory, which is what the header and the footer
-    /// show. `None` when the host did not report one, which leaves those
-    /// showing the url instead of a directory this machine does not have.
+    /// The endpoint's working directory. Present for a direct host and absent
+    /// for a gateway, whose selected host's directory arrives in its directory
+    /// rows instead.
     pub(crate) working_directory: Option<PathBuf>,
     /// Whether the session was created by this connect, which is what decides
     /// if it gets a fresh session's notices.
@@ -106,6 +106,7 @@ async fn resolve_named_host(
             // The host named itself in this handshake, and this row stands in
             // for what a gateway would have published about it.
             name: hello.name.clone(),
+            working_directory: hello.working_directory.clone(),
             unreachable: false,
         }],
         None => {

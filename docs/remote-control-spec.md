@@ -1291,7 +1291,13 @@ follows the latest handshake. A gateway states no name of its own and
 invents none, so a host it has never spoken to carries none, and the
 name a down host last reported outlives a gateway restart with the id
 it belongs to, which is what keeps an unreachable host's group
-readable.
+readable. A host row also carries the `working_directory` from that
+host's latest hello. This is live host metadata rather than gateway
+state, so a host this gateway process has not reached yet carries none,
+as does a row from an older gateway. A client derives the displayed
+directory from the focused session's host row and leaves it empty when
+the field is absent. The gateway's own hello still omits a working
+directory, which remains the role discriminator.
 Clients re-attach with their cursors as usual, which resumes
 incrementally when the host's epochs survived and fully when they did
 not. The same mechanism covers the case where a host evicts a slow

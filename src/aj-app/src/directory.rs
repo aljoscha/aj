@@ -229,6 +229,27 @@ impl SessionDirectory {
         &self.hosts
     }
 
+    /// The focused session's host working directory, when the peer publishes
+    /// one.
+    ///
+    /// A plain host publishes no host rows and a gateway groups each session by
+    /// [`SessionSummary::host`]. Joining those two fields here keeps callers
+    /// from parsing opaque session ids or maintaining another host map. `None`
+    /// also covers an older gateway whose host row has no directory field.
+    pub fn focused_working_directory(&self) -> Option<&std::path::Path> {
+        let host = self
+            .rows
+            .iter()
+            .find(|row| row.id == self.focused())?
+            .host
+            .as_deref()?;
+        self.hosts
+            .iter()
+            .find(|candidate| candidate.id.as_deref() == Some(host))?
+            .working_directory
+            .as_deref()
+    }
+
     /// The working set always holds at least the focused session, which
     /// [`Self::new`] establishes and no operation empties.
     fn focused_entry(&self) -> &Attached {
@@ -1035,6 +1056,7 @@ mod tests {
             id: Some(id.to_string()),
             address: None,
             name: None,
+            working_directory: None,
             unreachable,
         }
     }
@@ -1046,6 +1068,7 @@ mod tests {
             id: None,
             address: Some(address.to_string()),
             name: None,
+            working_directory: None,
             unreachable: true,
         }
     }

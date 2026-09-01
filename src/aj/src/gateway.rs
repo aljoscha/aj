@@ -549,8 +549,8 @@ pub(crate) struct Recorder {
 }
 
 impl Recorder {
-    /// Settle what the host at `address` reports about itself, and write it
-    /// down.
+    /// Settle what the host at `address` reports about itself, writing the
+    /// persisted part down when it changed.
     ///
     /// Write-ahead, the way a withdrawal is: the record is written from the set
     /// as it would stand, and only then does the set change, so a process that
@@ -584,12 +584,13 @@ impl Recorder {
             return Ok(());
         };
         let _writing = inner.writing.lock().await;
-        let Some(record) = inner.directory.record_adopting(address, reported)? else {
-            return Ok(());
-        };
-        if let Err(err) = inner.state.save(&record) {
+        if let Some(record) = inner.directory.record_adopting(address, reported)?
+            && let Err(err) = inner.state.save(&record)
+        {
             tracing::warn!("could not write down what this gateway just learned: {err}");
         }
+        // Working directory is live handshake metadata rather than enrollment
+        // state, so it can need publishing when there was no record to write.
         if let Adopted::Replaced(withdrawn) = inner.directory.adopt(address, reported)? {
             tracing::info!(
                 "the host at {address} answers to {} now",

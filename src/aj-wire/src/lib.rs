@@ -461,7 +461,9 @@ pub struct SessionList {
 /// A gateway names each host by exactly one of [`Self::id`] and
 /// [`Self::address`], and carries [`Self::name`] on top of that when the host
 /// reported one: a client labels a group by the name, else the id, else the
-/// address, and addresses that host's sessions by the id either way.
+/// address, and addresses that host's sessions by the id either way. The
+/// working directory is likewise the host's own report, carried here because a
+/// gateway's endpoint-level [`Hello`] deliberately describes no one host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryHost {
     /// The id this host's sessions are namespaced under, in the vocabulary
@@ -488,6 +490,15 @@ pub struct DirectoryHost {
     /// gateway has never spoken to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The directory this host serves, as [`Hello::working_directory`] reported
+    /// it at the latest contact.
+    ///
+    /// Per-host presentation state rather than an address. A gateway client
+    /// uses the focused session's host row, so moving focus across hosts moves
+    /// the directory it shows. Absent means unknown, from an older gateway or a
+    /// host this gateway has not spoken to in this process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<PathBuf>,
     /// The gateway's control connection to this host is down, which is what
     /// [`SessionSummary::unreachable`] says about each of its rows.
     #[serde(default)]

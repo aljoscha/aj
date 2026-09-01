@@ -260,6 +260,7 @@ mod tests {
             id: Some(id.to_string()),
             address: None,
             name: None,
+            working_directory: None,
             unreachable: false,
         }
     }
@@ -286,6 +287,7 @@ mod tests {
             id: None,
             address: Some(address.to_string()),
             name: None,
+            working_directory: None,
             unreachable: true,
         }
     }
@@ -452,6 +454,7 @@ mod tests {
                 id: Some(String::new()),
                 address: None,
                 name: None,
+                working_directory: None,
                 unreachable: false,
             },
             learned("bbb"),
