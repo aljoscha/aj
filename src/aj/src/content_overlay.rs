@@ -1893,8 +1893,14 @@ mod tests {
     /// one-cell body width that maximizes soft-wrapped height.
     #[test]
     fn valid_u16_boundary_environment_text_remains_drawable_and_complete() {
-        let at_boundary = "A".repeat(65_529);
-        let beyond_boundary = "B".repeat(131_100);
+        // Reordering equal-sized payloads must change the reconstructed pair,
+        // so every chunk carries a repeating phase rather than uniform text.
+        let at_boundary: String = (b'A'..=b'J').map(char::from).cycle().take(65_529).collect();
+        let beyond_boundary: String = (b'K'..=b'T')
+            .map(char::from)
+            .cycle()
+            .take(131_100)
+            .collect();
         let env = std::collections::BTreeMap::from([
             (at_boundary.clone(), String::new()),
             (beyond_boundary.clone(), String::new()),
