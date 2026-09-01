@@ -1329,8 +1329,22 @@ pub mod codex {
                     break;
                 }
                 request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
                 }
             }
             let response = format!(
@@ -1496,6 +1510,14 @@ pub mod codex {
                     "{reset}"
                 );
                 assert!(reset.contains("chatgpt-account-id: account-a"), "{reset}");
+                let (_, body) = reset
+                    .split_once("\r\n\r\n")
+                    .expect("reset request has a body boundary");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    serde_json::json!({ "redeem_request_id": "same-account-key" }),
+                    "the production request carries the attempt's idempotency key"
+                );
 
                 match tokio::time::timeout(
                     Duration::from_secs(1),

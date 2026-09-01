@@ -505,8 +505,10 @@ pub(crate) fn help_rows(styles: &ContentStyles) -> Vec<Row> {
 
 const ACCOUNT_ROW_CELL_LIMIT: u16 = u16::MAX;
 const ACCOUNT_ROW_CLIPPED_PREFIX_CELLS: usize = 96;
-const ACCOUNT_ROW_CLIPPED_NOTICE: &str =
-    "[clipped; complete account row exceeds 65,535-cell terminal limit] ";
+const AUTH_ROW_CLIPPED_NOTICE: &str =
+    "[clipped; complete auth row exceeds 65,535-cell terminal limit] ";
+const USAGE_ROW_CLIPPED_NOTICE: &str =
+    "[clipped; complete usage row exceeds 65,535-cell terminal limit] ";
 
 /// Measure terminal cells without accumulating the complete string in `u16`.
 /// Account representations above the vaxis extent are graphic ASCII, so the
@@ -527,12 +529,13 @@ fn account_label_for_row(
     represented: &str,
     cell_budget: usize,
     method: vaxis::gwidth::Method,
+    clipped_notice: &str,
 ) -> String {
     if terminal_cells(represented, method) <= cell_budget {
         return represented.to_string();
     }
 
-    let notice_cells = terminal_cells(ACCOUNT_ROW_CLIPPED_NOTICE, method);
+    let notice_cells = terminal_cells(clipped_notice, method);
     if notice_cells > cell_budget {
         return "[clipped]".chars().take(cell_budget).collect();
     }
@@ -550,7 +553,7 @@ fn account_label_for_row(
         prefix.push_str(grapheme);
         prefix_cells += width;
     }
-    format!("{ACCOUNT_ROW_CLIPPED_NOTICE}{prefix}")
+    format!("{clipped_notice}{prefix}")
 }
 
 /// Auth-status rows: one per provider/account credential, its default marker,
@@ -633,7 +636,12 @@ pub(crate) fn auth_rows(
                 } else {
                     ordinary
                 };
-                account_label_for_row(&represented, account_cell_budget, width_method)
+                account_label_for_row(
+                    &represented,
+                    account_cell_budget,
+                    width_method,
+                    AUTH_ROW_CLIPPED_NOTICE,
+                )
             })
         })
         .collect::<Vec<_>>();
@@ -757,7 +765,7 @@ pub(crate) fn usage_rows(
         .iter()
         .flat_map(|(_, _, group)| group.iter())
         .filter(|(_, detail)| detail.is_some())
-        .map(|(label, _)| label.chars().count())
+        .map(|(label, _)| terminal_cells(label, width_method))
         .max()
         .unwrap_or(0);
 
@@ -770,7 +778,11 @@ pub(crate) fn usage_rows(
             account.as_ref()?;
             let (label, detail) = group.first()?;
             let tail = match detail {
-                Some(detail) => format!("  {label:<label_w$}  {detail}"),
+                Some(detail) => {
+                    let padding =
+                        " ".repeat(label_w.saturating_sub(terminal_cells(label, width_method)));
+                    format!("  {label}{padding}  {detail}")
+                }
                 None => format!("  {label}"),
             };
             let fixed_cells = id_w + 2 + terminal_cells(&tail, width_method);
@@ -780,7 +792,12 @@ pub(crate) fn usage_rows(
         .unwrap_or_else(|| usize::from(ACCOUNT_ROW_CELL_LIMIT));
     for (_, account, _) in &mut groups {
         if let Some(represented) = account {
-            *represented = account_label_for_row(represented, account_cell_budget, width_method);
+            *represented = account_label_for_row(
+                represented,
+                account_cell_budget,
+                width_method,
+                USAGE_ROW_CLIPPED_NOTICE,
+            );
         }
     }
     let account_w = groups
@@ -809,7 +826,9 @@ pub(crate) fn usage_rows(
             }
             match detail {
                 Some(detail) => {
-                    row.push(span(format!("  {label:<label_w$}"), Style::default()));
+                    let padding =
+                        " ".repeat(label_w.saturating_sub(terminal_cells(label, width_method)));
+                    row.push(span(format!("  {label}{padding}"), Style::default()));
                     row.push(span(format!("  {detail}"), styles.muted));
                 }
                 None => row.push(span(format!("  {label}"), Style::default())),
@@ -1721,6 +1740,38 @@ mod tests {
                 .sum()
         };
         assert_eq!(prefix_width(first), prefix_width(second));
+    }
+
+    #[test]
+    fn usage_rows_align_detail_by_terminal_cells() {
+        use aj_models::usage::{ProviderUsage, UsageWindow};
+
+        let statuses = ["界", "aa"].map(|label| ProviderUsageStatus {
+            provider_id: "provider".into(),
+            account: None,
+            outcome: UsageOutcome::Usage(ProviderUsage {
+                windows: vec![UsageWindow {
+                    label: label.into(),
+                    used: 0.5,
+                    resets_at: None,
+                }],
+                notes: Vec::new(),
+                reset_offer: None,
+            }),
+        });
+        let rows = usage_rows(&statuses, &test_styles(), Method::Unicode);
+        let prefix_cells = |row: &Row| {
+            row[..row.len() - 1]
+                .iter()
+                .map(|segment| terminal_cells(&segment.text, Method::Unicode))
+                .sum::<usize>()
+        };
+
+        assert_eq!(
+            prefix_cells(&rows[0]),
+            prefix_cells(&rows[1]),
+            "a wide grapheme and two ASCII cells align the detail column: {rows:?}"
+        );
     }
 
     /// The provider-id column is right-aligned to the widest id across

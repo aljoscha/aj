@@ -167,20 +167,22 @@ where
         let auth = auth.clone();
         let discover = discover.clone();
         discoveries.spawn(async move {
+            let has_runtime_override =
+                source.is_some() && auth.has_runtime_override(&provider_id).await;
             let accounts =
                 tokio::time::timeout(SOURCE_TIMEOUT, discover(auth, provider_id.clone())).await;
-            (provider_id, source, accounts)
+            (provider_id, source, has_runtime_override, accounts)
         });
     }
 
     let mut statuses = Vec::new();
     let mut discovered_accounts = Vec::new();
     while let Some(discovered) = discoveries.join_next().await {
-        let Ok((provider_id, source, result)) = discovered else {
+        let Ok((provider_id, source, has_runtime_override, result)) = discovered else {
             tracing::warn!("usage account discovery task panicked");
             continue;
         };
-        let accounts = match result {
+        let mut accounts = match result {
             Ok(Ok(Some(accounts))) if accounts.accounts.is_empty() => vec![None],
             Ok(Ok(Some(accounts))) => accounts.accounts.into_iter().map(Some).collect(),
             Ok(Ok(None)) => vec![None],
@@ -205,6 +207,13 @@ where
                 continue;
             }
         };
+        if has_runtime_override && accounts.iter().all(Option::is_some) {
+            // A process override is an effective provider credential outside
+            // the stored account namespace. Preserve its provider-level row
+            // beside the labeled inventory rather than duplicating it under
+            // every account label.
+            accounts.push(None);
+        }
         if let Some(source) = source {
             discovered_accounts.push((source, accounts));
         } else {
@@ -743,6 +752,33 @@ mod tests {
             fetched,
             vec![Some("personal".to_string()), Some("work".to_string())],
             "the source receives each account label rather than only the store default"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_override_keeps_its_provider_row_beside_labeled_accounts() {
+        let (_dir, auth) = two_account_auth("runtime-override").await;
+        auth.set_runtime_api_key("anthropic", "override-key".to_string())
+            .await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let statuses =
+            collect_usage_from_sources(&auth, vec![fake_source(Arc::clone(&calls), None, None)])
+                .await;
+        let rows = account_statuses(&statuses);
+        assert_eq!(
+            rows.iter()
+                .map(|status| status.account.as_deref())
+                .collect::<Vec<_>>(),
+            vec![None, Some("personal"), Some("work")],
+            "the effective override stays provider-level beside stored inventory"
+        );
+        let mut fetched = calls.lock().expect("calls mutex").clone();
+        fetched.sort();
+        assert_eq!(
+            fetched,
+            vec![None, Some("personal".to_string()), Some("work".to_string()),],
+            "None preserves the ordinary override resolution path"
         );
     }
 

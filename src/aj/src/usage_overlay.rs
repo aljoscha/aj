@@ -422,6 +422,11 @@ impl UsageOverlay {
         self.fetch_failed = false;
     }
 
+    fn refresh_display(&mut self) {
+        self.start_fetch();
+        self.set_phase(Phase::Display);
+    }
+
     /// Turn a finished consume into a terminal phase.
     fn apply_consume_result(&mut self, result: Result<ResetOutcome, UsageError>) {
         let Phase::Consuming { target, key } = &self.phase else {
@@ -639,14 +644,14 @@ impl UsageOverlay {
         };
         let (target, idempotency_key) = (target.clone(), idempotency_key.clone());
         if key.matches(Key::ESCAPE, Modifiers::empty()) {
-            self.set_phase(Phase::Display);
+            self.refresh_display();
         } else if key.matches(Key::ENTER, Modifiers::empty()) {
             match self.selected_value().as_deref() {
                 // The retry reuses the idempotency key, so it can't
                 // double-spend even if the failed attempt reached the
                 // server.
                 Some("retry") => self.begin_consume(target, idempotency_key),
-                _ => self.set_phase(Phase::Display),
+                _ => self.refresh_display(),
             }
         } else {
             self.move_menu_cursor(ctx, key);
@@ -659,8 +664,7 @@ impl UsageOverlay {
             (self.on_close)(ctx);
         } else if key.matches(Key::ENTER, Modifiers::empty()) {
             // Refetch so the reset windows and the updated count show.
-            self.start_fetch();
-            self.set_phase(Phase::Display);
+            self.refresh_display();
         }
         ctx.consume_and_redraw();
     }
@@ -1312,6 +1316,33 @@ mod tests {
             ],
             "retry preserves the exact report-issued target"
         );
+    }
+
+    #[test]
+    fn leaving_an_ambiguous_failure_refetches_before_another_attempt() {
+        for event in [
+            key(Key::ESCAPE, Modifiers::empty()),
+            key(Key::ENTER, Modifiers::empty()),
+        ] {
+            let (mut overlay, _) = overlay_with(vec![codex_status(Some(1))], Vec::new());
+            overlay.set_phase(Phase::Failed {
+                target: target("openai-codex", None),
+                key: "ambiguous-attempt".to_string(),
+                message: "the response was lost".to_string(),
+            });
+            if matches!(&event, Event::KeyPress(key) if key.matches(Key::ENTER, Modifiers::empty()))
+            {
+                overlay.select_menu_value("cancel");
+            }
+
+            send(&mut overlay, &event);
+
+            assert!(matches!(overlay.phase, Phase::Display));
+            assert!(
+                overlay.statuses_rx.is_some(),
+                "leaving a possibly consumed attempt refetches its report"
+            );
+        }
     }
 
     #[test]

@@ -26069,6 +26069,14 @@ mod tests {
         world.auth = client_auth.clone();
         host_auth.reset_credential_read_count();
         client_auth.reset_credential_read_count();
+        assert!(
+            world
+                .control
+                .usage_service()
+                .expect("local host usage service")
+                .can_reset("openai-codex"),
+            "Control carries the host's production reset source as well as collection"
+        );
 
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await,
