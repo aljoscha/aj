@@ -40,14 +40,13 @@ use crate::remote::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents, SILE
 
 /// Why a control operation did not do what was asked.
 ///
-/// The `Display` of either arm is user-facing: it is what gets folded into
-/// the transcript as a notice, which is what makes the same refusal read the
-/// same locally and over the wire (the host words its own refusals, spec
-/// 6.6).
+/// Its transparent arms preserve the source diagnostic. Presentation callers
+/// choose whether a remote status wrapper is useful transport context or
+/// should be stripped so a refusal reads the same locally and over the wire.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ControlError {
-    // Transparent, so the wrapper adds no layer of its own: what the peer
-    // said is what a notice shows and what an error chain reports.
+    // Transparent, so the wrapper adds no layer of its own to the diagnostic
+    // or its error chain.
     #[error(transparent)]
     Host(#[from] HostError),
     #[error(transparent)]
