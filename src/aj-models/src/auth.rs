@@ -1328,9 +1328,20 @@ fn migrate_legacy_openai_oauth(data: &mut AuthData) {
 /// power-loss durability, which requires syncing both the file and directory.
 fn write_auth_file(path: &Path, data: &AuthData) -> Result<(), AuthError> {
     let content = serde_json::to_string_pretty(data).map_err(AuthError::Serialize)?;
-    replace_auth_file(path, content.as_bytes(), |file, bytes| {
-        file.write_all(bytes)
-    })
+    replace_auth_file(path, content.as_bytes(), write_credentials)
+}
+
+/// The production byte writer behind [`write_auth_file`].
+///
+/// Named rather than inlined as a closure so tests can observe and
+/// fault-inject the exact writer whose result [`replace_auth_file`] must
+/// propagate, instead of substituting a test closure downstream of it.
+fn write_credentials(file: &mut std::fs::File, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(result) = fault::intercept_credential_write(file, bytes) {
+        return result;
+    }
+    file.write_all(bytes)
 }
 
 /// Replace `path` only after `write` succeeds.
@@ -1356,11 +1367,11 @@ fn replace_auth_file(
         .tempfile_in(parent)?;
 
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        replacement.as_file().set_permissions(perms)?;
-    }
+    set_unix_file_permissions(
+        PermissionSite::ReplacementFile,
+        replacement.as_file(),
+        0o600,
+    )?;
 
     write(replacement.as_file_mut(), content)?;
     replacement
@@ -1397,11 +1408,11 @@ fn prepare_auth_parent(path: &Path) -> io::Result<()> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::DirBuilderExt;
 
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true).mode(0o700).create(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        set_unix_permissions(PermissionSite::Parent, parent, 0o700)?;
     }
 
     #[cfg(not(unix))]
@@ -1434,13 +1445,53 @@ fn make_existing_auth_file_private(path: &Path) -> io::Result<()> {
     }
 
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    set_unix_permissions(PermissionSite::ExistingFile, path, 0o600)?;
 
     Ok(())
+}
+
+/// One hardening chmod in the credential write path.
+///
+/// Every site routes through [`set_unix_permissions`] or
+/// [`set_unix_file_permissions`] so a test can fail exactly one site's
+/// operation and require the storage result to surface it. Swallowing any of
+/// these failures would leave credential bytes behind permissive modes.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PermissionSite {
+    /// The private mode of the same-directory replacement file, applied
+    /// before it receives any credential byte.
+    ReplacementFile,
+    /// The 0700 mode of the storage directory.
+    Parent,
+    /// The 0600 repair of a permissive existing destination.
+    ExistingFile,
+}
+
+#[cfg(unix)]
+fn set_unix_permissions(site: PermissionSite, target: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(test)]
+    fault::injected_permission_failure(site)?;
+    #[cfg(not(test))]
+    let _ = site;
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(unix)]
+fn set_unix_file_permissions(
+    site: PermissionSite,
+    file: &std::fs::File,
+    mode: u32,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(test)]
+    fault::injected_permission_failure(site)?;
+    #[cfg(not(test))]
+    let _ = site;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +1619,96 @@ fn try_steal_stale_lock(lock_path: &Path, max_age: Duration) -> bool {
         return false;
     }
     std::fs::remove_dir(lock_path).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Test fault points
+// ---------------------------------------------------------------------------
+
+/// Test-only fault points crossed by the production write path.
+///
+/// The hooks are thread-local: auth tests run their storage operations on the
+/// current-thread tokio runtime, so an installed hook is visible to exactly
+/// the operations of its own test, and parallel tests cannot observe one
+/// another's injections. Installation returns an owning guard whose drop
+/// clears the hook, so a panicking test cannot leak an injection into a later
+/// test scheduled on the same thread. Installing replaces any installed hook
+/// and every guard's drop clears the slot outright: tests do not nest
+/// installations.
+///
+/// The permission injection fires above the real chmod, so it proves each
+/// site's failure propagates but cannot catch a swallow of the chmod syscall
+/// itself; an unprivileged test cannot make an owned target's chmod fail. The
+/// write seam has no such residual: the device-failure test swaps the
+/// replacement handle for `/dev/full` and drives the untouched production
+/// write into a real `ENOSPC`.
+#[cfg(test)]
+mod fault {
+    use std::cell::RefCell;
+    use std::io;
+
+    /// Interception for [`super::write_credentials`]. Returning `Some`
+    /// replaces the production write with the hook's result; returning `None`
+    /// falls through to the real writer, which lets an observer record the
+    /// write-time state without changing behavior.
+    type WriteHook = Box<dyn FnMut(&mut std::fs::File, &[u8]) -> Option<io::Result<()>>>;
+
+    thread_local! {
+        static CREDENTIAL_WRITE: RefCell<Option<WriteHook>> = const { RefCell::new(None) };
+        #[cfg(unix)]
+        static PERMISSION_FAILURE: RefCell<Option<super::PermissionSite>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(super) fn intercept_credential_write(
+        file: &mut std::fs::File,
+        bytes: &[u8],
+    ) -> Option<io::Result<()>> {
+        CREDENTIAL_WRITE.with(|hook| {
+            hook.borrow_mut()
+                .as_mut()
+                .and_then(|hook| hook(file, bytes))
+        })
+    }
+
+    /// Fail the given hardening chmod site with `PermissionDenied`, standing
+    /// in for the real `EPERM` a non-owned target produces.
+    #[cfg(unix)]
+    pub(super) fn injected_permission_failure(site: super::PermissionSite) -> io::Result<()> {
+        PERMISSION_FAILURE.with(|failure| match *failure.borrow() {
+            Some(injected) if injected == site => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("injected {site:?} permission failure"),
+            )),
+            _ => Ok(()),
+        })
+    }
+
+    /// Clears the installed hook on drop.
+    pub(super) struct HookGuard {
+        clear: fn(),
+    }
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            (self.clear)();
+        }
+    }
+
+    pub(super) fn install_write_hook(hook: WriteHook) -> HookGuard {
+        CREDENTIAL_WRITE.with(|slot| *slot.borrow_mut() = Some(hook));
+        HookGuard {
+            clear: || CREDENTIAL_WRITE.with(|slot| *slot.borrow_mut() = None),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn install_permission_failure(site: super::PermissionSite) -> HookGuard {
+        PERMISSION_FAILURE.with(|slot| *slot.borrow_mut() = Some(site));
+        HookGuard {
+            clear: || PERMISSION_FAILURE.with(|slot| *slot.borrow_mut() = None),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2689,13 +2830,354 @@ mod tests {
         );
     }
 
+    /// The temporal first-create guarantee: on a missing destination, the
+    /// production writer receives credential bytes only through an
+    /// already-private temporary file in an already-private parent, never
+    /// through the destination path. Observed during the write, not after it,
+    /// so a write-then-chmod regression cannot pass on final modes alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_first_credential_write_is_private_before_its_first_byte() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+        use std::rc::Rc;
+
+        let root =
+            TempDir::with_prefix("aj-auth-test-temporal-create-").expect("create scratch root");
+        let parent = root.path().join("credentials");
+        let path = parent.join("auth.json");
+
+        let observed = Rc::new(RefCell::new(None));
+        let record = Rc::clone(&observed);
+        let observer_path = path.clone();
+        let observer_parent = parent.clone();
+        let _guard = fault::install_write_hook(Box::new(move |file, _bytes| {
+            let file_mode = file
+                .metadata()
+                .expect("replacement file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            let same_directory_temp = std::fs::read_dir(&observer_parent)
+                .expect("list auth parent during write")
+                .filter_map(|entry| {
+                    entry
+                        .expect("read auth parent entry")
+                        .file_name()
+                        .into_string()
+                        .ok()
+                })
+                .any(|name| name.starts_with(".auth.json.tmp-"));
+            *record.borrow_mut() = Some((
+                file_mode,
+                mode(&observer_parent),
+                observer_path.exists(),
+                same_directory_temp,
+            ));
+            None
+        }));
+
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+        storage
+            .insert_bare(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "first-secret".into(),
+                },
+            )
+            .await
+            .expect("write first credential");
+
+        let (file_mode, parent_mode, destination_existed, same_directory_temp) = observed
+            .borrow_mut()
+            .take()
+            .expect("the first create must cross the production credential writer");
+        assert_eq!(
+            file_mode, 0o600,
+            "credential bytes must land on an already-private file"
+        );
+        assert_eq!(
+            parent_mode, 0o700,
+            "credential bytes must land in an already-private parent"
+        );
+        assert!(
+            !destination_existed,
+            "first-create bytes must go through the temporary file, not the destination"
+        );
+        assert!(
+            same_directory_temp,
+            "the replacement file must live in the destination's own directory"
+        );
+        assert_eq!(mode(&path), 0o600);
+        let stored = std::fs::read_to_string(&path).expect("read first store");
+        assert!(stored.contains("first-secret"));
+    }
+
+    /// Each hardening chmod is failed in isolation and the storage operation
+    /// must surface exactly that failure. The fixture is meaningful because
+    /// every other operation succeeds: after clearing the fault the same
+    /// insert completes, so a best-effort regression that swallowed the
+    /// failure would report success and the assertions below would fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_injected_permission_failure_surfaces_at_every_hardening_site() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for site in [
+            PermissionSite::Parent,
+            PermissionSite::ExistingFile,
+            PermissionSite::ReplacementFile,
+        ] {
+            let root = TempDir::with_prefix("aj-auth-test-permission-fault-")
+                .expect("create scratch root");
+            let parent = root.path().join("credentials");
+            let path = parent.join("auth.json");
+            let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+
+            // ExistingFile and ReplacementFile need a destination whose bytes
+            // the failed operation must leave untouched. ExistingFile fires
+            // only on a permissive destination in need of repair.
+            let prior = match site {
+                PermissionSite::Parent => None,
+                PermissionSite::ExistingFile | PermissionSite::ReplacementFile => {
+                    storage
+                        .insert_bare(
+                            "anthropic",
+                            AuthCredential::ApiKey {
+                                key: "prior-secret".into(),
+                            },
+                        )
+                        .await
+                        .expect("seed prior store");
+                    if site == PermissionSite::ExistingFile {
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                            .expect("make destination permissive");
+                    }
+                    Some(std::fs::read(&path).expect("read prior store"))
+                }
+            };
+
+            let guard = fault::install_permission_failure(site);
+            let result = storage
+                .insert_bare(
+                    "openai",
+                    AuthCredential::ApiKey {
+                        key: "injected-secret".into(),
+                    },
+                )
+                .await;
+            let error = match result {
+                Err(AuthError::Io(error)) => error,
+                other => panic!("{site:?}: the hardening failure must surface, got {other:?}"),
+            };
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "{site:?} surfaced the wrong kind: {error}"
+            );
+            assert!(
+                error.to_string().contains("injected"),
+                "{site:?} surfaced a different failure: {error}"
+            );
+            match &prior {
+                None => assert!(
+                    !path.exists(),
+                    "{site:?}: a failed first write must not publish a store"
+                ),
+                Some(prior) => assert_eq!(
+                    &std::fs::read(&path).expect("read store after failure"),
+                    prior,
+                    "{site:?}: the failed write changed the prior store"
+                ),
+            }
+            assert!(
+                !lock_path_for(&path).exists(),
+                "{site:?}: the failure leaked the acquired lock"
+            );
+            if parent.exists() {
+                let residue: Vec<_> = std::fs::read_dir(&parent)
+                    .expect("list auth parent")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("read auth parent entries")
+                    .into_iter()
+                    .map(|entry| entry.path())
+                    .filter(|entry| entry != &path)
+                    .collect();
+                assert!(residue.is_empty(), "{site:?} left residue: {residue:?}");
+            }
+
+            // replace_auth_file's own hardening calls are shadowed by the
+            // lock's on the storage path above; they are the only defense for
+            // a future direct caller, so their propagation is pinned here.
+            let direct = replace_auth_file(&path, b"{}", write_credentials);
+            assert!(
+                matches!(
+                    direct,
+                    Err(AuthError::Io(error)) if error.to_string().contains("injected")
+                ),
+                "{site:?}: replace_auth_file must surface its own hardening failure"
+            );
+
+            drop(guard);
+            storage
+                .insert_bare(
+                    "openai",
+                    AuthCredential::ApiKey {
+                        key: "replacement-secret".into(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{site:?}: the fixture must succeed without the fault: {error}")
+                });
+        }
+    }
+
+    /// A failure of the real production writer, reached through
+    /// `insert_bare`, must surface and leave the prior complete store
+    /// byte-identical. This crosses `write_auth_file`'s own writer rather
+    /// than substituting a test closure, so swallowing its result anywhere
+    /// on the path publishes a partial store and fails here.
+    #[tokio::test]
+    async fn a_failed_production_write_preserves_the_prior_complete_store() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let (_dir, path) = scratch_path("production-write-failure");
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+        storage
+            .insert_bare(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "prior-secret".into(),
+                },
+            )
+            .await
+            .expect("seed prior complete store");
+        let prior = std::fs::read(&path).expect("read prior store");
+
+        let hook_fired = Rc::new(Cell::new(false));
+        let fired = Rc::clone(&hook_fired);
+        let guard = fault::install_write_hook(Box::new(move |file, bytes| {
+            fired.set(true);
+            file.write_all(&bytes[..bytes.len() / 2])
+                .expect("partial injected write");
+            Some(Err(io::Error::other("injected production write failure")))
+        }));
+
+        let result = storage
+            .insert_bare(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "replacement-secret".into(),
+                },
+            )
+            .await;
+        assert!(
+            hook_fired.get(),
+            "the injection must cross write_auth_file's production writer"
+        );
+        assert!(matches!(
+            result,
+            Err(AuthError::Io(error))
+                if error.to_string() == "injected production write failure"
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read store after failed write"),
+            prior,
+            "a failed write published a partial store"
+        );
+        let entries = std::fs::read_dir(path.parent().expect("auth parent"))
+            .expect("list auth parent")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read auth parent entries");
+        assert_eq!(entries.len(), 1, "the failed write left a temp file");
+        assert_eq!(entries[0].path(), path);
+
+        drop(guard);
+        storage
+            .insert_bare(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "replacement-secret".into(),
+                },
+            )
+            .await
+            .expect("write succeeds without the fault");
+        let stored = std::fs::read_to_string(&path).expect("read replacement store");
+        assert!(stored.contains("prior-secret"));
+        assert!(stored.contains("replacement-secret"));
+    }
+
+    /// A real device-level write failure crossing the completely untouched
+    /// production writer: the hook only swaps the replacement handle for
+    /// `/dev/full` and falls through, so `write_credentials`' own `write_all`
+    /// takes the `ENOSPC`. This is the one seam-free propagation proof:
+    /// swallowing the write result anywhere, including inside the production
+    /// writer's tail, publishes an empty store and fails the prior-bytes
+    /// assertion.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn a_parent_permission_failure_is_surfaced() {
-        let storage =
-            AuthStorage::with_providers(PathBuf::from("/proc/self/status"), HashMap::new());
+    async fn a_real_device_write_failure_preserves_the_prior_complete_store() {
+        let (_dir, path) = scratch_path("device-write-failure");
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+        storage
+            .insert_bare(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "prior-secret".into(),
+                },
+            )
+            .await
+            .expect("seed prior complete store");
+        let prior = std::fs::read(&path).expect("read prior store");
 
-        assert!(matches!(storage.list().await, Err(AuthError::Io(_))));
+        let guard = fault::install_write_hook(Box::new(move |file, _bytes| {
+            *file = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .expect("open /dev/full");
+            None
+        }));
+
+        let result = storage
+            .insert_bare(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "replacement-secret".into(),
+                },
+            )
+            .await;
+        match result {
+            Err(AuthError::Io(error)) => assert_eq!(
+                error.kind(),
+                io::ErrorKind::StorageFull,
+                "the device failure must surface as-is: {error}"
+            ),
+            other => panic!("a full device must fail the write, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("read store after failed write"),
+            prior,
+            "a failed device write published a replacement store"
+        );
+        let entries = std::fs::read_dir(path.parent().expect("auth parent"))
+            .expect("list auth parent")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read auth parent entries");
+        assert_eq!(entries.len(), 1, "the failed write left a temp file");
+        assert_eq!(entries[0].path(), path);
+
+        drop(guard);
+        storage
+            .insert_bare(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "replacement-secret".into(),
+                },
+            )
+            .await
+            .expect("write succeeds without the fault");
     }
 
     /// `try_steal_stale_lock` should leave fresh locks alone but
