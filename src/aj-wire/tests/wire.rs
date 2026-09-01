@@ -353,6 +353,15 @@ fn shared_observation_content_remains_additively_decodable() {
     }))
     .expect("an observation keeps the existing unknown-field tolerance");
     assert!(matches!(content, UserContent::Text(_)));
+
+    let content: UserContent = serde_json::from_value(json!({
+        "type": "image",
+        "data": "aW1hZ2U=",
+        "mime_type": "image/png",
+        "future_observation_field": {"nested": true}
+    }))
+    .expect("an image observation keeps the existing unknown-field tolerance");
+    assert!(matches!(content, UserContent::Image(_)));
 }
 
 fn selected_model() -> ModelSelection {

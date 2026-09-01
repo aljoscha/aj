@@ -3435,11 +3435,12 @@ async fn the_forwarded_create_names_the_target_in_its_own_vocabulary() {
     recorder.stop();
 }
 
-/// A destination host owns create validation and every field of its refusal.
-/// This stand-in returns the generic strict-schema 400 with an additive field
-/// this gateway does not know, so the body can be compared byte for byte.
+/// A destination host owns create validation and every field of its refusal
+/// except the established top-level session-id namespace rewrite. This stand-in
+/// returns the generic strict-schema 400 with a host-local session id and an
+/// additive integer larger than `u64`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hosts_unknown_field_create_refusal_travels_back_whole() {
+async fn a_create_refusal_namespaces_its_session_and_preserves_other_fields() {
     let recorder = Recorder::start("recorder").await;
     let fixture = Fixture::over(
         TempDir::new().expect("tempdir"),
@@ -3452,10 +3453,21 @@ async fn a_hosts_unknown_field_create_refusal_travels_back_whole() {
     let response = fixture.create(&sent).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.text().await.expect("the refusal body");
+    let refusal: serde_json::Value = serde_json::from_str(&body).expect("a JSON refusal");
     assert_eq!(
-        response.text().await.expect("the refusal body"),
-        REFUSED_CREATE_BODY,
-        "the gateway decoded or rewrote the destination host's 400",
+        refusal["session"],
+        serde_json::json!("recorder:s-1"),
+        "a host-local session id escaped through the gateway: {refusal}",
+    );
+    assert_eq!(refusal["code"], serde_json::json!("invalid_request"));
+    assert_eq!(
+        refusal["message"],
+        serde_json::json!("malformed request body")
+    );
+    assert!(
+        body.contains(r#""future":{"n":18446744073709551616}"#),
+        "the unrelated additive value changed: {body}",
     );
     let forwarded: serde_json::Value =
         serde_json::from_str(&recorder.recorded()).expect("the forwarded create");
@@ -3588,7 +3600,7 @@ async fn a_create_body_that_repeats_a_key_is_the_hosts_to_refuse() {
 /// the proxy.
 const REFUSED_ROUTE: &str = "refuse";
 const REFUSED_CREATE_FIELD: &str = "unknown_to_host";
-const REFUSED_CREATE_BODY: &str = r#"{"code":"invalid_request","message":"malformed request body","future":{"n":18446744073709551616}}"#;
+const REFUSED_CREATE_BODY: &str = r#"{"code":"invalid_request","message":"malformed request body","session":"s-1","future":{"n":18446744073709551616}}"#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProxiedRequest {
