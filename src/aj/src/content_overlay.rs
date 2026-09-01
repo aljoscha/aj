@@ -1940,7 +1940,23 @@ mod tests {
         narrow.width_method = vaxis::gwidth::Method::Wcwidth;
         let mut overlay = ContentOverlay::new(env_rows.to_vec());
         let top = overlay.draw(&narrow);
-        assert!(!top.children.is_empty(), "the first continuation is drawn");
+        let body_column = |surface: &Surface| {
+            crate::test_support::flatten(surface)
+                .iter()
+                .map(|row| row.first().expect("two-column surface").char.grapheme())
+                .collect::<String>()
+        };
+        let expected_top: String = env_texts
+            .first()
+            .expect("first continuation")
+            .chars()
+            .take(8)
+            .collect();
+        assert_eq!(
+            body_column(&top),
+            expected_top,
+            "the first continuation reaches the composited body column",
+        );
         assert!(
             overlay.list.borrow().item_top_line(1)
                 > u64::try_from(ENV_ROW_PAYLOAD_CELLS).expect("payload bound fits u64"),
@@ -1948,9 +1964,20 @@ mod tests {
         );
         overlay.list.borrow_mut().scroll_to_bottom();
         let bottom = overlay.draw(&narrow);
-        assert!(
-            !bottom.children.is_empty(),
-            "the last continuation is drawn"
+        let expected_bottom = env_texts
+            .last()
+            .expect("last continuation")
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        assert_eq!(
+            body_column(&bottom),
+            expected_bottom,
+            "the final continuation payload reaches the composited body column",
         );
         assert!(
             overlay.list.borrow().is_at_bottom(),
