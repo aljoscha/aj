@@ -7,7 +7,7 @@
 //!
 //! The page opens on a background fetch of every provider's usage report.
 //! A provider is *eligible* for the reset action when its report carries a
-//! non-zero [`aj_models::usage::ProviderUsage::reset_credits`] and a
+//! non-zero [`aj_models::usage::ProviderUsage::reset_offer`] and a
 //! matching [`RateLimitResetSource`] is configured. When eligible, the
 //! footer offers the `aj.usage.reset` chord, which drives the flow: pick a
 //! provider account (when more than one is eligible), confirm, spend that
@@ -29,12 +29,10 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use aj_app::keybindings::{ACTION_USAGE_RESET, action_shortcut};
-use aj_app::usage::{ProviderUsageStatus, UsageOutcome};
-use aj_models::auth::AuthStorage;
-use aj_models::usage::{RateLimitResetSource, ResetOutcome};
+use aj_app::usage::{ProviderUsageStatus, UsageOutcome, UsageService};
+use aj_models::usage::{ResetCreditTarget, ResetOutcome, UsageError};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use vaxis::cell::{Segment, Style};
@@ -45,6 +43,9 @@ use vaxis::vxfw::{
     to_widget_ref,
 };
 
+use crate::account_inspection::{
+    AccountLabelInspection, InspectionOutcome, account_notice_text, account_picker_text,
+};
 use crate::content_overlay::{ContentStyles, Row, plain, usage_rows};
 use crate::keymap::action_matches;
 use crate::overlay::{
@@ -60,8 +61,11 @@ enum Phase {
     Display,
     /// More than one provider account is eligible: pick which one to reset.
     SelectProvider,
-    /// Confirm spending a credit for one provider account.
-    Confirm { target: UsageTarget },
+    /// Inspect the exact account representation before spending a credit.
+    Confirm {
+        target: UsageTarget,
+        inspection: AccountLabelInspection,
+    },
     /// Consume request in flight. `key` is the idempotency key, retained
     /// so a retry after a transient failure reuses it and can't
     /// double-spend.
@@ -72,6 +76,9 @@ enum Phase {
         key: String,
         message: String,
     },
+    /// The account changed after the report was fetched. Retrying the stale
+    /// target cannot succeed, so the only forward action is a fresh fetch.
+    RefreshRequired { message: String },
     /// The consume completed (a reset, or a benign no-op like "nothing to
     /// reset"). `Enter` refetches and returns to `Display`.
     Done { message: String },
@@ -87,6 +94,7 @@ enum PhaseKind {
     Confirm,
     Consuming,
     Failed,
+    RefreshRequired,
     Done,
 }
 
@@ -121,32 +129,45 @@ impl MenuItem {
     }
 }
 
-/// The credential row a reset action acts on. The account stays beside the
-/// provider through selection, confirmation, retry, and source execution so
-/// two subscriptions under one provider cannot collapse back to its default.
+/// The report-issued authorization target a reset action carries through
+/// selection, confirmation, retry, and source execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UsageTarget {
-    provider_id: String,
-    account: Option<String>,
-    reset_identity: Option<String>,
+    reset: ResetCreditTarget,
 }
 
 impl UsageTarget {
-    fn from_status(status: &ProviderUsageStatus) -> UsageTarget {
-        UsageTarget {
-            provider_id: status.provider_id.clone(),
-            account: status.account.clone(),
-            reset_identity: match &status.outcome {
-                UsageOutcome::Usage(usage) => usage.reset_identity.clone(),
-                _ => None,
-            },
+    fn from_status(status: &ProviderUsageStatus) -> Option<UsageTarget> {
+        let UsageOutcome::Usage(usage) = &status.outcome else {
+            return None;
+        };
+        let reset = usage.reset_offer.as_ref()?.target().clone();
+        if reset.provider_id() != status.provider_id || reset.account() != status.account.as_deref()
+        {
+            return None;
         }
+        Some(UsageTarget { reset })
     }
 
     fn display(&self) -> String {
-        match &self.account {
-            Some(account) => format!("{} / {}", self.provider_id, crate::text::one_line(account)),
-            None => self.provider_id.clone(),
+        match self.reset.account() {
+            Some(account) => format!(
+                "{} / {}",
+                self.reset.provider_id(),
+                account_picker_text(account).0
+            ),
+            None => self.reset.provider_id().to_string(),
+        }
+    }
+
+    fn notice_display(&self) -> String {
+        match self.reset.account() {
+            Some(account) => format!(
+                "{} / {}",
+                self.reset.provider_id(),
+                account_notice_text(account)
+            ),
+            None => self.reset.provider_id().to_string(),
         }
     }
 }
@@ -166,7 +187,7 @@ pub(crate) struct UsageOverlay {
     /// instead of wedging in its loading state.
     fetch_failed: bool,
     /// Pending consume result. `Some` only while in `Consuming`.
-    consume_rx: Option<oneshot::Receiver<Result<ResetOutcome, String>>>,
+    consume_rx: Option<oneshot::Receiver<Result<ResetOutcome, UsageError>>>,
     /// Rows of the current interactive menu phase, empty in read-only
     /// phases. The list cursor indexes into this to resolve the confirmed
     /// row's `value`.
@@ -178,6 +199,8 @@ pub(crate) struct UsageOverlay {
     /// Content-column tints for the read-only Display rows, snapshotted at
     /// construction.
     styles: ContentStyles,
+    /// Terminal width policy used to align and bound represented accounts.
+    width_method: vaxis::gwidth::Method,
     /// The selection-band styles for the interactive menu phases,
     /// snapshotted at construction.
     ///
@@ -185,8 +208,7 @@ pub(crate) struct UsageOverlay {
     /// open. A theme hot-reload while the overlay is up does not re-tint
     /// it, it re-tints on reopen.
     chrome_select: SelectStyles,
-    auth: AuthStorage,
-    reset_sources: Vec<Arc<dyn RateLimitResetSource>>,
+    usage: UsageService,
     /// Where the fetch and consume tasks are spawned. Held so tests can
     /// pass their own runtime rather than relying on `Handle::current`.
     runtime: tokio::runtime::Handle,
@@ -207,9 +229,9 @@ impl UsageOverlay {
     /// fetch. The fetch pings `redraw` when it lands so the page repaints
     /// without a keypress.
     pub(crate) fn new(
-        auth: AuthStorage,
-        reset_sources: Vec<Arc<dyn RateLimitResetSource>>,
+        usage: UsageService,
         styles: ContentStyles,
+        width_method: vaxis::gwidth::Method,
         chrome_select: SelectStyles,
         runtime: tokio::runtime::Handle,
         redraw: UnboundedSender<()>,
@@ -236,9 +258,9 @@ impl UsageOverlay {
             list,
             bars,
             styles,
+            width_method,
             chrome_select,
-            auth,
-            reset_sources,
+            usage,
             runtime,
             redraw,
             on_close,
@@ -269,15 +291,20 @@ impl UsageOverlay {
                     subtitle_close()
                 }
             }
-            Phase::SelectProvider | Phase::Confirm { .. } | Phase::Failed { .. } => {
+            Phase::SelectProvider | Phase::Failed { .. } => {
                 format!(
                     "\u{2191}\u{2193} select \u{00b7} {} confirm \u{00b7} {} back",
                     confirm_key_label(),
                     close_key_label()
                 )
             }
+            Phase::Confirm { target, .. } => format!(
+                "{} · {} available · Left/Right inspect · Enter acknowledge/confirm · Esc back",
+                target.reset.provider_id(),
+                self.available_for(target)
+            ),
             Phase::Consuming { .. } => "resetting\u{2026}".to_string(),
-            Phase::Done { .. } => {
+            Phase::RefreshRequired { .. } | Phase::Done { .. } => {
                 format!(
                     "{} refresh  \u{2022}  {}",
                     confirm_key_label(),
@@ -301,11 +328,11 @@ impl UsageOverlay {
                 let UsageOutcome::Usage(usage) = &status.outcome else {
                     return None;
                 };
-                let available = usage.reset_credits?;
+                let available = usage.reset_offer.as_ref()?.available();
                 if available == 0 || !self.has_reset_source(&status.provider_id) {
                     return None;
                 }
-                Some(UsageTarget::from_status(status))
+                UsageTarget::from_status(status)
             })
             .collect()
     }
@@ -315,14 +342,7 @@ impl UsageOverlay {
     }
 
     fn has_reset_source(&self, provider_id: &str) -> bool {
-        self.reset_source_for(provider_id).is_some()
-    }
-
-    fn reset_source_for(&self, provider_id: &str) -> Option<Arc<dyn RateLimitResetSource>> {
-        self.reset_sources
-            .iter()
-            .find(|source| source.provider_id() == provider_id)
-            .cloned()
+        self.usage.can_reset(provider_id)
     }
 
     /// The reset credits available for `target`, for the confirm subtitle.
@@ -332,10 +352,13 @@ impl UsageOverlay {
             .iter()
             .flatten()
             .find(|status| {
-                status.provider_id == target.provider_id && status.account == target.account
+                status.provider_id == target.reset.provider_id()
+                    && status.account.as_deref() == target.reset.account()
             })
             .and_then(|status| match &status.outcome {
-                UsageOutcome::Usage(usage) => usage.reset_credits,
+                UsageOutcome::Usage(usage) => {
+                    usage.reset_offer.as_ref().map(|offer| offer.available())
+                }
                 _ => None,
             })
             .unwrap_or(0)
@@ -349,43 +372,30 @@ impl UsageOverlay {
         let mut eligible = self.eligible_targets();
         match eligible.len() {
             0 => {}
-            1 => self.set_phase(Phase::Confirm {
-                target: eligible.remove(0),
-            }),
+            1 => self.begin_confirmation(eligible.remove(0)),
             _ => self.set_phase(Phase::SelectProvider),
         }
+    }
+
+    fn begin_confirmation(&mut self, target: UsageTarget) {
+        let inspected = target
+            .reset
+            .account()
+            .unwrap_or_else(|| target.reset.provider_id());
+        let inspection = AccountLabelInspection::new(inspected, self.styles.muted);
+        self.set_phase(Phase::Confirm { target, inspection });
     }
 
     /// Kick off spending one credit for `target` under idempotency key
     /// `key`. Spawns the request and moves to `Consuming`.
     fn begin_consume(&mut self, target: UsageTarget, key: String) {
-        let Some(source) = self.reset_source_for(&target.provider_id) else {
-            // The action is only offered for providers with a source, so
-            // this is defensive.
-            self.set_phase(Phase::Failed {
-                target,
-                key,
-                message: "Resetting is not supported for this provider.".to_string(),
-            });
-            return;
-        };
-
         let (tx, rx) = oneshot::channel();
-        let auth = self.auth.clone();
+        let usage = self.usage.clone();
         let redraw = self.redraw.clone();
         let task_key = key.clone();
-        let task_account = target.account.clone();
-        let task_reset_identity = target.reset_identity.clone();
+        let task_target = target.reset.clone();
         self.runtime.spawn(async move {
-            let result = source
-                .consume_reset_credit(
-                    &auth,
-                    task_account.as_deref(),
-                    task_reset_identity.as_deref(),
-                    &task_key,
-                )
-                .await
-                .map_err(|err| err.to_string());
+            let result = usage.consume_reset_credit(&task_target, &task_key).await;
             if tx.send(result).is_ok() {
                 // A dropped receiver (the overlay closed) makes this a
                 // no-op.
@@ -400,10 +410,10 @@ impl UsageOverlay {
     /// the initial load and the post-reset refresh.
     fn start_fetch(&mut self) {
         let (tx, rx) = oneshot::channel();
-        let auth = self.auth.clone();
+        let usage = self.usage.clone();
         let redraw = self.redraw.clone();
         self.runtime.spawn(async move {
-            let statuses = aj_app::usage::collect_usage(&auth).await;
+            let statuses = usage.collect().await;
             if tx.send(statuses).is_ok() {
                 let _ = redraw.send(());
             }
@@ -413,7 +423,7 @@ impl UsageOverlay {
     }
 
     /// Turn a finished consume into a terminal phase.
-    fn apply_consume_result(&mut self, result: Result<ResetOutcome, String>) {
+    fn apply_consume_result(&mut self, result: Result<ResetOutcome, UsageError>) {
         let Phase::Consuming { target, key } = &self.phase else {
             return; // stale result after the user navigated away
         };
@@ -427,6 +437,12 @@ impl UsageOverlay {
             },
             Ok(ResetOutcome::NoCredit) => Phase::Done {
                 message: "No rate-limit resets available.".to_string(),
+            },
+            Err(UsageError::ResetTargetChanged { .. }) => Phase::RefreshRequired {
+                message: format!(
+                    "The {} account changed. Refresh usage before resetting.",
+                    target.notice_display()
+                ),
             },
             Err(err) => Phase::Failed {
                 target,
@@ -482,7 +498,9 @@ impl UsageOverlay {
             Err(oneshot::error::TryRecvError::Empty) => {}
             Err(oneshot::error::TryRecvError::Closed) => {
                 self.consume_rx = None;
-                self.apply_consume_result(Err("reset task ended unexpectedly".to_string()));
+                self.apply_consume_result(Err(UsageError::Fetch(
+                    "reset task ended unexpectedly".to_string(),
+                )));
             }
         }
     }
@@ -497,20 +515,18 @@ impl UsageOverlay {
         // matches only borrow `&self.phase` and end before the mutation.
         let menu_items: Vec<MenuItem> = match &self.phase {
             Phase::SelectProvider => provider_items(&self.eligible_targets(), self),
-            Phase::Confirm { target } => confirm_items(target, self.available_for(target)),
             Phase::Failed { message, .. } => failed_items(message),
             _ => Vec::new(),
         };
         let rows: Vec<Row> = match &self.phase {
             Phase::Display => self.display_rows(),
             Phase::Consuming { .. } => vec![plain("Resetting\u{2026}")],
-            Phase::Done { message } => vec![plain(message.clone())],
+            Phase::RefreshRequired { message } | Phase::Done { message } => {
+                vec![plain(message.clone())]
+            }
             _ => Vec::new(),
         };
-        let interactive = matches!(
-            self.phase,
-            Phase::SelectProvider | Phase::Confirm { .. } | Phase::Failed { .. }
-        );
+        let interactive = matches!(self.phase, Phase::SelectProvider | Phase::Failed { .. });
 
         self.menu_items = menu_items;
         let (source, count) = if interactive {
@@ -540,7 +556,7 @@ impl UsageOverlay {
             return vec![plain("Usage fetch failed.")];
         }
         match self.statuses.as_ref() {
-            Some(statuses) => usage_rows(statuses, &self.styles),
+            Some(statuses) => usage_rows(statuses, &self.styles, self.width_method),
             None => vec![loading_row()],
         }
     }
@@ -565,6 +581,7 @@ impl UsageOverlay {
             Phase::Confirm { .. } => PhaseKind::Confirm,
             Phase::Consuming { .. } => PhaseKind::Consuming,
             Phase::Failed { .. } => PhaseKind::Failed,
+            Phase::RefreshRequired { .. } => PhaseKind::RefreshRequired,
             Phase::Done { .. } => PhaseKind::Done,
         }
     }
@@ -590,7 +607,7 @@ impl UsageOverlay {
             self.set_phase(Phase::Display);
         } else if key.matches(Key::ENTER, Modifiers::empty()) {
             if let Some(target) = self.selected_target() {
-                self.set_phase(Phase::Confirm { target });
+                self.begin_confirmation(target);
             }
         } else {
             self.move_menu_cursor(ctx, key);
@@ -598,20 +615,15 @@ impl UsageOverlay {
         ctx.consume_and_redraw();
     }
 
-    fn handle_confirm_key(&mut self, ctx: &mut EventContext, key: &Key) {
-        let Phase::Confirm { target } = &self.phase else {
+    fn handle_confirm_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        let Phase::Confirm { target, inspection } = &mut self.phase else {
             return;
         };
         let target = target.clone();
-        if key.matches(Key::ESCAPE, Modifiers::empty()) {
-            self.set_phase(Phase::Display);
-        } else if key.matches(Key::ENTER, Modifiers::empty()) {
-            match self.selected_value().as_deref() {
-                Some("confirm") => self.begin_consume(target, new_idempotency_key()),
-                _ => self.set_phase(Phase::Display),
-            }
-        } else {
-            self.move_menu_cursor(ctx, key);
+        match inspection.handle_event(ctx, event) {
+            InspectionOutcome::Pending => {}
+            InspectionOutcome::Back => self.set_phase(Phase::Display),
+            InspectionOutcome::Confirmed => self.begin_consume(target, new_idempotency_key()),
         }
         ctx.consume_and_redraw();
     }
@@ -714,14 +726,17 @@ impl Widget for UsageOverlay {
             // NOTE: tint the thumb Muted per-draw, via the shared helper, so
             // it matches every other scrollbar. The style is snapshotted at
             // open, so this is parity with the other lists, not a live restyle.
-            let bars_surface = {
-                let mut bars = self.bars.borrow_mut();
-                crate::scroll::apply_thumb_style(&mut bars, self.styles.muted);
-                bars.draw(&body_ctx)
+            let body_surface = match &mut self.phase {
+                Phase::Confirm { inspection, .. } => inspection.draw(&body_ctx),
+                _ => {
+                    let mut bars = self.bars.borrow_mut();
+                    crate::scroll::apply_thumb_style(&mut bars, self.styles.muted);
+                    bars.draw(&body_ctx)
+                }
             };
             surface.children.push(SubSurface {
                 origin: RelativePoint { row: 0, col: 0 },
-                surface: bars_surface,
+                surface: body_surface,
                 z_index: 0,
             });
         }
@@ -729,6 +744,10 @@ impl Widget for UsageOverlay {
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        if matches!(self.phase, Phase::Confirm { .. }) {
+            self.handle_confirm_event(ctx, event);
+            return;
+        }
         let Event::KeyPress(key) = event else {
             // Mouse events fall through to the list (wheel scroll); no
             // consume here.
@@ -737,11 +756,12 @@ impl Widget for UsageOverlay {
         match self.phase_kind() {
             PhaseKind::Display => self.handle_display_key(ctx, key),
             PhaseKind::SelectProvider => self.handle_select_key(ctx, key),
-            PhaseKind::Confirm => self.handle_confirm_key(ctx, key),
+            PhaseKind::Confirm => unreachable!("confirmation events are handled above"),
             // The consume is quick and idempotency-keyed, so there's no
             // cancel: swallow every key.
             PhaseKind::Consuming => ctx.consume_and_redraw(),
             PhaseKind::Failed => self.handle_failed_key(ctx, key),
+            PhaseKind::RefreshRequired => self.handle_done_key(ctx, key),
             PhaseKind::Done => self.handle_done_key(ctx, key),
         }
     }
@@ -759,8 +779,8 @@ pub(crate) fn open_usage_overlay(
     editor: &WidgetRef,
     chrome: &OverlayChrome,
     styles: ContentStyles,
-    auth: AuthStorage,
-    reset_sources: Vec<Arc<dyn RateLimitResetSource>>,
+    width_method: vaxis::gwidth::Method,
+    usage: UsageService,
     runtime: tokio::runtime::Handle,
     redraw: UnboundedSender<()>,
 ) {
@@ -774,9 +794,9 @@ pub(crate) fn open_usage_overlay(
     // it in the border afterwards.
     let footer_source = Rc::new(RefCell::new(String::new()));
     let overlay = Rc::new(RefCell::new(UsageOverlay::new(
-        auth,
-        reset_sources,
+        usage,
         styles,
+        width_method,
         chrome.select.clone(),
         runtime,
         redraw,
@@ -813,18 +833,6 @@ fn row_widgets(rows: &[Row]) -> Vec<WidgetRef> {
         .collect()
 }
 
-/// Confirm menu: spending a credit or backing out. Names the provider account
-/// and what the reset does so the screen stands on its own, and defaults to
-/// the reset since that's the reason the user opened it.
-fn confirm_items(target: &UsageTarget, available: u32) -> Vec<MenuItem> {
-    vec![
-        MenuItem::new("confirm", format!("Use a reset for {}", target.display())).with_description(
-            format!("clears the current limits \u{00b7} {available} available"),
-        ),
-        MenuItem::new("cancel", "Cancel"),
-    ]
-}
-
 /// Retry menu shown after a transient consume failure. Defaults to "Try
 /// again". The retry reuses the idempotency key, so it can't double-spend
 /// even if the failed attempt actually reached the server.
@@ -839,9 +847,10 @@ fn failed_items(message: &str) -> Vec<MenuItem> {
 fn provider_items(targets: &[UsageTarget], overlay: &UsageOverlay) -> Vec<MenuItem> {
     targets
         .iter()
-        .map(|target| {
+        .enumerate()
+        .map(|(index, target)| {
             let display = target.display();
-            MenuItem::new(display.clone(), display)
+            MenuItem::new(format!("reset-row-{index}"), display)
                 .with_target(target.clone())
                 .with_description(format!("{} available", overlay.available_for(target)))
         })
@@ -939,10 +948,10 @@ fn new_idempotency_key() -> String {
 mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
-    use aj_models::auth::AuthCredential;
-    use aj_models::usage::{ProviderUsage, UsageError, UsageWindow};
+    use aj_models::auth::{AuthCredential, AuthStorage};
+    use aj_models::usage::{ProviderUsage, RateLimitResetSource, UsageError, UsageWindow};
     use async_trait::async_trait;
     use tempfile::TempDir;
     use vaxis::cell::Color;
@@ -999,9 +1008,9 @@ mod tests {
     struct FakeResetSource {
         provider_id: String,
         outcome: Result<ResetOutcome, String>,
+        target_changed: bool,
         keys: Arc<Mutex<Vec<String>>>,
-        accounts: Arc<Mutex<Vec<Option<String>>>>,
-        identities: Arc<Mutex<Vec<Option<String>>>>,
+        targets: Arc<Mutex<Vec<ResetCreditTarget>>>,
     }
 
     #[async_trait]
@@ -1012,19 +1021,17 @@ mod tests {
         async fn consume_reset_credit(
             &self,
             _auth: &AuthStorage,
-            account: Option<&str>,
-            reset_identity: Option<&str>,
+            target: &ResetCreditTarget,
             idempotency_key: &str,
         ) -> Result<ResetOutcome, UsageError> {
             self.keys.lock().unwrap().push(idempotency_key.to_string());
-            self.accounts
-                .lock()
-                .unwrap()
-                .push(account.map(str::to_string));
-            self.identities
-                .lock()
-                .unwrap()
-                .push(reset_identity.map(str::to_string));
+            self.targets.lock().unwrap().push(target.clone());
+            if self.target_changed {
+                return Err(UsageError::ResetTargetChanged {
+                    provider_id: target.provider_id().to_string(),
+                    account: target.account().map(str::to_string),
+                });
+            }
             self.outcome.clone().map_err(UsageError::Fetch)
         }
     }
@@ -1036,9 +1043,9 @@ mod tests {
         Arc::new(FakeResetSource {
             provider_id: provider_id.into(),
             outcome,
+            target_changed: false,
             keys: Arc::new(Mutex::new(Vec::new())),
-            accounts: Arc::new(Mutex::new(Vec::new())),
-            identities: Arc::new(Mutex::new(Vec::new())),
+            targets: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -1065,8 +1072,18 @@ mod tests {
                     resets_at: None,
                 }],
                 notes: vec![],
-                reset_credits,
-                reset_identity: account.map(|account| format!("identity-{account}")),
+                reset_offer: reset_credits.map(|available| {
+                    aj_models::usage::ResetCreditOffer::new(
+                        available,
+                        ResetCreditTarget::new(
+                            provider_id,
+                            account.map(str::to_string),
+                            account
+                                .map(|account| format!("identity-{account}"))
+                                .unwrap_or_else(|| "identity-bare".to_string()),
+                        ),
+                    )
+                }),
             }),
         }
     }
@@ -1077,9 +1094,13 @@ mod tests {
 
     fn target(provider_id: &str, account: Option<&str>) -> UsageTarget {
         UsageTarget {
-            provider_id: provider_id.to_string(),
-            account: account.map(str::to_string),
-            reset_identity: account.map(|account| format!("identity-{account}")),
+            reset: ResetCreditTarget::new(
+                provider_id,
+                account.map(str::to_string),
+                account
+                    .map(|account| format!("identity-{account}"))
+                    .unwrap_or_else(|| "identity-bare".to_string()),
+            ),
         }
     }
 
@@ -1098,9 +1119,9 @@ mod tests {
         };
         let auth = scratch_auth();
         let mut overlay = UsageOverlay::new(
-            auth,
-            sources,
+            UsageService::new(auth, sources),
             test_styles(),
+            vaxis::gwidth::Method::Unicode,
             SelectStyles::default(),
             runtime_handle(),
             tokio::sync::mpsc::unbounded_channel().0,
@@ -1195,10 +1216,8 @@ mod tests {
 
         send(&mut overlay, &key(u32::from('r'), Modifiers::empty()));
         let out = body(&mut overlay);
-        // The confirm names the provider and defaults to the reset.
-        assert!(out.contains("Use a reset for openai-codex"), "{out}");
-        assert!(out.contains("Cancel"), "{out}");
-        assert_eq!(overlay.selected_value().as_deref(), Some("confirm"));
+        assert!(out.contains("openai-codex"), "{out}");
+        assert!(out.contains("inspect the complete account label"), "{out}");
 
         // Esc backs out to the read-only page without spending.
         send(&mut overlay, &key(Key::ESCAPE, Modifiers::empty()));
@@ -1220,7 +1239,10 @@ mod tests {
                 Ok(ResetOutcome::NoCredit),
                 "No rate-limit resets available.",
             ),
-            (Err("boom".to_string()), "Couldn't reset usage: boom"),
+            (
+                Err(UsageError::Fetch("boom".to_string())),
+                "Couldn't reset usage: boom",
+            ),
         ];
         for (result, expected) in cases {
             let (mut overlay, _) = overlay_with(vec![codex_status(Some(2))], vec![]);
@@ -1250,14 +1272,13 @@ mod tests {
         // A source that always fails, so the flow lands back on the retry
         // menu and we can drive a second attempt.
         let keys = Arc::new(Mutex::new(Vec::new()));
-        let accounts = Arc::new(Mutex::new(Vec::new()));
-        let identities = Arc::new(Mutex::new(Vec::new()));
+        let targets = Arc::new(Mutex::new(Vec::new()));
         let source: Arc<dyn RateLimitResetSource> = Arc::new(FakeResetSource {
             provider_id: "openai-codex".into(),
             outcome: Err("boom".into()),
+            target_changed: false,
             keys: Arc::clone(&keys),
-            accounts: Arc::clone(&accounts),
-            identities: Arc::clone(&identities),
+            targets: Arc::clone(&targets),
         });
         let (mut overlay, _) = overlay_with(
             vec![usage_status_for_account(
@@ -1268,10 +1289,8 @@ mod tests {
             vec![source],
         );
 
-        // r -> confirm; "Use a reset" is the default row, so Enter mints a
-        // key and spends it.
+        // r opens the exact-account inspector; Enter confirms and mints a key.
         send(&mut overlay, &key(u32::from('r'), Modifiers::empty()));
-        overlay.select_menu_value("confirm");
         send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
         wait_for(&mut overlay, "Try again");
 
@@ -1286,18 +1305,70 @@ mod tests {
             "retry must reuse the idempotency key"
         );
         assert_eq!(
-            *accounts.lock().unwrap(),
-            vec![Some("work".to_string()), Some("work".to_string())],
-            "retry stays on the selected account as well as the same logical attempt"
-        );
-        assert_eq!(
-            *identities.lock().unwrap(),
+            *targets.lock().unwrap(),
             vec![
-                Some("identity-work".to_string()),
-                Some("identity-work".to_string())
+                target("openai-codex", Some("work")).reset,
+                target("openai-codex", Some("work")).reset,
             ],
-            "retry preserves the identity of the report being acted on"
+            "retry preserves the exact report-issued target"
         );
+    }
+
+    #[test]
+    fn changed_account_requires_refresh_and_never_retries_the_stale_target() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let source: Arc<dyn RateLimitResetSource> = Arc::new(FakeResetSource {
+            provider_id: "openai-codex".into(),
+            outcome: Ok(ResetOutcome::Reset),
+            target_changed: true,
+            keys: Arc::clone(&keys),
+            targets: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (mut overlay, _) = overlay_with(
+            vec![usage_status_for_account(
+                "openai-codex",
+                Some("wo\nrk"),
+                Some(1),
+            )],
+            vec![source],
+        );
+
+        send(&mut overlay, &key(u32::from('r'), Modifiers::empty()));
+        let confirm = body(&mut overlay);
+        assert!(
+            confirm.contains(r"\!\u{77}\u{6f}\u{a}\u{72}\u{6b}"),
+            "{confirm}"
+        );
+        send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
+        let stale = wait_for(&mut overlay, "Refresh usage before resetting");
+        assert!(
+            stale.contains(r"\!\u{77}\u{6f}\u{a}\u{72}\u{6b}"),
+            "{stale}"
+        );
+        assert!(!stale.contains("Try again"), "{stale}");
+        assert!(matches!(overlay.phase, Phase::RefreshRequired { .. }));
+        assert_eq!(keys.lock().unwrap().len(), 1, "one stale attempt");
+
+        send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
+        assert!(matches!(overlay.phase, Phase::Display));
+        assert!(overlay.statuses_rx.is_some(), "a fresh fetch is in flight");
+        assert_eq!(
+            keys.lock().unwrap().len(),
+            1,
+            "refresh does not retry the stale reset"
+        );
+    }
+
+    #[test]
+    fn changed_account_escape_closes_instead_of_restoring_the_stale_report() {
+        let (mut overlay, closed) = overlay_with(vec![codex_status(Some(1))], Vec::new());
+        overlay.set_phase(Phase::RefreshRequired {
+            message: "Refresh usage before resetting.".to_string(),
+        });
+
+        send(&mut overlay, &key(Key::ESCAPE, Modifiers::empty()));
+
+        assert!(*closed.borrow(), "Esc closes the stale report");
     }
 
     #[test]
@@ -1322,55 +1393,95 @@ mod tests {
         );
 
         // Choosing a provider advances to its confirm step.
-        overlay.select_menu_value("other");
+        overlay.select_menu_value("reset-row-1");
         send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
-        assert!(body(&mut overlay).contains("Use a reset"));
+        assert!(body(&mut overlay).contains("other"));
         match &overlay.phase {
-            Phase::Confirm { target: actual } => assert_eq!(actual, &target("other", None)),
+            Phase::Confirm { target: actual, .. } => assert_eq!(actual, &target("other", None)),
             _ => panic!("expected Confirm for the chosen provider"),
         }
     }
 
     #[test]
-    fn reset_picker_spends_the_selected_accounts_credit() {
-        let accounts = Arc::new(Mutex::new(Vec::new()));
-        let identities = Arc::new(Mutex::new(Vec::new()));
+    fn reset_picker_represents_and_spends_the_exact_raw_account() {
+        let targets = Arc::new(Mutex::new(Vec::new()));
         let source: Arc<dyn RateLimitResetSource> = Arc::new(FakeResetSource {
             provider_id: "openai-codex".into(),
             outcome: Ok(ResetOutcome::Reset),
+            target_changed: false,
             keys: Arc::new(Mutex::new(Vec::new())),
-            accounts: Arc::clone(&accounts),
-            identities: Arc::clone(&identities),
+            targets: Arc::clone(&targets),
         });
         let statuses = vec![
-            usage_status_for_account("openai-codex", Some("personal"), Some(1)),
             usage_status_for_account("openai-codex", Some("work"), Some(2)),
+            usage_status_for_account("openai-codex", Some("wo\nrk"), Some(1)),
         ];
         let (mut overlay, _) = overlay_with(statuses, vec![source]);
 
         send(&mut overlay, &key(u32::from('r'), Modifiers::empty()));
         let picker = body(&mut overlay);
-        assert!(picker.contains("openai-codex / personal"), "{picker}");
         assert!(picker.contains("openai-codex / work"), "{picker}");
-        overlay.select_menu_value("openai-codex / work");
+        assert!(
+            picker.contains(r"\!\u{77}\u{6f}\u{a}\u{72}\u{6b}"),
+            "{picker}"
+        );
+        overlay.select_menu_value("reset-row-1");
         send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
         let confirm = body(&mut overlay);
         assert!(
-            confirm.contains("Use a reset for openai-codex / work"),
+            confirm.contains(r"\!\u{77}\u{6f}\u{a}\u{72}\u{6b}"),
             "{confirm}"
         );
         send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
         wait_for(&mut overlay, "Usage reset.");
 
         assert_eq!(
-            *accounts.lock().unwrap(),
-            vec![Some("work".to_string())],
-            "the reset source receives the selected account, never the provider default"
+            *targets.lock().unwrap(),
+            vec![target("openai-codex", Some("wo\nrk")).reset],
+            "the reset source receives the selected report's exact target"
         );
+    }
+
+    #[test]
+    fn over_limit_reset_requires_acknowledgement_and_keeps_the_raw_target() {
+        let raw = format!("{}\u{1000}", "a".repeat(10_921));
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let source: Arc<dyn RateLimitResetSource> = Arc::new(FakeResetSource {
+            provider_id: "openai-codex".into(),
+            outcome: Ok(ResetOutcome::Reset),
+            target_changed: false,
+            keys: Arc::new(Mutex::new(Vec::new())),
+            targets: Arc::clone(&targets),
+        });
+        let (mut overlay, _) = overlay_with(
+            vec![usage_status_for_account(
+                "openai-codex",
+                Some(&raw),
+                Some(1),
+            )],
+            vec![source],
+        );
+
+        send(&mut overlay, &key(u32::from('r'), Modifiers::empty()));
+        let inspection = body(&mut overlay);
+        assert!(
+            inspection.contains("exceeds the 65,535-cell terminal inspection limit"),
+            "{inspection}"
+        );
+
+        send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
+        assert!(matches!(overlay.phase, Phase::Confirm { .. }));
+        assert!(
+            targets.lock().unwrap().is_empty(),
+            "acknowledgement is not the action"
+        );
+
+        send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
+        wait_for(&mut overlay, "Usage reset.");
         assert_eq!(
-            *identities.lock().unwrap(),
-            vec![Some("identity-work".to_string())],
-            "the reset source receives the upstream identity from the selected usage report"
+            *targets.lock().unwrap(),
+            vec![target("openai-codex", Some(&raw)).reset],
+            "the acknowledged action retains the exact raw legacy identity"
         );
     }
 
@@ -1379,7 +1490,7 @@ mod tests {
         let auth = scratch_auth();
         runtime_handle().block_on(async {
             for (label, key) in [("personal", "personal-key"), ("work", "work-key")] {
-                auth.set_account(
+                auth.insert_account(
                     "anthropic",
                     label,
                     AuthCredential::ApiKey {
@@ -1389,15 +1500,26 @@ mod tests {
                 .await
                 .expect("seed labeled account");
             }
+            for label in ["personal", "work"] {
+                auth.insert_account(
+                    "openrouter",
+                    label,
+                    AuthCredential::ApiKey {
+                        key: format!("{label}-router-key"),
+                    },
+                )
+                .await
+                .expect("seed labeled source-less account");
+            }
             // Keep the unrelated built-in Codex source off the network even
             // if the test process happens to carry a credential environment.
             auth.set_runtime_api_key("openai-codex", "not-an-oauth-token".to_string())
                 .await;
         });
         let mut overlay = UsageOverlay::new(
-            auth,
-            Vec::new(),
+            UsageService::new(auth, Vec::new()),
             test_styles(),
+            vaxis::gwidth::Method::Unicode,
             SelectStyles::default(),
             runtime_handle(),
             tokio::sync::mpsc::unbounded_channel().0,
@@ -1417,6 +1539,53 @@ mod tests {
             out.matches("usage not available").count(),
             3,
             "two Anthropic API-key accounts plus the isolated Codex override are unsupported:\n{out}"
+        );
+        assert_eq!(
+            out.matches("openrouter").count(),
+            2,
+            "the source-less provider keeps one rendered group per account:\n{out}"
+        );
+        assert_eq!(
+            out.matches("usage reporting not supported").count(),
+            3,
+            "two source-less accounts plus the bare openai row retain NoSource:\n{out}"
+        );
+    }
+
+    #[test]
+    fn initial_fetch_represents_legacy_accounts_through_the_real_overlay() {
+        let auth = scratch_auth();
+        let raw = serde_json::json!({
+            "anthropic": {
+                "type": "accounts",
+                "default": "work",
+                "accounts": {
+                    "work": { "type": "api_key", "key": "keep" },
+                    "wo\nrk": { "type": "api_key", "key": "hostile" }
+                }
+            }
+        });
+        std::fs::create_dir_all(auth.path().parent().expect("auth parent")).unwrap();
+        std::fs::write(auth.path(), serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        runtime_handle()
+            .block_on(auth.set_runtime_api_key("openai-codex", "not-an-oauth-token".to_string()));
+        let mut overlay = UsageOverlay::new(
+            UsageService::new(auth, Vec::new()),
+            test_styles(),
+            vaxis::gwidth::Method::Unicode,
+            SelectStyles::default(),
+            runtime_handle(),
+            tokio::sync::mpsc::unbounded_channel().0,
+            Box::new(|_| {}),
+            Rc::new(RefCell::new(String::new())),
+        );
+
+        let out = wait_for(&mut overlay, r"\!\u{77}\u{6f}\u{a}\u{72}\u{6b}");
+        assert!(out.contains("work"), "{out}");
+        assert_eq!(out.matches("anthropic").count(), 2, "{out}");
+        assert!(
+            !out.contains("wo\nrk"),
+            "raw control-bearing label leaked: {out:?}"
         );
     }
 

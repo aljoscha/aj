@@ -49,13 +49,9 @@ use aj_conf::skills::Skill;
 use aj_conf::{
     AgentEnv, Config, ConfigDiagnostic, ConfigThinkingDisplay, ConfigVerbosity, Severity,
 };
-use aj_models::auth::{
-    AccountLabelDisplayMode, AuthError, AuthStorage, StoredProviderCredentials,
-    display_account_label,
-};
+use aj_models::auth::{AuthError, AuthStorage, StoredProviderCredentials};
 use aj_models::registry::ModelInfo;
 use aj_models::types::UserContent;
-use aj_models::usage::default_reset_sources;
 use aj_models::{ThinkingConfig, speed_from_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter};
 use anyhow::{Context, Result, anyhow};
@@ -73,6 +69,7 @@ use vaxis::vxfw::{
     UserEvent, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
+use crate::account_inspection::{account_notice_text, account_picker_text};
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
 use crate::connect::Connected;
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
@@ -2264,38 +2261,6 @@ async fn open_default_logout_resolution(
     true
 }
 
-/// Represent an exact raw account for a picker. Search retains the complete
-/// canonical representation, while the row gets a disclosed bounded prefix so
-/// no selector surface claims to expose an arbitrarily long legacy identity.
-fn account_picker_text(raw: &str) -> (String, String) {
-    let represented = display_account_label(raw, AccountLabelDisplayMode::Ordinary);
-    let shown = if represented.len() > 65_535 {
-        let prefix = represented.chars().take(96).collect::<String>();
-        format!("[clipped; exceeds 65,535-cell inspection limit] {prefix}…")
-    } else {
-        represented.clone()
-    };
-    (shown, represented)
-}
-
-/// Post-action account text for transcript prose. Ordinary representations
-/// without spaces survive wrapping unchanged; labels with spaces use ASCII
-/// mode. An over-limit identity is referred to generically after its dedicated
-/// confirmation rather than inserting a partial identity.
-fn account_notice_text(raw: &str) -> String {
-    let ordinary = display_account_label(raw, AccountLabelDisplayMode::Ordinary);
-    let represented = if ordinary.contains(' ') {
-        display_account_label(raw, AccountLabelDisplayMode::Ascii)
-    } else {
-        ordinary
-    };
-    if represented.len() > 65_535 {
-        "the selected account (label exceeds the terminal inspection limit)".to_string()
-    } else {
-        represented
-    }
-}
-
 fn inspect_account_action(shell: &Rc<RefCell<Shell>>, app: &mut AsyncApp, action: AccountAction) {
     let handles = shell.borrow().overlay_handles();
     let theme = shell.borrow().theme.clone();
@@ -3760,34 +3725,27 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         // The usage overlay is interactive (it carries the rate-limit-reset
-        // flow), so it can't ride the read-only content-fill path. The host
-        // builds it here where it owns the deps the widget needs: the
-        // credential store, the theme snapshot, the shared redraw ping, and
-        // the runtime handle it spawns its fetch/consume onto.
+        // flow), so it can't ride the read-only content-fill path. Its service
+        // comes from Control so local use is bound to the host's credential
+        // store and remote use refuses before touching this client's store.
         CommandAction::OpenUsageStatus => {
-            // A connected world's credential store belongs to this client,
-            // not the session host the page would appear to describe. Refuse
-            // before cloning it because constructing the overlay starts a
-            // fetch that may refresh and rewrite an expired credential.
-            if world.control.is_remote() {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice(
-                        "show provider usage",
-                        "it would read this machine's credential store, so run it on the host",
-                    ),
-                );
-                return ActionEffect::Redraw;
-            }
+            let usage = match world.control.usage_service() {
+                Ok(usage) => usage,
+                Err(err) => {
+                    fold_notice(world, &err.to_string());
+                    return ActionEffect::Redraw;
+                }
+            };
             let handles = shell.borrow().overlay_handles();
             let styles = ContentStyles::from_theme(&shell.borrow().theme.read());
+            let width_method = shell.borrow().width_method();
             open_usage_overlay(
                 &handles.stack,
                 &handles.editor,
                 &handles.chrome,
                 styles,
-                world.auth.clone(),
-                default_reset_sources(),
+                width_method,
+                usage,
                 tokio::runtime::Handle::current(),
                 redraw_tx.clone(),
             );
@@ -26077,6 +26035,67 @@ mod tests {
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
     }
 
+    #[tokio::test]
+    async fn local_usage_reads_the_control_hosts_store_not_the_worlds_client_store() {
+        use aj_models::auth::AuthCredential;
+
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let host_auth = world.auth.clone();
+        host_auth
+            .insert_account(
+                "anthropic",
+                "host-account",
+                AuthCredential::ApiKey {
+                    key: "host-key".to_string(),
+                },
+            )
+            .await
+            .expect("seed host account");
+        host_auth
+            .set_runtime_api_key("openai-codex", "not-an-oauth-token".to_string())
+            .await;
+        let client_auth = AuthStorage::new(dir.path().join("client-auth.json"));
+        client_auth
+            .insert_account(
+                "anthropic",
+                "client-account",
+                AuthCredential::ApiKey {
+                    key: "client-key".to_string(),
+                },
+            )
+            .await
+            .expect("seed client account");
+        world.auth = client_auth.clone();
+        host_auth.reset_credential_read_count();
+        client_auth.reset_credential_read_count();
+
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await,
+            ActionEffect::OpenedOverlay
+        ));
+        let mut rendered = String::new();
+        for _ in 0..200 {
+            rendered = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+            if rendered.contains("host-account") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(rendered.contains("host-account"), "{rendered}");
+        assert!(!rendered.contains("client-account"), "{rendered}");
+        assert!(
+            host_auth.credential_read_count() > 0,
+            "the host service read its authoritative store"
+        );
+        assert_eq!(
+            client_auth.credential_read_count(),
+            0,
+            "interactive usage never reads the frontend's spare AuthStorage"
+        );
+    }
+
     /// Usage over a connection must stop before the connecting process's
     /// credential store can be read. Reads acquire a file lock and therefore
     /// create a missing parent directory, which gives the refusal a direct
@@ -26148,6 +26167,8 @@ mod tests {
             auth_root.exists(),
             "a credential read creates its lock parent"
         );
+        assert_eq!(unread_auth.credential_read_count(), 1, "observer is live");
+        unread_auth.reset_credential_read_count();
         std::fs::remove_dir_all(&auth_root).expect("re-arm the read observer");
         world.auth = unread_auth;
 
@@ -26155,6 +26176,11 @@ mod tests {
         assert!(matches!(effect, ActionEffect::Redraw));
 
         let assert_no_credential_harm = |stage: &str| {
+            assert_eq!(
+                world.auth.credential_read_count(),
+                0,
+                "the connected usage gesture crossed the client credential boundary {stage}",
+            );
             assert!(
                 !auth_root.exists(),
                 "the connected usage gesture touched the client's credential store {stage}",

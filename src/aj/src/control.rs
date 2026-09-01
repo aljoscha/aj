@@ -25,6 +25,7 @@ use aj_app::host::{
     QueueOp, SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::thinking_display_name;
+use aj_app::usage::UsageService;
 use aj_models::types::UserContent;
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{
@@ -201,6 +202,21 @@ impl Control {
         match self {
             Self::Local(_) => None,
             Self::Remote(remote) => Some(remote.client.base()),
+        }
+    }
+
+    /// Provider-usage operations owned by the viewed host. The current remote
+    /// protocol has no usage endpoint, so its backend refuses before a client
+    /// credential store can enter the operation.
+    pub(crate) fn usage_service(&self) -> Result<UsageService, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.usage_service()?),
+            Self::Remote(_) => Err(HostError::Unsupported(
+                "Can't show provider usage over a connection: it would read this machine's \
+                 credential store, so run it on the host."
+                    .to_string(),
+            )
+            .into()),
         }
     }
 

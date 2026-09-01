@@ -3988,7 +3988,7 @@ mod tests {
         let (_dir, path) = scratch_path("inventory-vs-override");
         let storage = AuthStorage::with_providers(path, HashMap::new());
         storage
-            .set_account("prov-x", "work", api_key("stored"))
+            .insert_account("prov-x", "work", api_key("stored"))
             .await
             .unwrap();
         storage
@@ -4071,7 +4071,7 @@ mod tests {
         let storage =
             AuthStorage::with_providers(path, HashMap::from([("stub".to_string(), provider)]));
         storage
-            .set_account(
+            .insert_account(
                 "stub",
                 "expired",
                 AuthCredential::OAuth(OAuthCredentials::new("old-r", "old-a", 1)),
@@ -4079,7 +4079,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .set_account(
+            .insert_account(
                 "stub",
                 "fresh",
                 AuthCredential::OAuth(OAuthCredentials::new("fresh-r", "fresh-a", i64::MAX)),

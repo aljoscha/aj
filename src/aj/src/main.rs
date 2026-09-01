@@ -56,6 +56,7 @@ fn is_interactive(args: &Args) -> bool {
         )
 }
 
+mod account_inspection;
 mod agent_picker;
 mod autocomplete;
 mod bubble;

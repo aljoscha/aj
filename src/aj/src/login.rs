@@ -31,6 +31,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -50,10 +51,11 @@ use vaxis::cell::{Hyperlink, Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     Builder, CursorState, DrawContext, Event, EventContext, FilterableSelect, ListView, MaxSize,
-    RelativePoint, RichText, ScrollView, ScrollableView, SelectItem, Size, Source, SubSurface,
-    Surface, Text, Widget, WidgetRef, WidthBasis, draw_widget, to_widget_ref,
+    RelativePoint, RichText, SelectItem, Size, Source, SubSurface, Surface, Text, Widget,
+    WidgetRef, WidthBasis, draw_widget, to_widget_ref,
 };
 
+use crate::account_inspection::{AccountLabelInspection, InspectionOutcome};
 use crate::overlay::{
     OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_top, subtitle_confirm_close,
     subtitle_login,
@@ -1046,30 +1048,13 @@ pub(crate) fn open_default_logout_picker(
     );
 }
 
-const ACCOUNT_INSPECTION_CELL_LIMIT: usize = 65_535;
-const OVER_LIMIT_PREFIX_CELLS: usize = 512;
-
 /// Non-softwrapped account-label inspection in front of a sensitive action.
-///
-/// The complete representation rides in a real [`ScrollView`] through 65,535
-/// logical cells. Longer legacy representations are classified in `usize`
-/// first and only a bounded represented prefix enters vaxis. Their action is
-/// armed by one explicit acknowledgement before a later Enter can confirm.
 struct AccountConfirmation {
-    /// The identity row is kept concrete so the non-softwrap contract is both
-    /// inspectable and asserted at draw, rather than hidden behind WidgetRef.
-    text: Rc<RefCell<Text>>,
-    view: Rc<RefCell<ScrollView>>,
-    represented_cells: usize,
-    surface_representation_cells: usize,
-    over_limit: bool,
-    acknowledged: bool,
-    last_width: u16,
+    inspection: AccountLabelInspection,
     action: AccountAction,
     request_slot: Rc<RefCell<Option<AuthPickerRequest>>>,
     stack: Rc<RefCell<OverlayStack>>,
     editor: WidgetRef,
-    warning_style: Style,
 }
 
 impl AccountConfirmation {
@@ -1081,147 +1066,44 @@ impl AccountConfirmation {
         warning_style: Style,
     ) -> Self {
         let (_, raw_label) = action.identity();
-        let creation_valid = validate_account_label(raw_label).is_ok();
-        let represented = display_account_label(raw_label, AccountLabelDisplayMode::Ordinary);
-        // A creation-valid ordinary label is bounded to 512 cells by contract.
-        // Only the scalar-escaped legacy branch can approach the u16 limit, and
-        // every one of its bytes is one terminal cell.
-        let represented_cells = if creation_valid {
-            usize::from(vaxis::gwidth::gwidth(
-                &represented,
-                vaxis::gwidth::Method::Unicode,
-            ))
-        } else {
-            represented.len()
-        };
-        let over_limit = represented_cells > ACCOUNT_INSPECTION_CELL_LIMIT;
-        let shown = if over_limit {
-            represented
-                .chars()
-                .take(OVER_LIMIT_PREFIX_CELLS)
-                .collect::<String>()
-        } else {
-            represented
-        };
-        let surface_representation_cells = shown.len();
-        let mut text_widget = Text::new(shown);
-        text_widget.softwrap = false;
-        let text = Rc::new(RefCell::new(text_widget));
-        let mut view = ScrollView::new(Source::Slice(vec![to_widget_ref(Rc::clone(&text))]));
-        view.draw_cursor = false;
         Self {
-            text,
-            view: Rc::new(RefCell::new(view)),
-            represented_cells,
-            surface_representation_cells,
-            over_limit,
-            acknowledged: false,
-            last_width: 1,
+            inspection: AccountLabelInspection::new(raw_label, warning_style),
             action,
             request_slot,
             stack,
             editor,
-            warning_style,
         }
+    }
+}
+
+impl Deref for AccountConfirmation {
+    type Target = AccountLabelInspection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inspection
+    }
+}
+
+impl DerefMut for AccountConfirmation {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inspection
     }
 }
 
 impl Widget for AccountConfirmation {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        debug_assert!(!self.text.borrow().softwrap);
-        debug_assert!(self.surface_representation_cells <= ACCOUNT_INSPECTION_CELL_LIMIT);
-        if !self.over_limit {
-            let represented_cells = ctx.string_width(&self.text.borrow().text);
-            self.represented_cells = represented_cells;
-            self.surface_representation_cells = represented_cells;
-        }
-        let size = ctx.max.size();
-        self.last_width = size.width.max(1);
-        let warning_rows = if self.over_limit { 2 } else { 1 };
-        let mut surface = Surface::with_size(size);
-        if size.height > 0 {
-            let view_ctx = ctx.with_constraints(
-                Size {
-                    width: 0,
-                    height: 0,
-                },
-                MaxSize {
-                    width: Some(size.width),
-                    height: Some(1),
-                },
-            );
-            surface.children.push(SubSurface {
-                origin: RelativePoint { row: 0, col: 0 },
-                surface: draw_widget(&to_widget_ref(Rc::clone(&self.view)), &view_ctx),
-                z_index: 0,
-            });
-        }
-        if size.height > 1 {
-            let message = if self.over_limit && self.acknowledged {
-                "Incomplete inspection acknowledged. Press Enter again to continue with the exact raw account."
-                    .to_string()
-            } else if self.over_limit {
-                format!(
-                    "Only a clipped prefix is shown. This legacy account exceeds the 65,535-cell \
-                     terminal inspection limit ({} cells).",
-                    self.represented_cells
-                )
-            } else {
-                "Use Left/Right or Home/End to inspect the complete account label.".to_string()
-            };
-            let mut warning = Text::new(message);
-            warning.style = self.warning_style;
-            warning.softwrap = true;
-            warning.width_basis = WidthBasis::Parent;
-            let warning_ctx = ctx.with_constraints(
-                Size {
-                    width: 0,
-                    height: 0,
-                },
-                MaxSize {
-                    width: Some(size.width),
-                    height: Some(size.height.saturating_sub(1).min(warning_rows)),
-                },
-            );
-            surface.children.push(SubSurface {
-                origin: RelativePoint { row: 1, col: 0 },
-                surface: warning.draw(&warning_ctx),
-                z_index: 0,
-            });
-        }
-        surface
+        self.inspection.draw(ctx)
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
-        let Event::KeyPress(key) = event else {
-            self.view.borrow_mut().handle_event(ctx, event);
-            return;
-        };
-        if key.matches(Key::ESCAPE, Modifiers::empty()) {
-            close_top(&self.stack, ctx, &self.editor);
-        } else if key.matches(Key::HOME, Modifiers::empty()) {
-            self.view.borrow_mut().set_scroll_left(0);
-            ctx.consume_and_redraw();
-        } else if key.matches(Key::END, Modifiers::empty()) {
-            let max_left = self
-                .surface_representation_cells
-                .saturating_sub(usize::from(self.last_width));
-            self.view
-                .borrow_mut()
-                .set_scroll_left(u32::try_from(max_left).expect("bounded surface offset fits u32"));
-            ctx.consume_and_redraw();
-        } else if key.matches(Key::ENTER, Modifiers::empty()) {
-            if self.over_limit && !self.acknowledged {
-                self.acknowledged = true;
-                self.warning_style.bold = true;
-                ctx.consume_and_redraw();
-            } else {
+        match self.inspection.handle_event(ctx, event) {
+            InspectionOutcome::Pending => {}
+            InspectionOutcome::Back => close_top(&self.stack, ctx, &self.editor),
+            InspectionOutcome::Confirmed => {
                 *self.request_slot.borrow_mut() =
                     Some(AuthPickerRequest::ApplyAccount(self.action.clone()));
                 close_all(&self.stack, ctx, &self.editor);
             }
-        } else {
-            self.view.borrow_mut().handle_event(ctx, event);
         }
     }
 
@@ -1296,8 +1178,10 @@ pub(crate) fn open_login_dialog(
 #[cfg(test)]
 mod tests {
     use aj_app::theme::ColorMode;
+    use vaxis::vxfw::ScrollableView;
 
     use super::*;
+    use crate::account_inspection::OVER_LIMIT_PREFIX_CELLS;
 
     fn theme() -> Theme {
         Theme::bundled_dark_with_mode(ColorMode::Truecolor)

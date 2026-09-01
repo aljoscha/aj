@@ -861,6 +861,15 @@ impl SessionHost {
         Ok(Self { inner })
     }
 
+    /// Provider-usage operations bound to this host's authoritative
+    /// credential store.
+    pub fn usage_service(&self) -> Result<crate::usage::UsageService, HostError> {
+        self.alive()?;
+        Ok(crate::usage::UsageService::standard(
+            self.inner.shared.auth.clone(),
+        ))
+    }
+
     /// Protocol identity and capabilities (spec 6.1).
     ///
     /// The list names the routes this host serves past the protocol-1

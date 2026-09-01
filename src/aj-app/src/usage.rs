@@ -9,13 +9,15 @@
 //!
 //! [`UsageSource`]: aj_models::usage::UsageSource
 
+use std::future::Future;
 use std::sync::Arc;
 
 use chrono::{Datelike, Local, TimeZone, Utc};
 
 use aj_models::auth::AuthStorage;
 use aj_models::usage::{
-    ProviderUsage, UsageAccount, UsageReport, UsageSource, default_usage_sources,
+    ProviderUsage, RateLimitResetSource, ResetCreditTarget, ResetOutcome, UsageAccount, UsageError,
+    UsageReport, UsageSource, default_reset_sources, default_usage_sources,
 };
 
 /// Per-account timeout. The Anthropic source's HTTP request already
@@ -29,7 +31,7 @@ const SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub struct ProviderUsageStatus {
     pub provider_id: String,
     /// The labeled stored account this row reports. `None` retains the
-    /// pre-accounts row for a bare, unconfigured, or source-less provider.
+    /// pre-accounts row for a bare or unconfigured provider.
     pub account: Option<String>,
     pub outcome: UsageOutcome,
 }
@@ -50,6 +52,68 @@ pub enum UsageOutcome {
     Error(String),
 }
 
+/// Host-owned provider-usage operations used by the interactive page.
+///
+/// The service keeps credential access and destructive reset sources behind
+/// one application boundary. A frontend receives it from its control backend,
+/// never by pairing its own credential store with a viewed session.
+#[derive(Clone)]
+pub struct UsageService {
+    auth: AuthStorage,
+    reset_sources: Vec<Arc<dyn RateLimitResetSource>>,
+}
+
+impl UsageService {
+    /// Build the standard host service over its authoritative credential
+    /// store.
+    pub fn standard(auth: AuthStorage) -> Self {
+        Self::new(auth, default_reset_sources())
+    }
+
+    /// Build a service with explicit reset sources. This is the provider
+    /// extension seam and lets tests exercise the real page without network
+    /// access.
+    pub fn new(auth: AuthStorage, reset_sources: Vec<Arc<dyn RateLimitResetSource>>) -> Self {
+        Self {
+            auth,
+            reset_sources,
+        }
+    }
+
+    /// Collect the complete per-account usage page from this host's store.
+    pub async fn collect(&self) -> Vec<ProviderUsageStatus> {
+        collect_usage(&self.auth).await
+    }
+
+    /// Whether this host has a destructive reset implementation for a
+    /// provider whose report offered credits.
+    pub fn can_reset(&self, provider_id: &str) -> bool {
+        self.reset_sources
+            .iter()
+            .any(|source| source.provider_id() == provider_id)
+    }
+
+    /// Spend one reset credit against the exact target issued by a report.
+    pub async fn consume_reset_credit(
+        &self,
+        target: &ResetCreditTarget,
+        idempotency_key: &str,
+    ) -> Result<ResetOutcome, UsageError> {
+        let Some(source) = self
+            .reset_sources
+            .iter()
+            .find(|source| source.provider_id() == target.provider_id())
+        else {
+            return Err(UsageError::Fetch(
+                "resetting is not supported for this provider".to_string(),
+            ));
+        };
+        source
+            .consume_reset_credit(&self.auth, target, idempotency_key)
+            .await
+    }
+}
+
 /// Providers surfaced on the `/usage` page even without a usage
 /// source, so the page self-documents that it covers all providers
 /// and not just Anthropic. Mirrors the `/auth` page's known set.
@@ -67,20 +131,52 @@ async fn collect_usage_from_sources(
     auth: &AuthStorage,
     sources: Vec<Arc<dyn UsageSource>>,
 ) -> Vec<ProviderUsageStatus> {
-    let mut discoveries = tokio::task::JoinSet::new();
+    collect_usage_with_discovery(auth, sources, |auth, provider_id| async move {
+        auth.accounts(&provider_id).await
+    })
+    .await
+}
+
+async fn collect_usage_with_discovery<F, Fut>(
+    auth: &AuthStorage,
+    sources: Vec<Arc<dyn UsageSource>>,
+    discover: F,
+) -> Vec<ProviderUsageStatus>
+where
+    F: Fn(AuthStorage, String) -> Fut + Clone + Send + 'static,
+    Fut: Future<
+            Output = Result<Option<aj_models::auth::ProviderAccounts>, aj_models::auth::AuthError>,
+        > + Send
+        + 'static,
+{
+    let mut providers = Vec::new();
     for source in sources {
-        let auth = auth.clone();
         let provider_id = source.provider_id().to_string();
+        if !providers.iter().any(|(current, _)| current == &provider_id) {
+            providers.push((provider_id, Some(source)));
+        }
+    }
+    for provider_id in KNOWN_PROVIDERS {
+        if !providers.iter().any(|(current, _)| current == provider_id) {
+            providers.push(((*provider_id).to_string(), None));
+        }
+    }
+
+    let mut discoveries = tokio::task::JoinSet::new();
+    for (provider_id, source) in providers {
+        let auth = auth.clone();
+        let discover = discover.clone();
         discoveries.spawn(async move {
-            let accounts = tokio::time::timeout(SOURCE_TIMEOUT, auth.accounts(&provider_id)).await;
-            (source, accounts)
+            let accounts =
+                tokio::time::timeout(SOURCE_TIMEOUT, discover(auth, provider_id.clone())).await;
+            (provider_id, source, accounts)
         });
     }
 
     let mut statuses = Vec::new();
     let mut discovered_accounts = Vec::new();
     while let Some(discovered) = discoveries.join_next().await {
-        let Ok((source, result)) = discovered else {
+        let Ok((provider_id, source, result)) = discovered else {
             tracing::warn!("usage account discovery task panicked");
             continue;
         };
@@ -90,22 +186,34 @@ async fn collect_usage_from_sources(
             Ok(Ok(None)) => vec![None],
             Ok(Err(err)) => {
                 statuses.push(ProviderUsageStatus {
-                    provider_id: source.provider_id().to_string(),
+                    provider_id,
                     account: None,
-                    outcome: UsageOutcome::Error(err.to_string()),
+                    outcome: source.as_ref().map_or(UsageOutcome::NoSource, |_| {
+                        UsageOutcome::Error(err.to_string())
+                    }),
                 });
                 continue;
             }
             Err(_) => {
                 statuses.push(ProviderUsageStatus {
-                    provider_id: source.provider_id().to_string(),
+                    provider_id,
                     account: None,
-                    outcome: UsageOutcome::Error("timed out".to_string()),
+                    outcome: source.as_ref().map_or(UsageOutcome::NoSource, |_| {
+                        UsageOutcome::Error("timed out".to_string())
+                    }),
                 });
                 continue;
             }
         };
-        discovered_accounts.push((source, accounts));
+        if let Some(source) = source {
+            discovered_accounts.push((source, accounts));
+        } else {
+            statuses.extend(accounts.into_iter().map(|account| ProviderUsageStatus {
+                provider_id: provider_id.clone(),
+                account: account.map(|(label, _)| label),
+                outcome: UsageOutcome::NoSource,
+            }));
+        }
     }
 
     // Complete the page-wide store snapshot before any source can begin an
@@ -147,16 +255,6 @@ async fn collect_usage_from_sources(
         match joined {
             Ok(status) => statuses.push(status),
             Err(err) => tracing::warn!("usage fetch task panicked: {err}"),
-        }
-    }
-
-    for id in KNOWN_PROVIDERS {
-        if !statuses.iter().any(|s| s.provider_id == *id) {
-            statuses.push(ProviderUsageStatus {
-                provider_id: id.to_string(),
-                account: None,
-                outcome: UsageOutcome::NoSource,
-            });
         }
     }
 
@@ -262,7 +360,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use aj_models::auth::AuthCredential;
-    use aj_models::usage::{UsageError, UsageWindow};
+    use aj_models::usage::{ResetCreditOffer, ResetCreditTarget, UsageError, UsageWindow};
     use async_trait::async_trait;
     use chrono::DateTime;
     use tempfile::TempDir;
@@ -273,6 +371,37 @@ mod tests {
         calls: Arc<Mutex<Vec<Option<String>>>>,
         fail_account: Option<String>,
         delays: Option<(u64, u64)>,
+    }
+
+    struct CoordinatedUsageSource {
+        provider_id: &'static str,
+        started: Arc<tokio::sync::Notify>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait]
+    impl UsageSource for CoordinatedUsageSource {
+        fn provider_id(&self) -> &str {
+            self.provider_id
+        }
+
+        async fn fetch(
+            &self,
+            _auth: &AuthStorage,
+            account: Option<UsageAccount<'_>>,
+        ) -> Result<UsageReport, UsageError> {
+            assert!(
+                account.is_some(),
+                "the source receives its discovered snapshot"
+            );
+            self.started.notify_one();
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
+            Ok(UsageReport::Unsupported {
+                reason: "scripted".to_string(),
+            })
+        }
     }
 
     #[async_trait]
@@ -321,8 +450,18 @@ mod tests {
                     resets_at: None,
                 }],
                 notes: vec![note.to_string()],
-                reset_credits,
-                reset_identity: account.map(|account| format!("identity-{account}")),
+                reset_offer: reset_credits.map(|available| {
+                    ResetCreditOffer::new(
+                        available,
+                        ResetCreditTarget::new(
+                            "anthropic",
+                            account.map(str::to_string),
+                            account
+                                .map(|account| format!("identity-{account}"))
+                                .unwrap_or_else(|| "identity-bare".to_string()),
+                        ),
+                    )
+                }),
             }))
         }
     }
@@ -331,7 +470,7 @@ mod tests {
         let dir = TempDir::with_prefix(format!("aj-usage-{tag}-")).expect("create temp dir");
         let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
         for (label, key) in [("personal", "personal-key"), ("work", "work-key")] {
-            auth.set_account(
+            auth.insert_account(
                 "anthropic",
                 label,
                 AuthCredential::ApiKey {
@@ -438,6 +577,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_emits_no_source_per_labeled_account() {
+        let dir = TempDir::with_prefix("aj-usage-no-source-").expect("create temp dir");
+        let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
+        for label in ["personal", "work"] {
+            auth.insert_account(
+                "openai",
+                label,
+                AuthCredential::ApiKey {
+                    key: format!("{label}-key"),
+                },
+            )
+            .await
+            .expect("seed source-less account");
+        }
+
+        let statuses = collect_usage_from_sources(&auth, Vec::new()).await;
+        let rows = statuses
+            .iter()
+            .filter(|status| status.provider_id == "openai")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .filter_map(|status| status.account.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["personal", "work"]
+        );
+        assert!(
+            rows.iter()
+                .all(|status| matches!(status.outcome, UsageOutcome::NoSource)),
+            "each stored account retains the existing NoSource outcome: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|status| status.account.is_some()),
+            "the labeled set must not collapse to one provider row: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_provider_discovery_completes_before_any_account_fetch() {
+        let dir = TempDir::with_prefix("aj-usage-discovery-barrier-").expect("create temp dir");
+        let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
+        for provider_id in ["anthropic", "openai-codex"] {
+            auth.insert_account(
+                provider_id,
+                "work",
+                AuthCredential::ApiKey {
+                    key: format!("{provider_id}-key"),
+                },
+            )
+            .await
+            .expect("seed provider account");
+        }
+
+        let blocked_discovery_started = Arc::new(tokio::sync::Notify::new());
+        let release_discovery = Arc::new(tokio::sync::Notify::new());
+        let stalled_fetch_started = Arc::new(tokio::sync::Notify::new());
+        let release_stalled_fetch = Arc::new(tokio::sync::Notify::new());
+        let fresh_fetch_finished = Arc::new(tokio::sync::Notify::new());
+        let sources: Vec<Arc<dyn UsageSource>> = vec![
+            Arc::new(CoordinatedUsageSource {
+                provider_id: "anthropic",
+                started: Arc::clone(&stalled_fetch_started),
+                release: Some(Arc::clone(&release_stalled_fetch)),
+            }),
+            Arc::new(CoordinatedUsageSource {
+                provider_id: "openai-codex",
+                started: Arc::clone(&fresh_fetch_finished),
+                release: None,
+            }),
+        ];
+        let discovering = {
+            let auth = auth.clone();
+            let blocked_discovery_started = Arc::clone(&blocked_discovery_started);
+            let release_discovery = Arc::clone(&release_discovery);
+            tokio::spawn(async move {
+                collect_usage_with_discovery(&auth, sources, move |auth, provider_id| {
+                    let blocked_discovery_started = Arc::clone(&blocked_discovery_started);
+                    let release_discovery = Arc::clone(&release_discovery);
+                    async move {
+                        if provider_id == "openai-codex" {
+                            blocked_discovery_started.notify_one();
+                            release_discovery.notified().await;
+                        }
+                        auth.accounts(&provider_id).await
+                    }
+                })
+                .await
+            })
+        };
+
+        blocked_discovery_started.notified().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                stalled_fetch_started.notified(),
+            )
+            .await
+            .is_err(),
+            "no source fetch starts while another provider is still discovering accounts"
+        );
+
+        release_discovery.notify_one();
+        stalled_fetch_started.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fresh_fetch_finished.notified(),
+        )
+        .await
+        .expect("the fresh provider uses its retained snapshot while its sibling stalls");
+        release_stalled_fetch.notify_one();
+        let statuses = discovering.await.expect("collector task");
+        assert!(
+            statuses.iter().any(|status| {
+                status.provider_id == "anthropic" && status.account.as_deref() == Some("work")
+            }) && statuses.iter().any(|status| {
+                status.provider_id == "openai-codex" && status.account.as_deref() == Some("work")
+            }),
+            "both discovered account rows survive: {statuses:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn collect_fetches_every_labeled_account_independently() {
         let (_dir, auth) = two_account_auth("two-accounts").await;
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -459,8 +720,11 @@ mod tests {
                 UsageOutcome::Usage(usage) => (
                     usage.windows[0].used,
                     usage.notes[0].as_str(),
-                    usage.reset_credits,
-                    usage.reset_identity.as_deref(),
+                    usage.reset_offer.as_ref().map(ResetCreditOffer::available),
+                    usage
+                        .reset_offer
+                        .as_ref()
+                        .and_then(|offer| offer.target().account()),
                 ),
                 other => panic!("expected per-account usage, got {other:?}"),
             })
@@ -468,8 +732,8 @@ mod tests {
         assert_eq!(
             reports,
             vec![
-                (0.25, "personal note", Some(1), Some("identity-personal")),
-                (0.75, "work note", Some(2), Some("identity-work"))
+                (0.25, "personal note", Some(1), Some("personal")),
+                (0.75, "work note", Some(2), Some("work"))
             ],
             "each account retains its complete windows, notes, reset credits, and action identity"
         );

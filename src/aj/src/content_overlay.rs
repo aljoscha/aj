@@ -47,7 +47,6 @@ use vaxis::vxfw::{
 use crate::overlay::{
     OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_close,
 };
-use crate::text::one_line;
 use crate::transcript::vaxis_color;
 
 /// A single content-overlay row: styled spans laid out as one line.
@@ -504,10 +503,10 @@ pub(crate) fn help_rows(styles: &ContentStyles) -> Vec<Row> {
     rows
 }
 
-const AUTH_ROW_CELL_LIMIT: u16 = u16::MAX;
-const AUTH_ROW_CLIPPED_PREFIX_CELLS: usize = 96;
-const AUTH_ROW_CLIPPED_NOTICE: &str =
-    "[clipped; complete auth row exceeds 65,535-cell terminal limit] ";
+const ACCOUNT_ROW_CELL_LIMIT: u16 = u16::MAX;
+const ACCOUNT_ROW_CLIPPED_PREFIX_CELLS: usize = 96;
+const ACCOUNT_ROW_CLIPPED_NOTICE: &str =
+    "[clipped; complete account row exceeds 65,535-cell terminal limit] ";
 
 /// Measure terminal cells without accumulating the complete string in `u16`.
 /// Account representations above the vaxis extent are graphic ASCII, so the
@@ -522,9 +521,9 @@ fn terminal_cells(text: &str, method: vaxis::gwidth::Method) -> usize {
 }
 
 /// Keep a disclosed prefix of an account representation within its share of
-/// the complete auth row. The raw account remains in storage and action models;
+/// the complete row. The raw account remains in storage and action models;
 /// this bounds only the read-only RichText surface.
-fn account_label_for_auth_row(
+fn account_label_for_row(
     represented: &str,
     cell_budget: usize,
     method: vaxis::gwidth::Method,
@@ -533,14 +532,14 @@ fn account_label_for_auth_row(
         return represented.to_string();
     }
 
-    let notice_cells = terminal_cells(AUTH_ROW_CLIPPED_NOTICE, method);
+    let notice_cells = terminal_cells(ACCOUNT_ROW_CLIPPED_NOTICE, method);
     if notice_cells > cell_budget {
         return "[clipped]".chars().take(cell_budget).collect();
     }
 
     let prefix_budget = cell_budget
         .saturating_sub(notice_cells)
-        .min(AUTH_ROW_CLIPPED_PREFIX_CELLS);
+        .min(ACCOUNT_ROW_CLIPPED_PREFIX_CELLS);
     let mut prefix = String::new();
     let mut prefix_cells = 0;
     for grapheme in represented.graphemes(true) {
@@ -551,7 +550,7 @@ fn account_label_for_auth_row(
         prefix.push_str(grapheme);
         prefix_cells += width;
     }
-    format!("{AUTH_ROW_CLIPPED_NOTICE}{prefix}")
+    format!("{ACCOUNT_ROW_CLIPPED_NOTICE}{prefix}")
 }
 
 /// Auth-status rows: one per provider/account credential, its default marker,
@@ -620,10 +619,10 @@ pub(crate) fn auth_rows(
                 + 9 // default marker or matching padding
                 + terminal_cells(&summaries[index], width_method)
                 + detail_cells;
-            usize::from(AUTH_ROW_CELL_LIMIT).saturating_sub(fixed_cells)
+            usize::from(ACCOUNT_ROW_CELL_LIMIT).saturating_sub(fixed_cells)
         })
         .min()
-        .unwrap_or_else(|| usize::from(AUTH_ROW_CELL_LIMIT));
+        .unwrap_or_else(|| usize::from(ACCOUNT_ROW_CELL_LIMIT));
     let represented = statuses
         .iter()
         .map(|status| {
@@ -634,7 +633,7 @@ pub(crate) fn auth_rows(
                 } else {
                     ordinary
                 };
-                account_label_for_auth_row(&represented, account_cell_budget, width_method)
+                account_label_for_row(&represented, account_cell_budget, width_method)
             })
         })
         .collect::<Vec<_>>();
@@ -679,7 +678,7 @@ fn usage_status_rows(status: &ProviderUsageStatus, now_ms: i64) -> Vec<(String, 
     let mut out = Vec::new();
     match &status.outcome {
         UsageOutcome::Usage(usage) => {
-            if usage.windows.is_empty() && usage.notes.is_empty() && usage.reset_credits.is_none() {
+            if usage.windows.is_empty() && usage.notes.is_empty() && usage.reset_offer.is_none() {
                 out.push(("no usage data reported".to_string(), None));
             }
             for window in &usage.windows {
@@ -689,7 +688,8 @@ fn usage_status_rows(status: &ProviderUsageStatus, now_ms: i64) -> Vec<(String, 
             for note in &usage.notes {
                 out.push((note.clone(), None));
             }
-            if let Some(available) = usage.reset_credits {
+            if let Some(offer) = &usage.reset_offer {
+                let available = offer.available();
                 let desc = if available > 0 {
                     format!("{available} available")
                 } else {
@@ -720,16 +720,29 @@ fn usage_status_rows(status: &ProviderUsageStatus, now_ms: i64) -> Vec<(String, 
 /// and the per-window status detail in `styles.muted`.
 /// The label is padded to a shared width on rows that carry a detail, so
 /// every detail value starts at the same column and lines up.
-pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyles) -> Vec<Row> {
+pub(crate) fn usage_rows(
+    statuses: &[ProviderUsageStatus],
+    styles: &ContentStyles,
+    width_method: vaxis::gwidth::Method,
+) -> Vec<Row> {
     let now_ms = now_unix_ms();
-    // Materialize each account's rows first so we can sanitize free-text
-    // labels and size every column before emitting spans.
-    let groups: Vec<(&str, Option<String>, Vec<(String, Option<String>)>)> = statuses
+    // Materialize each account's rows first so every identity uses the shared
+    // reversible representation and every column can be sized before spans
+    // are emitted.
+    let mut groups: Vec<(&str, Option<String>, Vec<(String, Option<String>)>)> = statuses
         .iter()
         .map(|status| {
+            let represented = status.account.as_deref().map(|account| {
+                let ordinary = display_account_label(account, AccountLabelDisplayMode::Ordinary);
+                if ordinary.contains(' ') {
+                    display_account_label(account, AccountLabelDisplayMode::Ascii)
+                } else {
+                    ordinary
+                }
+            });
             (
                 status.provider_id.as_str(),
-                status.account.as_deref().map(one_line),
+                represented,
                 usage_status_rows(status, now_ms),
             )
         })
@@ -740,17 +753,40 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyle
         .map(|(id, _, _)| id.chars().count())
         .max()
         .unwrap_or(0);
-    let account_w = groups
-        .iter()
-        .filter_map(|(_, account, _)| account.as_deref())
-        .map(|account| account.chars().count())
-        .max()
-        .unwrap_or(0);
     let label_w = groups
         .iter()
         .flat_map(|(_, _, group)| group.iter())
         .filter(|(_, detail)| detail.is_some())
         .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    // At one terminal cell wide, soft wrapping turns every cell into a row.
+    // Bound the account's share against the complete first row before handing
+    // it to RichText, including the longest status tail it sits beside.
+    let account_cell_budget = groups
+        .iter()
+        .filter_map(|(_, account, group)| {
+            account.as_ref()?;
+            let (label, detail) = group.first()?;
+            let tail = match detail {
+                Some(detail) => format!("  {label:<label_w$}  {detail}"),
+                None => format!("  {label}"),
+            };
+            let fixed_cells = id_w + 2 + terminal_cells(&tail, width_method);
+            Some(usize::from(ACCOUNT_ROW_CELL_LIMIT).saturating_sub(fixed_cells))
+        })
+        .min()
+        .unwrap_or_else(|| usize::from(ACCOUNT_ROW_CELL_LIMIT));
+    for (_, account, _) in &mut groups {
+        if let Some(represented) = account {
+            *represented = account_label_for_row(represented, account_cell_budget, width_method);
+        }
+    }
+    let account_w = groups
+        .iter()
+        .filter_map(|(_, account, _)| account.as_deref())
+        .map(|account| terminal_cells(account, width_method))
         .max()
         .unwrap_or(0);
 
@@ -767,7 +803,9 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyle
                 } else {
                     ""
                 };
-                row.push(span(format!("  {account:<account_w$}"), styles.muted));
+                let padding =
+                    " ".repeat(account_w.saturating_sub(terminal_cells(account, width_method)));
+                row.push(span(format!("  {account}{padding}"), styles.muted));
             }
             match detail {
                 Some(detail) => {
@@ -1304,7 +1342,7 @@ mod tests {
             .map(|segment| terminal_cells(&segment.text, Method::Unicode))
             .sum::<usize>();
         assert!(
-            cells <= usize::from(AUTH_ROW_CELL_LIMIT),
+            cells <= usize::from(ACCOUNT_ROW_CELL_LIMIT),
             "complete row has {cells} cells"
         );
     }
@@ -1491,8 +1529,7 @@ mod tests {
                             resets_at: None,
                         }],
                         notes: Vec::new(),
-                        reset_credits: None,
-                        reset_identity: None,
+                        reset_offer: None,
                     }),
                 },
                 ProviderUsageStatus {
@@ -1502,6 +1539,7 @@ mod tests {
                 },
             ],
             &test_styles(),
+            Method::Unicode,
         ));
         assert!(rows.contains("anthropic"), "{rows}");
         assert!(rows.contains("5-hour"), "{rows}");
@@ -1533,8 +1571,14 @@ mod tests {
                             },
                         ],
                         notes: vec!["Personal usage credits".into()],
-                        reset_credits: Some(1),
-                        reset_identity: Some("personal-upstream".into()),
+                        reset_offer: Some(aj_models::usage::ResetCreditOffer::new(
+                            1,
+                            aj_models::usage::ResetCreditTarget::new(
+                                "anthropic",
+                                Some("personal".into()),
+                                "personal-upstream",
+                            ),
+                        )),
                     }),
                 },
                 ProviderUsageStatus {
@@ -1544,6 +1588,7 @@ mod tests {
                 },
             ],
             &styles,
+            Method::Unicode,
         );
 
         assert_eq!(
@@ -1581,7 +1626,7 @@ mod tests {
             assert!(continuation[1].text.trim().is_empty(), "{continuation:?}");
         }
         assert_eq!(rows[4][0].text.trim(), "anthropic");
-        assert_eq!(rows[4][1].text.trim(), "work");
+        assert_eq!(rows[4][1].text.trim(), r"\!\u{77}\u{6f}\u{a}\u{72}\u{6b}");
         assert!(
             row_text(&rows[4]).contains("error: limit fetch failed"),
             "{:?}",
@@ -1623,11 +1668,11 @@ mod tests {
                         },
                     ],
                     notes: Vec::new(),
-                    reset_credits: None,
-                    reset_identity: None,
+                    reset_offer: None,
                 }),
             }],
             &styles,
+            Method::Unicode,
         );
         assert_eq!(rows.len(), 2, "one row per window: {rows:?}");
 
@@ -1696,8 +1741,7 @@ mod tests {
                             resets_at: None,
                         }],
                         notes: Vec::new(),
-                        reset_credits: None,
-                        reset_identity: None,
+                        reset_offer: None,
                     }),
                 },
                 ProviderUsageStatus {
@@ -1707,6 +1751,7 @@ mod tests {
                 },
             ],
             &test_styles(),
+            Method::Unicode,
         );
         assert_eq!(rows[0][0].text, "anthropic");
         assert_eq!(rows[1][0].text, "   openai");
