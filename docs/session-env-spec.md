@@ -101,9 +101,9 @@ mutation route, and placing env there would either open the mutation
 surface v1 excludes or force refusal logic into the settings path.
 Top-level placement makes create-only true by construction. A
 settings request that carries an `env` key anyway is an unknown field
-to every host and is ignored under 6.10 like any other, the standing
-unknown-field posture rather than a new hole, and no built-in client
-offers such a surface.
+to the destination host. A protocol 2 host refuses it under 6.10 before
+settings mutation; built-in clients send no command to a protocol 1
+host and offer no such settings surface.
 
 `BTreeMap` for deterministic serialization. The host applies the map
 in full or refuses the create (section 1 validation), never a partial
@@ -111,19 +111,20 @@ apply.
 
 ### 2.2 The answer says what happened
 
-Servers ignore unknown request fields (spec 6.10), so a host that
-predates this feature mints the session *without* env and cannot say
-so. An identity that fails silently is the exact harm this feature
-exists to end, so the create's answer must carry the fact.
+Protocol 2 effect owners refuse unknown request fields before effects
+(spec 6.10). The connection's exact protocol check excludes a protocol
+1 host, while a protocol 2 host that predates this field refuses the
+create instead of minting a session without env. The create's answer
+still carries the applied fact: it is the positive result contract and
+makes the session identity legible to its creator.
 
 `SessionCreated` gains:
 
 ```rust
 /// The env keys the create applied, present exactly when the request
 /// stated an env map (an empty stated map echoes as an empty list).
-/// Absent when the request stated none, and absent from hosts that
-/// predate session env, which is what lets a creator distinguish
-/// "applied" from "silently dropped by an old host".
+/// Absent when the request stated none. A successful answer without
+/// this field after env was stated violates the protocol.
 #[serde(default, skip_serializing_if = "Option::is_none")]
 pub env_keys: Option<Vec<String>>,
 ```
@@ -136,22 +137,25 @@ The decode table for a creator that stated env:
 
 | Answer | Meaning |
 | --- | --- |
-| 200, `env_keys` present | The host applied the map (all of it). |
-| 200, `env_keys` absent | The host predates session env. The session exists without identity. |
-| 400 naming a key | A knowing host refused an invalid map. Nothing was minted. |
+| 200, `env_keys` exactly matches the stated keys | The host applied the map (all of it). |
+| 200, `env_keys` absent or not an exact match | Protocol violation. The session exists, but the creator cannot claim env was applied. |
+| 400 `invalid_request` | The destination host refused the create before minting, whether because it predates the field or the map is invalid. |
 
-Client rule (strictness across version skew, extending spec section
-8's stated-axes-are-strict posture to the one case the host cannot
-enforce): a built-in client that stated env and receives an answer
-without `env_keys` reports it loudly. The TUI renders a prominent
-notice naming the host as predating session env. Unattended callers
-(the workshop's wake script) treat it as failure and name the minted,
-identityless session they are abandoning. A minted session is never
-deleted to make the error tidier, per the existing create contract.
+Client rule: a built-in client that stated env and receives a
+successful answer without the exact `env_keys` reports a protocol
+violation loudly. The TUI renders a prominent notice that the host did
+not confirm session env. Unattended callers (the workshop's wake
+script) treat it as failure and name the session whose identity they
+cannot verify. A minted session is never deleted to make the error
+tidier, per the existing create contract.
 
-This is attempt-and-read, the doctrinal fallback: no pre-gating, no
-hello round-trip in the create path, and it works identically through
-gateways, where the client only ever sees the gateway's hello.
+This is still attempt-and-read within protocol 2: there is no
+`session_env` capability pre-gate or extra hello round-trip in the
+create path. The connection's existing version check supplies the
+protocol 1 boundary, and the receiver's strict command decoder supplies
+the within-generation boundary. It works identically through gateways,
+where the client sees the gateway's hello and the destination host owns
+create validation.
 
 ### 2.3 Capability string
 
@@ -159,7 +163,8 @@ Hosts advertise `session_env` in `GET /v1/hello` capabilities,
 extending the 6.10 registry (new surface past the baseline). Gateways
 do not advertise it, a gateway cannot answer for its hosts (6.10). It
 is self-description, never a gate, and aj's own client code does not
-consult it: the `env_keys` echo is the normative signal. It exists so
+consult it: the request refusal or `env_keys` echo is the normative
+result. It exists so
 operator tooling can ask "is this bench binary new enough" without
 minting a session, which the workshop's cutover check wants.
 
@@ -170,9 +175,10 @@ as a `RawObject`, reading `host` and carrying every other field
 unread upstream, and namespaces only `id` on the way back (spec 6.10,
 `gateway/server.rs::create_session`). `env` rides through raw, and
 `env_keys` rides back inside the answer the gateway does not decode.
-This holds for older gateways by the same contract. The work is one
-pinning test: a create with env through the gateway reaches the host
-with the map intact and the echo intact on the way back.
+This holds for protocol 2 gateways that predate the feature by the same
+contract; a protocol 1 gateway is excluded by the version check. The
+work is one pinning test: a create with env through the gateway reaches
+the host with the map intact and the echo intact on the way back.
 
 ### 2.5 Spec doc amendments
 
@@ -347,12 +353,14 @@ same on either side of a subcommand and reaches `connect`):
   and leaves the file unchanged. Its general rule still treats an
   unknown final entry as a torn tail and truncates it, but the v1 writer
   does not expose `EnvChange` in that position.
-- New client, old host: section 2.2. The echo's absence is the
-  signal, the client is loud, nothing pre-gates.
-- Old client, new host: never states env, never sees `env_keys`
-  (skip-serialized), and ignores it if it ever did (6.10).
-- Old gateway between new ends: raw pass-through both directions
-  (section 2.4).
+- New client, protocol 1 host or gateway: the exact hello check refuses
+  the connection before create. New client, older protocol 2 host: its
+  strict decoder refuses the unknown env field before minting (section
+  2.2).
+- Older protocol 2 client, new host: never states env, never sees
+  `env_keys` (skip-serialized), and ignores it if it ever did (6.10).
+- Older protocol 2 gateway between new ends: raw pass-through both
+  directions (section 2.4). A protocol 1 gateway is incompatible.
 
 ## 8. Testing
 
@@ -361,11 +369,14 @@ test that goes red when the wiring line is deleted, not only when a
 helper-built component is driven directly.
 
 - **Wire**: round-trip of `env` on the create request and `env_keys`
-  on the answer, plus the forward-compat fixture (env-bearing create
-  decoded by the old shape ignores it, answer without `env_keys`
-  decodes as `None`).
+  on the answer. The strict request codec accepts env as a known field
+  and refuses an unknown neighbor; the additive answer codec ignores
+  unknown fields and decodes an absent `env_keys` as `None`, which the
+  creating client treats like any non-exact echo: a protocol violation
+  when it stated env.
 - **Gateway**: an env-bearing create through the real gateway route
-  reaches the host body-intact and the echo returns intact.
+  reaches the host with its env map and every non-routing field
+  structurally intact, and the echo returns intact.
   Assert at the upstream-body boundary, not only on the client's
   view.
 - **Host**: create with env, drive the real agent, the bash tool
@@ -412,9 +423,9 @@ helper-built component is driven directly.
 - **Export/replay**: export artifact contains the keys and the
   redaction marker and not the values (assert on the decoded
   embedded entries). Seed entry projects no replay notice.
-- **Client echo check**: against a scripted answer lacking
-  `env_keys`, the connect path surfaces the predates-session-env
-  notice.
+- **Client echo check**: scripted successful answers with absent and
+  non-exact `env_keys` make the connect path surface a protocol
+  violation and name the minted session.
 
 ## 9. Acceptance (end to end)
 
