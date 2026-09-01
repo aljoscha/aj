@@ -292,13 +292,17 @@ async fn create_session(
     namespace_created(answer, &target)
 }
 
-/// Namespace the session id a host just minted (spec 6.2, 6.6).
+/// Namespace session ids in a host's create answer (spec 6.2, 6.6).
 ///
-/// Only a create that happened names a session. Anything else is the host's own
-/// answer travelling back untouched, code and all: a refused create minted
-/// nothing, and there is no id to rewrite.
-fn namespace_created(answer: Answer, target: &HostTarget) -> Result<Response, ApiError> {
+/// A successful create names the session it minted in `id`. A refusal can
+/// independently refer to a session in its top-level `session` field, which is
+/// translated like every other host-authored error while its other fields stay
+/// raw.
+fn namespace_created(mut answer: Answer, target: &HostTarget) -> Result<Response, ApiError> {
     if !answer.status.is_success() {
+        if let Some(body) = namespaced_error(&answer.body, &target.host_id) {
+            answer.body = body;
+        }
         return Ok(answer.into_response());
     }
     let unreadable = |reason: String| ApiError {
@@ -1034,8 +1038,9 @@ mod tests {
         );
     }
 
-    /// The id a host minted is namespaced on the way out, and anything that is
-    /// not a created session travels back as the host wrote it (spec 6.6).
+    /// The id a host minted is namespaced on the way out. A refusal keeps its
+    /// host-authored fields, with any top-level session id translated into the
+    /// gateway's vocabulary (spec 6.6).
     #[tokio::test]
     async fn a_created_answer_is_namespaced_and_a_refusal_is_forwarded() {
         let target = HostTarget {
