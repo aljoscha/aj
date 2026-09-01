@@ -282,11 +282,27 @@ impl LiveSender {
                 return Offered::Dropped;
             }
         } else if state.frames.len() >= self.0.capacity.get() {
-            state.frames.clear();
+            // Cancellation is the hard-eviction signal and Attachment checks it
+            // before reading this queue. Once a terminal frame is queued, using
+            // that signal would let EOF overtake the actionable reason for the
+            // close. Keep the complete accepted queue and close it gracefully
+            // instead. The receiver drains that bounded FIFO before EOF, while
+            // ordinary reliable overflow remains an immediate eviction.
+            let terminal_sessions = state.terminal_sessions.clone();
+            let terminal_pending = state.frames.iter().any(|queued| {
+                queued
+                    .session()
+                    .is_some_and(|session| terminal_sessions.contains(session))
+            });
+            if !terminal_pending {
+                state.frames.clear();
+            }
             state.closed = true;
             drop(state);
             self.0.block_stop.cancel();
-            self.0.cancelled.cancel();
+            if !terminal_pending {
+                self.0.cancelled.cancel();
+            }
             self.0.ready.notify_waiters();
             return Offered::Evicted;
         }
@@ -420,6 +436,11 @@ impl SessionStreams {
         self.close_all();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn accepted_for_test(&self) -> bool {
+        !self.recipients.is_empty()
+    }
+
     fn close_all(&mut self) {
         if !self.completed {
             self.fanout
@@ -522,7 +543,7 @@ impl Fanout {
     /// a bound this client never asked to spend and could evict it over traffic
     /// it never asked for.
     pub(crate) fn detach(&self, id: SubscriberId, session: &str) {
-        let stopped = if let Some(subscriber) = self.lock().subscribers.get_mut(&id) {
+        let (stopped, close) = if let Some(subscriber) = self.lock().subscribers.get_mut(&id) {
             let stopped = subscriber
                 .attached
                 .remove(session)
@@ -534,12 +555,22 @@ impl Fanout {
             subscriber
                 .live
                 .retain(|frame| frame.session() != Some(session));
-            stopped
+            let close = subscriber
+                .attached
+                .is_empty()
+                .then(|| subscriber.live.clone());
+            (stopped, close)
         } else {
-            None
+            (None, None)
         };
         if let Some(stopped) = stopped {
             stopped.cancel();
+        }
+        if let Some(close) = close {
+            // Refusal frames still travel on the attach block. Closing only the
+            // live tail lets those drain first, followed by any queued terminal
+            // reason and then EOF.
+            close.close_after_block();
         }
     }
 
@@ -560,7 +591,10 @@ impl Fanout {
         let Some(subscriber) = state.subscribers.get_mut(&id) else {
             return None;
         };
-        if is_draining() {
+        // `stop_blocks` takes this same fanout lock before cancelling the root,
+        // so this check orders a bind against host-wide stream shutdown. A root
+        // stopped first can never acquire a new per-session block promise.
+        if subscriber.live.0.block_stop.is_cancelled() || is_draining() {
             return None;
         }
         let attached = subscriber.attached.get_mut(session)?;
@@ -765,6 +799,27 @@ impl Fanout {
 
     pub(crate) fn list_dirty(&self) -> &Notify {
         &self.list_dirty
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn stream_state_for_test(&self) -> Vec<(usize, bool, usize)> {
+        self.lock()
+            .subscribers
+            .values()
+            .map(|subscriber| {
+                let queue = subscriber
+                    .live
+                    .0
+                    .state
+                    .lock()
+                    .expect("live queue mutex poisoned");
+                (
+                    queue.frames.len(),
+                    queue.closed,
+                    queue.terminal_sessions.len(),
+                )
+            })
+            .collect()
     }
 
     fn lock(&self) -> MutexGuard<'_, FanoutState> {
@@ -1151,6 +1206,75 @@ mod tests {
         assert!(
             rx.recv().await.is_none(),
             "terminal queue closes after its frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_healthy_siblings_reliable_frame_cannot_erase_a_terminal_error() {
+        let fanout = Arc::new(Fanout::new(NonZeroUsize::new(1)));
+        let (id, live, cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        let stopped = live.block_stop_token();
+        finish(&fanout, id, SESSION, 0);
+        finish(&fanout, id, OTHER, 0);
+        let (mut attachment, block) = Attachment::new(
+            id,
+            live,
+            cancelled.clone(),
+            vec![SESSION.to_string(), OTHER.to_string()],
+            Arc::clone(&fanout),
+        );
+        drop(block);
+        fanout.publish(other(reliable("healthy already queued")));
+
+        let streams = fanout.publish_terminal(reliable("storage failed"), MATERIALIZATION);
+        fanout.publish(other(reliable("healthy after the failure")));
+
+        assert!(
+            !cancelled.is_cancelled(),
+            "healthy sibling traffic evicted the shared stream and erased its terminal error",
+        );
+        assert!(
+            stopped.is_cancelled(),
+            "graceful eviction left block work live"
+        );
+        assert!(
+            !fanout.attached(OTHER),
+            "overflow left the evicted subscriber registered",
+        );
+        let first = attachment.recv().await.expect("accepted healthy frame");
+        let second = attachment.recv().await.expect("terminal storage frame");
+        assert!(
+            matches!(first, Frame::Event { ref event, .. } if matches!(event.known(), Some(AgentEvent::Warning { text, .. }) if text == "healthy already queued")),
+            "the accepted healthy prefix changed: {first:?}",
+        );
+        assert!(
+            matches!(second, Frame::Event { ref event, .. } if matches!(event.known(), Some(AgentEvent::Warning { text, .. }) if text == "storage failed")),
+            "the terminal frame did not follow the accepted prefix: {second:?}",
+        );
+        assert!(
+            attachment.recv().await.is_none(),
+            "the retained terminal tail must end in EOF",
+        );
+        streams.close();
+    }
+
+    #[tokio::test]
+    async fn a_terminal_tail_closes_when_its_last_unresolved_sibling_detaches() {
+        let fanout = Arc::new(Fanout::default());
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        finish(&fanout, id, SESSION, 0);
+
+        fanout
+            .publish_terminal(reliable("storage failed"), MATERIALIZATION)
+            .close();
+        fanout.detach(id, OTHER);
+
+        assert_eq!(drained(&mut rx), vec!["warning storage failed"]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .expect("the terminal tail reaches EOF")
+                .is_none(),
         );
     }
 

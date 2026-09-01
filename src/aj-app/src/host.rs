@@ -39,6 +39,7 @@ mod store;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -562,23 +563,38 @@ pub(crate) struct HostShared {
     pub(crate) persistence: ConversationPersistence,
 }
 
-/// The session map, held.
-type SessionMap<'a> = tokio::sync::MutexGuard<'a, HashMap<String, LiveEntry>>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PublicationState {
-    /// A create whose prompt publication and tag attempt have not completed.
-    /// The host owns it for shutdown, but no directory or direct lookup may
-    /// disclose it. A tag-only create uses the same state briefly so its first
-    /// published row cannot precede its tag attempt.
-    PendingCreate,
-    Published,
+/// Live materializations and private create reservations under one lock.
+///
+/// Publication privacy belongs to the create transaction, not to the lifetime
+/// of its live owner. Keeping the axes beside each other under this lock lets a
+/// failed owner be removed normally while the id remains undiscoverable until
+/// its creator completes the publication decision.
+#[derive(Default)]
+struct SessionRegistry {
+    live: HashMap<String, LiveEntry>,
+    pending_creates: HashSet<String>,
 }
+
+impl Deref for SessionRegistry {
+    type Target = HashMap<String, LiveEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.live
+    }
+}
+
+impl DerefMut for SessionRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.live
+    }
+}
+
+/// The session registry, held.
+type SessionMap<'a> = tokio::sync::MutexGuard<'a, SessionRegistry>;
 
 /// One live session plus the task driving it.
 struct LiveEntry {
     session: Arc<LiveSession>,
-    publication: PublicationState,
     /// Awaited whenever the session is torn down, at shutdown or on release.
     /// This outer owner retains the session's advisory lock through detached
     /// task reaping and persistence fencing, so joining it is what releases the
@@ -653,8 +669,28 @@ pub struct FirstPublicationGate {
     release: Arc<tokio::sync::Notify>,
 }
 
+/// Pause one stream after a named session resolves but before its generation is
+/// bound to the registered subscriber.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Default)]
+pub struct AttachBindGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 #[cfg(any(test, feature = "test-support"))]
 impl FirstPublicationGate {
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl AttachBindGate {
     pub async fn entered(&self) {
         self.entered.notified().await;
     }
@@ -684,7 +720,7 @@ struct HostInner {
     /// What this host calls itself on the wire: `--name`, else the working
     /// directory's abbreviation, else nothing.
     name: Option<String>,
-    sessions: TokioMutex<HashMap<String, LiveEntry>>,
+    sessions: TokioMutex<SessionRegistry>,
     /// Complete stop controls for every session, independently of the async
     /// session-map lock. Shutdown can cancel detached work and abort drivers
     /// even when a release is holding that map.
@@ -693,6 +729,8 @@ struct HostInner {
     persistence_cleanup_gate: StdMutex<Option<PersistenceCleanupGate>>,
     #[cfg(any(test, feature = "test-support"))]
     first_publication_gate: StdMutex<Option<FirstPublicationGate>>,
+    #[cfg(any(test, feature = "test-support"))]
+    attach_bind_gate: StdMutex<Option<(String, AttachBindGate)>>,
     #[cfg(any(test, feature = "test-support"))]
     next_initial_fault: StdMutex<Option<aj_session::AppendFaultFixture>>,
     /// Wall clock and monotonic clock read at the same moment, for
@@ -790,12 +828,14 @@ impl SessionHost {
             host_id,
             working_directory,
             name,
-            sessions: TokioMutex::new(HashMap::new()),
+            sessions: TokioMutex::new(SessionRegistry::default()),
             session_stops: StdMutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
             persistence_cleanup_gate: StdMutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             first_publication_gate: StdMutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            attach_bind_gate: StdMutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             next_initial_fault: StdMutex::new(None),
             clock_anchor: (Utc::now(), Instant::now()),
@@ -926,19 +966,13 @@ impl SessionHost {
         let private = prompt.is_some() || tag.is_some();
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
-            .materialize(
-                &mut sessions,
-                None,
-                Some(run_config),
-                session_env,
-                if private {
-                    PublicationState::PendingCreate
-                } else {
-                    PublicationState::Published
-                },
-            )
+            .materialize(&mut sessions, None, Some(run_config), session_env)
             .await?;
         let session = live.id().to_string();
+        if private {
+            let inserted = sessions.pending_creates.insert(session.clone());
+            debug_assert!(inserted, "a newly minted id has no publication owner");
+        }
         let first_log = Arc::clone(&live.core.log);
         let publication = prompt.map(|content| {
             let (reply, outcome) = oneshot::channel();
@@ -956,11 +990,13 @@ impl SessionHost {
                 None
             };
             if private {
-                let entry = sessions
-                    .get_mut(&session)
-                    .expect("the tag-only create remains under the held map");
-                debug_assert!(Arc::ptr_eq(&entry.session, &live));
-                entry.publication = PublicationState::Published;
+                debug_assert!(
+                    sessions
+                        .get(&session)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.session, &live))
+                );
+                let removed = sessions.pending_creates.remove(&session);
+                debug_assert!(removed, "the tag-only create owns its reservation");
             }
             drop(sessions);
             if private {
@@ -1022,22 +1058,42 @@ impl SessionHost {
     /// and tag attempt have completed.
     async fn publish_pending_create(&self, session: &str, live: &Arc<LiveSession>) {
         let mut sessions = self.inner.sessions.lock().await;
-        let exact_pending = sessions.get(session).is_some_and(|entry| {
-            Arc::ptr_eq(&entry.session, live)
-                && entry.publication == PublicationState::PendingCreate
-        });
+        if !sessions.pending_creates.contains(session) {
+            return;
+        }
         // A later append can fail after the first user message published but
         // before the creator applies its tag. Persistence teardown may already
-        // have moved that durable session to the cold directory or let another
-        // client rematerialize it. Either owner names the same recoverable log,
-        // so a mismatch still discloses the id rather than creating a duplicate.
-        if exact_pending {
-            let entry = sessions
-                .get_mut(session)
-                .expect("the exact pending create was checked under the map");
-            entry.publication = PublicationState::Published;
+        // have retired its live owner. If teardown has begun but has not yet
+        // removed it, finish that ordinary cleanup here while the reservation
+        // still hides both live and cold views. The reservation is removed last.
+        let retiring = sessions.get(session).is_some_and(|entry| {
+            Arc::ptr_eq(&entry.session, live)
+                && (entry.session.is_draining() || entry.driver.is_finished())
+        });
+        let retired = retiring.then(|| sessions.remove(session)).flatten();
+        if retired.is_some() {
+            self.inner
+                .session_stops
+                .lock()
+                .expect("session stops mutex poisoned")
+                .remove(session);
         }
+        if let Some(retired) = retired {
+            let _ = retired.driver.await;
+        }
+        let cold = sessions.get(session).is_none();
+        let removed = sessions.pending_creates.remove(session);
+        debug_assert!(removed, "the creator owns its publication reservation");
         drop(sessions);
+        if cold
+            && !self.inner.shut_down.load(Ordering::Acquire)
+            && let Err(err) = self.enumerate().await
+        {
+            tracing::warn!(
+                session,
+                "could not reveal the durable created session: {err}"
+            );
+        }
         self.inner.shared.fanout.mark_list_dirty();
     }
 
@@ -1050,22 +1106,25 @@ impl SessionHost {
     async fn discard_pending_create(&self, session: &str, live: &Arc<LiveSession>) {
         live.request_shutdown();
         let mut sessions = self.inner.sessions.lock().await;
-        let ours = sessions.get(session).is_some_and(|entry| {
-            entry.publication == PublicationState::PendingCreate
-                && Arc::ptr_eq(&entry.session, live)
-        });
-        if !ours {
+        if !sessions.pending_creates.contains(session) {
             return;
         }
-        let entry = sessions
-            .remove(session)
-            .expect("the pending create identity was checked under the map");
-        let _ = entry.driver.await;
-        self.inner
-            .session_stops
-            .lock()
-            .expect("session stops mutex poisoned")
-            .remove(session);
+        let ours = sessions
+            .get(session)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.session, live));
+        if ours {
+            let entry = sessions
+                .remove(session)
+                .expect("the pending create identity was checked under the map");
+            let _ = entry.driver.await;
+            self.inner
+                .session_stops
+                .lock()
+                .expect("session stops mutex poisoned")
+                .remove(session);
+        }
+        let removed = sessions.pending_creates.remove(session);
+        debug_assert!(removed, "discard clears its publication reservation last");
     }
 
     /// Mint a session with `settings` resolved against this host's catalog
@@ -1082,13 +1141,7 @@ impl SessionHost {
         let run_config = self.resolve_creator_settings(settings)?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
-            .materialize(
-                &mut sessions,
-                None,
-                Some(run_config),
-                session_env,
-                PublicationState::Published,
-            )
+            .materialize(&mut sessions, None, Some(run_config), session_env)
             .await?;
         Ok(live.id().to_string())
     }
@@ -1181,6 +1234,22 @@ impl SessionHost {
             let resolved = loop {
                 match self.live(&request.session).await {
                     Ok(session) => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        let bind_gate = {
+                            let mut gate = self
+                                .inner
+                                .attach_bind_gate
+                                .lock()
+                                .expect("attach bind gate mutex poisoned");
+                            gate.as_ref()
+                                .is_some_and(|(target, _)| target == &request.session)
+                                .then(|| gate.take().expect("the matching bind gate exists").1)
+                        };
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(gate) = bind_gate {
+                            gate.entered.notify_one();
+                            gate.release.notified().await;
+                        }
                         if let Some(block) = self.inner.shared.fanout.bind_if_live(
                             id,
                             &request.session,
@@ -1189,8 +1258,9 @@ impl SessionHost {
                         ) {
                             break Ok((session, block));
                         }
-                        if cancelled.is_cancelled() {
-                            break Err(HostError::Conflict {
+                        if cancelled.is_cancelled() || stopped.is_cancelled() {
+                            self.inner.shared.fanout.deregister(id);
+                            return Err(HostError::Conflict {
                                 reason: "the attach stream closed during materialization"
                                     .to_string(),
                             });
@@ -1320,14 +1390,10 @@ impl SessionHost {
         // cold cache is a leaf, so nesting its lock under the map cannot invert
         // an order.
         let sessions = self.inner.sessions.lock().await;
-        let private: HashSet<String> = sessions
-            .iter()
-            .filter(|(_, entry)| entry.publication == PublicationState::PendingCreate)
-            .map(|(id, _)| id.clone())
-            .collect();
+        let private = sessions.pending_creates.clone();
         let live: Vec<Arc<LiveSession>> = sessions
             .values()
-            .filter(|entry| entry.publication == PublicationState::Published)
+            .filter(|entry| !private.contains(entry.session.id()))
             .map(|entry| Arc::clone(&entry.session))
             .collect();
         let cold = self.inner.cold.rows();
@@ -1439,6 +1505,59 @@ impl SessionHost {
         gate
     }
 
+    /// Pause one attach immediately before it binds `session` to its stream.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pause_attach_bind_for_test(&self, session: &str) -> AttachBindGate {
+        let gate = AttachBindGate::default();
+        *self
+            .inner
+            .attach_bind_gate
+            .lock()
+            .expect("attach bind gate mutex poisoned") = Some((session.to_string(), gate.clone()));
+        gate
+    }
+
+    /// Publish a frame through the real host fanout.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn publish_frame_for_test(&self, frame: Frame) {
+        self.inner.shared.fanout.publish(frame);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stream_state_for_test(&self) -> Vec<(usize, bool, usize)> {
+        self.inner.shared.fanout.stream_state_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stop_attach_blocks_for_test(&self) {
+        self.inner.shared.fanout.stop_blocks();
+    }
+
+    /// Publish and complete one live generation's terminal frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn publish_terminal_for_test(&self, frame: Frame) -> bool {
+        let session = frame
+            .session()
+            .expect("terminal test frame names a session");
+        let materialization = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(session)
+            .expect("terminal test session is live")
+            .session
+            .materialization();
+        let streams = self
+            .inner
+            .shared
+            .fanout
+            .publish_terminal(frame, materialization);
+        let accepted = streams.accepted_for_test();
+        streams.close();
+        accepted
+    }
+
     /// Fault the staging writer of the next created session before any prompt
     /// can reach its provider.
     #[cfg(any(test, feature = "test-support"))]
@@ -1472,16 +1591,39 @@ impl SessionHost {
         self.directory().await
     }
 
-    /// The one private create currently in the map, for visibility-race tests.
+    /// The one live private create currently in the map, for visibility-race
+    /// tests. A reservation whose failed owner has been removed is deliberately
+    /// not returned.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn pending_create_id_for_test(&self) -> Option<String> {
+        let sessions = self.inner.sessions.lock().await;
+        sessions
+            .pending_creates
+            .iter()
+            .find(|id| sessions.contains_key(*id))
+            .cloned()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn pending_create_log_for_test(&self) -> Option<Arc<TokioMutex<ConversationLog>>> {
+        let sessions = self.inner.sessions.lock().await;
+        sessions.pending_creates.iter().find_map(|id| {
+            sessions
+                .get(id)
+                .map(|entry| Arc::clone(&entry.session.core.log))
+        })
+    }
+
+    /// Whether the creator still owns the id's publication decision even after
+    /// its live generation has ended.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn pending_create_reserved_for_test(&self, session: &str) -> bool {
         self.inner
             .sessions
             .lock()
             .await
-            .iter()
-            .find(|(_, entry)| entry.publication == PublicationState::PendingCreate)
-            .map(|(id, _)| id.clone())
+            .pending_creates
+            .contains(session)
     }
 
     /// Populate the cold cache without excluding live ids. This stages the
@@ -1878,7 +2020,6 @@ impl SessionHost {
                 session,
                 driver,
                 stop,
-                publication: _,
             } = entry;
             let id = session.id().to_string();
             pending_reapers.insert(id.clone());
@@ -1976,7 +2117,7 @@ impl SessionHost {
         let Some(entry) = sessions.get(session) else {
             return false;
         };
-        if entry.publication == PublicationState::PendingCreate {
+        if sessions.pending_creates.contains(session) {
             return false;
         }
         let (reply, outcome) = oneshot::channel();
@@ -2069,13 +2210,7 @@ impl SessionHost {
         validate_session_id(session)?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
-            .materialize(
-                &mut sessions,
-                Some(session),
-                None,
-                None,
-                PublicationState::Published,
-            )
+            .materialize(&mut sessions, Some(session), None, None)
             .await?;
         Ok((sessions, live))
     }
@@ -2090,12 +2225,14 @@ impl SessionHost {
     async fn live_or_cold(&self, session: &str) -> Result<Option<Arc<LiveSession>>, HostError> {
         self.alive()?;
         validate_session_id(session)?;
-        if let Some(entry) = self.inner.sessions.lock().await.get(session) {
-            if entry.publication == PublicationState::PendingCreate {
-                return Err(HostError::UnknownSession(session.to_string()));
-            }
+        let sessions = self.inner.sessions.lock().await;
+        if sessions.pending_creates.contains(session) {
+            return Err(HostError::UnknownSession(session.to_string()));
+        }
+        if let Some(entry) = sessions.get(session) {
             return Ok(Some(Arc::clone(&entry.session)));
         }
+        drop(sessions);
         if !self.on_disk(session)? {
             return Err(HostError::UnknownSession(session.to_string()));
         }
@@ -2234,17 +2371,16 @@ impl SessionHost {
     /// must not both build a core and fight over its lock.
     async fn materialize(
         &self,
-        sessions: &mut HashMap<String, LiveEntry>,
+        sessions: &mut SessionRegistry,
         id: Option<&str>,
         create_run_config: Option<RunConfigSnapshot>,
         create_session_env: Option<BTreeMap<String, String>>,
-        publication: PublicationState,
     ) -> Result<Arc<LiveSession>, HostError> {
         if let Some(id) = id {
+            if sessions.pending_creates.contains(id) {
+                return Err(HostError::UnknownSession(id.to_string()));
+            }
             if let Some(entry) = sessions.get(id) {
-                if entry.publication == PublicationState::PendingCreate {
-                    return Err(HostError::UnknownSession(id.to_string()));
-                }
                 if !entry.session.is_draining() && !entry.driver.is_finished() {
                     return Ok(Arc::clone(&entry.session));
                 }
@@ -2482,6 +2618,9 @@ impl SessionHost {
                         let ours = sessions
                             .get(&owner_session)
                             .is_some_and(|entry| Arc::ptr_eq(&entry.session, &owner_live));
+                        // Publication reservations are independent of live
+                        // ownership. Removing this failed generation leaves a
+                        // pending create private until its creator finishes.
                         let removed = ours.then(|| sessions.remove(&owner_session)).flatten();
                         if removed.is_some() {
                             // Nested under the session map just like
@@ -2523,7 +2662,6 @@ impl SessionHost {
                 session: Arc::clone(&session),
                 driver: handle,
                 stop,
-                publication,
             },
         );
         // Here rather than at the callers: a session goes live through

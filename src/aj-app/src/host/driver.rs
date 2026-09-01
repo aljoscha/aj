@@ -154,6 +154,7 @@ impl Driver {
                         self.session.start_draining();
                         let failure = self.wind_down().await;
                         if let Some(failure) = failure {
+                            self.refuse_pending_for_persistence(&failure);
                             let streams = self.publish_persistence_failure(&failure);
                             return DriverExit::PersistenceFailed(streams);
                         }
@@ -243,6 +244,7 @@ impl Driver {
                             let failure = self.wind_down().await;
                             let _ = reply.send(ReleaseOutcome::Released { row });
                             if let Some(failure) = failure {
+                                self.refuse_pending_for_persistence(&failure);
                                 let streams = self.publish_persistence_failure(&failure);
                                 return DriverExit::PersistenceFailed(streams);
                             }
@@ -282,10 +284,23 @@ impl Driver {
     async fn stop_for_persistence(&mut self, failure: PersistenceFailure) -> SessionStreams {
         self.session.start_draining();
         self.stopping_for_persistence = true;
+        self.refuse_pending_for_persistence(&failure);
         self.finish_first_publication(Err(persistence_host_error(&failure)));
         let streams = self.publish_persistence_failure(&failure);
         let _ = self.wind_down().await;
         streams
+    }
+
+    /// Seal the request admission boundary and answer everything already owned
+    /// by this driver with the terminal storage verdict.
+    fn refuse_pending_for_persistence(&mut self, failure: &PersistenceFailure) {
+        // Closing prevents later sends while preserving every request whose
+        // send already succeeded. A synchronous send either precedes this close
+        // and is drained here or fails without transferring request ownership.
+        self.requests.close();
+        while let Ok(request) = self.requests.try_recv() {
+            refuse_for_persistence(request, failure);
+        }
     }
 
     fn publish_persistence_failure(&self, failure: &PersistenceFailure) -> SessionStreams {
@@ -1409,6 +1424,22 @@ impl Driver {
             tag,
             archived,
         })
+    }
+}
+
+/// Answer one request admitted before a conversation-log persistence cutoff.
+fn refuse_for_persistence(request: Request, failure: &PersistenceFailure) {
+    match request {
+        Request::Command { reply, .. } => {
+            let _ = reply.send(Err(persistence_host_error(failure)));
+        }
+        Request::FirstPrompt { reply, .. } => {
+            let _ = reply.send(Err(persistence_host_error(failure)));
+        }
+        Request::Release { reply } => {
+            let _ = reply.send(ReleaseOutcome::Declined);
+        }
+        Request::Shutdown => {}
     }
 }
 

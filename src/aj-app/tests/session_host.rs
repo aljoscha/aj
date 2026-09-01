@@ -994,6 +994,242 @@ async fn first_publication_wait_releases_the_global_session_map() {
 }
 
 #[tokio::test]
+async fn later_persistence_cleanup_cannot_publish_a_still_pending_create() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message("created")],
+        1,
+        Duration::from_millis(20),
+    ));
+    let publication = harness.host.pause_next_first_publication();
+    let cleanup = harness.host.pause_next_persistence_cleanup();
+    let host = harness.host.clone();
+    let creating = tokio::spawn(async move {
+        host.create_with(
+            None,
+            Some(vec![UserContent::text("first message")]),
+            Some("tag-after-publication".to_string()),
+            None,
+        )
+        .await
+    });
+    bounded(
+        "the private create to release the map",
+        publication.entered(),
+    )
+    .await;
+    let pending = harness
+        .host
+        .pending_create_id_for_test()
+        .await
+        .expect("the create remains private before its tag attempt and response");
+    let canonical = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{pending}.jsonl"));
+    bounded("the requested first message to become canonical", async {
+        while !canonical.is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    fault
+        .install(
+            &mut *harness
+                .host
+                .pending_create_log_for_test()
+                .await
+                .expect("pending create log")
+                .lock()
+                .await,
+        )
+        .expect("fail the later assistant append");
+    bounded(
+        "later persistence failure to reach cleanup",
+        cleanup.entered(),
+    )
+    .await;
+    cleanup.release();
+    bounded("failed generation removal", async {
+        while harness.host.pending_create_id_for_test().await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        harness
+            .host
+            .pending_create_reserved_for_test(&pending)
+            .await,
+        "failed-generation cleanup erased the creator's privacy reservation",
+    );
+    assert!(
+        !harness.host.has_session_stop(&pending),
+        "the failed live generation retained its stop handle",
+    );
+
+    let leaked_before_response = harness
+        .host
+        .sessions()
+        .await
+        .expect("directory remains readable")
+        .sessions
+        .iter()
+        .any(|session| session.id == pending);
+    let published_early = harness
+        .host
+        .published_directory()
+        .await
+        .sessions
+        .iter()
+        .any(|session| session.id == pending);
+    let direct_early = harness.host.local_handles(&pending).await;
+    let read_early = harness.host.tasks(&pending).await;
+    publication.release();
+    let result = bounded("the creator response", creating)
+        .await
+        .expect("create task");
+    assert!(
+        !leaked_before_response,
+        "persistence cleanup published {pending} before the pending create attempted its tag or answered its creator",
+    );
+    assert!(
+        !published_early,
+        "the refresh surface published {pending} before the creator completed",
+    );
+    match direct_early {
+        Err(HostError::UnknownSession(id)) => assert_eq!(id, pending),
+        Err(other) => panic!("private direct lookup returned the wrong refusal: {other:?}"),
+        Ok(_) => panic!("direct lookup addressed the private create before its creator completed"),
+    }
+    match read_early {
+        Err(HostError::UnknownSession(id)) => assert_eq!(id, pending),
+        Err(other) => panic!("private read returned the wrong refusal: {other:?}"),
+        Ok(_) => panic!("non-materializing read addressed the private create before completion"),
+    }
+    let Err(CreateError::Incomplete(partial)) = result else {
+        panic!(
+            "the durable create should disclose its tag failure after the transaction: {result:?}"
+        );
+    };
+    assert_eq!(partial.session, pending);
+    assert!(
+        !harness
+            .host
+            .pending_create_reserved_for_test(&partial.session)
+            .await,
+        "creator completion retained the publication reservation",
+    );
+    let published = harness
+        .host
+        .sessions()
+        .await
+        .expect("the durable created session remains discoverable")
+        .sessions
+        .into_iter()
+        .find(|session| session.id == partial.session)
+        .expect("creator completion publishes the exact durable id");
+    assert!(!published.live, "failed generation remained live");
+    assert_eq!(
+        harness
+            .persistence
+            .read_tag(&partial.session)
+            .expect("read created session tag"),
+        None,
+        "the failed tag attempt left a sidecar",
+    );
+    let rematerialized = harness
+        .host
+        .local_handles(&partial.session)
+        .await
+        .expect("the published cold session rematerializes by the same id");
+    assert_eq!(rematerialized.session_id, partial.session);
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn caller_cancellation_and_shutdown_cannot_strand_a_publication_reservation() {
+    let harness = Harness::new(vec![finalized_text_message("created")]);
+    let publication = harness.host.pause_next_first_publication();
+    let host = harness.host.clone();
+    let caller = tokio::spawn(async move {
+        host.create_with(
+            None,
+            Some(vec![UserContent::text("first message")]),
+            None,
+            None,
+        )
+        .await
+    });
+    bounded(
+        "the host-owned create to release the map",
+        publication.entered(),
+    )
+    .await;
+    let pending = harness
+        .host
+        .pending_create_id_for_test()
+        .await
+        .expect("the create remains private while its caller waits");
+    let canonical = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{pending}.jsonl"));
+    bounded("the requested first message to become canonical", async {
+        while !canonical.is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("the frontend caller is canceled")
+            .is_cancelled(),
+        "the caller ended for an unexpected reason",
+    );
+    bounded(
+        "host shutdown while the create transaction is detached",
+        harness.host.shutdown(),
+    )
+    .await;
+    assert!(
+        harness
+            .host
+            .pending_create_reserved_for_test(&pending)
+            .await,
+        "caller cancellation or shutdown erased the host-owned transaction",
+    );
+    assert!(
+        !harness.host.has_session_stop(&pending),
+        "shutdown left the private generation's stop authority live",
+    );
+
+    publication.release();
+    bounded("the detached creator to settle its reservation", async {
+        while harness
+            .host
+            .pending_create_reserved_for_test(&pending)
+            .await
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    let revived = harness.revive(Vec::new());
+    let resumed = revived
+        .host
+        .local_handles(&pending)
+        .await
+        .expect("the detached transaction left its canonical session recoverable");
+    assert_eq!(resumed.session_id, pending);
+    revived.host.shutdown().await;
+}
+
+#[tokio::test]
 async fn explicit_creation_applies_settings_before_its_first_prompt() {
     let harness = Harness::new(vec![finalized_text_message("created remotely")]);
     let session = harness
@@ -5989,6 +6225,186 @@ async fn direct_head_flush_failure_stops_before_moving_the_head() {
     drop(log);
     assert_eq!(fault.writes(), 1, "one pending line was written");
     assert_eq!(fault.flushes(), 1, "the failing flush ran once");
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_queued_command_at_the_persistence_cutoff_uses_the_terminal_code() {
+    let harness = Harness::new(vec![finalized_text_message("first answer")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "materialize the log").await;
+    let _ = until_idle(&mut client.stream).await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let fault = AppendFaultFixture::new(AppendFault::Flush);
+    let mut log = handles.log.lock().await;
+    let target = log.head().cloned().expect("message head");
+    log.append_model_change(ThreadFilter::USER, "provider", "model")
+        .expect("stage pending state entry");
+    fault
+        .install(&mut *log)
+        .expect("install the direct flush fault");
+
+    let first_host = harness.host.clone();
+    let first_session = session.clone();
+    let failing = tokio::spawn(async move {
+        first_host
+            .command(
+                &first_session,
+                Command::Head {
+                    target: HeadTarget::Entry(target),
+                },
+            )
+            .await
+    });
+    let second_host = harness.host.clone();
+    let second_session = session.clone();
+    let admitted = tokio::spawn(async move {
+        second_host
+            .command(
+                &second_session,
+                Command::Tag {
+                    tag: Some("queued-at-cutoff".to_string()),
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(log);
+
+    let first = bounded("the command that fuses the log", failing)
+        .await
+        .expect("first command task")
+        .expect_err("the flush fails");
+    assert_eq!(first.code(), "persistence_failed");
+    let first_message = first.to_string();
+    let second = bounded("the already-admitted command answer", admitted)
+        .await
+        .expect("second command task")
+        .expect_err("the fused session refuses the queued command");
+    assert_eq!(
+        second.code(),
+        "persistence_failed",
+        "the queued request disagreed with the terminal storage failure: {second:?}",
+    );
+    assert_eq!(
+        second.to_string(),
+        first_message,
+        "commands admitted at one persistence cutoff must receive one actionable verdict",
+    );
+    let terminal = frames_until(
+        &mut client.stream,
+        "the terminal persistence frame",
+        |frame| matches!(frame, Frame::Error { code, .. } if code == "persistence_failed"),
+    )
+    .await;
+    assert!(
+        terminal.iter().any(
+            |frame| matches!(frame, Frame::Error { code, .. } if code == "persistence_failed")
+        ),
+    );
+    let terminal_message = terminal.iter().find_map(|frame| match frame {
+        Frame::Error { message, .. } => Some(message),
+        _ => None,
+    });
+    assert_eq!(
+        terminal_message.map(String::as_str),
+        Some(first_message.as_str())
+    );
+    assert_eq!(
+        harness
+            .persistence
+            .read_tag(&session)
+            .expect("read the unchanged session tag"),
+        None,
+        "the explicitly refused queued tag command still executed",
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn graceful_terminal_eviction_ends_an_attach_retry() {
+    let harness = Harness::with_live_capacity(Vec::new(), 1);
+    let failed = harness.create().await;
+    let healthy = harness.create().await;
+    let gate = harness.host.pause_attach_bind_for_test(&healthy);
+    let host = harness.host.clone();
+    let failed_request = attach_request(&failed);
+    let healthy_request = attach_request(&healthy);
+    let attaching =
+        tokio::spawn(async move { host.attach(&[failed_request, healthy_request]).await });
+    bounded(
+        "the second session to reach generation binding",
+        gate.entered(),
+    )
+    .await;
+
+    let terminal_accepted = harness
+        .host
+        .publish_terminal_for_test(Frame::Error {
+            session: failed.clone(),
+            epoch: None,
+            code: "persistence_failed".to_string(),
+            message: "storage failed".to_string(),
+            lock_generation: None,
+        })
+        .await;
+    assert!(
+        terminal_accepted,
+        "the first session was not bound before the second reached its gate",
+    );
+    assert_eq!(harness.host.stream_state_for_test(), vec![(1, false, 1)]);
+    harness.host.publish_frame_for_test(Frame::Heartbeat);
+    assert!(
+        harness.host.stream_state_for_test().is_empty(),
+        "reliable overflow did not remove the gracefully closed subscriber: {:?}",
+        harness.host.stream_state_for_test(),
+    );
+    gate.release();
+
+    let err = bounded("the gracefully evicted attach to stop retrying", attaching)
+        .await
+        .expect("attach task")
+        .expect_err("stream-wide eviction fails the incomplete attach");
+    assert!(
+        matches!(err, HostError::Conflict { .. }),
+        "stream-wide eviction returned the wrong attach error: {err:?}",
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stream_stopped_before_binding_cannot_return_a_false_successful_attach() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let gate = harness.host.pause_attach_bind_for_test(&session);
+    let host = harness.host.clone();
+    let request = attach_request(&session);
+    let attaching = tokio::spawn(async move { host.attach(&[request]).await });
+    bounded(
+        "the session to resolve before generation binding",
+        gate.entered(),
+    )
+    .await;
+
+    harness.host.stop_attach_blocks_for_test();
+    gate.release();
+
+    let err = bounded(
+        "the stopped stream to refuse its unbound generation",
+        attaching,
+    )
+    .await
+    .expect("attach task")
+    .expect_err("a stopped stream cannot promise an attach block");
+    assert!(
+        matches!(err, HostError::Conflict { .. }),
+        "stopped stream returned the wrong attach error: {err:?}",
+    );
     harness.host.shutdown().await;
 }
 
