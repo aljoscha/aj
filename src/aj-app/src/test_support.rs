@@ -763,9 +763,13 @@ fn canonical_entry(entry: &Entry) -> CanonicalEntry {
 mod tests {
     use super::*;
 
-    use aj_agent::events::AgentEvent;
+    use aj_agent::events::{AgentEvent, CompactionReason};
+    use aj_agent::message::AgentMessage;
     use aj_agent::tool::TaskKind;
+    use aj_agent::types::TokenUsage;
     use aj_models::streaming::AssistantMessageEvent;
+    use aj_models::types::{Message, TextContent, UserContent, UserMessage};
+    use aj_wire::Frame;
 
     use crate::chat::reduce;
 
@@ -869,6 +873,213 @@ mod tests {
         assert_ne!(left, right, "the fixture difference survives the mask");
 
         assert_convergent_eq(&left, &right, "negative control");
+    }
+
+    /// Relative equality cannot reveal a field removed from both sides of the
+    /// projection. Pin reducer-owned axes against one exact live fold so shared
+    /// observer blindness has an absolute detector.
+    #[test]
+    fn the_canonical_form_keeps_known_reducer_values_for_the_swept_axes() {
+        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut lifecycle = AgentLifecycle::default();
+        let mut assistant =
+            AgentMessage::wire(Message::Assistant(finalized_text_message("answer")));
+        assistant.set_id("message-assistant".to_string());
+        {
+            let mut apply = |event| {
+                let _ = reduce(&mut chat, &mut lifecycle, event, None);
+            };
+            apply(AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            });
+            apply(AgentEvent::CompactionStart {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Manual,
+            });
+            apply(AgentEvent::CompactionProgress {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Manual,
+                phase: CompactionPhase::Saving,
+            });
+            apply(AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: assistant,
+            });
+            apply(AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: TokenUsage {
+                    accumulated_input: 0,
+                    turn_input: 1_000,
+                    accumulated_output: 0,
+                    turn_output: 10,
+                    accumulated_cache_write: 0,
+                    turn_cache_write: 50,
+                    accumulated_cache_read: 0,
+                    turn_cache_read: 200,
+                    turn_incomplete: false,
+                    accumulated_incomplete: false,
+                },
+            });
+            apply(AgentEvent::ToolExecutionStart {
+                agent_id: AgentId::Main,
+                call_id: "call-task".to_string(),
+                tool: "bash".to_string(),
+                args: serde_json::json!({"command": "sleep 30"}),
+            });
+            apply(AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "call-task".to_string(),
+                kind: TaskKind::Bash {
+                    command: "sleep 30".to_string(),
+                },
+                label: "sleep 30".to_string(),
+            });
+            let mut partial = finalized_text_message("half");
+            partial.response_id = None;
+            apply(AgentEvent::MessageUpdate {
+                agent_id: AgentId::Main,
+                message: AgentMessage::wire(Message::Assistant(partial.clone())),
+                event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "half".to_string(),
+                    partial,
+                },
+            });
+        }
+
+        let projected = CanonicalState::of_reduced(&chat, &lifecycle);
+        let main = projected.agent(AgentId::Main).expect("main projection");
+        assert_eq!(
+            main.context_usage,
+            ContextUsage {
+                tokens: Some(1_250),
+                context_window: 200_000,
+                incomplete: false,
+            },
+            "the model's context accounting remains observable",
+        );
+        assert_eq!(
+            main.compaction_phase,
+            Some(CompactionPhase::Saving),
+            "the in-flight compaction phase remains observable",
+        );
+        assert_eq!(
+            main.render,
+            CanonicalRender {
+                last_usage_source: Some("message-assistant".to_string()),
+                tool_calls: BTreeSet::from(["call-task".to_string()]),
+                messages: BTreeSet::from(["message-assistant".to_string()]),
+                streaming: true,
+            },
+            "durable and in-flight render identity remains observable",
+        );
+        assert_eq!(
+            projected.tasks,
+            vec![CanonicalTask {
+                id: 1,
+                owner: AgentId::Main,
+                kind: TaskKind::Bash {
+                    command: "sleep 30".to_string(),
+                },
+                label: "sleep 30".to_string(),
+                status: TaskStatus::Running,
+                call_id: "call-task".to_string(),
+                cell: Some(2),
+            }],
+            "the complete task and its output destination remain observable",
+        );
+        assert_eq!(
+            projected.running,
+            vec![AgentId::Main],
+            "the in-flight agent set remains observable",
+        );
+        assert_eq!(
+            projected.compacting,
+            vec![AgentId::Main],
+            "the in-flight compaction set remains observable",
+        );
+    }
+
+    /// Queue snapshots are written by [`SessionClient`], not the reducer. Pin
+    /// the exact payloads after the real client fold so retaining only their
+    /// counts cannot satisfy the observer.
+    #[test]
+    fn the_canonical_form_keeps_exact_client_queue_payloads() {
+        let session = "known-session";
+        let epoch = "known-epoch";
+        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut client = SessionClient::new(session.to_string());
+        client.expect_attach();
+        let _ = client.apply(
+            &mut chat,
+            Frame::State {
+                session: session.to_string(),
+                epoch: epoch.to_string(),
+                working: false,
+                settings: agent_settings(),
+                last_seq: 0,
+            },
+        );
+        let _ = client.apply(
+            &mut chat,
+            Frame::CaughtUp {
+                session: session.to_string(),
+                epoch: epoch.to_string(),
+                last_seq: 0,
+            },
+        );
+        let _ = client.apply(
+            &mut chat,
+            Frame::Event {
+                session: session.to_string(),
+                epoch: epoch.to_string(),
+                durability: None,
+                event: AgentEvent::QueueUpdate {
+                    agent_id: AgentId::Main,
+                    steering: vec![AgentMessage::wire(Message::User(UserMessage {
+                        content: vec![UserContent::Text(TextContent {
+                            text: "steer exactly".to_string(),
+                            text_signature: None,
+                        })],
+                        timestamp: 11,
+                    }))],
+                    follow_up: vec![AgentMessage::wire(Message::User(UserMessage {
+                        content: vec![UserContent::Text(TextContent {
+                            text: "follow exactly".to_string(),
+                            text_signature: None,
+                        })],
+                        timestamp: 22,
+                    }))],
+                }
+                .into(),
+            },
+        );
+
+        let projected = CanonicalState::of(&chat, &client);
+        assert_eq!(
+            projected.queue,
+            vec![CanonicalQueue {
+                agent: AgentId::Main,
+                steering: vec![serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "steer exactly",
+                    }],
+                    "timestamp": 11,
+                })],
+                follow_up: vec![serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "follow exactly",
+                    }],
+                    "timestamp": 22,
+                })],
+            }],
+            "the exact steering and follow-up payloads remain observable",
+        );
     }
 
     /// The property the fault-injection sweep rests on: a client that was
