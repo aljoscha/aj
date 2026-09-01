@@ -4,8 +4,9 @@
 //! For text files: returns a [`ToolOutcome`] with [`ToolDetails::Text`].
 //! The `summary` is the relative display path (with optional `start:end`
 //! line range) and the `body` is the line-numbered content the user
-//! sees. The `content` block sent back to the model preserves the
-//! original line numbers so the LLM can reference them.
+//! sees. The `content` block sent back to the model and the display
+//! body use the same absolute file line numbers so every surface can
+//! reference the source directly.
 //!
 //! Text output is bounded by two simultaneous budgets (line count and
 //! byte count) enforced by `truncate_head`: whichever fires first
@@ -41,7 +42,7 @@ Usage:
 - Relative, absolute, `~/`, `file://`, and `@`-prefixed paths are accepted
 - Supports text files and images (PNG, JPEG, GIF, WebP). Images are returned as
   attachments; the offset/limit parameters do not apply to images.
-- For text files: results include line numbers, starting at 1. Output is capped
+- For text files: results include absolute file line numbers. Output is capped
   at 2000 lines or 50KB (whichever fires first). When the cap is hit, the
   result tells you the next offset to continue from.
 - You can specify an offset and a limit but it's usually better to read the
@@ -198,19 +199,12 @@ impl ToolDefinition for ReadFileTool {
         let start_line_display = start_idx + 1;
         let end_line_display = start_line_display + kept_count.saturating_sub(1);
 
-        // Build the wire- and display-bound bodies from the kept lines.
-        // The wire body preserves absolute line numbers so the model
-        // can reference them; the display body renumbers from 1.
-        let formatted_for_model: Vec<String> = kept
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{:>5}: {}", start_idx + i + 1, line))
-            .collect();
-        let mut model_body = formatted_for_model.join("\n");
-        let mut display_body = format_for_display(kept);
+        // Format the retained slice once with source coordinates. The model and
+        // user then see the same bytes apart from the display body's established
+        // final newline.
+        let mut body = format_numbered_lines(kept, start_line_display);
 
-        // Footers — wire content and display body get the same string,
-        // appended after a blank line for readability.
+        // Append the footer once so it cannot drift between the two projections.
         let footer = if trunc.truncated {
             let next_offset = end_line_display + 1;
             match trunc.truncated_by {
@@ -238,15 +232,11 @@ impl ToolDefinition for ReadFileTool {
         };
 
         if let Some(footer) = footer {
-            model_body.push_str("\n\n");
-            model_body.push_str(&footer);
-            if !display_body.ends_with('\n') {
-                display_body.push('\n');
-            }
-            display_body.push('\n');
-            display_body.push_str(&footer);
-            display_body.push('\n');
+            body.push_str("\n\n");
+            body.push_str(&footer);
         }
+        let mut display_body = body.clone();
+        display_body.push('\n');
 
         // Summary path keeps its existing `start:end` suffix when the
         // model narrowed the slice. The cap doesn't change that;
@@ -257,7 +247,7 @@ impl ToolDefinition for ReadFileTool {
         }
 
         Ok(ToolOutcome {
-            content: vec![UserContent::text(model_body)],
+            content: vec![UserContent::text(body)],
             details: ToolDetails::Text {
                 summary: display_path,
                 body: display_body,
@@ -433,13 +423,23 @@ fn image_omitted_outcome(display_path: String, source_mime: &str) -> ToolOutcome
     }
 }
 
-/// Formats `read_file` results for display to the user by adding line numbers.
+fn format_numbered_lines(lines: &[&str], first_line: usize) -> String {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("{:>5}: {line}", first_line + index))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Formats a slice beginning at source line one with the display body's
+/// established final newline.
 pub fn format_for_display(lines: &[&str]) -> String {
-    let mut result = String::new();
-    for (i, line) in lines.iter().enumerate() {
-        result.push_str(&format!("{:>5}: {}\n", i + 1, line));
+    let mut body = format_numbered_lines(lines, 1);
+    if !body.is_empty() {
+        body.push('\n');
     }
-    result
+    body
 }
 
 #[cfg(test)]
@@ -461,6 +461,18 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn text_body(outcome: &ToolOutcome) -> &str {
+        match &outcome.details {
+            ToolDetails::Text { body, .. } => body,
+            other => panic!("expected Text details, got {other:?}"),
+        }
+    }
+
+    fn assert_display_is_content_plus_newline(outcome: &ToolOutcome) {
+        let content = extract_text(&outcome.content);
+        assert_eq!(text_body(outcome), format!("{content}\n"));
     }
 
     /// Reads a small temp file end-to-end through the new contract and
@@ -507,6 +519,7 @@ mod tests {
             }
             other => panic!("expected Text details, got {other:?}"),
         }
+        assert_display_is_content_plus_newline(&outcome);
     }
 
     /// Pins the line-number gutter contract: numbers are right-aligned
@@ -537,10 +550,15 @@ mod tests {
         let wire = extract_text(&outcome.content);
         assert!(wire.contains("    1: line 1"), "wire: {wire:?}");
         assert!(wire.contains("   10: line 10"), "wire: {wire:?}");
-
-        let display = format_for_display(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
-        assert!(display.contains("    1: a"), "display: {display:?}");
-        assert!(display.contains("   10: j"), "display: {display:?}");
+        let display = text_body(&outcome);
+        assert!(display.contains("    1: line 1"), "display: {display:?}");
+        assert!(display.contains("   10: line 10"), "display: {display:?}");
+        assert_display_is_content_plus_newline(&outcome);
+        assert_eq!(
+            format_for_display(&["a", "b"]),
+            "    1: a\n    2: b\n",
+            "the public line-one formatter keeps its established output",
+        );
     }
 
     #[tokio::test]
@@ -583,11 +601,61 @@ mod tests {
         match &outcome.details {
             ToolDetails::Text { summary, body } => {
                 assert!(summary.ends_with(" 3:4"), "summary: {summary:?}");
-                assert!(body.starts_with("    1: line 3"), "body: {body:?}");
-                assert!(body.contains("    2: line 4"), "body: {body:?}");
+                assert!(body.starts_with("    3: line 3"), "body: {body:?}");
+                assert!(body.contains("    4: line 4"), "body: {body:?}");
             }
             other => panic!("expected Text details, got {other:?}"),
         }
+        assert_display_is_content_plus_newline(&outcome);
+    }
+
+    #[tokio::test]
+    async fn offset_output_keeps_wide_absolute_gutters_and_blank_lines() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        for _ in 0..99_998 {
+            writeln!(file, "skip").unwrap();
+        }
+        writeln!(file).unwrap();
+        write!(file, "last").unwrap();
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = ReadFileTool::new()
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: path.display().to_string(),
+                    offset: Some(99_999),
+                    limit: Some(2),
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(extract_text(&outcome.content), "99999: \n100000: last");
+        assert_display_is_content_plus_newline(&outcome);
+    }
+
+    #[tokio::test]
+    async fn out_of_range_offset_keeps_both_text_bodies_empty() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        writeln!(file, "only line").unwrap();
+        let mut ctx = DummyToolContext::default();
+
+        let outcome = ReadFileTool::new()
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: file.path().display().to_string(),
+                    offset: Some(2),
+                    limit: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(extract_text(&outcome.content), "");
+        assert_eq!(text_body(&outcome), "");
     }
 
     #[tokio::test]
@@ -631,9 +699,11 @@ mod tests {
             .expect("execute");
 
         assert!(outcome.is_error);
+        let content = extract_text(&outcome.content);
         match &outcome.details {
             ToolDetails::Text { body, .. } => {
                 assert!(body.contains("Failed to read file"), "body: {body:?}");
+                assert_eq!(body, &content, "errors do not gain a display newline");
             }
             other => panic!("expected Text details, got {other:?}"),
         }
@@ -655,7 +725,7 @@ mod tests {
                 &mut ctx,
                 ReadFileInput {
                     path: path.display().to_string(),
-                    offset: None,
+                    offset: Some(41),
                     limit: None,
                 },
             )
@@ -665,17 +735,19 @@ mod tests {
         assert!(!outcome.is_error);
         let wire = extract_text(&outcome.content);
         let expected_total = READ_MAX_LINES + 50;
-        let expected_next = READ_MAX_LINES + 1;
+        let expected_start = 41;
+        let expected_end = READ_MAX_LINES + 40;
+        let expected_next = expected_end + 1;
         let expected_footer = format!(
-            "[Showing lines 1-{READ_MAX_LINES} of {expected_total}. Use offset={expected_next} to continue.]"
+            "[Showing lines {expected_start}-{expected_end} of {expected_total}. Use offset={expected_next} to continue.]"
         );
         assert!(
             wire.contains(&expected_footer),
             "missing line-limited footer\nfooter: {expected_footer}\nwire tail: {:?}",
             &wire[wire.len().saturating_sub(200)..]
         );
-        // And the last shown wire line should be `line 2000`.
-        assert!(wire.contains(&format!("{READ_MAX_LINES}: line {READ_MAX_LINES}")));
+        assert!(wire.contains(&format!("{expected_end}: line {expected_end}")));
+        assert_display_is_content_plus_newline(&outcome);
     }
 
     /// A file with one huge line under the line cap but over the byte
@@ -684,10 +756,10 @@ mod tests {
     #[tokio::test]
     async fn large_byte_count_emits_byte_limited_footer() {
         let mut file = NamedTempFile::new().expect("temp file");
-        // Each line is ~6 KB; ten such lines = 60 KB total. The byte
-        // cap (50 KB) fires before the line cap (2000).
+        // Starting at line three leaves ten ~6 KB lines. The byte cap
+        // (50 KB) fires before the line cap (2000).
         let chunk: String = "x".repeat(6 * 1024);
-        for _ in 0..10 {
+        for _ in 0..12 {
             writeln!(file, "{chunk}").unwrap();
         }
         let path = file.path().to_path_buf();
@@ -698,7 +770,7 @@ mod tests {
                 &mut ctx,
                 ReadFileInput {
                     path: path.display().to_string(),
-                    offset: None,
+                    offset: Some(3),
                     limit: None,
                 },
             )
@@ -713,6 +785,8 @@ mod tests {
             &wire[wire.len().saturating_sub(200)..]
         );
         assert!(wire.contains("Use offset="));
+        assert!(wire.starts_with("    3: "), "wire: {wire:?}");
+        assert_display_is_content_plus_newline(&outcome);
     }
 
     /// A file whose first line alone exceeds the byte cap yields the
@@ -767,6 +841,7 @@ mod tests {
             wire.len(),
             &wire[..wire.len().min(200)],
         );
+        assert_eq!(text_body(&outcome), wire, "escapes stay byte-identical");
     }
 
     /// Offset that lands on a line bigger than the cap still routes to
