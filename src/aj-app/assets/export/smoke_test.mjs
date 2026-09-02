@@ -429,8 +429,8 @@ thinkingToolData.entries.find((entry) => entry.id === 'atool').message.content.u
   type: 'thinking', thinking: 'Need to inspect this file.', redacted: false,
 });
 const thinkingToolView = await renderData(thinkingToolData);
-check('thinking plus tool calls is not treated as pure tool calls',
-  thinkingToolView.elements['tree-container'].children.some((node) => node.dataset.id === 'atool'));
+check('thinking plus tool calls stays out of the sidebar without assistant text',
+  !thinkingToolView.elements['tree-container'].children.some((node) => node.dataset.id === 'atool'));
 
 console.log('task notification');
 has('task notification block', 'class="task-notification"');

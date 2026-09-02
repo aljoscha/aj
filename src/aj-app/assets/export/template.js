@@ -1122,10 +1122,11 @@
     if (!entryCategory(entry)) return false;
     if (entry.type === 'message' && entry.message && entry.message.role === 'assistant') {
       const content = entry.message.content || [];
-      const pureToolCalls = content.length > 0 && content.every((block) => block.type === 'tool_call');
+      const hasText = textOf(content).trim().length > 0;
+      const hasToolCalls = content.some((block) => block.type === 'tool_call');
       const stopReason = entry.message.stop_reason;
       const errored = stopReason === 'Error' || stopReason === 'Aborted';
-      if (pureToolCalls && !errored) return false;
+      if (hasToolCalls && !hasText && !errored) return false;
     }
     return true;
   }
