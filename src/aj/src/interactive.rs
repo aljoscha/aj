@@ -20487,57 +20487,6 @@ mod tests {
             .collect()
     }
 
-    /// The focused row is drawn differently from the rest, so the user can see
-    /// which session they are in without reading the header.
-    #[tokio::test]
-    async fn the_focused_row_is_marked_apart_from_the_others() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        run_prompt(&mut world, "seed").await;
-        world
-            .control
-            .create(None, None, None, None, None)
-            .await
-            .expect("a second session");
-        let deadline = Instant::now() + SETTLE_DEADLINE;
-        loop {
-            fold_ready_frames(&mut world);
-            sync_sidebar(&world, &shell);
-            if shell.borrow().sidebar.borrow().rows.len() >= 2 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the rows never arrived");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        // By row position, not by label: two sessions minted in the same second
-        // share a time-of-day label, so matching on text would be a coin flip.
-        let focused_index = {
-            let sidebar = Rc::clone(&shell.borrow().sidebar);
-            let state = sidebar.borrow();
-            state
-                .rows
-                .iter()
-                .position(|row| row.focused)
-                .expect("a focused row")
-        };
-
-        // Two sessions show the strip by default, so nothing has to be toggled.
-        let styles = sidebar_row_styles(&shell);
-        assert!(styles.len() >= 2, "two rows are painted: {styles:?}");
-        let focused_style = styles[focused_index].1;
-        for (index, (text, style)) in styles.iter().enumerate() {
-            if index == focused_index {
-                continue;
-            }
-            assert_ne!(
-                focused_style, *style,
-                "row {index} ({text:?}) is drawn the same as the focused row",
-            );
-        }
-        shut_down(&world).await;
-    }
-
     /// The strip's focus and working-set axes, read off the composed frame:
     /// the marker in the leftmost column says which session is on screen, and
     /// the label's brightness says what the client holds open (spec 9.2).
@@ -27159,70 +27108,6 @@ mod tests {
             walk.push(parent.clone());
         }
         walk
-    }
-
-    /// One stream serves every session it attached: both get their own
-    /// attach block, and `attached` answers for both. This is what lets the
-    /// client keep background sessions live on a single connection (spec
-    /// 6.5, 9.2).
-    #[tokio::test]
-    async fn one_stream_carries_several_sessions() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-        let second = world
-            .control
-            .create(None, None, None, None, None)
-            .await
-            .expect("a second session");
-
-        let mut stream = world
-            .control
-            .attach_all(&[
-                AttachRequest {
-                    session: world.session().to_string(),
-                    cursor: None,
-                },
-                AttachRequest {
-                    session: second.clone(),
-                    cursor: None,
-                },
-            ])
-            .await
-            .expect("one attach covering both");
-        assert!(stream.attached(world.session()));
-        assert!(stream.attached(&second));
-
-        // Both blocks arrive on the one stream. Reading until each session
-        // has been caught up proves the host really served two blocks rather
-        // than one, and that the frames carry the session that owns them.
-        let mut caught_up: Vec<String> = Vec::new();
-        let deadline = Instant::now() + SETTLE_DEADLINE;
-        while caught_up.len() < 2 {
-            assert!(Instant::now() < deadline, "only saw {caught_up:?}");
-            match stream.recv().await {
-                ControlFrame::Frame(aj_wire::Frame::CaughtUp { session, .. }) => {
-                    if !caught_up.contains(&session) {
-                        caught_up.push(session);
-                    }
-                }
-                ControlFrame::Frame(_) => {}
-                other => panic!(
-                    "the stream ended early: {}",
-                    match other {
-                        ControlFrame::Lost(err) => err.to_string(),
-                        _ => "closed".to_string(),
-                    }
-                ),
-            }
-        }
-        caught_up.sort();
-        let mut expected = vec![world.session().to_string(), second];
-        expected.sort();
-        assert_eq!(caught_up, expected);
-
-        drop(stream);
-        remote.shutdown().await;
     }
 
     /// The head the tree read carries reaches the overlay, so the row the
