@@ -46,7 +46,9 @@ use serde::{Deserialize, Serialize};
 /// extra provider-specific fields go in [`OAuthCredentials::extra`]
 /// rather than as named fields, so adding a new provider doesn't
 /// require a schema migration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Its [`Debug`](std::fmt::Debug) output includes the expiry and `extra` keys,
+/// but redacts both core tokens and every `extra` value.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthCredentials {
     /// Long-lived refresh token used to mint fresh access tokens
     /// without re-prompting the user.
@@ -68,6 +70,20 @@ pub struct OAuthCredentials {
     /// error rather than being silently swallowed into `extra`.
     #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for OAuthCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut extra_keys = self.extra.keys().collect::<Vec<_>>();
+        extra_keys.sort_unstable();
+
+        f.debug_struct("OAuthCredentials")
+            .field("refresh", &"<redacted>")
+            .field("access", &"<redacted>")
+            .field("expires", &self.expires)
+            .field("extra", &extra_keys)
+            .finish()
+    }
 }
 
 impl OAuthCredentials {
@@ -343,6 +359,27 @@ mod tests {
         let creds = OAuthCredentials::new("r", "a", 1234);
         let json = serde_json::to_string(&creds).expect("serialize");
         assert_eq!(json, r#"{"refresh":"r","access":"a","expires":1234}"#);
+    }
+
+    #[test]
+    fn credentials_debug_prints_extra_keys_but_not_values_or_tokens() {
+        let mut creds = OAuthCredentials::new("refresh-secret", "access-secret", 1234);
+        creds.extra.insert(
+            "future_token_field".into(),
+            serde_json::Value::String("extra-secret".into()),
+        );
+
+        let debug = format!("{creds:?}");
+        assert!(debug.contains("OAuthCredentials"));
+        assert!(debug.contains("refresh"));
+        assert!(debug.contains("access"));
+        assert!(debug.contains("expires"));
+        assert!(debug.contains("extra"));
+        assert!(debug.contains("future_token_field"));
+        assert!(debug.contains("1234"));
+        for secret in ["refresh-secret", "access-secret", "extra-secret"] {
+            assert!(!debug.contains(secret), "credential leaked in {debug}");
+        }
     }
 
     /// Expiration check: timestamps in the past or equal to `now`

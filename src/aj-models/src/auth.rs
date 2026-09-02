@@ -59,7 +59,9 @@ pub use account_label::{
 /// [`OAuthCredentials`] fields are flattened into the same object,
 /// matching the disk layout
 /// (`{ "type": "oauth", "refresh": ..., "access": ..., "expires": ..., ...extra }`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Its [`Debug`](std::fmt::Debug) output preserves the credential variant but
+/// never includes bearer material.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AuthCredential {
     /// Static API key the user pasted in (no refresh logic).
@@ -71,6 +73,18 @@ pub enum AuthCredential {
     /// OAuth-issued tokens with refresh capability.
     #[serde(rename = "oauth")]
     OAuth(OAuthCredentials),
+}
+
+impl std::fmt::Debug for AuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey { .. } => f
+                .debug_struct("ApiKey")
+                .field("key", &"<redacted>")
+                .finish(),
+            Self::OAuth(credentials) => f.debug_tuple("OAuth").field(credentials).finish(),
+        }
+    }
 }
 
 /// The label a bare entry's credential adopts when a second account
@@ -85,7 +99,7 @@ pub const DEFAULT_ACCOUNT_LABEL: &str = "default";
 /// single login still writes the shape it always did. The set adds one
 /// tag:
 /// `{ "type": "accounts", "default": "personal", "accounts": { "personal": {...} } }`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum StoredEntry {
     #[serde(rename = "api_key")]
@@ -102,6 +116,25 @@ enum StoredEntry {
         default: String,
         accounts: HashMap<String, AuthCredential>,
     },
+}
+
+// Unlike the account-set variant, the bare API-key variant does not compose
+// through `AuthCredential`, so this storage leaf owns the same redaction.
+impl std::fmt::Debug for StoredEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey { .. } => f
+                .debug_struct("ApiKey")
+                .field("key", &"<redacted>")
+                .finish(),
+            Self::OAuth(credentials) => f.debug_tuple("OAuth").field(credentials).finish(),
+            Self::Accounts { default, accounts } => f
+                .debug_struct("Accounts")
+                .field("default", default)
+                .field("accounts", accounts)
+                .finish(),
+        }
+    }
 }
 
 impl StoredEntry {
@@ -1886,6 +1919,77 @@ mod tests {
             }
             _ => panic!("expected OAuth variant"),
         }
+    }
+
+    #[test]
+    fn credential_debug_redacts_secrets_through_stored_and_public_containers() {
+        const API_KEY: &str = "api-key-debug-sentinel";
+        const REFRESH_TOKEN: &str = "refresh-debug-sentinel";
+        const ACCESS_TOKEN: &str = "access-debug-sentinel";
+        const EXTRA_VALUE: &str = "extra-value-debug-sentinel";
+
+        let mut oauth = OAuthCredentials::new(REFRESH_TOKEN, ACCESS_TOKEN, 1234);
+        oauth.extra.insert(
+            "future_token_field".into(),
+            serde_json::Value::String(EXTRA_VALUE.into()),
+        );
+        let api_key = AuthCredential::ApiKey {
+            key: API_KEY.into(),
+        };
+        let oauth = AuthCredential::OAuth(oauth);
+
+        let outputs = [
+            format!("{api_key:?}"),
+            format!("{oauth:?}"),
+            format!(
+                "{:?}",
+                StoredEntry::ApiKey {
+                    key: API_KEY.into()
+                }
+            ),
+            format!(
+                "{:?}",
+                ProviderAccounts {
+                    default: "personal".into(),
+                    accounts: vec![
+                        ("personal".into(), api_key.clone()),
+                        ("work".into(), oauth.clone()),
+                    ],
+                }
+            ),
+            format!(
+                "{:?}",
+                StoredProviderCredentials::Accounts(ProviderAccounts {
+                    default: "personal".into(),
+                    accounts: vec![("personal".into(), api_key), ("work".into(), oauth),],
+                })
+            ),
+            format!(
+                "{:?}",
+                ResolvedCredential {
+                    key: ACCESS_TOKEN.into(),
+                    source: CredentialSource::Account("personal".into()),
+                }
+            ),
+        ];
+
+        for output in &outputs {
+            for secret in [API_KEY, REFRESH_TOKEN, ACCESS_TOKEN, EXTRA_VALUE] {
+                assert!(!output.contains(secret), "credential leaked in {output}");
+            }
+        }
+
+        assert!(outputs[0].contains("ApiKey"));
+        assert!(outputs[0].contains("key"));
+        assert!(outputs[1].contains("OAuth(OAuthCredentials"));
+        assert!(outputs[2].contains("ApiKey"));
+        let accounts = &outputs[3];
+        assert!(accounts.contains("ProviderAccounts"));
+        assert!(accounts.contains("personal"));
+        assert!(accounts.contains("work"));
+        assert!(accounts.contains("future_token_field"));
+        assert!(outputs[4].contains("Accounts(ProviderAccounts"));
+        assert!(outputs[5].contains("Account(\"personal\")"));
     }
 
     /// Explicit bare insert, replace, and removal persist their exact slot.
