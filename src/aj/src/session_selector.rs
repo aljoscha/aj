@@ -1,31 +1,30 @@
 //! The session-selector overlay: resume a previous session in place.
 //!
-//! A [`FilterableSelect`] over the project's session previews. Confirming
-//! a row parks a [`SessionRequest::Resume`] for the host, which tears the
-//! current session down and rebuilds onto the chosen one. Choosing the
-//! session already active is a no-op close, and Esc cancels.
+//! A [`FilterableSelect`] over the sessions available to this frontend.
+//! Confirming a row parks a [`SessionRequest::Resume`] for the host, which
+//! tears the current session down and rebuilds onto the chosen one. Choosing
+//! the session already active is a no-op close, and Esc cancels.
 //!
-//! The preview scan is off the drive loop: the overlay opens showing a
-//! loading placeholder and the host streams rows in as the scan (run on a
-//! blocking thread over [`ConversationPersistence`](aj_session::ConversationPersistence))
-//! emits per-file batches, so the list fills progressively rather than
-//! blocking on the whole walk. Rows are newest-first, the active session
-//! pre-selected and tagged `(current)`.
+//! A local selector fills progressively from a preview scan run off the drive
+//! loop. A selector over a connection is built synchronously from the merged
+//! directory snapshot the client already holds and never reads the client's
+//! local session store. The active session is pre-selected and tagged
+//! `(current)` in both modes.
 //!
-//! A row's filter key is `"{first_user_message} {tag} {session_id}"` so typing
-//! the prompt, the label, or the id finds it, and a `#`-prefixed query narrows
-//! to the labels alone. The confirmed value is the session id, recovered
+//! A local row's filter key is
+//! `"{first_user_message} {tag} {session_id}"`. A connected row's is
+//! `"{tag} {session_id} {host_label}"`. A `#`-prefixed query narrows either
+//! source to tags alone. The confirmed value is the session id, recovered
 //! through a shared filter-key -> id map (the same indirection the command
 //! palette uses for its actions), since the widget hands the confirm callback
 //! only the row's filter key.
 //!
 //! Archived sessions are left out, the one the user is in excepted, and the
 //! overlay's own toggle ([`ACTION_SESSION_TOGGLE_ARCHIVED`]) puts the rest
-//! back inline, marked. A
-//! picker is where hiding them earns its keep, so the toggle belongs to this
-//! overlay rather than to whatever the strip is showing. Every preview the
-//! scan delivers is kept, revealed or not, so the toggle answers from what
-//! has already been read rather than starting the walk again.
+//! back inline, marked. A picker is where hiding them earns its keep, so the
+//! toggle belongs to this overlay rather than to whatever the strip is
+//! showing. Each source retains every row it has received, revealed or not, so
+//! toggling never starts another read.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -34,6 +33,7 @@ use std::rc::Rc;
 use aj_app::keybindings::{ACTION_SESSION_TOGGLE_ARCHIVED, action_shortcut};
 use aj_app::session::SessionRequest;
 use aj_session::SessionPreview;
+use aj_wire::{DirectoryHost, SessionSummary};
 use chrono::{DateTime, Datelike, Utc};
 use vaxis::vxfw::{
     DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectItem,
@@ -44,11 +44,11 @@ use crate::interactive::OverlayHandles;
 use crate::keymap::action_matches;
 use crate::overlay::{OverlayPlacement, close_all, close_key_label, close_top, confirm_key_label};
 use crate::settings_ui::push_window;
+use crate::sidebar::{host_label, session_label, session_label_source};
 use crate::text::one_line;
 
-/// How much of the first user message a row's primary column shows before
-/// truncating with an ellipsis.
-const PREVIEW_MAX_CHARS: usize = 60;
+/// How much source text a row's primary column shows.
+const PRIMARY_MAX_CHARS: usize = 60;
 
 /// How wide the tag column may get before truncating with an ellipsis. A tag
 /// can be 80 bytes, and the column is sized to the widest one on show, so
@@ -97,6 +97,40 @@ fn loading_items() -> Vec<SelectItem> {
     vec![SelectItem::new("Loading\u{2026}", "")]
 }
 
+/// Rows the shared selector widget can rebuild when its archived toggle
+/// changes. Local rows accumulate behind a scan. Connected rows are an owned
+/// snapshot of the client's already-merged directory.
+enum SelectorRows {
+    Local(Rc<RefCell<Vec<SessionPreview>>>),
+    Connected {
+        rows: Vec<SessionSummary>,
+        hosts: Vec<DirectoryHost>,
+    },
+}
+
+impl SelectorRows {
+    fn items(
+        &self,
+        ids: &Rc<RefCell<HashMap<String, String>>>,
+        current: &str,
+        reveal: bool,
+        now: DateTime<Utc>,
+    ) -> Vec<SelectItem> {
+        match self {
+            SelectorRows::Local(seen) => build_items(ids, &seen.borrow(), current, reveal, now),
+            SelectorRows::Connected { rows, hosts } => {
+                build_connected_items(ids, rows, hosts, current, reveal, now)
+            }
+        }
+    }
+}
+
+struct OpenedSelector {
+    select: Rc<RefCell<FilterableSelect>>,
+    ids: Rc<RefCell<HashMap<String, String>>>,
+    reveal: Rc<Cell<bool>>,
+}
+
 /// Open the session selector, showing a loading placeholder and parking a
 /// scan for the host in `handles.session_scan`. A confirmed non-current row
 /// lands a [`SessionRequest::Resume`] in `handles.session_request`; the
@@ -106,12 +140,63 @@ fn loading_items() -> Vec<SelectItem> {
 /// A switch is never refused for being busy. The session left behind stays
 /// attached and keeps folding, so its turn finishes unwatched.
 pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let opened = push_session_selector(
+        handles,
+        current.clone(),
+        SelectorRows::Local(Rc::clone(&seen)),
+    );
+    *handles.session_scan.borrow_mut() = Some(SessionScan {
+        select: opened.select,
+        current,
+        ids: opened.ids,
+        seen,
+        reveal: opened.reveal,
+    });
+}
+
+/// Open the selector over one snapshot of a connected client's merged
+/// directory. All rows are present immediately and no local preview scan is
+/// parked. Reopening is the refresh operation for this picker.
+pub(crate) fn open_connected_session_selector(
+    handles: &OverlayHandles,
+    current: String,
+    rows: &[SessionSummary],
+    hosts: &[DirectoryHost],
+) {
+    push_session_selector(
+        handles,
+        current,
+        SelectorRows::Connected {
+            rows: rows.to_vec(),
+            hosts: hosts.to_vec(),
+        },
+    );
+}
+
+/// Push the one selector widget over either row source, sharing confirm,
+/// cancel, filtering, archived reveal, and overlay behavior by construction.
+fn push_session_selector(
+    handles: &OverlayHandles,
+    current: String,
+    rows: SelectorRows,
+) -> OpenedSelector {
+    let ids: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+    let reveal = Rc::new(Cell::new(false));
+    let initial = match &rows {
+        SelectorRows::Local(_) => loading_items(),
+        SelectorRows::Connected { .. } => rows.items(&ids, &current, reveal.get(), Utc::now()),
+    };
     let select = Rc::new(RefCell::new(FilterableSelect::new(
-        loading_items(),
+        initial,
         handles.chrome.select.clone(),
     )));
+    if matches!(&rows, SelectorRows::Connected { .. }) {
+        select.borrow().select_matching(|item| {
+            ids.borrow().get(&item.filter_key).map(String::as_str) == Some(current.as_str())
+        });
+    }
     let focus = select.borrow().focus_target();
-    let ids: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
     {
         let mut sel = select.borrow_mut();
         // A project can hold many sessions, so show the vertical scroll bar.
@@ -145,12 +230,10 @@ pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
             close_top(&stack_cancel, ctx, &editor_cancel)
         }));
     }
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    let reveal = Rc::new(Cell::new(false));
     let selector = Rc::new(RefCell::new(SessionSelector {
         select: Rc::clone(&select),
         ids: Rc::clone(&ids),
-        seen: Rc::clone(&seen),
+        rows,
         reveal: Rc::clone(&reveal),
         current: current.clone(),
         window: None,
@@ -165,13 +248,11 @@ pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
         OverlayPlacement::Large,
     );
     selector.borrow_mut().window = Some(window);
-    *handles.session_scan.borrow_mut() = Some(SessionScan {
+    OpenedSelector {
         select,
-        current,
         ids,
-        seen,
         reveal,
-    });
+    }
 }
 
 /// The selector widget: the list, and what the archived toggle needs to
@@ -183,7 +264,7 @@ pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
 pub(crate) struct SessionSelector {
     select: Rc<RefCell<FilterableSelect>>,
     ids: Rc<RefCell<HashMap<String, String>>>,
-    seen: Rc<RefCell<Vec<SessionPreview>>>,
+    rows: SelectorRows,
     reveal: Rc<Cell<bool>>,
     current: String,
     /// The window frame, for the subtitle the toggle rewrites. `None` until
@@ -195,18 +276,14 @@ impl SessionSelector {
     /// Rebuild the rows for the current setting of the toggle, keeping the
     /// highlight on the row it was on when that row survives.
     ///
-    /// From the previews already delivered, so revealing does not wait on a
-    /// second walk of the store. A batch still to arrive fills in behind this
-    /// through [`extend_session_scan`], which reads the same flag.
+    /// From the retained source rows, so revealing starts no read. A local
+    /// batch still to arrive fills in behind this through
+    /// [`extend_session_scan`], which reads the same flag.
     fn rebuild(&self, now: DateTime<Utc>) {
         let was = self.select.borrow().selected().map(|item| item.filter_key);
-        let items = build_items(
-            &self.ids,
-            &self.seen.borrow(),
-            &self.current,
-            self.reveal.get(),
-            now,
-        );
+        let items = self
+            .rows
+            .items(&self.ids, &self.current, self.reveal.get(), now);
         {
             let select = self.select.borrow();
             select.set_items(items);
@@ -319,6 +396,97 @@ fn build_items(
     // the confirm callback fires from the widget's own dispatch and reads it.
 }
 
+/// Build selector rows from the client-side directory snapshot. The directory
+/// has no preview or message-count fields, so the id-derived label is primary
+/// and the host, state, and activity age form the description.
+fn build_connected_items(
+    ids: &Rc<RefCell<HashMap<String, String>>>,
+    rows: &[SessionSummary],
+    hosts: &[DirectoryHost],
+    current: &str,
+    reveal: bool,
+    now: DateTime<Utc>,
+) -> Vec<SelectItem> {
+    let mut ids = ids.borrow_mut();
+    rows.iter()
+        .filter(|row| reveal || !row.archived || row.id == current)
+        .map(|row| {
+            let item = build_connected_item(row, hosts, row.id == current, now);
+            ids.insert(item.filter_key.clone(), row.id.clone());
+            item
+        })
+        .collect()
+}
+
+/// Build one row from the fields an enumeration is allowed to carry. The
+/// complete id remains the confirm value and filter corpus even when its host
+/// qualifier is removed for display.
+fn build_connected_item(
+    row: &SessionSummary,
+    hosts: &[DirectoryHost],
+    is_current: bool,
+    now: DateTime<Utc>,
+) -> SelectItem {
+    let tag = row.tag.as_deref().map(one_line);
+    let host = row.host.as_deref().map(|id| {
+        let label = hosts
+            .iter()
+            .find(|host| host.id.as_deref() == Some(id))
+            .and_then(host_label)
+            .unwrap_or(id);
+        one_line(label)
+    });
+    let label = session_label(
+        session_label_source(&row.id, row.host.as_deref()),
+        PRIMARY_MAX_CHARS,
+    );
+    let primary = if is_current {
+        format!("{label} (current)")
+    } else {
+        label
+    };
+    let tag_key = tag.as_deref().unwrap_or("");
+    let host_key = host.as_deref().unwrap_or("");
+    let item = SelectItem::new(primary, format!("{tag_key} {} {host_key}", row.id))
+        .with_description(format_connected_secondary(row, host.as_deref(), now));
+    decorate_tag(item, tag)
+}
+
+/// The connected row's textual state. Unreachable and working keep the
+/// sidebar's priority, then this surface distinguishes a live session from a
+/// cold idle one. The sidebar's remaining state is unseen output instead, so
+/// its [`crate::sidebar::RowStatus`] is not this formatter's vocabulary.
+fn connected_state(row: &SessionSummary) -> &'static str {
+    if row.unreachable {
+        "unreachable"
+    } else if row.working {
+        "working"
+    } else if row.live {
+        "live"
+    } else {
+        "idle"
+    }
+}
+
+fn format_connected_secondary(
+    row: &SessionSummary,
+    host: Option<&str>,
+    now: DateTime<Utc>,
+) -> String {
+    let mut facts = Vec::with_capacity(3);
+    if let Some(host) = host {
+        facts.push(host.to_string());
+    }
+    facts.push(connected_state(row).to_string());
+    facts.push(format!("last {}", format_age(now, row.last_activity)));
+    let line = facts.join(" · ");
+    if row.archived {
+        format!("archived · {line}")
+    } else {
+        line
+    }
+}
+
 /// Build one row: the truncated first user message (tagged `(current)` for
 /// the active session) as the label, the session's own label as a column
 /// beside it, the metadata triplet as the dim description, and
@@ -337,6 +505,11 @@ fn build_item(preview: &SessionPreview, is_current: bool, now: DateTime<Utc>) ->
         haystack(preview, tag.as_deref()),
     )
     .with_description(format_secondary(preview, now));
+    decorate_tag(item, tag)
+}
+
+/// Give either row source the same tag column, truncation, and `#` scope key.
+fn decorate_tag(item: SelectItem, tag: Option<String>) -> SelectItem {
     match tag {
         Some(tag) => item
             .with_prefix(truncate_chars(&tag, TAG_COLUMN_MAX_CHARS))
@@ -381,7 +554,7 @@ fn format_primary(preview: &SessionPreview, is_current: bool) -> String {
         .as_deref()
         .unwrap_or("(no user message yet)");
     let first_line = one_line(raw.lines().next().unwrap_or(raw));
-    let truncated = truncate_chars(&first_line, PREVIEW_MAX_CHARS);
+    let truncated = truncate_chars(&first_line, PRIMARY_MAX_CHARS);
     if is_current {
         format!("{truncated} (current)")
     } else {
@@ -466,6 +639,7 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use aj_wire::QueueCounts;
     use chrono::Duration;
     use vaxis::vxfw::SelectStyles;
 
@@ -489,6 +663,29 @@ mod tests {
             first_user_message: first_user.map(|s| s.to_string()),
             tag: None,
             archived: false,
+        }
+    }
+
+    fn connected_row(
+        id: &str,
+        tag: Option<&str>,
+        host: Option<&str>,
+        age: Duration,
+    ) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            live: false,
+            working: false,
+            queued: QueueCounts::default(),
+            tasks: 0,
+            last_seq: None,
+            last_activity: Utc::now() - age,
+            tag: tag.map(str::to_string),
+            host: host.map(str::to_string),
+            unreachable: false,
+            archived: false,
+            locked: false,
+            lock_generation: None,
         }
     }
 
@@ -589,6 +786,141 @@ mod tests {
         assert_eq!(untagged.prefix, None);
         assert_eq!(untagged.scope_key, None);
         assert_eq!(untagged.description, item.description);
+    }
+
+    #[test]
+    fn a_connected_row_uses_the_directory_label_host_and_state() {
+        let now = Utc::now();
+        let mut row = connected_row(
+            "host-a:2025-05-09-14-30-00-000",
+            Some("fix-auth"),
+            Some("host-a"),
+            Duration::hours(2),
+        );
+        row.last_activity = now - Duration::hours(2);
+        row.live = true;
+        row.working = true;
+        let hosts = vec![DirectoryHost {
+            id: Some("host-a".to_string()),
+            address: None,
+            name: Some("Studio Left".to_string()),
+            working_directory: None,
+            unreachable: false,
+        }];
+
+        let item = build_connected_item(&row, &hosts, true, now);
+
+        assert_eq!(item.prefix.as_deref(), Some("fix-auth"));
+        assert_eq!(item.scope_key.as_deref(), Some("fix-auth"));
+        assert_eq!(item.label, "14-30-00 (current)");
+        assert_eq!(
+            item.description.as_deref(),
+            Some("Studio Left · working · last 2h"),
+        );
+        assert!(item.filter_key.contains("fix-auth"));
+        assert!(item.filter_key.contains("host-a:2025-05-09-14-30-00-000"));
+        assert!(item.filter_key.contains("Studio Left"));
+    }
+
+    #[test]
+    fn connected_state_precedence_keeps_live_distinct_from_idle() {
+        let base = connected_row("session", None, None, Duration::minutes(1));
+        for (row, expected) in [
+            (
+                SessionSummary {
+                    unreachable: true,
+                    working: true,
+                    live: true,
+                    ..base.clone()
+                },
+                "unreachable",
+            ),
+            (
+                SessionSummary {
+                    working: true,
+                    live: true,
+                    ..base.clone()
+                },
+                "working",
+            ),
+            (
+                SessionSummary {
+                    live: true,
+                    ..base.clone()
+                },
+                "live",
+            ),
+            (base, "idle"),
+        ] {
+            assert_eq!(connected_state(&row), expected);
+        }
+    }
+
+    #[test]
+    fn connected_archived_rows_share_the_local_reveal_and_current_exemption() {
+        let now = Utc::now();
+        let mut current = connected_row("current", None, None, Duration::minutes(1));
+        current.archived = true;
+        current.last_activity = now - Duration::minutes(1);
+        let mut other = connected_row("other", None, None, Duration::minutes(2));
+        other.archived = true;
+        other.last_activity = now - Duration::minutes(2);
+        let ids = Rc::new(RefCell::new(HashMap::new()));
+        let rows = SelectorRows::Connected {
+            rows: vec![current, other],
+            hosts: Vec::new(),
+        };
+
+        let hidden = rows.items(&ids, "current", false, now);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].label, "current (current)");
+        assert_eq!(
+            hidden[0].description.as_deref(),
+            Some("archived · idle · last 1m"),
+            "a plain-host row omits the host part",
+        );
+
+        let shown = rows.items(&ids, "current", true, now);
+        assert_eq!(shown.len(), 2);
+        assert!(shown.iter().all(|item| {
+            item.description
+                .as_deref()
+                .is_some_and(|description| description.starts_with("archived · idle · last "))
+        }));
+    }
+
+    #[test]
+    fn a_connected_snapshot_preselects_the_current_row_without_a_scan() {
+        let handles = OverlayHandles::for_tests();
+        let opened = push_session_selector(
+            &handles,
+            "current".to_string(),
+            SelectorRows::Connected {
+                rows: vec![
+                    connected_row("other", None, None, Duration::minutes(1)),
+                    connected_row("current", None, None, Duration::minutes(2)),
+                ],
+                hosts: Vec::new(),
+            },
+        );
+
+        let selected = opened
+            .select
+            .borrow()
+            .selected()
+            .expect("the current row is selected");
+        assert_eq!(
+            opened
+                .ids
+                .borrow()
+                .get(&selected.filter_key)
+                .map(String::as_str),
+            Some("current"),
+        );
+        assert!(
+            handles.session_scan.borrow().is_none(),
+            "a synchronous directory snapshot parks no local scan",
+        );
     }
 
     /// A tag can be 80 bytes, so the column truncates. The filter still sees
@@ -888,7 +1220,7 @@ mod tests {
         let p = preview("2025-05-11", Some(&long), 1, Duration::seconds(10));
         let primary = format_primary(&p, false);
         assert!(primary.ends_with('\u{2026}'), "{primary}");
-        assert_eq!(primary.chars().count(), PREVIEW_MAX_CHARS);
+        assert_eq!(primary.chars().count(), PRIMARY_MAX_CHARS);
     }
 
     /// A store holding one tagged session: an empty log under a valid id, the
