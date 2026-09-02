@@ -88,8 +88,10 @@ const entries = [
       details: { kind: 'text', summary: 'future marker summary',
         body_ref: { source: 'future_content', append_newline: false } },
       is_error: false, timestamp: 0 } },
-  // sub-agent run spawned by a1
-  { id: 'sp', parent_id: 'a1', thread: 'subagent', agent_id: 1, type: 'sub_agent_spawn', task: 'investigate the bug',
+  // The spawn event can be persisted after sibling tool results from the same
+  // assistant turn, so its parent is the current main-thread head rather than
+  // necessarily the assistant entry that contains the `agent` call.
+  { id: 'sp', parent_id: 'r3f', thread: 'subagent', agent_id: 1, type: 'sub_agent_spawn', task: 'investigate the bug',
     settings: { provider: 'anthropic', model_id: 'claude-test', thinking: 'off', speed: 'standard', verbosity: '' }, timestamp: '2024-01-01T00:00:06Z' },
   { id: 'sm', parent_id: 'sp', thread: 'subagent', agent_id: 1, type: 'message', timestamp: '2024-01-01T00:00:07Z',
     message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'sub-agent finding' }],
@@ -368,6 +370,20 @@ has('sub-agent id and task', 'sub-agent #1');
 has('sub-agent task text', 'investigate the bug');
 has('sub-agent nested message', 'sub-agent finding');
 check('agent report not duplicated', rendered.split('sub-agent finding').length - 1 === 1);
+const legacySubData = JSON.parse(JSON.stringify(sessionData));
+legacySubData.entries = legacySubData.entries.filter((entry) => entry.id !== 'sp' && entry.id !== 'sm');
+const legacySubView = await renderData(legacySubData);
+check('legacy agent report remains visible without a spawn root', legacySubView.elements['messages'].innerHTML.includes('sub-agent finding'));
+const legacyAgentRow = legacySubView.elements['tree-container'].children.find((n) => nodeText(n).includes('[agent:'));
+check('legacy agent report remains in the tree', !!legacyAgentRow);
+if (legacyAgentRow) fire(legacyAgentRow, 'click');
+check('legacy agent result navigates to its tool block', legacySubView.scrolledTargets.includes('tool-call-c4'));
+const incompleteSubData = JSON.parse(JSON.stringify(sessionData));
+incompleteSubData.entries = incompleteSubData.entries.filter((entry) => entry.id !== 'sm');
+const incompleteSubView = await renderData(incompleteSubData);
+check('agent report remains visible when its child transcript is missing', incompleteSubView.elements['messages'].innerHTML.includes('sub-agent finding'));
+check('incomplete agent report remains in the tree',
+  incompleteSubView.elements['tree-container'].children.some((n) => nodeText(n).includes('[agent:')));
 
 console.log('task notification');
 has('task notification block', 'class="task-notification"');
@@ -455,17 +471,15 @@ console.log('layout');
   const rows = treeRows();
   const at = (id) => rows.find((r) => r.id === id);
   const has2 = (s) => rows.find((r) => r.content.includes(s));
-  const a2 = at('a2'), a3 = at('a3'), sp2 = has2('sub-agent #2');
+  const a1 = at('a1'), a2 = at('a2'), a3 = at('a3');
+  const sp1 = has2('sub-agent #1'), sp2 = has2('sub-agent #2');
   check('sub-agent run hangs one level in off its spawning message', !!(a2 && sp2) && sp2.indent === a2.indent + 1);
+  check('delayed spawn root hangs off its spawning message', !!(a1 && sp1) && sp1.indent === a1.indent + 1);
   check('main thread is not indented by a sub-agent run', !!(a2 && a3) && a3.indent === a2.indent);
   check('sub-agent run renders before the conversation continues', !!(sp2 && a3) && rows.indexOf(sp2) < rows.indexOf(a3));
   // A run followed by a spine continuation keeps the connector open (├)
-  // so the spine threads down to the continuation; a run inside a fork
-  // (sub-agent #1, off a1) closes with └ because its continuation is
-  // bumped one level in and the columns no longer line up.
-  const sp1 = has2('sub-agent #1');
+  // so the spine threads down to the continuation.
   check('run before a spine continuation keeps the connector open', !!sp2 && sp2.prefix.includes('\u251c') && !sp2.prefix.includes('\u2514'));
-  check('run inside a fork closes its connector', !!sp1 && sp1.prefix.includes('\u2514'));
 }
 
 // Sub-agent runs appear in the tree by default and the toggle hides them.

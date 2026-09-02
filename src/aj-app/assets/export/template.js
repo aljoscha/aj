@@ -73,17 +73,35 @@
   const urlTargetId = urlParam('targetId');
 
   // Sub-agent runs live on their own `subagent` thread, keyed by
-  // `agent_id`. A `sub_agent_spawn` entry roots each run and is parented
-  // at the assistant message that spawned it, so we index spawns by that
-  // parent to nest the run inline under that message. These spawns also
-  // appear in the navigation tree as a branch off that message, shown by
-  // default and hidden via the sidebar toggle.
+  // `agent_id`. A `sub_agent_spawn` entry roots each run. Its persisted
+  // parent is the main-thread head when the spawn event is handled, which
+  // can be a sibling tool result appended after the assistant's `agent`
+  // call. Walk back to that assistant so the run still nests beneath the
+  // turn that spawned it.
   const spawnsByParent = new Map();
+  const spawnByAgentId = new Map();
   const subThread = new Map();
+
+  function spawnHostId(spawn) {
+    let cur = spawn.parent_id != null ? byId.get(spawn.parent_id) : null;
+    const seen = new Set();
+    while (cur && cur.thread !== 'subagent' && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      const m = cur.type === 'message' ? cur.message : null;
+      if (m && m.role === 'assistant' && (m.content || []).some((b) => b.type === 'tool_call' && b.name === 'agent')) {
+        return cur.id;
+      }
+      cur = cur.parent_id != null ? byId.get(cur.parent_id) : null;
+    }
+    return spawn.parent_id;
+  }
+
   for (const e of entries) {
     if (e.type === 'sub_agent_spawn') {
-      if (!spawnsByParent.has(e.parent_id)) spawnsByParent.set(e.parent_id, []);
-      spawnsByParent.get(e.parent_id).push(e);
+      const hostId = spawnHostId(e);
+      if (!spawnsByParent.has(hostId)) spawnsByParent.set(hostId, []);
+      spawnsByParent.get(hostId).push(e);
+      spawnByAgentId.set(e.agent_id, e);
     }
     if (e.thread === 'subagent' && e.agent_id != null) {
       if (!subThread.has(e.agent_id)) subThread.set(e.agent_id, []);
@@ -101,9 +119,18 @@
     if (m.role === 'tool_result' && m.tool_call_id) resultByCallId.set(m.tool_call_id, m);
     if (m.role === 'assistant') {
       for (const b of m.content || []) {
-        if (b.type === 'tool_call') toolCallById.set(b.id, { name: b.name, arguments: b.arguments });
+        if (b.type === 'tool_call') toolCallById.set(b.id, { name: b.name, arguments: b.arguments, entry_id: e.id });
       }
     }
+  }
+
+  function hasInlineRun(toolCallId, result) {
+    const agentId = result && result.details && result.details.agent_id;
+    const spawn = agentId != null ? spawnByAgentId.get(agentId) : null;
+    const call = toolCallId ? toolCallById.get(toolCallId) : null;
+    const childEntries = agentId != null ? subThread.get(agentId) : null;
+    return !!(spawn && call && spawnHostId(spawn) === call.entry_id && childEntries &&
+      childEntries.some((e) => e.type === 'message' && e.message && e.message.role === 'assistant'));
   }
 
   // ============================================================
@@ -413,9 +440,10 @@
   function renderToolCall(call) {
     const result = resultByCallId.get(call.id);
     if (call.name === 'agent') {
-      // The successful report is shown by the inline sub-agent box; only
-      // surface a genuine failure here so it is not lost.
-      return result && result.is_error ? renderToolExecution(call, result) : '';
+      // A persisted spawn renders the successful report in its inline box.
+      // Legacy or incomplete logs have only the tool result, so keep that
+      // result visible unless a matching run has renderable child content.
+      return result && (result.is_error || !hasInlineRun(call.id, result)) ? renderToolExecution(call, result) : '';
     }
     return renderToolExecution(call, result);
   }
@@ -686,13 +714,17 @@
   //
   // The tree shows the conversation, its branches, and (toggleable)
   // sub-agent runs. A sub-agent run hangs off the assistant that spawned
-  // it: its `sub_agent_spawn` entry is parented at that assistant, so the
-  // run appears as a branch there. Session-state and system entries are kept
-  // but hidden by the default filter. The layout (indent, ASCII
+  // it, using the same resolved host as the inline transcript box.
+  // Session-state and system entries are kept but hidden by the default
+  // filter. The layout (indent, ASCII
   // connectors, gutters) draws each branch point one level deeper, so the
   // conversation's branch structure reads at a glance.
 
   const treeEntries = entries;
+
+  function treeParentId(entry) {
+    return entry.type === 'sub_agent_spawn' ? spawnHostId(entry) : entry.parent_id;
+  }
 
   function buildTree() {
     const nodeMap = new Map();
@@ -700,7 +732,8 @@
     for (const entry of treeEntries) nodeMap.set(entry.id, { entry, children: [] });
     for (const entry of treeEntries) {
       const node = nodeMap.get(entry.id);
-      const parent = entry.parent_id != null && entry.parent_id !== entry.id ? nodeMap.get(entry.parent_id) : null;
+      const parentId = treeParentId(entry);
+      const parent = parentId != null && parentId !== entry.id ? nodeMap.get(parentId) : null;
       if (parent) parent.children.push(node);
       else roots.push(node);
     }
@@ -853,11 +886,13 @@
     // guards a malformed parent_id cycle (pathTo guards the same).
     function visibleAncestor(id) {
       const seen = new Set();
-      let pid = flatById.get(id) && flatById.get(id).node.entry.parent_id;
+      let item = flatById.get(id);
+      let pid = item && treeParentId(item.node.entry);
       while (pid != null && !seen.has(pid)) {
         seen.add(pid);
         if (visibleIds.has(pid)) return pid;
-        pid = flatById.get(pid) && flatById.get(pid).node.entry.parent_id;
+        item = flatById.get(pid);
+        pid = item && treeParentId(item.node.entry);
       }
       return null;
     }
@@ -1093,7 +1128,7 @@
       const tr = entry.message;
       const call = tr.tool_call_id ? toolCallById.get(tr.tool_call_id) : null;
       const isAgent = call ? call.name === 'agent' : tr.tool_name === 'agent';
-      if (isAgent && !tr.is_error) return false;
+      if (isAgent && !tr.is_error && hasInlineRun(tr.tool_call_id, tr)) return false;
     }
 
     // Hide assistant messages that are only tool calls (no text) unless
@@ -1206,7 +1241,9 @@
     const entry = byId.get(entryId);
     if (entry && entry.type === 'message' && entry.message && entry.message.role === 'tool_result') {
       const det = entry.message.details;
-      if (det && det.kind === 'sub_agent_report') return 'subagent-' + det.agent_id;
+      if (det && det.kind === 'sub_agent_report' && hasInlineRun(entry.message.tool_call_id, entry.message)) {
+        return 'subagent-' + det.agent_id;
+      }
       if (entry.message.tool_call_id) return 'tool-call-' + entry.message.tool_call_id;
     }
     // The spawn node has no element of its own; scroll to its run's box.
