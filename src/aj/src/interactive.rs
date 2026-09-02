@@ -27153,22 +27153,32 @@ mod tests {
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let (world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
 
-        // A second session the host really has, but this stream does not
-        // carry, so "does the host know it" and "is it on this stream" cannot
-        // be confused.
-        let other = world
+        // Two sessions the host really has. This stream names one and omits the
+        // other, so both multi-session bookkeeping and the negative case are
+        // observable independently of whether the host knows the id.
+        let included = world
             .control
             .create(None, None, None, None, None)
             .await
             .expect("a second session");
-        assert_ne!(other, world.session());
+        let omitted = world
+            .control
+            .create(None, None, None, None, None)
+            .await
+            .expect("a third session");
 
         let stream = world
             .control
-            .attach_all(&[AttachRequest {
-                session: world.session().to_string(),
-                cursor: None,
-            }])
+            .attach_all(&[
+                AttachRequest {
+                    session: world.session().to_string(),
+                    cursor: None,
+                },
+                AttachRequest {
+                    session: included.clone(),
+                    cursor: None,
+                },
+            ])
             .await
             .expect("attach");
         assert!(
@@ -27176,7 +27186,11 @@ mod tests {
             "the stream carries the session it named",
         );
         assert!(
-            !stream.attached(&other),
+            stream.attached(&included),
+            "the stream carries every session it named",
+        );
+        assert!(
+            !stream.attached(&omitted),
             "a session this stream did not name is not attached on it",
         );
         assert!(!stream.attached("no-such-session"));
