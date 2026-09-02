@@ -131,6 +131,12 @@ impl AnthropicOAuth {
         Self::with_token_url(TOKEN_URL)
     }
 
+    /// Build a provider whose token exchange uses `token_url`.
+    #[cfg(feature = "test-support")]
+    pub fn with_token_url_for_test(token_url: impl Into<String>) -> Self {
+        Self::with_token_url(token_url)
+    }
+
     /// Build a provider with a caller-supplied token URL. Used by
     /// tests to redirect to a local mock; not exposed publicly.
     fn with_token_url(token_url: impl Into<String>) -> Self {
@@ -676,11 +682,15 @@ mod tests {
         assert_eq!(body["refresh_token"], "old-refresh");
     }
 
-    /// Non-2xx responses surface as `OAuthError::Server`, carrying
-    /// the upstream status and body so the caller can log it.
+    /// Non-2xx responses retain the standard OAuth diagnostic without
+    /// carrying other response fields into the error.
     #[tokio::test]
     async fn token_endpoint_errors_propagate_as_server_error() {
-        let mock = MockTokenServer::start(r#"{"error":"invalid_grant"}"#, 400).await;
+        let mock = MockTokenServer::start(
+            r#"{"error":"invalid_grant","error_description":"Refresh token expired","access_token":"SECRET-ACCESS","refresh_token":"SECRET-REFRESH"}"#,
+            400,
+        )
+        .await;
         let client = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
@@ -692,7 +702,14 @@ mod tests {
         match err {
             OAuthError::Server { status, body } => {
                 assert_eq!(status, 400);
-                assert!(body.contains("invalid_grant"));
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&body).expect("OAuth diagnostic"),
+                    serde_json::json!({
+                        "error": "invalid_grant",
+                        "error_description": "Refresh token expired",
+                    })
+                );
+                assert!(!body.contains("SECRET"), "credential data survived: {body}");
             }
             other => panic!("expected Server error, got {other:?}"),
         }

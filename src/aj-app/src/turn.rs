@@ -682,21 +682,33 @@ fn wrap_overflow_giveup(err: TurnError) -> TurnError {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::io::Read as _;
     use std::sync::{Arc, Mutex};
 
     use aj_agent::TurnError;
     use aj_agent::bus::listener_from_sync;
     use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
     use aj_conf::Config;
+    use aj_models::auth::{AuthCredential, AuthStorage};
+    use aj_models::oauth::OAuthCredentials;
+    use aj_models::oauth::anthropic::AnthropicOAuth;
     use aj_models::types::{AssistantContent, AssistantMessage};
-    use aj_session::{AppendHandoff, ConversationEntryKind, ConversationPersistence, ThreadFilter};
+    use aj_session::{
+        AppendHandoff, ConversationEntryKind, ConversationLog, ConversationPersistence,
+        ThreadFilter, replay,
+    };
+    use base64::Engine as _;
+    use flate2::read::GzDecoder;
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
 
     use super::{
         OVERFLOW_GIVEUP, TurnPolicy, TurnStart, apply_turn_config, drive_turn, tools_for_turn,
     };
     use crate::compaction::{CompactionOutcome, run_compaction};
+    use crate::session_setup::RunConfigSnapshot;
     use crate::test_support::{
         build_test_agent, finalized_text_message, finalized_text_message_with_usage,
         scripted_run_config, scripted_run_config_with_window,
@@ -741,6 +753,169 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Serve one OAuth token response and return the task so the test can shut
+    /// the server down before inspecting any durable output.
+    async fn oauth_failure_server(response_body: String) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind token endpoint");
+        let address = listener.local_addr().expect("token endpoint address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept token request");
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).await.expect("read token request");
+            assert!(read > 0, "token endpoint received an empty request");
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write token response");
+            stream.shutdown().await.expect("close token response");
+        });
+        (format!("http://{address}/oauth/token"), task)
+    }
+
+    fn decoded_export(html: &str) -> String {
+        let encoded = html
+            .split_once("id=\"session-data\">")
+            .and_then(|(_, rest)| rest.split_once("</script>"))
+            .map(|(payload, _)| payload)
+            .expect("export data island");
+        let compressed = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("export base64");
+        let mut json = String::new();
+        GzDecoder::new(&compressed[..])
+            .read_to_string(&mut json)
+            .expect("export gzip");
+        json
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_error_never_persists_unapproved_response_fields() {
+        const ACCESS: &str = "SECRET-ACCESS-IN-TOKEN-RESPONSE";
+        const REFRESH: &str = "SECRET-REFRESH-IN-TOKEN-RESPONSE";
+        const DESCRIPTION: &str = "Refresh token expired";
+        let response = serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": DESCRIPTION,
+            "access_token": ACCESS,
+            "refresh_token": REFRESH,
+        })
+        .to_string();
+        let (token_url, server) = oauth_failure_server(response).await;
+
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let auth_dir = TempDir::new().expect("auth tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let oauth: Arc<dyn aj_models::oauth::OAuthProvider> =
+            Arc::new(AnthropicOAuth::with_token_url_for_test(token_url));
+        let auth = AuthStorage::with_providers(
+            auth_dir.path().join("auth.json"),
+            HashMap::from([("anthropic".to_string(), oauth)]),
+        );
+        auth.insert_bare(
+            "anthropic",
+            AuthCredential::OAuth(OAuthCredentials::new(
+                "expired-refresh",
+                "expired-access",
+                0,
+            )),
+        )
+        .await
+        .expect("store expired OAuth credential");
+
+        let mut model = crate::test_support::scripted_model_info();
+        model.api = "anthropic-messages".to_string();
+        model.provider = "anthropic".to_string();
+        model.base_url = "https://example.invalid".to_string();
+        let resolved =
+            crate::model::from_model_info(&auth, model, None).expect("resolve Anthropic model");
+        let run_config = Arc::new(Mutex::new(RunConfigSnapshot {
+            provider: resolved.provider,
+            model_info: resolved.model_info,
+            stream_options: resolved.stream_options,
+            thinking: None,
+            thinking_display: None,
+            speed: None,
+            model_key: ("anthropic".to_string(), "test-model".to_string()),
+            session_id: None,
+        }));
+        let (mut agent, log, _persistence_handle) = build_test_agent(&persistence, &run_config);
+        let result = drive_turn(
+            &mut agent,
+            &log,
+            &AppendHandoff::default(),
+            &TurnPolicy {
+                recover_overflow: false,
+                auto_threshold: None,
+                keep_recent: 20_000,
+            },
+            TurnStart::Prompt("trigger refresh".into()),
+            |_| {},
+            CancellationToken::new(),
+        )
+        .await;
+        server.await.expect("token endpoint task");
+
+        assert!(result.is_err(), "the rejected refresh must fail the turn");
+        let live = serde_json::to_string(
+            agent
+                .last_assistant()
+                .and_then(|message| message.error.as_ref())
+                .expect("live assistant error"),
+        )
+        .expect("serialize live AssistantError");
+        let durable_path = log.lock().await.path().to_path_buf();
+        let persisted = std::fs::read_to_string(&durable_path).expect("read durable session");
+        let session_id = log.lock().await.session_id().to_string();
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume session");
+        let replayed = replay(&resumed)
+            .filter_map(|event| match event {
+                AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
+                    Some(aj_models::types::Message::Assistant(message)) => {
+                        message.error.as_ref().map(|error| {
+                            serde_json::to_string(error).expect("serialize AssistantError")
+                        })
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let exported = decoded_export(&crate::export::render_session_html(&resumed));
+
+        for (surface, text) in [
+            ("live AssistantError", live.as_str()),
+            ("persisted session", persisted.as_str()),
+            ("replay", replayed.as_str()),
+            ("export", exported.as_str()),
+        ] {
+            assert!(
+                text.contains("invalid_grant"),
+                "{surface} lost the OAuth error code"
+            );
+            assert!(
+                text.contains("status 400"),
+                "{surface} lost the token endpoint status"
+            );
+            assert!(
+                text.contains(DESCRIPTION),
+                "{surface} lost the diagnostic description"
+            );
+            assert!(!text.contains(ACCESS), "{surface} leaked the access token");
+            assert!(
+                !text.contains(REFRESH),
+                "{surface} leaked the refresh token"
+            );
+        }
     }
 
     /// Main's catalog is derived from the effective config at turn

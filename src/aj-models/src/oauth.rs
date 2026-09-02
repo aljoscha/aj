@@ -302,9 +302,80 @@ pub(crate) fn redacted_body_summary(body: &str) -> String {
     format!("{} bytes (redacted)", body.len())
 }
 
+/// Retain the standard OAuth error diagnostic while dropping every other
+/// token-endpoint response field.
+///
+/// RFC 6749 defines `error` and `error_description` as strings. Restricting
+/// both the field names and value types keeps useful refresh-failure context
+/// without carrying arbitrary response data into [`OAuthError::Server`], whose
+/// display text can reach durable session logs.
+pub(crate) fn redacted_oauth_error_body(body: &str) -> String {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str(body) else {
+        return redacted_body_summary(body);
+    };
+
+    let retained = ["error", "error_description"]
+        .into_iter()
+        .filter_map(|key| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(|value| {
+                    (
+                        key.to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    )
+                })
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+
+    if retained.is_empty() {
+        redacted_body_summary(body)
+    } else {
+        serde_json::Value::Object(retained).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_error_body_retains_standard_diagnostics_only() {
+        let body = serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "Refresh token expired",
+            "access_token": "SECRET-ACCESS",
+            "refresh_token": "SECRET-REFRESH",
+            "nested": { "credential": "SECRET-NESTED" },
+        })
+        .to_string();
+
+        let redacted = redacted_oauth_error_body(&body);
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&redacted).expect("retained JSON diagnostic"),
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "Refresh token expired",
+            })
+        );
+        assert!(
+            !redacted.contains("SECRET"),
+            "credential data survived: {redacted}"
+        );
+    }
+
+    #[test]
+    fn oauth_error_body_summarizes_nonstandard_responses() {
+        for body in [
+            "upstream proxy failure",
+            r#"{"access_token":"SECRET-ACCESS"}"#,
+            r#"{"error":{"refresh_token":"SECRET-REFRESH"}}"#,
+        ] {
+            assert_eq!(redacted_oauth_error_body(body), redacted_body_summary(body));
+        }
+    }
 
     /// `OAuthCredentials` must round-trip through serde with the `extra`
     /// map flattened into the JSON object — the on-disk shape is
