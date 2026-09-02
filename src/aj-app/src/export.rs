@@ -403,6 +403,21 @@ mod tests {
     }
 
     #[test]
+    fn assembles_independent_sidebar_filters() {
+        let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, TOOL_RESULT]);
+        let html = render_session_html(&log);
+
+        assert!(html.contains("id=\"filter-default\""));
+        for category in ["user", "assistant", "tools", "subagents", "state"] {
+            assert!(
+                html.contains(&format!("data-entry-filter=\"{category}\"")),
+                "missing {category} sidebar toggle"
+            );
+        }
+        assert_eq!(html.matches("data-entry-filter=").count(), 5);
+    }
+
+    #[test]
     fn title_derived_from_first_prompt() {
         let (_dir, log) = log_from_jsonl(&[SYSTEM, USER]);
         let html = render_session_html(&log);

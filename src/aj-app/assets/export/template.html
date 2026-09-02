@@ -21,11 +21,12 @@
           <input type="text" class="sidebar-search" id="tree-search" placeholder="Search...">
         </div>
         <div class="sidebar-filters">
-          <button class="filter-btn active" data-filter="default" title="Hide state entries">Default</button>
-          <button class="filter-btn" data-filter="no-tools" title="Default minus tool results">No-tools</button>
-          <button class="filter-btn" data-filter="user-only" title="Only user messages">User</button>
-          <button class="filter-btn" data-filter="all" title="Show everything">All</button>
-          <button class="toggle-btn" id="toggle-subagents" title="Show or hide sub-agent runs in the sidebar">Sub-agents</button>
+          <button type="button" class="filter-btn active" id="filter-default" aria-pressed="true" title="Show user and assistant messages">Default</button>
+          <button type="button" class="filter-btn active" data-entry-filter="user" aria-pressed="true" title="Show or hide user messages">User</button>
+          <button type="button" class="filter-btn active" data-entry-filter="assistant" aria-pressed="true" title="Show or hide assistant messages">Assistant</button>
+          <button type="button" class="filter-btn" data-entry-filter="tools" aria-pressed="false" title="Show or hide tool results and task notices">Tools</button>
+          <button type="button" class="filter-btn" data-entry-filter="subagents" aria-pressed="false" title="Show or hide sub-agent runs">Sub-agents</button>
+          <button type="button" class="filter-btn" data-entry-filter="state" aria-pressed="false" title="Show or hide session state and compactions">State</button>
           <button class="sidebar-close" id="sidebar-close" title="Close" aria-label="Close sidebar">&#10005;</button>
         </div>
       </div>

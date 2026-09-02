@@ -47,9 +47,9 @@ body {
 a { color: var(--link); }
 
 /* Layout: a fixed-width navigation sidebar beside a scrolling content
- * pane. The sidebar lists the conversation tree (branches plus, by
- * default, sub-agent runs hanging off the message that spawned them). A
- * sub-agent run also renders inline as a collapsible box in the content. */
+ * pane. The sidebar lists the filterable conversation tree, including
+ * sub-agent runs hanging off the message that spawned them when enabled.
+ * A sub-agent run also renders inline as a collapsible box in the content. */
 #app { display: flex; min-height: 100vh; }
 #sidebar {
   width: var(--sidebar-width); flex-shrink: 0; display: flex; flex-direction: column;
@@ -74,14 +74,6 @@ a { color: var(--link); }
 }
 .filter-btn:hover { color: var(--fg); border-color: var(--fg); }
 .filter-btn.active { background: var(--link); color: var(--bg); border-color: var(--link); }
-/* The sub-agent toggle is independent of the radio filters, so it uses
- * the tool accent (amber) when active to read as a separate control. */
-.toggle-btn {
-  padding: 3px 8px; font-size: 10px; font-family: inherit; background: transparent;
-  color: var(--muted); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
-}
-.toggle-btn:hover { color: var(--fg); border-color: var(--fg); }
-.toggle-btn.active { background: var(--tool); color: var(--bg); border-color: var(--tool); }
 .sidebar-close {
   display: none; padding: 3px 8px; font-size: 12px; font-family: inherit; background: transparent;
   color: var(--muted); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; margin-left: auto;
@@ -195,6 +187,7 @@ pre code { background: none; padding: 0; }
 .role { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
 .msg.user .role { color: var(--user); }
 .msg.assistant .role { color: var(--assistant); }
+.entry-anchor { display: block; }
 .role .model { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); }
 .msg.highlight { outline: 2px solid var(--link); outline-offset: 2px; }
 .copy-link-btn {

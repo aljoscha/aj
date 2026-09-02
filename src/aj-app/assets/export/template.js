@@ -487,6 +487,10 @@
       html += '<div class="msg assistant" id="entry-' + escapeHtml(entry.id) + '">' + copyLinkButton(entry.id) +
         '<div class="role">Assistant <span class="model">' + escapeHtml(msg.model || '') + '</span></div>' +
         body + '</div>';
+    } else {
+      // Tool-only assistant turns have no bubble, but their sidebar row still
+      // needs a stable target immediately before the rendered tool blocks.
+      html += '<span class="entry-anchor" id="entry-' + escapeHtml(entry.id) + '"></span>';
     }
 
     for (const block of msg.content || []) {
@@ -697,8 +701,8 @@
       '</div></div>';
 
     const sysEntry = entries.find((e) => e.type === 'system_prompt');
-    if (sysEntry && sysEntry.text) {
-      html += '<details class="system-prompt"><summary class="system-prompt-header">System prompt</summary>' +
+    if (sysEntry) {
+      html += '<details class="system-prompt" id="entry-' + escapeHtml(sysEntry.id) + '"><summary class="system-prompt-header">System prompt</summary>' +
         '<pre>' + escapeHtml(sysEntry.text) + '</pre></details>';
     }
     return html;
@@ -1095,75 +1099,38 @@
   // FILTERING
   // ============================================================
 
-  let filterMode = 'default';
   let searchQuery = '';
-  // Sub-agent runs are shown by default; the sidebar toggle hides them.
-  let showSubAgents = true;
-  const STATE_TYPES = ['system_prompt', 'model_change', 'thinking_change', 'speed_change', 'verbosity_change', 'env_change'];
-  const activeLeafIsExempt = (entry, leafId) =>
-    entry.id === leafId && !STATE_TYPES.includes(entry.type);
+  const DEFAULT_FILTERS = { user: true, assistant: true, tools: false, subagents: false, state: false };
+  const entryFilters = Object.assign({}, DEFAULT_FILTERS);
+  const STATE_TYPES = new Set([
+    'system_prompt', 'model_change', 'thinking_change', 'speed_change',
+    'verbosity_change', 'env_change', 'compaction',
+  ]);
 
-  // Structural suppression that runs in every filter mode: the
-  // sub-agent toggle, the duplicate `agent` tool result, and the empty
-  // assistant wrapper whose tool calls already show as their own
-  // tool-result rows. The current non-state leaf is exempt so the active
-  // conversation never vanishes. State leaves still obey the selected mode.
-  // This set is the widest any mode can show, so it is
-  // the denominator for the "x / y entries" status: under "All" with no
-  // search the numerator equals it and the status reads N / N.
-  function structurallyVisible(entry, leafId) {
-    // Sub-agent rows appear only when the toggle is on. Checked before
-    // the leaf rule so hiding wins even if the leaf is a sub-agent.
-    if (entry.thread === 'subagent' && !showSubAgents) return false;
-    if (activeLeafIsExempt(entry, leafId)) return true;
-
-    // A successful `agent` tool result duplicates its sub-agent run:
-    // when sub-agent rows are shown, the run's spawn node already names
-    // the same task (and its report shows in the inline box), so drop
-    // the tool result to avoid listing the task twice. With sub-agent
-    // rows hidden there is no spawn node, so we keep it as the
-    // conversation-thread trace of the call. A failed run is always
-    // kept so the failure is not lost, matching renderToolCall.
-    if (showSubAgents && entry.type === 'message' && entry.message && entry.message.role === 'tool_result') {
-      const tr = entry.message;
-      const call = tr.tool_call_id ? toolCallById.get(tr.tool_call_id) : null;
-      const isAgent = call ? call.name === 'agent' : tr.tool_name === 'agent';
-      if (isAgent && !tr.is_error && hasInlineRun(tr.tool_call_id, tr)) return false;
-    }
-
-    // Hide assistant messages that are only tool calls (no text) unless
-    // the turn errored or was aborted. Their calls already appear as the
-    // tool-result rows beneath them.
-    if (entry.type === 'message' && entry.message && entry.message.role === 'assistant') {
-      const hasText = textOf(entry.message.content).trim().length > 0;
-      const sr = entry.message.stop_reason;
-      const errored = sr && sr !== 'Stop' && sr !== 'ToolUse';
-      if (!hasText && !errored) return false;
-    }
-    return true;
+  function entryCategory(entry) {
+    if (entry.thread === 'subagent') return 'subagents';
+    if (STATE_TYPES.has(entry.type)) return 'state';
+    if (entry.type !== 'message') return null;
+    if (!entry.message) return null;
+    if (entry.message.role === 'user') return 'user';
+    if (entry.message.role === 'assistant') return 'assistant';
+    if (entry.message.role === 'tool_result' || entry.message.role === 'task_notification') return 'tools';
+    return null;
   }
 
-  function passesMode(entry) {
-    const isState = STATE_TYPES.includes(entry.type);
-    switch (filterMode) {
-      case 'user-only': return entry.type === 'message' && entry.message && entry.message.role === 'user';
-      case 'no-tools': return !isState && !(entry.type === 'message' && entry.message && entry.message.role === 'tool_result');
-      case 'all': return true;
-      default: return !isState;
-    }
+  function structurallyVisible(entry) {
+    return entryCategory(entry) != null;
   }
 
-  // Returns the laid-out visible nodes plus `total`, the structural
-  // count that is the status denominator. The active mode and search
-  // narrow the structural set. A non-state leaf stays visible regardless,
-  // matching structurallyVisible, while a state leaf obeys the mode.
-  function filterNodes(flatNodes, leafId, activeIds) {
+  // Returns the laid-out visible nodes plus the stable number of categorized
+  // entries. Toggles and search narrow only the numerator.
+  function filterNodes(flatNodes, activeIds) {
     const tokens = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
-    const structural = flatNodes.filter((flat) => structurallyVisible(flat.node.entry, leafId));
+    const structural = flatNodes.filter((flat) => structurallyVisible(flat.node.entry));
     const visible = structural.filter((flat) => {
       const entry = flat.node.entry;
-      if (activeLeafIsExempt(entry, leafId)) return true;
-      if (!passesMode(entry)) return false;
+      const category = entryCategory(entry);
+      if (!entryFilters[category]) return false;
       if (tokens.length > 0) {
         const text = searchableText(entry);
         if (!tokens.every((t) => text.includes(t))) return false;
@@ -1188,7 +1155,7 @@
     const roots = buildTree();
     const activeIds = activePathIds(currentLeafId);
     const flatNodes = collectNodes(roots);
-    const { visible: filtered, total } = filterNodes(flatNodes, currentLeafId, activeIds);
+    const { visible: filtered, total } = filterNodes(flatNodes, activeIds);
     const container = document.getElementById('tree-container');
 
     container.innerHTML = '';
@@ -1468,38 +1435,48 @@
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
   }
 
-  document.querySelectorAll('.filter-btn').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.filter-btn').forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      filterMode = btn.dataset.filter;
-      renderTree();
-    });
-  });
+  const defaultFilterButton = document.getElementById('filter-default');
+  const entryFilterButtons = Array.from(document.querySelectorAll('[data-entry-filter]'));
 
-  // Sub-agent visibility is an independent toggle, not one of the radio
-  // filter modes. Hidden entirely when the session spawned no sub-agents.
-  const subToggle = document.getElementById('toggle-subagents');
-  if (subToggle) {
-    if (subThread.size === 0) {
-      subToggle.style.display = 'none';
-    } else {
-      subToggle.classList.toggle('active', showSubAgents);
-      subToggle.addEventListener('click', () => {
-        showSubAgents = !showSubAgents;
-        subToggle.classList.toggle('active', showSubAgents);
-        // If we hide while the active leaf is a sub-agent (e.g. a
-        // hand-crafted deep link), re-home onto its host conversation so
-        // the active node does not vanish from the tree.
-        const leaf = byId.get(currentLeafId);
-        if (!showSubAgents && leaf && leaf.thread === 'subagent') {
-          navigateTo(leafForTarget(currentLeafId), 'none');
-          return;
-        }
-        renderTree();
-      });
+  function filtersAreDefault() {
+    return Object.keys(DEFAULT_FILTERS).every((key) => entryFilters[key] === DEFAULT_FILTERS[key]);
+  }
+
+  function updateFilterButtons() {
+    const isDefault = filtersAreDefault();
+    defaultFilterButton.classList.toggle('active', isDefault);
+    defaultFilterButton.setAttribute('aria-pressed', String(isDefault));
+    for (const button of entryFilterButtons) {
+      const active = entryFilters[button.dataset.entryFilter];
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
     }
   }
+
+  function applyFilterChange() {
+    updateFilterButtons();
+    // A hand-crafted deep link can use a sub-agent entry as its leaf. Re-home
+    // it when that category is hidden so the active branch remains coherent.
+    const leaf = byId.get(currentLeafId);
+    if (!entryFilters.subagents && leaf && leaf.thread === 'subagent') {
+      navigateTo(leafForTarget(currentLeafId), 'none');
+      return;
+    }
+    renderTree();
+  }
+
+  defaultFilterButton.addEventListener('click', () => {
+    Object.assign(entryFilters, DEFAULT_FILTERS);
+    applyFilterChange();
+  });
+  for (const button of entryFilterButtons) {
+    button.addEventListener('click', () => {
+      const category = button.dataset.entryFilter;
+      entryFilters[category] = !entryFilters[category];
+      applyFilterChange();
+    });
+  }
+  updateFilterButtons();
 
   function isEditable(el) {
     if (!el) return false;
