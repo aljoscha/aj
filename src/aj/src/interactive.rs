@@ -3728,21 +3728,27 @@ async fn apply_command_action(
                     continue;
                 };
                 let default = set.default;
-                rows.extend(set.accounts.into_iter().filter_map(|(account_label, _)| {
-                    if account_label == default {
-                        return None;
-                    }
+                rows.extend(set.accounts.into_iter().map(|(account_label, _)| {
+                    let is_current = account_label == default;
                     let (shown, search) = account_picker_text(&account_label);
                     let action = AccountAction::SetDefault {
                         provider_id: id.clone(),
                         account_label: account_label.clone(),
                     };
-                    Some(AuthRow {
+                    AuthRow {
                         request: AuthPickerRequest::InspectAccount(action),
-                        label: format!("{id} — {shown}"),
+                        label: if is_current {
+                            format!("{id} — {shown} (current)")
+                        } else {
+                            format!("{id} — {shown}")
+                        },
                         filter_key: format!("{id} {search}"),
-                        summary: "make this the default account".to_string(),
-                    })
+                        summary: if is_current {
+                            "current default account".to_string()
+                        } else {
+                            "make this the default account".to_string()
+                        },
+                    }
                 }));
             }
             if rows.is_empty() {
@@ -14581,6 +14587,15 @@ mod tests {
             ActionEffect::OpenedOverlay
         ));
         focus_overlay(&mut app, &root);
+        app.render(&root).expect("render default-account picker");
+        let picker = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            picker.contains("provider — personal (current)"),
+            "current default is visible and tagged: {picker}"
+        );
+        writer.write_all(b"\x1b[B").expect("select next account");
+        let event = app.next_input().await.expect("picker navigation event");
+        app.handle_input(event);
         writer.write_all(b"\r").expect("select work");
         let event = app.next_input().await.expect("picker event");
         app.handle_input(event);
