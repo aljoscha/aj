@@ -10,7 +10,7 @@
 
 use serde::Deserialize;
 
-use super::{OAuthError, redacted_body_summary};
+use super::{OAuthError, redacted_body_summary, redacted_oauth_error_body};
 
 /// Bound on every token-endpoint HTTP call. Long enough to cover the
 /// network round-trip even on slow connections, short enough that a
@@ -47,11 +47,11 @@ pub(super) struct TokenResponse {
 /// `request` carries the provider's chosen body encoding (JSON vs.
 /// form) and headers. `token_url` is passed separately only to label
 /// transport errors. A non-2xx response surfaces as
-/// [`OAuthError::Server`] with the raw body (RFC 6749 error objects,
-/// the key login-failure diagnostic, not credentials). A 2xx body that
-/// fails to deserialize surfaces as [`OAuthError::Parse`] with the body
-/// *redacted*: a successful token body is itself the credential
-/// payload, and `OAuthError`'s `Display` reaches logs and stdout.
+/// [`OAuthError::Server`] with only the standard RFC 6749 `error` and
+/// `error_description` fields retained. A 2xx body that fails to deserialize
+/// surfaces as [`OAuthError::Parse`] with the body redacted. Token endpoint
+/// bodies can carry credentials under either status, and `OAuthError`'s
+/// `Display` reaches logs and stdout.
 pub(super) async fn send_token_request(
     request: reqwest::RequestBuilder,
     token_url: &str,
@@ -70,7 +70,7 @@ pub(super) async fn send_token_request(
     if !status.is_success() {
         return Err(OAuthError::Server {
             status: status.as_u16(),
-            body: text,
+            body: redacted_oauth_error_body(&text),
         });
     }
 
