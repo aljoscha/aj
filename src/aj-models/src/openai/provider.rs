@@ -846,6 +846,7 @@ struct ToolCallSlot {
 }
 
 impl StreamState {
+    #[cfg(any(test, feature = "test-support"))]
     fn new(model: &ModelInfo) -> Self {
         Self::new_with_account(model, None)
     }
