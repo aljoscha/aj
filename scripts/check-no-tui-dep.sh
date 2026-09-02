@@ -3,9 +3,9 @@
 #
 # aj-app is the frontend-agnostic core. Keeping the vaxis backend out of its
 # runtime dependency closure preserves the core/frontend boundary: rendering
-# lives in the `aj` binary, not in the shared library. See
-# docs/aj-app-extraction-spec.md. We check the normal (runtime) dependency
-# closure only; dev-dependencies do not leak into a consuming binary.
+# lives in the `aj` binary, not in the shared library. We check the normal
+# (runtime) dependency closure only; dev-dependencies do not leak into a
+# consuming binary.
 set -euo pipefail
 
 banned='^(vaxis|vaxis-ucd|vaxis-derive)( |$)'

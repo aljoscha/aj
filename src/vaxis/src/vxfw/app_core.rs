@@ -526,7 +526,7 @@ pub(crate) struct FocusHandler {
     ///
     /// TODO: a focus-inspector overlay that renders the focus tree and this
     /// log with per-node handled markers. The record also still lacks the
-    /// "which controller action fired" slot the keymap spec calls for, which
+    /// "which controller action fired" slot, which
     /// needs a label channel from `KeymapController::fire` through the
     /// `EventContext`. Both belong to the inspector work.
     pub(crate) keystroke_log: VecDeque<KeystrokeRecord>,

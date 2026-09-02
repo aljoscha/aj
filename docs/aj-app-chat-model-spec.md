@@ -2,7 +2,7 @@
 
 ## Status: implemented
 
-Companion to `docs/aj-next-vaxis-plan.md`. This spec defines the one true
+This spec defines the one true
 interface for `aj-next`'s interactive rendering: a backend-neutral **chat model**
 (`ChatState`) plus an **`AgentEvent` reducer** that applies each event to that
 model.

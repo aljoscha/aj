@@ -2,8 +2,10 @@
 
 ## Status: phases 0 through 3 landed and accepted, phase 4 (provisioning) paused, daily-driving
 
-Companion document: `docs/remote-control-implementation.md`, the manual
-for the implementing agent.
+This document is the authoritative contract for the wire protocol, the
+host, the gateway, and the client. A change that alters behaviour it
+describes updates the relevant section in the same range. Existing code
+refers to sections here as a bare `spec N.N`.
 
 ## 1. Overview
 
@@ -1425,9 +1427,9 @@ The wire surface (gateway capability):
 ### 7.3 The ember backend
 
 Ember is CLI-only by design, the backend shells out and parses
-`--format json` where available (the manual flags ember behavior as
-"re-verify against the installed ember" since it is a separate
-project):
+`--format json` where available (ember is a separate project, so its
+behavior is re-verified against the installed ember rather than
+assumed):
 
 - One-time setup (documented, not automated by aj): build a golden
   image with `ember image build` from a Dockerfile that bakes the aj
@@ -1814,8 +1816,7 @@ every new direct dependency requires an explicit architecture review.
 
 ## 11. Testing strategy
 
-Tests come first in each phase (the implementation manual is explicit
-about ordering). The layers:
+Tests come first in each phase. The layers:
 
 1. **Wire tests**: strict round-trip identity for every known event
    variant and frame kind, pinned JSON fixtures both directions,

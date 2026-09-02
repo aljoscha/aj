@@ -14,8 +14,8 @@ cover bash tasks, with live output in the transcript.
 
 This builds directly on the retention + concurrency foundation from
 `docs/subagent-steering-spec.md` (§7 there sketches background spawn as
-"an additive mode on top"; this is that mode) and reuses the rendering
-machinery from `docs/subagent-observability-spec.md`.
+"an additive mode on top"; this is that mode) and reuses the sub-agent
+rendering machinery.
 
 This document is the implementation contract. It is split into stages
 at the end for orchestration.

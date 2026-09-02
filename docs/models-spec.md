@@ -339,16 +339,15 @@ the `AgentMessage → Message` projection before each call.
 JSONL files in `~/.aj/threads/` — lives in the `aj-session` crate,
 not in `aj-models`. `aj-session` consumes both wire `Message`s
 (from `aj-models`) and `AgentMessage`s (from `aj-agent`) and writes
-them to disk. See `docs/aj-next-plan.md` §2.0 and §3 for the
-on-disk schema, the migration plan, and the bus-listener model that
-drives writes.
+them to disk. The on-disk schema and the bus-listener model that
+drives writes are owned by `aj-session`.
 
 ### 1.8 Thread Persistence (out of scope)
 
 Thread persistence is **not** part of `aj-models`. The JSONL on-disk
 format, `ConversationLog`, replay, and thread navigation all live in
 the `aj-session` crate, which is layered on top of `aj-models` and
-`aj-agent`. See `docs/aj-next-plan.md` for the design.
+`aj-agent`.
 
 This is a deliberate split. `aj-models` is reusable from any
 frontend (CLI, TUI, RPC server, embedded harness) without forcing a
@@ -367,7 +366,7 @@ use a different store, or skip persistence entirely.
 with the `aj-next` cutover, is a clean break in `aj-models` terms:
 the new wire `Message` types differ from today's `MessageParam`
 shape, and any pre-existing thread files use the old shape. The
-migration walker in `aj-session` (see `aj-next-plan.md` §3)
+migration walker in `aj-session`
 rewrites the agent-level fields (`UserOutput` → `ToolDetails`); a
 separate one-shot pass handles wire-message migration when the
 `aj-models` rewrite lands. Both walkers leave `.bak` files; both
@@ -2613,5 +2612,4 @@ All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
     remove the old `StreamingEvent` enum, remove the `openai_ng` module.
     Remove the `async-openai` dependency. The conversation persistence
     that today lives in `aj-models::conversation` is removed from
-    `aj-models` entirely (moved to `aj-session`); see
-    `docs/aj-next-plan.md` §2.0.
+    `aj-models` entirely (moved to `aj-session`).

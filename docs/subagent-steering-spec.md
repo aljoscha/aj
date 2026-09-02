@@ -7,9 +7,8 @@ concurrently with whatever the main agent (or other sub-agents) are
 doing. The sub-agent view becomes the main view in every respect except
 which agent it is wired to.
 
-This supersedes the "steering a sub-agent from the picker
-(observe-only)" non-goal in `docs/subagent-observability-spec.md`; the
-rendering, picker, footer and box machinery built there are reused
+The sub-agent rendering, picker, footer and box machinery this builds
+on were designed observe-only; steering is added on top of them
 unchanged.
 
 This document is the implementation contract. It is split into stages

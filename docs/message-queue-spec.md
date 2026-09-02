@@ -8,8 +8,7 @@ the turn is done. The same gesture set also lets the user **steer** a
 running turn — inject a more urgent message right after the next tool
 call — and pull a queued message back into the editor to edit it.
 
-This implements the two queues sketched in `docs/aj-next-plan.md` §1.9
-("Steering and follow-up queues") and finally wires the
+This implements the steering and follow-up queues and wires the
 already-defined-but-unemitted `AgentEvent::QueueUpdate` event
 (`src/aj-agent/src/events.rs`). It applies to the main agent **and** to
 sub-agents (which are fully promptable per
@@ -101,9 +100,8 @@ trigger already guards.
 
 The loader, footer, and editor marker are all rendered for
 `EventPump::active_view` and re-synced on `set_active_view`
-(`event_pump.rs:408`/`417`); per-agent state is keyed by `AgentId`
-(`docs/view-scoped-footer-spec.md`). The pending-message box follows
-the same model.
+(`event_pump.rs:408`/`417`); per-agent state is keyed by `AgentId`.
+The pending-message box follows the same model.
 
 ---
 
