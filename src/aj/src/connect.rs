@@ -70,26 +70,23 @@ pub(crate) async fn connect(
     let session_env = args.launch_env().map_err(|err| anyhow!("--env: {err}"))?;
     let session = launch.session();
     // A gateway needs its directory to validate `--host`, so fetch that before
-    // host resolution. A plain host validates the same flag from hello first.
-    // Named and latest session selection then fill the snapshot only when host
-    // validation did not already fetch it. This preserves which invalid input
-    // wins while sharing one generation between both decisions.
-    let mut directory = if launch.host().is_some() && hello.working_directory.is_none() {
+    // host resolution. Named selection can reuse that exact validation snapshot.
+    // Latest deliberately reads again after host resolution because recency is a
+    // later decision and may have changed in between. A plain host validates the
+    // flag from hello and needs no host-directory snapshot.
+    let host_directory = if launch.host().is_some() && hello.working_directory.is_none() {
         Some(read_directory(&control).await?)
     } else {
         None
     };
     let host = match launch.host() {
-        Some(named) => resolve_named_host(&hello, named, directory.as_ref())?,
+        Some(named) => resolve_named_host(&hello, named, host_directory.as_ref())?,
         None => None,
     };
-    if directory.is_none() && matches!(session, ConnectSession::Named(_) | ConnectSession::Latest) {
-        directory = Some(read_directory(&control).await?);
-    }
     let (session, created) = resolve_session(
         &control,
         session,
-        directory.as_ref(),
+        host_directory.as_ref(),
         host,
         settings,
         tag,
@@ -164,7 +161,7 @@ fn resolve_named_host(
 async fn resolve_session(
     control: &Control,
     session: ConnectSession<'_>,
-    directory: Option<&SessionList>,
+    host_directory: Option<&SessionList>,
     host: Option<String>,
     settings: Option<SessionSettings>,
     tag: Option<String>,
@@ -172,7 +169,14 @@ async fn resolve_session(
 ) -> Result<(String, bool)> {
     match session {
         ConnectSession::Named(id) => {
-            let list = directory.expect("named session resolution requires the directory snapshot");
+            let fetched;
+            let list = match host_directory {
+                Some(directory) => directory,
+                None => {
+                    fetched = read_directory(control).await?;
+                    &fetched
+                }
+            };
             if list.sessions.iter().any(|summary| summary.id == id) {
                 Ok((id.to_string(), false))
             } else {
@@ -184,8 +188,7 @@ async fn resolve_session(
             true,
         )),
         ConnectSession::Latest => {
-            let list =
-                directory.expect("latest session resolution requires the directory snapshot");
+            let list = read_directory(control).await?;
             // Most recently modified, with the id as the tie-break: ids are
             // minted as timestamps, so the higher one is the younger session.
             // An archived session is one its user is done with, and this is
@@ -320,11 +323,17 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use aj_app::host::{Command, SessionHost};
-    use aj_wire::SessionSummary;
+    use aj_wire::{QueueCounts, SessionSummary};
+    use axum::{Json, Router, routing::get};
+    use chrono::Utc;
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::remote::tests::{HostHandles, addr, bounded, scripted, scripted_host};
@@ -348,6 +357,121 @@ mod tests {
 
     fn nothing_stated() -> Stated {
         Stated::new(ConfigLayer::default(), ConfigLayer::default())
+    }
+
+    fn gateway_session(id: &str, last_activity: chrono::DateTime<Utc>) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            live: false,
+            working: false,
+            queued: QueueCounts::default(),
+            tasks: 0,
+            last_seq: None,
+            last_activity,
+            tag: None,
+            host: Some("host-id".to_string()),
+            unreachable: false,
+            archived: false,
+            locked: false,
+            lock_generation: None,
+        }
+    }
+
+    /// Gateway host validation and Latest selection are separate decisions.
+    /// The latter must observe a session that appears after the former rather
+    /// than reusing its older directory generation.
+    #[tokio::test]
+    async fn gateway_latest_reads_again_after_host_resolution() {
+        let host = DirectoryHost {
+            id: Some("host-id".to_string()),
+            address: None,
+            name: Some("workstation".to_string()),
+            working_directory: Some(PathBuf::from("/workstation")),
+            unreachable: false,
+        };
+        let now = Utc::now();
+        let responses = Arc::new([
+            SessionList {
+                sessions: vec![gateway_session("host-id:older", now)],
+                hosts: vec![host.clone()],
+            },
+            SessionList {
+                sessions: vec![
+                    gateway_session("host-id:older", now),
+                    gateway_session("host-id:newer", now + chrono::Duration::seconds(1)),
+                ],
+                hosts: vec![host],
+            },
+        ]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&responses);
+        let counted = Arc::clone(&reads);
+        let hello = Hello {
+            protocol: aj_wire::PROTOCOL_VERSION,
+            capabilities: Vec::new(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            host_id: "gateway".to_string(),
+            working_directory: None,
+            name: None,
+        };
+        let app = Router::new()
+            .route(
+                "/v1/hello",
+                get(move || {
+                    let hello = hello.clone();
+                    async { Json(hello) }
+                }),
+            )
+            .route(
+                "/v1/sessions",
+                get(move || {
+                    let index = counted.fetch_add(1, Ordering::SeqCst);
+                    let response = served
+                        .get(index)
+                        .cloned()
+                        .expect("connect reads exactly the two directory generations");
+                    async { Json(response) }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sequenced gateway");
+        let address = listener.local_addr().expect("read gateway address");
+        let (shutdown, stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        let url = format!("http://{address}");
+        let parsed = args(&["aj", "connect", &url, "--host", "host-id"]);
+        let launch = parsed.connect_launch().expect("connect launch");
+
+        let connected = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect(&parsed, &Config::default(), &nothing_stated(), &launch),
+        )
+        .await
+        .expect("connect did not settle")
+        .expect("connect through the sequenced gateway");
+        assert_eq!(
+            connected.session, "host-id:newer",
+            "Latest reused the host-validation directory generation",
+        );
+        assert!(!connected.created, "Latest created instead of attaching");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "gateway host validation and Latest selection need independent reads",
+        );
+
+        drop(connected);
+        shutdown.send(()).expect("the sequenced gateway is running");
+        task.await
+            .expect("join the sequenced gateway")
+            .expect("stop the sequenced gateway");
     }
 
     /// A stock client states nothing, so nothing travels and the host defaults

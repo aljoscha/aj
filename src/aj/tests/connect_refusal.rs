@@ -4,7 +4,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
-use std::process::ExitStatus;
+use std::os::unix::process::CommandExt;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -71,6 +72,7 @@ impl TestHost {
                         id: Some("host-id".to_string()),
                         address: None,
                         name: Some("workstation".to_string()),
+                        working_directory: Some(std::path::PathBuf::from("/workstation")),
                         unreachable: false,
                     }]
                 })
@@ -164,6 +166,13 @@ struct ChildOutput {
     timed_out: bool,
 }
 
+struct DetachedOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
 async fn run_connect(
     home: &TempDir,
     url: &str,
@@ -234,6 +243,65 @@ async fn run_connect(
     })
     .await
     .expect("join the aj connect runner")
+}
+
+/// Run connect in a fresh process session with no controlling terminal.
+/// Correct preflight needs no terminal, while reaching `PosixTty::new` first
+/// fails at its `/dev/tty` acquisition and changes the observed refusal.
+async fn run_connect_without_terminal(home: &TempDir, url: &str, id: &str) -> DetachedOutput {
+    let home = home.path().to_path_buf();
+    let url = url.to_string();
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let stdout_path = home.join("detached-stdout");
+        let stderr_path = home.join("detached-stderr");
+        let stdout = File::create(&stdout_path).expect("create detached stdout");
+        let stderr = File::create(&stderr_path).expect("create detached stderr");
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_aj"));
+        command
+            .args(["connect", &url, &id])
+            .current_dir(&home)
+            .env("HOME", &home)
+            .env("AJ_LOG_FILE", "/dev/null")
+            .env("RUST_LOG", "")
+            .env("RUST_BACKTRACE", "0")
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        // SAFETY: the post-fork hook calls only setsid, the same
+        // async-signal-safe operation used by vaxis's PTY launcher.
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(std::io::Error::from)
+            });
+        }
+        let mut child = command.spawn().expect("spawn detached aj connect");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (status, timed_out) = loop {
+            if let Some(status) = child.try_wait().expect("poll detached aj connect") {
+                break (status, false);
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("kill a stuck detached aj connect");
+                break (
+                    child.wait().expect("reap a stuck detached aj connect"),
+                    true,
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        DetachedOutput {
+            status,
+            stdout: std::fs::read_to_string(&stdout_path).expect("read detached stdout"),
+            stderr: std::fs::read_to_string(&stderr_path).expect("read detached stderr"),
+            timed_out,
+        }
+    })
+    .await
+    .expect("join the detached aj connect runner")
 }
 
 fn read_terminal(master: OwnedFd) -> Vec<u8> {
@@ -312,6 +380,32 @@ async fn an_unknown_explicit_session_refuses_before_the_terminal_and_exits_nonze
 
         assert_preterminal_refusal(id, expected_stderr, output, session_reads, event_reads);
     }
+}
+
+#[tokio::test]
+async fn an_unknown_explicit_session_refuses_without_acquiring_a_terminal() {
+    let home = TempDir::new().expect("temporary home");
+    let host = TestHost::start(PeerKind::Host).await;
+
+    let output = run_connect_without_terminal(&home, &host.url, "nosuchsession").await;
+    let (session_reads, event_reads) = host.stop().await;
+
+    assert!(!output.timed_out, "the detached refusal did not finish");
+    assert_ne!(
+        output.status.code().expect("a normal exit code"),
+        0,
+        "the detached refusal reported success",
+    );
+    assert_eq!(
+        output.stderr, "Error: unknown session \"nosuchsession\"\n",
+        "terminal acquisition replaced the preflight refusal",
+    );
+    assert_eq!(output.stdout, "", "the detached refusal wrote to stdout");
+    assert_eq!(
+        session_reads, 1,
+        "the detached preflight refetched sessions"
+    );
+    assert_eq!(event_reads, 0, "the detached preflight reached attach");
 }
 
 #[tokio::test]
