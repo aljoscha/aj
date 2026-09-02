@@ -1059,6 +1059,7 @@ pub(super) struct StreamState {
 }
 
 impl StreamState {
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn new(model: &ModelInfo, requested_tier: Option<ServiceTier>) -> Self {
         Self::new_with_account(model, requested_tier, None)
     }
