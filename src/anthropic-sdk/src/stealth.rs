@@ -39,7 +39,7 @@ pub(crate) const CLAUDE_CODE_IDENTITY_PROMPT: &str =
 /// That only affects OAuth mode, since API-key requests don't send this
 /// header. Bump it if OAuth turns start failing authorization for no
 /// other apparent reason.
-pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.75";
+pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.251";
 
 /// Canonical tool names from Claude Code 2.x.
 ///
