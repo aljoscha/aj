@@ -34,7 +34,6 @@ use aj_app::keybindings::{
 };
 use aj_app::theme::{Theme, ThemeColor};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
-use aj_models::auth::{AccountLabelDisplayMode, display_account_label};
 use aj_session::SessionStats;
 use unicode_segmentation::UnicodeSegmentation;
 use vaxis::cell::{Segment, Style};
@@ -627,13 +626,11 @@ pub(crate) fn auth_rows(
         .iter()
         .map(|status| {
             status.account_label.as_deref().map(|label| {
-                let ordinary = display_account_label(label, AccountLabelDisplayMode::Ordinary);
-                let represented = if ordinary.contains(' ') {
-                    display_account_label(label, AccountLabelDisplayMode::Ascii)
-                } else {
-                    ordinary
-                };
-                account_label_for_auth_row(&represented, account_cell_budget, width_method)
+                // As stored, folded to one row exactly like a session tag: a
+                // control character in a hand-edited legacy label must not
+                // reach the terminal through this read-only surface.
+                let folded = crate::text::one_line(label);
+                account_label_for_auth_row(&folded, account_cell_budget, width_method)
             })
         })
         .collect::<Vec<_>>();
@@ -1149,9 +1146,10 @@ mod tests {
             Method::Unicode,
         ));
         assert!(rows.contains("work"), "{rows}");
-        assert!(
-            rows.contains("\\!\\u{77}\\u{6f}\\u{a}\\u{72}\\u{6b}"),
-            "{rows}"
+        assert_eq!(
+            rows.matches("work").count(),
+            2,
+            "both accounts render a row, the hostile one folded: {rows}"
         );
         assert_eq!(rows.matches("default").count(), 1, "{rows}");
         assert!(
@@ -1218,17 +1216,15 @@ mod tests {
             &test_styles(),
             Method::Unicode,
         ));
-        assert!(rows.contains("\\!\\u{61}\\u{20}\\u{62}"), "{rows}");
-        assert!(rows.contains("\\u{20}\\u{20}\\u{20}\\u{20}"), "{rows}");
         assert!(
-            !rows.contains("a    b"),
-            "raw trimmable identity reached RichText"
+            rows.contains("a b") && rows.contains("a    b"),
+            "labels render as stored: {rows}"
         );
     }
 
     #[test]
     fn auth_rows_disclose_bounded_geometry_for_over_limit_legacy_labels() {
-        let label = format!("{}\u{1000}", "a".repeat(10_921));
+        let label = format!("{}\u{1000}", "a".repeat(65_540));
         let rows = rows_text(&auth_rows(
             &[ProviderAuthStatus {
                 provider_id: "provider".into(),
@@ -1246,7 +1242,7 @@ mod tests {
             "{rows}"
         );
         assert!(
-            !rows.contains("\\u{1000}"),
+            !rows.contains('\u{1000}'),
             "the final tail entered vaxis: {rows}"
         );
         assert!(
@@ -1258,7 +1254,7 @@ mod tests {
 
     #[test]
     fn auth_rows_budget_the_exact_limit_label_against_the_complete_row() {
-        let label = format!("{}\u{0100}", "a".repeat(10_921));
+        let label = format!("{}\u{0100}", "a".repeat(65_533));
         let rows = auth_rows(
             &[ProviderAuthStatus {
                 provider_id: "provider".into(),
@@ -1277,7 +1273,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            !text.contains("\\u{100}"),
+            !text.contains('\u{0100}'),
             "the exact-limit tail entered RichText: {text}"
         );
         let cells = rows[0]

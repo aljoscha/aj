@@ -49,10 +49,7 @@ use aj_conf::skills::Skill;
 use aj_conf::{
     AgentEnv, Config, ConfigDiagnostic, ConfigThinkingDisplay, ConfigVerbosity, Severity,
 };
-use aj_models::auth::{
-    AccountLabelDisplayMode, AuthError, AuthStorage, StoredProviderCredentials,
-    display_account_label,
-};
+use aj_models::auth::{AuthError, AuthStorage, StoredProviderCredentials};
 use aj_models::registry::ModelInfo;
 use aj_models::types::UserContent;
 use aj_models::usage::default_reset_sources;
@@ -2265,10 +2262,11 @@ async fn open_default_logout_resolution(
 }
 
 /// Represent an exact raw account for a picker. Search retains the complete
-/// canonical representation, while the row gets a disclosed bounded prefix so
-/// no selector surface claims to expose an arbitrarily long legacy identity.
+/// stored label folded to one line (exactly like a session tag reaching a
+/// row), while the row gets a disclosed bounded prefix so no selector surface
+/// claims to expose an arbitrarily long legacy identity.
 fn account_picker_text(raw: &str) -> (String, String) {
-    let represented = display_account_label(raw, AccountLabelDisplayMode::Ordinary);
+    let represented = crate::text::one_line(raw);
     let shown = if represented.len() > 65_535 {
         let prefix = represented.chars().take(96).collect::<String>();
         format!("[clipped; exceeds 65,535-cell inspection limit] {prefix}…")
@@ -2278,21 +2276,15 @@ fn account_picker_text(raw: &str) -> (String, String) {
     (shown, represented)
 }
 
-/// Post-action account text for transcript prose. Ordinary representations
-/// without spaces survive wrapping unchanged; labels with spaces use ASCII
-/// mode. An over-limit identity is referred to generically after its dedicated
-/// confirmation rather than inserting a partial identity.
+/// Post-action account text for transcript prose. A label shows as stored,
+/// folded to one line for the transcript row; an over-limit legacy identity
+/// is referred to generically after its dedicated confirmation rather than
+/// inserting a partial identity.
 fn account_notice_text(raw: &str) -> String {
-    let ordinary = display_account_label(raw, AccountLabelDisplayMode::Ordinary);
-    let represented = if ordinary.contains(' ') {
-        display_account_label(raw, AccountLabelDisplayMode::Ascii)
-    } else {
-        ordinary
-    };
-    if represented.len() > 65_535 {
+    if raw.len() > 65_535 {
         "the selected account (label exceeds the terminal inspection limit)".to_string()
     } else {
-        represented
+        crate::text::one_line(raw)
     }
 }
 
@@ -13888,7 +13880,7 @@ mod tests {
     async fn auth_fetch_draws_exact_limit_legacy_row_at_narrow_overlay_geometry() {
         let dir = TempDir::new().expect("tempdir");
         let (world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let label = format!("{}\u{0100}", "a".repeat(10_921));
+        let label = format!("{}\u{0100}", "a".repeat(65_533));
         let raw = serde_json::json!({
             "provider": {
                 "type": "accounts",
@@ -13942,7 +13934,7 @@ mod tests {
             "{fetched}"
         );
         assert!(
-            !fetched.contains("\\u{100}"),
+            !fetched.contains('\u{0100}'),
             "the exact legacy tail reached the row: {fetched}"
         );
     }
@@ -14104,11 +14096,8 @@ mod tests {
         let one_space = account_notice_text("a b");
         let many_spaces = account_notice_text("a    b");
         assert_ne!(one_space, many_spaces);
-        assert!(
-            !one_space.contains(' '),
-            "prose representation must not expose trimmable spaces"
-        );
-        assert!(many_spaces.contains("\\u{20}\\u{20}"));
+        assert_eq!(one_space, "a b", "a label shows as stored");
+        assert_eq!(many_spaces, "a    b", "a label shows as stored");
     }
 
     #[tokio::test]
@@ -14491,7 +14480,6 @@ mod tests {
         app.render(&root).expect("render hostile rows");
         let rendered = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(rendered.contains("work"), "{rendered}");
-        assert!(rendered.contains("\\!\\u{77}\\u{6f}\\u{a}"), "{rendered}");
         assert!(
             !rendered.contains("wo\nrk"),
             "raw label leaked: {rendered:?}"
@@ -14624,7 +14612,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_limit_logout_path_discloses_clipping_acknowledges_and_removes_raw_key() {
-        let label = format!("{}\u{1000}", "a".repeat(10_921));
+        let label = format!("{}\u{1000}", "a".repeat(65_535));
         let dir = TempDir::new().expect("tempdir");
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
@@ -14686,7 +14674,7 @@ mod tests {
         app.render(&root).expect("render bounded prefix end");
         let after_end = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
-            after_end.contains("\\u{61}"),
+            after_end.contains("aaa"),
             "End blanked the bounded represented prefix: {after_end}"
         );
         assert!(
@@ -14732,14 +14720,14 @@ mod tests {
             "{notices}"
         );
         assert!(
-            !notices.contains("\\u{1000}"),
+            !notices.contains('\u{1000}'),
             "full legacy tail leaked: {notices}"
         );
     }
 
     #[tokio::test]
     async fn exact_limit_logout_path_reaches_tail_then_removes_the_exact_raw_key() {
-        let label = format!("{}\u{0100}", "a".repeat(10_921));
+        let label = format!("{}\u{0100}", "a".repeat(65_533));
         let dir = TempDir::new().expect("tempdir");
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
@@ -14790,7 +14778,7 @@ mod tests {
         app.render(&root).expect("render final tail");
         let tail = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
-            tail.contains("\\u{100}"),
+            tail.contains('\u{0100}'),
             "final tail was not exposed: {tail:?}"
         );
 
@@ -14821,7 +14809,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_limit_login_replacement_requires_acknowledgement_before_oauth_request() {
-        let label = format!("{}\u{1000}", "a".repeat(10_921));
+        let label = format!("{}\u{1000}", "a".repeat(65_535));
         let dir = TempDir::new().expect("tempdir");
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;

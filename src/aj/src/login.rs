@@ -38,10 +38,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use aj_app::auth::{LoginLine, auth_lines, browser_available, copy_to_clipboard, open_browser};
 use aj_app::keybindings::{fixed_keys, format_keybinding};
 use aj_app::theme::{Theme, ThemeColor};
-use aj_models::auth::{
-    AccountLabelDisplayMode, display_account_label, validate_account_label,
-    validate_account_label_edit,
-};
+use aj_models::auth::{normalize_account_label, validate_account_label_edit};
 use aj_models::oauth::{OAuthAuthInfo, OAuthCallbacks, OAuthError};
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
@@ -273,12 +270,7 @@ impl LoginDialog {
             let st = Arc::clone(&state);
             let submitted_value = Rc::clone(&input_value);
             field.on_submit = Some(Box::new(move |_ctx, value| {
-                let kind = st.lock().expect("login dialog state poisoned").input_kind;
-                let value = if kind == Some(LoginInputKind::AccountLabel) {
-                    value.to_string()
-                } else {
-                    value.trim().to_string()
-                };
+                let value = value.trim().to_string();
                 let sender = pending.lock().expect("pending input poisoned").take();
                 match sender {
                     // Only deliver a non-empty value; a stray empty submit
@@ -548,7 +540,7 @@ impl Widget for LoginDialog {
                     && !self.account_insertion_is_safe(text)
                 {
                     self.refuse_account_input(
-                        "Account label paste rejected: use safe single-line Unicode within 256 bytes.",
+                        "Account label paste rejected: a label is one line within 256 bytes.",
                     );
                 } else {
                     self.clear_input_error();
@@ -637,7 +629,7 @@ impl Widget for LoginDialog {
                     || key.matches(u32::from('j'), Modifiers::CTRL)
                 {
                     let value = self.input_value.borrow();
-                    if let Err(err) = validate_account_label(&value) {
+                    if let Err(err) = normalize_account_label(&value) {
                         self.refuse_account_input(&format!("Account label rejected: {err}"));
                         ctx.consume_and_redraw();
                         return;
@@ -647,7 +639,7 @@ impl Widget for LoginDialog {
                     && !self.account_insertion_is_safe(text)
                 {
                     self.refuse_account_input(
-                        "Account label character rejected: use safe single-line Unicode within 256 bytes.",
+                        "Account label character rejected: a label is one line within 256 bytes.",
                     );
                     ctx.consume_and_redraw();
                     return;
@@ -727,8 +719,9 @@ impl DialogCallbacks {
         rx.await.map_err(|_| OAuthError::Cancelled)
     }
 
-    /// Ask for a new account label before OAuth begins. Existing exact labels
-    /// are represented through the shared grammar for collision guidance.
+    /// Ask for a new account label before OAuth begins. Existing labels are
+    /// listed as stored for collision guidance, within a byte budget so an
+    /// oversized legacy store cannot balloon the prompt.
     pub(crate) async fn prompt_account_label(
         &self,
         existing: &[String],
@@ -738,16 +731,12 @@ impl DialogCallbacks {
         let mut represented_bytes = 0;
         let mut omitted = 0;
         for label in existing {
-            let ordinary = display_account_label(label, AccountLabelDisplayMode::Ordinary);
-            let represented = if ordinary.contains(' ') {
-                display_account_label(label, AccountLabelDisplayMode::Ascii)
-            } else {
-                ordinary
-            };
+            // As stored, folded to the prompt's one line like any label row.
+            let folded = crate::text::one_line(label);
             let separator = usize::from(!labels.is_empty()) * 2;
-            if represented_bytes + separator + represented.len() <= REPRESENTATION_BUDGET {
-                represented_bytes += separator + represented.len();
-                labels.push(represented);
+            if represented_bytes + separator + folded.len() <= REPRESENTATION_BUDGET {
+                represented_bytes += separator + folded.len();
+                labels.push(folded);
             } else {
                 omitted += 1;
             }
@@ -1081,29 +1070,36 @@ impl AccountConfirmation {
         warning_style: Style,
     ) -> Self {
         let (_, raw_label) = action.identity();
-        let creation_valid = validate_account_label(raw_label).is_ok();
-        let represented = display_account_label(raw_label, AccountLabelDisplayMode::Ordinary);
-        // A creation-valid ordinary label is bounded to 512 cells by contract.
-        // Only the scalar-escaped legacy branch can approach the u16 limit, and
-        // every one of its bytes is one terminal cell.
-        let represented_cells = if creation_valid {
-            usize::from(vaxis::gwidth::gwidth(
-                &represented,
-                vaxis::gwidth::Method::Unicode,
-            ))
-        } else {
-            represented.len()
+        // As stored, folded to one drawn line like every label surface: the
+        // exact identity lives in `action`, this widget only shows it.
+        let represented = crate::text::one_line(raw_label);
+        // A stored label shows as stored. One grapheme's width fits u16, and
+        // summing in usize keeps an arbitrarily long legacy label's
+        // measurement exact where a single saturating u16 total could never
+        // exceed the inspection limit.
+        use unicode_segmentation::UnicodeSegmentation as _;
+        let unicode_cells = |text: &str| -> usize {
+            text.graphemes(true)
+                .map(|grapheme| {
+                    usize::from(vaxis::gwidth::gwidth(
+                        grapheme,
+                        vaxis::gwidth::Method::Unicode,
+                    ))
+                })
+                .sum()
         };
+        let represented_cells = unicode_cells(&represented);
         let over_limit = represented_cells > ACCOUNT_INSPECTION_CELL_LIMIT;
-        let shown = if over_limit {
-            represented
+        let (shown, surface_representation_cells) = if over_limit {
+            let prefix = represented
                 .chars()
                 .take(OVER_LIMIT_PREFIX_CELLS)
-                .collect::<String>()
+                .collect::<String>();
+            let cells = unicode_cells(&prefix);
+            (prefix, cells)
         } else {
-            represented
+            (represented, represented_cells)
         };
-        let surface_representation_cells = shown.len();
         let mut text_widget = Text::new(shown);
         text_widget.softwrap = false;
         let text = Rc::new(RefCell::new(text_widget));
@@ -1453,7 +1449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_label_rejects_unsafe_and_overlength_edits_atomically() {
+    async fn account_label_rejects_control_and_overlength_edits_atomically() {
         let (mut dialog, state, pending, _cancel) = make();
         let (cb, _rx) = callbacks(&state, &pending);
         let fut = tokio::spawn(async move { cb.prompt_account_label(&[]).await });
@@ -1474,7 +1470,7 @@ mod tests {
         for rejected in [
             Event::Paste("\n".to_string()),
             Event::Paste("bbbbbbb".to_string()),
-            key_event(0x202e, Modifiers::empty(), Some("\u{202e}")),
+            key_event(0x7, Modifiers::empty(), Some("\u{7}")),
         ] {
             dialog.handle_event(&mut ctx, &rejected);
             assert_eq!(
@@ -1492,10 +1488,7 @@ mod tests {
             assert!(!fut.is_finished(), "callback did not fire");
         }
         let error = state.lock().unwrap().input_error.clone().unwrap();
-        assert!(
-            !error.contains('\u{202e}'),
-            "diagnostic echoed rejected text"
-        );
+        assert!(!error.contains('\u{7}'), "diagnostic echoed rejected text");
 
         dialog.handle_event(&mut ctx, &Event::Paste("bbbbbb".to_string()));
         let accepted = format!("{accepted}bbbbbb");
@@ -1519,32 +1512,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_account_label_stays_editable_after_rejected_submission() {
+    async fn a_padded_label_submission_is_trimmed_and_delivered() {
         let (mut dialog, state, pending, _cancel) = make();
         let (cb, _rx) = callbacks(&state, &pending);
         let fut = tokio::spawn(async move { cb.prompt_account_label(&["wo\nrk".into()]).await });
         tokio::task::yield_now().await;
         let prompt = state.lock().unwrap().input_prompt.clone().unwrap();
         assert!(
-            prompt.contains("\\!\\u{77}"),
-            "legacy label represented: {prompt}"
+            prompt.contains("work") && !prompt.contains('\n'),
+            "legacy label folds to the prompt line: {prompt:?}"
         );
 
         let mut ctx = EventContext::new();
         dialog.handle_event(&mut ctx, &Event::Paste("work ".to_string()));
         dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
-        assert_eq!(dialog.input_value.borrow().as_str(), "work ");
-        assert_eq!(dialog.field.byte_offset_to_cursor(), 5);
-        assert!(pending.lock().unwrap().is_some());
-        assert!(!fut.is_finished());
-        assert!(state.lock().unwrap().input_error.is_some());
-
-        dialog.handle_event(
-            &mut ctx,
-            &key_event(Key::BACKSPACE, Modifiers::empty(), None),
+        assert!(
+            state.lock().unwrap().input_error.is_none(),
+            "padding is trimmed, not refused"
         );
-        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
         assert_eq!(fut.await.unwrap().unwrap(), "work");
+        assert_eq!(
+            dialog.input_value.borrow().as_str(),
+            "",
+            "the delivered submission cleared the field"
+        );
     }
 
     #[tokio::test]
@@ -1573,9 +1564,10 @@ mod tests {
             !prompt.contains("[clipped"),
             "sub-limit labels were rewritten"
         );
-        assert!(prompt.contains("\\!\\u{61}\\u{20}\\u{62}"), "{prompt}");
-        assert!(prompt.contains("\\u{20}\\u{20}\\u{20}\\u{20}"), "{prompt}");
-        assert!(!prompt.contains("a    b"));
+        assert!(
+            prompt.contains("a b") && prompt.contains("a    b"),
+            "labels list as stored: {prompt}"
+        );
         drop(dialog);
         drop(pending.lock().unwrap().take());
         assert!(matches!(fut.await.unwrap(), Err(OAuthError::Cancelled)));
@@ -1585,10 +1577,10 @@ mod tests {
     async fn exact_limit_existing_label_uses_width_safe_prompt_guidance() {
         let (mut dialog, state, pending, _cancel) = make();
         let (cb, _rx) = callbacks(&state, &pending);
-        let exact_limit = format!("{}\u{0100}", "a".repeat(10_921));
-        assert_eq!(
-            display_account_label(&exact_limit, AccountLabelDisplayMode::Ordinary).len(),
-            65_535
+        let exact_limit = "a".repeat(4_097);
+        assert!(
+            exact_limit.len() > 4_096,
+            "fixture exceeds the prompt's representation budget"
         );
         let fut = tokio::spawn(async move { cb.prompt_account_label(&[exact_limit]).await });
         tokio::task::yield_now().await;
@@ -2025,7 +2017,7 @@ mod tests {
     fn account_confirmation_end_uses_the_active_width_method() {
         let raw = format!("{}個", "👋🏿".repeat(31));
         assert!(
-            validate_account_label(&raw).is_ok(),
+            normalize_account_label(&raw).is_ok(),
             "creation-valid fixture"
         );
         let (mut confirmation, _) = confirmation_for(raw);
@@ -2049,7 +2041,7 @@ mod tests {
 
     #[test]
     fn exact_limit_account_confirmation_scrolls_to_the_final_tail() {
-        let raw = format!("{}\u{0100}", "a".repeat(10_921));
+        let raw = format!("{}\u{0100}", "a".repeat(65_534));
         let (mut confirmation, _) = confirmation_for(raw);
         assert_eq!(confirmation.represented_cells, 65_535);
         assert_eq!(confirmation.surface_representation_cells, 65_535);
@@ -2064,14 +2056,14 @@ mod tests {
         );
         let tail = crate::test_support::rows(&confirmation.draw(&ctx)).join("\n");
         assert!(
-            tail.contains("\\u{100}"),
+            tail.contains('\u{0100}'),
             "final tail is reachable: {tail:?}"
         );
     }
 
     #[test]
     fn over_limit_account_requires_acknowledgement_and_keeps_raw_identity() {
-        let raw = format!("{}\u{1000}", "a".repeat(10_921));
+        let raw = format!("{}\u{1000}", "a".repeat(65_535));
         let (mut confirmation, request) = confirmation_for(raw.clone());
         assert_eq!(confirmation.represented_cells, 65_536);
         assert_eq!(
@@ -2108,7 +2100,7 @@ mod tests {
 
     #[test]
     fn over_limit_account_end_stays_within_the_bounded_surface_extent() {
-        let raw = format!("{}\u{1000}", "a".repeat(10_921));
+        let raw = format!("{}\u{1000}", "a".repeat(65_535));
         let (mut confirmation, _) = confirmation_for(raw);
         let draw_ctx = crate::test_support::draw_ctx(24, Some(4));
         let _ = confirmation.draw(&draw_ctx);
@@ -2127,7 +2119,7 @@ mod tests {
         );
         let rows = crate::test_support::rows(&confirmation.draw(&draw_ctx));
         assert!(
-            rows[0].contains("\\u{61}"),
+            rows[0].contains("aaa"),
             "bounded prefix disappeared: {rows:?}"
         );
         assert!(!confirmation.view.borrow().has_more_right());

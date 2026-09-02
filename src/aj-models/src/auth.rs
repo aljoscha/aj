@@ -43,8 +43,7 @@ use crate::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider, 
 
 mod account_label;
 pub use account_label::{
-    ACCOUNT_LABEL_UNICODE_VERSION, AccountLabelDisplayMode, AccountLabelValidationError,
-    MAX_ACCOUNT_LABEL_BYTES, display_account_label, validate_account_label,
+    AccountLabelError, MAX_ACCOUNT_LABEL_BYTES, normalize_account_label,
     validate_account_label_edit,
 };
 
@@ -259,8 +258,20 @@ fn check_account_insert(data: &AuthData, provider_id: &str, label: &str) -> Resu
             label: label.to_string(),
         });
     }
-    validate_account_label(label).map_err(|err| AuthError::InvalidLabel(err.to_string()))?;
-    Ok(())
+    // The store's account keys are exact strings, so the one transformation
+    // the rule performs, the trim, happens at the prompt that collects the
+    // label. Here the label must already be its own normal form: anything
+    // else is an API caller bypassing that prompt.
+    match normalize_account_label(label) {
+        Ok(Some(normalized)) if normalized == label => Ok(()),
+        Ok(Some(_)) => Err(AuthError::InvalidLabel(
+            "no surrounding whitespace".to_string(),
+        )),
+        Ok(None) => Err(AuthError::InvalidLabel(
+            "at least one character".to_string(),
+        )),
+        Err(err) => Err(AuthError::InvalidLabel(err.to_string())),
+    }
 }
 
 /// Apply an insertion already approved by [`check_account_insert`].
@@ -332,8 +343,8 @@ pub enum AuthError {
     /// default would move what unlabeled resolution bills against.
     #[error("the selected account is provider {provider:?}'s default; set another default first")]
     RemovingDefault { provider: String, label: String },
-    /// An account label that fails the shared creation policy, including its
-    /// normalization, Unicode repertoire, grapheme, spacing, and length rules.
+    /// A label the account rule refuses: control characters, over-long, blank,
+    /// or padded input reaching the store without the prompt's trim.
     #[error("invalid account label: {0}")]
     InvalidLabel(String),
     /// Insert-only account creation named an exact key already occupied in
@@ -3587,9 +3598,9 @@ mod tests {
             }
         }
 
-        let label = format!("{}\u{1000}", "a".repeat(10_921));
+        let label = "a".repeat(65_536);
         assert_eq!(
-            display_account_label(&label, AccountLabelDisplayMode::Ordinary).len(),
+            label.len(),
             65_536,
             "fixture crosses the terminal inspection boundary"
         );
