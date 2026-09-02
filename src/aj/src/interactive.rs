@@ -170,6 +170,11 @@ struct World {
     /// Every reader either has a wire equivalent to fall back on or is a
     /// gesture connect mode refuses outright.
     local: Option<LocalHandles>,
+    /// Client-side notices every locally created session receives once. Its
+    /// environment is read when these are folded, while process-wide
+    /// diagnostics, credential status, and terminal capabilities are captured
+    /// once at launch.
+    local_session_notices: Option<LocalSessionNotices>,
     /// The directory the focused session runs in: this process's own for a
     /// local run, a direct host's from `hello`, or a gateway host's from the
     /// focused session's directory row.
@@ -225,6 +230,15 @@ struct World {
     launch_env: Option<BTreeMap<String, String>>,
 }
 
+/// The process-side inputs to one local fresh session's leading notice block.
+#[derive(Clone)]
+struct LocalSessionNotices {
+    diagnostics: Vec<AgentEvent>,
+    sandbox_warning: bool,
+    auth_warning: Option<String>,
+    tmux_warning: Option<String>,
+}
+
 /// Which session the process opens with.
 enum StartupSession {
     /// Mint a fresh one.
@@ -254,6 +268,12 @@ async fn build_world(
     // or any hint renders. Rejected entries are surfaced as a startup warning
     // in the notice block below.
     let keybinding_problems = aj_app::actions::install_keybindings(config.keybindings.clone());
+    let mut local_session_notices = LocalSessionNotices {
+        diagnostics: startup_diagnostic_events(diagnostics, &keybinding_problems),
+        sandbox_warning: aj_app::notices::sandbox_warning_enabled(),
+        auth_warning: None,
+        tmux_warning: aj_app::tmux::options().and_then(aj_app::tmux::build_warning),
+    };
 
     // `aj continue` with neither an explicit id nor a latest session
     // on disk degrades to a fresh session, matching `aj`.
@@ -330,7 +350,6 @@ async fn build_world(
             .expect("run config mutex poisoned");
         (cfg.settings(), cfg.model_info.context_window)
     };
-    let provider_id = settings.provider.clone();
     let chat = seeded_chat(&config, settings, context_window, &catalog);
     let mut world = World {
         control,
@@ -346,6 +365,7 @@ async fn build_world(
         startup: HashMap::new(),
         chat: Rc::new(RefCell::new(chat)),
         status: Rc::new(RefCell::new(StatusState::default())),
+        local_session_notices: None,
         config,
         config_layers,
         catalog,
@@ -358,47 +378,36 @@ async fn build_world(
     fold_attach_block(&mut world).await;
     refresh_client_reads(&mut world).await;
 
-    // Startup notices, after the attach block so resumed history stays on
-    // top. Order mirrors aj: config diagnostics, then (fresh session only)
-    // the context listing followed by the skill warnings, then sandbox,
-    // auth, tmux, then the resume-restore notices.
-    fold_startup_diagnostics(&mut world, diagnostics, &keybinding_problems);
-    // The context listing and skill warnings describe the freshly-loaded env,
-    // which governs only a fresh session, so `fresh_env_notices` returns them
-    // for a create and nothing for a resume. Folding them here, ahead of the
-    // sandbox/auth/tmux warnings, keeps the context leading the fresh-session
-    // block. The same helper feeds the in-process new-session path, so a
-    // `/new` surfaces identical env context and skill problems.
-    for event in fresh_env_notices(fresh, &env) {
-        fold_event(&mut world, event);
-    }
-    if aj_app::notices::sandbox_warning_enabled() {
-        fold_warning(&mut world, aj_app::notices::SANDBOX_WARNING);
-    }
-    // Apply a `--api-key` runtime override to the resolved provider, then
-    // nudge toward logging in when no credential is configured. Both are
-    // skipped for the scripted fake provider, which needs no credentials.
+    // Apply a `--api-key` runtime override before checking the initial
+    // provider. Credential storage can wait on its cross-process file lock, so
+    // the result joins the launch snapshot rather than being re-read from the
+    // interactive session-change loop.
     if args.scripted.is_none() {
+        let provider = world
+            .local
+            .as_ref()
+            .expect("a local world has session handles")
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned")
+            .settings()
+            .provider;
         if let Some(key) = args.api_key.clone() {
-            auth.set_runtime_api_key(&provider_id, key).await;
+            auth.set_runtime_api_key(&provider, key).await;
         }
-        let warning = match auth.has_auth(&provider_id).await {
+        local_session_notices.auth_warning = match auth.has_auth(&provider).await {
             Ok(true) => None,
             Ok(false) => Some(format!(
                 "Heads up: {}",
-                aj_app::model::missing_key_message(&provider_id)
+                aj_app::model::missing_key_message(&provider)
             )),
             Err(err) => Some(format!(
-                "Couldn't check credentials for {provider_id:?}: {err}"
+                "Couldn't check credentials for {provider:?}: {err}"
             )),
         };
-        if let Some(text) = warning {
-            fold_warning(&mut world, &text);
-        }
     }
-    if let Some(warning) = aj_app::tmux::options().and_then(aj_app::tmux::build_warning) {
-        fold_warning(&mut world, &warning);
-    }
+    world.local_session_notices = Some(local_session_notices);
+    fold_local_session_notices(&mut world, fresh.then_some(&env));
     if !fresh && args.has_launch_tag() {
         fold_warning(&mut world, TAG_WITHOUT_A_CREATE);
     }
@@ -415,38 +424,37 @@ async fn build_world(
     Ok(world)
 }
 
-/// Fold the diagnostics every mode reports at startup: the config problems
-/// found while loading the layers, then the keybinding overrides that had no
-/// effect.
-///
-/// Folded after the attach block so a resumed session's history stays above
-/// them.
-fn fold_startup_diagnostics(
-    world: &mut World,
+/// Build the client diagnostics that lead a local fresh session's notice block
+/// and that every mode reports when the process starts: config problems first,
+/// then keybinding overrides that had no effect.
+fn startup_diagnostic_events(
     diagnostics: &[ConfigDiagnostic],
     keybinding_problems: &[aj_app::actions::KeybindingProblem],
-) {
-    for d in diagnostics {
-        let text = d.to_string();
-        let event = match d.severity() {
-            Severity::Warning => AgentEvent::Warning {
-                agent_id: AgentId::Main,
-                text,
-            },
-            Severity::Error => AgentEvent::Error {
-                agent_id: AgentId::Main,
-                text,
-            },
-        };
-        fold_event(world, event);
-    }
+) -> Vec<AgentEvent> {
+    let mut events = diagnostics
+        .iter()
+        .map(|d| {
+            let text = d.to_string();
+            match d.severity() {
+                Severity::Warning => AgentEvent::Warning {
+                    agent_id: AgentId::Main,
+                    text,
+                },
+                Severity::Error => AgentEvent::Error {
+                    agent_id: AgentId::Main,
+                    text,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
     if !keybinding_problems.is_empty() {
         let mut msg = String::from("Some keybindings in config.toml had no effect:");
         for problem in keybinding_problems {
             msg.push_str(&format!("\n  - {problem}"));
         }
-        fold_warning(world, &msg);
+        events.push(warning_event(&msg));
     }
+    events
 }
 
 /// Build the session world against a remote host: the connect-mode half of
@@ -500,6 +508,7 @@ async fn build_connect_world(
         startup: HashMap::new(),
         chat: Rc::new(RefCell::new(chat)),
         status: Rc::new(RefCell::new(StatusState::default())),
+        local_session_notices: None,
         config,
         config_layers,
         catalog,
@@ -511,7 +520,9 @@ async fn build_connect_world(
     refresh_client_reads(&mut world).await;
     world.sync_working_directory();
 
-    fold_startup_diagnostics(&mut world, diagnostics, &keybinding_problems);
+    for event in startup_diagnostic_events(diagnostics, &keybinding_problems) {
+        fold_event(&mut world, event);
+    }
     if args.listen.is_some() {
         fold_warning(
             &mut world,
@@ -1561,8 +1572,8 @@ fn fold_selected_startup(world: &mut World, startup: PendingStartup) {
         .as_ref()
         .map(|handles| (handles.env.clone(), handles.restore_notices.clone()));
     if let Some((env, restore_notices)) = local {
-        for event in fresh_env_notices(startup.fresh, &env) {
-            fold_event(world, event);
+        if startup.fresh {
+            fold_local_session_notices(world, Some(&env));
         }
         if startup.attaching {
             for notice in restore_notices {
@@ -2048,6 +2059,38 @@ fn fresh_env_notices(fresh: bool, env: &AgentEnv) -> Vec<AgentEvent> {
             .iter()
             .map(|d| warning_event(&d.to_string())),
     );
+    events
+}
+
+/// Fold the complete leading notice block for a local session. A fresh
+/// session supplies its newly assembled environment; an initial resume omits
+/// it but still receives the process-side diagnostics and safety warnings.
+fn fold_local_session_notices(world: &mut World, fresh_env: Option<&AgentEnv>) {
+    let Some(notices) = world.local_session_notices.clone() else {
+        return;
+    };
+    for event in local_session_notice_events(notices, fresh_env) {
+        fold_event(world, event);
+    }
+}
+
+fn local_session_notice_events(
+    notices: LocalSessionNotices,
+    fresh_env: Option<&AgentEnv>,
+) -> Vec<AgentEvent> {
+    let mut events = notices.diagnostics;
+    if let Some(env) = fresh_env {
+        events.extend(fresh_env_notices(true, env));
+    }
+    if notices.sandbox_warning {
+        events.push(warning_event(aj_app::notices::SANDBOX_WARNING));
+    }
+    if let Some(warning) = notices.auth_warning {
+        events.push(warning_event(&warning));
+    }
+    if let Some(warning) = notices.tmux_warning {
+        events.push(warning_event(&warning));
+    }
     events
 }
 
@@ -9995,14 +10038,12 @@ mod tests {
         shut_down(&blank).await;
     }
 
-    /// `fresh_env_notices` produces the fresh-session env block: a leading Info
-    /// context listing followed by one warning per skill diagnostic for a
-    /// fresh session, and nothing for a resume (whose prompt is fixed in its
-    /// log). This is the shared unit both the cold-start and `/new` paths
-    /// fold, so a skill problem introduced before a `/new` surfaces just as it
-    /// does on a cold start.
+    /// The complete fresh-session block keeps config diagnostics, context and
+    /// skill diagnostics, sandbox, auth, and tmux warnings in their promised
+    /// order. Its environment portion is absent for a resume, whose prompt is
+    /// fixed in its log.
     #[test]
-    fn fresh_env_notices_carries_context_and_skill_warnings_for_create_only() {
+    fn fresh_session_notice_block_has_one_order_and_fresh_environment() {
         let env = AgentEnv {
             working_directory: std::path::PathBuf::from("/tmp/project"),
             git_root_directory: None,
@@ -10038,17 +10079,49 @@ mod tests {
             resume.is_empty(),
             "a resume folds no env notices: {resume:?}"
         );
+
+        let complete = local_session_notice_events(
+            LocalSessionNotices {
+                diagnostics: vec![warning_event("config warning")],
+                sandbox_warning: true,
+                auth_warning: Some("auth warning".to_string()),
+                tmux_warning: Some("tmux warning".to_string()),
+            },
+            Some(&env),
+        );
+        assert!(
+            matches!(&complete[0], AgentEvent::Warning { text, .. } if text == "config warning")
+        );
+        assert!(
+            matches!(&complete[1], AgentEvent::Notice { text, .. } if text.contains("Context:"))
+        );
+        assert!(
+            matches!(&complete[2], AgentEvent::Warning { text, .. } if text.contains("missing description"))
+        );
+        assert!(
+            matches!(&complete[3], AgentEvent::Warning { text, .. } if text == aj_app::notices::SANDBOX_WARNING)
+        );
+        assert!(matches!(&complete[4], AgentEvent::Warning { text, .. } if text == "auth warning"));
+        assert!(matches!(&complete[5], AgentEvent::Warning { text, .. } if text == "tmux warning"));
+        assert_eq!(complete.len(), 6, "unexpected notice in the ordered block");
     }
 
-    /// A session change folds the fresh session's context as an Info notice: a
-    /// created session carries the context string into its scrollback, a
-    /// resume does not, and a refused change folds neither (it never left the
-    /// session it was in).
+    /// A created session receives the same leading notice block as the initial
+    /// one, while a resume neither regenerates its context nor repeats the
+    /// process-side warnings.
     #[tokio::test]
-    async fn session_switch_folds_context_for_fresh_only() {
+    async fn session_switch_folds_complete_notice_block_for_fresh_only() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let expected_notices = main_notices(&world);
+        let parity_warning = warning_event("session notice parity sentinel");
+        world
+            .local_session_notices
+            .as_mut()
+            .expect("a local world has a notice policy")
+            .diagnostics
+            .push(parity_warning);
         // Persist the session so the resume path below has a log on disk.
         persist_session(&mut world).await;
         let resumable = world.session().to_string();
@@ -10082,6 +10155,35 @@ mod tests {
             "a created session folds its context: {:?}",
             main_notices(&world),
         );
+        let created_notices = main_notices(&world);
+        assert_eq!(
+            created_notices
+                .iter()
+                .filter(|notice| notice.as_str() == "session notice parity sentinel")
+                .count(),
+            1,
+            "the created session omitted or duplicated a process-side warning",
+        );
+        let diagnostic_at = created_notices
+            .iter()
+            .position(|notice| notice == "session notice parity sentinel")
+            .expect("the deterministic process warning");
+        let context_at = created_notices
+            .iter()
+            .position(|notice| notice.contains("Context:"))
+            .expect("the fresh-session context");
+        assert!(
+            diagnostic_at < context_at,
+            "process diagnostics must lead fresh-session environment notices: {created_notices:?}",
+        );
+        assert_eq!(
+            created_notices
+                .into_iter()
+                .filter(|notice| notice != "session notice parity sentinel")
+                .collect::<Vec<_>>(),
+            expected_notices,
+            "a created session's notice block differs from initial startup",
+        );
 
         // Back onto the persisted session: a resume's prompt is fixed in its
         // log, so nothing describes the env read now.
@@ -10103,6 +10205,11 @@ mod tests {
             1,
             "a resume folded a second context onto the transcript it restored: {:?}",
             main_notices(&world),
+        );
+        assert_eq!(
+            main_notices(&world),
+            expected_notices,
+            "a resume duplicated or changed the initial notice block",
         );
 
         // A refused target remains selected with no fresh-session context and
