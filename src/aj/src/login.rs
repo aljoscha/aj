@@ -50,8 +50,8 @@ use vaxis::cell::{Hyperlink, Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     Builder, CursorState, DrawContext, Event, EventContext, FilterableSelect, ListView, MaxSize,
-    RelativePoint, RichText, ScrollView, ScrollableView, SelectItem, Size, Source, SubSurface,
-    Surface, Text, Widget, WidgetRef, WidthBasis, draw_widget, to_widget_ref,
+    RelativePoint, RichText, SelectItem, Size, Source, SubSurface, Surface, Text, Widget,
+    WidgetRef, WidthBasis, draw_widget, to_widget_ref,
 };
 
 use crate::overlay::{
@@ -825,7 +825,7 @@ pub(crate) enum LoginTarget {
     ExistingAccount(Option<String>),
 }
 
-/// A sensitive action over one exact raw account identity.
+/// An action over one or more labeled accounts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AccountAction {
     ReplaceLogin {
@@ -849,43 +849,7 @@ pub(crate) enum AccountAction {
     LogoutAll {
         provider_id: String,
         expected_accounts: Vec<String>,
-        inspect_index: usize,
     },
-}
-
-impl AccountAction {
-    pub(crate) fn identity(&self) -> (&str, &str) {
-        match self {
-            Self::ReplaceLogin {
-                provider_id,
-                account_label,
-                ..
-            }
-            | Self::Logout {
-                provider_id,
-                account_label,
-            }
-            | Self::SetDefault {
-                provider_id,
-                account_label,
-            } => (provider_id, account_label),
-            Self::LogoutWithNewDefault {
-                provider_id,
-                new_default,
-                ..
-            } => (provider_id, new_default),
-            Self::LogoutAll {
-                provider_id,
-                expected_accounts,
-                inspect_index,
-            } => (
-                provider_id,
-                expected_accounts
-                    .get(*inspect_index)
-                    .expect("logout-all inspection index names an expected account"),
-            ),
-        }
-    }
 }
 
 /// What confirming an auth picker row asks the host to do. Parked in the
@@ -899,9 +863,7 @@ pub(crate) enum AuthPickerRequest {
         provider_name: String,
         target: LoginTarget,
     },
-    /// Open the complete account-label inspection before a sensitive action.
-    InspectAccount(AccountAction),
-    /// Apply an action after its required inspection or acknowledgement.
+    /// Apply an action to one or more labeled accounts.
     ApplyAccount(AccountAction),
     /// Remove a provider's bare credential.
     LogoutBare { provider_id: String },
@@ -972,7 +934,7 @@ fn open_auth_picker(
             }
             // A confirmed pick is terminal: tear the whole stack down
             // (palette and picker) so the host can continue with a login
-            // dialog, account inspection, or direct bare mutation. Cancel
+            // dialog or direct mutation. Cancel
             // below uses `close_top`, returning to the palette underneath.
             close_all(&stack_c, ctx, &editor_c);
         }));
@@ -1046,220 +1008,6 @@ pub(crate) fn open_default_logout_picker(
         request_slot,
         "Choose a new default or remove all accounts",
         rows,
-    );
-}
-
-const ACCOUNT_INSPECTION_CELL_LIMIT: usize = 65_535;
-const OVER_LIMIT_PREFIX_CELLS: usize = 512;
-
-/// Non-softwrapped account-label inspection in front of a sensitive action.
-///
-/// The complete representation rides in a real [`ScrollView`] through 65,535
-/// logical cells. Longer legacy representations are classified in `usize`
-/// first and only a bounded represented prefix enters vaxis. Their action is
-/// armed by one explicit acknowledgement before a later Enter can confirm.
-struct AccountConfirmation {
-    /// The identity row is kept concrete so the non-softwrap contract is both
-    /// inspectable and asserted at draw, rather than hidden behind WidgetRef.
-    text: Rc<RefCell<Text>>,
-    view: Rc<RefCell<ScrollView>>,
-    represented_cells: usize,
-    surface_representation_cells: usize,
-    over_limit: bool,
-    acknowledged: bool,
-    last_width: u16,
-    action: AccountAction,
-    request_slot: Rc<RefCell<Option<AuthPickerRequest>>>,
-    stack: Rc<RefCell<OverlayStack>>,
-    editor: WidgetRef,
-    warning_style: Style,
-}
-
-impl AccountConfirmation {
-    fn new(
-        action: AccountAction,
-        request_slot: Rc<RefCell<Option<AuthPickerRequest>>>,
-        stack: Rc<RefCell<OverlayStack>>,
-        editor: WidgetRef,
-        warning_style: Style,
-    ) -> Self {
-        let (_, raw_label) = action.identity();
-        let creation_valid = validate_account_label(raw_label).is_ok();
-        let represented = display_account_label(raw_label, AccountLabelDisplayMode::Ordinary);
-        // A creation-valid ordinary label is bounded to 512 cells by contract.
-        // Only the scalar-escaped legacy branch can approach the u16 limit, and
-        // every one of its bytes is one terminal cell.
-        let represented_cells = if creation_valid {
-            usize::from(vaxis::gwidth::gwidth(
-                &represented,
-                vaxis::gwidth::Method::Unicode,
-            ))
-        } else {
-            represented.len()
-        };
-        let over_limit = represented_cells > ACCOUNT_INSPECTION_CELL_LIMIT;
-        let shown = if over_limit {
-            represented
-                .chars()
-                .take(OVER_LIMIT_PREFIX_CELLS)
-                .collect::<String>()
-        } else {
-            represented
-        };
-        let surface_representation_cells = shown.len();
-        let mut text_widget = Text::new(shown);
-        text_widget.softwrap = false;
-        let text = Rc::new(RefCell::new(text_widget));
-        let mut view = ScrollView::new(Source::Slice(vec![to_widget_ref(Rc::clone(&text))]));
-        view.draw_cursor = false;
-        Self {
-            text,
-            view: Rc::new(RefCell::new(view)),
-            represented_cells,
-            surface_representation_cells,
-            over_limit,
-            acknowledged: false,
-            last_width: 1,
-            action,
-            request_slot,
-            stack,
-            editor,
-            warning_style,
-        }
-    }
-}
-
-impl Widget for AccountConfirmation {
-    fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        debug_assert!(!self.text.borrow().softwrap);
-        debug_assert!(self.surface_representation_cells <= ACCOUNT_INSPECTION_CELL_LIMIT);
-        if !self.over_limit {
-            let represented_cells = ctx.string_width(&self.text.borrow().text);
-            self.represented_cells = represented_cells;
-            self.surface_representation_cells = represented_cells;
-        }
-        let size = ctx.max.size();
-        self.last_width = size.width.max(1);
-        let warning_rows = if self.over_limit { 2 } else { 1 };
-        let mut surface = Surface::with_size(size);
-        if size.height > 0 {
-            let view_ctx = ctx.with_constraints(
-                Size {
-                    width: 0,
-                    height: 0,
-                },
-                MaxSize {
-                    width: Some(size.width),
-                    height: Some(1),
-                },
-            );
-            surface.children.push(SubSurface {
-                origin: RelativePoint { row: 0, col: 0 },
-                surface: draw_widget(&to_widget_ref(Rc::clone(&self.view)), &view_ctx),
-                z_index: 0,
-            });
-        }
-        if size.height > 1 {
-            let message = if self.over_limit && self.acknowledged {
-                "Incomplete inspection acknowledged. Press Enter again to continue with the exact raw account."
-                    .to_string()
-            } else if self.over_limit {
-                format!(
-                    "Only a clipped prefix is shown. This legacy account exceeds the 65,535-cell \
-                     terminal inspection limit ({} cells).",
-                    self.represented_cells
-                )
-            } else {
-                "Use Left/Right or Home/End to inspect the complete account label.".to_string()
-            };
-            let mut warning = Text::new(message);
-            warning.style = self.warning_style;
-            warning.softwrap = true;
-            warning.width_basis = WidthBasis::Parent;
-            let warning_ctx = ctx.with_constraints(
-                Size {
-                    width: 0,
-                    height: 0,
-                },
-                MaxSize {
-                    width: Some(size.width),
-                    height: Some(size.height.saturating_sub(1).min(warning_rows)),
-                },
-            );
-            surface.children.push(SubSurface {
-                origin: RelativePoint { row: 1, col: 0 },
-                surface: warning.draw(&warning_ctx),
-                z_index: 0,
-            });
-        }
-        surface
-    }
-
-    fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
-        let Event::KeyPress(key) = event else {
-            self.view.borrow_mut().handle_event(ctx, event);
-            return;
-        };
-        if key.matches(Key::ESCAPE, Modifiers::empty()) {
-            close_top(&self.stack, ctx, &self.editor);
-        } else if key.matches(Key::HOME, Modifiers::empty()) {
-            self.view.borrow_mut().set_scroll_left(0);
-            ctx.consume_and_redraw();
-        } else if key.matches(Key::END, Modifiers::empty()) {
-            let max_left = self
-                .surface_representation_cells
-                .saturating_sub(usize::from(self.last_width));
-            self.view
-                .borrow_mut()
-                .set_scroll_left(u32::try_from(max_left).expect("bounded surface offset fits u32"));
-            ctx.consume_and_redraw();
-        } else if key.matches(Key::ENTER, Modifiers::empty()) {
-            if self.over_limit && !self.acknowledged {
-                self.acknowledged = true;
-                self.warning_style.bold = true;
-                ctx.consume_and_redraw();
-            } else {
-                *self.request_slot.borrow_mut() =
-                    Some(AuthPickerRequest::ApplyAccount(self.action.clone()));
-                close_all(&self.stack, ctx, &self.editor);
-            }
-        } else {
-            self.view.borrow_mut().handle_event(ctx, event);
-        }
-    }
-
-    fn wants_events(&self) -> bool {
-        true
-    }
-}
-
-/// Open account inspection for one sensitive raw-identity action.
-pub(crate) fn open_account_confirmation(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
-    theme: &Theme,
-    action: AccountAction,
-) {
-    let provider_id = action.identity().0.to_string();
-    let warning_style = LoginStyles::from_theme(theme, TerminalCaps::default()).notice;
-    let confirm = Rc::new(RefCell::new(AccountConfirmation::new(
-        action,
-        Rc::clone(request_slot),
-        Rc::clone(stack),
-        Rc::clone(editor),
-        warning_style,
-    )));
-    let focus = to_widget_ref(Rc::clone(&confirm));
-    push_window(
-        stack,
-        chrome,
-        &format!("Confirm account action — {provider_id}"),
-        "Left/Right inspect · Enter acknowledge/confirm · Esc close".to_string(),
-        to_widget_ref(confirm),
-        focus,
-        OverlayPlacement::Small,
     );
 }
 
@@ -1964,176 +1712,6 @@ mod tests {
             rows.iter().any(|r| r.contains("auth.example.com")),
             "the URL still renders as text: {rows:?}",
         );
-    }
-
-    fn confirmation_for(
-        raw_label: String,
-    ) -> (AccountConfirmation, Rc<RefCell<Option<AuthPickerRequest>>>) {
-        let request = Rc::new(RefCell::new(None));
-        let stack = Rc::new(RefCell::new(OverlayStack::default()));
-        let editor: WidgetRef = Rc::new(RefCell::new(Text::new("")));
-        let action = AccountAction::Logout {
-            provider_id: "provider".to_string(),
-            account_label: raw_label,
-        };
-        (
-            AccountConfirmation::new(action, Rc::clone(&request), stack, editor, Style::default()),
-            request,
-        )
-    }
-
-    #[test]
-    fn account_confirmation_preserves_internal_space_without_softwrap() {
-        let (mut one, _) = confirmation_for("a b".to_string());
-        let (mut many, _) = confirmation_for("a    b".to_string());
-        let ctx = crate::test_support::draw_ctx(2, Some(4));
-        assert!(!one.text.borrow().softwrap);
-        assert!(!many.text.borrow().softwrap);
-        let _ = one.draw(&ctx);
-        let _ = many.draw(&ctx);
-        assert!(one.view.borrow().has_more_right());
-        assert!(many.view.borrow().has_more_right());
-
-        let mut event_ctx = EventContext::new();
-        let mut final_rows = String::new();
-        for expected_left in 1..=4 {
-            many.handle_event(
-                &mut event_ctx,
-                &key_event(Key::RIGHT, Modifiers::empty(), None),
-            );
-            final_rows = crate::test_support::rows(&many.draw(&ctx)).join("\n");
-            assert_eq!(many.view.borrow().scroll_left(), expected_left);
-        }
-        assert!(
-            final_rows.contains(" b"),
-            "final cells remain in order: {final_rows:?}"
-        );
-        assert!(!many.view.borrow().has_more_right());
-    }
-
-    #[test]
-    fn account_confirmation_keeps_rtl_graphemes_in_logical_cells_without_isolates() {
-        let raw = "אב";
-        let (mut confirmation, _) = confirmation_for(raw.to_string());
-        let rows = crate::test_support::rows(
-            &confirmation.draw(&crate::test_support::draw_ctx(20, Some(4))),
-        )
-        .join("\n");
-        assert!(rows.contains(raw), "logical source order changed: {rows:?}");
-        assert!(!rows.contains('\u{2068}'), "vaxis must not inject FSI");
-        assert!(!rows.contains('\u{2069}'), "vaxis must not inject PDI");
-    }
-
-    #[test]
-    fn account_confirmation_end_uses_the_active_width_method() {
-        let raw = format!("{}個", "👋🏿".repeat(31));
-        assert!(
-            validate_account_label(&raw).is_ok(),
-            "creation-valid fixture"
-        );
-        let (mut confirmation, _) = confirmation_for(raw);
-        let mut ctx = crate::test_support::draw_ctx(10, Some(4));
-        ctx.width_method = vaxis::gwidth::Method::Wcwidth;
-        let _ = confirmation.draw(&ctx);
-        assert_eq!(confirmation.represented_cells, 126);
-
-        let mut event_ctx = EventContext::new();
-        confirmation.handle_event(
-            &mut event_ctx,
-            &key_event(Key::END, Modifiers::empty(), None),
-        );
-        let tail = crate::test_support::rows(&confirmation.draw(&ctx)).join("\n");
-        assert!(
-            tail.contains('個'),
-            "End reaches the final grapheme: {tail:?}"
-        );
-        assert!(!confirmation.view.borrow().has_more_right());
-    }
-
-    #[test]
-    fn exact_limit_account_confirmation_scrolls_to_the_final_tail() {
-        let raw = format!("{}\u{0100}", "a".repeat(10_921));
-        let (mut confirmation, _) = confirmation_for(raw);
-        assert_eq!(confirmation.represented_cells, 65_535);
-        assert_eq!(confirmation.surface_representation_cells, 65_535);
-        assert!(!confirmation.over_limit);
-
-        let ctx = crate::test_support::draw_ctx(24, Some(4));
-        let _ = confirmation.draw(&ctx);
-        let mut event_ctx = EventContext::new();
-        confirmation.handle_event(
-            &mut event_ctx,
-            &key_event(Key::END, Modifiers::empty(), None),
-        );
-        let tail = crate::test_support::rows(&confirmation.draw(&ctx)).join("\n");
-        assert!(
-            tail.contains("\\u{100}"),
-            "final tail is reachable: {tail:?}"
-        );
-    }
-
-    #[test]
-    fn over_limit_account_requires_acknowledgement_and_keeps_raw_identity() {
-        let raw = format!("{}\u{1000}", "a".repeat(10_921));
-        let (mut confirmation, request) = confirmation_for(raw.clone());
-        assert_eq!(confirmation.represented_cells, 65_536);
-        assert_eq!(
-            confirmation.surface_representation_cells, OVER_LIMIT_PREFIX_CELLS,
-            "only a bounded represented prefix enters vaxis"
-        );
-        assert!(confirmation.over_limit);
-
-        let mut ctx = EventContext::new();
-        confirmation.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
-        assert!(confirmation.acknowledged);
-        assert!(
-            request.borrow().is_none(),
-            "acknowledgement is not the action"
-        );
-        let warning = crate::test_support::rows(
-            &confirmation.draw(&crate::test_support::draw_ctx(80, Some(4))),
-        )
-        .join("\n");
-        assert!(
-            warning.contains("Incomplete inspection acknowledged"),
-            "{warning}"
-        );
-
-        confirmation.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
-        assert!(matches!(
-            request.borrow().as_ref(),
-            Some(AuthPickerRequest::ApplyAccount(AccountAction::Logout {
-                provider_id,
-                account_label,
-            })) if provider_id == "provider" && account_label == &raw
-        ));
-    }
-
-    #[test]
-    fn over_limit_account_end_stays_within_the_bounded_surface_extent() {
-        let raw = format!("{}\u{1000}", "a".repeat(10_921));
-        let (mut confirmation, _) = confirmation_for(raw);
-        let draw_ctx = crate::test_support::draw_ctx(24, Some(4));
-        let _ = confirmation.draw(&draw_ctx);
-
-        // The complete legacy extent can exceed every scroll offset type, but
-        // only the bounded disclosed prefix belongs to the vaxis surface.
-        confirmation.represented_cells = usize::try_from(u32::MAX).unwrap() + 25;
-        let mut event_ctx = EventContext::new();
-        confirmation.handle_event(
-            &mut event_ctx,
-            &key_event(Key::END, Modifiers::empty(), None),
-        );
-        assert_eq!(
-            confirmation.view.borrow().scroll_left(),
-            u32::try_from(OVER_LIMIT_PREFIX_CELLS - 24).unwrap()
-        );
-        let rows = crate::test_support::rows(&confirmation.draw(&draw_ctx));
-        assert!(
-            rows[0].contains("\\u{61}"),
-            "bounded prefix disappeared: {rows:?}"
-        );
-        assert!(!confirmation.view.borrow().has_more_right());
     }
 
     fn sample_rows() -> Vec<AuthRow> {

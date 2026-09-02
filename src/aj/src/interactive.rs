@@ -84,8 +84,8 @@ use crate::image_store::ImageStore;
 use crate::keymap::{HostCtx, build_keymap};
 use crate::login::{
     AccountAction, AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, LoginTarget,
-    open_account_confirmation, open_default_account_picker, open_default_logout_picker,
-    open_login_dialog, open_login_picker, open_logout_picker,
+    open_default_account_picker, open_default_logout_picker, open_login_dialog, open_login_picker,
+    open_logout_picker,
 };
 use crate::overlay::{MouseBlocker, OverlayChrome, OverlayStack, Scrim, close_key_label};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
@@ -2231,7 +2231,7 @@ async fn open_default_logout_resolution(
                 new_default: new_default.clone(),
             };
             AuthRow {
-                request: AuthPickerRequest::InspectAccount(action),
+                request: AuthPickerRequest::ApplyAccount(action),
                 label: shown,
                 filter_key: format!("{provider_id} {search}"),
                 summary: Some("make default, then remove the selected account".to_string()),
@@ -2239,10 +2239,9 @@ async fn open_default_logout_resolution(
         })
         .collect::<Vec<_>>();
     rows.push(AuthRow {
-        request: AuthPickerRequest::InspectAccount(AccountAction::LogoutAll {
+        request: AuthPickerRequest::ApplyAccount(AccountAction::LogoutAll {
             provider_id: provider_id.clone(),
             expected_accounts,
-            inspect_index: 0,
         }),
         label: format!("Remove all {provider_id} accounts"),
         filter_key: format!("{provider_id} remove all accounts"),
@@ -2264,59 +2263,27 @@ async fn open_default_logout_resolution(
     true
 }
 
-/// Represent an exact raw account for a picker. Search retains the complete
-/// canonical representation, while the row gets a disclosed bounded prefix so
-/// no selector surface claims to expose an arbitrarily long legacy identity.
+/// Represent an exact raw account for display and filtering in a picker.
 fn account_picker_text(raw: &str) -> (String, String) {
     let represented = display_account_label(raw, AccountLabelDisplayMode::Ordinary);
-    let shown = if represented.len() > 65_535 {
-        let prefix = represented.chars().take(96).collect::<String>();
-        format!("[clipped; exceeds 65,535-cell inspection limit] {prefix}…")
-    } else {
-        represented.clone()
-    };
-    (shown, represented)
+    (represented.clone(), represented)
 }
 
 /// Post-action account text for transcript prose. Ordinary representations
 /// without spaces survive wrapping unchanged; labels with spaces use ASCII
-/// mode. An over-limit identity is referred to generically after its dedicated
-/// confirmation rather than inserting a partial identity.
+/// mode.
 fn account_notice_text(raw: &str) -> String {
     let ordinary = display_account_label(raw, AccountLabelDisplayMode::Ordinary);
-    let represented = if ordinary.contains(' ') {
+    if ordinary.contains(' ') {
         display_account_label(raw, AccountLabelDisplayMode::Ascii)
     } else {
         ordinary
-    };
-    if represented.len() > 65_535 {
-        "the selected account (label exceeds the terminal inspection limit)".to_string()
-    } else {
-        represented
     }
 }
 
-fn inspect_account_action(shell: &Rc<RefCell<Shell>>, app: &mut AsyncApp, action: AccountAction) {
-    let handles = shell.borrow().overlay_handles();
-    let theme = shell.borrow().theme.clone();
-    open_account_confirmation(
-        &handles.stack,
-        &handles.editor,
-        &handles.chrome,
-        &handles.auth_request,
-        &theme.read(),
-        action,
-    );
-    app.post_app_event(UserEvent {
-        name: REFOCUS_OVERLAY_EVENT.to_string(),
-        data: None,
-    });
-    app.request_redraw();
-}
-
 /// Apply a confirmed authentication picker request. Login mounts the dialog
-/// and spawns the flow. Bare logout writes inline, while labeled mutations
-/// route through exact-account inspection and default-removal resolution.
+/// and spawns the flow. Logout and labeled account mutations write inline,
+/// with explicit resolution when removing a default that has siblings.
 async fn apply_auth_request(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
@@ -2347,9 +2314,6 @@ async fn apply_auth_request(
             };
             fold_notice(world, &notice);
             app.request_redraw();
-        }
-        AuthPickerRequest::InspectAccount(action) => {
-            inspect_account_action(shell, app, action);
         }
         AuthPickerRequest::ApplyAccount(action) => match action {
             AccountAction::ReplaceLogin {
@@ -2444,31 +2408,17 @@ async fn apply_auth_request(
             AccountAction::LogoutAll {
                 provider_id,
                 expected_accounts,
-                inspect_index,
             } => {
-                let next_index = inspect_index + 1;
-                if next_index < expected_accounts.len() {
-                    inspect_account_action(
-                        shell,
-                        app,
-                        AccountAction::LogoutAll {
-                            provider_id,
-                            expected_accounts,
-                            inspect_index: next_index,
-                        },
-                    );
-                } else {
-                    let notice = match world
-                        .auth
-                        .remove_all_accounts(&provider_id, &expected_accounts)
-                        .await
-                    {
-                        Ok(()) => format!("Logged out of all {provider_id} accounts."),
-                        Err(err) => format!("Failed to log out of {provider_id}: {err}"),
-                    };
-                    fold_notice(world, &notice);
-                    app.request_redraw();
-                }
+                let notice = match world
+                    .auth
+                    .remove_all_accounts(&provider_id, &expected_accounts)
+                    .await
+                {
+                    Ok(()) => format!("Logged out of all {provider_id} accounts."),
+                    Err(err) => format!("Failed to log out of {provider_id}: {err}"),
+                };
+                fold_notice(world, &notice);
+                app.request_redraw();
             }
         },
     }
@@ -3621,7 +3571,7 @@ async fn apply_command_action(
                                 account_label,
                             };
                             AuthRow {
-                                request: AuthPickerRequest::InspectAccount(action),
+                                request: AuthPickerRequest::ApplyAccount(action),
                                 label: format!("{name} — {shown}"),
                                 filter_key: format!("{id} {name} {search} reauthenticate"),
                                 summary: Some("log in again and replace this account".to_string()),
@@ -3689,7 +3639,7 @@ async fn apply_command_action(
                                 account_label: account_label.clone(),
                             };
                             AuthRow {
-                                request: AuthPickerRequest::InspectAccount(action),
+                                request: AuthPickerRequest::ApplyAccount(action),
                                 label: format!("{id} — {shown}"),
                                 filter_key: format!("{id} {search}"),
                                 summary: Some(format!("remove this {suffix}")),
@@ -3736,7 +3686,7 @@ async fn apply_command_action(
                         account_label: account_label.clone(),
                     };
                     AuthRow {
-                        request: AuthPickerRequest::InspectAccount(action),
+                        request: AuthPickerRequest::ApplyAccount(action),
                         label: if is_current {
                             format!("{id} — {shown} (current)")
                         } else {
@@ -14385,13 +14335,13 @@ mod tests {
             let event = app.next_input().await.expect("input event");
             app.handle_input(event);
         }
-        let inspect = shell
+        let request = shell
             .borrow()
             .take_auth_request()
             .expect("opaque row queued an account request");
         assert!(matches!(
-            &inspect,
-            AuthPickerRequest::InspectAccount(AccountAction::Logout {
+            &request,
+            AuthPickerRequest::ApplyAccount(AccountAction::Logout {
                 provider_id,
                 account_label,
             }) if provider_id == "a" && account_label == "b c"
@@ -14411,10 +14361,10 @@ mod tests {
             let event = app.next_input().await.expect("input event");
             app.handle_input(event);
         }
-        let second_inspect = shell.borrow().take_auth_request().expect("second request");
+        let second_request = shell.borrow().take_auth_request().expect("second request");
         assert!(matches!(
-            &second_inspect,
-            AuthPickerRequest::InspectAccount(AccountAction::Logout {
+            &second_request,
+            AuthPickerRequest::ApplyAccount(AccountAction::Logout {
                 provider_id,
                 account_label,
             }) if provider_id == "a b" && account_label == "c"
@@ -14428,18 +14378,9 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            inspect,
+            request,
         )
         .await;
-        app.render(&root).expect("render confirmation");
-        writer.write_all(b"\r").expect("confirm exact account");
-        let event = app.next_input().await.expect("confirmation event");
-        app.handle_input(event);
-        let apply = shell
-            .borrow()
-            .take_auth_request()
-            .expect("confirmation queued exact action");
-        apply_auth_request(&mut world, &shell, &mut app, &mut login_session, &tx, apply).await;
 
         assert!(world.auth.get("a").await.unwrap().is_none());
         assert!(matches!(
@@ -14453,18 +14394,9 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            second_inspect,
+            second_request,
         )
         .await;
-        app.render(&root).expect("render second confirmation");
-        writer.write_all(b"\r").expect("confirm second account");
-        let event = app.next_input().await.expect("confirmation event");
-        app.handle_input(event);
-        let apply = shell
-            .borrow()
-            .take_auth_request()
-            .expect("second exact action");
-        apply_auth_request(&mut world, &shell, &mut app, &mut login_session, &tx, apply).await;
         assert!(world.auth.get("a b").await.unwrap().is_none());
     }
 
@@ -14503,10 +14435,10 @@ mod tests {
         writer.write_all(b"\r").expect("confirm hostile row");
         let event = app.next_input().await.expect("picker event");
         app.handle_input(event);
-        let inspect = shell.borrow().take_auth_request().expect("queued request");
+        let request = shell.borrow().take_auth_request().expect("queued request");
         assert!(matches!(
-            &inspect,
-            AuthPickerRequest::InspectAccount(AccountAction::Logout {
+            &request,
+            AuthPickerRequest::ApplyAccount(AccountAction::Logout {
                 provider_id,
                 account_label,
             }) if provider_id == "provider" && account_label == "wo\nrk"
@@ -14520,15 +14452,9 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            inspect,
+            request,
         )
         .await;
-        app.render(&root).expect("render confirmation");
-        writer.write_all(b"\r").expect("confirm removal");
-        let event = app.next_input().await.expect("confirmation event");
-        app.handle_input(event);
-        let apply = shell.borrow().take_auth_request().expect("queued action");
-        apply_auth_request(&mut world, &shell, &mut app, &mut login_session, &tx, apply).await;
         assert!(
             world
                 .auth
@@ -14548,7 +14474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_account_picker_inspects_then_applies_the_exact_raw_identity() {
+    async fn default_account_picker_applies_the_exact_raw_identity() {
         use aj_models::auth::AuthCredential;
 
         let dir = TempDir::new().expect("tempdir");
@@ -14600,10 +14526,10 @@ mod tests {
         writer.write_all(b"\r").expect("select work");
         let event = app.next_input().await.expect("picker event");
         app.handle_input(event);
-        let inspect = shell.borrow().take_auth_request().expect("inspect request");
+        let request = shell.borrow().take_auth_request().expect("account request");
         assert!(matches!(
-            &inspect,
-            AuthPickerRequest::InspectAccount(AccountAction::SetDefault {
+            &request,
+            AuthPickerRequest::ApplyAccount(AccountAction::SetDefault {
                 provider_id,
                 account_label,
             }) if provider_id == "provider" && account_label == "work"
@@ -14617,15 +14543,9 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            inspect,
+            request,
         )
         .await;
-        app.render(&root).expect("render confirmation");
-        writer.write_all(b"\r").expect("confirm work");
-        let event = app.next_input().await.expect("confirmation event");
-        app.handle_input(event);
-        let apply = shell.borrow().take_auth_request().expect("apply request");
-        apply_auth_request(&mut world, &shell, &mut app, &mut login_session, &tx, apply).await;
         assert_eq!(
             world
                 .auth
@@ -14639,286 +14559,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn over_limit_logout_path_discloses_clipping_acknowledges_and_removes_raw_key() {
-        let label = format!("{}\u{1000}", "a".repeat(10_921));
+    async fn default_logout_resolution_applies_the_selected_replacement() {
         let dir = TempDir::new().expect("tempdir");
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
         let raw = serde_json::json!({
             "provider": {
                 "type": "accounts",
-                "default": "safe",
+                "default": "personal",
                 "accounts": {
-                    (label.clone()): { "type": "api_key", "key": "remove" },
-                    "safe": { "type": "api_key", "key": "keep" }
+                    "personal": { "type": "api_key", "key": "one" },
+                    "work": { "type": "api_key", "key": "two" }
                 }
             }
         });
         std::fs::write(world.auth.path(), serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let mut login_session = None;
 
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenLogoutSelector).await,
             ActionEffect::OpenedOverlay
         ));
         focus_overlay(&mut app, &root);
-        app.render(&root).expect("render clipped selector row");
-        let picker = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-        assert!(
-            picker.contains("[clipped; exceeds 65,535-cell inspection limit]"),
-            "{picker}"
-        );
-        writer.write_all(b"\r").expect("select over-limit row");
-        let event = app.next_input().await.expect("picker event");
-        app.handle_input(event);
-        let inspect = shell.borrow().take_auth_request().expect("inspect request");
-        assert!(matches!(
-            &inspect,
-            AuthPickerRequest::InspectAccount(AccountAction::Logout {
-                account_label,
-                ..
-            }) if account_label == &label
-        ));
-
-        let (tx, _rx) = unbounded_channel();
-        let mut login_session = None;
-        apply_auth_request(
-            &mut world,
-            &shell,
-            &mut app,
-            &mut login_session,
-            &tx,
-            inspect,
-        )
-        .await;
-        app.render(&root).expect("render over-limit confirmation");
-        let warning = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-        assert!(warning.contains("65,535-cell"), "{warning}");
-
+        let filter = "provider personal";
         writer
-            .write_all(b"\x1bOF")
-            .expect("inspect bounded prefix end");
-        let event = app.next_input().await.expect("End event");
-        app.handle_input(event);
-        app.render(&root).expect("render bounded prefix end");
-        let after_end = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-        assert!(
-            after_end.contains("\\u{61}"),
-            "End blanked the bounded represented prefix: {after_end}"
-        );
-        assert!(
-            after_end.contains("Only a clipped prefix is shown"),
-            "inspection warning disappeared after End: {after_end}"
-        );
-
-        writer
-            .write_all(b"\r")
-            .expect("acknowledge incomplete inspection");
-        let event = app.next_input().await.expect("acknowledgement event");
-        app.handle_input(event);
-        assert!(
-            shell.borrow().auth_request.borrow().is_none(),
-            "acknowledgement did not invoke the action"
-        );
-        writer
-            .write_all(b"\r")
-            .expect("confirm after acknowledgement");
-        let event = app.next_input().await.expect("confirmation event");
-        app.handle_input(event);
-        let apply = shell.borrow().take_auth_request().expect("apply request");
-        apply_auth_request(&mut world, &shell, &mut app, &mut login_session, &tx, apply).await;
-        assert!(
-            world
-                .auth
-                .get_account("provider", &label)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            world
-                .auth
-                .get_account("provider", "safe")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        let notices = main_notices(&world).join("\n");
-        assert!(
-            notices.contains("label exceeds the terminal inspection limit"),
-            "{notices}"
-        );
-        assert!(
-            !notices.contains("\\u{1000}"),
-            "full legacy tail leaked: {notices}"
-        );
-    }
-
-    #[tokio::test]
-    async fn exact_limit_logout_path_reaches_tail_then_removes_the_exact_raw_key() {
-        let label = format!("{}\u{0100}", "a".repeat(10_921));
-        let dir = TempDir::new().expect("tempdir");
-        let (mut app, mut writer, mut world, shell, root) =
-            init_app_with_world(&dir, "streaming-text").await;
-        let raw = serde_json::json!({
-            "provider": {
-                "type": "accounts",
-                "default": "safe",
-                "accounts": {
-                    (label.clone()): { "type": "api_key", "key": "remove" },
-                    "safe": { "type": "api_key", "key": "keep" }
-                }
-            }
-        });
-        std::fs::write(world.auth.path(), serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
-
-        assert!(matches!(
-            apply_command(&mut world, &shell, CommandAction::OpenLogoutSelector).await,
-            ActionEffect::OpenedOverlay
-        ));
-        focus_overlay(&mut app, &root);
-        writer.write_all(b"\r").expect("select exact-bound row");
-        let event = app.next_input().await.expect("picker event");
-        app.handle_input(event);
-        let inspect = shell.borrow().take_auth_request().expect("inspect request");
-        assert!(matches!(
-            &inspect,
-            AuthPickerRequest::InspectAccount(AccountAction::Logout {
-                account_label,
-                ..
-            }) if account_label == &label
-        ));
-
-        let (tx, _rx) = unbounded_channel();
-        let mut login_session = None;
-        apply_auth_request(
-            &mut world,
-            &shell,
-            &mut app,
-            &mut login_session,
-            &tx,
-            inspect,
-        )
-        .await;
-        app.render(&root).expect("render exact-bound confirmation");
-        writer.write_all(b"\x1bOF").expect("scroll to final tail");
-        let event = app.next_input().await.expect("end event");
-        app.handle_input(event);
-        app.render(&root).expect("render final tail");
-        let tail = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-        assert!(
-            tail.contains("\\u{100}"),
-            "final tail was not exposed: {tail:?}"
-        );
-
-        writer
-            .write_all(b"\r")
-            .expect("confirm exact-bound account");
-        let event = app.next_input().await.expect("confirmation event");
-        app.handle_input(event);
-        let apply = shell.borrow().take_auth_request().expect("apply request");
-        apply_auth_request(&mut world, &shell, &mut app, &mut login_session, &tx, apply).await;
-        assert!(
-            world
-                .auth
-                .get_account("provider", &label)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            world
-                .auth
-                .get_account("provider", "safe")
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn over_limit_login_replacement_requires_acknowledgement_before_oauth_request() {
-        let label = format!("{}\u{1000}", "a".repeat(10_921));
-        let dir = TempDir::new().expect("tempdir");
-        let (mut app, mut writer, mut world, shell, root) =
-            init_app_with_world(&dir, "streaming-text").await;
-        let raw = serde_json::json!({
-            "anthropic": {
-                "type": "accounts",
-                "default": label.clone(),
-                "accounts": {
-                    (label.clone()): { "type": "api_key", "key": "keep" }
-                }
-            }
-        });
-        std::fs::write(world.auth.path(), serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
-
-        assert!(matches!(
-            apply_command(&mut world, &shell, CommandAction::OpenLoginSelector).await,
-            ActionEffect::OpenedOverlay
-        ));
-        focus_overlay(&mut app, &root);
-        // Anthropic's add row is first; its exact-account replacement is next.
-        writer
-            .write_all(b"\x1bOB\r")
-            .expect("select replacement row");
-        for _ in 0..2 {
-            let event = app.next_input().await.expect("picker event");
+            .write_all(format!("{filter}\r").as_bytes())
+            .expect("select the default account");
+        for _ in 0..=filter.len() {
+            let event = app.next_input().await.expect("logout picker input");
             app.handle_input(event);
         }
-        let inspect = shell.borrow().take_auth_request().expect("inspect request");
+        let logout = shell
+            .borrow()
+            .take_auth_request()
+            .expect("default account row parks a request");
         assert!(matches!(
-            &inspect,
-            AuthPickerRequest::InspectAccount(AccountAction::ReplaceLogin {
+            &logout,
+            AuthPickerRequest::ApplyAccount(AccountAction::Logout {
                 provider_id,
                 account_label,
-                ..
-            }) if provider_id == "anthropic" && account_label == &label
+            }) if provider_id == "provider" && account_label == "personal"
         ));
-
-        let (tx, _rx) = unbounded_channel();
-        let mut login_session = None;
         apply_auth_request(
             &mut world,
             &shell,
             &mut app,
             &mut login_session,
             &tx,
-            inspect,
+            logout,
         )
         .await;
-        app.render(&root)
-            .expect("render over-limit replacement confirmation");
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
+        focus_overlay(&mut app, &root);
         writer
             .write_all(b"\r")
-            .expect("acknowledge incomplete inspection");
-        let event = app.next_input().await.expect("acknowledgement event");
+            .expect("choose work as the replacement default");
+        let event = app.next_input().await.expect("resolution picker input");
         app.handle_input(event);
-        assert!(shell.borrow().auth_request.borrow().is_none());
-        assert!(
-            login_session.is_none(),
-            "OAuth has not started after acknowledgement"
-        );
-
-        writer.write_all(b"\r").expect("confirm replacement");
-        let event = app.next_input().await.expect("confirmation event");
-        app.handle_input(event);
+        let request = shell
+            .borrow()
+            .take_auth_request()
+            .expect("replacement row parks a request");
         assert!(matches!(
-            shell.borrow().auth_request.borrow().as_ref(),
-            Some(AuthPickerRequest::ApplyAccount(AccountAction::ReplaceLogin {
+            &request,
+            AuthPickerRequest::ApplyAccount(AccountAction::LogoutWithNewDefault {
                 provider_id,
                 account_label,
-                ..
-            })) if provider_id == "anthropic" && account_label == &label
+                new_default,
+            }) if provider_id == "provider"
+                && account_label == "personal"
+                && new_default == "work"
         ));
-        assert!(
-            login_session.is_none(),
-            "OAuth waits for the host to apply the request"
-        );
+        apply_auth_request(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            request,
+        )
+        .await;
+
+        let accounts = world.auth.accounts("provider").await.unwrap().unwrap();
+        assert_eq!(accounts.default, "work");
+        assert_eq!(accounts.accounts.len(), 1);
+        assert_eq!(accounts.accounts[0].0, "work");
     }
 
     #[tokio::test]
-    async fn remove_all_inspects_and_acknowledges_every_exact_account_before_deletion() {
-        let over_limit = format!("{}\u{1000}", "a".repeat(10_921));
+    async fn remove_all_applies_the_complete_expected_account_set() {
         let dir = TempDir::new().expect("tempdir");
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
@@ -14927,7 +14657,7 @@ mod tests {
                 "type": "accounts",
                 "default": "0safe",
                 "accounts": {
-                    (over_limit.clone()): { "type": "api_key", "key": "one" },
+                    "work": { "type": "api_key", "key": "one" },
                     "0safe": { "type": "api_key", "key": "two" }
                 }
             }
@@ -14936,7 +14666,6 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let mut login_session = None;
 
-        // The selected default was inspected before this action in production.
         apply_auth_request(
             &mut world,
             &shell,
@@ -14951,23 +14680,22 @@ mod tests {
         .await;
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
         focus_overlay(&mut app, &root);
-        // First row chooses the long sibling as default; second removes all.
+        // First row chooses the sibling as default; second removes all.
         writer.write_all(b"\x1bOB\r").expect("choose remove all");
         for _ in 0..2 {
             let event = app.next_input().await.expect("resolution picker event");
             app.handle_input(event);
         }
-        let inspect = shell
+        let request = shell
             .borrow()
             .take_auth_request()
-            .expect("inspect all request");
+            .expect("remove all request");
         assert!(matches!(
-            &inspect,
-            AuthPickerRequest::InspectAccount(AccountAction::LogoutAll {
+            &request,
+            AuthPickerRequest::ApplyAccount(AccountAction::LogoutAll {
                 expected_accounts,
-                inspect_index: 0,
                 ..
-            }) if expected_accounts == &vec!["0safe".to_string(), over_limit.clone()]
+            }) if expected_accounts == &vec!["0safe".to_string(), "work".to_string()]
         ));
         apply_auth_request(
             &mut world,
@@ -14975,45 +14703,9 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            inspect,
+            request,
         )
         .await;
-        app.render(&root).expect("render first inspection");
-
-        writer.write_all(b"\r").expect("confirm first identity");
-        let event = app.next_input().await.expect("first inspection event");
-        app.handle_input(event);
-        let first = shell
-            .borrow()
-            .take_auth_request()
-            .expect("first inspected action");
-        apply_auth_request(&mut world, &shell, &mut app, &mut login_session, &tx, first).await;
-        assert_eq!(
-            world
-                .auth
-                .accounts("provider")
-                .await
-                .unwrap()
-                .unwrap()
-                .accounts
-                .len(),
-            2,
-            "inspection alone cannot delete"
-        );
-        app.render(&root)
-            .expect("render over-limit second inspection");
-        for _ in 0..2 {
-            writer
-                .write_all(b"\r")
-                .expect("advance over-limit inspection");
-            let event = app.next_input().await.expect("second inspection event");
-            app.handle_input(event);
-        }
-        let last = shell
-            .borrow()
-            .take_auth_request()
-            .expect("last inspected action");
-        apply_auth_request(&mut world, &shell, &mut app, &mut login_session, &tx, last).await;
         assert!(world.auth.get("provider").await.unwrap().is_none());
     }
 
@@ -15129,7 +14821,7 @@ mod tests {
     #[tokio::test]
     async fn login_request_target_replaces_only_the_selected_existing_account() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut app, _writer, mut world, shell, _root) =
+        let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
         let provider_id = "targeted-login";
         register_controlled_oauth(&world, provider_id, "new-work-access", LoginGate::Ready).await;
@@ -15156,6 +14848,32 @@ mod tests {
             .await
             .expect("seed work account");
 
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenLoginSelector).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+        let filter = format!("{provider_id} work");
+        writer
+            .write_all(format!("{filter}\r").as_bytes())
+            .expect("select existing work account");
+        for _ in 0..=filter.len() {
+            let event = app.next_input().await.expect("login picker input");
+            app.handle_input(event);
+        }
+        let request = shell
+            .borrow()
+            .take_auth_request()
+            .expect("existing account row parks a request");
+        assert!(matches!(
+            &request,
+            AuthPickerRequest::ApplyAccount(AccountAction::ReplaceLogin {
+                provider_id: selected,
+                account_label,
+                ..
+            }) if selected == provider_id && account_label == "work"
+        ));
+
         let (tx, _rx) = unbounded_channel();
         let mut login_session = None;
         apply_auth_request(
@@ -15164,11 +14882,7 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            AuthPickerRequest::Login {
-                provider_id: provider_id.to_string(),
-                provider_name: "Controlled OAuth".to_string(),
-                target: LoginTarget::ExistingAccount(Some("work".to_string())),
-            },
+            request,
         )
         .await;
         let result = tokio::time::timeout(
