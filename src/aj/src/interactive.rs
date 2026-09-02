@@ -94,7 +94,9 @@ use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt
 use crate::quit_hint::QuitHint;
 use crate::remote::RemoteError;
 use crate::selection_copied::SelectionCopied;
-use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
+use crate::session_selector::{
+    SessionScan, extend_session_scan, open_connected_session_selector, open_session_selector,
+};
 use crate::session_tag::{TagEdit, open_session_tag};
 use crate::session_tree::{build_tree_rows, open_session_tree};
 use crate::settings_ui::{
@@ -3418,27 +3420,21 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         // The session-selector and session-tree overlays open READ-ONLY at any
-        // time, even mid-work. Switching (Enter) is refused at confirm time
-        // with a toast (see their `on_confirm` closures), so there is no
-        // open-time busy guard here. `NewSession` below refuses while busy up
-        // front instead, since it opens no overlay.
+        // time, even mid-work. A session switch leaves the session behind
+        // attached and is never refused. A branch switch is refused by the
+        // tree's confirm closure while busy. Neither needs an open-time guard.
         CommandAction::OpenSessionSelector => {
-            // NOTE: the previews come off this process's own session store, so
-            // over a connection this overlay describes the wrong machine. The
-            // sidebar is the surface that lists a peer's sessions (spec 9.2),
-            // and it reads the `list` rows instead.
-            if world.control.is_remote() {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice(
-                        "browse this machine's sessions",
-                        "a connection's sessions are the ones in the sidebar",
-                    ),
-                );
-                return ActionEffect::Redraw;
-            }
             let handles = shell.borrow().overlay_handles();
-            open_session_selector(&handles, world.session().to_string());
+            if world.control.is_remote() {
+                open_connected_session_selector(
+                    &handles,
+                    world.session().to_string(),
+                    world.directory.rows(),
+                    world.directory.hosts(),
+                );
+            } else {
+                open_session_selector(&handles, world.session().to_string());
+            }
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionTree => match open_tree_overlay(world, shell).await {
@@ -16267,6 +16263,18 @@ mod tests {
         app.render(root).expect("render");
     }
 
+    /// Draw only the top overlay window, excluding sidebar and transcript text
+    /// that could otherwise satisfy a row assertion from a different surface.
+    fn top_overlay_rows(shell: &Rc<RefCell<Shell>>) -> Vec<String> {
+        let top = {
+            let shell = shell.borrow();
+            let stack = shell.overlays.borrow();
+            Rc::clone(&stack.top().expect("an open overlay").widget)
+        };
+        let surface = top.borrow_mut().draw(&full_draw_ctx());
+        crate::test_support::rows(&surface)
+    }
+
     /// A watcher for a bundled theme is inert (no on-disk source), which is
     /// all the apply path needs for tests that don't exercise reloads.
     fn inert_theme_watch() -> ThemeWatch {
@@ -19496,6 +19504,16 @@ mod tests {
         /// A scripted host whose served working directory is `dir`, rather than
         /// the test process's ambient directory.
         async fn at_directory(dir: &TempDir) -> RemoteHost {
+            Self::at_named_directory(dir, None).await
+        }
+
+        /// The same host with an explicit label, for multi-host presentation
+        /// tests that must distinguish the joined host label from its id.
+        async fn named_at_directory(dir: &TempDir, name: &str) -> RemoteHost {
+            Self::at_named_directory(dir, Some(name)).await
+        }
+
+        async fn at_named_directory(dir: &TempDir, name: Option<&str>) -> RemoteHost {
             let provider = crate::remote::tests::scripted(
                 vec![aj_app::test_support::finalized_text_message("done")],
                 0,
@@ -19505,7 +19523,7 @@ mod tests {
                 dir,
                 provider,
                 crate::remote::tests::HostHandles::new(dir),
-                None,
+                name,
             );
             let server = crate::remote::RemoteServer::bind(
                 host.clone(),
@@ -25737,13 +25755,12 @@ mod tests {
     /// A gesture connect mode has no path for folds a notice naming why, rather
     /// than silently doing nothing (spec 9.1).
     ///
-    /// These are the four this arm refuses, all of them about this machine: an
-    /// export writes a file where the log is, the session selector previews
-    /// this process's own store, prompt history scans that store's logs, and
-    /// usage reads this process's credential store. The session-info overlay
-    /// refuses too, in its fill rather than here, see `spawn_overlay_fetch`.
-    /// Session switching and creation are no longer among them, see
-    /// `connect_mode_creates_and_switches_sessions`.
+    /// These are the three this arm refuses, all of them about this machine: an
+    /// export writes a file where the log is, prompt history scans that store's
+    /// logs, and usage reads this process's credential store. The session-info
+    /// overlay refuses too, in its fill rather than here, see
+    /// `spawn_overlay_fetch`. Session browsing, switching, and creation are no
+    /// longer among them.
     #[tokio::test]
     async fn connect_mode_refuses_the_gestures_about_this_machine() {
         let dir = TempDir::new().expect("tempdir");
@@ -25751,14 +25768,9 @@ mod tests {
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
 
         // The reason is pinned, not just the fact of a refusal: each names the
-        // host-local thing it cannot reach, and the selector points at what the
-        // user should reach for instead.
+        // host-local thing it cannot reach.
         for (action, reason) in [
             (CommandAction::ExportHtml, "run the export there"),
-            (
-                CommandAction::OpenSessionSelector,
-                "a connection's sessions are the ones in the sidebar",
-            ),
             (
                 CommandAction::OpenPromptHistory,
                 "this machine's own session logs",
@@ -26344,6 +26356,130 @@ mod tests {
             world.directory.is_attached(&created),
             "the session left behind stays in the working set",
         );
+        remote.shutdown().await;
+    }
+
+    /// A direct host publishes no host grouping. Its selector still opens from
+    /// the remote directory, renders the two-part state/age description, and a
+    /// confirm enters the existing focus path.
+    #[tokio::test]
+    async fn a_plain_host_selector_omits_the_host_part_and_switches() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let mut seeded = Vec::new();
+        for tag in ["plain-alpha", "plain-beta"] {
+            let session = remote.host.create().await.expect("create a host session");
+            remote
+                .host
+                .command(
+                    &session,
+                    Command::Tag {
+                        tag: Some(tag.to_string()),
+                    },
+                )
+                .await
+                .expect("tag the host session");
+            seeded.push(session);
+        }
+        assert_ne!(seeded[0], seeded[1], "the fixture minted two sessions");
+        assert_eq!(
+            remote
+                .host
+                .sessions()
+                .await
+                .expect("read the host directory")
+                .sessions
+                .len(),
+            2,
+            "both seeded sessions are discoverable before connecting",
+        );
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        for session in &seeded {
+            assert!(
+                poll_row(&mut world, &shell, session, |_| true).await,
+                "the connected client folded the seeded row {session}",
+            );
+        }
+        assert!(
+            world.directory.hosts().is_empty(),
+            "a plain host has no host rows"
+        );
+        assert!(
+            world.directory.rows().iter().all(|row| row.host.is_none()),
+            "plain-host session rows carry no host qualifier",
+        );
+        let target = world
+            .directory
+            .rows()
+            .iter()
+            .find(|row| row.id != world.session())
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "a non-focused host session; focused={}, rows={:?}",
+                    world.session(),
+                    world
+                        .directory
+                        .rows()
+                        .iter()
+                        .map(|row| (&row.id, &row.tag))
+                        .collect::<Vec<_>>(),
+                )
+            });
+        let target_tag = target.tag.clone().expect("the target is tagged");
+        let (mut app, mut writer, root) = app_over(&shell).await;
+
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+        assert!(
+            shell.borrow().take_session_scan().is_none(),
+            "a connected selector parks no local preview scan",
+        );
+        let drawn = top_overlay_rows(&shell);
+        let target_line = drawn
+            .iter()
+            .find(|line| line.contains(&target_tag))
+            .unwrap_or_else(|| panic!("the target row drew: {drawn:?}"));
+        assert!(
+            target_line.contains("live · last "),
+            "the directory state and age drew: {target_line:?}",
+        );
+        assert_eq!(
+            target_line.matches('·').count(),
+            1,
+            "a plain-host row has no host part: {target_line:?}",
+        );
+
+        type_text(&mut app, &mut writer, &target_tag).await;
+        press(&mut app, &mut writer, b"\r").await;
+        let requested = match shell.borrow().take_session_request() {
+            Some(SessionRequest::Resume(id)) => id,
+            other => panic!("confirm parked one resume request, got {other:?}"),
+        };
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(requested),
+        )
+        .await;
+        if matches!(moved, Focus::Moved) {
+            settle_pending_transition(&mut app, &shell, &mut world).await;
+        }
+        assert_eq!(
+            world.session(),
+            target.id,
+            "confirm focused the exact opaque id the row carried",
+        );
+        assert!(
+            world
+                .stream
+                .as_ref()
+                .is_some_and(|stream| stream.attached(&target.id)),
+            "the reopened plain-host stream serves the selected session",
+        );
+
         remote.shutdown().await;
     }
 
@@ -27477,6 +27613,201 @@ mod tests {
         gateway.until_sessions(1).await;
         let (world, shell) = connect_world_and_shell_at(client, &gateway.url(), &[]).await;
         (gateway, ids, world, shell)
+    }
+
+    /// The selector over a gateway is the merged client directory made
+    /// interactive: both hosts' rows and labels draw, the host label filters,
+    /// and confirming a row on the other host carries its opaque id through the
+    /// drive loop into a focused, attached stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_gateway_selector_filters_hosts_and_focuses_the_confirmed_row() {
+        let (left_dir, right_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::named_at_directory(&left_dir, "selector-left").await;
+        let right = RemoteHost::named_at_directory(&right_dir, "selector-right").await;
+        for (host, tag) in [(&left, "left-session"), (&right, "right-session")] {
+            let session = host.host.create().await.expect("create a host session");
+            host.host
+                .command(
+                    &session,
+                    Command::Tag {
+                        tag: Some(tag.to_string()),
+                    },
+                )
+                .await
+                .expect("tag the host session");
+        }
+        let gateway = RemoteGateway::over(&[&left, &right]).await;
+        gateway.until_sessions(2).await;
+        let (mut world, shell) = connect_world_and_shell_at(&client_dir, &gateway.url(), &[]).await;
+
+        let local = world
+            .persistence
+            .enumerate_sessions()
+            .expect("enumerate the connecting process's store");
+        assert!(
+            local.is_empty(),
+            "the client-side store must hold none of the peer sessions: {local:?}",
+        );
+        assert_eq!(
+            world.directory.rows().len(),
+            2,
+            "one real directory row arrived from each host",
+        );
+        assert_eq!(
+            world.directory.hosts().len(),
+            2,
+            "the two host rows arrived"
+        );
+        assert!(
+            world.directory.rows().iter().all(|row| row.host.is_some()),
+            "gateway rows name their host",
+        );
+        let labels: BTreeMap<String, String> = world
+            .directory
+            .hosts()
+            .iter()
+            .map(|host| {
+                let id = host.id.clone().expect("an adopted host id");
+                let label = crate::sidebar::host_label(host)
+                    .expect("the host is labelled")
+                    .to_string();
+                assert_ne!(label, id, "the fixture makes a skipped name join visible");
+                (id, label)
+            })
+            .collect();
+        assert_eq!(
+            labels
+                .values()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2,
+            "host filtering needs two distinct labels",
+        );
+        assert!(
+            world.directory.rows().iter().all(|row| {
+                row.host
+                    .as_ref()
+                    .is_some_and(|host| labels.contains_key(host))
+            }),
+            "every session row joins to exactly one published host",
+        );
+        let initial_host = world
+            .directory
+            .rows()
+            .iter()
+            .find(|row| row.id == world.session())
+            .and_then(|row| row.host.clone())
+            .expect("the focused row names its host");
+        let target = world
+            .directory
+            .rows()
+            .iter()
+            .find(|row| row.id != world.session())
+            .cloned()
+            .expect("the row on the non-focused host");
+        let target_host = target.host.clone().expect("the target names its host");
+        assert_ne!(
+            target_host, initial_host,
+            "the target is on the other real host",
+        );
+        let target_host_label = labels
+            .get(&target_host)
+            .cloned()
+            .expect("the target host joins to its label");
+        let target_tag = target.tag.clone().expect("the target is tagged");
+        let other_tag = world
+            .directory
+            .rows()
+            .iter()
+            .find(|row| row.id != target.id)
+            .and_then(|row| row.tag.clone())
+            .expect("the other row is tagged");
+        let (mut app, mut writer, root) = app_over(&shell).await;
+
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+        let parked_local_scan = shell.borrow().take_session_scan().is_some();
+        let opened = top_overlay_rows(&shell).join("\n");
+        assert!(
+            opened.contains("left-session") && opened.contains("right-session"),
+            "the merged peer rows, not the empty client store, fill the picker: {opened}",
+        );
+        assert!(
+            labels.values().all(|label| opened.contains(label)),
+            "each row carries its joined host label: {opened}",
+        );
+        assert!(
+            !parked_local_scan,
+            "a connected selector does not engage SessionFill or the local store",
+        );
+
+        type_text(&mut app, &mut writer, &target_host_label).await;
+        app.render(&root).expect("render the filtered selector");
+        let filtered = top_overlay_rows(&shell).join("\n");
+        assert!(
+            filtered.contains(&target_tag) && !filtered.contains(&other_tag),
+            "typing a host label leaves only that host's row: {filtered}",
+        );
+        writer.write_all(b"\r").expect("confirm the filtered row");
+
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let exit = crate::remote::tests::bounded(
+            "the selector confirmation to end the drive loop",
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await
+        .expect("the drive loop exits without a fatal error");
+        let SessionExit::Switch(requested) = exit else {
+            panic!("the selector did not request a session switch")
+        };
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(requested.clone()),
+        )
+        .await;
+        if matches!(moved, Focus::Moved) {
+            settle_pending_transition(&mut app, &shell, &mut world).await;
+        }
+        assert_eq!(
+            world.session(),
+            target.id,
+            "the row's exact gateway-qualified id became focused",
+        );
+        assert_eq!(requested, target.id, "confirm kept the row id opaque");
+        let focused_host = world
+            .directory
+            .rows()
+            .iter()
+            .find(|row| row.id == world.session())
+            .and_then(|row| row.host.as_deref());
+        assert_eq!(focused_host, Some(target_host.as_str()));
+        assert!(
+            world
+                .stream
+                .as_ref()
+                .is_some_and(|stream| stream.attached(&target.id)),
+            "the reopened stream serves the selected session",
+        );
+
+        drop(world);
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
     }
 
     /// A gateway client shows the focused session's host directory, and moving

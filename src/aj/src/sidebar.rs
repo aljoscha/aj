@@ -342,11 +342,7 @@ impl SidebarRow {
     /// qualifies some other way, or a gateway fronting a gateway, keeps the
     /// label it has today rather than losing a guessed-at slice of it.
     fn label_source(&self) -> &str {
-        self.host
-            .as_deref()
-            .and_then(|host| self.id.strip_prefix(host)?.strip_prefix(':'))
-            .filter(|session| !session.is_empty())
-            .unwrap_or(&self.id)
+        session_label_source(&self.id, self.host.as_deref())
     }
 }
 
@@ -601,9 +597,8 @@ pub(crate) fn rows_for_display(
 /// back and crosses group boundaries where the strip does. That is the point:
 /// stepping is orientation across hosts, and a step that walked the hidden
 /// rows would attach a stale session per press without showing anything (spec
-/// 9.2). A host's tail is reached by unfolding it, which over a connection is
-/// the only way there: the session selector browses this client's own store
-/// and refuses over the wire.
+/// 9.2). A host's tail is reached by unfolding it or by opening the session
+/// selector, whose connected row source is not subject to the strip's cap.
 ///
 /// `None` when there is nothing to move to: fewer than two displayed rows, or
 /// no row claiming focus (the directory and the rows disagree, so any answer
@@ -1135,6 +1130,19 @@ pub(crate) fn host_label(host: &DirectoryHost) -> Option<&str> {
     named(&host.name)
         .or_else(|| named(&host.id))
         .or_else(|| named(&host.address))
+}
+
+/// What a session row reads its display label from: `id` without the exact
+/// qualifier named by `host`, or the complete opaque id when that prefix is
+/// absent or would leave no session component.
+///
+/// The host field is the authority for the qualifier. This function only
+/// matches that supplied value and never discovers structure by parsing the
+/// id, preserving the client-side opacity rule from spec 6.2.
+pub(crate) fn session_label_source<'a>(id: &'a str, host: Option<&str>) -> &'a str {
+    host.and_then(|host| id.strip_prefix(host)?.strip_prefix(':'))
+        .filter(|session| !session.is_empty())
+        .unwrap_or(id)
 }
 
 /// The visible part of a session id: its time of day.
