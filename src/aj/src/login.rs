@@ -912,19 +912,22 @@ pub(crate) struct AuthRow {
     pub(crate) request: AuthPickerRequest,
     pub(crate) label: String,
     pub(crate) filter_key: String,
-    pub(crate) summary: String,
+    pub(crate) summary: Option<String>,
 }
 
-/// Build one selectable row: the friendly label as the primary column, the
-/// status summary as the muted description, and `"{id} {label}"` as the
-/// filter key so typing either the id or the name finds it.
+/// Build one selectable row: the friendly label as the primary column, an
+/// optional status summary as the muted description, and `"{id} {label}"` as
+/// the filter key so typing either the id or the name finds it.
 fn picker_items(rows: &[AuthRow]) -> Vec<SelectItem> {
     rows.iter()
         .enumerate()
         .map(|(index, row)| {
-            SelectItem::new(row.label.clone(), row.filter_key.clone())
-                .with_value(format!("auth-row-{index}"))
-                .with_description(row.summary.clone())
+            let mut item = SelectItem::new(row.label.clone(), row.filter_key.clone())
+                .with_value(format!("auth-row-{index}"));
+            if let Some(summary) = &row.summary {
+                item = item.with_description(summary.clone());
+            }
+            item
         })
         .collect()
 }
@@ -2143,7 +2146,7 @@ mod tests {
                 },
                 label: "Anthropic (Claude Pro/Max)".to_string(),
                 filter_key: "anthropic Anthropic (Claude Pro/Max)".to_string(),
-                summary: "subscription".to_string(),
+                summary: Some("subscription".to_string()),
             },
             AuthRow {
                 request: AuthPickerRequest::Login {
@@ -2153,7 +2156,7 @@ mod tests {
                 },
                 label: "OpenAI".to_string(),
                 filter_key: "openai OpenAI".to_string(),
-                summary: "not configured".to_string(),
+                summary: Some("not configured".to_string()),
             },
         ]
     }
