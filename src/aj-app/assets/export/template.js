@@ -1300,7 +1300,7 @@
         }
         const el = document.getElementById(scrollTargetId(scrollToEntryId)) || document.getElementById('entry-' + scrollToEntryId);
         if (el) {
-          el.scrollIntoView({ block: 'center' });
+          el.scrollIntoView({ block: 'start' });
           el.classList.add('highlight');
           setTimeout(() => el.classList.remove('highlight'), 2000);
         }

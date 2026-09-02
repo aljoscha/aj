@@ -194,12 +194,16 @@ async function renderData(data) {
   // The shim does not parse assigned innerHTML. Resolve transcript ids from
   // the real rendered markup so navigation remains observable.
   const scrolledTargets = [];
+  const scrollCalls = [];
   const documentShim = {
     getElementById: (id) => {
       if (elements[id]) return elements[id];
       if (!elements['messages'].innerHTML.includes('id="' + id + '"')) return null;
       const renderedElement = makeEl('div');
-      renderedElement.scrollIntoView = () => scrolledTargets.push(id);
+      renderedElement.scrollIntoView = (options) => {
+        scrolledTargets.push(id);
+        scrollCalls.push({ id, options });
+      };
       return renderedElement;
     },
     createElement: (tag) => makeEl(tag),
@@ -232,10 +236,10 @@ async function renderData(data) {
   if (!elements['messages'].innerHTML) {
     throw new Error('renderer did not produce output (data load failed?)');
   }
-  return { elements, filterButtons, scrolledTargets };
+  return { elements, filterButtons, scrolledTargets, scrollCalls };
 }
 
-const { elements, filterButtons, scrolledTargets } = await renderData(sessionData);
+const { elements, filterButtons, scrolledTargets, scrollCalls } = await renderData(sessionData);
 
 const rendered = elements['header-container'].innerHTML + '\n' + elements['messages'].innerHTML;
 
@@ -514,6 +518,8 @@ if (spawnNode) {
   fire(spawnNode, 'click');
   check('clicking sub-agent renders its inline box', elements['messages'].innerHTML.includes('id="subagent-1"'));
   check('clicking sub-agent keeps full conversation', elements['messages'].innerHTML.includes('Done.'));
+  check('sidebar navigation aligns the target at the top',
+    scrollCalls.some((call) => call.id === 'subagent-1' && call.options && call.options.block === 'start'));
 }
 
 // Navigating to a sibling branch must rebuild the tree (not just update
