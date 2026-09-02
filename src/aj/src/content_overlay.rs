@@ -27,9 +27,11 @@ use std::rc::Rc;
 use aj_app::auth::ProviderAuthStatus;
 use aj_app::commands::COMMANDS;
 use aj_app::keybindings::{
-    ACTION_AGENT_PICKER, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP, ACTION_CHAT_SCROLL_BOTTOM,
-    ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE, ACTION_COPY_MESSAGE, ACTION_DEQUEUE,
-    ACTION_HISTORY_OPEN, ACTION_PALETTE_OPEN, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE,
+    ACTION_AGENT_PICKER, ACTION_BRANCH_MESSAGE, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP,
+    ACTION_CHAT_SCROLL_BOTTOM, ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE,
+    ACTION_COPY_MESSAGE, ACTION_DEQUEUE, ACTION_HISTORY_OPEN, ACTION_PALETTE_OPEN,
+    ACTION_SESSION_NEW, ACTION_SESSION_NEXT, ACTION_SESSION_PREV, ACTION_SIDEBAR_ARCHIVED,
+    ACTION_SIDEBAR_FOLD, ACTION_SIDEBAR_TOGGLE, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE,
     ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS, AJ_KEYBINDINGS, action_shortcut,
 };
 use aj_app::theme::{Theme, ThemeColor};
@@ -309,7 +311,8 @@ pub(crate) fn loading_rows() -> Vec<Row> {
 /// The compose-time global chords listed under section 1 (editor
 /// shortcuts). These are the app-level chords a user can fire while the
 /// editor is focused (open the palette, paste an image, toggle thinking
-/// or tool output, recall or steer a message, open the pickers).
+/// or tool output, recall or steer a message, open the pickers, or operate
+/// the session sidebar).
 ///
 /// Resolved through [`action_shortcut`] at render time, never a
 /// literal, so a rebind relabels the row.
@@ -322,16 +325,23 @@ const COMPOSE_GLOBAL_ACTIONS: &[&str] = &[
     ACTION_AGENT_PICKER,
     ACTION_SUBMIT_STEERING,
     ACTION_DEQUEUE,
+    ACTION_SIDEBAR_TOGGLE,
+    ACTION_SIDEBAR_FOLD,
+    ACTION_SESSION_NEXT,
+    ACTION_SESSION_PREV,
+    ACTION_SESSION_NEW,
+    ACTION_SIDEBAR_ARCHIVED,
 ];
 
 /// The chat-scroll and transcript-navigation chords listed under section 2.
-/// `ACTION_COPY_MESSAGE` lives in transcript-focus mode, so it belongs with
-/// the transcript keys rather than the compose-time chords.
+/// `ACTION_COPY_MESSAGE` and `ACTION_BRANCH_MESSAGE` live in transcript-focus
+/// mode, so they belong with the transcript keys rather than the compose-time
+/// chords.
 ///
 /// The overlay-management chord `ACTION_OVERLAY_CLOSE_ALL` and the
-/// overlay-local chords (agent/history scope toggles, task kill, settings
-/// clear, usage reset) are deliberately absent: each is surfaced by the
-/// overlay it acts on (the close-all label rides every overlay subtitle),
+/// overlay-local chords (agent/history/session scope toggles, task kill,
+/// settings clear, usage reset) are deliberately absent: each is surfaced by
+/// the overlay it acts on (the close-all label rides every overlay subtitle),
 /// not by this keymap reference.
 const SCROLL_NAV_ACTIONS: &[&str] = &[
     ACTION_CHAT_PAGE_UP,
@@ -340,6 +350,7 @@ const SCROLL_NAV_ACTIONS: &[&str] = &[
     ACTION_CHAT_SCROLL_BOTTOM,
     ACTION_TRANSCRIPT_FOCUS,
     ACTION_COPY_MESSAGE,
+    ACTION_BRANCH_MESSAGE,
 ];
 
 /// One line of the help page before layout: a colored section heading, a
@@ -1043,6 +1054,25 @@ mod tests {
     }
 
     #[test]
+    fn help_lists_the_global_sidebar_actions() {
+        let rows = help_rows(&test_styles());
+        for id in [
+            ACTION_SIDEBAR_TOGGLE,
+            ACTION_SIDEBAR_FOLD,
+            ACTION_SESSION_NEXT,
+            ACTION_SESSION_PREV,
+            ACTION_SESSION_NEW,
+            ACTION_SIDEBAR_ARCHIVED,
+        ] {
+            let (key, desc) = global_chord(id).expect("sidebar action in the keybinding table");
+            assert!(
+                row_containing(&rows, desc).contains(&key),
+                "sidebar action {desc:?} must carry the resolved label {key:?}"
+            );
+        }
+    }
+
+    #[test]
     fn help_section_two_lists_scroll_nav_with_resolved_labels() {
         let rows = help_rows(&test_styles());
         // Each scroll/nav action's row carries its resolved label next to its
@@ -1059,6 +1089,12 @@ mod tests {
         assert!(
             rows_text(&rows).contains("Mouse wheel"),
             "wheel row present"
+        );
+        let (key, desc) =
+            global_chord(ACTION_BRANCH_MESSAGE).expect("branch action in the keybinding table");
+        assert!(
+            row_containing(&rows, desc).contains(&key),
+            "branch action must carry the resolved label {key:?}"
         );
     }
 
