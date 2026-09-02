@@ -82,7 +82,7 @@ pub const COMMANDS: &[Command] = &[
         name: "logout",
         title: "logout",
         category: "auth",
-        description: "Inspect and remove a stored account or credential.",
+        description: "Remove a stored account or credential.",
         action_id: None,
         action: CommandAction::OpenLogoutSelector,
     },
@@ -282,16 +282,13 @@ pub enum CommandAction {
     OpenModelSelector,
     /// Open the OAuth provider/account picker. Adding an account opens the login
     /// dialog, which prompts for a label before OAuth begins when the provider
-    /// is already configured. Replacing a labeled account first requires exact
-    /// account inspection.
+    /// is already configured.
     OpenLoginSelector,
-    /// Open the logout account picker over stored credentials. A selected
-    /// account is inspected before removal. Removing a default account with
-    /// siblings requires choosing a replacement default or explicitly removing
-    /// the complete provider account set.
+    /// Open the logout account picker over stored credentials. Removing a
+    /// default account with siblings requires choosing a replacement default or
+    /// explicitly removing the complete provider account set.
     OpenLogoutSelector,
-    /// Open the labeled-account picker for changing a provider's store
-    /// default. The confirmed exact raw account is inspected before mutation.
+    /// Open the labeled-account picker for changing a provider's store default.
     OpenDefaultAccountSelector,
     /// Open the read-only authentication-status overlay. It lists provider-level
     /// credential sources and one row per stored account, marking the default.
