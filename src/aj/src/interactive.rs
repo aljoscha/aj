@@ -9912,6 +9912,15 @@ mod tests {
         ConversationPersistence::new(dir.path().join("sessions"))
     }
 
+    fn listed_session_ids(persistence: &ConversationPersistence) -> Vec<String> {
+        persistence
+            .list_sessions()
+            .expect("list the fixture")
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect()
+    }
+
     /// `--tag` names the session a local run creates: the label lands on the
     /// created session, through the host's own create rather than beside it.
     #[tokio::test]
@@ -9950,7 +9959,22 @@ mod tests {
         let newer = "2999-01-01-00-00-00-000";
         let log_path = |id: &str| persistence.sessions_dir().join(format!("{id}.jsonl"));
         std::fs::copy(log_path(&older), log_path(newer)).expect("a younger session");
+        assert_eq!(
+            listed_session_ids(&persistence),
+            vec![newer.to_string(), older.clone()],
+            "the copied session is listable and outranks the older one",
+        );
         persistence.write_archived(newer, true).expect("archive it");
+        assert!(
+            persistence.read_archived(newer).expect("read the sidecar"),
+            "the newer session is archived before the composed call",
+        );
+        assert!(
+            !persistence
+                .read_archived(&older)
+                .expect("read the older archive bit"),
+            "the older session remains unarchived before the composed call",
+        );
 
         let world = world_from_argv(&dir, &["aj", "--scripted", "streaming-text", "continue"])
             .await
@@ -9974,7 +9998,16 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let persistence = store_in(&dir);
         let only = seed_session(&persistence);
+        assert_eq!(
+            listed_session_ids(&persistence),
+            vec![only.clone()],
+            "the seeded session is listable before archiving",
+        );
         persistence.write_archived(&only, true).expect("archive it");
+        assert!(
+            persistence.read_archived(&only).expect("read the sidecar"),
+            "the only session is archived before the composed call",
+        );
 
         let world = world_from_argv(&dir, &["aj", "--scripted", "streaming-text", "continue"])
             .await
@@ -9998,7 +10031,16 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let persistence = store_in(&dir);
         let only = seed_session(&persistence);
+        assert_eq!(
+            listed_session_ids(&persistence),
+            vec![only.clone()],
+            "the seeded session is listable before archiving",
+        );
         persistence.write_archived(&only, true).expect("archive it");
+        assert!(
+            persistence.read_archived(&only).expect("read the sidecar"),
+            "the intended archive bit is readable before sealing metadata",
+        );
 
         let meta = dir.path().join("sessions").join("meta");
         let _sealed = PermissionGuard::seal(&meta);
