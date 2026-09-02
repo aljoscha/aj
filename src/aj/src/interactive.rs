@@ -49,10 +49,7 @@ use aj_conf::skills::Skill;
 use aj_conf::{
     AgentEnv, Config, ConfigDiagnostic, ConfigThinkingDisplay, ConfigVerbosity, Severity,
 };
-use aj_models::auth::{
-    AccountLabelDisplayMode, AuthError, AuthStorage, StoredProviderCredentials,
-    display_account_label,
-};
+use aj_models::auth::{AuthError, AuthStorage, StoredProviderCredentials};
 use aj_models::registry::ModelInfo;
 use aj_models::types::UserContent;
 use aj_models::usage::default_reset_sources;
@@ -2386,22 +2383,17 @@ async fn open_default_logout_resolution(
     true
 }
 
-/// Represent an exact raw account for display and filtering in a picker.
+/// Represent a stored account label for display and filtering in a picker:
+/// the label as stored, folded to one line exactly like a session tag.
 fn account_picker_text(raw: &str) -> (String, String) {
-    let represented = display_account_label(raw, AccountLabelDisplayMode::Ordinary);
+    let represented = crate::text::one_line(raw);
     (represented.clone(), represented)
 }
 
-/// Post-action account text for transcript prose. Ordinary representations
-/// without spaces survive wrapping unchanged; labels with spaces use ASCII
-/// mode.
+/// Post-action account text for transcript prose: the label as stored,
+/// folded to one line.
 fn account_notice_text(raw: &str) -> String {
-    let ordinary = display_account_label(raw, AccountLabelDisplayMode::Ordinary);
-    if ordinary.contains(' ') {
-        display_account_label(raw, AccountLabelDisplayMode::Ascii)
-    } else {
-        ordinary
-    }
+    crate::text::one_line(raw)
 }
 
 /// Apply a confirmed authentication picker request. Login mounts the dialog
@@ -14235,7 +14227,7 @@ mod tests {
     async fn auth_fetch_draws_exact_limit_legacy_row_at_narrow_overlay_geometry() {
         let dir = TempDir::new().expect("tempdir");
         let (world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let label = format!("{}\u{0100}", "a".repeat(10_921));
+        let label = format!("{}\u{0100}", "a".repeat(65_533));
         let raw = serde_json::json!({
             "provider": {
                 "type": "accounts",
@@ -14289,7 +14281,7 @@ mod tests {
             "{fetched}"
         );
         assert!(
-            !fetched.contains("\\u{100}"),
+            !fetched.contains('\u{0100}'),
             "the exact legacy tail reached the row: {fetched}"
         );
     }
@@ -14451,11 +14443,8 @@ mod tests {
         let one_space = account_notice_text("a b");
         let many_spaces = account_notice_text("a    b");
         assert_ne!(one_space, many_spaces);
-        assert!(
-            !one_space.contains(' '),
-            "prose representation must not expose trimmable spaces"
-        );
-        assert!(many_spaces.contains("\\u{20}\\u{20}"));
+        assert_eq!(one_space, "a b", "a label shows as stored");
+        assert_eq!(many_spaces, "a    b", "a label shows as stored");
     }
 
     #[tokio::test]
@@ -14820,7 +14809,6 @@ mod tests {
         app.render(&root).expect("render hostile rows");
         let rendered = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(rendered.contains("work"), "{rendered}");
-        assert!(rendered.contains("\\!\\u{77}\\u{6f}\\u{a}"), "{rendered}");
         assert!(
             !rendered.contains("wo\nrk"),
             "raw label leaked: {rendered:?}"

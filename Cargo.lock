@@ -175,8 +175,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "unicode-normalization",
- "unicode-segmentation",
 ]
 
 [[package]]

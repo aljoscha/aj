@@ -21,8 +21,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true }
 tracing.workspace = true
-unicode-normalization.workspace = true
-unicode-segmentation.workspace = true
 
 [features]
 # Exposes the per-provider round-trip helpers (`replay_sse_events` and the

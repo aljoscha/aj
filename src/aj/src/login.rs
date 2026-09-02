@@ -38,10 +38,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use aj_app::auth::{LoginLine, auth_lines, browser_available, copy_to_clipboard, open_browser};
 use aj_app::keybindings::{fixed_keys, format_keybinding};
 use aj_app::theme::{Theme, ThemeColor};
-use aj_models::auth::{
-    AccountLabelDisplayMode, display_account_label, validate_account_label,
-    validate_account_label_edit,
-};
+use aj_models::auth::{normalize_account_label, validate_account_label_edit};
 use aj_models::oauth::{OAuthAuthInfo, OAuthCallbacks, OAuthError};
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
@@ -273,18 +270,15 @@ impl LoginDialog {
             let st = Arc::clone(&state);
             let submitted_value = Rc::clone(&input_value);
             field.on_submit = Some(Box::new(move |_ctx, value| {
-                let kind = st.lock().expect("login dialog state poisoned").input_kind;
-                let value = if kind == Some(LoginInputKind::AccountLabel) {
-                    value.to_string()
-                } else {
-                    value.trim().to_string()
-                };
+                // The field has cleared itself by now, whatever we do with the
+                // value, so the mirror the edit guard reads follows it.
+                *submitted_value.borrow_mut() = String::new();
+                let value = value.trim().to_string();
                 let sender = pending.lock().expect("pending input poisoned").take();
                 match sender {
                     // Only deliver a non-empty value; a stray empty submit
                     // leaves the prompt in place for the real paste.
                     Some(tx) if !value.is_empty() => {
-                        *submitted_value.borrow_mut() = String::new();
                         let mut state = st.lock().expect("login dialog state poisoned");
                         state.input_prompt = None;
                         state.input_kind = None;
@@ -548,7 +542,7 @@ impl Widget for LoginDialog {
                     && !self.account_insertion_is_safe(text)
                 {
                     self.refuse_account_input(
-                        "Account label paste rejected: use safe single-line Unicode within 256 bytes.",
+                        "Account label paste rejected: a label is one line within 256 bytes.",
                     );
                 } else {
                     self.clear_input_error();
@@ -637,7 +631,7 @@ impl Widget for LoginDialog {
                     || key.matches(u32::from('j'), Modifiers::CTRL)
                 {
                     let value = self.input_value.borrow();
-                    if let Err(err) = validate_account_label(&value) {
+                    if let Err(err) = normalize_account_label(&value) {
                         self.refuse_account_input(&format!("Account label rejected: {err}"));
                         ctx.consume_and_redraw();
                         return;
@@ -647,7 +641,7 @@ impl Widget for LoginDialog {
                     && !self.account_insertion_is_safe(text)
                 {
                     self.refuse_account_input(
-                        "Account label character rejected: use safe single-line Unicode within 256 bytes.",
+                        "Account label character rejected: a label is one line within 256 bytes.",
                     );
                     ctx.consume_and_redraw();
                     return;
@@ -727,8 +721,9 @@ impl DialogCallbacks {
         rx.await.map_err(|_| OAuthError::Cancelled)
     }
 
-    /// Ask for a new account label before OAuth begins. Existing exact labels
-    /// are represented through the shared grammar for collision guidance.
+    /// Ask for a new account label before OAuth begins. Existing labels are
+    /// listed as stored for collision guidance, within a byte budget so an
+    /// oversized legacy store cannot balloon the prompt.
     pub(crate) async fn prompt_account_label(
         &self,
         existing: &[String],
@@ -738,16 +733,12 @@ impl DialogCallbacks {
         let mut represented_bytes = 0;
         let mut omitted = 0;
         for label in existing {
-            let ordinary = display_account_label(label, AccountLabelDisplayMode::Ordinary);
-            let represented = if ordinary.contains(' ') {
-                display_account_label(label, AccountLabelDisplayMode::Ascii)
-            } else {
-                ordinary
-            };
+            // As stored, folded to the prompt's one line like any label row.
+            let folded = crate::text::one_line(label);
             let separator = usize::from(!labels.is_empty()) * 2;
-            if represented_bytes + separator + represented.len() <= REPRESENTATION_BUDGET {
-                represented_bytes += separator + represented.len();
-                labels.push(represented);
+            if represented_bytes + separator + folded.len() <= REPRESENTATION_BUDGET {
+                represented_bytes += separator + folded.len();
+                labels.push(folded);
             } else {
                 omitted += 1;
             }
@@ -1204,7 +1195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_label_rejects_unsafe_and_overlength_edits_atomically() {
+    async fn account_label_rejects_control_and_overlength_edits_atomically() {
         let (mut dialog, state, pending, _cancel) = make();
         let (cb, _rx) = callbacks(&state, &pending);
         let fut = tokio::spawn(async move { cb.prompt_account_label(&[]).await });
@@ -1225,7 +1216,7 @@ mod tests {
         for rejected in [
             Event::Paste("\n".to_string()),
             Event::Paste("bbbbbbb".to_string()),
-            key_event(0x202e, Modifiers::empty(), Some("\u{202e}")),
+            key_event(0x7, Modifiers::empty(), Some("\u{7}")),
         ] {
             dialog.handle_event(&mut ctx, &rejected);
             assert_eq!(
@@ -1243,10 +1234,7 @@ mod tests {
             assert!(!fut.is_finished(), "callback did not fire");
         }
         let error = state.lock().unwrap().input_error.clone().unwrap();
-        assert!(
-            !error.contains('\u{202e}'),
-            "diagnostic echoed rejected text"
-        );
+        assert!(!error.contains('\u{7}'), "diagnostic echoed rejected text");
 
         dialog.handle_event(&mut ctx, &Event::Paste("bbbbbb".to_string()));
         let accepted = format!("{accepted}bbbbbb");
@@ -1270,32 +1258,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_account_label_stays_editable_after_rejected_submission() {
+    async fn a_padded_label_submission_is_trimmed_and_delivered() {
         let (mut dialog, state, pending, _cancel) = make();
         let (cb, _rx) = callbacks(&state, &pending);
         let fut = tokio::spawn(async move { cb.prompt_account_label(&["wo\nrk".into()]).await });
         tokio::task::yield_now().await;
         let prompt = state.lock().unwrap().input_prompt.clone().unwrap();
         assert!(
-            prompt.contains("\\!\\u{77}"),
-            "legacy label represented: {prompt}"
+            prompt.contains("work") && !prompt.contains('\n'),
+            "legacy label folds to the prompt line: {prompt:?}"
         );
 
         let mut ctx = EventContext::new();
         dialog.handle_event(&mut ctx, &Event::Paste("work ".to_string()));
         dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
-        assert_eq!(dialog.input_value.borrow().as_str(), "work ");
-        assert_eq!(dialog.field.byte_offset_to_cursor(), 5);
-        assert!(pending.lock().unwrap().is_some());
-        assert!(!fut.is_finished());
-        assert!(state.lock().unwrap().input_error.is_some());
-
-        dialog.handle_event(
-            &mut ctx,
-            &key_event(Key::BACKSPACE, Modifiers::empty(), None),
+        assert!(
+            state.lock().unwrap().input_error.is_none(),
+            "padding is trimmed, not refused"
         );
-        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
         assert_eq!(fut.await.unwrap().unwrap(), "work");
+        assert_eq!(
+            dialog.input_value.borrow().as_str(),
+            "",
+            "the delivered submission cleared the field"
+        );
     }
 
     #[tokio::test]
@@ -1324,9 +1310,10 @@ mod tests {
             !prompt.contains("[clipped"),
             "sub-limit labels were rewritten"
         );
-        assert!(prompt.contains("\\!\\u{61}\\u{20}\\u{62}"), "{prompt}");
-        assert!(prompt.contains("\\u{20}\\u{20}\\u{20}\\u{20}"), "{prompt}");
-        assert!(!prompt.contains("a    b"));
+        assert!(
+            prompt.contains("a b") && prompt.contains("a    b"),
+            "labels list as stored: {prompt}"
+        );
         drop(dialog);
         drop(pending.lock().unwrap().take());
         assert!(matches!(fut.await.unwrap(), Err(OAuthError::Cancelled)));
@@ -1336,10 +1323,10 @@ mod tests {
     async fn exact_limit_existing_label_uses_width_safe_prompt_guidance() {
         let (mut dialog, state, pending, _cancel) = make();
         let (cb, _rx) = callbacks(&state, &pending);
-        let exact_limit = format!("{}\u{0100}", "a".repeat(10_921));
-        assert_eq!(
-            display_account_label(&exact_limit, AccountLabelDisplayMode::Ordinary).len(),
-            65_535
+        let exact_limit = "a".repeat(4_097);
+        assert!(
+            exact_limit.len() > 4_096,
+            "fixture exceeds the prompt's representation budget"
         );
         let fut = tokio::spawn(async move { cb.prompt_account_label(&[exact_limit]).await });
         tokio::task::yield_now().await;
