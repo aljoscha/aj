@@ -2238,7 +2238,7 @@ async fn open_default_logout_resolution(
                 request: AuthPickerRequest::InspectAccount(action),
                 label: shown,
                 filter_key: format!("{provider_id} {search}"),
-                summary: "make default, then remove the selected account".to_string(),
+                summary: Some("make default, then remove the selected account".to_string()),
             }
         })
         .collect::<Vec<_>>();
@@ -2250,7 +2250,7 @@ async fn open_default_logout_resolution(
         }),
         label: format!("Remove all {provider_id} accounts"),
         filter_key: format!("{provider_id} remove all accounts"),
-        summary: "remove the complete labeled set".to_string(),
+        summary: Some("remove the complete labeled set".to_string()),
     });
     let handles = shell.borrow().overlay_handles();
     open_default_logout_picker(
@@ -3599,11 +3599,11 @@ async fn apply_command_action(
                     },
                     label: name.clone(),
                     filter_key: format!("{id} {name} add account"),
-                    summary: if stored.is_some() {
+                    summary: Some(if stored.is_some() {
                         "add another account".to_string()
                     } else {
                         status.summary
-                    },
+                    }),
                 });
                 match stored {
                     Some(StoredProviderCredentials::Bare(_)) => rows.push(AuthRow {
@@ -3614,7 +3614,7 @@ async fn apply_command_action(
                         },
                         label: format!("{name} — existing credential"),
                         filter_key: format!("{id} {name} existing credential reauthenticate"),
-                        summary: "log in again and replace the bare credential".to_string(),
+                        summary: Some("log in again and replace the bare credential".to_string()),
                     }),
                     Some(StoredProviderCredentials::Accounts(set)) => {
                         rows.extend(set.accounts.into_iter().map(|(account_label, _)| {
@@ -3628,7 +3628,7 @@ async fn apply_command_action(
                                 request: AuthPickerRequest::InspectAccount(action),
                                 label: format!("{name} — {shown}"),
                                 filter_key: format!("{id} {name} {search} reauthenticate"),
-                                summary: "log in again and replace this account".to_string(),
+                                summary: Some("log in again and replace this account".to_string()),
                             }
                         }));
                     }
@@ -3677,7 +3677,7 @@ async fn apply_command_action(
                         },
                         label: id.clone(),
                         filter_key: format!("{id} bare credential"),
-                        summary: "remove the stored credential".to_string(),
+                        summary: Some("remove the stored credential".to_string()),
                     }),
                     Ok(Some(StoredProviderCredentials::Accounts(set))) => {
                         let default = set.default;
@@ -3696,7 +3696,7 @@ async fn apply_command_action(
                                 request: AuthPickerRequest::InspectAccount(action),
                                 label: format!("{id} — {shown}"),
                                 filter_key: format!("{id} {search}"),
-                                summary: format!("remove this {suffix}"),
+                                summary: Some(format!("remove this {suffix}")),
                             }
                         }));
                     }
@@ -3747,11 +3747,7 @@ async fn apply_command_action(
                             format!("{id} — {shown}")
                         },
                         filter_key: format!("{id} {search}"),
-                        summary: if is_current {
-                            "current default account".to_string()
-                        } else {
-                            "make this the default account".to_string()
-                        },
+                        summary: None,
                     }
                 }));
             }
@@ -14596,6 +14592,11 @@ mod tests {
         assert!(
             picker.contains("provider — personal (current)"),
             "current default is visible and tagged: {picker}"
+        );
+        assert!(!picker.contains("current default account"), "{picker}");
+        assert!(
+            !picker.contains("make this the default account"),
+            "{picker}"
         );
         writer.write_all(b"\x1b[B").expect("select next account");
         let event = app.next_input().await.expect("picker navigation event");
