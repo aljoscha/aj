@@ -27,8 +27,7 @@ const entries = [
   { id: 'u1', parent_id: 'root', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:01Z',
     message: { role: 'user', content: [{ type: 'text', text: 'Fix the **bug**. Here is code:\n```rust\nfn main(){}\n```' }], timestamp: 0 } },
   // The exporter preserves keys but replaces every value before the renderer
-  // sees it. This state entry stays out of the default tree, appears under
-  // All with a keys-only label, and renders a real navigation target.
+  // sees it. State entries remain hidden until the State toggle is enabled.
   { id: 'env1', parent_id: 'u1', thread: 'user', type: 'env_change', timestamp: '2024-01-01T00:00:01Z',
     env: { BEADS_ACTOR: '[redacted]', SECRET_TOKEN: '[redacted]', ['line\nbidi\u202e']: '[redacted]',
       ['quote"slash\\']: '[redacted]', ['unicode界']: '[redacted]' } },
@@ -144,6 +143,11 @@ const entries = [
   // tree's branch connectors. It is off the active path to a3.
   { id: 'u1b', parent_id: 'u1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:02Z',
     message: { role: 'user', content: [{ type: 'text', text: 'alternative branch' }], timestamp: 0 } },
+  { id: 'atool', parent_id: 'u1b', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:03Z',
+    message: { role: 'assistant', model: 'claude-test', content: [
+      { type: 'tool_call', id: 'c10', name: 'read_file', arguments: { path: '/home/me/pending.rs' } }],
+      usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total_tokens: 0, cost: { total: 0 } },
+      stop_reason: 'ToolUse', timestamp: 0 } },
 ];
 const sessionData = { session_id: 'smoke-session', leaf_id: 'a3', entries };
 
@@ -162,6 +166,8 @@ function makeEl(tag) {
     appendChild(c) { this.children.push(c); return c; },
     append(...cs) { for (const c of cs) this.children.push(c); },
     addEventListener(type, fn) { (this._on || (this._on = {}))[type] = ((this._on && this._on[type]) || []).concat(fn); },
+    setAttribute(name, value) { (this.attributes || (this.attributes = {}))[name] = String(value); },
+    getAttribute(name) { return this.attributes && this.attributes[name]; },
     scrollIntoView() {},
     querySelector() { return null; },
     querySelectorAll() { return []; },
@@ -175,19 +181,20 @@ function makeEl(tag) {
 async function renderData(data) {
   const elements = {};
   for (const id of ['session-data', 'header-container', 'messages', 'tree-container', 'tree-status',
-    'sidebar', 'sidebar-overlay', 'hamburger', 'sidebar-close', 'tree-search', 'toggle-subagents']) {
+    'sidebar', 'sidebar-overlay', 'hamburger', 'sidebar-close', 'tree-search', 'filter-default']) {
     elements[id] = makeEl('div');
   }
   // Feed the island exactly as the exporter does: gzip-compressed,
   // base64-encoded. This exercises the renderer's real inflate path.
   elements['session-data'].textContent = zlib.gzipSync(JSON.stringify(data)).toString('base64');
 
-  // Filter radio buttons, queried by class (not id) exactly as the page
-  // wires them. `default` starts active, matching template.html.
-  const filterButtons = ['default', 'no-tools', 'user-only', 'all'].map((mode) => {
+  // Category toggles are queried by data attribute exactly as the page wires
+  // them. User and Assistant start active, matching template.html.
+  elements['filter-default'].classList.add('active');
+  const entryFilterButtons = ['user', 'assistant', 'tools', 'subagents', 'state'].map((category) => {
     const btn = makeEl('button');
-    btn.dataset.filter = mode;
-    if (mode === 'default') btn.classList.add('active');
+    btn.dataset.entryFilter = category;
+    if (category === 'user' || category === 'assistant') btn.classList.add('active');
     return btn;
   });
 
@@ -198,7 +205,8 @@ async function renderData(data) {
   const documentShim = {
     getElementById: (id) => {
       if (elements[id]) return elements[id];
-      if (!elements['messages'].innerHTML.includes('id="' + id + '"')) return null;
+      const renderedMarkup = elements['header-container'].innerHTML + elements['messages'].innerHTML;
+      if (!renderedMarkup.includes('id="' + id + '"')) return null;
       const renderedElement = makeEl('div');
       renderedElement.scrollIntoView = (options) => {
         scrolledTargets.push(id);
@@ -208,7 +216,7 @@ async function renderData(data) {
     },
     createElement: (tag) => makeEl(tag),
     querySelector: () => null,
-    querySelectorAll: (sel) => (sel === '.filter-btn' ? filterButtons : []),
+    querySelectorAll: (sel) => (sel === '[data-entry-filter]' ? entryFilterButtons : []),
     addEventListener: () => {},
   };
 
@@ -236,10 +244,10 @@ async function renderData(data) {
   if (!elements['messages'].innerHTML) {
     throw new Error('renderer did not produce output (data load failed?)');
   }
-  return { elements, filterButtons, scrolledTargets, scrollCalls };
+  return { elements, entryFilterButtons, scrolledTargets, scrollCalls };
 }
 
-const { elements, filterButtons, scrolledTargets, scrollCalls } = await renderData(sessionData);
+const { elements, entryFilterButtons, scrollCalls } = await renderData(sessionData);
 
 const rendered = elements['header-container'].innerHTML + '\n' + elements['messages'].innerHTML;
 
@@ -378,6 +386,7 @@ const legacySubData = JSON.parse(JSON.stringify(sessionData));
 legacySubData.entries = legacySubData.entries.filter((entry) => entry.id !== 'sp' && entry.id !== 'sm');
 const legacySubView = await renderData(legacySubData);
 check('legacy agent report remains visible without a spawn root', legacySubView.elements['messages'].innerHTML.includes('sub-agent finding'));
+fire(legacySubView.entryFilterButtons.find((button) => button.dataset.entryFilter === 'tools'), 'click');
 const legacyAgentRow = legacySubView.elements['tree-container'].children.find((n) => nodeText(n).includes('[agent:'));
 check('legacy agent report remains in the tree', !!legacyAgentRow);
 if (legacyAgentRow) fire(legacyAgentRow, 'click');
@@ -386,8 +395,18 @@ const incompleteSubData = JSON.parse(JSON.stringify(sessionData));
 incompleteSubData.entries = incompleteSubData.entries.filter((entry) => entry.id !== 'sm');
 const incompleteSubView = await renderData(incompleteSubData);
 check('agent report remains visible when its child transcript is missing', incompleteSubView.elements['messages'].innerHTML.includes('sub-agent finding'));
+fire(incompleteSubView.entryFilterButtons.find((button) => button.dataset.entryFilter === 'tools'), 'click');
 check('incomplete agent report remains in the tree',
   incompleteSubView.elements['tree-container'].children.some((n) => nodeText(n).includes('[agent:')));
+const emptySystemData = JSON.parse(JSON.stringify(sessionData));
+emptySystemData.entries.find((entry) => entry.id === 'root').text = '';
+const emptySystemView = await renderData(emptySystemData);
+fire(emptySystemView.entryFilterButtons.find((button) => button.dataset.entryFilter === 'state'), 'click');
+const emptySystemNode = emptySystemView.elements['tree-container'].children.find((node) => node.dataset.id === 'root');
+if (emptySystemNode) fire(emptySystemNode, 'click');
+check('empty system prompt remains a navigable State row',
+  !!emptySystemNode && emptySystemView.elements['header-container'].innerHTML.includes('id="entry-root"') &&
+    emptySystemView.scrolledTargets.includes('entry-root'));
 
 console.log('task notification');
 has('task notification block', 'class="task-notification"');
@@ -409,67 +428,92 @@ console.log('tree');
 check('tree has nodes', elements['tree-container'].children.length > 0);
 check('tree user node', treeText.includes('user:'));
 check('tree assistant node', treeText.includes('assistant:'));
-check('tree tool node', treeText.includes('[bash:') || treeText.includes('[read:'));
+check('default tree hides tools', !treeText.includes('[bash:') && !treeText.includes('[read:'));
+check('default tree hides sub-agents', !treeText.includes('sub-agent #'));
 check('tree status line', /\d+ \/ \d+ entries/.test(treeStatus));
 check('tree node text escaped', !treeText.includes('<script>alert'));
 check('tree shows branch sibling', treeText.includes('alternative branch'));
 check('tree draws branch connectors', treeText.includes('\u251c') || treeText.includes('\u2514'));
-check('default tree hides environment state', !treeText.includes('[environment:'));
+check('default tree hides state', !treeText.includes('[environment:'));
+
+console.log('filters');
+{
+  const byCategory = (category) => entryFilterButtons.find((button) => button.dataset.entryFilter === category);
+  const toggle = (category) => fire(byCategory(category), 'click');
+  const currentTree = () => elements['tree-container'].children.map(nodeText).join('\n');
+  const status = () => elements['tree-status'].textContent.match(/(\d+) \/ (\d+)/);
+  const initialStatus = status();
+
+  check('default preset is active', elements['filter-default'].classList.contains('active'));
+  check('user and assistant toggles start active',
+    byCategory('user').classList.contains('active') && byCategory('assistant').classList.contains('active'));
+  check('tools, sub-agent, and state toggles start inactive',
+    !byCategory('tools').classList.contains('active') &&
+      !byCategory('subagents').classList.contains('active') &&
+      !byCategory('state').classList.contains('active'));
+
+  toggle('user');
+  check('user toggle hides user messages', !currentTree().includes('user:'));
+  check('assistant toggle remains independent', currentTree().includes('assistant:'));
+  check('changing a toggle deactivates Default', !elements['filter-default'].classList.contains('active'));
+  toggle('assistant');
+  check('assistant toggle hides assistant messages', !currentTree().includes('assistant:'));
+  toggle('tools');
+  check('tools toggle shows tool results', currentTree().includes('[read:') || currentTree().includes('[bash:'));
+  check('tools toggle shows task notices', currentTree().includes('[task_notification]'));
+  check('tools include agent results when sub-agents are hidden', currentTree().includes('[agent:'));
+  toggle('subagents');
+  check('sub-agent toggle shows complete runs',
+    currentTree().includes('sub-agent #1') && currentTree().includes('sub-agent finding'));
+  check('tools remain visible alongside sub-agents', currentTree().includes('[agent:'));
+  toggle('user');
+  toggle('assistant');
+  toggle('state');
+  const allStatus = status();
+  check('toggle changes keep a stable denominator',
+    !!(initialStatus && allStatus) && initialStatus[2] === allStatus[2] && allStatus[1] === allStatus[2]);
+  check('state toggle shows session state and compactions',
+    currentTree().includes('[environment:') && currentTree().includes('[compaction]'));
+  check('environment state shows keys without values',
+    currentTree().includes('BEADS_ACTOR') && currentTree().includes('SECRET_TOKEN') &&
+      !currentTree().includes('[redacted]'));
+  const envNode = elements['tree-container'].children.find((node) => node.dataset.id === 'env1');
+  check('state row is navigable', !!envNode);
+  if (envNode) {
+    fire(envNode, 'click');
+    check('state navigation renders its transcript target', elements['messages'].innerHTML.includes('id="entry-env1"'));
+    check('state navigation reaches its scroll target',
+      scrollCalls.some((call) => call.id === 'entry-env1'));
+  }
+  const systemNode = elements['tree-container'].children.find((node) => node.dataset.id === 'root');
+  check('system prompt state row is navigable', !!systemNode);
+  if (systemNode) {
+    fire(systemNode, 'click');
+    check('system prompt exposes a scroll target',
+      elements['header-container'].innerHTML.includes('id="entry-root"') &&
+        scrollCalls.some((call) => call.id === 'entry-root'));
+  }
+
+  fire(elements['filter-default'], 'click');
+  check('Default restores user and assistant', currentTree().includes('user:') && currentTree().includes('assistant:'));
+  check('Default hides tools, sub-agents, and state',
+    !currentTree().includes('[read:') && !currentTree().includes('sub-agent #') && !currentTree().includes('[environment:'));
+  check('Default restores toggle and accessibility states',
+    elements['filter-default'].classList.contains('active') &&
+      byCategory('user').getAttribute('aria-pressed') === 'true' &&
+      byCategory('assistant').getAttribute('aria-pressed') === 'true' &&
+      byCategory('tools').getAttribute('aria-pressed') === 'false' &&
+      byCategory('subagents').getAttribute('aria-pressed') === 'false' &&
+      byCategory('state').getAttribute('aria-pressed') === 'false');
+
+  // Leave sub-agents visible for the layout and navigation checks below.
+  toggle('subagents');
+}
 
 // Spine layout: a sub-agent run hangs one level in off the message that
 // spawned it and renders before the conversation continues, while the
 // main thread stays on its spine (not indented by the run). sp2 is
 // spawned by a2; a3 is a2's conversation continuation.
-// The status denominator is the structural set (what the widest filter
-// can show given the sub-agent toggle), not the raw entry count. So
-// "All" with no search reads N / N, and narrowing the mode lowers the
-// numerator while the denominator holds.
-console.log('filter denominator');
-{
-  const byMode = (m) => filterButtons.find((b) => b.dataset.filter === m);
-  fire(byMode('no-tools'), 'click');
-  check('no-tools tree hides environment state',
-    !elements['tree-container'].children.some((n) => n.dataset.id === 'env1'));
-  fire(byMode('all'), 'click');
-  const all = elements['tree-status'].textContent.match(/(\d+) \/ (\d+)/);
-  check('all filter reads N / N', !!all && all[1] === all[2]);
-  const envNode = elements['tree-container'].children.find((n) => n.dataset.id === 'env1');
-  check('all filter gives environment state a keys-only row',
-    !!envNode && nodeText(envNode).includes('environment:') &&
-      nodeText(envNode).includes('BEADS_ACTOR') && nodeText(envNode).includes('SECRET_TOKEN') &&
-      nodeText(envNode).includes('line\\nbidi\\u{202e}') &&
-      !nodeText(envNode).includes('[redacted]') && !nodeText(envNode).includes('\u202e'));
-  if (envNode) {
-    fire(envNode, 'click');
-    const envTranscript = elements['messages'].innerHTML;
-    check('environment row navigates to its rendered transcript target',
-      envTranscript.includes('id="entry-env1"'));
-    check('environment target names keys without values',
-      envTranscript.includes('session environment keys: &quot;BEADS_ACTOR&quot;, &quot;SECRET_TOKEN&quot;') &&
-        envTranscript.includes('line\\nbidi\\u{202e}') &&
-        envTranscript.includes('quote\\&quot;slash\\\\') &&
-        envTranscript.includes('unicode\\u{754c}') &&
-        !envTranscript.includes('[redacted]') && !envTranscript.includes('\u202e') &&
-        !envTranscript.includes('界'));
-    check('environment target lookup reaches the scroll path',
-      scrolledTargets.includes('entry-env1'));
-    const activeEnv = elements['tree-container'].children.find((n) => n.classList.contains('active'));
-    check('environment row becomes the active target', !!activeEnv && activeEnv.dataset.id === 'env1');
-  }
-  fire(byMode('no-tools'), 'click');
-  check('no-tools hides environment state at the active head',
-    !elements['tree-container'].children.some((n) => n.dataset.id === 'env1'));
-  fire(byMode('user-only'), 'click');
-  check('user-only hides environment state at the active head',
-    !elements['tree-container'].children.some((n) => n.dataset.id === 'env1'));
-  const narrow = elements['tree-status'].textContent.match(/(\d+) \/ (\d+)/);
-  check('narrowing keeps the same denominator', !!narrow && narrow[2] === all[2]);
-  check('narrowing lowers the numerator', !!narrow && Number(narrow[1]) < Number(all[1]));
-  fire(byMode('default'), 'click'); // restore the default view for later checks
-  check('default hides environment state at the active head',
-    !elements['tree-container'].children.some((n) => n.dataset.id === 'env1'));
-}
-
 console.log('layout');
 {
   const rows = treeRows();
@@ -486,29 +530,18 @@ console.log('layout');
   check('run before a spine continuation keeps the connector open', !!sp2 && sp2.prefix.includes('\u251c') && !sp2.prefix.includes('\u2514'));
 }
 
-// Sub-agent runs appear in the tree by default and the toggle hides them.
+// Sub-agent runs can be independently hidden without changing the other
+// category toggles.
 console.log('sub-agents');
-check('sub-agent run shown in tree by default', treeText.includes('sub-agent #1'));
-check('sub-agent task in tree', treeText.includes('investigate the bug'));
-check('sub-agent message in tree', treeText.includes('sub-agent finding'));
-// The successful `agent` tool result is not listed as its own tree node
-// while sub-agent rows are shown: the spawn node already names the task.
-check('agent tool result not duplicated in tree', !treeText.includes('[agent:'));
-const subToggle = elements['toggle-subagents'];
-check('sub-agent toggle present', !!subToggle);
-if (subToggle) {
-  check('sub-agent toggle active by default', subToggle.classList.contains('active'));
-  fire(subToggle, 'click');
-  const hidden = elements['tree-container'].children.map(nodeText).join('\n');
-  check('sub-agent hidden after toggle', !hidden.includes('sub-agent #1'));
-  check('conversation still present when hidden', hidden.includes('user:'));
-  // With the spawn rows gone, the agent result is the only trace of the
-  // run left on the conversation thread, so it reappears.
-  check('agent tool result shown in tree when sub-agents hidden', hidden.includes('[agent:'));
-  fire(subToggle, 'click');
-  const reshown = elements['tree-container'].children.map(nodeText).join('\n');
-  check('sub-agent shown again after toggling back', reshown.includes('sub-agent #1'));
-}
+const subToggle = entryFilterButtons.find((button) => button.dataset.entryFilter === 'subagents');
+const visibleSubs = elements['tree-container'].children.map(nodeText).join('\n');
+check('sub-agent task in tree', visibleSubs.includes('investigate the bug'));
+check('sub-agent message in tree', visibleSubs.includes('sub-agent finding'));
+fire(subToggle, 'click');
+const hiddenSubs = elements['tree-container'].children.map(nodeText).join('\n');
+check('sub-agent hidden after toggle', !hiddenSubs.includes('sub-agent #1'));
+check('conversation remains after hiding sub-agents', hiddenSubs.includes('user:'));
+fire(subToggle, 'click');
 
 // Clicking a sub-agent row opens its inline box and keeps the full
 // conversation visible (it routes to the host assistant's branch).
@@ -535,6 +568,14 @@ if (branchNode) {
   check('tree rebuilt: node count matches status', !!m && Number(m[1]) === elements['tree-container'].children.length);
   const active = elements['tree-container'].children.find((n) => n.classList.contains('active'));
   check('active node moved to clicked branch', !!active && active.dataset.id === 'u1b');
+  const toolOnlyNode = elements['tree-container'].children.find((n) => n.dataset.id === 'atool');
+  check('tool-only assistant stays in the Assistant category', !!toolOnlyNode);
+  if (toolOnlyNode) {
+    fire(toolOnlyNode, 'click');
+    check('tool-only assistant exposes a scroll target',
+      elements['messages'].innerHTML.includes('id="entry-atool"') &&
+        scrollCalls.some((call) => call.id === 'entry-atool'));
+  }
 }
 
 console.log('');
