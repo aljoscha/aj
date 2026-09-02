@@ -407,6 +407,30 @@ if (emptySystemNode) fire(emptySystemNode, 'click');
 check('empty system prompt remains a navigable State row',
   !!emptySystemNode && emptySystemView.elements['header-container'].innerHTML.includes('id="entry-root"') &&
     emptySystemView.scrolledTargets.includes('entry-root'));
+const lengthToolData = JSON.parse(JSON.stringify(sessionData));
+lengthToolData.entries.find((entry) => entry.id === 'atool').message.stop_reason = 'Length';
+const lengthToolView = await renderData(lengthToolData);
+check('length-limited tool-only assistant stays out of the sidebar',
+  !lengthToolView.elements['tree-container'].children.some((node) => node.dataset.id === 'atool'));
+const erroredToolData = JSON.parse(JSON.stringify(sessionData));
+const erroredToolMessage = erroredToolData.entries.find((entry) => entry.id === 'atool').message;
+erroredToolMessage.stop_reason = 'Error';
+erroredToolMessage.error = { category: 'provider', message: 'tool turn failed' };
+const erroredToolView = await renderData(erroredToolData);
+check('errored tool-only assistant remains in the sidebar',
+  erroredToolView.elements['tree-container'].children.some((node) => node.dataset.id === 'atool'));
+const abortedToolData = JSON.parse(JSON.stringify(sessionData));
+abortedToolData.entries.find((entry) => entry.id === 'atool').message.stop_reason = 'Aborted';
+const abortedToolView = await renderData(abortedToolData);
+check('aborted tool-only assistant remains in the sidebar',
+  abortedToolView.elements['tree-container'].children.some((node) => node.dataset.id === 'atool'));
+const thinkingToolData = JSON.parse(JSON.stringify(sessionData));
+thinkingToolData.entries.find((entry) => entry.id === 'atool').message.content.unshift({
+  type: 'thinking', thinking: 'Need to inspect this file.', redacted: false,
+});
+const thinkingToolView = await renderData(thinkingToolData);
+check('thinking plus tool calls is not treated as pure tool calls',
+  thinkingToolView.elements['tree-container'].children.some((node) => node.dataset.id === 'atool'));
 
 console.log('task notification');
 has('task notification block', 'class="task-notification"');
@@ -428,6 +452,7 @@ console.log('tree');
 check('tree has nodes', elements['tree-container'].children.length > 0);
 check('tree user node', treeText.includes('user:'));
 check('tree assistant node', treeText.includes('assistant:'));
+check('assistant with text and tool calls remains visible', treeText.includes('Reading the file.'));
 check('default tree hides tools', !treeText.includes('[bash:') && !treeText.includes('[read:'));
 check('default tree hides sub-agents', !treeText.includes('sub-agent #'));
 check('tree status line', /\d+ \/ \d+ entries/.test(treeStatus));
@@ -569,13 +594,7 @@ if (branchNode) {
   const active = elements['tree-container'].children.find((n) => n.classList.contains('active'));
   check('active node moved to clicked branch', !!active && active.dataset.id === 'u1b');
   const toolOnlyNode = elements['tree-container'].children.find((n) => n.dataset.id === 'atool');
-  check('tool-only assistant stays in the Assistant category', !!toolOnlyNode);
-  if (toolOnlyNode) {
-    fire(toolOnlyNode, 'click');
-    check('tool-only assistant exposes a scroll target',
-      elements['messages'].innerHTML.includes('id="entry-atool"') &&
-        scrollCalls.some((call) => call.id === 'entry-atool'));
-  }
+  check('tool-only assistant stays out of the sidebar', !toolOnlyNode);
 }
 
 console.log('');
