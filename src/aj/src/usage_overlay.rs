@@ -418,6 +418,9 @@ impl UsageOverlay {
                 let _ = redraw.send(());
             }
         });
+        // A refresh invalidates the report that authorized any reset target.
+        // Until the new fetch lands there is no actionable credit row.
+        self.statuses = None;
         self.statuses_rx = Some(rx);
         self.fetch_failed = false;
     }
@@ -1324,7 +1327,15 @@ mod tests {
             key(Key::ESCAPE, Modifiers::empty()),
             key(Key::ENTER, Modifiers::empty()),
         ] {
-            let (mut overlay, _) = overlay_with(vec![codex_status(Some(1))], Vec::new());
+            let keys = Arc::new(Mutex::new(Vec::new()));
+            let source: Arc<dyn RateLimitResetSource> = Arc::new(FakeResetSource {
+                provider_id: "openai-codex".into(),
+                outcome: Ok(ResetOutcome::Reset),
+                target_changed: false,
+                keys: Arc::clone(&keys),
+                targets: Arc::new(Mutex::new(Vec::new())),
+            });
+            let (mut overlay, _) = overlay_with(vec![codex_status(Some(1))], vec![source]);
             overlay.set_phase(Phase::Failed {
                 target: target("openai-codex", None),
                 key: "ambiguous-attempt".to_string(),
@@ -1341,6 +1352,16 @@ mod tests {
             assert!(
                 overlay.statuses_rx.is_some(),
                 "leaving a possibly consumed attempt refetches its report"
+            );
+            assert!(
+                overlay.statuses.is_none(),
+                "the stale report cannot authorize another reset while refresh is pending"
+            );
+            send(&mut overlay, &key(u32::from('r'), Modifiers::empty()));
+            assert!(matches!(overlay.phase, Phase::Display));
+            assert!(
+                keys.lock().unwrap().is_empty(),
+                "the reset chord cannot reuse the stale report with a new key"
             );
         }
     }
