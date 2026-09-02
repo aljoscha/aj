@@ -100,7 +100,7 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
         kv("cache read", &stats.usage.cache_read.to_string()),
         kv("cache write", &stats.usage.cache_write.to_string()),
         kv("total tokens", &stats.usage.total_tokens.to_string()),
-        kv("cost", &cost_label(stats.usage.cost.total)),
+        kv("cost", &session_cost_label(stats)),
         kv("of which compaction", &compaction_label(stats)),
     ]);
 
@@ -169,6 +169,20 @@ fn cost_label(total: f64) -> String {
     format!("${total:.4}")
 }
 
+fn session_cost_label(stats: &SessionStats) -> String {
+    let mut label = cost_label(stats.usage.cost.total);
+    let responses: usize = stats.usage_breakdown.iter().map(|b| b.responses).sum();
+    let unpriced: usize = stats
+        .usage_breakdown
+        .iter()
+        .map(|b| b.unpriced_responses)
+        .sum();
+    if unpriced > 0 {
+        label.push_str(&format!(" · {unpriced} of {responses} responses unpriced"));
+    }
+    label
+}
+
 fn bucket_key(bucket: &UsageBucket) -> String {
     let provider = without_control_characters(&bucket.provider);
     let model = without_control_characters(&bucket.model);
@@ -184,11 +198,15 @@ fn without_control_characters(value: &str) -> String {
 }
 
 fn bucket_value(bucket: &UsageBucket) -> String {
-    let mut value = format!(
-        "{} tokens · {}",
-        bucket.usage.total_tokens,
+    let cost = if bucket.unpriced_responses > 0 && bucket.unpriced_responses == bucket.responses {
+        "unpriced".to_string()
+    } else {
         cost_label(bucket.usage.cost.total)
-    );
+    };
+    let mut value = format!("{} tokens · {cost}", bucket.usage.total_tokens);
+    if bucket.unpriced_responses > 0 && bucket.unpriced_responses < bucket.responses {
+        value.push_str(&format!(" · {} unpriced", bucket.unpriced_responses));
+    }
     if bucket.usage.incomplete {
         value.push_str(" · partial");
     }
@@ -530,6 +548,30 @@ mod tests {
             value_of(&rows, "of which compaction"),
             "1 run, not recorded",
             "the exact missing-compaction wording remains"
+        );
+    }
+
+    #[test]
+    fn digest_distinguishes_partially_and_fully_unpriced_usage() {
+        let mut stats = sample_stats();
+        stats.usage.cost.total = 0.30;
+        stats.usage_breakdown[0].unpriced_responses = 1;
+        stats.usage_breakdown[1].usage.cost = UsageCost::default();
+        stats.usage_breakdown[1].unpriced_responses = 6;
+
+        let rows = digest(&stats, None);
+
+        assert_eq!(
+            value_of(&rows, "cost"),
+            "$0.3000 · 7 of 18 responses unpriced"
+        );
+        assert_eq!(
+            value_of(&rows, "anthropic / claude-sonnet-4-5"),
+            "2250 tokens · $0.3000 · 1 unpriced"
+        );
+        assert_eq!(
+            value_of(&rows, "openai / gpt-5 (work)"),
+            "1500 tokens · unpriced"
         );
     }
 
