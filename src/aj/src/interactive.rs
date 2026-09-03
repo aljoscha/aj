@@ -5109,6 +5109,11 @@ impl OverlayHandles {
 /// extends the transcript already on screen (a rejoin into the same epoch) is
 /// drawn as it arrives: what shows up is what was missed.
 ///
+/// The splash is for an empty session the user can talk to, so it too waits
+/// for the connection: a session selected but not yet attached has an empty
+/// model only because nothing has arrived, and the logo would flash for the
+/// moment before its block opens.
+///
 /// A thin wrapper so the flex-1 child can pick per draw without disturbing the
 /// transcript's focus and scroll wiring. Whichever child it picks is drawn
 /// through [`draw_widget`], so that child's stamped widget identity (and thus
@@ -5124,7 +5129,15 @@ struct ChatSlot {
 
 impl Widget for ChatSlot {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        if self.status.borrow().rebuilding {
+        let conversation = self.chat.borrow().has_conversation();
+        let (rebuilding, connected) = {
+            let status = self.status.borrow();
+            (
+                status.rebuilding,
+                status.connection == Connection::Connected,
+            )
+        };
+        if rebuilding || (!conversation && !connected) {
             // A flex parent's measuring pass draws under an unbounded height,
             // and the slot has no inherent height, so report zero there.
             return Surface::with_size(vaxis::vxfw::Size {
@@ -5132,7 +5145,7 @@ impl Widget for ChatSlot {
                 height: ctx.max.height.unwrap_or(0),
             });
         }
-        let child = if self.chat.borrow().has_conversation() {
+        let child = if conversation {
             draw_widget(&to_widget_ref(Rc::clone(&self.transcript)), ctx)
         } else {
             draw_widget(&to_widget_ref(Rc::clone(&self.splash)), ctx)
@@ -23650,6 +23663,12 @@ mod tests {
         .await;
         drop(writer);
         assert!(matches!(moved, Focus::Moved));
+        let selected = painted_rows(&shell, 100, 40);
+        assert!(
+            !selected.iter().any(|row| row.contains(" for commands")),
+            "the empty-state splash flashed for a session whose block has not \
+             opened yet: {selected:?}",
+        );
 
         let status = Rc::clone(&world.status);
         let observed_shell = Rc::clone(&shell);
