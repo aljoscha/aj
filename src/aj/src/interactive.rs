@@ -6878,7 +6878,7 @@ struct Resume {
 
 enum ResumeStep {
     /// Waiting to re-open the stream.
-    Waiting(Connection),
+    Waiting,
     /// The stream is open and its attach block is arriving.
     CatchingUp(Block),
 }
@@ -6889,7 +6889,7 @@ impl Resume {
     /// owes a rejoin. What differs is who asked, and nothing here reads that.
     fn new() -> Resume {
         Resume {
-            step: ResumeStep::Waiting(Connection::Reconnecting),
+            step: ResumeStep::Waiting,
             retry: Retry::default(),
         }
     }
@@ -6903,7 +6903,7 @@ impl Resume {
     /// that follows it.
     fn ready(&self) -> bool {
         match &self.step {
-            ResumeStep::Waiting(_) => self.retry.ready(),
+            ResumeStep::Waiting => self.retry.ready(),
             ResumeStep::CatchingUp(block) => {
                 block.settled().is_some() || Instant::now() >= block.deadline()
             }
@@ -6914,7 +6914,7 @@ impl Resume {
     /// failure is holding the next attempt back, or a block is still arriving.
     fn due(&self) -> Instant {
         match &self.step {
-            ResumeStep::Waiting(_) => self.retry.due().unwrap_or_else(Instant::now),
+            ResumeStep::Waiting => self.retry.due().unwrap_or_else(Instant::now),
             ResumeStep::CatchingUp(block) => block.deadline(),
         }
     }
@@ -6929,7 +6929,7 @@ impl Resume {
     /// be held.
     fn block_mut(&mut self) -> Option<&mut Block> {
         match &mut self.step {
-            ResumeStep::Waiting(_) => None,
+            ResumeStep::Waiting => None,
             ResumeStep::CatchingUp(block) => Some(block),
         }
     }
@@ -6940,18 +6940,12 @@ impl Resume {
         matches!(self.step, ResumeStep::CatchingUp(_))
     }
 
-    fn connection(&self) -> Connection {
-        match self.step {
-            ResumeStep::Waiting(connection) => connection,
-            ResumeStep::CatchingUp(_) => Connection::CatchingUp,
-        }
-    }
-
     /// Note a failed step: the recovery starts over from the open, after the
-    /// backoff.
-    fn failed(&mut self, connection: Connection) {
+    /// backoff. What the failure was is the loop's to show, through
+    /// `world.connection`.
+    fn failed(&mut self) {
         self.retry.failed();
-        self.step = ResumeStep::Waiting(connection);
+        self.step = ResumeStep::Waiting;
     }
 }
 
@@ -7033,7 +7027,7 @@ async fn advance_resume(
 ) -> Result<ResumeAdvance, ControlError> {
     let mut state = state;
     match state.step {
-        ResumeStep::Waiting(_) => {
+        ResumeStep::Waiting => {
             // Recovery is one-stream-at-a-time. A stalled or refused stream may
             // still be live, but it is obsolete before the replacement open
             // starts and must not retain subscriptions alongside that request.
@@ -7930,7 +7924,7 @@ async fn drive(
             let state = resume.take().expect("checked just above");
             match advance_resume(world, shell, state).await {
                 Ok(ResumeAdvance::Pending(next)) => {
-                    world.connection = next.connection();
+                    world.connection = Connection::CatchingUp;
                     resume = Some(next);
                 }
                 Ok(ResumeAdvance::OpenFailed { mut state, error }) => {
@@ -7948,8 +7942,8 @@ async fn drive(
                         break Err(anyhow::anyhow!("the session host is gone: {error}"));
                     }
                     tracing::warn!("could not re-attach the selected session: {reason}");
-                    state.failed(Connection::Reconnecting);
-                    world.connection = state.connection();
+                    state.failed();
+                    world.connection = Connection::Reconnecting;
                     resume = Some(state);
                 }
                 Ok(ResumeAdvance::Settled { mut state, caught }) => match caught {
@@ -7971,7 +7965,7 @@ async fn drive(
                             );
                             world.stream.take();
                             world.client_mut().owe_reattach();
-                            state.failed(Connection::Reconnecting);
+                            state.failed();
                             world.connection = Connection::Reconnecting;
                             resume = Some(state);
                         } else {
@@ -7992,7 +7986,7 @@ async fn drive(
                         // ordinary refusal waits for the directory's rejoin
                         // edge instead of polling the peer.
                         if world.client().needs_reattach() {
-                            state.failed(Connection::Refused);
+                            state.failed();
                             resume = Some(state);
                         } else {
                             resume = None;
@@ -8016,7 +8010,7 @@ async fn drive(
                             );
                         }
                         tracing::warn!("the selected session's attach block did not land");
-                        state.failed(Connection::Stalled);
+                        state.failed();
                         world.connection = Connection::Stalled;
                         resume = Some(state);
                     }
@@ -11989,21 +11983,25 @@ mod tests {
         let mut seen = Vec::new();
         let mut pending = Some(Resume::new());
         let deadline = Instant::now() + SETTLE_DEADLINE;
+        world.connection = Connection::Reconnecting;
         while let Some(mut state) = pending.take() {
             assert!(Instant::now() < deadline, "the re-attach never settled");
-            if seen.last() != Some(&state.connection()) {
-                seen.push(state.connection());
+            if seen.last() != Some(&world.connection) {
+                seen.push(world.connection);
             }
-            world.connection = state.connection();
             if state.ready() {
                 match advance_resume(world, shell, state).await? {
-                    ResumeAdvance::Pending(state) => pending = Some(state),
+                    ResumeAdvance::Pending(state) => {
+                        world.connection = Connection::CatchingUp;
+                        pending = Some(state);
+                    }
                     ResumeAdvance::OpenFailed { error, .. } => return Err(error),
                     ResumeAdvance::Settled {
                         mut state,
                         caught: CatchUp::Stalled(_),
                     } => {
-                        state.failed(Connection::Stalled);
+                        state.failed();
+                        world.connection = Connection::Stalled;
                         pending = Some(state);
                     }
                     ResumeAdvance::Settled {
@@ -12164,7 +12162,7 @@ mod tests {
             // The stream opened, then died inside the block.
             state.step = ResumeStep::CatchingUp(arriving_block());
             let at = Instant::now();
-            state.failed(Connection::Reconnecting);
+            state.failed();
             assert!(!state.ready(), "attempt {attempt} left nothing holding it");
             assert!(
                 state.due().saturating_duration_since(at) >= applied,
@@ -12178,7 +12176,7 @@ mod tests {
         }
 
         for _ in 0..10 {
-            state.failed(Connection::Reconnecting);
+            state.failed();
         }
         assert_eq!(
             state.retry.delay, RETRY_BACKOFF_MAX,
@@ -15980,13 +15978,13 @@ mod tests {
                         CatchUp::Refused { .. } => {
                             world.connection = Connection::Refused;
                             if world.client().needs_reattach() {
-                                state.failed(Connection::Refused);
+                                state.failed();
                                 world.resume = Some(state);
                             }
                         }
                         CatchUp::Stalled(_) => {
                             world.connection = Connection::Stalled;
-                            state.failed(Connection::Stalled);
+                            state.failed();
                             world.resume = Some(state);
                         }
                         CatchUp::Caught => unreachable!(),
@@ -25043,7 +25041,7 @@ mod tests {
         else {
             panic!("the peer answered the open, so a block is now awaited");
         };
-        assert_eq!(resuming.connection(), Connection::CatchingUp);
+        assert!(resuming.arriving(), "the open did not arm a block");
         assert_ne!(
             world
                 .directory
