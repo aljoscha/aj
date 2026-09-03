@@ -46,9 +46,9 @@ explicit state and tolerating slightly stale data over protocol dances.
 behaviour the spec describes updates the spec in the same branch.
 
 Anything the user does that needs to know about the host, such as listing
-sessions or reading their state, is implemented once against the `Control`
-trait. Whether the host is the local process or a remote one is a backend
-detail behind that trait, so the interactive UI never reads host files
+sessions or reading their state, is implemented once against `Control` in
+`src/aj/src/control.rs`. Whether the host is the local process or a remote one
+is a detail behind that seam, so the interactive UI never reads host files
 directly. Tests for backend equivalence run against the real local and remote
 adapters.
 
