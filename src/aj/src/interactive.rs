@@ -339,11 +339,7 @@ async fn build_world(
         .expect("a local run holds the host")
         .local_handles(&session)
         .await?;
-    // Read off the handles before they move into the world: the notices below
-    // are folded after the attach block, and this is the local-only half of
-    // startup either way.
     let env = handles.env.clone();
-    let restore_notices = handles.restore_notices.clone();
     let (settings, context_window) = {
         let cfg = handles
             .run_config
@@ -360,7 +356,7 @@ async fn build_world(
         local: Some(handles),
         working_directory: env.working_directory.clone(),
         working_directory_follows_focus: false,
-        connection: Connection::Connected,
+        connection: Connection::CatchingUp,
         resume: None,
         transition: None,
         startup: HashMap::new(),
@@ -374,10 +370,7 @@ async fn build_world(
         persistence: persistence.clone(),
         launch_env,
     };
-    // Awaited rather than drained: the block is producer-paced, and the
-    // resumed history has to be in the model before the first frame is drawn.
-    fold_attach_block(&mut world).await;
-    refresh_client_reads(&mut world).await;
+    world.resume = Some(Resume::launched(&world));
 
     // Apply a `--api-key` runtime override before checking the initial
     // provider. Credential storage can wait on its cross-process file lock, so
@@ -407,20 +400,35 @@ async fn build_world(
             )),
         };
     }
+    // A fresh session's notices carry its env, which the fold reads off the
+    // handles once the block has committed. A resume reports the process-level
+    // ones here, alongside the flags that only a create could have honored.
+    let mut rows = Vec::new();
+    if !fresh {
+        rows.extend(local_session_notice_events(
+            local_session_notices.clone(),
+            None,
+        ));
+        if args.has_launch_tag() {
+            rows.push(warning_event(TAG_WITHOUT_A_CREATE));
+        }
+        if args.has_launch_env() {
+            rows.push(warning_event(ENV_WITHOUT_A_CREATE));
+        }
+    }
     world.local_session_notices = Some(local_session_notices);
-    fold_local_session_notices(&mut world, fresh.then_some(&env));
-    if !fresh && args.has_launch_tag() {
-        fold_warning(&mut world, TAG_WITHOUT_A_CREATE);
-    }
-    if !fresh && args.has_launch_env() {
-        fold_warning(&mut world, ENV_WITHOUT_A_CREATE);
-    }
-    if let Some(warning) = &partial_create {
-        fold_warning(&mut world, warning);
-    }
-    for notice in restore_notices {
-        fold_notice(&mut world, &notice);
-    }
+    world.startup.insert(
+        session,
+        PendingStartup {
+            fresh,
+            attaching: !fresh,
+            partial_create,
+            launch: Some(Launch {
+                rows,
+                connect_summary: None,
+            }),
+        },
+    );
 
     Ok(world)
 }
@@ -503,7 +511,7 @@ async fn build_connect_world(
         // `@file` completions and tool output all name paths on that machine.
         working_directory: working_directory.unwrap_or_default(),
         working_directory_follows_focus,
-        connection: Connection::Connected,
+        connection: Connection::CatchingUp,
         resume: None,
         transition: None,
         startup: HashMap::new(),
@@ -517,51 +525,42 @@ async fn build_connect_world(
         persistence: persistence.clone(),
         launch_env: args.launch_env().map_err(|err| anyhow!("--env: {err}"))?,
     };
-    fold_attach_block(&mut world).await;
-    refresh_client_reads(&mut world).await;
-    world.sync_working_directory();
+    world.resume = Some(Resume::launched(&world));
 
-    for event in startup_diagnostic_events(diagnostics, &keybinding_problems) {
-        fold_event(&mut world, event);
-    }
+    let mut rows = startup_diagnostic_events(diagnostics, &keybinding_problems);
     if args.listen.is_some() {
-        fold_warning(
-            &mut world,
+        rows.push(warning_event(
             "--listen has nothing to serve in connect mode: the sessions live on the host.",
-        );
+        ));
     }
     if !created && args.has_launch_tag() {
-        fold_warning(&mut world, TAG_WITHOUT_A_CREATE);
+        rows.push(warning_event(TAG_WITHOUT_A_CREATE));
     }
     if !created && args.connect_host().is_some() {
-        fold_warning(&mut world, HOST_WITHOUT_A_CREATE);
+        rows.push(warning_event(HOST_WITHOUT_A_CREATE));
     }
     if !created && args.thinking.is_some() {
-        fold_warning(&mut world, THINKING_WITHOUT_A_CREATE);
+        rows.push(warning_event(THINKING_WITHOUT_A_CREATE));
     }
     if !created && args.has_launch_env() {
-        fold_warning(&mut world, ENV_WITHOUT_A_CREATE);
+        rows.push(warning_event(ENV_WITHOUT_A_CREATE));
     }
-    let dialed = format!("Connected to {}.", connect_url(&world));
-    fold_notice(&mut world, &dialed);
-    if let Some(settings) = world.client_mut().take_first_attach_settings() {
-        let summary = format!(
-            "Session settings: model {}/{}, thinking {}, thinking display {}, speed {}, \
-             verbosity {}.",
-            settings.provider,
-            settings.model_id,
-            settings.thinking,
-            settings.thinking_display,
-            settings.speed,
-            settings.verbosity,
-        );
-        let notice = if created {
-            format!("Created session {}. {summary}", world.session())
-        } else {
-            format!("Attached session {}. {summary}", world.session())
-        };
-        fold_notice(&mut world, &notice);
-    }
+    rows.push(notice_event(&format!(
+        "Connected to {}.",
+        connect_url(&world)
+    )));
+    world.startup.insert(
+        world.session().to_string(),
+        PendingStartup {
+            fresh: false,
+            attaching: false,
+            partial_create: None,
+            launch: Some(Launch {
+                rows,
+                connect_summary: Some(created),
+            }),
+        },
+    );
 
     Ok(world)
 }
@@ -857,9 +856,10 @@ impl AttachStall {
 /// The fold of one attach block as it arrives, frame by frame.
 ///
 /// The rule a block's frames go through, held apart from what drives them in.
-/// Two drivers: [`fold_attach_block`] awaits a block whole, and the drive loop
-/// feeds one from its `select!` so the paint and the input survive a catch-up of
-/// any length.
+/// The drive loop feeds one from its `select!` so the paint and the input
+/// survive a catch-up of any length, at launch as much as after a switch or a
+/// lost stream. Tests that act on a world without its loop await one whole
+/// through [`Self::fold_through`].
 ///
 /// ## What ends the block
 ///
@@ -939,14 +939,14 @@ impl Block {
         self.settled = Some(caught);
     }
 
-    /// Fold this block to its end, awaiting its frames, for a driver with
-    /// nothing else to do while it arrives.
+    /// Fold this block to its end, awaiting its frames, for a test that acts on
+    /// a world without driving its loop.
     ///
     /// The deadline is not optional for such a driver, because it parks its
     /// caller: a peer that keeps its stream warm and says nothing about the
     /// session, which a gateway with no link to the owning host does, would
     /// otherwise park it forever.
-    ///
+    #[cfg(test)]
     async fn fold_through(&mut self, world: &mut World) -> CatchUp {
         loop {
             if let Some(caught) = self.settled.clone() {
@@ -1061,25 +1061,14 @@ impl Block {
 }
 
 /// Fold the attach block the focused session's client is waiting for, up to and
-/// including its `caught_up`, and report what became of it.
-///
-/// The block is producer-paced: it is generated at the pace the
-/// client reads it rather than queued before the attach returns, so draining
-/// only what is ready would paint the first frame against an empty
-/// transcript. Awaiting the block's end is also what makes the reads it
-/// obliges observe the state it established.
-///
-/// What ends a block and what bounds the wait for it are [`Block`]'s.
-///
-/// The drive loop's own catch-up is not folded here. It feeds a [`Block`] from
-/// its `select!`, so no paint and no keystroke waits on a backfill (see
-/// [`Resume`]).
+/// including its `caught_up`, and report what became of it. The tests' awaiting
+/// driver, for a world nothing else is driving.
 ///
 /// Whatever the block did apply stays applied. A block that stopped arriving
 /// leaves the client re-owing its re-attach
 /// ([`aj_app::client::SessionClient::abandon_attach`]), so something asks again;
-/// a refused one deliberately does not. This stays silent about the reason, which
-/// the caller reports.
+/// a refused one deliberately does not.
+#[cfg(test)]
 async fn fold_attach_block(world: &mut World) -> CatchUp {
     Block::open(world).fold_through(world).await
 }
@@ -1246,10 +1235,27 @@ enum PendingTransition {
     },
 }
 
+/// The rows a session is owed on top of its history once its first block
+/// commits: fresh-session setup, the notices a restore produced, a create that
+/// only partly applied. Built where the gesture knows them and folded by the
+/// loop after Caught, so a block that lands in between cannot bury them.
 struct PendingStartup {
     fresh: bool,
     attaching: bool,
     partial_create: Option<String>,
+    /// What the process start reports once, on the session it opened with.
+    launch: Option<Launch>,
+}
+
+/// The rows every launch reports once: config diagnostics, launch flags that
+/// had no effect in this mode, the line saying what was dialed. A connect
+/// launch also summarizes the session's settings off its first `state` frame,
+/// which is only known once the block has opened.
+struct Launch {
+    rows: Vec<AgentEvent>,
+    /// `Some(created)` for a connect launch: whether the session was minted by
+    /// this launch or attached, which the summary says.
+    connect_summary: Option<bool>,
 }
 
 /// A session change the drive loop broke out for.
@@ -1460,11 +1466,13 @@ fn focus_session(
             fresh: true,
             attaching,
             partial_create: partial.clone(),
+            launch: None,
         }),
         PendingTransition::Switch { .. } if attaching => Some(PendingStartup {
             fresh: false,
             attaching: true,
             partial_create: None,
+            launch: None,
         }),
         PendingTransition::Switch { .. } | PendingTransition::Head { .. } => None,
     };
@@ -1530,22 +1538,49 @@ fn focus_session(
     app.request_redraw();
 }
 
-/// Fold the selected local session's startup rows after its first usable
-/// Caught. A failed attempt leaves the cached transcript focused without
-/// claiming that restore or fresh-session setup completed.
+/// Fold the selected session's startup rows after its first usable Caught. A
+/// failed attempt leaves the cached transcript focused without claiming that
+/// restore or fresh-session setup completed.
 fn fold_selected_startup(world: &mut World, startup: PendingStartup) {
     let local = world
         .local
         .as_ref()
         .map(|handles| (handles.env.clone(), handles.restore_notices.clone()));
-    if let Some((env, restore_notices)) = local {
-        if startup.fresh {
-            fold_local_session_notices(world, Some(&env));
+    if let Some((env, _)) = &local
+        && startup.fresh
+    {
+        fold_local_session_notices(world, Some(env));
+    }
+    if let Some(launch) = startup.launch {
+        for event in launch.rows {
+            fold_event(world, event);
         }
-        if startup.attaching {
-            for notice in restore_notices {
-                fold_notice(world, &notice);
-            }
+        if let Some(created) = launch.connect_summary
+            && let Some(settings) = world.client_mut().take_first_attach_settings()
+        {
+            let summary = format!(
+                "Session settings: model {}/{}, thinking {}, thinking display {}, speed {}, \
+                 verbosity {}.",
+                settings.provider,
+                settings.model_id,
+                settings.thinking,
+                settings.thinking_display,
+                settings.speed,
+                settings.verbosity,
+            );
+            let notice = if created {
+                format!("Created session {}. {summary}", world.session())
+            } else {
+                format!("Attached session {}. {summary}", world.session())
+            };
+            fold_notice(world, &notice);
+        }
+    }
+    if let Some((_, restore_notices)) = local
+        && startup.attaching
+    {
+        for notice in restore_notices {
+            fold_notice(world, &notice);
         }
     }
     if let Some(partial) = startup.partial_create {
@@ -1577,11 +1612,19 @@ async fn complete_pending_transition(
     world: &mut World,
 ) {
     let session = world.session().to_string();
-    if let Some(startup) = world.startup.remove(&session) {
+    let startup = world.startup.remove(&session);
+    let launched = startup
+        .as_ref()
+        .is_some_and(|startup| startup.launch.is_some());
+    if let Some(startup) = startup {
         fold_selected_startup(world, startup);
     }
     let Some(transition) = world.transition.take() else {
-        fold_notice(world, reattached_notice(&world.control));
+        // A launch's first Caught is the session opening, not a stream coming
+        // back, and its rows already say what was dialed.
+        if !launched {
+            fold_notice(world, reattached_notice(&world.control));
+        }
         app.request_redraw();
         return;
     };
@@ -6882,6 +6925,15 @@ impl Resume {
         }
     }
 
+    /// Recovery from a stream the launch already opened: the block is the
+    /// next thing on it, and the loop folds it like any other.
+    fn launched(world: &World) -> Resume {
+        Resume {
+            step: ResumeStep::CatchingUp(Block::open(world)),
+            retry: Retry::default(),
+        }
+    }
+
     /// Whether the next step may run.
     ///
     /// A block still arriving has no step of its own: the loop's frame arm
@@ -7201,8 +7253,10 @@ async fn drive(
         .resume
         .take()
         .or_else(|| world.directory.needs_reattach().then(Resume::new));
-    if resume.is_some() && world.connection == Connection::Connected {
-        world.connection = Connection::Reconnecting;
+    if resume.is_some() {
+        if world.connection == Connection::Connected {
+            world.connection = Connection::Reconnecting;
+        }
         sync_status(world);
         app.request_redraw();
     }
@@ -8807,9 +8861,10 @@ mod tests {
         let args = Args::parse_from(["aj", "--scripted", demo]);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        build_world(&args, layers, &[], &auth, &persistence, idle_grace)
+        let world = build_world(&args, layers, &[], &auth, &persistence, idle_grace)
             .await
-            .expect("build world")
+            .expect("build world");
+        launched(world).await
     }
 
     /// A `[keybindings]` override for an unknown action is rejected at startup
@@ -8982,9 +9037,10 @@ mod tests {
         let args = Args::parse_from(["aj", "--scripted", demo, "continue", session_id]);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        build_world(&args, default_layers(), &[], &auth, &persistence, None)
+        let world = build_world(&args, default_layers(), &[], &auth, &persistence, None)
             .await
-            .expect("build resumed world")
+            .expect("build resumed world");
+        launched(world).await
     }
 
     /// Submit a prompt and drive a scripted demo, including its sub-agent
@@ -9720,7 +9776,7 @@ mod tests {
         let args = Args::parse_from(argv);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        build_world(
+        let world = build_world(
             &args,
             layers_spilling_into(dir),
             &[],
@@ -9728,7 +9784,8 @@ mod tests {
             &persistence,
             None,
         )
-        .await
+        .await?;
+        Ok(launched(world).await)
     }
 
     /// This run's session store, for reading a sidecar back.
@@ -12260,6 +12317,25 @@ mod tests {
         )
     }
 
+    /// Bring a freshly built world to where the drive loop's first iterations
+    /// take it: the launch's block folded and committed, its reads discharged,
+    /// its startup rows on top of the history. For tests that act on a world
+    /// without driving its loop.
+    async fn launched(mut world: World) -> World {
+        let mut resume = world.resume.take().expect("a launch arms a block");
+        let block = resume.block_mut().expect("a launch opens its block");
+        let caught = block.fold_through(&mut world).await;
+        assert_eq!(caught, CatchUp::Caught, "the launch's block did not land");
+        refresh_client_reads(&mut world).await;
+        world.sync_working_directory();
+        world.connection = Connection::Connected;
+        let session = world.session().to_string();
+        if let Some(startup) = world.startup.remove(&session) {
+            fold_selected_startup(&mut world, startup);
+        }
+        world
+    }
+
     /// Poll `observed` until it answers `Some`, bounded by [`SETTLE_DEADLINE`] so
     /// a loop that never gets there fails a test instead of hanging it.
     async fn poll_for<T>(observed: impl FnMut() -> Option<T>) -> Option<T> {
@@ -12715,6 +12791,7 @@ mod tests {
         )
         .await
         .expect("build env-bearing world");
+        let world = launched(world).await;
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
@@ -19690,9 +19767,11 @@ mod tests {
             .expect("connect to the scripted host");
         let auth = AuthStorage::new(dir.path().join("client-auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("client-sessions"));
-        build_connect_world(&args, connected, default_layers(), &[], &auth, &persistence)
-            .await
-            .expect("build the connect-mode world")
+        let world =
+            build_connect_world(&args, connected, default_layers(), &[], &auth, &persistence)
+                .await
+                .expect("build the connect-mode world");
+        launched(world).await
     }
 
     /// The launch turn `argv` carries for a connect run, derived the way the
@@ -23422,6 +23501,116 @@ mod tests {
         );
         assert_eq!(world.connection, Connection::Connected);
         assert_eq!(world.session(), target);
+        remote.shutdown().await;
+    }
+
+    /// A launch is folded by the drive loop like any other attach: the world
+    /// comes out of its build catching up, and the first Caught puts the history
+    /// on screen with the launch's own rows on top of it, saying nothing about a
+    /// stream coming back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_launch_lands_its_rows_on_top_of_the_replayed_history() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        // History on the host, written through a first client that then lets go.
+        let (mut seed, _seed_shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        run_prompt(&mut seed, "history before the launch").await;
+        let session = seed.session().to_string();
+        seed.stream.take();
+
+        let client_dir = TempDir::new().expect("tempdir");
+        let url = remote.url();
+        let args = Args::parse_from(["aj", "connect", &url]);
+        let connected = dial_at(&url, &client_config(), &nothing_stated(), &[])
+            .await
+            .expect("connect to the scripted host");
+        let auth = AuthStorage::new(client_dir.path().join("client-auth.json"));
+        let persistence = ConversationPersistence::new(client_dir.path().join("client-sessions"));
+        let mut world =
+            build_connect_world(&args, connected, default_layers(), &[], &auth, &persistence)
+                .await
+                .expect("build the connect-mode world");
+        assert_eq!(
+            world.session(),
+            session,
+            "the launch attached the latest session"
+        );
+        assert_eq!(
+            world.connection,
+            Connection::CatchingUp,
+            "a built world is still catching up on its launch's block",
+        );
+        assert!(
+            main_notices(&world).is_empty(),
+            "launch rows were folded before the block: {:?}",
+            main_notices(&world),
+        );
+        let working_directory = world.working_directory.clone();
+        let shell = Rc::new(RefCell::new(Shell::new(
+            Rc::clone(&world.chat),
+            Rc::clone(&world.status),
+            None,
+            ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
+            "aj".to_string(),
+            world.session(),
+            working_directory,
+        )));
+
+        let status = Rc::clone(&world.status);
+        let observed_shell = Rc::clone(&shell);
+        let (exit, observed) = drive_until(&mut world, &shell, move |writer| async move {
+            let caught = settled(Duration::from_secs(5), || {
+                (status.borrow().connection == Connection::Connected).then_some(())
+            })
+            .await;
+            let screen = painted_rows(&observed_shell, 100, 40);
+            drop(writer);
+            (caught, screen)
+        })
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let (caught, screen) = observed;
+        assert!(caught.is_some(), "the launch's block never committed");
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains("history before the launch")),
+            "the replayed history is not on screen: {screen:?}",
+        );
+        let kinds: Vec<String> = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .map(|entry| match &entry.kind {
+                aj_app::chat::EntryKind::User(_) => "user".to_string(),
+                aj_app::chat::EntryKind::Notice(notice) => notice.text.clone(),
+                _ => "other".to_string(),
+            })
+            .collect();
+        let user = kinds
+            .iter()
+            .position(|kind| kind == "user")
+            .expect("the replayed prompt");
+        let dialed = kinds
+            .iter()
+            .position(|kind| kind.starts_with("Connected to "))
+            .expect("the launch's dialed row");
+        let attached = kinds
+            .iter()
+            .position(|kind| kind.starts_with("Attached session "))
+            .expect("the launch's settings summary");
+        assert!(
+            user < dialed && dialed < attached,
+            "the launch rows did not land on top of the history, in order: {kinds:?}",
+        );
+        assert!(
+            !kinds.iter().any(|kind| kind == "Reconnected to the host."),
+            "a launch's first Caught was reported as a reconnect: {kinds:?}",
+        );
         remote.shutdown().await;
     }
 
@@ -28157,7 +28346,7 @@ mod tests {
         ]);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        let mut world = build_world(
+        let world = build_world(
             &args,
             layers_spilling_into(&dir),
             &[],
@@ -28167,6 +28356,7 @@ mod tests {
         )
         .await
         .expect("build launch-env world");
+        let mut world = launched(world).await;
         let initial = world.session().to_string();
         assert_eq!(
             initial, legacy,
@@ -28254,6 +28444,7 @@ mod tests {
         )
         .await
         .expect("build embedded-host world");
+        let world = launched(world).await;
         let host = world.control.host().expect("local host").clone();
         let expected = BTreeMap::from([("BEADS_ACTOR".to_string(), "session-actor".to_string())]);
         assert_eq!(
