@@ -240,7 +240,7 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 ///
 /// The tag is taken at the append site. A consumer that instead read the
 /// log's length when it received the event would race concurrent
-/// sub-agent appends and mis-number the event (spec section 5). The one
+/// sub-agent appends and mis-number the event. The one
 /// durable event this listener does not append itself is `CompactionEnd`,
 /// whose entry is filed on `handoff` by the compaction run.
 ///

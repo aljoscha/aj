@@ -948,8 +948,8 @@ fn open_auth_picker(
         stack,
         chrome,
         title,
-        // The confirm/close hint resolves through the shared keybinding data
-        // (Spec F). Enter/Esc *handling* stays a fixed `FilterableSelect`
+        // The confirm/close hint resolves through the shared keybinding data.
+        // Enter/Esc *handling* stays a fixed `FilterableSelect`
         // convention (see the NOTE in `crate::overlay`).
         subtitle_confirm_close(),
         to_widget_ref(Rc::clone(&select)),

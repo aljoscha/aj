@@ -10,8 +10,8 @@ Documentation=https://github.com/aljoscha/aj
 [Service]
 Type=simple
 
-# One host serves one working directory (spec section 4) and its session
-# store is keyed to it. %h is your home directory, so a repo kept under
+# One host serves one working directory and its session store is keyed
+# to it. %h is your home directory, so a repo kept under
 # it gets a store named for its path relative to home (~/projects/api
 # becomes projects-api), which is what keeps two checkouts apart.
 WorkingDirectory=%h/projects/api
@@ -27,12 +27,11 @@ WorkingDirectory=%h/projects/api
 # The control port runs arbitrary commands through the agent, so it is
 # never served unauthenticated. `tailscale` verifies each peer against the
 # local daemon and admits only the logins named in AJ_ALLOW, or a tagged
-# node granted github.com/aljoscha/aj/cap/control in the tailnet policy
-# (spec section 6.11).
+# node granted github.com/aljoscha/aj/cap/control in the tailnet policy.
 #
 # `open` belongs only to a network that is private by construction, such
-# as an ember guest reachable from its hypervisor and nowhere else
-# (spec section 7.4). A machine you can ssh into is not that.
+# as an ember guest reachable from its hypervisor and nowhere else. A
+# machine you can ssh into is not that.
 #
 # The conservative alternative is to drop AJ_AUTH and AJ_ALLOW, leave
 # AJ_LISTEN at its loopback default, and reach the host through an ssh

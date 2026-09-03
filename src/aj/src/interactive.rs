@@ -3,7 +3,7 @@
 //! The base layout from the alt-screen UX spec: a one-line header, a
 //! flex-filling transcript, an editor, and a one-line footer, stacked
 //! in a `FlexColumn`. A session host backs the shell: this frontend is the
-//! host's first client, attached in process (spec section 5). Prompts and
+//! host's first client, attached in process. Prompts and
 //! every other mutation go out as host commands, the frames the host
 //! publishes fold into the [`ChatState`] model through
 //! [`SessionClient`](aj_app::client::SessionClient), and the
@@ -141,9 +141,9 @@ const APP_TITLE: &str = "aj";
 /// are drivable headlessly in tests, without a terminal.
 struct World {
     /// The host this frontend drives, in process or over the control port,
-    /// and the only path to mutating a session (spec section 5). Which of the
-    /// two it is decides nothing above [`Control`] except the handful of
-    /// gestures spec 9.1 leaves out of connect mode.
+    /// and the only path to mutating a session. Which of the two it is decides
+    /// nothing above [`Control`] except the handful of gestures connect mode
+    /// refuses because they read this client's own machine.
     control: Control,
     /// Every session this peer offers: the `list` rows, and a fold plus a
     /// transcript for each session this client attached. Which one is focused
@@ -152,7 +152,7 @@ struct World {
     /// The one stream serving every attached session. `None` while the selected
     /// session is disconnected and an open or retry is pending.
     ///
-    /// Changing the attach set means reopening the stream (spec 6.5). Keeping
+    /// Changing the attach set means reopening the stream. Keeping
     /// absence explicit lets a focus gesture close the prior stream before it
     /// asks for the selected target, without manufacturing a placeholder stream.
     stream: Option<Stream>,
@@ -330,7 +330,8 @@ async fn build_world(
     let control = Control::local(host);
     let mut directory = SessionDirectory::new(session.clone());
     // The stream before the handles: its attachment is what stops the host from
-    // releasing the session in between (spec section 5), which would leave the
+    // releasing the session in between (attachment is the retention signal an
+    // idle session is released without), which would leave the
     // world holding handles into a core nothing drives.
     let stream = open_stream(&control, &mut directory).await?;
     let handles = control
@@ -465,7 +466,7 @@ fn startup_diagnostic_events(
 /// block, discharge the reads it obliges, then the startup notices. The
 /// restored-settings summary is rendered here from the first attach's own
 /// `state` frame rather than published by the host, which is what keeps it
-/// from repeating on every reconnect (spec 9.1).
+/// from repeating on every reconnect.
 async fn build_connect_world(
     args: &Args,
     connected: Connected,
@@ -723,7 +724,7 @@ impl World {
 /// each session's own cursor, and arm every fold the peer reports it served.
 ///
 /// One stream per client, not one per session: the ordering guarantees are per
-/// stream, and changing the attach set means reopening it (spec 6.5). So this
+/// stream, and changing the attach set means reopening it. So this
 /// is both the first attach and the re-attach, and a first focus of a session
 /// is a reopen over the grown set.
 ///
@@ -732,7 +733,7 @@ impl World {
 /// [`SessionDirectory::expect_attach`]).
 ///
 /// The caller folds the blocks with [`fold_attach_block`], which awaits the
-/// focused session's: blocks are producer-paced (spec 6.9), so they are not
+/// focused session's: blocks are producer-paced, so they are not
 /// necessarily queued when this returns. The cursors offered are the clients'
 /// own, so a re-attach after a head switch is served under the new epoch and
 /// one within an epoch is served the suffix.
@@ -748,7 +749,7 @@ async fn open_stream(
 /// Read the focused session's tree from the host and open the tree overlay
 /// over it, answering the built select.
 ///
-/// The read carries the current head alongside the segments (spec 6.7), and
+/// The read carries the current head alongside the segments, and
 /// the overlay needs both: the head selects the row the session is on, and
 /// makes confirming that row a no-op rather than a switch onto itself. It is
 /// the one read that materializes a session, which an attached one already
@@ -800,7 +801,7 @@ async fn recv_stream(stream: Option<&mut Stream>) -> ControlFrame {
 enum CatchUp {
     /// The block arrived whole and its `caught_up` committed it.
     Caught,
-    /// A refusal replaced the block (spec 6.5). The stream is live, the fold has
+    /// A refusal replaced the block. The stream is live, the fold has
     /// dropped the attachment and folded what that costs, and nothing here asks
     /// again.
     Refused { reason: String, refusal: Refusal },
@@ -864,13 +865,13 @@ impl AttachStall {
 ///
 /// The client's own arm, not a frame kind, so the block ends on everything that
 /// ends one: the `caught_up` that commits it, and the refusal that replaces it
-/// for a session the server cannot resolve (spec 6.5). Reading the arm rather
+/// for a session the server cannot resolve. Reading the arm rather
 /// than the wire is also what keeps a `caught_up` the fold *rejected* from
 /// reporting a block complete. A client that is not armed has no block coming,
 /// so its fold is over before it starts.
 ///
-/// A `reset` for the session ends it too, and at once: spec 6.5 says a reset
-/// received mid-block abandons the block, since the cursor only advances at a
+/// A `reset` for the session ends it too, and at once: a reset received
+/// mid-block abandons the block, since the cursor only advances at a
 /// `caught_up` that is now not coming. Folding on past it would hand a peer whose
 /// upstream is flapping one fresh deadline per flap, which is the unbounded wait
 /// the deadline exists to not have.
@@ -878,8 +879,8 @@ impl AttachStall {
 /// ## The deadline
 ///
 /// Silence *about the session*, never total elapsed time. A block is
-/// producer-paced (spec 6.9), so it is as long as the history behind it, and a
-/// client's cursor does not move until the block completes (spec 6.5): a block
+/// producer-paced, so it is as long as the history behind it, and a
+/// client's cursor does not move until the block completes: a block
 /// cut short by a total deadline is re-served from the same cursor and cut short
 /// again, which trades a hang for a livelock. Silence about the session only runs
 /// out once the block has stopped arriving.
@@ -987,7 +988,7 @@ impl Block {
     /// it passed: the drive loop's own iteration holds awaits bounded by the
     /// request timeout rather than by this budget. Frames in hand say the block
     /// did not stop arriving after all, and folding them is cheaper for everyone
-    /// than a projection re-served from a cursor that never moved (spec 6.5).
+    /// than a projection re-served from a cursor that never moved.
     ///
     /// A rescue and not a guarantee: what the drain sees is what the transport
     /// has already handed over, not what the peer has written. For a remote
@@ -1009,7 +1010,7 @@ impl Block {
     /// Frames land in the model as they arrive rather than being held back to the
     /// block's end, which is what lets a driver paint a catch-up while it runs.
     /// The block's atomicity is the client's cursor, and that does not move until
-    /// the `caught_up` commits it (spec 6.5), so applying early moves nothing
+    /// the `caught_up` commits it, so applying early moves nothing
     /// early.
     ///
     /// A frame past the block's end is applied and decides nothing: the verdict
@@ -1042,7 +1043,8 @@ impl Block {
             } if mine => Some((message.clone(), Refusal::from_code(code, *lock_generation))),
             _ => None,
         };
-        // Spec 6.5: a `reset` mid-block abandons the block. Folded first,
+        // A `reset` mid-block abandons the block: the cursor only advances at
+        // a `caught_up` that is now not coming. Folded first,
         // because folding is what records the re-attach it asks for.
         let abandons = mine && matches!(frame, aj_wire::Frame::Reset { .. });
         if mine {
@@ -1096,7 +1098,7 @@ struct Folded {
 /// Fold the attach block the focused session's client is waiting for, up to and
 /// including its `caught_up`, and report what became of it.
 ///
-/// The block is producer-paced (spec 6.9): it is generated at the pace the
+/// The block is producer-paced: it is generated at the pace the
 /// client reads it rather than queued before the attach returns, so draining
 /// only what is ready would paint the first frame against an empty
 /// transcript. Awaiting the block's end is also what makes the reads it
@@ -1119,7 +1121,7 @@ async fn fold_attach_block(world: &mut World) -> CatchUp {
 
 /// Discharge the reads an attach block obliges: neither the task table nor
 /// the pending-message queues are replayable, so a backfill regenerates
-/// neither (spec 6.7).
+/// neither.
 ///
 /// Both reads land in the shared chat model, which is what every frontend
 /// renders from, so the local and the remote path stay one path.
@@ -1762,7 +1764,7 @@ fn fail_pending_transition(
 /// The head switch is the host's: it refuses while work is live, clears the
 /// abandoned branch's queues, mints a fresh epoch and publishes `reset`.
 /// Re-attaching under the client we already hold is what adopts that epoch,
-/// which is what drops the abandoned branch's transcript (spec 6.5).
+/// which is what drops the abandoned branch's transcript.
 ///
 /// The gesture reports itself in toasts. A branch that took replaces the
 /// transcript wholesale, so a confirmation folded into it would be describing
@@ -1878,7 +1880,7 @@ async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<Catch
 /// Re-read the focused session's direct handles, for a local run.
 ///
 /// A stream that had to be reopened can land on a fresh materialization: the
-/// host releases a session once it is idle and unattached (spec section 5), and
+/// host releases a session once it is idle and unattached, and
 /// a client whose stream died is not attached. The handles the world holds then
 /// name a core nothing drives, so the footer's task table and every overlay
 /// that reads the log would be frozen at the state the old materialization
@@ -2561,7 +2563,7 @@ fn complete_login(
 /// answer is needed synchronously at draw or dispatch time and where a stale
 /// one costs at most a refusal the host would have made anyway.
 ///
-/// `working` covers the main agent only (spec 6.3), which is also the one
+/// `working` covers the main agent only, which is also the one
 /// case the lifecycle can lag: the host marks it busy the moment it spawns
 /// the turn, before the turn's `AgentStart` reaches anyone.
 fn view_busy(world: &World, view: AgentId) -> bool {
@@ -2578,7 +2580,7 @@ fn view_busy(world: &World, view: AgentId) -> bool {
 /// refuse-while-busy gestures the host re-checks anyway.
 ///
 /// The tasks come off the chat model, which every client keeps from the task
-/// events plus the tasks read (spec 6.7), rather than off a live registry no
+/// events plus the tasks read, rather than off a live registry no
 /// remote client has.
 fn running_work(world: &World) -> (usize, usize) {
     let chat = world.chat.borrow();
@@ -2616,8 +2618,8 @@ fn sync_status(world: &World) -> bool {
 /// widget cannot reach the directory and the loop is its only writer.
 ///
 /// Rows come from the peer's `list` frames, so a session the client has never
-/// attached is listed too and that is where its attention glyph comes from
-/// (spec 6.8). The strip's own order is put on them here
+/// attached is listed too and that is where its attention glyph comes from.
+/// The strip's own order is put on them here
 /// ([`crate::sidebar::rows_for_display`]), and it holds still under a refresh:
 /// what a fresh directory changes is the glyphs, not the places.
 ///
@@ -2646,14 +2648,14 @@ fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
     let mut state = sidebar.borrow_mut();
     state.set_cols(cols);
     // Showing itself once the peer offers a choice is the default, and an
-    // explicit toggle outranks it for the rest of the process (spec 9.2).
+    // explicit toggle outranks it for the rest of the process.
     if !state.toggled {
         state.visible = rows.len() > 1;
     }
     state.rows = rows;
     // The hosts ride along beside the rows, because a gateway names hosts it
     // holds no rows for and those are exactly the ones the rows cannot account
-    // for (spec 7.1).
+    // for.
     state.hosts = world.directory.hosts().to_vec();
 }
 
@@ -2663,7 +2665,7 @@ fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
 /// session by walking the strip's displayed order and a click names one by the
 /// row it landed on, but a pointer gesture is a second trigger for the action
 /// the chord dispatches rather than a second way into the switch, so both land
-/// here (spec 9.2).
+/// here.
 fn park_session_request(
     slot: &Rc<RefCell<Option<SessionRequest>>>,
     ctx: &mut EventContext,
@@ -2857,7 +2859,7 @@ fn quit_arm_running_work(world: &World) -> Option<String> {
 ///
 /// The withdrawal is the host's, which is what makes the same gesture work
 /// for a client that cannot reach the queues: the command hands back the
-/// text it removed (spec 6.6).
+/// text it removed.
 async fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> bool {
     let target = world.chat.borrow().active_view();
     let withdrawn = world
@@ -2920,7 +2922,7 @@ fn insert_pasted_image_path(editor: &Rc<RefCell<TextArea>>, path: &Path) -> bool
 /// is empty). While idle there is nothing to steer yet, so a non-empty
 /// editor starts a normal turn.
 ///
-/// Which of those three the gesture means is the host's decision (spec 6.6).
+/// Which of those three the gesture means is the host's decision.
 /// The editor-side effects depend only on whether there was text: a draft
 /// that went somewhere is recorded in history and returns the transcript to
 /// its tail, an empty one promotes silently.
@@ -3121,8 +3123,8 @@ async fn submit_with_armed_anchor(
         return ArmedSubmit::Stay;
     };
     // The anchor names the message, and the host moves the head to its
-    // parent: a branch replaces the message rather than continuing after it
-    // (spec 6.6). Resolving it here would need the log, which a connection
+    // parent: a branch replaces the message rather than continuing after it.
+    // Resolving it here would need the log, which a connection
     // does not have, and would race an append besides.
     shell.borrow().disarm_branch();
     ArmedSubmit::Branch {
@@ -3196,8 +3198,7 @@ fn focused_archived(world: &World) -> bool {
 /// is explicit in both directions and nothing else ever changes it, so the
 /// user pressing the same chord twice is how a mistake is undone. What the
 /// peer accepted is recorded on its row, because rows are coalesced on a tick
-/// (spec 6.8) and the second press must not read the state the first one
-/// replaced.
+/// and the second press must not read the state the first one replaced.
 ///
 /// Always spoken, because the strip is not always the answer: it is hidden
 /// under one row and the focused session stays in view either way, so nothing
@@ -3519,7 +3520,7 @@ async fn apply_command_action(
             // `spawn_history_scan`), so over a connection the overlay would
             // answer about the client's machine while looking like the
             // session's history. Refusing is the honest answer until a
-            // host-side history read exists (spec 13 banks the shape).
+            // host-side history read exists.
             if world.control.is_remote() {
                 fold_notice(
                     world,
@@ -3856,8 +3857,8 @@ async fn apply_picker_outcome(
             // per-iteration status/keymap sync picks up the new view, so
             // switching plus a redraw is all it takes.
             world.chat.borrow_mut().set_active_view(id);
-            // Each view opens at its bottom with follow-tail engaged (Spec E
-            // section 1, per-view scroll). `reset_to_tail` also clears the
+            // Each view opens at its bottom with follow-tail engaged (scroll is
+            // per view). `reset_to_tail` also clears the
             // render cache, which the draw's active-view clear would do
             // anyway, so the two don't fight.
             shell.borrow().transcript.borrow_mut().reset_to_tail();
@@ -3911,7 +3912,7 @@ async fn apply_picker_outcome(
 }
 
 /// Open the task-output viewer for `id`, backed by the live registry locally
-/// and by the per-task read over a connection (spec 6.7). A remote viewer's
+/// and by the per-task read over a connection. A remote viewer's
 /// handle is kept so the drive loop can push the snapshots it polls.
 fn open_task_viewer(world: &World, shell: &Rc<RefCell<Shell>>, id: TaskId, command: String) {
     let handles = shell.borrow().overlay_handles();
@@ -4177,7 +4178,7 @@ async fn command_settings(
 }
 
 /// The note a persisting settings change earns over a connection: the wire
-/// carries no persist axis (spec 6.6), because the config files a default
+/// carries no persist axis, because the config files a default
 /// would be written to are the host's own, not this client's.
 fn unpersisted_note(world: &World, persisting: bool) -> Option<String> {
     (persisting && world.control.is_remote()).then(|| {
@@ -4664,7 +4665,7 @@ fn spawn_overlay_fetch(
             // modes can read it, so it is taken here rather than inside the
             // spawned read.
             let tag = focused_tag(world);
-            // Not supported over the wire in v1 (spec 9.1): the stats come off
+            // Not supported over the wire: the stats come off
             // the host's own log. The overlay is already open, so the refusal
             // fills it rather than folding a notice behind it.
             let Some(log) = world.local.as_ref().map(|local| Arc::clone(&local.log)) else {
@@ -4991,8 +4992,8 @@ fn editor_border_color(theme: &Theme, level: Option<&ThinkingConfig>) -> Color {
     )
 }
 
-/// Build the editor's border theme from the shared palette (Spec D structured
-/// colors), the same way the other chrome resolves its styles.
+/// Build the editor's border theme from the shared palette, the same way
+/// the other chrome resolves its styles.
 ///
 /// The `border_color` seeded here is only a resting default (the `ThinkingOff`
 /// token, which shares a value with `borderMuted` in the bundled themes). The
@@ -5039,7 +5040,7 @@ pub(crate) struct OverlayHandles {
     /// Where the agent picker parks its confirmed pick / kill.
     pub(crate) picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>>,
     /// Where a remote task-output viewer parks a `Ctrl+K` kill, since it has
-    /// no registry to kill through (spec 6.6's task-kill command).
+    /// no registry to kill through (the task-kill command does it).
     pub(crate) task_kill: Rc<RefCell<Option<TaskId>>>,
     /// Where the prompt-history overlay parks a scan request.
     pub(crate) history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
@@ -5639,7 +5640,7 @@ impl Shell {
                 AjAction::TranscriptFocus => {
                     // Tab has two meanings while the autocomplete popup is
                     // closed (its gate), split by whether the transcript is
-                    // already focused (Spec E section 1). When focused, Tab
+                    // already focused. When focused, Tab
                     // steps to the next-older user message. Otherwise it engages
                     // focus mode, but only if there is a user message to land
                     // on: its `FocusIn` lands on the newest one. No user
@@ -5728,7 +5729,7 @@ impl Shell {
         }
         // Wire the transcript's Esc-to-exit callback to move focus back to the
         // editor. The resulting `FocusOut` clears the item cursor, exiting
-        // transcript-focus mode (Spec E section 1).
+        // transcript-focus mode.
         {
             let editor_widget: WidgetRef = to_widget_ref(Rc::clone(&editor));
             transcript
@@ -5750,7 +5751,7 @@ impl Shell {
         }
         // A pointer gesture on the strip parks the request the stepping and
         // create chords park, through the function they both call, so a click
-        // triggers the action rather than reimplementing it (spec 9.2). The
+        // triggers the action rather than reimplementing it. The
         // fold is the same arrangement one level in: the click and the chord
         // meet at the state the layout reads.
         {
@@ -6400,8 +6401,8 @@ fn sync_editor_chrome(world: &World, shell: &Rc<RefCell<Shell>>) {
 /// Runs the interactive shell until the user quits.
 ///
 /// Restores the terminal via [`AsyncApp::shutdown`] on the way out,
-/// then prints the usage banner and resume hint to the normal screen
-/// (Spec E section 7). The driver's futures are `!Send`, so this must
+/// then prints the usage banner and resume hint to the normal screen.
+/// The driver's futures are `!Send`, so this must
 /// run on a top-level `block_on` (the `#[tokio::main]` future), not a
 /// spawned task.
 pub async fn run(args: Args) -> Result<()> {
@@ -6433,8 +6434,7 @@ pub async fn run(args: Args) -> Result<()> {
     let persistence = ConversationPersistence::new(sessions_dir);
 
     // Connect mode dials the host before anything touches the terminal, so an
-    // unreachable host or a protocol mismatch reports on the normal screen
-    // (spec 9.1).
+    // unreachable host or a protocol mismatch reports on the normal screen.
     let mut world = match &args.command {
         Some(CliCommand::Connect { .. }) => {
             // Every connect command has a launch. Reading it as "not a connect
@@ -6444,7 +6444,7 @@ pub async fn run(args: Args) -> Result<()> {
                 .connect_launch()
                 .expect("a connect command carries a launch");
             // Statedness has to come from the layers, not from the effective
-            // config: only a create sends stated axes (spec section 8), and the
+            // config: only a create sends stated axes, and the
             // effective config cannot tell a written entry from a fallback.
             let (user_layer, _) = Config::load_layer();
             let stated = crate::connect::Stated::new(user_layer, layers.project.clone());
@@ -6879,7 +6879,7 @@ struct Resume {
     /// that keeps dying inside its attach block has to back off exactly like
     /// one that cannot be opened at all, because every attempt costs the host
     /// a full projection and a client's cursor does not move until the block
-    /// completes (spec 6.5).
+    /// completes.
     retry: Retry,
 }
 
@@ -7770,9 +7770,8 @@ async fn drive(
                     // A stream ends for ordinary reasons in either mode: a
                     // connection drops, and an in-process subscriber is evicted
                     // when this loop stopped draining long enough for the
-                    // host's reliable fan-out to overflow (spec 6.9). Both
-                    // recover the same way, by re-attaching with a cursor
-                    // (spec 6.5). Only a local attach that then fails means
+                    // host's reliable fan-out to overflow. Both recover the
+                    // same way, by re-attaching with a cursor. Only a local attach that then fails means
                     // the host itself is gone, and `advance_resume` is where
                     // that becomes the shell's exit.
                     lost => {
@@ -8160,14 +8159,14 @@ async fn drive(
 ///
 /// The host owns it for a local run (its agents hold the running totals). A
 /// connection has no such read and renders the banner from the accounting its
-/// own fold derived from the event stream (spec 9.1), which covers exactly
+/// own fold derived from the event stream, which covers exactly
 /// the frames this client saw.
 async fn session_usage(world: &World, session: &str) -> Option<UsageSummary> {
     // Asking the host locks the session's agent, and a turn holds that lock
     // for its whole duration, so a busy session would park this loop until the
     // turn ended: no paint, no input, not even a cancel. Fall back to the
     // client's own event-derived accounting, which is what a connection uses
-    // for the same banner (spec 9.1). A session with work in flight has no
+    // for the same banner. A session with work in flight has no
     // final usage to report anyway.
     let (agents, bash) = running_work(world);
     let busy = agents + bash > 0;
@@ -8216,7 +8215,7 @@ impl ExitBanner {
     /// (reading a session's usage locks its agent).
     ///
     /// A connection reads neither: its usage comes from this client's own
-    /// event-derived accounting (spec 9.1), and the resume hint is left out
+    /// event-derived accounting, and the resume hint is left out
     /// because `aj continue` would resume a session on the *host*, not here.
     async fn collect(world: &World, completed: Vec<(String, UsageSummary)>) -> ExitBanner {
         let live = session_usage(world, world.session())
@@ -8945,7 +8944,8 @@ mod tests {
     }
 
     /// Discharge the task and queue reads into the client model, the way an
-    /// attach block obliges (spec 6.7).
+    /// attach block obliges: neither is replayable, so no backfill regenerates
+    /// them.
     ///
     /// Tests that stage host-side state through the live handles need it: a
     /// direct enqueue or task registration publishes no frame, so the model
@@ -9247,8 +9247,8 @@ mod tests {
     /// and reporting, with its transcript already projected.
     ///
     /// The attach block projects sub threads eagerly, so a resumed session
-    /// has nothing left to materialize on demand (spec 6.5, and section 13's
-    /// accepted backfill cost).
+    /// has nothing left to materialize on demand: the cursor is the applied
+    /// prefix of one seq space, which a deferred thread would break.
     #[tokio::test]
     async fn a_resume_projects_every_subagent_transcript() {
         let dir = TempDir::new().expect("tempdir");
@@ -11770,8 +11770,8 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// A persistence failure ends the materialization under this client (spec
-    /// section 5): the storage error shows up as an error row, the client owes
+    /// A persistence failure ends the materialization under this client: the
+    /// storage error shows up as an error row, the client owes
     /// a re-attach at once, and the loop's ordinary rejoin lands on a fresh
     /// materialization of the same session, which then runs the next prompt.
     #[tokio::test]
@@ -11990,7 +11990,7 @@ mod tests {
 
     /// Overflow the focused session's in-process subscription until the host's
     /// reliable fan-out evicts it, which is how a local stream ends with the
-    /// host still there (spec 6.9).
+    /// host still there.
     ///
     /// The overflow is real: every queue command publishes a reliable
     /// `QueueUpdate`, and nothing drains the stream while they run. The stream
@@ -12081,7 +12081,7 @@ mod tests {
     }
 
     /// An in-process subscriber is evicted like any other when the shell stops
-    /// draining and the host's reliable fan-out overflows (spec 6.9), so a
+    /// draining and the host's reliable fan-out overflows, so a
     /// closed local stream is a re-attach, not the end of the shell.
     ///
     /// This covers the step the loop drives; that the loop routes a local
@@ -12190,7 +12190,7 @@ mod tests {
     ///
     /// Each attempt costs the host a full projection and is served the
     /// identical suffix (a client's cursor does not move until the block
-    /// completes, spec 6.5), so a flat retry is a livelock on a busy host whose
+    /// completes), so a flat retry is a livelock on a busy host whose
     /// fan-out keeps evicting a client that is still attaching.
     #[test]
     fn a_failure_inside_the_attach_block_backs_off() {
@@ -12345,7 +12345,7 @@ mod tests {
     /// The focused session's durable high-water mark, as the host reports it.
     ///
     /// The directory is the test's window onto the host's own bookkeeping. A
-    /// client may not turn a position it read there into a cursor (spec 6.5),
+    /// client may not turn a position it read there into a cursor,
     /// and nothing here does.
     async fn host_mark(world: &World) -> u64 {
         world
@@ -12433,7 +12433,7 @@ mod tests {
         run_prompt(&mut world, "seed").await;
 
         // Attach without discharging the reads, which is the state every
-        // `caught_up` leaves the client in (spec 6.7).
+        // `caught_up` leaves the client in.
         world.stream = Some(
             open_stream(&world.control, &mut world.directory)
                 .await
@@ -12449,7 +12449,7 @@ mod tests {
             !world.client().needs_reattach(),
             "and nothing else is owed alongside them",
         );
-        // Wait the host's `list` coalescing out (spec 6.8) and drain, so the
+        // Wait the host's `list` coalescing out and drain, so the
         // stream the loop parks on has nothing left to say. A frame would wake
         // the loop for free and the retry would ride along on it.
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -17776,7 +17776,7 @@ mod tests {
 
     /// Neither gesture is gated on live work: the selector opens mid-turn and
     /// `NewSession` parks its request, because the session left behind keeps
-    /// folding and finishes its turn unwatched (spec 9.2).
+    /// folding and finishes its turn unwatched.
     #[tokio::test]
     async fn new_session_and_the_selector_are_open_mid_turn() {
         let dir = TempDir::new().expect("tempdir");
@@ -18708,7 +18708,7 @@ mod tests {
 
     /// A session change leaves the outgoing session's background work running:
     /// the switch tears nothing down, and the host holds a session with live
-    /// work whatever its idle grace says (spec section 5).
+    /// work whatever its idle grace says.
     ///
     /// The up-front refusals (the session overlays' confirms, the
     /// `NewSession` command) are what keep a user from walking away from live
@@ -18757,7 +18757,7 @@ mod tests {
     /// A backgrounded session keeps folding. Its frames arrive on the same
     /// stream while another session is focused, its own transcript takes them,
     /// and switching back is a swap onto state that is already current rather
-    /// than a rebuild off the log (spec 9.2).
+    /// than a rebuild off the log.
     ///
     /// The cursor is what makes this observable: it advances only if that
     /// session's fold ran, and a switch that dropped the outgoing client the way
@@ -18864,7 +18864,7 @@ mod tests {
     /// arrives.
     ///
     /// Stronger than [`settle`], which only takes what is already queued. Attach
-    /// blocks are producer-paced (spec 6.9), so a block nobody has read yet is
+    /// blocks are producer-paced, so a block nobody has read yet is
     /// generated on demand and is still there to be found. Draining is what
     /// makes "no block is coming" true rather than merely "no block is queued".
     async fn drain_stream(world: &mut World) {
@@ -19016,7 +19016,7 @@ mod tests {
     /// A `reset` for a *background* session is discharged too. Another peer
     /// switching that session's head mints a fresh epoch, and until a re-attach
     /// is served its fold filters out every later frame, so a switch onto it
-    /// would paint the branch the reset abandoned (spec 6.5).
+    /// would paint the branch the reset abandoned.
     #[tokio::test]
     async fn a_background_session_reset_by_another_peer_recovers() {
         let dir = TempDir::new().expect("tempdir");
@@ -19098,9 +19098,9 @@ mod tests {
 
     /// A switch keeps the outgoing session attached, so the host holds it past
     /// its idle grace and its live frames keep arriving for the transcript the
-    /// client parked (spec 9.2).
+    /// client parked.
     ///
-    /// The retained lock is the point, not an oversight: spec section 5 counts a
+    /// The retained lock is the point, not an oversight: the host counts a
     /// deliberately attached background session as use, so a client that keeps
     /// one keeps its lock. What the user gets for it is an instant switch back
     /// onto a transcript that stayed current while they were away.
@@ -19144,10 +19144,7 @@ mod tests {
             parked.live,
             "the outgoing session was released, so the switch detached it",
         );
-        assert!(
-            parked.last_seq.is_some(),
-            "a live row carries its position (spec 6.8)",
-        );
+        assert!(parked.last_seq.is_some(), "a live row carries its position");
         assert!(
             rows.iter()
                 .any(|entry| entry.id == world.session() && entry.live),
@@ -19584,7 +19581,7 @@ mod tests {
         shut_down(&world).await;
     }
 
-    // ---- Connect mode (spec 9.1, 11.7) ----
+    // ---- Connect mode ----
 
     /// A scripted host served on a loopback control port, for the connect-mode
     /// tests: the same composition a local run builds, reached over the real
@@ -19683,8 +19680,8 @@ mod tests {
 
     /// The config a stock connect-mode test client runs with: the built-in
     /// one, untouched. Nothing in it is *stated*, so nothing travels with a
-    /// create and the host defaults every axis against its own model (spec
-    /// section 8), which is what lets these tests run against a scripted host
+    /// create and the host defaults every axis against its own model, which
+    /// is what lets these tests run against a scripted host
     /// whose model supports no thinking effort at all.
     fn client_config() -> Config {
         Config::default()
@@ -19717,7 +19714,7 @@ mod tests {
     }
 
     /// The same against any peer's url: a gateway is dialed exactly as a host
-    /// is, which is the whole point of it serving a host's API (spec 7.1).
+    /// is, which is the whole point of it serving a host's API.
     async fn dial_at(
         url: &str,
         config: &Config,
@@ -20177,7 +20174,7 @@ mod tests {
     }
 
     /// Poll until the host reports `session` released, which is what a client
-    /// detaching it is for (spec section 5). The caller has to run a host with
+    /// detaching it is for. The caller has to run a host with
     /// a short idle grace for this to answer inside the deadline.
     async fn released(world: &World, session: &str) -> bool {
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -20199,9 +20196,9 @@ mod tests {
     }
 
     /// A peer that does not know the archive endpoint is told about by name,
-    /// not left silent (spec 9.1). Capabilities are declared-only and a
-    /// gateway cannot speak for the hosts behind it, so probing the endpoint
-    /// is the check the spec sanctions, and this is what the probe finds.
+    /// not left silent. Capabilities are declared-only and a gateway cannot
+    /// speak for the hosts behind it, so probing the endpoint is the sanctioned
+    /// check, and this is what the probe finds.
     ///
     /// The peer here is a real host reached at a path it does not serve, which
     /// is the same 404 and the same `unknown_endpoint` code an older host
@@ -20651,7 +20648,7 @@ mod tests {
 
     /// The strip's focus and working-set axes, read off the composed frame:
     /// the marker in the leftmost column says which session is on screen, and
-    /// the label's brightness says what the client holds open (spec 9.2).
+    /// the label's brightness says what the client holds open.
     ///
     /// The three brightnesses need all three working-set states at once, which
     /// is what the visit-and-return is for: it leaves the second session
@@ -20738,7 +20735,7 @@ mod tests {
     }
 
     /// A host the peer holds no rows for is painted as an empty group, from the
-    /// directory through the mirror to the composed frame (spec 7.1).
+    /// directory through the mirror to the composed frame.
     ///
     /// Nothing here reaches into the strip. The frame goes through the reducer
     /// the stream folds into, the mirror is filled by [`sync_sidebar`], and the
@@ -20758,7 +20755,7 @@ mod tests {
             poll_row(&mut world, &shell, &focused, |_| true).await,
             "the session's own row never arrived",
         );
-        // One session leaves the strip hidden by default (spec 9.2), so it is
+        // One session leaves the strip hidden by default, so it is
         // pinned open. Everything the strip then draws comes from the mirror.
         pin_sidebar_open(&shell);
 
@@ -20868,7 +20865,7 @@ mod tests {
     }
 
     /// The strip labels its groups by the names the peer publishes for its
-    /// hosts, and sorts them by what it draws (spec 7.1, 9.2).
+    /// hosts, and sorts them by what it draws.
     ///
     /// The same chain as the test above, end to end: a `list` frame carrying
     /// names, through the reducer and the mirror, to the composed frame. Cutting
@@ -21135,7 +21132,7 @@ mod tests {
     }
 
     /// An explicit toggle outranks the row-count default for the rest of the
-    /// process, in both directions (spec 9.2).
+    /// process, in both directions.
     ///
     /// The mirror runs every drive-loop iteration and is what applies the
     /// default, so the claim is only worth anything across a re-sync.
@@ -21547,7 +21544,7 @@ mod tests {
         shut_down(&world).await;
     }
 
-    // ---- Session tag (spec 6.8) ----
+    // ---- Session tag ----
 
     /// Run the two production steps the drive loop takes between a parked
     /// global action and an open overlay: the host handler, then whatever
@@ -22317,7 +22314,7 @@ mod tests {
     /// A click on a row parks exactly what the stepping chord parks. Both go
     /// through the one function that parks a session change, so a pointer
     /// gesture triggers the action rather than reaching into the switch on its
-    /// own (spec 9.2).
+    /// own.
     ///
     /// Driven through the composed frame: the press is hit-tested against the
     /// surface the shell actually paints, so a strip left out of the layout,
@@ -22441,7 +22438,7 @@ mod tests {
         );
     }
 
-    /// The chord and the click are two triggers for one action (spec 9.2): the
+    /// The chord and the click are two triggers for one action: the
     /// chord folds the group the focused row sits in, and the click on that
     /// group's line undoes exactly that.
     #[tokio::test]
@@ -22690,7 +22687,7 @@ mod tests {
     }
 
     /// With one session the strip stays hidden and costs the transcript nothing,
-    /// and the toggle chord shows it (spec 9.2). Measured through the composed
+    /// and the toggle chord shows it. Measured through the composed
     /// frame, so a strip missing from the layout fails here.
     #[tokio::test]
     async fn the_sidebar_is_hidden_for_a_lone_session_until_the_toggle_asks() {
@@ -22806,7 +22803,7 @@ mod tests {
         remote.host.shutdown().await;
     }
 
-    /// The connect-mode smoke test (spec 11.7): a prompt submitted over the
+    /// The connect-mode smoke test: a prompt submitted over the
     /// wire streams the host's answer into the transcript, and the footer
     /// shows the host's settings rather than this client's.
     #[tokio::test]
@@ -22850,7 +22847,7 @@ mod tests {
 
     /// `--host` against a plain host resolves against that host's own handshake,
     /// so a value it does not answer to is refused before the terminal is taken
-    /// over, with the host named the way that host names itself (spec 6.6, 7.1).
+    /// over, with the host named the way that host names itself.
     ///
     /// The whole path: the hello this client already holds, the single candidate
     /// synthesized from it, and the refusal a person reads. The id leads because
@@ -22886,7 +22883,7 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// Session selection per spec 9.1: an explicit id attaches it, `--new`
+    /// Session selection: an explicit id attaches it, `--new`
     /// creates, bare connect takes the host's latest, and a host with no
     /// sessions gets one created.
     #[tokio::test]
@@ -23008,7 +23005,8 @@ mod tests {
     /// The shape a gateway takes when it cannot serve what a client attached:
     /// the stream is open, its own frames keep arriving, and the attach block is
     /// replaced by a refusal, abandoned by a `reset`, or simply never begun
-    /// (spec 6.5, 7.1). No real host can be asked to behave any of those ways,
+    /// (a session on a host the gateway cannot reach contributes no upstream).
+    /// No real host can be asked to behave any of those ways,
     /// and the warmth is the whole point: it is what the transport's silence
     /// deadline cannot see, because the connection is not silent.
     ///
@@ -23125,8 +23123,8 @@ mod tests {
                             }
                         }
                         let request = String::from_utf8_lossy(&request).to_string();
-                        // A block that lands obliges the task and queue reads
-                        // (spec 6.7). A peer that left those hanging would park
+                        // A block that lands obliges the task and queue reads.
+                        // A peer that left those hanging would park
                         // the caller in a request rather than in the fold, which
                         // is a different failure than the one under test, so they
                         // are answered with the wire types' own empty values.
@@ -24119,7 +24117,7 @@ mod tests {
     /// This is the difference between the bound a block fold has and a total
     /// budget, and it is the whole reason the deadline is measured on silence
     /// about the session. A block is as long as the history behind it and a
-    /// client's cursor does not move until its `caught_up` (spec 6.5), so a total
+    /// client's cursor does not move until its `caught_up`, so a total
     /// budget would cut a large backfill short, be re-served the identical block
     /// from the identical cursor, and cut it short again: a livelock where the
     /// bug was a hang.
@@ -24178,7 +24176,7 @@ mod tests {
 
     /// A `reset` for the session being caught up ends the block at once.
     ///
-    /// Spec 6.5: a `reset` received mid-block abandons the block, because the
+    /// A `reset` received mid-block abandons the block, because the
     /// cursor only advances at a `caught_up` that is now not coming. Folding past
     /// it is what would hand a peer whose upstream flaps one fresh deadline per
     /// flap, and a flap period under the budget is then an unbounded wait again:
@@ -24297,7 +24295,7 @@ mod tests {
     /// folds a slow one through rather than cutting it short.
     ///
     /// This is the freeze the block became loop state for. A backfill is
-    /// producer-paced (spec 6.9), so its length is the history behind it, and a
+    /// producer-paced, so its length is the history behind it, and a
     /// loop that awaits one shows a frozen frame and ignores the keyboard for that
     /// whole time. The tests above type after a block has ended, so they cannot
     /// tell a loop that survives a catch-up from one that only comes back
@@ -24425,7 +24423,7 @@ mod tests {
     /// instead of starting a fresh one over it: a fresh one drops the pacing the
     /// previous attempts earned. Every attach costs the host a full projection and
     /// is served the identical suffix, because a client's cursor does not move
-    /// until the block completes (spec 6.5), so an unpaced reopen is a livelock
+    /// until the block completes, so an unpaced reopen is a livelock
     /// against a peer that cannot serve a block through.
     ///
     /// The backoff is only visible as a rate, so the assertion is the count over a
@@ -24479,7 +24477,7 @@ mod tests {
     /// A re-attach the peer answers with a refusal instead of a block leaves the
     /// drive loop running and reading its input.
     ///
-    /// The refusal replaces the block and says it is not coming (spec 6.5). The
+    /// The refusal replaces the block and says it is not coming. The
     /// client's fold already understands it and drops the attachment, so a
     /// catch-up that waits for a `caught_up` regardless is waiting for a frame it
     /// has been told will never arrive, on a stream that stays open. The frame
@@ -24708,7 +24706,7 @@ mod tests {
     /// awaits bounded by the request timeout rather than by the silence budget: a
     /// peer read at the foot of the iteration can outlast it. Abandoning then
     /// costs the host a full projection to re-serve the identical suffix, because
-    /// a client's cursor does not move until the block completes (spec 6.5), and
+    /// a client's cursor does not move until the block completes, and
     /// nothing about the block had actually stopped arriving.
     ///
     /// In-process, because the rule is the driver's and the drain is a channel
@@ -24946,7 +24944,7 @@ mod tests {
     /// A swap onto a session whose attach block is still outstanding does not
     /// park the loop on it.
     ///
-    /// Spec 9.2 makes a focus switch a view swap. The arm cannot be the fold's
+    /// A focus switch is a view swap. The arm cannot be the fold's
     /// whole precondition, because it is set for every session a stream was
     /// opened over and stays set until that session's block is folded: a peer
     /// that will never bring one leaves it set for good. So a swap has to be
@@ -25026,7 +25024,7 @@ mod tests {
         let session = world.session().to_string();
 
         // Continuity broken on a stream that is still live, which is what a
-        // `reset` means (spec 6.3).
+        // `reset` means.
         let _ = world.directory.apply(
             &mut world.chat.borrow_mut(),
             aj_wire::Frame::Reset {
@@ -25103,7 +25101,7 @@ mod tests {
     }
 
     /// A `list` frame whose rows carry the `locked` bit each pair names, which
-    /// is what a peer publishes about a session a rival writer holds (spec 6.8).
+    /// is what a peer publishes about a session a rival writer holds.
     fn list_holding(sessions: &[(&str, bool)]) -> String {
         serde_json::to_string(&aj_wire::Frame::List {
             sessions: sessions
@@ -25162,7 +25160,7 @@ mod tests {
         .expect("an error frame")
     }
 
-    /// A locked refusal naming which hold refused this attach (spec 6.5).
+    /// A locked refusal naming which hold refused this attach.
     fn locked_refusal_at(session: &str, generation: u64, message: &str) -> String {
         serde_json::to_string(&aj_wire::Frame::Error {
             session: session.to_string(),
@@ -25185,7 +25183,8 @@ mod tests {
     ///
     /// `locked` is the code that makes this the hard case, and the reason this
     /// test asserts about it rather than about a session the peer cannot
-    /// resolve. It is the one refusal with two edges armed (spec 6.5), and
+    /// resolve. It is the one refusal with two edges armed (the row returning
+    /// to the list, and the row's `locked` bit falling), and
     /// against a peer whose rows carry no bit the second of them can never
     /// fire, so this is where a client has most to gain from asking anyway and
     /// must not: the wait is the gap an old peer always had, chosen over a
@@ -25295,7 +25294,8 @@ mod tests {
     /// The first stream never carries the hold's rise. Its baseline says free at
     /// generation 6, then the gateway's opening list says free at 7 before the
     /// spliced refusal names 7. No list follows that refusal. The current row is
-    /// therefore the only recovery evidence (spec 6.4, 6.5). The second stream
+    /// therefore the only recovery evidence, since `list` frames may be
+    /// coalesced. The second stream
     /// refuses again with 7 and keeps publishing that same released generation.
     /// A client that does not consume the fire opens a third stream, then more,
     /// one per list.
@@ -25397,7 +25397,8 @@ mod tests {
     ///
     /// The edge nobody had seen work. A refusal says attaching cannot succeed
     /// now, and the peer's directory is the only thing that says when that could
-    /// have changed. It says so by listing the session again (spec 6.5, 7.1). Without this the client stops asking and never starts, which is a
+    /// have changed. It says so by listing the session again. Without this the
+    /// client stops asking and never starts, which is a
     /// dead end no gesture recovers: a re-focus of the focused session is a
     /// no-op, and the session stays in the working set so nothing else reopens
     /// the stream either.
@@ -25592,7 +25593,7 @@ mod tests {
     /// peer's list for as long as the hold lasts, so the absence edge this
     /// client already had has nothing to fire on and the release is the only
     /// thing that says the answer changed. It arrives as the row's `locked` bit
-    /// going false (spec 6.5, 6.8). Without this the client stops asking and
+    /// going false. Without this the client stops asking and
     /// never starts, and the rival letting go is invisible to it forever.
     ///
     /// Asserted at the peer, because the claim is that the client asks again on
@@ -25689,7 +25690,7 @@ mod tests {
     /// edge that spans a lost connection still fires.
     ///
     /// Both edges are transitions between the rows one folded list replaces and
-    /// the next, never a live watch (spec 6.5), and losing a stream replaces no
+    /// the next, never a live watch, and losing a stream replaces no
     /// rows. So a hold that ended while the client was away is seen at the first
     /// list after it comes back. A client that rebuilt its baseline on
     /// reconnect, or that armed the edge from the rows on the connection the
@@ -25811,7 +25812,7 @@ mod tests {
         let mut world = connect_world(&dir, &remote, &[]).await;
 
         // Attach without discharging the reads, which is the state every
-        // `caught_up` leaves the client in (spec 6.7).
+        // `caught_up` leaves the client in.
         world.stream = Some(
             open_stream(&world.control, &mut world.directory)
                 .await
@@ -25864,7 +25865,7 @@ mod tests {
     }
 
     /// A gesture connect mode has no path for folds a notice naming why, rather
-    /// than silently doing nothing (spec 9.1).
+    /// than silently doing nothing.
     ///
     /// These are the three this arm refuses, all of them about this machine: an
     /// export writes a file where the log is, prompt history scans that store's
@@ -26397,7 +26398,7 @@ mod tests {
     }
 
     /// Creating and switching sessions work over a connection, which is what the
-    /// sidebar drives (spec 9.2). Both go through the control surface, so the
+    /// sidebar drives. Both go through the control surface, so the
     /// session they land on attaches the same way it would in process.
     #[tokio::test]
     async fn connect_mode_creates_and_switches_sessions() {
@@ -26594,7 +26595,7 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// Provenance decides what travels with a create (spec section 8). A level
+    /// Provenance decides what travels with a create. A level
     /// the user actually wrote is honored strictly, so a host whose model
     /// cannot serve it refuses in its own words, before any terminal setup. The
     /// same level left unstated does not travel at all, and the host defaults
@@ -27198,8 +27199,7 @@ mod tests {
     }
 
     /// The task-output overlay in connect mode is backed by the per-task read:
-    /// the drive loop polls it and pushes each snapshot into the open viewer
-    /// (spec 6.7).
+    /// the drive loop polls it and pushes each snapshot into the open viewer.
     #[tokio::test]
     async fn connect_mode_task_overlay_renders_the_per_task_read() {
         let dir = TempDir::new().expect("tempdir");
@@ -27341,7 +27341,7 @@ mod tests {
     ///
     /// Without the head the overlay falls back to its default cursor, and
     /// confirming that row parks a real branch request, so the user switches
-    /// to the branch they were already on (spec 6.7).
+    /// to the branch they were already on.
     #[tokio::test]
     async fn the_tree_overlay_opens_on_the_head_the_read_carries() {
         let dir = TempDir::new().expect("tempdir");
@@ -27413,8 +27413,7 @@ mod tests {
 
     /// The tree view and the branch gesture work over a connection: the tree
     /// read carries the head the overlay pre-selects, and the branch anchor
-    /// travels as a `before` target the host resolves to the message's parent
-    /// (spec 6.6, 6.7).
+    /// travels as a `before` target the host resolves to the message's parent.
     #[tokio::test]
     async fn connect_mode_browses_the_tree_and_branches() {
         let dir = TempDir::new().expect("tempdir");
@@ -27505,7 +27504,7 @@ mod tests {
         );
 
         // A branch replaces the message it was taken from rather than
-        // continuing after it (spec 6.6), so the original prompt is gone from
+        // continuing after it, so the original prompt is gone from
         // the branch's transcript and the edited one stands in its place. An
         // `entry` target would land on the message and keep both.
         settle(&mut world).await;
@@ -27566,7 +27565,7 @@ mod tests {
         settle(&mut world).await;
         remote.shutdown().await;
     }
-    // ---- Which host a create is for (spec 6.6, 7.1) ----
+    // ---- Which host a create is for ----
 
     /// A real gateway in front of `hosts`, dialed over HTTP exactly as a client
     /// dials one in production.
@@ -28937,7 +28936,7 @@ mod tests {
     }
 
     /// A plain host is one candidate, its own: the flag may name it, and naming
-    /// anything else is refused here rather than on the host (spec 6.6).
+    /// anything else is refused here rather than on the host.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_host_flag_against_a_plain_host_names_that_host() {
         let (host_dir, client_dir) = (

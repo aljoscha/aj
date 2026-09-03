@@ -128,13 +128,13 @@ use crate::tool_details::resolve_tool_details;
 /// with the entry it just appended, and [`project_suffix`] tags a
 /// projected event with the entry it derives from.
 ///
-/// `entry` is `Some` exactly for the events that are durable (spec 6.4),
+/// `entry` is `Some` exactly for the events that are durable,
 /// so a client can advance its cursor on the same events whether they
 /// arrive live or in a backfill. It is absent for everything a live run
 /// emits without persisting, for bracketing frames the projection
 /// synthesizes, and for every projected event of an entry at or below the
 /// cursor: their entry is already applied, and tagging them would make
-/// the client's cursor invariant drop them (spec 6.5).
+/// the client's cursor invariant drop them.
 #[derive(Debug, Clone)]
 pub struct TaggedEvent {
     pub entry: Option<EntryRef>,
@@ -167,12 +167,12 @@ pub struct Backfill {
 /// below the cursor are computed and dropped, never skipped. `None`
 /// projects the whole log, and so does a cursor beyond the log's
 /// `last_seq`, which cannot name a position in this materialization
-/// (spec 6.5 treats it as an epoch mismatch).
+/// (it is treated as an epoch mismatch).
 ///
 /// `live_subs` names the sub-agents the caller knows are still running.
 /// Every other run's bracket is force-closed exactly as dead-log
 /// [`replay`] closes it, and theirs is left open for the real
-/// `SubAgentEnd` to close live (spec 6.5). A run whose bracket opened at
+/// `SubAgentEnd` to close live. A run whose bracket opened at
 /// or below the cursor has its `SubAgentStart` re-synthesized before its
 /// first emitted event, so the suffix is well-bracketed.
 ///
@@ -596,8 +596,7 @@ struct ReplayState {
     /// and re-opened at the sub's next one, with its spawn root well behind
     /// us. Re-opening from the message alone would lose the task, the
     /// background flag and the settings the root carries, and the client
-    /// would seed the child's footer from an empty settings snapshot
-    /// (spec 6.5).
+    /// would seed the child's footer from an empty settings snapshot.
     spawned: HashMap<usize, AgentEvent>,
     /// Agents for which at least one `Message` entry has been
     /// projected. Notice-producing state entries emit a
@@ -735,7 +734,7 @@ impl ReplayState {
         if run.start.is_some() {
             // The run may have opened on an entry this walk dropped, in
             // which case its start has to be re-synthesized here so the
-            // suffix stays well-bracketed (spec 6.5).
+            // suffix stays well-bracketed.
             self.deliver_start(n, keep, out);
             return;
         }
@@ -801,7 +800,7 @@ impl ReplayState {
     /// Re-emit run `n`'s start when it was computed for an entry the walk
     /// dropped. Untagged: its spawn root is at or below the cursor, so a
     /// durable tag would make the client's cursor invariant drop the
-    /// bracket (spec 6.5).
+    /// bracket.
     fn deliver_start(&mut self, n: usize, keep: bool, out: &mut VecDeque<TaggedEvent>) {
         let Some(run) = self.open_runs.get_mut(&n) else {
             return;
@@ -4266,7 +4265,7 @@ mod tests {
 
         // Dead-log replay force-closes the bracket at EOF. A live
         // backfill must not, because the real `SubAgentEnd` for a running
-        // sub is still coming (spec 6.5).
+        // sub is still coming.
         let (last, head) = replayed.split_last().expect("replay is not empty");
         assert_eq!(last["type"], "sub_agent_end");
         assert_eq!(
@@ -4497,8 +4496,8 @@ mod tests {
         );
     }
 
-    /// Spec 6.5: a cursor beyond `last_seq` cannot name a position in
-    /// this materialization, so it reads as no cursor at all. Silently
+    /// A cursor beyond `last_seq` cannot name a position in this
+    /// materialization, so it reads as no cursor at all. Silently
     /// serving an empty suffix instead would lose the client's whole
     /// history.
     #[test]
@@ -5001,13 +5000,13 @@ mod tests {
             .expect("the suffix tags at least one event");
         // The system prompt and the seed model change project nothing, so
         // seqs start above 1 and are not contiguous. Clients must tolerate
-        // that (spec 6.4).
+        // that.
         assert_eq!(first_tagged.seq, 3);
     }
 
     /// An abandoned branch's entries occupy interior positions that
     /// project nothing, so a client cannot do gap detection on seq at
-    /// all, not even "the gaps are all at the front" (spec 6.4).
+    /// all, not even "the gaps are all at the front".
     #[test]
     fn an_abandoned_branch_leaves_an_interior_gap_in_the_tagged_positions() {
         let (_dir, log) = log_with_abandoned_sibling_branch();

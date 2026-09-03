@@ -1,4 +1,4 @@
-//! The HTTP client for the remote-control protocol (spec 6.1, 6.5-6.7).
+//! The HTTP client for the remote-control protocol.
 //!
 //! One [`RemoteClient`] is one connection's worth of surface: the reads, the
 //! commands, and [`RemoteClient::events`] for the stream. It decodes the
@@ -50,7 +50,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a stream may be silent before it counts as dead.
 ///
 /// The host heartbeats every 30 seconds, so two missed heartbeats is the
-/// signal (spec 6.1). The caller reconnects with backoff.
+/// signal. The caller reconnects with backoff.
 pub(crate) const SILENCE: Duration = Duration::from_secs(60);
 
 /// Why a remote call did not answer what was asked.
@@ -64,9 +64,9 @@ pub(crate) enum RemoteError {
     /// carried one, which is what a caller branches on.
     ///
     /// `body` is that body as it arrived, because a gateway re-emits a refusal it
-    /// did not author and every field of it is the host's to keep (spec 6.6,
-    /// 6.10). `code` and `message` are the two fields this protocol names inside
-    /// it, read out for callers that branch or display.
+    /// did not author and every field of it is the host's to keep. `code` and
+    /// `message` are the two fields this protocol names inside it, read out for
+    /// callers that branch or display.
     #[error("the host answered {status}: {message}")]
     Status {
         status: StatusCode,
@@ -160,7 +160,7 @@ impl RemoteCommand {
         }
     }
 
-    /// Whether this command answers with the text it withdrew (spec 6.6).
+    /// Whether this command answers with the text it withdrew.
     fn withdraws(&self) -> bool {
         matches!(
             self,
@@ -232,7 +232,7 @@ impl RemoteClient {
     /// The reachability and identity probe, which also settles version skew.
     ///
     /// A protocol mismatch fails here rather than later on a frame nobody can
-    /// read: the integer only moves on a breaking change (spec 6.10).
+    /// read: the integer only moves on a breaking change.
     pub(crate) async fn hello(&self) -> Result<Hello, RemoteError> {
         let hello: Hello = self.get("/v1/hello").await?;
         check_protocol(&hello)?;
@@ -374,9 +374,9 @@ async fn refusal(response: reqwest::Response) -> Result<reqwest::Response, Remot
         return Ok(response);
     }
     let body = response.text().await.unwrap_or_default();
-    // Both fields are read on their own, because spec 6.6 calls an envelope
-    // carrying only a `message` a complete error and an unknown `code` renders as
-    // its message verbatim. A proxy, or a status the framework answers itself
+    // Both fields are read on their own, because an envelope carrying only a
+    // `message` is a complete error and an unknown `code` renders as its
+    // message verbatim. A proxy, or a status the framework answers itself
     // (405), sends no envelope at all, and then the raw text stands in: pasting a
     // whole JSON body into `message` would show a user a blob instead of the
     // sentence the peer wrote.
@@ -399,8 +399,7 @@ async fn refusal(response: reqwest::Response) -> Result<reqwest::Response, Remot
     })
 }
 
-/// A refusal's body read for the two fields this protocol names, each optional
-/// (spec 6.6).
+/// A refusal's body read for the two fields this protocol names, each optional.
 #[derive(serde::Deserialize)]
 struct Envelope {
     code: Option<String>,
@@ -480,8 +479,8 @@ impl RemoteEvents {
 
     /// The next frame, `None` once the stream ended.
     ///
-    /// An unknown frame kind is skipped: an endpoint client discards those
-    /// (spec 6.10). A gateway, which forwards them, reads
+    /// An unknown frame kind is skipped: an endpoint client discards those.
+    /// A gateway, which forwards them, reads
     /// [`Self::recv_decoded`] instead. A malformed known frame is an error and
     /// ends the stream, because a reliable frame this client cannot apply
     /// leaves its state incomplete, and a reconnect with a cursor is the
@@ -501,8 +500,8 @@ impl RemoteEvents {
     /// The next frame in decoded form, `None` once the stream ended.
     ///
     /// A kind this build does not know arrives as [`DecodedFrame::Unknown`]
-    /// with its JSON retained, which is what a gateway forwards (spec 6.10). A
-    /// malformed *known* frame is still an error: a frame whose kind we
+    /// with its JSON retained, which is what a gateway forwards. A malformed
+    /// *known* frame is still an error: a frame whose kind we
     /// recognize and whose payload we cannot read is a peer we have stopped
     /// understanding, not an additive change.
     pub(crate) async fn recv_decoded(&mut self) -> Option<Result<DecodedFrame, RemoteError>> {
@@ -557,8 +556,8 @@ mod tests {
         );
     }
 
-    /// Spec 6.6: codes arrive error by error, an envelope with only a `message`
-    /// is a complete error, and an unknown code renders as its message verbatim.
+    /// Codes arrive error by error, an envelope with only a `message` is a
+    /// complete error, and an unknown code renders as its message verbatim.
     /// So both fields are read on their own, and a body that is no envelope at
     /// all is the only case where the raw text is the best there is.
     #[tokio::test]

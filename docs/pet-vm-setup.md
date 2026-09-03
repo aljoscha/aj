@@ -13,7 +13,7 @@ directory. Both choices matter, see below.
 
 One host per working directory. That is not a convention, it is what a
 host is: a host serves the sessions of the directory it was started in,
-and its `host_id` names that store (spec section 4). Two checkouts means
+and its `host_id` names that store. Two checkouts means
 two units and two ports.
 
 A gateway aggregates hosts behind one address and namespaces their
@@ -48,8 +48,7 @@ documents this and tolerates it).
 ## Before anything listens
 
 The control port runs arbitrary commands through the agent. Serving it
-unauthenticated publishes a remote shell, so the gate is not optional
-(spec section 6.11):
+unauthenticated publishes a remote shell, so the gate is not optional:
 
 - **`--auth tailscale`** verifies every peer against the local tailscale
   daemon and admits only the logins you name with `--allow`, or a tagged
@@ -61,8 +60,7 @@ unauthenticated publishes a remote shell, so the gate is not optional
   ssh tunnel this needs no tailnet.
 - **`--auth open`** belongs only to a network that is private by
   construction, such as an ember guest reachable from its hypervisor and
-  nowhere else (spec section 7.4). A machine you can ssh into is not
-  that.
+  nowhere else. A machine you can ssh into is not that.
 
 Draft the tailnet policy against the real tailnet before the first host
 listens, not after.
@@ -150,7 +148,7 @@ aj connect http://gateway-host:6160
 
 With more than one host enrolled, a create has to name the host it is for,
 because a session runs an agent in that host's working directory and the
-gateway will not guess (section 6.6 of the remote-control spec). In the TUI the
+gateway will not guess. In the TUI the
 create action asks: it opens a picker over the enrolled hosts, with nothing
 selected until you say so. A run with no terminal to ask names the host itself:
 
@@ -174,8 +172,7 @@ so namespaced ids clients are holding keep resolving.
 Restarting the **gateway** ends every client stream and drops its
 knowledge of what each host holds. It relearns on reconnect. Learned host
 ids persist, so a configured host that is down when the gateway starts is
-still named in the directory, marked unreachable, with no rows under it
-(spec section 7.1).
+still named in the directory, marked unreachable, with no rows under it.
 
 A **reboot** brings both back through linger, but a user unit cannot
 order itself against system units, so a host may fail its first attempts

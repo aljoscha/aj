@@ -6,7 +6,7 @@
 //! [`AgentPickerOutcome::Observe`] the host applies with
 //! [`aj_app::chat::ChatState::set_active_view`]. Confirming a task row
 //! drills into the task-output viewer. Two overlay-local chords act
-//! at-target (Spec F), so they never enter the global keymap:
+//! at-target, so they never enter the global keymap:
 //!
 //! - `Ctrl+T` ([`ACTION_AGENT_TOGGLE_SCOPE`]) flips the scope between
 //!   "running only" and "all", rebuilding the row set in place.
@@ -206,7 +206,7 @@ impl Widget for AgentPicker {
         let Event::KeyPress(key) = event else {
             return;
         };
-        // Overlay-local scope toggle (Spec F): matched here at-target,
+        // Overlay-local scope toggle: matched here at-target,
         // ahead of the inner select, and rebuilds the rows in place.
         if action_matches(key, ACTION_AGENT_TOGGLE_SCOPE) {
             self.scope = match self.scope {

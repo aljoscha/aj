@@ -1,4 +1,4 @@
-//! The connection identity gate (spec 6.11).
+//! The connection identity gate.
 //!
 //! An attached client can run arbitrary commands through the agent, so the
 //! control port is remote code execution. The protocol itself stays

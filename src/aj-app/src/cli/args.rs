@@ -493,7 +493,7 @@ impl<'a> ConnectLaunch<'a> {
     }
 }
 
-/// The session a `connect` run asks for (spec 9.1).
+/// The session a `connect` run asks for.
 ///
 /// One value for three states rather than an id and a flag that can both
 /// speak: a run that creates names no session, so it has no id to overrule
@@ -622,7 +622,7 @@ pub enum Command {
         /// refused with the candidates listed rather than resolved to a guess:
         /// a create runs an agent in a working directory. Against a plain host
         /// the only value it may name is that host's own id, which is what the
-        /// host itself accepts (spec 6.6).
+        /// host itself accepts.
         ///
         /// A create is all it can point at, and it is resolved on every run
         /// that carries it, so a stale or misspelled value is refused rather

@@ -55,7 +55,7 @@ use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 /// replace the message it was taken from rather than continue after it. An
 /// entry the log does not hold is a 404, and one with no parent is refused:
 /// branching before a root would leave the session with no history at all,
-/// and no transcript gesture can legitimately ask for it (spec 6.6).
+/// and no transcript gesture can legitimately ask for it.
 fn resolve_head_target(
     log: &aj_session::ConversationLog,
     target: &HeadTarget,
@@ -448,7 +448,7 @@ impl Driver {
 
     /// Publish a `state` frame when `working` changed, which is the flag a
     /// client seeds its spinner from and the one that self-heals an
-    /// `AgentEnd` it missed (spec 6.3).
+    /// `AgentEnd` it missed.
     ///
     /// The frame's `last_seq` also moves on every durable append, and we
     /// deliberately do not re-emit for that: the durable frame carries the
@@ -469,8 +469,8 @@ impl Driver {
     }
 
     /// Publish `agent`'s queue snapshot. The agent only emits this after a
-    /// drain, so the host emits it on the enqueue side too (spec section 5)
-    /// and a second client learns about a message it did not queue itself.
+    /// drain, so the host emits it on the enqueue side too and a second
+    /// client learns about a message it did not queue itself.
     fn publish_queue(&self, agent: AgentId) {
         let (steering, follow_up) = self.session.core.message_queues.event_messages(agent);
         self.publish_event(
@@ -629,7 +629,7 @@ impl Driver {
                 CommandOutcome::Withdrawn(text)
             }
             QueueOp::Clear => {
-                // Session-wide (spec 6.6), so every agent that has
+                // Session-wide, so every agent that has
                 // something queued gets its own `QueueUpdate`: a client
                 // tracks the queues per agent and would otherwise keep
                 // showing the ones it was not told about.
@@ -660,9 +660,9 @@ impl Driver {
     /// Write the session's tag sidecar and put the new label on its row.
     ///
     /// The write happens here rather than at the host's surface because this
-    /// task holds the session's advisory lock, which is what spec 6.6 means by
-    /// materializing like any other command: two writers of one store cannot
-    /// interleave on a session's label.
+    /// task holds the session's advisory lock: a tag materializes like any
+    /// other command so that two writers of one store cannot interleave on a
+    /// session's label.
     ///
     /// A tag is display metadata and nothing else, so it appends no log entry
     /// and publishes no `state` frame. The session list is where it surfaces,
@@ -913,8 +913,8 @@ impl Driver {
     /// A settings entry that lands before its thread's first message
     /// projects no notice, so a tagged frame would name something no
     /// backfill can regenerate. Publishing the confirmation untagged is
-    /// what keeps the pre-first-prompt settings gesture from going silent
-    /// (spec section 5): live clients see it, and it is a transient notice
+    /// what keeps the pre-first-prompt settings gesture from going silent:
+    /// live clients see it, and it is a transient notice
     /// like any other. The entry's position still moves the high-water
     /// mark, since the entry is on disk either way.
     fn publish_notice(
@@ -1004,14 +1004,14 @@ impl Driver {
             log.flush_pending().map_err(internal)?;
             // Resolved here rather than at the caller, under the same lock
             // that moves the head: a parent read outside it could be
-            // superseded by an append before the switch lands (spec 6.6).
+            // superseded by an append before the switch lands.
             let entry = resolve_head_target(&log, &target)?;
             let known = log.contains(&entry);
             log.set_head(entry).map_err(|err| match err {
                 // `set_head` refuses an id it does not know and one whose
                 // role cannot be a head (a sub-agent entry) with the same
                 // error. The first is a 404 and the second a malformed
-                // request, so the two are told apart here (spec 6.1).
+                // request, so the two are told apart here.
                 //
                 // Both quote the entry the request named. For a `before`
                 // target that is not the entry `set_head` rejected, and
@@ -1135,7 +1135,7 @@ impl Driver {
     /// client once, detach them, and tear down the way a shutdown does.
     ///
     /// The error frame is what makes a client let go of this materialization
-    /// and ask for the session again (spec 6.5), and the ask rebuilds it from
+    /// and ask for the session again, and the ask rebuilds it from
     /// disk because the host treats a draining entry as absent. Detaching
     /// after the frame keeps later teardown frames (a cancelled turn's notice,
     /// the final state) off streams that have already been told the session is
@@ -1268,7 +1268,7 @@ impl Driver {
         // The stamp is what this driver saw, not what the file says. The flush
         // above can land buffered entries a whole idle grace after the work
         // that produced them, and a row stamped with its own teardown reads to
-        // a client as output it has not seen (spec 6.8).
+        // a client as output it has not seen.
         //
         // The status lock nests under the log lock here. That is the order the
         // driver always takes them in, and nothing takes the log lock while

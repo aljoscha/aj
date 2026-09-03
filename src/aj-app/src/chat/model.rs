@@ -416,7 +416,7 @@ pub struct AgentRender {
     /// update opens a second, unfinalized copy of a message that is
     /// already rendered, and nothing later removes it. Live flow honors
     /// this because the accumulator emits the updates before the end.
-    /// Across an attach boundary it is the server's job: spec 6.5 drops
+    /// Across an attach boundary it is the server's job: the host drops
     /// the lossy frames that were in flight when the attach was served,
     /// exactly so a stale snapshot cannot land after the backfill.
     pub(crate) current_assistant: Option<EntryId>,
@@ -963,7 +963,7 @@ impl ChatState {
     }
 
     /// Drop the transient-derived in-flight detail before a re-attach
-    /// backfill is applied (spec 6.5's re-attach reconciliation).
+    /// backfill is applied (re-attach reconciliation).
     ///
     /// This clears transient *detail* and never durable identity or
     /// structure. The unfinalized streaming assistant entry goes, since
@@ -1028,7 +1028,7 @@ impl ChatState {
     /// view configuration.
     ///
     /// A client calls this when it adopts a different epoch for the session
-    /// (a head switch to another branch, a host restart, spec 6.5).
+    /// (a head switch to another branch, a host restart).
     /// Nothing it derived from the old epoch's entries describes the
     /// history it is about to be served, so the fold restarts from the full
     /// backfill.

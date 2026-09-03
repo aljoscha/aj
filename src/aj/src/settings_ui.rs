@@ -897,7 +897,7 @@ impl Widget for SettingList {
             ctx.consume_and_redraw();
             return;
         }
-        // The clear chord is overlay-local (Spec F): matched here at-target
+        // The clear chord is overlay-local: matched here at-target
         // rather than by the global keymap, and only in project mode over an
         // actual override.
         if self.project_mode && action_matches(key, ACTION_SETTINGS_CLEAR) {
@@ -1409,7 +1409,7 @@ pub(crate) fn open_settings(
 }
 
 /// The settings window's key-hint subtitle. The project window advertises the
-/// clear chord, all labels resolved from keybinding data (Spec F).
+/// clear chord, all labels resolved from keybinding data.
 fn settings_subtitle(project_mode: bool) -> String {
     let mut hint = subtitle_edit_close("edit");
     if project_mode && let Some(clear) = action_shortcut(ACTION_SETTINGS_CLEAR) {

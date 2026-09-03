@@ -1,6 +1,6 @@
 //! Catch-up equivalence for the client fold: a client that loses its
 //! connection mid-turn and re-attaches has to converge on the same
-//! durable-derived state as one that never dropped (spec 2, 6.5, 11.2).
+//! durable-derived state as one that never dropped.
 //!
 //! The turn is a real scripted-provider run, so the frames are the exact
 //! shapes the agent emits, tagged with their log entries by the same
@@ -149,7 +149,7 @@ fn agent_end_frame(epoch: &str, agent_id: AgentId) -> Frame {
     }
 }
 
-/// The three cumulative-snapshot events (spec 6.4).
+/// The three cumulative-snapshot events, the lossy frame class.
 fn is_lossy(event: &AgentEvent) -> bool {
     matches!(
         event,
@@ -296,8 +296,8 @@ fn sweep(
             }
             client.reattach(log, EPOCH);
             for frame in &frames[resume..] {
-                // Spec 6.5 has the server drop the lossy frames that were
-                // in flight when an attach was served, because a
+                // The server drops the lossy frames that were in flight
+                // when an attach was served, because a
                 // cumulative snapshot delivered after the durable frame
                 // that superseded it resurrects stale transient state: a
                 // `MessageUpdate` for a message the backfill already
@@ -445,7 +445,7 @@ async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
     );
 
     // The retry emits a "Retrying inference" notice with no durable origin,
-    // which no backfill can hand over (spec 6.4), so the tier for a client
+    // which no backfill can hand over, so the tier for a client
     // that was disconnected is the convergent one. It masks that notice and
     // nothing else: usage rows stay under comparison, which is the point here.
     let expected = uninterrupted(&frames).canonical().convergent();
@@ -490,8 +490,8 @@ async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
 ///
 /// This folds through `reduce` rather than through [`SessionClient`]
 /// deliberately. The client's cursor invariant drops the durable frames of
-/// entries it already applied, and spec 6.5 is explicit that the invariant
-/// is a de-duplication optimization rather than the correctness mechanism.
+/// entries it already applied, and that invariant is a de-duplication
+/// optimization rather than the correctness mechanism.
 /// Idempotent application is, so this pins the property the invariant is
 /// not allowed to stand in for.
 #[tokio::test]
@@ -577,7 +577,7 @@ async fn a_fold_without_durable_identity_diverges() {
 }
 
 /// A second guard on the oracle: a pending queued message is part of the
-/// state two clients have to agree on (spec 11.2), so a client that was
+/// state two clients have to agree on, so a client that was
 /// told about one and a client that was not must not compare equal.
 ///
 /// The reducer treats `QueueUpdate` as a redraw ping and drops the payload,

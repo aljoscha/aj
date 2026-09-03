@@ -97,7 +97,7 @@ impl ContentStyles {
             // colored emphasis as the window title above it, drawn bold on
             // top. We avoid `MdHeading` here: it is empty in the bundled
             // palettes, so it would render bold-only with no color and miss
-            // the spec's colored-heading requirement.
+            // the colored-heading requirement.
             heading: Style {
                 bold: true,
                 ..fg(ThemeColor::Accent)
@@ -281,7 +281,7 @@ pub(crate) fn open_content_overlay(
     // border and title chrome around it.
     let focus: WidgetRef = to_widget_ref(Rc::clone(&content));
     let mut window = OverlayWindow::new(title, to_widget_ref(content));
-    // The close hint resolves through the shared keybinding data (Spec F):
+    // The close hint resolves through the shared keybinding data:
     // Esc's label from `format_keybinding`, the close-all label from the
     // keymap action. The Esc/Enter *handling* stays a fixed `ContentOverlay`
     // convention (see the NOTE in `crate::overlay`).
@@ -308,9 +308,9 @@ pub(crate) fn loading_rows() -> Vec<Row> {
     vec![plain("Loading\u{2026}")]
 }
 
-/// The compose-time global chords listed under section 1 (editor
-/// shortcuts). These are the app-level chords a user can fire while the
-/// editor is focused (open the palette, paste an image, toggle thinking
+/// The compose-time global chords listed under the help page's first section
+/// (editor shortcuts). These are the app-level chords a user can fire while
+/// the editor is focused (open the palette, paste an image, toggle thinking
 /// or tool output, recall or steer a message, open the pickers, or operate
 /// the session sidebar).
 ///
@@ -333,7 +333,8 @@ const COMPOSE_GLOBAL_ACTIONS: &[&str] = &[
     ACTION_SIDEBAR_ARCHIVED,
 ];
 
-/// The chat-scroll and transcript-navigation chords listed under section 2.
+/// The chat-scroll and transcript-navigation chords listed under the help
+/// page's second section.
 /// `ACTION_COPY_MESSAGE` and `ACTION_BRANCH_MESSAGE` live in transcript-focus
 /// mode, so they belong with the transcript keys rather than the compose-time
 /// chords.
@@ -500,8 +501,8 @@ fn render_section(lines: &[HelpLine], styles: &ContentStyles) -> Vec<Row> {
 ///
 /// Every displayed label is generated from authoritative data, never a
 /// static snapshot: editor chords come from [`TextArea::bindings`], and
-/// global-chord and command labels resolve through the keybinding data
-/// (Spec F's hint-label rule), so a rebind flows through to the label.
+/// global-chord and command labels resolve through the keybinding data,
+/// so a rebind flows through to the label.
 pub(crate) fn help_rows(styles: &ContentStyles) -> Vec<Row> {
     let sections = [editor_shortcut_lines(), scroll_nav_lines(), command_lines()];
     let mut rows = Vec::new();
@@ -976,7 +977,7 @@ mod tests {
         }
 
         // The injected `test_styles` above only proves the render applies
-        // whatever heading style it is handed. The spec asks for a *colored*
+        // whatever heading style it is handed. The page promises a *colored*
         // heading out of the box, so the token `from_theme` picks must resolve
         // to a real foreground in the bundled palettes, not the terminal
         // default. Pointing `heading` back at an empty/uncolored token (which
@@ -1029,9 +1030,9 @@ mod tests {
     }
 
     #[test]
-    fn help_section_one_pins_spec_named_globals() {
+    fn help_section_one_pins_named_compose_globals() {
         let rows = help_rows(&test_styles());
-        // The spec names these compose-time globals for section 1. We pin each
+        // Section 1 promises these compose-time globals. We pin each
         // by its action-id constant directly, not by iterating
         // `COMPOSE_GLOBAL_ACTIONS`, so dropping a const entry drops its row and
         // fails this named test (its description no longer appears, so
@@ -1045,7 +1046,7 @@ mod tests {
             ACTION_THINKING_TOGGLE,
             ACTION_TOOLS_EXPAND,
         ] {
-            let (key, desc) = global_chord(id).expect("spec-named global in the keybinding table");
+            let (key, desc) = global_chord(id).expect("named global in the keybinding table");
             assert!(
                 row_containing(&rows, desc).contains(&key),
                 "section-1 global {desc:?} must carry the resolved label {key:?}"

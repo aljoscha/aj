@@ -111,8 +111,8 @@ pub(crate) fn open_palette(
         }));
     }
     let mut window = OverlayWindow::new("Commands", to_widget_ref(select));
-    // The confirm/close hint resolves through the shared keybinding data
-    // (Spec F): Enter/Esc labels from `format_keybinding`, the close-all label
+    // The confirm/close hint resolves through the shared keybinding data:
+    // Enter/Esc labels from `format_keybinding`, the close-all label
     // from the keymap action. The Enter/Esc *handling* stays a fixed
     // `FilterableSelect` convention (see the NOTE in `crate::overlay`).
     window.subtitle = subtitle_confirm_close();
@@ -182,7 +182,7 @@ fn dispatch_from_palette(
 
 /// One palette row per command: the `title` as the label, the `category` as
 /// the dim prefix column, and the bound shortcut (resolved from keybinding
-/// data per Spec F) in the right slot when the command carries an action. The
+/// data) in the right slot when the command carries an action. The
 /// filter key is `"{category} {title}"` so typing a category surfaces its
 /// whole group. The widget lays out the columns, so the label carries only
 /// the title.

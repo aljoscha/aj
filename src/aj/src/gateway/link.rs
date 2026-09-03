@@ -1,4 +1,4 @@
-//! One enrolled host's control connection (spec 7.1).
+//! One enrolled host's control connection.
 //!
 //! Per host: its `/v1/events` stream with no session attachments, which is what
 //! the gateway learns that host's directory from. A client that attaches
@@ -35,8 +35,7 @@ impl Link {
     /// Start dialing `address` and feeding what it says into `directory`.
     ///
     /// `recorder` is where the id this host reports is settled: this is where one
-    /// is learned, so it is where the gateway's record of it comes from
-    /// (spec 7.1).
+    /// is learned, so it is where the gateway's record of it comes from.
     pub(crate) fn spawn(
         address: HostAddress,
         directory: Arc<Directory>,
@@ -142,14 +141,14 @@ async fn attempt(address: &HostAddress, directory: &Directory, recorder: &Record
     };
     // What that id settles is the gateway's to decide: a configured
     // enrollment's is provisional and a dynamic one's is the record it was made
-    // from (spec 7.1). A link is where one is learned, so it is also where the
+    // from. A link is where one is learned, so it is also where the
     // gateway's record of it comes from, and the same goes for the name this
     // host reports beside it.
     if let Err(err) = recorder.settle(address, &Reported::of(&hello)).await {
         return Attempt::Failed(err.to_string());
     }
-    // No session is named: this is the control connection of spec 7.1, so the
-    // host sends it `list` frames and heartbeats and nothing else.
+    // No session is named: this is the control connection, so the host sends
+    // it `list` frames and heartbeats and nothing else.
     let mut events = match client.events(&[]).await {
         Ok(events) => events,
         Err(err) => return Attempt::Failed(err.to_string()),
@@ -165,7 +164,7 @@ async fn attempt(address: &HostAddress, directory: &Directory, recorder: &Record
             DecodedFrame::Known(known) => match known.value() {
                 // The rows travel as their host wrote them: this gateway owns
                 // three of their fields and passes the rest through, so a typed
-                // re-encode here would strip a newer host's (spec 6.10).
+                // re-encode here would strip a newer host's.
                 Frame::List { .. } => match frame.rows() {
                     // `Ok(None)` cannot come back for a `list` frame: the read
                     // decides on the same kind this arm matched on.
@@ -177,7 +176,7 @@ async fn attempt(address: &HostAddress, directory: &Directory, recorder: &Record
                     }
                 },
                 // A control connection names no session, so a host publishes it
-                // none of these (spec 6.5). The ones a client asked for reach it
+                // none of these. The ones a client asked for reach it
                 // on that client's own spliced stream instead, and so does the
                 // refusal of one it cannot serve.
                 Frame::Event { .. }
@@ -192,7 +191,7 @@ async fn attempt(address: &HostAddress, directory: &Directory, recorder: &Record
             },
             // A kind from a newer host. Retained rather than read: forwarding it
             // to a client is what keeps an older gateway usable between newer
-            // peers (spec 6.10), and dropping the connection over it would make
+            // peers, and dropping the connection over it would make
             // this gateway the one thing that cannot tolerate the future.
             DecodedFrame::Unknown { kind, .. } => {
                 tracing::debug!("{address} sent a frame of unknown kind {kind:?}");

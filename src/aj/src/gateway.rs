@@ -1,4 +1,4 @@
-//! `aj gateway`: many session hosts behind one endpoint (spec 7.1).
+//! `aj gateway`: many session hosts behind one endpoint.
 //!
 //! A gateway holds no session logs and no cursors. It keeps one control
 //! connection per enrolled host, merges what those hosts say about their
@@ -16,7 +16,7 @@
 //! - [`splice`] is one client stream: the upstreams of the sessions it
 //!   attached, and the `reset` frames an upstream that broke or was withdrawn
 //!   earns them.
-//! - [`outbound`] is that stream's bounded queue (spec 6.9).
+//! - [`outbound`] is that stream's bounded queue.
 //! - [`server`] is the HTTP surface, including the proxy.
 
 mod config;
@@ -57,7 +57,7 @@ use crate::remote::{RemoteClient, RemoteError};
 /// File under the gateway's state directory holding its own stable id.
 ///
 /// A gateway has no session store to name it, and `GET /v1/hello` carries an id
-/// for a gateway as much as for a host (spec 6.1), so it keeps one here beside
+/// for a gateway as much as for a host, so it keeps one here beside
 /// its enrollments. Persisted rather than minted per process because a client
 /// that remembers which endpoint it was talking to should still recognize it
 /// after a restart.
@@ -72,10 +72,10 @@ const GATEWAY_ID_FILE: &str = "gateway-id";
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 
-/// How long a client's stream may be idle before a heartbeat frame (spec 6.1).
+/// How long a client's stream may be idle before a heartbeat frame.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
-/// How much slack one client's outbound queue holds (spec 6.9).
+/// How much slack one client's outbound queue holds.
 ///
 /// The same bound a host applies to its own clients, for the same reason: enough
 /// burst room for a client that reads normally, little enough that a client this
@@ -103,7 +103,7 @@ pub(crate) struct Tuning {
     pub(crate) heartbeat: Duration,
     /// How long a proxied request waits on the owning host.
     pub(crate) upstream_timeout: Duration,
-    /// How many frames one client's stream may fall behind by (spec 6.9).
+    /// How many frames one client's stream may fall behind by.
     pub(crate) outbound_queue: NonZeroUsize,
 }
 
@@ -122,7 +122,7 @@ impl Default for Tuning {
 /// What a gateway is built from.
 pub(crate) struct GatewaySetup {
     /// Where the gateway keeps its own state: its id and its enrollments.
-    /// `~/.aj/gateway/` in a real run (spec 7.1).
+    /// `~/.aj/gateway/` in a real run.
     pub(crate) state_dir: PathBuf,
     /// The hosts the configuration file names, enrolled for as long as it does.
     pub(crate) static_hosts: Vec<HostAddress>,
@@ -131,15 +131,15 @@ pub(crate) struct GatewaySetup {
 
 /// Why a gateway could not do what was asked of it.
 ///
-/// Typed because the HTTP layer maps the variants onto the status vocabulary of
-/// spec 6.1, and because the CLI reports one of them at start-up.
+/// Typed because the HTTP layer maps the variants onto the protocol's status
+/// vocabulary, and because the CLI reports one of them at start-up.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GatewayError {
     #[error(transparent)]
     Address(#[from] AddressError),
     /// The host did not answer, so the gateway does not know its id and cannot
     /// namespace it. 503, which is the one status a gateway has that a host does
-    /// not (spec 6.1).
+    /// not.
     #[error("could not reach a host at {address}: {source}")]
     Unreachable {
         address: HostAddress,
@@ -151,7 +151,7 @@ pub(crate) enum GatewayError {
     /// The host that owns an attached session refused it, in its own words: a
     /// session it does not hold, a lock conflict. Carried rather than
     /// interpreted, so a client of a gateway reads a host's refusal exactly as a
-    /// client of that host would (spec 6.10).
+    /// client of that host would.
     #[error("the host answered {status}: {message}")]
     AttachRefused {
         status: StatusCode,
@@ -159,7 +159,7 @@ pub(crate) enum GatewayError {
         /// in its body appear under downstream.
         host_id: String,
         /// The host's own sentence, for this gateway's own log and for the
-        /// envelope it mints when the host sent none (spec 6.6).
+        /// envelope it mints when the host sent none.
         message: String,
         /// The refusal body as the host wrote it, which is what travels back.
         body: String,
@@ -215,15 +215,15 @@ impl Gateway {
     /// host's: the configuration is the record of it being enrolled from here
     /// on, and keeping both would enroll it twice or resurrect it when the
     /// operator removes it from the configuration. Its id is not that record's
-    /// to lose, though, because an id names a store (spec 4) and promoting an
+    /// to lose, though, because an id names a store and promoting an
     /// enrollment into a file did not change which store answers there.
     ///
     /// A configured host's *id* comes out of the state file too, with the name
     /// that host last reported, and both are applied once the enrollments are in
     /// place: a host that is down when this gateway starts is still named by the
     /// id its sessions are namespaced under and still labelled by the name it
-    /// calls itself, which is what a client renders its empty group from
-    /// (spec 7.1). Applied last so that a cached id can only ever cost itself: a
+    /// calls itself, which is what a client renders its empty group from.
+    /// Applied last so that a cached id can only ever cost itself: a
     /// collision drops the id and never an enrollment.
     pub(crate) fn new(setup: GatewaySetup) -> Result<Self, GatewayError> {
         let GatewaySetup {
@@ -304,14 +304,14 @@ impl Gateway {
         Ok(gateway)
     }
 
-    /// Protocol identity and capabilities (spec 6.1).
+    /// Protocol identity and capabilities.
     ///
     /// No working directory: a gateway serves none of its own, and that absence
     /// is how a client tells the two roles apart. The capability list is empty
     /// where a host's names the routes it serves past the baseline: this hello
     /// is the gateway's own, and a gateway cannot answer for hosts that need
     /// not agree with each other. A client that wants a route attempts it and
-    /// reads the refusal (spec 6.10).
+    /// reads the refusal.
     pub(crate) fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
@@ -326,7 +326,7 @@ impl Gateway {
         }
     }
 
-    /// The merged session directory (spec 7.1).
+    /// The merged session directory.
     pub(crate) fn sessions(&self) -> Arc<MergedDirectory> {
         self.inner.directory.sessions()
     }
@@ -393,7 +393,7 @@ impl Gateway {
     }
 
     /// Remove the enrollment of `host_id` and tear down what this gateway was
-    /// doing for it (spec 7.1).
+    /// doing for it.
     ///
     /// Active teardown rather than bookkeeping, in this order:
     ///
@@ -435,13 +435,13 @@ impl Gateway {
         Ok(self.inner.directory.route(id)?)
     }
 
-    /// Which host a create is for, or why none is (spec 6.6).
+    /// Which host a create is for, or why none is: the named host, else the
+    /// only enrolled one, and ambiguity is refused rather than guessed.
     pub(crate) fn create_target(&self, named: Option<&str>) -> Result<HostTarget, GatewayError> {
         Ok(self.inner.directory.create_target(named)?)
     }
 
-    /// Open one client's event stream, splicing every session it attached
-    /// (spec 7.1).
+    /// Open one client's event stream, splicing every session it attached.
     ///
     /// `shutdown` is the serving port's own token: it ends the splice's upstreams
     /// whether or not the client is still reading (see [`Splice::open`]).
@@ -530,7 +530,7 @@ impl Gateway {
     }
 }
 
-/// What a link hands what a host just said about itself to (spec 7.1).
+/// What a link hands what a host just said about itself to.
 ///
 /// A host's id and its name are learned by speaking to the host, so a link is
 /// the only thing that can learn either, and a gateway whose hosts all come from

@@ -1,4 +1,4 @@
-//! The client's view of every session a peer offers (spec 6.8, 9.2).
+//! The client's view of every session a peer offers.
 //!
 //! One [`SessionDirectory`] holds two very different kinds of knowledge, and
 //! keeping them apart is the point of the type:
@@ -10,8 +10,8 @@
 //!   Live frames keep arriving for these while they sit in the background,
 //!   which is what makes switching to one a view swap rather than a rebuild.
 //!
-//! Background attachment is a bounded working set, LRU over focus (spec
-//! section 5). Retaining a session costs a live driver and a held lock on the
+//! Background attachment is a bounded working set, LRU over focus.
+//! Retaining a session costs a live driver and a held lock on the
 //! host, so browsing the store must not leave one behind per session visited.
 //! [`WORKING_SET`] bounds it, the focused session is never the one dropped,
 //! and a session that falls out keeps its `list` row and so keeps carrying its
@@ -31,7 +31,7 @@
 //! Attaching is not this type's job: it owns no stream and does no IO. The
 //! caller attaches the set [`SessionDirectory::attach_requests`] names and arms
 //! the folds the peer served, and a session dropped from the working set is
-//! detached by that same reopen leaving it unnamed (spec 6.5).
+//! detached by that same reopen leaving it unnamed.
 
 use std::collections::{HashMap, HashSet};
 
@@ -62,12 +62,12 @@ pub const WITHHELD_NOTICE: &str = "Nothing is following this session now. It re-
 /// Its own sentence rather than the one above, because the condition above is
 /// the wrong thing to watch for here: a locked session stays on the peer's list
 /// for as long as the hold lasts, and what asks again is the hold ending, which
-/// the peer's rows report (spec 6.8).
+/// the peer's rows report.
 ///
 /// A condition and not a promise, for the same reason the one above is one, and
 /// the condition is what the peer reports rather than what the rival does. A
 /// peer that never publishes the bit cannot report the release and this session
-/// waits, which spec 6.5 chooses over a retry. Saying it re-attaches "once that
+/// waits, which the protocol chooses over a retry loop. Saying it re-attaches "once that
 /// writer lets go" would promise the user exactly what that degradation
 /// withholds.
 pub const WITHHELD_LOCKED_NOTICE: &str = "Nothing is following this session now. Another writer \
@@ -87,7 +87,7 @@ fn withheld_notice(refusal: Refusal) -> &'static str {
 /// The tradeoff is re-attach cost against what browsing leaves running on the
 /// host. Larger, and juggling a working set of sessions never pays for a
 /// re-attach, but a walk through a big store piles up live drivers and held
-/// locks other processes in the same directory may want (spec section 5).
+/// locks other processes in the same directory may want.
 /// Smaller, and switching among a few sessions starts re-attaching, which
 /// costs a full backfill once the host has released one.
 ///
@@ -134,12 +134,12 @@ pub struct SessionDirectory {
     ///
     /// Held beside the rows rather than derived from them, because a gateway
     /// names hosts it holds no rows for: after a restart it has none for a host
-    /// that is down, and it stores none deliberately (spec 7.1). Those are
+    /// that is down, and it stores none deliberately. Those are
     /// exactly the hosts a scan over the rows cannot find, and they are what
     /// tells "unreachable, contents unknown" from "no such host".
     hosts: Vec<DirectoryHost>,
     /// Each session's durable position as of when the user last looked at it,
-    /// compared against a row's `last_seq` to derive unseen output (spec 6.8).
+    /// compared against a row's `last_seq` to derive unseen output.
     /// Both sides are the host's own sequence numbers, so neither clock enters
     /// and skew cannot make a session look either stale or fresh.
     ///
@@ -150,13 +150,13 @@ pub struct SessionDirectory {
     /// Sessions derived to have output the user has not looked at.
     ///
     /// Latched rather than recomputed per read, because the evidence is
-    /// perishable while the attention is not (spec 6.8). A cold row carries no
+    /// perishable while the attention is not. A cold row carries no
     /// `last_seq`, so a session that moved and then went cold would answer the
     /// quiet way if each read re-derived from the row. The row was only ever
     /// evidence, the attention is this client's own state, so it is derived
     /// where live evidence arrives and cleared where the user looks.
     unseen: HashSet<String>,
-    /// The highest released generation each session has fired on (spec 6.5).
+    /// The highest released generation each session has fired on.
     ///
     /// Directory-scoped so eviction, archive retirement, and a later refocus do
     /// not turn an already consumed row into new evidence.
@@ -224,7 +224,7 @@ impl SessionDirectory {
     ///
     /// A gateway names every host it has enrolled, the ones it holds no rows
     /// for included, each by its id or, while it has none, by its configured
-    /// address (spec 7.1).
+    /// address.
     pub fn hosts(&self) -> &[DirectoryHost] {
         &self.hosts
     }
@@ -361,7 +361,7 @@ impl SessionDirectory {
     /// succeed *now*; the peer's directory is the only thing that says when that
     /// could have changed, and the refusal's code names which edge that is
     /// ([`Refusal`]). Asking on any other schedule is either a retry loop or a
-    /// timer, and the protocol hands us a fact instead (spec 6.5, 7.1).
+    /// timer, and the protocol hands us a fact instead.
     ///
     /// Two edges, and either one re-asks:
     ///
@@ -371,7 +371,7 @@ impl SessionDirectory {
     /// - The row's `locked` bit true then false, for a `locked` refusal alone. A
     ///   session a rival writer holds stays listed for as long as the hold
     ///   lasts, so absence has no edge to offer there, and the rival letting go
-    ///   is the fact that changes that refusal's answer (spec 6.8).
+    ///   is the fact that changes that refusal's answer.
     ///
     /// Both are transitions between the rows one folded list replaces and the
     /// next, never live watches, so a change that happened while the client was
@@ -383,10 +383,10 @@ impl SessionDirectory {
     /// And a third for a locked refusal, which is not a transition at all: a row
     /// reporting the lock free at the refusal's generation or beyond. A
     /// transition cannot be carried by `list`, which is lossy-coalescible by
-    /// contract (spec 6.4), and the locked bit's rise and fall are seconds apart
+    /// contract, and the locked bit's rise and fall are seconds apart
     /// by design, so a client that did not drain in between is handed the fall's
     /// snapshot alone and has a baseline that never saw the rise. The generation
-    /// is what makes that one snapshot sufficient (spec 6.5, 6.8). Two rules
+    /// is what makes that one snapshot sufficient. Two rules
     /// keep it from becoming the poll the other two exist to avoid: it reads at
     /// or beyond rather than different, so a snapshot older than the refusal can
     /// never fire, and a fire consumes the generation it read
@@ -438,7 +438,7 @@ impl SessionDirectory {
                 // The hosts are part of the answer: a host the gateway holds no
                 // rows for has no row to carry its label or its reachability,
                 // so comparing rows alone would render such a host once and
-                // never update it again (spec 7.1).
+                // never update it again.
                 let changed = self.rows != sessions || self.hosts != hosts;
                 let rejoined = self.rejoin_edges_fired(&sessions);
                 self.rows = sessions;
@@ -462,7 +462,7 @@ impl SessionDirectory {
     /// and answer the session this displaced from the working set.
     ///
     /// `mint` builds the transcript for a session focused for the first time,
-    /// which is also what attaches it (spec 9.2). It runs only in that case, so
+    /// which is also what attaches it. It runs only in that case, so
     /// a caller can put whatever a fresh transcript costs behind it.
     ///
     /// A displaced session is detached, which takes effect when the caller
@@ -545,7 +545,7 @@ impl SessionDirectory {
     /// session no stream feeds, or holding a lock for one it has dropped.
     ///
     /// Archived is off the rows and nothing else: the bit is the peer's to
-    /// publish (spec 6.8), so a session the client has seen no row for is one
+    /// publish, so a session the client has seen no row for is one
     /// it keeps holding.
     fn held(&self, session: &str, keep: &str) -> bool {
         session == keep
@@ -621,7 +621,7 @@ impl SessionDirectory {
     /// just watched read as unseen the moment they switched away.
     ///
     /// What is recorded is this client's own fold position, never the one the
-    /// row reports. `list` frames are coalesced on a tick (spec 6.8), so the
+    /// row reports. `list` frames are coalesced on a tick, so the
     /// row in hand at this moment predates output the user watched arrive, and
     /// recording it would announce that output as unseen.
     fn mark_viewed(&mut self, session: &str) {
@@ -654,8 +654,8 @@ impl SessionDirectory {
             // `is_unseen` answers no for it whatever this holds, and leaving it
             // runs `mark_viewed`, which discharges the mark on the way out.
             //
-            // Both kinds of evidence spec 6.8 admits: frames folded while
-            // attached, and a live row's own position while not.
+            // Both kinds of evidence of a durable position count: frames folded
+            // while attached, and a live row's own position while not.
             let applied = self
                 .attached
                 .iter()
@@ -682,7 +682,7 @@ impl SessionDirectory {
     /// True when the session is idle and its durable position is past the one
     /// recorded at the last view. A working session is excluded because its
     /// glyph says it is working, which is the more useful fact, and the unseen
-    /// mark is what remains once it stops (spec 6.8).
+    /// mark is what remains once it stops.
     ///
     /// The focused session is never unseen: the user is looking at it.
     ///
@@ -699,7 +699,7 @@ impl SessionDirectory {
     /// Whether any session in the working set owes a re-attach.
     ///
     /// A `reset` obliges the session it names, and one reopen discharges the
-    /// whole set (spec 6.5), so the question a caller has to ask is set-wide.
+    /// whole set, so the question a caller has to ask is set-wide.
     /// Asking only about the focused session would leave a background session
     /// that was reset folding nothing: every later frame carries an epoch its
     /// fold filters out, so its transcript would freeze on the abandoned branch
@@ -731,7 +731,7 @@ impl SessionDirectory {
     /// cursor, focused first.
     ///
     /// One stream carries all of them, because a stream serves the set it was
-    /// opened with (spec 6.5) and a client that lost one lost them all. The
+    /// opened with and a client that lost one lost them all. The
     /// focused session comes first so its catch-up is the first block on the new
     /// stream, which is the one the user is waiting to see.
     ///
@@ -848,7 +848,7 @@ fn delivered_seq(frame: &Frame) -> Option<u64> {
 }
 
 /// The generation at which `row` is evidence that the hold behind `refusal` has
-/// ended, `None` when it is no such evidence (spec 6.5).
+/// ended, `None` when it is no such evidence.
 ///
 /// `consumed` is what this session's edge has already fired on. Both
 /// comparisons are load-bearing and neither may be loosened:
@@ -983,7 +983,7 @@ mod tests {
     }
 
     /// A released session's row: no durable position, which is what makes the
-    /// latch load-bearing (spec 6.8).
+    /// latch load-bearing.
     fn cold_row(id: &str) -> SessionSummary {
         SessionSummary {
             last_seq: None,
@@ -993,7 +993,7 @@ mod tests {
     }
 
     /// A row for a session a rival writer holds, so asking this peer for it
-    /// would be refused right now (spec 6.8).
+    /// would be refused right now.
     ///
     /// No generation, which is what a peer that publishes none says. The
     /// generation-carrying rows are [`held_at`] and [`free_at`].
@@ -1004,7 +1004,7 @@ mod tests {
         }
     }
 
-    /// A held row naming which hold it is (spec 6.8).
+    /// A held row naming which hold it is.
     fn held_at(id: &str, generation: u64) -> SessionSummary {
         SessionSummary {
             lock_generation: Some(generation),
@@ -1021,7 +1021,7 @@ mod tests {
         }
     }
 
-    /// A per-session attach refusal, as a peer sends one (spec 6.5).
+    /// A per-session attach refusal, as a peer sends one.
     fn refusal(session: &str, code: &str) -> Frame {
         refusal_naming(session, code, None)
     }
@@ -1062,7 +1062,7 @@ mod tests {
     }
 
     /// A configured host the gateway has never reached: no id to name it by,
-    /// its address instead, and no rows at all (spec 7.1).
+    /// its address instead, and no rows at all.
     fn configured(address: &str) -> DirectoryHost {
         DirectoryHost {
             id: None,
@@ -1098,8 +1098,8 @@ mod tests {
     /// A directory focused on `FOCUSED` with `OTHER` attached in the
     /// background, both caught up, plus the frontend's transcript.
     ///
-    /// `OTHER` gets there the way a real client does: a first focus attaches it
-    /// (spec 9.2), then the user switches back.
+    /// `OTHER` gets there the way a real client does: a first focus attaches it,
+    /// then the user switches back.
     fn two_sessions() -> (SessionDirectory, ChatState) {
         let mut directory = SessionDirectory::new(FOCUSED.to_string());
         let mut focused_chat = chat();
@@ -1146,7 +1146,7 @@ mod tests {
     /// Focusing a background session swaps the two transcripts, so what it
     /// folded while out of view is on screen immediately and the session
     /// being left keeps everything it had. This is the "view swap, not a
-    /// rebuild" the sidebar rests on (spec 9.2).
+    /// rebuild" the sidebar rests on.
     #[test]
     fn focusing_swaps_the_transcripts_both_ways() {
         let (mut directory, mut focused_chat) = two_sessions();
@@ -1178,7 +1178,7 @@ mod tests {
 
     /// A first focus mints the transcript and attaches, which is how a
     /// session the user has only ever seen as a row becomes one they can
-    /// read (spec 9.2).
+    /// read.
     #[test]
     fn a_first_focus_mints_and_attaches() {
         let (mut directory, mut focused_chat) = two_sessions();
@@ -1265,7 +1265,7 @@ mod tests {
     /// A host the gateway holds no rows for has no row to carry its state, so
     /// a repaint predicate that read only the rows would draw such a host once
     /// and never again: it could go out, come back, or learn its id, and the
-    /// strip would keep the first label and mark it was given (spec 7.1).
+    /// strip would keep the first label and mark it was given.
     #[test]
     fn a_change_confined_to_the_hosts_is_still_news() {
         let (mut directory, mut focused_chat) = two_sessions();
@@ -1315,7 +1315,7 @@ mod tests {
     /// watched, so switching away must not leave it marked unseen.
     ///
     /// The row in hand when the user leaves predates that output: `list` frames
-    /// are coalesced on a tick (spec 6.8), so the frame reporting the turn
+    /// are coalesced on a tick, so the frame reporting the turn
     /// lands after the switch. What the client records is therefore its own
     /// fold position, which is exactly what was on screen.
     #[test]
@@ -1359,7 +1359,7 @@ mod tests {
     /// A session the user left before its first row still records what they
     /// saw. The client's own fold position is known whether or not a row has
     /// arrived, so the never-viewed rule cannot go on answering for a session
-    /// the user did view (spec 6.8).
+    /// the user did view.
     #[test]
     fn a_session_left_before_its_first_row_still_reports_later_output() {
         let mut directory = SessionDirectory::new(FOCUSED.to_string());
@@ -1380,7 +1380,7 @@ mod tests {
     }
 
     /// The unseen mark latches: derived while the evidence was live, it holds
-    /// after the session goes cold and its row loses `last_seq` (spec 6.8). The
+    /// after the session goes cold and its row loses `last_seq`. The
     /// row was only ever evidence, the attention is this client's own state.
     #[test]
     fn the_unseen_mark_outlives_the_row_that_proved_it() {
@@ -1457,7 +1457,7 @@ mod tests {
     /// Unseen output is derived by comparing two of the host's own durable
     /// positions, the row's current one against the one the client had folded
     /// when the user last looked. Neither side is a clock, so no skew and no
-    /// stale stamp can invent or hide the glyph (spec 6.8).
+    /// stale stamp can invent or hide the glyph.
     #[test]
     fn unseen_output_compares_durable_positions() {
         let (mut directory, mut focused_chat) = two_sessions();
@@ -1579,7 +1579,7 @@ mod tests {
     }
 
     /// Visiting past the bound detaches exactly the least recently focused
-    /// session, and never the focused one (spec section 5). Browsing must not
+    /// session, and never the focused one. Browsing must not
     /// leave a live driver and a held lock behind per session visited.
     #[test]
     fn visiting_past_the_bound_drops_the_least_recently_focused() {
@@ -1974,7 +1974,7 @@ mod tests {
     ///
     /// The only edge a held session offers. Its row stays on the peer's list for
     /// as long as the hold lasts, so absence never transitions and a client
-    /// waiting on that one alone waits forever (spec 6.5, 6.8).
+    /// waiting on that one alone waits forever.
     #[test]
     fn a_locked_refusal_re_asks_when_the_bit_falls() {
         let mut directory = SessionDirectory::new(FOCUSED.to_string());
@@ -2038,8 +2038,8 @@ mod tests {
 
     /// A code this build has never heard of keeps exactly the absence edge, and
     /// gains nothing from the bit. An unknown refusal has to behave like the
-    /// refusals this build knows rather than like the most specific one, which
-    /// is spec 6.6's additive codes applied to rejoining.
+    /// refusals this build knows rather than like the most specific one: error
+    /// codes are additive, so an unknown one gets the generic handling.
     #[test]
     fn an_unknown_code_does_not_re_ask_when_the_bit_falls() {
         let mut directory = SessionDirectory::new(FOCUSED.to_string());
@@ -2161,7 +2161,7 @@ mod tests {
         let mut directory = SessionDirectory::new(FOCUSED.to_string());
         let mut focused_chat = chat();
         // Rows that never carry the key, which is what an older host publishes
-        // and what a reader must treat as no promise of anything (spec 6.8).
+        // and what a reader must treat as no promise of anything.
         let _ = directory.apply(&mut focused_chat, list(vec![row(FOCUSED, false, 0)]));
         let _ = directory.apply(&mut focused_chat, refusal(FOCUSED, "locked"));
         assert_eq!(
@@ -2184,7 +2184,7 @@ mod tests {
     /// The headline of the generation clause: a hold whose rise the client never
     /// received still ends visibly.
     ///
-    /// `list` is lossy-coalescible by contract (spec 6.4), so the snapshot
+    /// `list` is lossy-coalescible by contract, so the snapshot
     /// carrying the bit's rise may be superseded in the fan-out before this
     /// client drains it, and the rise and the fall are seconds apart by design
     /// (the host publishes the rise within its list debounce of its own refused
@@ -2192,7 +2192,7 @@ mod tests {
     /// missed the rise holds a baseline where the bit is already false, so the
     /// transition edge has nothing to fire on and the peer has published both
     /// edges correctly. Only the generation on the row makes the release legible
-    /// from the latest snapshot alone (spec 6.5, 6.8).
+    /// from the latest snapshot alone.
     ///
     /// No frame in this test carries a set bit, which is the whole point: the
     /// two landed edges are inert throughout, so nothing here can pass on their
@@ -2270,7 +2270,7 @@ mod tests {
     /// from the refusal's.
     ///
     /// This is what `>=` buys over `!=`. A client can be handed such a row: a
-    /// gateway relays what it last heard for a host it cannot reach (spec 6.8),
+    /// gateway relays what it last heard for a host it cannot reach,
     /// and a reconnect can land on rows a whole hold behind. Under a difference
     /// test every one of them re-asks, which is the retry loop the refusal rule
     /// exists to refuse, and it re-asks fastest exactly when the peer is least
@@ -2481,7 +2481,7 @@ mod tests {
     /// the ordinary path, because a restarted host has no lock history yet and
     /// its rows carry no generation until it sees a hold, while a refusal held
     /// over the restart still names one. Absent must therefore read as no
-    /// knowledge rather than as any particular generation (spec 6.8): a client
+    /// knowledge rather than as any particular generation: a client
     /// that read it as a number would either spin against every old peer or
     /// treat a silent row as evidence.
     #[test]

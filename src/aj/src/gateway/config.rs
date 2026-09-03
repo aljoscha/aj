@@ -1,4 +1,4 @@
-//! The gateway's static configuration (spec 7.1).
+//! The gateway's static configuration.
 //!
 //! `~/.aj/gateway.toml` by default, `--config <file>` to name another. It holds
 //! the addresses of hosts the operator wants enrolled for as long as the file
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// One host's base URL, normalized so that two spellings of one host are one
 /// address.
 ///
-/// Normalization is what makes the "no duplicates" rule of spec 7.1 checkable:
+/// Normalization is what makes the "one enrollment per host" rule checkable:
 /// the configuration's `100.64.0.2:6161` and a later
 /// `POST /v1/hosts {"address": "http://100.64.0.2:6161/"}` are the same host,
 /// and comparing the raw strings would enroll it twice.

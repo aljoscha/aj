@@ -1,15 +1,15 @@
-//! The HTTP surface of a gateway (spec 6.1, 6.7, 7.1).
+//! The HTTP surface of a gateway.
 //!
 //! The session-facing routes are the ones a host serves, which is what makes a
-//! gateway and a host indistinguishable to a client (spec section 4). Two things
+//! gateway and a host indistinguishable to a client. Two things
 //! are this layer's alone: the enrollment endpoints, and the proxy.
 //!
 //! The proxy is **one wildcard route, not a handler per command**. Everything
 //! under `/v1/sessions/{id}/` travels to the owning host unread: the method, the
 //! query, the body, and back the status and the response body. What is touched is
 //! the id, to strip the namespace, and the `session` an error body names, to put
-//! it back (spec 6.6). That is what lets an older gateway sit between a newer host
-//! and a newer client (spec 6.10's forward-don't-filter) and it means a
+//! it back. That is what lets an older gateway sit between a newer host and a
+//! newer client (forward, don't filter) and it means a
 //! request/response route a host gains needs no change here. What gets validated
 //! is the namespace, never the route.
 //!
@@ -59,8 +59,9 @@ const PROXY_BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// Why a gateway could not be served.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ServerError {
-    /// The identity gate refuses to serve this address at all (spec 6.11). A
-    /// gateway is remote code execution exactly as a host is.
+    /// The identity gate refuses to serve this address at all: a non-loopback
+    /// bind in `local` mode fails to start rather than serving unauthenticated.
+    /// A gateway is remote code execution exactly as a host is.
     #[error(transparent)]
     Identity(#[from] IdentityError),
     #[error("could not bind {addr}: {source}")]
@@ -220,7 +221,7 @@ async fn hello(State(state): State<Arc<ServerState>>) -> Response {
     Json(state.gateway.hello()).into_response()
 }
 
-/// The merged directory (spec 7.1), which is the payload the `list` frames carry.
+/// The merged directory, which is the payload the `list` frames carry.
 async fn sessions(State(state): State<Arc<ServerState>>) -> Response {
     Json(state.gateway.sessions().as_ref().clone()).into_response()
 }
@@ -246,7 +247,7 @@ async fn withdraw(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Create a session on the host it is for (spec 6.6).
+/// Create a session on the host it is for.
 ///
 /// The target is resolved here and nowhere else: the host the body names, or
 /// the sole enrolled one when it names none. What travels upstream is the
@@ -254,7 +255,7 @@ async fn withdraw(
 /// names its target in the vocabulary of the server that answers it, and what
 /// comes back has its session id namespaced for the same reason. Everything
 /// else in both directions is carried unread, a field this build does not know
-/// included (spec 6.10).
+/// included.
 async fn create_session(
     State(state): State<Arc<ServerState>>,
     request: Request,
@@ -262,7 +263,7 @@ async fn create_session(
     let content_type = forwarded_content_type(&request);
     // Read before the body, which consumes the request. Carried for the same
     // reason the proxy carries one: a parameter this build does not know is not
-    // this gateway's to drop (spec 6.10).
+    // this gateway's to drop.
     let query = request.uri().query().map(str::to_string);
     let mut body = create_body(read_body(request).await?)?;
     let target = state.gateway.create_target(named_host(&body)?.as_deref())?;
@@ -292,7 +293,7 @@ async fn create_session(
     namespace_created(answer, &target)
 }
 
-/// Namespace session ids in a host's create answer (spec 6.2, 6.6).
+/// Namespace session ids in a host's create answer.
 ///
 /// A successful create names the session it minted in `id`. A refusal can
 /// independently refer to a session in its top-level `session` field, which is
@@ -334,7 +335,7 @@ fn namespace_created(mut answer: Answer, target: &HostTarget) -> Result<Response
     .into_response())
 }
 
-/// Open the gateway's event stream (spec 6.5, 7.1).
+/// Open the gateway's event stream.
 ///
 /// Every session the request names is attached on the host that owns it, with
 /// the client's own cursor, and its frames travel back with their ids namespaced
@@ -362,8 +363,8 @@ async fn events(
 /// A refusal the owning host wrote travels back as that host wrote it, with the
 /// session ids in it namespaced and nothing else touched, which is the path a
 /// proxied refusal takes: the client asked this question and the host answered
-/// it, so its own fields are what a capable client composes its wording from
-/// (spec 6.6). A body this gateway cannot read that way, and everything that is
+/// it, so its own fields are what a capable client composes its wording from.
+/// A body this gateway cannot read that way, and everything that is
 /// the gateway's own answer, goes through [`ApiError`].
 fn refused(err: GatewayError) -> Response {
     if let GatewayError::AttachRefused {
@@ -384,13 +385,11 @@ fn refused(err: GatewayError) -> Response {
     ApiError::from(err).into_response()
 }
 
-/// Parse the stream's repeatable `session=<id>[@<epoch>:<seq>]` parameters
-/// (spec 6.5).
+/// Parse the stream's repeatable `session=<id>[@<epoch>:<seq>]` parameters.
 ///
 /// The cursor is split off at the **first** `@`, exactly as a host does, so a
 /// namespaced id and the cursor behind it read the same on both sides of a
-/// gateway. Unknown parameters are ignored (spec 6.10), and attaching nothing is
-/// legal.
+/// gateway. Unknown parameters are ignored, and attaching nothing is legal.
 ///
 /// The id itself is judged where it is resolved
 /// ([`crate::gateway::directory::Directory::group`]): it is one namespace plus
@@ -427,7 +426,7 @@ async fn unknown_endpoint() -> ApiError {
     }
 }
 
-/// One SSE `data:` line per frame this client is owed (spec 6.1).
+/// One SSE `data:` line per frame this client is owed.
 ///
 /// Which frames those are, and where they come from, is
 /// [`Splice::next_frame`]'s: this only writes them. Dropping the response drops
@@ -445,7 +444,7 @@ fn client_stream(
             let json = match &frame {
                 // A frame from a host is re-serialized from the JSON it arrived
                 // as, so a payload this build does not understand travels
-                // verbatim (spec 6.10). The merged directory is this gateway's
+                // verbatim. The merged directory is this gateway's
                 // own composition and keeps its rows the same way.
                 Outgoing::Spliced(frame) => serde_json::to_string(frame),
                 Outgoing::Directory(directory) => serde_json::to_string(&directory.as_frame()),
@@ -490,7 +489,7 @@ async fn forward(
     let route = state.gateway.route(id)?;
     let mut url = upstream_url(&route, rest).ok_or_else(|| not_a_base_url(&route.address))?;
     // Forwarded as it arrived: a parameter this build does not know is not this
-    // gateway's to drop (spec 6.10).
+    // gateway's to drop.
     url.set_query(request.uri().query());
     let method = request.method().clone();
     let content_type = forwarded_content_type(&request);
@@ -507,7 +506,7 @@ async fn forward(
     )
     .await?;
     // A refusal the host wrote names its session in the host's own vocabulary,
-    // which no client of this gateway can address (spec 6.6).
+    // which no client of this gateway can address.
     if !answer.status.is_success()
         && let Some(body) = namespaced_error(&answer.body, &route.host_id)
     {
@@ -517,13 +516,13 @@ async fn forward(
 }
 
 /// A host's error body under this gateway's own vocabulary, `None` when the body
-/// is no JSON object at all (spec 6.6).
+/// is no JSON object at all.
 ///
 /// An error that references a session names it in a top-level `session` field,
 /// and that is the one field of an error body a gateway owes anything to: the id
 /// the host used is one no client here can address. Everything else travels as it
 /// arrived, a field this build does not know included, which is the discipline
-/// the create route follows in the other direction (spec 6.10).
+/// the create route follows in the other direction.
 ///
 /// The `None` is what separates a refusal this gateway can carry from one it can
 /// only summarize: a proxy's HTML page, an empty body.
@@ -586,7 +585,7 @@ fn not_a_base_url(address: &HostAddress) -> ApiError {
 /// segment is percent-encoded on the way out. That is what keeps a session id
 /// carrying a path separator from turning into a different route on the host: the
 /// host decodes it back into the id it was given and answers 404 for it, which is
-/// its own grammar's business (spec 6.2).
+/// its own grammar's business.
 ///
 /// Encoding does not save a dot segment, which a URL path drops rather than
 /// escapes. `SessionAddress::parse` refuses those, so the id here cannot be one.
@@ -688,8 +687,7 @@ const HOST_FIELD: &str = "host";
 /// The created answer's session id, [`aj_wire::SessionCreated::id`].
 const CREATED_ID_FIELD: &str = "id";
 
-/// The field an error body names a session in (spec 6.6), the same convention
-/// frames use (spec 6.3).
+/// The field an error body names a session in, the same convention frames use.
 const SESSION_FIELD: &str = "session";
 
 /// A create body as its top-level fields, with a blank one reading as `{}`.
@@ -702,7 +700,7 @@ const SESSION_FIELD: &str = "session";
 /// [`RawObject`] is what every body this gateway edits is held as: it owns a
 /// named field or two and keeps everything else as the text it arrived in, so a
 /// field this build does not know travels with its number literals intact, and
-/// a body a host would refuse stays one (spec 6.10's forward-don't-filter).
+/// a body a host would refuse stays one: forward, don't filter.
 fn create_body(bytes: Bytes) -> Result<RawObject, ApiError> {
     let bytes = if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
         Bytes::from_static(b"{}")
@@ -713,7 +711,7 @@ fn create_body(bytes: Bytes) -> Result<RawObject, ApiError> {
         .map_err(|err| ApiError::invalid(format!("malformed request body: {err}")))
 }
 
-/// The host a create names, `None` when it names none (spec 6.6).
+/// The host a create names, `None` when it names none.
 ///
 /// Read as the type [`aj_wire::CreateSessionRequest::host`] has, so a `null`
 /// reads as naming none exactly as the typed body decodes it. A value that is
@@ -735,8 +733,8 @@ fn named_host(body: &RawObject) -> Result<Option<String>, ApiError> {
 /// A JSON request body with the protocol's error shape for a malformed one.
 ///
 /// The twin of the host's own extractor. `aj-wire` owns the closed request
-/// schema and blank-body rule, while each HTTP server maps the failure to spec
-/// 6.1's `{code, message}` envelope.
+/// schema and blank-body rule, while each HTTP server maps the failure to the
+/// protocol's `{code, message}` envelope.
 struct Body<T>(T);
 
 impl<S, T> FromRequest<S> for Body<T>
@@ -756,8 +754,8 @@ where
     }
 }
 
-/// An unsuccessful response: the status plus the stable `{code, message}` body
-/// of spec 6.1.
+/// An unsuccessful response: the status plus the protocol's stable
+/// `{code, message}` body.
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -778,7 +776,7 @@ impl ApiError {
         }
     }
 
-    /// The 503 that only a gateway can answer (spec 6.1).
+    /// The 503 that only a gateway can answer: the owning host is unreachable.
     fn unreachable(host: &str, cause: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -813,8 +811,7 @@ impl From<GatewayError> for ApiError {
             // something in front of the host, nothing. The gateway names it
             // itself, because the host named nothing, and carries the host's own
             // words. A body that *is* an envelope never reaches here (see
-            // [`refused`]), because every field of one is the host's to keep
-            // (spec 6.6).
+            // [`refused`]), because every field of one is the host's to keep.
             GatewayError::AttachRefused {
                 status, message, ..
             } => {
@@ -841,7 +838,7 @@ impl From<GatewayError> for ApiError {
     }
 }
 
-/// The status vocabulary of spec 6.1 for a directory refusal.
+/// The protocol's status and code for a directory refusal.
 fn directory_status(err: &DirectoryError) -> (StatusCode, &'static str) {
     match err {
         DirectoryError::AddressEnrolled { .. } => (StatusCode::CONFLICT, "already_enrolled"),
@@ -849,8 +846,7 @@ fn directory_status(err: &DirectoryError) -> (StatusCode, &'static str) {
         DirectoryError::UnknownHost { .. } => (StatusCode::NOT_FOUND, "unknown_host"),
         DirectoryError::StaticHost { .. } => (StatusCode::CONFLICT, "static_host"),
         // An id no namespace can hold reads exactly like a session that is not
-        // there, because to a client both are opaque ids that name nothing
-        // (spec 6.2).
+        // there, because to a client both are opaque ids that name nothing.
         DirectoryError::UnknownSession { .. } => (StatusCode::NOT_FOUND, "unknown_session"),
         DirectoryError::Unreachable { .. } => (StatusCode::SERVICE_UNAVAILABLE, "host_unreachable"),
         DirectoryError::UnusableHostId { .. } => (StatusCode::CONFLICT, "unusable_host_id"),
@@ -973,7 +969,7 @@ mod tests {
     }
 
     /// A create body is read for its `host` and for nothing else, and what goes
-    /// upstream is the client's own body with that one field set (spec 6.6).
+    /// upstream is the client's own body with that one field set.
     #[test]
     fn a_create_body_is_read_for_its_host_alone() {
         for (raw, named) in [
@@ -1040,7 +1036,7 @@ mod tests {
 
     /// The id a host minted is namespaced on the way out. A refusal keeps its
     /// host-authored fields, with any top-level session id translated into the
-    /// gateway's vocabulary (spec 6.6).
+    /// gateway's vocabulary.
     #[tokio::test]
     async fn a_created_answer_is_namespaced_and_a_refusal_is_forwarded() {
         let target = HostTarget {

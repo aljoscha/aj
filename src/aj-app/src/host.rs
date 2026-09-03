@@ -1,5 +1,5 @@
 //! The session host: N live sessions behind one attachment and command
-//! interface (spec section 5).
+//! interface.
 //!
 //! The local frontend and a network server are peers here. Both attach
 //! through [`SessionHost::attach`] and mutate through
@@ -18,8 +18,8 @@
 //! durable frames reach a stream in strictly increasing seq order" a
 //! property of the code. The fan-out subscribes to the bus through a
 //! channel rather than an inline listener, because an inline listener's
-//! stall or error becomes a fatal turn error (spec 6.9): network activity
-//! must never be able to fail a turn.
+//! stall or error becomes a fatal turn error: network activity must never
+//! be able to fail a turn.
 //!
 //! **Locks.** The order is log, then session status, then the subscriber
 //! registry. The log's is an async mutex and is the only one a caller may
@@ -89,7 +89,7 @@ use fanout::Fanout;
 ///
 /// `last_seq` churns on every durable event of a busy turn, and one `list`
 /// frame per event would swamp every client's queue for data that is
-/// cumulative anyway (spec 6.8).
+/// cumulative anyway.
 const LIST_COALESCE: Duration = Duration::from_millis(200);
 
 /// Elapsed shutdown time at which unfinished ownership is reported. Currently
@@ -103,7 +103,7 @@ const HOST_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const HOST_ABORT_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a session stays live with nothing running and nobody attached
-/// before the host releases it (spec section 5).
+/// before the host releases it.
 ///
 /// The tradeoff is resume cost against lock hold time. Shorter, and switching
 /// away from a session and back re-resumes its whole log for nothing. Longer,
@@ -112,8 +112,8 @@ const HOST_ABORT_GRACE: Duration = Duration::from_secs(10);
 pub const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(30);
 
 /// The `error` frame code a session's stream carries when its conversation
-/// log refused a write and the materialization ended over it (spec 6.5). A
-/// client re-asks for the session at once: the host rebuilds it from disk.
+/// log refused a write and the materialization ended over it. A client
+/// re-asks for the session at once: the host rebuilds it from disk.
 pub const PERSISTENCE_FAILED_CODE: &str = "persistence_failed";
 
 /// The one sentence a client sees for a fused log. A session with a canonical
@@ -136,11 +136,12 @@ pub(crate) fn persistence_failure_message(failure: &PersistenceFailure) -> Strin
 
 /// How often the host re-probes the sessions it publishes as locked.
 ///
-/// The falling edge of the `locked` bit (spec 6.8), and the only recurring
-/// question the host owes: a rival letting go is invisible otherwise, cleanly
-/// or by crashing, and the client's half of the contract forbids it from asking
-/// on a schedule (spec 6.5). Rising edges are events the host already has, its
-/// own refusal and the enumeration sweep, so this tick only ever clears.
+/// The falling edge of the `locked` bit, and the only recurring question the
+/// host owes: a rival letting go is invisible otherwise, cleanly or by
+/// crashing, and a client refused with `locked` waits for the directory to
+/// say the bit fell rather than asking on a schedule. Rising edges are
+/// events the host already has, its own refusal and the enumeration sweep,
+/// so this tick only ever clears.
 ///
 /// Deliberately its own constant rather than a share of the idle grace: the two
 /// pace unrelated things, and tuning one must not silently move the other. The
@@ -151,15 +152,15 @@ pub const LOCK_PROBE_TICK: Duration = Duration::from_secs(2);
 /// File in the session store holding this store's stable host id.
 ///
 /// It names the store, not the process: session ids are unique within a
-/// store, which is what makes `<host_id>:<session_id>` globally unique
-/// (spec section 4). It therefore lives next to the logs it identifies,
+/// store, which is what makes `<host_id>:<session_id>` globally unique. It
+/// therefore lives next to the logs it identifies,
 /// never in user-global state or the working directory.
 const HOST_ID_FILE: &str = "host-id";
 
 /// Why a host request could not be served.
 ///
 /// Typed because callers branch on it: a network server maps the variants
-/// onto the status vocabulary of spec 6.1. 400 for [`Self::Invalid`], 404
+/// onto HTTP statuses: 400 for [`Self::Invalid`], 404
 /// for the unknown cases, 409 for [`Self::Conflict`], [`Self::Locked`] and
 /// [`Self::Unsupported`], 500 for [`Self::Internal`]. (503 is the gateway's
 /// alone: it means an upstream host is unreachable, which a host cannot say
@@ -183,14 +184,14 @@ pub enum HostError {
     ///
     /// The message names the holder when its lock file recorded one, because a
     /// user told "session in use" needs to know which process to go quit or
-    /// detach (spec section 5). `None` when the record is missing or illegible,
+    /// detach. `None` when the record is missing or illegible,
     /// which an older build's lock file is.
     #[error("session {session} is held by {}", holder_name(holder))]
     Locked {
         session: String,
         holder: Option<LockHolder>,
         /// The generation of this refused acquire, in the vocabulary of the
-        /// row's `lock_generation` (spec 6.8).
+        /// row's `lock_generation`.
         ///
         /// Captured by the same cache update that advances the row, so later
         /// acquires cannot change what this refusal carries.
@@ -212,8 +213,8 @@ pub enum HostError {
 }
 
 impl HostError {
-    /// The protocol code this failure travels as (spec 6.1): in an error body,
-    /// and in the `error` frame that refuses one session's attach (spec 6.3).
+    /// The protocol code this failure travels as: in an error body, and in the
+    /// `error` frame that refuses one session's attach.
     ///
     /// The vocabulary lives here, beside the failures it names, rather than in
     /// the HTTP layer, which maps the same variants onto statuses. A frame
@@ -233,7 +234,7 @@ impl HostError {
     }
 
     /// The acquire generation a `locked` refusal names, `None` from every other
-    /// failure (spec 6.5, 6.8).
+    /// failure.
     ///
     /// Beside [`Self::code`] for the same reason that one is here: the frame
     /// that refuses one session's attach is assembled from this error, and the
@@ -334,7 +335,7 @@ pub struct HostSetup {
     pub restore: Option<RestoreContext>,
     pub persistence: ConversationPersistence,
     pub auth: AuthStorage,
-    /// The one working directory this host serves (spec section 4).
+    /// The one working directory this host serves.
     pub working_directory: PathBuf,
     /// What this host calls itself for a reader, `None` to derive a name
     /// from the working directory.
@@ -348,7 +349,7 @@ pub struct HostSetup {
     /// `None` for [`DEFAULT_IDLE_GRACE`].
     pub idle_grace: Option<Duration>,
     /// How many frames one client's live queue holds before an undroppable
-    /// frame evicts it (spec 6.9), `None` for the fan-out's own default.
+    /// frame evicts it, `None` for the fan-out's own default.
     ///
     /// Tuning, not policy: the bound governs live fan-out only, and eviction
     /// and its recovery behave the same at any value.
@@ -396,7 +397,7 @@ fn keep_tail(path: &str) -> &str {
 /// A mutation of one session.
 ///
 /// Commands that act on "the viewed agent" locally carry the target
-/// explicitly, so a client resolves its own view to a parameter (spec 6.6).
+/// explicitly, so a client resolves its own view to a parameter.
 pub enum Command {
     Prompt {
         agent: AgentId,
@@ -416,7 +417,7 @@ pub enum Command {
         instructions: Option<String>,
     },
     Settings(SettingsChange),
-    /// Set the session's label, `None` clears it (spec 6.6).
+    /// Set the session's label, `None` clears it.
     ///
     /// The value is expected to have been through
     /// [`aj_session::normalize_tag`] already: a trimmed single line, or `None`
@@ -448,7 +449,7 @@ pub enum Command {
 /// [`Self::Before`] exists because branching from a transcript message must
 /// replace that message rather than continue after it, so the head goes to
 /// its parent. The host resolves the parent, which keeps the gesture one
-/// command and keeps every client from repeating the same walk (spec 6.6).
+/// command and keeps every client from repeating the same walk.
 pub enum HeadTarget {
     Entry(EntryId),
     Before(EntryId),
@@ -470,8 +471,8 @@ impl HeadTarget {
 ///
 /// The queues hold at most one message per agent (the "one message, one
 /// kind" invariant), so a withdrawal names the agent rather than a slot.
-/// A clear takes no agent: spec 6.6 makes it session-wide, and only
-/// `remove` targets an agent.
+/// A clear takes no agent: it is session-wide, and only `remove` targets an
+/// agent.
 pub enum QueueOp {
     Remove { agent: AgentId },
     Clear,
@@ -511,12 +512,12 @@ pub struct AttachRequest {
     pub session: String,
     /// The last durable position the client committed. A cursor from
     /// another epoch, or beyond the session's high-water mark, means a full
-    /// backfill (spec 6.5).
+    /// backfill.
     pub cursor: Option<Cursor>,
 }
 
 /// What one attached stream owes one of the sessions it named: the block it
-/// asked for, or the refusal it gets instead (spec 6.5).
+/// asked for, or the refusal it gets instead.
 ///
 /// Resolved before the stream is handed back and written in the order the
 /// sessions were named, so a client reads one answer per session and can tell
@@ -528,8 +529,8 @@ enum Serving {
 
 /// Direct handles into one live session, for a client attached in process.
 ///
-/// Spec section 5 sanctions this: the local frontend attaches "through direct
-/// handles and channels, not through HTTP". It is a **read** surface: the
+/// The local frontend attaches through direct handles and channels rather
+/// than through HTTP. This is a **read** surface: the
 /// footer reads the run config, a task-output overlay the task registry, and
 /// none of that goes through a command. The pending-message box does not
 /// appear here, it renders the queue snapshot the fold keeps in
@@ -673,7 +674,7 @@ struct HostInner {
     /// The store's own sessions, with the per-file facts a directory entry
     /// needs cached against the files they came from. A `list` refresh runs on
     /// a coalescing tick that session events drive, so it must not rescan the
-    /// store's contents (spec 6.8).
+    /// store's contents.
     cold: ColdSessions<ConversationPersistence>,
     idle_grace: Duration,
     /// Set by [`SessionHost::shutdown`], and never cleared: a host is torn
@@ -768,9 +769,10 @@ impl SessionHost {
             shutdown: StdMutex::new(ShutdownState::default()),
             shutdown_changed: tokio::sync::Notify::new(),
         });
-        // Host startup is an enumeration point (spec 6.8). Nothing is live
-        // yet, and a store that cannot be read is not fatal: the next
-        // enumeration point tries again.
+        // Host startup is an enumeration point, one of the few places the
+        // cold cache is rebuilt from the store. Nothing is live yet, and a
+        // store that cannot be read is not fatal: the next enumeration point
+        // tries again.
         //
         // Synchronous, which it can afford to be because a row costs a
         // `readdir` entry, a `stat` and one first-line sniff. Anything that
@@ -785,13 +787,13 @@ impl SessionHost {
         Ok(Self { inner })
     }
 
-    /// Protocol identity and capabilities (spec 6.1).
+    /// Protocol identity and capabilities, the reachability and identity probe.
     ///
     /// The list names the routes this host serves past the protocol-1
-    /// baseline, which spec 6.10 asks a new endpoint to arrive with. It is
-    /// self-description and not a gate: what a peer does with it is the peer's
-    /// business, and a client that simply attempts a route and reads the
-    /// refusal is following the same section.
+    /// baseline: every endpoint added after that baseline arrives with a
+    /// capability string. It is self-description and not a gate: what a peer
+    /// does with it is the peer's business, and a client that simply attempts
+    /// a route and reads the refusal is equally well behaved.
     pub fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
@@ -812,7 +814,7 @@ impl SessionHost {
         self.mint(None, None).await
     }
 
-    /// Whether a create naming `host` is this host's to serve (spec 6.6).
+    /// Whether a create naming `host` is this host's to serve.
     ///
     /// A host serves exactly one working directory, so the only session it can
     /// create is its own: an absent name and this host's own id are the same
@@ -945,10 +947,9 @@ impl SessionHost {
     /// published in between is either already in the backfill (and filtered
     /// against its boundary) or above it (and delivered), so a client can
     /// neither miss one nor be served one twice. That is what makes attaching
-    /// a single round trip with no client-side buffer-and-reconcile dance
-    /// (spec 6.5).
+    /// a single round trip with no client-side buffer-and-reconcile dance.
     ///
-    /// A stream never fails wholesale over one bad session (spec 6.5). Each
+    /// A stream never fails wholesale over one bad session. Each
     /// named session gets one of two answers, in the order it was named: its
     /// attach block, or an `error` frame carrying why this host could not
     /// serve it (an id its store could never hold, one it does not have, one
@@ -962,7 +963,7 @@ impl SessionHost {
     /// fold from.
     pub async fn attach(&self, requests: &[AttachRequest]) -> Result<Attachment, HostError> {
         self.alive()?;
-        // One block per named session is the client contract (spec 6.5), and
+        // One block per named session is the client contract, and
         // a duplicate would be served two: the second would open a block
         // the client is not expecting and quiesce state it just applied. It
         // is the request that is malformed, not a session, so it is refused
@@ -978,7 +979,7 @@ impl SessionHost {
             names.push(request.session.clone());
         }
         // Registered before anything is materialized, so the release path sees
-        // an attach in flight as use from the first instant (spec section 5).
+        // an attach in flight as use from the first instant.
         // Materializing first would leave a window where an idle session could
         // be released out from under a block about to be served from it.
         let (id, live_frames, cancelled) = self.inner.shared.fanout.register(&names);
@@ -1025,13 +1026,13 @@ impl SessionHost {
                         code: err.code().to_string(),
                         message: err.to_string(),
                         // A locked refusal names its acquire generation, and
-                        // every other code carries none (spec 6.5).
+                        // every other code carries none.
                         lock_generation: err.lock_generation(),
                     }));
                 }
             }
         }
-        // A stream attach is an enumeration point (spec 6.8), placed after the
+        // A stream attach is an enumeration point, placed after the
         // materializations so their sessions are already out of the per-file
         // work. A store that cannot be read does not fail an attach whose
         // sessions all resolved.
@@ -1074,7 +1075,7 @@ impl SessionHost {
     /// Apply a command to `session`, materializing it if it is only on disk.
     ///
     /// The session map is held from the materialization through the send, which
-    /// is what keeps a release from landing in between (spec section 5): a
+    /// is what keeps a release from landing in between: a
     /// command either reaches the driver ahead of the release request, and the
     /// driver then declines to go, or it waits out the whole teardown and
     /// re-materializes. The reply is awaited with the map released, since
@@ -1097,10 +1098,10 @@ impl SessionHost {
     }
 
     /// Every session of the host's working directory, on-disk ones as well
-    /// as live ones. The discovery surface (spec 6.7): there is no separate
-    /// on-disk listing.
+    /// as live ones. The discovery surface: there is no separate on-disk
+    /// listing.
     ///
-    /// An enumeration point (spec 6.8), so an explicit listing shows a session
+    /// An enumeration point, so an explicit listing shows a session
     /// a sibling process left in the directory even though no refresh would
     /// have gone looking for it.
     pub async fn sessions(&self) -> Result<SessionList, HostError> {
@@ -1112,16 +1113,16 @@ impl SessionHost {
     /// The directory as the host holds it, live sessions' own state merged with
     /// the cold rows as they stand.
     ///
-    /// Touches no filesystem: this is what a refresh serves (spec 6.8), and it
-    /// runs on every published frame.
+    /// Touches no filesystem: this is what a refresh serves, and it runs on
+    /// every published frame.
     async fn directory(&self) -> SessionList {
         // Both halves are read under the session map, which is what makes them
         // one observation. A release records its cold row and drops the session
         // from the map under that same lock, so a session read here is either
         // live or has a row, never neither. Taking the rows outside the hold
         // would let a release land in between and drop the session out of the
-        // directory for a frame, which is not something a release may do (spec
-        // section 5: a client sees the liveness flag flip and nothing else). The
+        // directory for a frame, which is not something a release may do (a
+        // client sees the liveness flag flip and nothing else). The
         // cold cache is a leaf, so nesting its lock under the map cannot invert
         // an order.
         let sessions = self.inner.sessions.lock().await;
@@ -1142,14 +1143,15 @@ impl SessionHost {
                         working: false,
                         queued: QueueCounts::default(),
                         tasks: 0,
-                        // A cold row carries no durable position (spec 6.8):
-                        // the count is not recorded anywhere, so producing one
-                        // would mean reading the log.
+                        // A cold row carries no durable position: the count
+                        // is not recorded anywhere, so producing one would
+                        // mean reading the log, and a list-observed seq is
+                        // never a cursor anyway.
                         last_seq: None,
                         last_activity: session.last_activity,
                         tag: session.tag,
-                        // Only a gateway names the host a row belongs to
-                        // (spec 6.8). Every row here is this host's own.
+                        // Only a gateway names the host a row belongs to.
+                        // Every row here is this host's own.
                         host: None,
                         unreachable: false,
                         archived: session.archived,
@@ -1167,8 +1169,7 @@ impl SessionHost {
             // The one field a live row still takes from the cold cache. The
             // generation describes the session's lock history, not who holds it
             // now, so it survives this host taking the session: a client refused
-            // over the hold that ended is owed the same evidence either way
-            // (spec 6.8).
+            // over the hold that ended is owed the same evidence either way.
             let generation = self.inner.cold.lock_generation(id);
             summaries.insert(id.to_string(), summarize(session, generation));
         }
@@ -1177,7 +1178,7 @@ impl SessionHost {
         let mut sessions: Vec<SessionSummary> = summaries.into_values().collect();
         sessions.sort_by(|left, right| right.id.cmp(&left.id));
         // No hosts: a plain host serves one working directory, and the field
-        // is a gateway's (spec 7.1).
+        // is a gateway's.
         SessionList {
             sessions,
             hosts: Vec::new(),
@@ -1186,8 +1187,8 @@ impl SessionHost {
 
     /// How many times the host has read its session store's directory.
     ///
-    /// The refresh contract (spec 6.8) is about the filesystem work a refresh
-    /// does *not* do, which the frames it produces cannot show, so this is the
+    /// The refresh contract is about the filesystem work a refresh does *not*
+    /// do, which the frames it produces cannot show, so this is the
     /// seam the tests assert on.
     #[cfg(any(test, feature = "test-support"))]
     pub fn store_directory_reads(&self) -> u64 {
@@ -1196,7 +1197,7 @@ impl SessionHost {
 
     /// How many times the host has read its session store's `meta/` directory.
     ///
-    /// The other half of the enumeration's directory cost (spec 6.8). A
+    /// The other half of the enumeration's directory cost. A
     /// sidecar listing transfers no bytes and reads no sidecar, so neither a
     /// byte budget nor [`Self::store_tag_reads`] can see it: this is the only
     /// seam that catches a refresh that went looking for labels.
@@ -1248,7 +1249,7 @@ impl SessionHost {
     /// How many times the host has read its session store's `locks/`
     /// directory.
     ///
-    /// The third of the enumeration's directory reads (spec 6.8), for the axis
+    /// The third of the enumeration's directory reads, for the axis
     /// whose fact belongs to another writer. Like the sidecar listings it
     /// transfers no bytes, so no byte budget can see it.
     #[cfg(any(test, feature = "test-support"))]
@@ -1269,9 +1270,10 @@ impl SessionHost {
 
     /// How many membership questions the host has put to its session store.
     ///
-    /// The seam for spec 6.2's "before it reaches ... any store lookup": an id
-    /// the grammar turns away and one the store does not hold answer the same
-    /// 404, so only this tells them apart.
+    /// A wire-supplied id is validated against the id grammar and rejected
+    /// before it reaches any path construction or store lookup. An id the
+    /// grammar turns away and one the store does not hold answer the same 404,
+    /// so only this tells them apart.
     #[cfg(any(test, feature = "test-support"))]
     pub fn store_membership_lookups(&self) -> u64 {
         self.inner.cold.membership_lookups()
@@ -1279,7 +1281,7 @@ impl SessionHost {
 
     /// How many tag sidecars the host has read to refresh its directory.
     ///
-    /// The per-file half of the refresh contract's budget (spec 6.8): a row
+    /// The per-file half of the refresh contract's budget: a row
     /// carries its label whether it was cached or freshly read, so this is the
     /// only way to tell an untagged store costing nothing from one paying a
     /// read per row. A materialization's own read of the session it opens goes
@@ -1294,7 +1296,7 @@ impl SessionHost {
     /// Materializing is not activity. A session resumed from a log written
     /// last week keeps reporting last week, or every session the user merely
     /// opens would claim it just did something and the unseen-output glyph
-    /// would read off it (spec 6.8).
+    /// would read off it.
     ///
     /// A row this host already holds wins outright, because it is an answer
     /// about the session and the file's modification time is an answer about
@@ -1312,12 +1314,12 @@ impl SessionHost {
             .unwrap_or_else(Utc::now)
     }
 
-    /// Re-read the store into the cold cache. The enumeration point (spec 6.8).
+    /// Re-read the store into the cold cache. The enumeration point.
     async fn enumerate(&self) -> Result<(), HostError> {
         // The live set keeps a live session's log out of the per-file work.
         // The host holds its status, which is both cheaper and more current
         // than the file, and a session mid-append is the last thing worth
-        // sniffing (spec 6.8).
+        // sniffing.
         let live: HashSet<String> = self.inner.sessions.lock().await.keys().cloned().collect();
         // The scan is blocking IO, so it runs with the session map's lock
         // already released.
@@ -1334,7 +1336,7 @@ impl SessionHost {
     /// in-memory registry keeps `Instant`s, which mean nothing off-process.
     ///
     /// A session that is not live answers empty rather than being
-    /// materialized for the read (spec 6.7): a cold session has no tasks by
+    /// materialized for the read: a cold session has no tasks by
     /// definition, and paying a resume, an agent rebuild and the advisory
     /// lock to learn that would be perverse.
     pub async fn tasks(&self, session: &str) -> Result<TaskTable, HostError> {
@@ -1410,7 +1412,7 @@ impl SessionHost {
 
     /// The session's branch tree, for a tree view and head switching.
     ///
-    /// The one read that materializes (spec 6.7): the tree is derived from
+    /// The one read that materializes: the tree is derived from
     /// the log's parent chains, so answering it means parsing the log, which
     /// is what a materialization does anyway.
     pub async fn tree(&self, session: &str) -> Result<SessionTree, HostError> {
@@ -1674,7 +1676,7 @@ impl SessionHost {
     }
 
     /// Release `session` if its driver reports it idle, answering whether it
-    /// went (spec section 5).
+    /// went.
     ///
     /// The session map is held for the whole teardown, which is what makes
     /// release serialize with materialization: a command or attach that arrives
@@ -1744,7 +1746,7 @@ impl SessionHost {
             }
         } else {
             // The session's liveness flag is the only trace a release leaves on
-            // the wire (spec section 5), so a client watching the directory has
+            // the wire, so a client watching the directory has
             // to be told.
             self.inner.shared.fanout.mark_list_dirty();
         }
@@ -1796,7 +1798,7 @@ impl SessionHost {
     /// The live session for `session`, or `None` when the store knows it but
     /// this host has not materialized it.
     ///
-    /// The read path. A read must not materialize (spec 6.7), because doing
+    /// The read path. A read must not materialize, because doing
     /// so resumes the log, rebuilds the agent environment and takes the
     /// session's advisory lock, all to answer a question whose answer for a
     /// cold session is "nothing".
@@ -1815,7 +1817,7 @@ impl SessionHost {
     /// Take a session's advisory lock, refusing when another writer holds
     /// it.
     ///
-    /// Either answer records the session's `locked` bit (spec 6.8): a refusal
+    /// Either answer records the session's `locked` bit: a refusal
     /// says a rival holds it, and a won lock clears any stale rival bit. Every
     /// answer advances the session's generation before its row is published.
     fn acquire(&self, id: &str) -> Result<SessionLock, HostError> {
@@ -1913,7 +1915,7 @@ impl SessionHost {
             validate_thinking_level(&run.model_info, &level).map_err(HostError::Unsupported)?;
         } else {
             // Unstated, so this axis is ours to default and we default it
-            // against the model actually chosen (spec section 8). Our own
+            // against the model actually chosen. Our own
             // configured level was resolved for our own default model, and a
             // creator who names a model without naming a level would otherwise
             // inherit a level that model may have no word for.
@@ -1977,7 +1979,7 @@ impl SessionHost {
         // final undelimited tail (removing an interrupted record or adding
         // a missing framing newline) and the repair walk appends
         // synthesized tool results. A materialization this host refuses
-        // must have done neither (spec section 5).
+        // must have done neither.
         //
         // A create has nothing on disk to read or repair, and it mints its
         // id by an atomic `create_new` claim on that id's lock-file path,
@@ -2027,7 +2029,7 @@ impl SessionHost {
         let (events, persistence_failure) = core.install_persisting_forwarder(&handoff).await;
         // One small read, on a path that has just read the whole log. From
         // here the session answers its own label out of memory, so no
-        // directory refresh ever reaches the sidecar for it (spec 6.8). A
+        // directory refresh ever reaches the sidecar for it. A
         // label we cannot read is not worth failing a materialization over.
         let tag = match self.inner.persistence.read_tag(&session_id) {
             Ok(tag) => tag,
@@ -2151,7 +2153,7 @@ impl SessionHost {
     ///
     /// Costs one `stat`: an id that is not one this store could ever hold has
     /// already been refused by [`validate_session_id`], so nothing here builds
-    /// a path out of an unchecked string (spec 6.2).
+    /// a path out of an unchecked string.
     fn on_disk(&self, id: &str) -> Result<bool, HostError> {
         self.inner
             .cold
@@ -2189,7 +2191,7 @@ impl SessionHost {
         };
         let boundary = snapshot.last_seq();
         // Only the epoch is checked here. A cursor past the boundary is treated
-        // as a mismatch too (spec 6.5), which `project_suffix` does: it owns
+        // as a mismatch too, which `project_suffix` does: it owns
         // the clamp because it is the layer that knows the log's own mark.
         let cursor = request
             .cursor
@@ -2398,14 +2400,15 @@ async fn send_block_frame(
 ///
 /// The wire treats session ids as opaque strings, so one arriving from a peer
 /// is checked against the store's grammar before it reaches a path or a
-/// lookup (spec 6.2). Membership in an enumeration is not a substitute: it
+/// lookup. Membership in an enumeration is not a substitute: it
 /// happens to be safe, but it makes path safety depend on how a lookup is
 /// implemented, and it costs a directory read per question.
 ///
-/// 404, because spec 6.2 says so. The store refuses the same ids at its own
-/// door, which is what makes the safety hold whatever route reaches it, so
-/// this gate is about *where* the refusal happens rather than whether it
-/// does.
+/// 404, the same answer an unknown session gets: an id that cannot name a
+/// session is indistinguishable on the wire from one that names none. The
+/// store refuses the same ids at its own door, which is what makes the safety
+/// hold whatever route reaches it, so this gate is about *where* the refusal
+/// happens rather than whether it does.
 pub(crate) fn validate_session_id(session: &str) -> Result<(), HostError> {
     if aj_session::is_valid_session_id(session) {
         return Ok(());
@@ -2488,7 +2491,7 @@ fn summarize(session: &Arc<LiveSession>, lock_generation: Option<u64>) -> Sessio
         unreachable: false,
         archived: status.archived,
         // Never locked: the bit names a rival, and this host holds this
-        // session's lock for as long as it is live (spec 6.8).
+        // session's lock for as long as it is live.
         locked: false,
         lock_generation,
     }
@@ -2514,7 +2517,7 @@ fn wall_clock(anchor: (DateTime<Utc>, Instant), at: Instant) -> DateTime<Utc> {
 
 /// Mint a fresh epoch token.
 ///
-/// Opaque and never persisted (spec 6.5): a host restart must invalidate
+/// Opaque and never persisted: a host restart must invalidate
 /// every cursor, because the log tail is not crash-stable and a
 /// post-restart position may not mean what it meant before.
 pub(crate) fn mint_epoch() -> String {
@@ -2569,7 +2572,7 @@ fn read_host_id(path: &Path) -> Result<Option<String>, HostError> {
 }
 
 /// Release sessions that have been idle and unattached for the host's grace
-/// period (spec section 5).
+/// period.
 ///
 /// Two clocks have to agree before a session goes, because neither sees the
 /// whole picture. This task's own observation covers what the session cannot
@@ -2639,12 +2642,13 @@ fn spawn_idle_sweeper(inner: &Arc<HostInner>) {
 
 /// Clear the `locked` bit of any session whose rival has let go.
 ///
-/// The host's half of spec 6.5's rejoin contract. A refused client is forbidden
-/// to ask on a schedule, which buys it the host's diligence instead, and this is
-/// where that debt is paid: the rising edges are events the host already has,
-/// its own refusal and the enumeration sweep, and the falling edge has none at
-/// all. A clean release truncates the holder record and a crash releases by
-/// closing a descriptor, and neither reaches this process. Asking the flock is
+/// The host's half of the rejoin contract. A client refused with `locked` is
+/// forbidden to ask on a schedule and waits for the row's bit to fall instead,
+/// which buys it the host's diligence, and this is where that debt is paid:
+/// the rising edges are events the host already has, its own refusal and the
+/// enumeration sweep, and the falling edge has none at all. A clean release
+/// truncates the holder record and a crash releases by closing a descriptor,
+/// and neither reaches this process. Asking the flock is
 /// the only read the fact supports, so this paces that read rather than standing
 /// in for a signal.
 ///

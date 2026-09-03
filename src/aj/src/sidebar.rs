@@ -1,5 +1,5 @@
 //! The session sidebar: a strip listing the sessions the peer offers that the
-//! user has not put away (spec 9.2).
+//! user has not put away.
 //!
 //! The widget is read-only chrome. It renders from a [`SidebarState`] mirror
 //! the drive loop refreshes once per iteration from the client's session
@@ -54,7 +54,7 @@
 //! testable place.
 //!
 //! Pointer gestures are a second trigger for actions the chords already
-//! dispatch, never a behavior of their own (spec 9.2). The strip resolves a
+//! dispatch, never a behavior of their own. The strip resolves a
 //! click into a [`StripGesture`], which names a session, a group to fold, or
 //! a create and nothing else, and the shell hands that to the same place the
 //! chord's handler hands its own answer. A draw records what each line it paints
@@ -152,7 +152,7 @@ const ID_COLS: usize = 8;
 const ID_TAG_GAP: usize = 1;
 
 /// What a row's glyph says about its session, in the order a row that could
-/// claim several of these should claim one (spec 6.8, 9.2).
+/// claim several of these should claim one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RowStatus {
     /// The peer cannot reach the host this session lives on.
@@ -172,7 +172,7 @@ impl RowStatus {
     /// cannot answer for this session at all, so `working` and the activity
     /// stamp behind `unseen` are both stale rather than wrong. Working next
     /// because it is the live fact. Unseen is what remains once a session
-    /// stops, which is why it cannot outrank working (spec 6.8).
+    /// stops, which is why it cannot outrank working.
     pub(crate) fn of(row: &SessionSummary, unseen: bool) -> Self {
         if row.unreachable {
             RowStatus::Unreachable
@@ -200,7 +200,7 @@ impl RowStatus {
 }
 
 /// Where a row sits in the client's working set, which the strip encodes as
-/// the label's brightness (spec 9.2).
+/// the label's brightness.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Presence {
     /// The session on screen.
@@ -215,7 +215,7 @@ pub(crate) enum Presence {
 pub(crate) struct SidebarRow {
     pub(crate) id: String,
     /// The name the user gave the session, shown in place of the id-derived
-    /// label (spec 6.8).
+    /// label.
     pub(crate) tag: Option<String>,
     /// Which enrolled host the row belongs to. `None` on a plain host's rows,
     /// which are all its own.
@@ -224,9 +224,9 @@ pub(crate) struct SidebarRow {
     /// Whether this is the session on screen.
     pub(crate) focused: bool,
     /// Whether the client folds frames for this session, which is what makes
-    /// the working set legible (spec 9.2).
+    /// the working set legible.
     pub(crate) attached: bool,
-    /// Whether the user has put the session away (spec 6.8).
+    /// Whether the user has put the session away.
     pub(crate) archived: bool,
     /// When the peer says the session last did something, on the peer's clock.
     ///
@@ -333,9 +333,9 @@ impl SidebarRow {
     /// The qualifier is matched from the host the row carries into the id,
     /// never read out of the id: a client is told which host a row belongs to
     /// precisely so it does not have to parse an id it is not allowed to parse
-    /// (spec 6.2 goes further than the direction rule, "clients never parse
-    /// session ids", which is why this matches a string it was handed rather
-    /// than looking for a separator). See [`aj_wire::SessionSummary::host`].
+    /// (the protocol goes further than the direction rule, clients never parse
+    /// session ids at all, which is why this matches a string it was handed
+    /// rather than looking for a separator). See [`aj_wire::SessionSummary::host`].
     ///
     /// One qualifier deep, which is what a gateway writes (the separator is the
     /// wire's, written down in full in `gateway::naming`). A peer that
@@ -385,7 +385,7 @@ pub(crate) struct SidebarState {
     /// Whether the strip is wanted, by default or by an explicit ask.
     pub(crate) visible: bool,
     /// Whether the user has worked the toggle, which pins `visible` against the
-    /// default that otherwise follows the row count (spec 9.2).
+    /// default that otherwise follows the row count.
     pub(crate) toggled: bool,
     /// Whether the terminal is too narrow to spare the columns, resolved per
     /// frame by the shell, which is the only place the width is known.
@@ -395,8 +395,7 @@ pub(crate) struct SidebarState {
     configured_cols: Option<u16>,
     /// Rows in display order (see [`rows_for_display`]).
     pub(crate) rows: Vec<SidebarRow>,
-    /// The hosts the peer named alongside its rows, empty against a plain host
-    /// (spec 7.1).
+    /// The hosts the peer named alongside its rows, empty against a plain host.
     ///
     /// Held rather than read back off the rows, because the entry that matters
     /// is the one for a host the peer holds no rows for: that host appears
@@ -554,10 +553,10 @@ fn focused_id(rows: &[SidebarRow]) -> Option<&str> {
 /// mints, puts the newest session at the top of its group. Nothing here reads
 /// activity: a row that moved out from under the pointer between the look and
 /// the click is a row the user cannot hit, so the strip holds still and lets
-/// the glyphs carry what changed (spec 9.2, and see the module doc). The
+/// the glyphs carry what changed (see the module doc). The
 /// per-group cap is where recency is still read (see [`GROUP_CAP`]).
 ///
-/// `unseen` answers spec 6.8's "has it moved since I looked" for a row the
+/// `unseen` answers "has it moved since I looked" for a row the
 /// caller already holds, and `attached` answers "do I hold it open" for a
 /// session id, which keeps this linear.
 ///
@@ -596,9 +595,9 @@ pub(crate) fn rows_for_display(
 /// The displayed order is the layout's, so a step skips the rows the cap holds
 /// back and crosses group boundaries where the strip does. That is the point:
 /// stepping is orientation across hosts, and a step that walked the hidden
-/// rows would attach a stale session per press without showing anything (spec
-/// 9.2). A host's tail is reached by unfolding it or by opening the session
-/// selector, whose connected row source is not subject to the strip's cap.
+/// rows would attach a stale session per press without showing anything. A
+/// host's tail is reached by unfolding it or by opening the session selector,
+/// whose connected row source is not subject to the strip's cap.
 ///
 /// `None` when there is nothing to move to: fewer than two displayed rows, or
 /// no row claiming focus (the directory and the rows disagree, so any answer
@@ -655,8 +654,8 @@ pub(crate) enum StripLine {
 /// What a pointer gesture on the strip asks for.
 ///
 /// A gesture names the ask and nothing more, because it is a second trigger
-/// for an action the chords already dispatch rather than a path of its own
-/// (spec 9.2): the shell hands this to the same place the chord's handler
+/// for an action the chords already dispatch rather than a path of its own:
+/// the shell hands this to the same place the chord's handler
 /// hands the session it stepped to.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum StripGesture {
@@ -724,7 +723,7 @@ struct Group<'a> {
     /// instead of the user reading it off every row.
     unreachable: bool,
     /// Where the group's rows sit in [`Layout::order`]. Empty for a host the
-    /// peer holds no rows for (spec 7.1).
+    /// peer holds no rows for.
     span: Range<usize>,
     /// How many of the group's rows the cap holds back, zero when it holds
     /// back none (see [`GROUP_CAP`]).
@@ -822,14 +821,14 @@ impl<'a> Layout<'a> {
             })
             .collect();
         // Then the hosts the peer holds no rows for, which no scan over the
-        // rows could have found (spec 7.1).
+        // rows could have found.
         groups.extend(
             hosts
                 .iter()
                 .filter(|host| {
                     // A host whose rows we hold is already a group, named by the
                     // id those rows carry. An address never matches one: rows
-                    // are namespaced by id (spec 6.2), so a host with no id has
+                    // are namespaced by id, so a host with no id has
                     // no rows here either.
                     host.id
                         .as_deref()
@@ -837,7 +836,7 @@ impl<'a> Layout<'a> {
                 })
                 .filter_map(|host| {
                     // The learned id where the peer has one, the configured
-                    // address until it does (spec 7.1). An entry naming neither
+                    // address until it does. An entry naming neither
                     // is not a group: it can hold no rows, and a header keyed on
                     // nothing would fold the plain host's unlabeled run.
                     let key = named(&host.id).or_else(|| named(&host.address))?;
@@ -905,7 +904,7 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// How many headers the hosts the peer holds no rows for need (spec 7.1).
+    /// How many headers the hosts the peer holds no rows for need.
     ///
     /// They are their headers and nothing else, so they take no part in the
     /// run: a run reaches into a span of rows, and these have none. That is
@@ -926,7 +925,7 @@ impl<'a> Layout<'a> {
     /// The create row takes its line first, then those hosts. A row that loses
     /// its line still leaves the overflow count behind, while a host that lost
     /// its would leave nothing at all, so the hosts are the ones that cannot be
-    /// cut while anything else can (spec 7.1).
+    /// cut while anything else can.
     ///
     /// That holds only while the count itself has a line, so the rows keep one
     /// wherever they have any rows to count. Cutting the count too would leave
@@ -965,8 +964,8 @@ impl<'a> Layout<'a> {
 
     /// Whether `group` draws its fold line under a run that reaches it: it has
     /// rows the cap holds back, or the user unfolded it and the line is what
-    /// folds it again (spec 9.2, the pointer must be able to undo what the
-    /// pointer did).
+    /// folds it again (the pointer must be able to undo what the pointer
+    /// did).
     ///
     /// Tied to the run the same way a header is, so a group that draws a row
     /// draws its affordance: a cap that held rows back silently would be a
@@ -1058,7 +1057,7 @@ impl<'a> Layout<'a> {
             if group.span.is_empty() {
                 // A host the peer holds no rows for is its header and nothing
                 // else, drawn where its label sorts rather than pushed to an
-                // end (spec 7.1). It is drawn out of its own budget, so the
+                // end. It is drawn out of its own budget, so the
                 // rows cannot crowd it out (see [`Self::split`]).
                 if let Some(label) = group.label.filter(|_| empty < budget.empty) {
                     lines.push(StripLine::Header {
@@ -1107,9 +1106,9 @@ impl<'a> Layout<'a> {
 /// A host's `field` where it names something, `None` where it is absent or
 /// empty.
 ///
-/// An empty string is no name. A peer's word for a host arrives unpoliced (spec
-/// 6.2), and nothing downstream can carry one: a strip group keyed on it says
-/// nothing about the host it claims is there, and a create-flow row keyed on it
+/// An empty string is no name. A peer's word for a host arrives unpoliced, and
+/// nothing downstream can carry one: a strip group keyed on it says nothing
+/// about the host it claims is there, and a create-flow row keyed on it
 /// collides with the sentinel row that deliberately names none.
 pub(crate) fn named(field: &Option<String>) -> Option<&str> {
     field.as_deref().filter(|text| !text.is_empty())
@@ -1117,7 +1116,7 @@ pub(crate) fn named(field: &Option<String>) -> Option<&str> {
 
 /// What a client calls one of a peer's hosts: the name that host reports for
 /// itself, else the id its sessions are namespaced under, else the address the
-/// peer has only ever known it by (spec 7.1).
+/// peer has only ever known it by.
 ///
 /// One rule for every surface that names a host, so the strip's header and the
 /// create-flow picker cannot label one host two ways. `None` for an entry
@@ -1138,7 +1137,7 @@ pub(crate) fn host_label(host: &DirectoryHost) -> Option<&str> {
 ///
 /// The host field is the authority for the qualifier. This function only
 /// matches that supplied value and never discovers structure by parsing the
-/// id, preserving the client-side opacity rule from spec 6.2.
+/// id, which is opaque to clients.
 pub(crate) fn session_label_source<'a>(id: &'a str, host: Option<&str>) -> &'a str {
     host.and_then(|host| id.strip_prefix(host)?.strip_prefix(':'))
         .filter(|session| !session.is_empty())
@@ -1242,7 +1241,7 @@ fn elide_to_cols(text: &str, cols: usize) -> String {
 /// reads left to right and its head is what its author chose first, so the tail
 /// goes: `builder-1-ext…`. The rule keys on the shape rather than on how the
 /// name was produced, because the wire deliberately does not say which it was
-/// and should not grow a bit for typography (spec 6.1).
+/// and should not grow a bit for typography.
 ///
 /// For a field of a known width, which is the strip's: the create-flow picker
 /// hands its rows over whole, because a row is built before its overlay has a
@@ -1852,7 +1851,7 @@ mod tests {
 
     /// The two exemptions: the session on screen and the ones the client holds
     /// open stay in the default view however archived they are, because the
-    /// strip is what says where the working set is (spec 9.2). Archiving the
+    /// strip is what says where the working set is. Archiving the
     /// focused session is allowed and leaves it on screen, so this is the
     /// state right after that gesture.
     #[test]
@@ -1922,7 +1921,7 @@ mod tests {
     /// Rows sit where their ids put them, newest minted id first, whatever the
     /// activity on them says. A row that climbed to the top when a message
     /// arrived would move out from under a pointer aimed at it, which is the
-    /// whole reason the strip holds still (spec 9.2).
+    /// whole reason the strip holds still.
     #[test]
     fn rows_order_by_id_not_by_activity() {
         // Activity descends as the ids ascend, so an activity-ordered result
@@ -1965,7 +1964,7 @@ mod tests {
     }
 
     /// The directory's answers ride into the row: what the peer says about the
-    /// session, and what this client holds open (spec 9.2).
+    /// session, and what this client holds open.
     #[test]
     fn a_row_carries_the_tag_the_host_and_the_attachment() {
         let mut tagged = at("session-a", 0);
@@ -2167,7 +2166,7 @@ mod tests {
 
     /// Stepping walks what the strip draws, so it steps over the rows the cap
     /// holds back rather than focusing them one at a time. Each of those
-    /// focuses would attach a session the user cannot even see (spec 9.2).
+    /// focuses would attach a session the user cannot even see.
     #[test]
     fn stepping_steps_over_the_rows_the_cap_holds_back() {
         let state = stepping_state("s-8");
@@ -2373,7 +2372,7 @@ mod tests {
     }
 
     /// One host, or none at all, is not a grouping. A plain connect has to look
-    /// exactly as it would have before hosts existed (spec 9.2).
+    /// exactly as it would have before hosts existed.
     #[test]
     fn a_single_host_gets_no_headers() {
         let hostless = rows_named(&["a", "b", "c"]);
@@ -2396,7 +2395,7 @@ mod tests {
     /// Distinct hosts group, the groups sit where their labels sort, and each
     /// group keeps the order its rows arrived in. Nothing here reads activity:
     /// a section that floated on it would move the click targets under the
-    /// pointer (spec 9.2).
+    /// pointer.
     #[test]
     fn groups_sit_where_their_labels_sort() {
         // The rows arrive as the display order has them, id descending (see
@@ -2500,7 +2499,7 @@ mod tests {
     /// This is the case the directory's host entries exist for. A gateway holds
     /// a host's rows only for as long as that host has sent them, so across a
     /// restart it has none for a host that is down, and a strip grouping by the
-    /// rows alone would draw that host as nothing at all (spec 7.1). It
+    /// rows alone would draw that host as nothing at all. It
     /// interleaves rather than sinking to the bottom, because a host is looked
     /// up by its name whether or not it is holding anything.
     #[test]
@@ -2592,7 +2591,7 @@ mod tests {
     /// A group reads as the name its host reports for itself, whether the group
     /// holds rows or is a host the peer holds none for. The id is what the rows
     /// carry and what a session is addressed by, so it stays the fallback and
-    /// never the label of a host that named itself (spec 7.1).
+    /// never the label of a host that named itself.
     #[test]
     fn a_group_reads_as_the_name_its_host_reports() {
         let rows = vec![row("s-1").host("290dc828").build()];
@@ -2691,7 +2690,7 @@ mod tests {
     /// A host named both ways at once is labelled by the id. The id is what its
     /// sessions are namespaced under, so it is the name the rest of the strip is
     /// read against, and the address only ever stands in for it while there is
-    /// none (spec 7.1).
+    /// none.
     #[test]
     fn a_host_named_both_ways_is_labelled_by_its_id() {
         let both = DirectoryHost {
@@ -2793,7 +2792,7 @@ mod tests {
     ///
     /// An id or an address with nothing in it is that same entry: a client does
     /// not police the grammar a gateway enforces at enrollment, so this is the
-    /// peer's word taken as it arrives (spec 6.2). Such an entry is not a group
+    /// peer's word taken as it arrives. Such an entry is not a group
     /// at all, which is also what keeps it from turning the one real host's
     /// single run into a grouping that wears a header.
     #[test]
@@ -3192,8 +3191,8 @@ mod tests {
     }
 
     /// The cap never holds back a row the strip has promised to show: the
-    /// focused row and the ones the client holds open (spec 9.2), and the ones
-    /// wearing the working or attention glyph (spec 6.8).
+    /// focused row and the ones the client holds open, and the ones wearing
+    /// the working or attention glyph.
     #[test]
     fn the_cap_never_holds_back_an_exempt_row() {
         for (what, exempt) in [
@@ -3252,7 +3251,7 @@ mod tests {
 
     /// Unfolding a group shows every row it was holding, and its line stays
     /// behind as what folds them away again: the pointer has to be able to
-    /// undo what the pointer did (spec 9.2).
+    /// undo what the pointer did.
     #[test]
     fn unfolding_a_group_shows_its_tail_and_keeps_the_line() {
         let rows = scattered_rows();
@@ -3516,7 +3515,7 @@ mod tests {
     }
 
     /// The qualifier is matched from the host the row carries into the id, and
-    /// never looked for in the id, which a client may not parse (spec 6.2). So
+    /// never looked for in the id, which a client may not parse. So
     /// an id this row's host does not account for keeps the label it has today,
     /// whole, rather than losing a slice of it to a guess.
     ///
@@ -3708,7 +3707,7 @@ mod tests {
     }
 
     /// The working set is legible: the three states get three brightnesses, and
-    /// nothing else moves them (spec 9.2).
+    /// nothing else moves them.
     #[test]
     fn the_working_set_shows_as_three_brightnesses() {
         assert_eq!(row("a").focused().build().presence(), Presence::Focused);
@@ -3799,7 +3798,7 @@ mod tests {
         }
     }
 
-    /// A host that reports a name for itself, as every host does (spec 6.1).
+    /// A host that reports a name for itself, as every host does.
     fn calling_itself(id: &str, name: &str, unreachable: bool) -> DirectoryHost {
         DirectoryHost {
             name: Some(name.to_string()),
@@ -3808,7 +3807,7 @@ mod tests {
     }
 
     /// A configured host the gateway has never reached: no id to be named by,
-    /// its address instead, and no rows of its own (spec 7.1).
+    /// its address instead, and no rows of its own.
     fn configured(address: &str) -> DirectoryHost {
         DirectoryHost {
             id: None,
@@ -3980,7 +3979,7 @@ mod tests {
     /// A host the peer holds no rows for, as the strip paints it: a header
     /// with nothing under it, in the place its label sorts it to among the
     /// hosts that have rows, named by the id where the peer has learned one
-    /// and by the configured address until it has (spec 7.1).
+    /// and by the configured address until it has.
     ///
     /// The mark rides in the header's rule exactly as it does over a group
     /// whose rows are all unreachable, because it says the same thing: nothing

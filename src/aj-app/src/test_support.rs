@@ -165,7 +165,7 @@ pub fn build_test_agent(
 /// [`build_test_agent`] with the durable tagger in place of the plain
 /// persistence listener: every event the agent emits arrives on the
 /// returned receiver paired with the log entry it appended, which is the
-/// shape a session host fans out to its clients (spec 6.4).
+/// shape a session host fans out to its clients.
 ///
 /// The forwarder persists as well, so the plain listener is dropped here.
 /// Keeping both would append every message twice.
@@ -191,7 +191,7 @@ pub fn build_tagged_test_agent(
 
 /// Comparable projection of a [`ChatState`] and the client that folded
 /// into it: the equality oracle for reducer-equivalence tests, and the
-/// full form of the canonical form's two tiers (spec 11.2).
+/// full form of the canonical form's two tiers.
 ///
 /// Two states that would render the same conversation project onto the
 /// same value, so `assert_eq!` on this type answers "did these two folds
@@ -377,7 +377,7 @@ impl CanonicalEntry {
     ///
     /// Two shapes qualify. A notice no log entry backs (every locally
     /// raised one) rides a reliable-transient frame, delivered exactly
-    /// once (spec 6.4). An unfinalized assistant row is the in-flight
+    /// once. An unfinalized assistant row is the in-flight
     /// streaming text, which the reducer's own quiesce drops on the way
     /// into a re-attach because nothing names it and the durable message
     /// replaces it.
@@ -398,14 +398,14 @@ impl CanonicalEntry {
 }
 
 /// The convergent tier of the canonical form: a [`CanonicalState`] with
-/// every transient-only artifact masked out (spec 11.2).
+/// every transient-only artifact masked out.
 ///
 /// This is the tier a client that lost its connection can be held to. A
-/// reliable-transient frame is delivered once and is never replayed
-/// (spec 6.4), so a client disconnected across a transient's only
-/// delivery window legitimately never has it and no re-attach can hand it
-/// over later. Comparing the full form there would assert a promise the
-/// protocol does not make. The no-fault comparisons keep the full form,
+/// reliable-transient frame is delivered once and is never replayed, so a
+/// client disconnected across a transient's only delivery window
+/// legitimately never has it and no re-attach can hand it over later.
+/// Comparing the full form there would assert a promise the protocol does
+/// not make. The no-fault comparisons keep the full form,
 /// where both clients saw every frame and any difference is a real one.
 ///
 /// The mask is narrow on purpose: it removes what

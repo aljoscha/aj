@@ -1,4 +1,4 @@
-//! Namespaced session ids (spec 6.2).
+//! Namespaced session ids.
 //!
 //! A gateway addresses a session as `<host_id>:<session_id>` and treats the
 //! whole string as opaque in its own API. This is the one place that grammar is
@@ -9,7 +9,7 @@
 use std::fmt;
 
 /// What separates the two halves of a namespaced id. A colon, which is valid
-/// in a URL path segment (spec 6.2).
+/// in a URL path segment.
 const SEPARATOR: char = ':';
 
 /// Longest host id a gateway will namespace with. Generous next to the 32
@@ -159,7 +159,7 @@ impl std::error::Error for HostIdError {}
 /// A host mints 32 hexadecimal characters, which this admits, but the id is
 /// read back from a file a person can edit and reaches a gateway over the wire.
 /// So it is checked at the boundary rather than trusted, exactly as a session id
-/// is (spec 6.2).
+/// is.
 pub(crate) fn validate_host_id(id: &str) -> Result<(), HostIdError> {
     if id.is_empty() {
         return Err(HostIdError::Empty);

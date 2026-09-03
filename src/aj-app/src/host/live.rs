@@ -46,7 +46,7 @@ pub(crate) enum Request {
     /// The driver answers this rather than the caller deciding, because it
     /// answers at its own position in the request queue: a command enqueued
     /// ahead of this has already taken effect, so the session it judges is the
-    /// one the command left behind (spec section 5's serialization rule).
+    /// one the command left behind.
     Release {
         reply: oneshot::Sender<ReleaseOutcome>,
     },
@@ -72,7 +72,7 @@ pub(crate) struct ReleasedRow {
     /// The file the release left behind, which is the fingerprint the
     /// directory caches its format verdict under.
     pub(crate) file: SessionMetadata,
-    /// The activity stamp the session's cold row carries (spec 6.8): when this
+    /// The activity stamp the session's cold row carries: when this
     /// driver last saw the session do something.
     ///
     /// Not [`Self::file`]'s modification time, which answers a different
@@ -99,7 +99,7 @@ pub(crate) struct ReleasedRow {
 /// may be mid-turn.
 pub(crate) struct SessionStatus {
     /// Opaque token minted per materialization and replaced on a head
-    /// switch. Never persisted (spec 6.5).
+    /// switch. Never persisted, so a host restart invalidates every cursor.
     pub(crate) epoch: String,
     /// The highest durable position this host has **published** a frame for.
     ///
@@ -109,10 +109,10 @@ pub(crate) struct SessionStatus {
     /// and an attach block's `state` frame carry the log's mark (read under
     /// its lock, so it covers everything on disk), while `list` frames and an
     /// on-change `state` frame carry this one. A client is never harmed by the
-    /// lag, since a `list` position is glyph data and never a cursor
-    /// (spec 6.5).
+    /// lag, since a `list` position is glyph data and never a cursor.
     pub(crate) last_seq: u64,
-    /// Whether the **main** agent has a turn in flight (spec 6.3).
+    /// Whether the **main** agent has a turn in flight. Says nothing about
+    /// sub-agents, whose liveness travels through lifecycle events.
     pub(crate) working: bool,
     /// The settings the next main turn runs against, cached off the run
     /// config so a `state` frame needs no lock of its own.
@@ -128,7 +128,7 @@ pub(crate) struct SessionStatus {
     /// directly, lags the log: a spawn root reaches disk several bus emits
     /// before the host consumes the `AgentStart` that would record the run as
     /// live, and a backfill served in that window would fabricate a
-    /// conclusion for a sub-agent that is still running (spec 6.5).
+    /// conclusion for a sub-agent that is still running.
     pub(crate) finished_subs: BTreeSet<usize>,
     /// The sub-agents the host is driving a turn for.
     ///
@@ -138,7 +138,7 @@ pub(crate) struct SessionStatus {
     /// the new run can land while the run still reads as finished.
     pub(crate) driven_subs: BTreeSet<usize>,
     pub(crate) last_activity: DateTime<Utc>,
-    /// The session's label (spec 6.8), read from its sidecar when the session
+    /// The session's label, read from its sidecar when the session
     /// was materialized and kept current by the tag command.
     ///
     /// Held here so a directory refresh, which runs on a coalescing tick, can
@@ -175,7 +175,7 @@ impl SessionStatus {
         self.last_work = Instant::now();
     }
 
-    /// The `state` frame this status describes (spec 6.3).
+    /// The `state` frame this status describes.
     fn frame(&self, session: &str) -> Frame {
         Frame::State {
             session: session.to_string(),
@@ -242,7 +242,7 @@ impl LiveSession {
     /// describes, unless `update` reports nothing changed.
     ///
     /// The status lock spans the update, the decision and the publish because
-    /// lossy coalescing is newest-wins by queue position (spec 6.9): a frame
+    /// lossy coalescing is newest-wins by queue position: a frame
     /// built from an older snapshot but enqueued later drops the queued newer
     /// one and leaves every subscriber holding the stale snapshot. Holding
     /// `status` is what serializes the session's publishers, its driver and an
@@ -308,7 +308,7 @@ impl LiveSession {
 }
 
 /// Whether `session` is releasable: nothing running, nothing queued, no
-/// undelivered task notice, nobody attached (spec section 5).
+/// undelivered task notice, nobody attached.
 ///
 /// Queued messages and task notices hold a session live because both live in
 /// memory only: releasing a session holding one would discard something the

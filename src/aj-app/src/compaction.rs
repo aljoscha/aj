@@ -843,8 +843,7 @@ mod tests {
         );
     }
 
-    /// Spec section 5: live durable frames reach a stream in strictly
-    /// increasing seq order.
+    /// Live durable frames reach a stream in strictly increasing seq order.
     #[tokio::test]
     async fn durable_seqs_reach_the_sink_in_increasing_order() {
         let outcome = compaction_with_a_racing_append().await;

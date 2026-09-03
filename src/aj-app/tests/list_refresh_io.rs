@@ -1,4 +1,5 @@
-//! The list refresh's I/O budget (spec 6.8).
+//! The list refresh's I/O budget: a refresh touches no filesystem, and an
+//! enumeration reads directories per axis rather than files per session.
 //!
 //! One test, in its own binary, because the oracle is this process's
 //! cumulative read counter and any other test running beside it would show up
@@ -65,7 +66,7 @@ const STARTUP_BUDGET: u64 = 900 * 1024;
 
 /// The sidecar axes an enumeration lists: labels and archived bits, one
 /// `readdir` of `meta/` each. What the assertions below are about is that the
-/// count is per axis and never per session (spec 6.8), so it moves when an
+/// count is per axis and never per session, so it moves when an
 /// axis is added and not otherwise.
 const SIDECAR_AXES: u64 = 2;
 
@@ -156,7 +157,7 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
 /// Both halves of the directory's I/O contract, in one test because the
 /// oracle is a process-wide counter and two tests would run concurrently.
 ///
-/// Composing a host enumerates its store (spec 6.8), before the shell paints
+/// Composing a host enumerates its store, before the shell paints
 /// anything. That enumeration may read a log's first line to place it in or
 /// out of the directory, and nothing else: a row's stamp comes from the
 /// `stat`, and it carries no position at all. The failure this pins is not
@@ -189,7 +190,7 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
     assert_eq!(
         host.store_directory_reads(),
         1,
-        "composing a host is one enumeration point (spec 6.8)",
+        "composing a host is one enumeration point",
     );
     assert_eq!(
         host.store_sidecar_directory_reads(),
@@ -199,7 +200,7 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
     assert_eq!(
         host.store_lock_directory_reads(),
         1,
-        "and reads the lock directory once, not once per session (spec 6.8)",
+        "and reads the lock directory once, not once per session",
     );
     assert_eq!(
         host.store_lock_probes(),

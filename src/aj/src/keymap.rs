@@ -71,10 +71,10 @@ fn no_overlay(cx: &HostCtx) -> bool {
 /// Transcript focus is entered with Tab whenever the autocomplete popup is
 /// closed: the chord matches in the capture phase, ahead of the editor, so
 /// gating it on the popup lets Tab stay the editor's accept key while the popup
-/// is open, and focus the transcript otherwise, draft text and all (Spec E
-/// section 1). Reading the editor here is safe even though it is a focused
-/// widget: the capture-phase match runs at the root before the event descends
-/// to the editor, so the editor is not already borrowed.
+/// is open, and focus the transcript otherwise, draft text and all. Reading
+/// the editor here is safe even though it is a focused widget: the
+/// capture-phase match runs at the root before the event descends to the
+/// editor, so the editor is not already borrowed.
 fn focus_enabled(cx: &HostCtx) -> bool {
     no_overlay(cx) && !cx.editor.borrow().is_showing_autocomplete()
 }
@@ -165,7 +165,7 @@ fn activator(spec: &ChordSpec) -> Activator {
 
 /// Whether `key` activates `action_id`'s effective chord.
 ///
-/// Overlay-local chords (Spec F) are matched at-target rather than through the
+/// Overlay-local chords are matched at-target rather than through the
 /// global keymap, but they must still read the same source of truth as their
 /// hint labels. Resolving the action's effective chord here (the same data
 /// [`aj_app::keybindings::action_shortcut`] renders) keeps match and label from
@@ -213,8 +213,8 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
         // close-all only exists while one is, and the render toggles
         // plus the clipboard paste work regardless. Chat page-scroll is
         // inert under a modal too, because an open overlay owns its own
-        // PageUp/PageDown (Spec E section 1 routes the page keys to the
-        // chat only when nothing is capturing).
+        // PageUp/PageDown (the page keys reach the chat only when nothing
+        // is capturing).
         //
         // NOTE(aljoscha): the `global_bindings` phase puts the page
         // and Home/End chords in the capture phase, ahead of the focused
@@ -225,7 +225,7 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
         // motion stays on the Emacs-style Ctrl+A/Ctrl+E, and the arrow keys
         // still move within it.
         //
-        // NOTE(aljoscha): Spec E.1 also lists half-page (Ctrl+U/Ctrl+D) as
+        // NOTE(aljoscha): half-page (Ctrl+U/Ctrl+D) would be natural
         // chat-scroll keys, but those are editor chords in the Emacs-style
         // `TextArea` (kill-to-start, delete-forward), so they can't double as
         // editor-focused chat-scroll chords. Half-page scroll is not bound yet.

@@ -82,8 +82,8 @@ pub(crate) struct TranscriptStyles {
     /// Bold tool name in a tool cell's header.
     pub(crate) bold: Style,
     /// Bold key label in the keybinding-hint palette color (`keybindingHint`),
-    /// used by the splash's `{key} for commands` hint (and, per Spec E-10, the
-    /// list-row shortcut column).
+    /// used by the splash's `{key} for commands` hint and the list-row shortcut
+    /// column.
     pub(crate) keybinding_hint: Style,
     pub(crate) diff_add: Style,
     pub(crate) diff_remove: Style,
@@ -94,10 +94,10 @@ pub(crate) struct TranscriptStyles {
     /// The user-message bubble tint.
     pub(crate) user_message_bg: Color,
     /// Border glyph color for the focused user message's marker in
-    /// transcript-focus mode, the theme's `borderAccent` (Spec E section 2).
+    /// transcript-focus mode, the theme's `borderAccent`.
     pub(crate) border_accent: Color,
     /// Background tint for a transcript selection's highlight, the theme's
-    /// `TextSelectionBg` token (see Spec E section 2): a macOS-style blue on
+    /// `TextSelectionBg` token: a macOS-style blue on
     /// light themes and a darker blue on dark themes, distinct from the
     /// menu-cursor band. Only the background is restyled over the composed
     /// frame, so the selected text stays readable.
@@ -230,9 +230,9 @@ struct CachedEntry {
 /// break hit-testing.
 ///
 /// Transcript-focus mode does not change this. The focused user message's
-/// marker is a border painted into the bubble's own padding (Spec E section
-/// 2), so it is per-entry render output folded into that entry's fingerprint,
-/// not a `ListView`-level gutter. Entries stay non-interactive and the "no
+/// marker is a border painted into the bubble's own padding, so it is
+/// per-entry render output folded into that entry's fingerprint, not a
+/// `ListView`-level gutter. Entries stay non-interactive and the "no
 /// interactive entries" assumption still holds.
 struct EntryRenderCache {
     slots: HashMap<(AgentId, EntryId), CachedEntry>,
@@ -1132,7 +1132,7 @@ fn indent_entry<W: Widget + 'static>(widget: W) -> Padding {
 /// excluded from their tool list), so that arm is defensive only.
 ///
 /// `focus` carries the pre-styled copy-key hint when this entry is the focused
-/// user message, marking its bubble with the focus border (Spec E section 2).
+/// user message, marking its bubble with the focus border.
 /// It is `None` for every other entry and every non-`User` kind ignores it.
 ///
 /// `image` is how a tool-result image entry renders this frame, resolved from
@@ -1197,8 +1197,7 @@ pub(crate) fn build_entry_widget(
 /// visual cue, which also keeps the text cleanly copy-pasteable).
 ///
 /// When `focus` is `Some`, the bubble carries the focus border in the
-/// `borderAccent` color, with the supplied copy-key hint on its bottom edge
-/// (Spec E section 2).
+/// `borderAccent` color, with the supplied copy-key hint on its bottom edge.
 fn build_user_bubble(
     user: &UserEntry,
     styles: &TranscriptStyles,
@@ -1291,10 +1290,10 @@ fn task_outcome_tag(outcome: &TaskOutcome) -> u8 {
 }
 
 /// The pre-styled shortcut hint shown on the focused-message border's bottom
-/// edge, resolved through the keybinding data so the keys are never literals
-/// (Spec E section 2). Each key renders in the accent color and the rest
-/// muted, the way an overlay styles the key hints in its chrome. Both the copy
-/// and branch shortcuts share the one line (`y to copy · b to branch`).
+/// edge, resolved through the keybinding data so the keys are never literals.
+/// Each key renders in the accent color and the rest muted, the way an overlay
+/// styles the key hints in its chrome. Both the copy and branch shortcuts share
+/// the one line (`y to copy · b to branch`).
 fn copy_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
     let copy_key = action_shortcut(ACTION_COPY_MESSAGE).unwrap_or_default();
     let branch_key = action_shortcut(ACTION_BRANCH_MESSAGE).unwrap_or_default();
@@ -1552,7 +1551,7 @@ struct SelPos {
 /// A free-form transcript selection: an anchor and a caret, each an
 /// entry-relative [`SelPos`]. Anchoring to `(entry, position)` rather than an
 /// absolute viewport row means the highlight tracks its content across
-/// scrolling and follow-tail (Spec E section 2). A zero-width selection
+/// scrolling and follow-tail. A zero-width selection
 /// (`anchor == caret`) is a plain click with nothing highlighted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Selection {
@@ -1686,9 +1685,9 @@ fn round_lines(v: f64) -> i32 {
 }
 
 /// The chat area: a follow-tail `ListView` over the active transcript,
-/// wrapped in [`ScrollBars`] for the vertical scrollbar thumb (Spec E
-/// section 1). The bar reserves the rightmost column and hides its
-/// thumb while the transcript fits the viewport.
+/// wrapped in [`ScrollBars`] for the vertical scrollbar thumb. The bar
+/// reserves the rightmost column and hides its thumb while the transcript
+/// fits the viewport.
 ///
 /// The bars stamp both their own surface and the inner list's, so
 /// content-area mouse events hit-test to the list and bar-column events
@@ -1720,7 +1719,7 @@ pub struct TranscriptView {
     image_store: Rc<RefCell<ImageStore>>,
     /// Per-entry rendered rows, laid out on demand and cached. Select-to-copy
     /// extracts and highlights text out of these rather than a whole-transcript
-    /// grid (Spec E section 2). See [`entry_rows`](Self::entry_rows).
+    /// grid. See [`entry_rows`](Self::entry_rows).
     entry_text: EntryTextCache,
     /// `DrawContext` presentation state stashed from the last [`draw`], so the
     /// per-entry text layout builds under the same cell size and
@@ -1736,14 +1735,14 @@ pub struct TranscriptView {
     last_globals: GlobalRenderInputs,
     /// While true, every draw pins the viewport to the bottom so a
     /// streaming turn stays in view. Wheel-up and thumb drags
-    /// disengage, a scroll that lands back at the bottom re-engages
-    /// (Spec E section 1). Suspended while the transcript is focused: the
-    /// item cursor then owns the viewport, so [`draw`](Widget::draw) neither
-    /// pins the bottom nor re-engages while focus mode is active.
+    /// disengage, a scroll that lands back at the bottom re-engages.
+    /// Suspended while the transcript is focused: the item cursor then owns
+    /// the viewport, so [`draw`](Widget::draw) neither pins the bottom nor
+    /// re-engages while focus mode is active.
     follow_tail: bool,
-    /// Whether the transcript is in focus mode (Spec E section 1), shared by
-    /// `Rc` with the [`EntryBuilder`] (so the focus border tracks the mode)
-    /// and the keymap host context (so the copy chord is gated on it). This
+    /// Whether the transcript is in focus mode, shared by `Rc` with the
+    /// [`EntryBuilder`] (so the focus border tracks the mode) and the keymap
+    /// host context (so the copy chord is gated on it). This
     /// view is the single writer: [`enter_focus_mode`](Self::enter_focus_mode)
     /// and [`exit_focus_mode`](Self::exit_focus_mode), driven by focus in/out,
     /// set it.
@@ -1768,9 +1767,9 @@ pub struct TranscriptView {
     /// geometry rather than re-laying live entries between frames.
     agent_hit_rows: Vec<Option<AgentId>>,
     agent_hit_width: u16,
-    /// The active free-form selection, if any (Spec E section 2). Set on a
-    /// left-button press-drag over the content and kept highlighted after the
-    /// release copies it, until the next plain click or Esc clears it.
+    /// The active free-form selection, if any. Set on a left-button press-drag
+    /// over the content and kept highlighted after the release copies it,
+    /// until the next plain click or Esc clears it.
     selection: Option<Selection>,
     /// The complete unit selected by the current press. A multi-click drag
     /// keeps this word or rendered line selected while extending by whole units.
@@ -1980,9 +1979,9 @@ impl TranscriptView {
         };
         let mut list = ListView::new(Source::Builder(Box::new(builder)));
         // `draw_cursor` stays off in every mode: the focused-message marker is
-        // the border painted into the bubble padding (Spec E section 2), not a
-        // cursor gutter. The list cursor still exists and moves under focus
-        // navigation. `draw_cursor` only controls the gutter drawing.
+        // the border painted into the bubble padding, not a cursor gutter. The
+        // list cursor still exists and moves under focus navigation.
+        // `draw_cursor` only controls the gutter drawing.
         list.draw_cursor = false;
         // Give the transcript a terminal-scrollback feel: when the content is
         // shorter than the chat slot it sits at the bottom, so the first message
@@ -2047,8 +2046,8 @@ impl TranscriptView {
     /// its identity across the swap (the outer loop overwrites its contents
     /// in place), so the fresh session's transcript must open at the tail
     /// rather than wherever the previous session was scrolled. On an
-    /// `active_view` switch each view opens at its bottom (Spec E section 1,
-    /// per-view scroll). The draw path refreshes `item_count` before
+    /// `active_view` switch each view opens at its bottom (scroll position is
+    /// per view). The draw path refreshes `item_count` before
     /// scrolling, so we needn't touch the list's scroll offset here.
     pub(crate) fn reset_to_tail(&mut self) {
         // A different session in the reused `chat` cell is a different
@@ -2156,7 +2155,7 @@ impl TranscriptView {
 
     /// The entry indices of the active view's user messages, ascending
     /// (document order). Transcript-focus navigation steps between these,
-    /// skipping assistant, tool, and other entries (Spec E section 1).
+    /// skipping assistant, tool, and other entries.
     fn user_message_indices(&self) -> Vec<usize> {
         let chat = self.chat.borrow();
         let Some(transcript) = chat.transcript(chat.active_view()) else {
@@ -2495,9 +2494,8 @@ impl TranscriptView {
         }
     }
 
-    /// The text of the focused user message, for the copy chord (Spec E
-    /// section 2). `None` when not in focus mode or the cursor is not on a
-    /// user message.
+    /// The text of the focused user message, for the copy chord. `None` when
+    /// not in focus mode or the cursor is not on a user message.
     ///
     /// Returns the message's own content (`joined_text`), which is the whole
     /// message the copy action promises, not the rendered cells (that would
@@ -2543,15 +2541,14 @@ impl TranscriptView {
         }
     }
 
-    /// Enter transcript-focus mode (Spec E section 1): set the shared focus
-    /// flag, suspend follow-tail so the cursor is not fought by auto-scroll,
-    /// and land the cursor on the newest user message. Driven by
-    /// `Event::FocusIn`, so the mode is exactly "the transcript is the focused
-    /// widget".
+    /// Enter transcript-focus mode: set the shared focus flag, suspend
+    /// follow-tail so the cursor is not fought by auto-scroll, and land the
+    /// cursor on the newest user message. Driven by `Event::FocusIn`, so the
+    /// mode is exactly "the transcript is the focused widget".
     fn enter_focus_mode(&mut self, ctx: &mut EventContext) {
         // The focus flag drives the per-entry border (via the shared cell the
         // `EntryBuilder` reads) that marks the focused message. `draw_cursor`
-        // stays off (Spec E section 2).
+        // stays off.
         self.focused.set(true);
         self.follow_tail = false;
         self.focus_last_user_message(ctx);
@@ -2567,8 +2564,8 @@ impl TranscriptView {
     }
 
     /// Handle a key press while the transcript is focused, stepping the item
-    /// cursor between user messages (Spec E section 1). A no-op when not
-    /// focused (the key then falls through unconsumed).
+    /// cursor between user messages. A no-op when not focused (the key then
+    /// falls through unconsumed).
     ///
     /// Tab is not handled here: the global capture-phase chord owns it and
     /// dispatches to [`focus_prev_user_message`](Self::focus_prev_user_message).
@@ -2621,8 +2618,7 @@ impl TranscriptView {
         }
     }
 
-    /// Scroll the transcript up by half a viewport (Spec E section 1, the
-    /// PageUp chord).
+    /// Scroll the transcript up by half a viewport (the PageUp chord).
     ///
     /// A manual scroll up means the reader wants history, so follow-tail
     /// disengages and new content stops yanking the viewport to the bottom.
@@ -2636,8 +2632,7 @@ impl TranscriptView {
         self.start_line_scroll(ctx, -lines);
     }
 
-    /// Scroll the transcript down by half a viewport (Spec E section 1, the
-    /// PageDown chord).
+    /// Scroll the transcript down by half a viewport (the PageDown chord).
     ///
     /// This never touches `follow_tail` directly. If the glide lands back at
     /// the bottom the next draw re-engages follow-tail (see
@@ -2648,7 +2643,7 @@ impl TranscriptView {
         self.start_line_scroll(ctx, lines);
     }
 
-    /// Scroll the transcript to the top (Spec E section 1, Home), mode-aware.
+    /// Scroll the transcript to the top (Home), mode-aware.
     pub(crate) fn scroll_to_top(&mut self, ctx: &mut EventContext) {
         if self.in_focus_mode() {
             // Focus mode: move the item cursor onto the first user message,
@@ -2666,7 +2661,7 @@ impl TranscriptView {
         self.list.borrow_mut().jump_to_item(0);
     }
 
-    /// Scroll the transcript to the bottom (Spec E section 1, End), mode-aware.
+    /// Scroll the transcript to the bottom (End), mode-aware.
     pub(crate) fn scroll_to_bottom(&mut self, ctx: &mut EventContext) {
         if self.in_focus_mode() {
             // Focus mode: move the item cursor onto the last user message,
@@ -2929,7 +2924,7 @@ impl TranscriptView {
     ///
     /// There is no cursor gutter to subtract: the focus marker is a border
     /// inside the bubble padding, so entries are laid out at the same width in
-    /// every mode (Spec E section 2).
+    /// every mode.
     fn content_width(&self) -> u16 {
         self.last_view.width.saturating_sub(1)
     }
@@ -3166,9 +3161,9 @@ impl TranscriptView {
         self.agent_hit_width = width;
     }
 
-    /// Drive the free-form selection from a left-button mouse event (Spec E
-    /// section 2). Called only after the bars declined the event, so a
-    /// scrollbar-thumb drag scrolls rather than selects.
+    /// Drive the free-form selection from a left-button mouse event. Called
+    /// only after the bars declined the event, so a scrollbar-thumb drag
+    /// scrolls rather than selects.
     fn handle_selection_mouse(&mut self, ctx: &mut EventContext, m: &mouse::Mouse) {
         match m.kind {
             mouse::Type::Press => {
@@ -3529,7 +3524,7 @@ impl Widget for TranscriptView {
         let count = self.entry_count();
         // Focus mode hands the viewport to the item cursor, so follow-tail
         // must neither pin the bottom nor re-engage while it is active, or the
-        // auto-scroll fights the cursor navigation (Spec E section 1).
+        // auto-scroll fights the cursor navigation.
         let focus_mode = self.in_focus_mode();
         {
             let mut list = self.list.borrow_mut();
@@ -3565,8 +3560,8 @@ impl Widget for TranscriptView {
         // it, even if live entry geometry changes in the meantime.
         self.last_view = ctx.max.size();
         self.record_agent_hit_map();
-        // Paint the selection highlight over the composed frame (Spec E
-        // section 2). A zero-width selection (a plain click) shows nothing.
+        // Paint the selection highlight over the composed frame. A zero-width
+        // selection (a plain click) shows nothing.
         if let Some(sel) = self.selection {
             if sel.anchor != sel.caret {
                 self.paint_selection(&mut surface, sel);
@@ -3602,7 +3597,7 @@ impl Widget for TranscriptView {
                 if ctx.consume_event {
                     return;
                 }
-                // Free-form selection over the content area (Spec E section 2).
+                // Free-form selection over the content area.
                 // Runs only for the left button and only now that the bars
                 // declined the event, so a scrollbar-thumb drag scrolls rather
                 // than selects. The inner list ignores the left button, so we
@@ -3621,9 +3616,9 @@ impl Widget for TranscriptView {
                 self.bars.borrow_mut().handle_event(ctx, event);
             }
             // Focus in/out drive transcript-focus mode: the transcript is "in
-            // focus mode" exactly when it is the focused widget (Spec E
-            // section 1). FocusOut also fires when an opening overlay steals
-            // focus, which cleanly exits the mode.
+            // focus mode" exactly when it is the focused widget. FocusOut
+            // also fires when an opening overlay steals focus, which cleanly
+            // exits the mode.
             Event::FocusIn => self.enter_focus_mode(ctx),
             Event::FocusOut => {
                 self.cancel_selection_gesture();
@@ -3633,9 +3628,9 @@ impl Widget for TranscriptView {
             // no-op once the animation is done and the tick chain has stopped.
             Event::Tick => self.advance_scroll_anim(ctx),
             Event::KeyPress(key) => {
-                // Esc clears a live selection first (Spec E section 2), before
-                // the focus-mode Esc would leave the mode, so one Esc drops the
-                // highlight and a second exits focus.
+                // Esc clears a live selection first, before the focus-mode Esc
+                // would leave the mode, so one Esc drops the highlight and a
+                // second exits focus.
                 if key.matches(Key::ESCAPE, Modifiers::empty()) && self.selection.is_some() {
                     self.selection = None;
                     self.cancel_selection_gesture();
@@ -3937,8 +3932,7 @@ mod tests {
 
     /// The focus border paints into the bubble's existing padding, so a
     /// focused bubble has the exact same surface size as an unfocused one.
-    /// Gaining or losing focus therefore never reflows the transcript (Spec E
-    /// section 2).
+    /// Gaining or losing focus therefore never reflows the transcript.
     #[test]
     fn focus_border_reuses_the_padding_and_keeps_the_bubble_size() {
         let user = UserEntry {
@@ -4493,7 +4487,7 @@ mod tests {
     }
 
     /// The scrollbar thumb draws in the reserved last column only when
-    /// the transcript overflows the viewport (Spec E section 1).
+    /// the transcript overflows the viewport.
     #[test]
     fn thumb_draws_only_when_the_transcript_overflows() {
         // Fifty two-row entries overflow the 10-row viewport. Follow-tail
@@ -4520,7 +4514,7 @@ mod tests {
 
     /// Dragging the thumb jumps the viewport and disengages
     /// follow-tail, and a drag that lands back at the bottom re-engages
-    /// it, the same rule wheel scrolling follows (Spec E section 1).
+    /// it, the same rule wheel scrolling follows.
     #[test]
     fn thumb_drag_disengages_follow_tail_until_back_at_bottom() {
         // An 11-row viewport over fifty two-row entries: the one-row
@@ -4597,7 +4591,7 @@ mod tests {
     }
 
     /// PageUp disengages follow-tail and scrolls the transcript up; paging
-    /// back down to the bottom re-engages it (Spec E section 1).
+    /// back down to the bottom re-engages it.
     #[test]
     fn page_up_disengages_and_page_down_reengages_follow_tail() {
         // Fifty two-row entries over a 10-row viewport, so the transcript is
@@ -4641,7 +4635,7 @@ mod tests {
 
     /// Editor-mode Home pins the viewport to the absolute top and disengages
     /// follow-tail, and End re-engages follow-tail so the viewport lands back
-    /// at the bottom (Spec E section 1, the global Home/End chords).
+    /// at the bottom (the global Home/End chords).
     #[test]
     fn scroll_to_top_and_bottom_move_the_viewport_in_editor_mode() {
         let chat = chat_with_notices(50);
@@ -4712,7 +4706,7 @@ mod tests {
 
     /// In focus mode the Home/End chords move the item cursor to the first /
     /// last user message rather than scrolling the viewport, matching the
-    /// `g` / `G` jumps (Spec E section 1).
+    /// `g` / `G` jumps.
     #[test]
     fn scroll_to_top_and_bottom_move_the_item_cursor_in_focus_mode() {
         // User messages at indices 0, 2, 4, 6, 8; assistant replies between.
@@ -4754,7 +4748,7 @@ mod tests {
     }
 
     /// Switching the active view opens the switched-to view at its bottom
-    /// with follow-tail engaged (Spec E section 1, per-view scroll). The host
+    /// with follow-tail engaged (scroll position is per view). The host
     /// runs `set_active_view` then `reset_to_tail` on the switch; this drives
     /// that sequence from a scrolled-up main view and checks the switched-to
     /// view opens pinned to its own bottom.
@@ -4815,7 +4809,7 @@ mod tests {
         );
     }
 
-    // ---- Transcript-focus mode (Spec E section 1) ------------------------
+    // ---- Transcript-focus mode -------------------------------------------
 
     fn key_press(codepoint: u32, mods: Modifiers) -> Event {
         Event::KeyPress(Key {
@@ -5204,8 +5198,8 @@ mod tests {
     }
 
     /// Transcript-focus navigation steps between user prompts only, so a
-    /// task notification is never a focus stop (Spec E section 1). The
-    /// notice sits between two real prompts and must be skipped.
+    /// task notification is never a focus stop. The notice sits between two
+    /// real prompts and must be skipped.
     #[test]
     fn transcript_focus_skips_task_notifications() {
         let chat = empty_chat();
@@ -5927,7 +5921,7 @@ mod tests {
     /// Focusing marks the newest user message with the border (and no other
     /// entry), stepping moves the border message-to-message, and leaving focus
     /// drops it. The transcript's row count never changes across any of it, so
-    /// the marker never reflows the transcript (Spec E section 2).
+    /// the marker never reflows the transcript.
     #[test]
     fn focus_border_marks_one_message_and_never_reflows() {
         // Users at 0, 2, 4, with assistant replies between. Tall viewport so
@@ -6750,7 +6744,7 @@ mod tests {
 
     /// Moving focus re-renders exactly the entry gaining and the entry losing
     /// the border, and leaves the rest cache hits, because `focused` is folded
-    /// into the fingerprint (Spec E section 2).
+    /// into the fingerprint.
     #[test]
     fn moving_focus_rerenders_only_the_two_affected_user_entries() {
         // Users at 0 and 2, assistant replies at 1 and 3.
@@ -7517,7 +7511,7 @@ mod tests {
         );
     }
 
-    // ---- Per-entry text layout (Spec E section 2) ------------------------
+    // ---- Per-entry text layout -------------------------------------------
 
     /// The `EntryId` of the active view's entry at `idx`, for building
     /// `SelPos` values in the selection tests.
@@ -7599,7 +7593,7 @@ mod tests {
         }
     }
 
-    // ---- Free-form selection (Spec E section 2) --------------------------
+    // ---- Free-form selection ---------------------------------------------
 
     /// Rows any cell of which carries the selection background.
     fn highlighted_rows(grid: &[Vec<Cell>], bg: Color) -> Vec<usize> {

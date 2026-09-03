@@ -1,4 +1,4 @@
-//! The overlay/modal substrate for the alt-screen shell (Spec E §5, §6).
+//! The overlay/modal substrate for the alt-screen shell.
 //!
 //! `vxfw` has no built-in modal system, so the shell composes one from
 //! z-indexed `SubSurface`s and focus: the host owns a stack of open overlays,
@@ -338,8 +338,8 @@ pub(crate) fn close_all(
 //
 // The single source for every overlay's key-hint subtitle, so the palette,
 // the read-only content pages, the login dialog, and the selectors read one
-// wording rather than each formatting its own literal (Spec F: hint labels
-// resolved, never hardcoded).
+// wording rather than each formatting its own literal: hint labels are
+// resolved, never hardcoded.
 //
 // NOTE: Esc/Enter are FIXED `vxfw` widget conventions here. The overlay
 // widgets (`ContentOverlay`, `FilterableSelect`, `LoginDialog`) hardcode Esc

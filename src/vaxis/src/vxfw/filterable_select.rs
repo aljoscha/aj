@@ -17,7 +17,7 @@
 //! Ctrl+J) confirms, and Up/Down/Ctrl+P/Ctrl+N are forwarded to the list's
 //! cursor. Everything else falls through to the field at-target.
 //!
-//! # Selection band (Spec E, decision E-7)
+//! # Selection band
 //!
 //! The cursored row is drawn as a full-width band over
 //! [`SelectStyles::selected_bg`] with normal foreground on top, rather than an

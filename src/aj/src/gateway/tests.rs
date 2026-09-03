@@ -1,4 +1,4 @@
-//! Two in-process hosts behind a gateway (spec 11.5).
+//! Two in-process hosts behind a gateway.
 //!
 //! Everything here runs real hosts on real loopback ports behind a real
 //! gateway router on a third one, so the bytes under test are the bytes a
@@ -92,7 +92,7 @@ impl Upstream {
     }
 
     /// A host over `dir`'s store, served on `at` or on a fresh loopback port,
-    /// calling itself `name` or deriving a name from `dir` (spec 6.1).
+    /// calling itself `name` or deriving a name from `dir`.
     async fn serve(
         dir: &TempDir,
         at: Option<SocketAddr>,
@@ -126,7 +126,7 @@ impl Upstream {
     }
 
     /// The name this host reports for itself, which a real host always has: it
-    /// derives one from its working directory when nothing named it (spec 6.1).
+    /// derives one from its working directory when nothing named it.
     fn host_name(&self) -> String {
         self.host
             .hello()
@@ -230,10 +230,10 @@ impl Upstream {
 ///
 /// The gateway is enrolled at the relay's address, so a cut breaks every
 /// connection this gateway holds to that host, control link and spliced streams
-/// alike, while the host itself keeps running. That is the flap spec 7.1
-/// describes: "a gateway-to-host connection drops ... even though client
-/// connections stayed up", and the one where the host's epochs survive, so a
-/// resume through it is incremental.
+/// alike, while the host itself keeps running. That is the flap in which a
+/// gateway-to-host connection drops even though client connections stayed up,
+/// and the one where the host's epochs survive, so a resume through it is
+/// incremental.
 struct Bridge {
     address: HostAddress,
     /// Whether connections are passed through, and the pipes in flight.
@@ -333,7 +333,7 @@ impl Bridge {
 struct Fixture {
     state: TempDir,
     /// The addresses this gateway's configuration names, which a restart keeps:
-    /// the configuration file does not change because the process did (spec 7.1).
+    /// the configuration file does not change because the process did.
     static_hosts: Vec<HostAddress>,
     tuning: Tuning,
     gateway: Gateway,
@@ -473,7 +473,7 @@ impl Fixture {
     }
 
     /// The same with `query` (no `?`) on the request: a create's parameters are
-    /// as much the client's as its body (spec 6.10).
+    /// as much the client's as its body.
     async fn create_with_query(&self, query: &str, body: &str) -> reqwest::Response {
         let separator = if query.is_empty() { "" } else { "?" };
         self.http
@@ -593,7 +593,7 @@ struct Carried {
     /// The sessions a `reset` named, in order.
     resets: Vec<String>,
     /// Whether the stream ended, which for a client of a gateway means it was
-    /// evicted or the gateway went away (spec 6.9).
+    /// evicted or the gateway went away.
     ended: bool,
 }
 
@@ -628,7 +628,7 @@ async fn carried_until(
     carried
 }
 
-/// The sessions the `reset` frames among `frames` name (spec 6.3).
+/// The sessions the `reset` frames among `frames` name.
 fn resets(frames: &[Frame]) -> Vec<String> {
     frames
         .iter()
@@ -639,7 +639,7 @@ fn resets(frames: &[Frame]) -> Vec<String> {
         .collect()
 }
 
-/// The sessions the `error` frames among `frames` refuse (spec 6.3).
+/// The sessions the `error` frames among `frames` refuse.
 fn refused_sessions<'a>(frames: impl Iterator<Item = &'a Frame>) -> Vec<&'a str> {
     frames
         .filter_map(|frame| match frame {
@@ -650,7 +650,7 @@ fn refused_sessions<'a>(frames: impl Iterator<Item = &'a Frame>) -> Vec<&'a str>
 }
 
 /// The first `error` frame on `events`: the session it refuses, its code and
-/// its message (spec 6.3).
+/// its message.
 async fn refused_session(events: &mut RemoteEvents) -> (String, String, String) {
     let frames = frames_until(events, "a session-scoped refusal", |frame| {
         matches!(frame, Frame::Error { .. })
@@ -698,7 +698,7 @@ fn assistant_text(frames: &[Frame]) -> Vec<String> {
         .collect()
 }
 
-/// The durable positions among `frames`, in delivery order (spec 6.4).
+/// The durable positions among `frames`, in delivery order.
 fn durable_seqs(frames: &[Frame]) -> Vec<u64> {
     frames
         .iter()
@@ -712,7 +712,7 @@ fn durable_seqs(frames: &[Frame]) -> Vec<u64> {
         .collect()
 }
 
-/// The epoch of the `state` frame that opens an attach block (spec 6.5).
+/// The epoch of the `state` frame that opens an attach block.
 fn epoch_of(frames: &[Frame]) -> String {
     frames
         .iter()
@@ -757,7 +757,7 @@ fn prompt(text: &str) -> RemoteCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Namespacing and the merged directory (spec 6.2, 6.8, 7.1)
+// Namespacing and the merged directory
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -784,7 +784,7 @@ async fn a_client_only_ever_sees_namespaced_ids() {
         assert_eq!(
             row.host.as_deref(),
             Some(address.host.as_str()),
-            "the row names its host, so a client never parses the id (spec 6.8)",
+            "the row names its host, so a client never parses the id",
         );
         assert!(!row.unreachable, "both hosts are up");
     }
@@ -801,15 +801,14 @@ async fn a_client_only_ever_sees_namespaced_ids() {
     right.stop().await;
 }
 
-/// A row travels as the host that owns it wrote it (spec 6.10): the gateway
+/// A row travels as the host that owns it wrote it: the gateway
 /// rewrites the three fields it owns and passes everything else through, a field
 /// this build has no type for and a number literal no float survives included.
 ///
 /// Two hosts, because the merge is where two hosts' rows meet and is the one
-/// place a re-encode would be tempting. The `preview` this carries is the field
-/// spec section 13 banks as future work, which is exactly the version ceiling
-/// spec 6.10 exists to prevent: a gateway must forward it years before it has a
-/// type for it.
+/// place a re-encode would be tempting. The `preview` this carries is a field no
+/// host writes yet, which is exactly the version ceiling forwarding unread
+/// prevents: a gateway must forward it years before it has a type for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_newer_hosts_row_reaches_a_client_whole() {
     let left = FakeHost::with_rows(
@@ -994,8 +993,7 @@ async fn an_archived_row_reaches_a_client_archived() {
 
 /// An archive lands on the host that owns the session, through a gateway that
 /// knows nothing about the route: per-session requests are proxied by the
-/// namespace, not by an enumeration of the routes this build has heard of
-/// (spec 6.10, 7.1).
+/// namespace, not by an enumeration of the routes this build has heard of.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_archive_reaches_the_owning_host_through_a_gateway() {
     let mut left = Upstream::start().await;
@@ -1060,7 +1058,7 @@ async fn archived_ids(host: &Upstream) -> Vec<String> {
 }
 
 /// A gateway marks a host's sessions unreachable while it still has their rows,
-/// and after a restart it has none: it stores no rows, deliberately (spec 7.1).
+/// and after a restart it has none: it stores no rows, deliberately.
 /// The signal survives because its `list` frames name the enrolled hosts with
 /// their reachability, so a client that holds no rows for a host still knows the
 /// host is there and cannot be reached.
@@ -1070,8 +1068,8 @@ async fn archived_ids(host: &Upstream) -> Vec<String> {
 /// empty directory from a directory that has not arrived, and the reachable
 /// host's rows are what say the merge ran at all.
 ///
-/// The downed one is the *configured* host, which is the enrollment mechanism
-/// spec 7.1 lists first and the one an id has to outlive to be there at all: a
+/// The downed one is the *configured* host, which is the enrollment kind whose
+/// id has to outlive a restart to be there at all: a
 /// configured host is enrolled by address, so its id is only ever learned, and a
 /// gateway that forgot it would come back with a host it cannot name, cannot
 /// namespace and therefore cannot show.
@@ -1087,7 +1085,7 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
     down.prompt(&session, "first").await;
     settled(&down, &session, 1).await;
     // One host each way, because a learned id has to survive whichever way the
-    // host was enrolled (spec 7.1). The configured one is connected before the
+    // host was enrolled. The configured one is connected before the
     // second is enrolled, so its id is learned before anything else writes the
     // gateway's record: what this test is about is the restart, not the moment
     // the record happens to be written.
@@ -1176,7 +1174,7 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
 
 /// A host's name outlives the gateway process that learned it, so a host that is
 /// down when the gateway comes back is still labelled by its name rather than
-/// regressing to hex (spec 7.1). This is what the name is written down for.
+/// regressing to hex. This is what the name is written down for.
 ///
 /// One host of each enrollment kind, because the two learn a name on different
 /// paths: a dynamic enrollment records what the enrolling handshake reported, a
@@ -1324,7 +1322,7 @@ async fn a_host_that_comes_back_under_a_new_name_is_relabelled() {
 }
 
 /// A configured host this gateway has never spoken to is named by the address it
-/// is enrolled at, and never by an id (spec 7.1).
+/// is enrolled at, and never by an id.
 ///
 /// An id namespaces sessions, so a synthetic one would poison every id a client
 /// holds the moment the real one arrived, and a client that grouped rows under it
@@ -1496,7 +1494,7 @@ async fn each_host_row_carries_its_upstream_hello_directory() {
 }
 
 // ---------------------------------------------------------------------------
-// Proxying (spec 7.1, and 6.10's forward-don't-filter)
+// Proxying
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1634,12 +1632,12 @@ async fn an_id_no_namespace_can_hold_is_a_404() {
 }
 
 /// An error body a host wrote crosses the proxy with its session named in this
-/// gateway's own vocabulary, and nothing else touched (spec 6.6).
+/// gateway's own vocabulary, and nothing else touched.
 ///
 /// The host names the session as the host knows it, which is an id no client of
 /// this gateway can address: the rewrite is the same one the create answer gets,
 /// and everything around it travels as the host wrote it, the fields this build
-/// has no name for included (spec 6.10).
+/// has no name for included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_proxied_error_body_names_the_session_this_gateways_way() {
     let recorder = Recorder::start("recorder").await;
@@ -1771,7 +1769,7 @@ async fn a_known_per_session_command_stays_opaque_through_the_gateway() {
 }
 
 // ---------------------------------------------------------------------------
-// A host that is not there (spec 6.8's `unreachable`, 6.1's 503)
+// A host that is not there: `unreachable` rows, 503 for proxied requests
 // ---------------------------------------------------------------------------
 
 /// The enrolled-host entry `host` has in `list`.
@@ -1906,7 +1904,7 @@ async fn a_command_to_a_downed_host_answers_503() {
     assert_eq!(
         err.code(),
         Some("host_unreachable"),
-        "the one status a gateway has that a host does not (spec 6.1)",
+        "the one status a gateway has that a host does not",
     );
     let err = fixture.client.tree(&id).await.expect_err("nor can a read");
     assert_eq!(err.status(), Some(StatusCode::SERVICE_UNAVAILABLE));
@@ -1915,7 +1913,7 @@ async fn a_command_to_a_downed_host_answers_503() {
 }
 
 // ---------------------------------------------------------------------------
-// Enrollment (spec 7.1)
+// Enrollment
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1981,7 +1979,7 @@ async fn an_enrollment_round_trips_and_outlives_the_process() {
 /// A configured host is the configuration file's to hold, in both directions:
 /// the gateway will not withdraw one, and it does not keep one after the operator
 /// removes it from the file. The id it learned for it goes too, since an id
-/// records identity and never enrollment (spec 7.1).
+/// records identity and never enrollment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_static_config_host_is_enrolled_and_cannot_be_withdrawn() {
     let mut host = Upstream::start().await;
@@ -2027,7 +2025,7 @@ async fn a_static_config_host_is_enrolled_and_cannot_be_withdrawn() {
 }
 
 /// A learned id is written down the moment it is learned, not only when
-/// something else happens to write the gateway's record (spec 7.1).
+/// something else happens to write the gateway's record.
 ///
 /// A gateway whose hosts all come from the configuration file never enrolls or
 /// withdraws anything, which is exactly what the other two write paths are. An id
@@ -2429,7 +2427,7 @@ async fn a_host_id_this_gateway_cannot_namespace_with_is_refused_at_enrollment()
 /// and the file stops naming it.
 ///
 /// The state file is the gateway's own memory and a person can edit it, so it is
-/// read with the same suspicion as the wire (spec 6.2): an id nothing can route
+/// read with the same suspicion as the wire: an id nothing can route
 /// would otherwise sit in the enrolled set forever, connecting no host and
 /// counting against every create that names none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2530,8 +2528,7 @@ async fn two_enrollments_at_once_are_both_recorded() {
 }
 
 /// A remembered host the configuration now also names is one host, and the
-/// configuration is the record of it being enrolled at all from then on
-/// (spec 7.1).
+/// configuration is the record of it being enrolled at all from then on.
 ///
 /// Its id is not that record's to lose. An id names a store, and an operator
 /// promoting a dynamic enrollment into the configuration file did not change
@@ -2596,7 +2593,7 @@ async fn a_remembered_host_the_configuration_names_too_keeps_its_id() {
 
 /// A configured enrollment names an address, so the operator's intent is
 /// whatever aj host answers there and the id this gateway holds for it is
-/// provisional (spec 7.1). Contact under a new id is a rebuilt host, and it runs
+/// provisional. Contact under a new id is a rebuilt host, and it runs
 /// the whole sequence: the old identity is withdrawn, its group's attached
 /// sessions are reset, its rows leave, and the state file adopts the new id.
 ///
@@ -2755,8 +2752,7 @@ async fn a_configured_hosts_contact_under_a_new_id_replaces_the_old_identity() {
 
 /// A dynamic enrollment names a host this gateway shook hands with, so its
 /// recorded id is the record's referent: a different id at that address is a
-/// store this enrollment is not about, and contact under one is refused
-/// (spec 7.1).
+/// store this enrollment is not about, and contact under one is refused.
 ///
 /// The refusal has to name the remedy that works for a dynamic enrollment, which
 /// is withdrawing it and enrolling the address again, so this carries that remedy
@@ -2828,8 +2824,7 @@ async fn a_dynamic_hosts_contact_under_a_new_id_is_refused() {
 }
 
 /// A configured host's id is provisional however this gateway came by it, a
-/// restored one included: it is still only the id that answered last time
-/// (spec 7.1).
+/// restored one included: it is still only the id that answered last time.
 ///
 /// This is the case a persisted id introduced. The host at a configured address
 /// is rebuilt while the gateway is down, so the id the state file restores names
@@ -2923,7 +2918,7 @@ fn enrolled_as(address: &HostAddress, host_id: &str) -> crate::gateway::enrollme
     }
 }
 
-/// The same for a host that names itself, which every real one does (spec 6.1).
+/// The same for a host that names itself, which every real one does.
 fn enrolled_naming(
     address: &HostAddress,
     host_id: &str,
@@ -2936,7 +2931,7 @@ fn enrolled_naming(
 }
 
 // ---------------------------------------------------------------------------
-// The gateway's own surface (spec 6.1, 6.3)
+// The gateway's own surface
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2950,13 +2945,13 @@ async fn hello_names_the_gateway_and_omits_a_working_directory() {
     assert!(!hello.host_id.is_empty(), "a gateway names itself too");
     assert_eq!(
         hello.working_directory, None,
-        "a gateway serves no working directory of its own (spec 6.1)",
+        "a gateway serves no working directory of its own",
     );
     assert_eq!(
         hello.name, None,
         "and it names the hosts behind it rather than itself: there is no group \
          header for a gateway to label, and a client that reached one addressed \
-         it directly (spec 7.1)",
+         it directly",
     );
     let id = hello.host_id;
 
@@ -3093,7 +3088,7 @@ async fn a_shutdown_does_not_wait_out_an_attached_client() {
 
 /// A settled gateway stops talking: its link stays up rather than reconnecting,
 /// and a directory that has not changed is not republished, because `list` is
-/// cumulative and an identical snapshot carries no information (spec 6.8).
+/// cumulative and an identical snapshot carries no information.
 ///
 /// The host has to resend its directory for that to be about anything, so this
 /// one does, on cue and twice: the same rows, then rows that differ. The second
@@ -3165,7 +3160,7 @@ async fn an_unchanged_directory_publishes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// Creating a session (spec 6.6)
+// Creating a session
 // ---------------------------------------------------------------------------
 
 /// One enrolled host needs no naming: a create that names none defaults to it.
@@ -3295,7 +3290,7 @@ async fn a_create_lands_on_the_host_it_names() {
 }
 
 /// A named target that is not there is the same 503 a proxied command to it
-/// answers (spec 6.1): a create is not held for a host that may come back, and
+/// answers: a create is not held for a host that may come back, and
 /// it certainly does not land somewhere else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_naming_a_host_that_is_not_there_answers_503() {
@@ -3379,12 +3374,12 @@ async fn a_create_naming_a_host_that_is_not_enrolled_is_a_404() {
 
 /// What goes upstream is the client's own create body with one field changed:
 /// `host`, set to the id of the host that answers it, because the create names
-/// its target in that host's own vocabulary (spec 6.6).
+/// its target in that host's own vocabulary.
 ///
 /// A real host accepts an absent field as readily as its own id, so only a
 /// server that keeps what it was sent can show the difference. The same
 /// recording shows that everything else travels untouched, a field this build
-/// does not know included (spec 6.10).
+/// does not know included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_forwarded_create_names_the_target_in_its_own_vocabulary() {
     let recorder = Recorder::start("recorder").await;
@@ -3520,7 +3515,8 @@ async fn a_create_is_refused_for_a_host_the_gateway_has_no_link_to() {
 ///
 /// The gateway reads the body for its `host` field and judges nothing else, so
 /// a thinking level only the host has a vocabulary for is the host's call to
-/// make (spec 6.10, and spec 8's strictness about stated settings).
+/// make, and a stated setting it cannot serve is refused rather than
+/// substituted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hosts_own_create_refusal_travels_back() {
     let mut host = Upstream::start().await;
@@ -3551,8 +3547,7 @@ async fn a_hosts_own_create_refusal_travels_back() {
     host.stop().await;
 }
 
-/// A create body a host refuses is refused through a gateway too (spec 6.10,
-/// 7.1).
+/// A create body a host refuses is refused through a gateway too.
 ///
 /// A gateway edits the body for the one field it owns and normalizes nothing
 /// else, so a duplicate key reaches the host that judges it. Collapsing the two
@@ -3738,9 +3733,9 @@ impl Recorder {
                                     body: body.to_vec(),
                                 },
                             );
-                            // One route refuses, in the shape spec 6.6 gives an
-                            // error about a session: the id in the host's own
-                            // vocabulary, plus a field of its own.
+                            // One route refuses, in the shape of an error about
+                            // a session: the id in the host's own vocabulary,
+                            // plus a field of its own.
                             if rest == REFUSED_ROUTE {
                                 return (
                                     StatusCode::NOT_FOUND,
@@ -3813,7 +3808,7 @@ impl Recorder {
 }
 
 // ---------------------------------------------------------------------------
-// Splicing a client's sessions (spec 7.1, 6.5, 6.10)
+// Splicing a client's sessions
 // ---------------------------------------------------------------------------
 
 /// A real turn on a real host, watched through a gateway.
@@ -3836,7 +3831,7 @@ async fn a_spliced_turn_reaches_a_client_with_its_ids_namespaced() {
         block
             .iter()
             .any(|frame| matches!(frame, Frame::State { .. })),
-        "an attach block opens with the session's state (spec 6.5): {block:?}",
+        "an attach block opens with the session's state: {block:?}",
     );
     assert!(
         named_sessions(&block).iter().all(|named| *named == id),
@@ -3935,7 +3930,7 @@ async fn two_hosts_ride_one_client_stream() {
 }
 
 /// What travels upstream is the host's own ids with the client's own cursors,
-/// one stream per host (spec 7.1).
+/// one stream per host.
 ///
 /// A real host would answer an attach either way, so only a host that keeps what
 /// it was asked can show the difference: a gateway that forwarded namespaced ids,
@@ -3973,7 +3968,7 @@ async fn an_upstream_attach_carries_host_ids_and_the_clients_cursors() {
     );
     assert!(
         attaches.iter().any(|attached| attached.is_empty()),
-        "and the control connection attaches nothing at all (spec 7.1): {attaches:?}",
+        "and the control connection attaches nothing at all: {attaches:?}",
     );
 
     fixture.shutdown().await;
@@ -3981,7 +3976,7 @@ async fn an_upstream_attach_carries_host_ids_and_the_clients_cursors() {
 }
 
 /// An id this gateway cannot resolve is refused before any host is asked about
-/// it, which is the same 404 a proxied request to it answers (spec 6.2).
+/// it, which is the same 404 a proxied request to it answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attaching_an_id_this_gateway_cannot_name_reaches_no_host() {
     let fake = FakeHost::start("fake", Script::Frames(block("s-1", "epoch-1", 0))).await;
@@ -4021,8 +4016,8 @@ async fn attaching_an_id_this_gateway_cannot_name_reaches_no_host() {
     fake.stop();
 }
 
-/// A client's stream never fails wholesale over one bad session (spec 6.5,
-/// 7.1): the sessions this gateway can resolve are served, on every host they
+/// A client's stream never fails wholesale over one bad session: the
+/// sessions this gateway can resolve are served, on every host they
 /// live on, and each id it cannot resolve is refused on that same stream.
 ///
 /// Two hosts, because that is what the rule is about: failing the stream over
@@ -4124,8 +4119,7 @@ async fn a_stream_refuses_the_ids_it_cannot_resolve_and_serves_both_hosts() {
 
 /// The refusals an attach owes are answers to that attach, not live fan-out: a
 /// client naming more ids this gateway cannot resolve than its queue can hold is
-/// served every one of them, and the sessions it holds on real hosts with them
-/// (spec 6.5, 7.1).
+/// served every one of them, and the sessions it holds on real hosts with them.
 ///
 /// A client whose refusals travelled its own bounded queue would be evicted by
 /// its own attach, and the re-attach it made to recover would be evicted the
@@ -4217,7 +4211,7 @@ async fn more_dead_ids_than_the_bound_do_not_evict_the_client_that_named_them() 
 }
 
 /// The owning host's refusal of an attach travels back, code and all: the client
-/// asked the question and the host answered it (spec 6.10).
+/// asked the question and the host answered it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hosts_own_attach_refusal_travels_back() {
     let fake = FakeHost::start("fake", Script::Refuse).await;
@@ -4243,7 +4237,7 @@ async fn a_hosts_own_attach_refusal_travels_back() {
     fake.stop();
 }
 
-/// A refusal an owning host wrote reaches the client whole (spec 6.6).
+/// A refusal an owning host wrote reaches the client whole.
 ///
 /// Three things about the same body: an envelope carrying only a `message` is a
 /// complete error, so the message is the host's sentence and not the JSON it
@@ -4295,7 +4289,7 @@ async fn a_hosts_own_attach_refusal_travels_back_whole() {
 }
 
 /// A frame kind this build does not know is forwarded with its session id
-/// rewritten and nothing else touched (spec 6.10's forward-don't-filter).
+/// rewritten and nothing else touched.
 ///
 /// The two frames that do not travel are in the same script: a host's own `list`
 /// would put ids no client of this gateway can address on the stream, and a
@@ -4315,10 +4309,9 @@ async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
         r#"{"kind":"something_newer","session":"s-1","payload":{"n":18446744073709551616}}"#
             .to_string(),
     );
-    // No `session` at all, which makes it host-scoped: forwarded as it arrived
-    // (spec 6.10).
+    // No `session` at all, which makes it host-scoped: forwarded as it arrived.
     script.push(r#"{"kind":"something_global","note":"host wide"}"#.to_string());
-    // A host's own `reset`, which a head switch produces (spec 6.3): the gateway
+    // A host's own `reset`, which a head switch produces: the gateway
     // has its own reasons to emit one, and that is no reason to swallow this.
     script.push(
         serde_json::to_string(&Frame::Reset {
@@ -4419,7 +4412,7 @@ async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
 }
 
 // ---------------------------------------------------------------------------
-// A host that flaps (spec 7.1's `reset`)
+// A host that flaps: `reset` on the lost edge and on the return edge
 // ---------------------------------------------------------------------------
 
 /// A host that goes away resets exactly its own sessions, and the sessions of
@@ -4478,11 +4471,12 @@ async fn a_lost_host_resets_its_own_sessions_and_leaves_the_others_alone() {
 }
 
 /// A gateway does not reopen an upstream it lost. It says `reset` and waits for
-/// the client to attach again (spec 7.1).
+/// the client to attach again.
 ///
 /// Resuming one itself would need a *current* cursor, and the client's cursor
 /// advances as it applies what this gateway forwarded, so the gateway would have
-/// to keep per-session cursor state that spec 7.1 forbids it. A host that hangs a
+/// to keep per-session cursor state, a second cursor authority it must not
+/// hold. A host that hangs a
 /// spliced stream up while its control connection stays open is that case with
 /// nothing else moving: exactly one upstream was ever opened, and exactly one
 /// `reset` came back.
@@ -4518,7 +4512,7 @@ async fn a_gateway_does_not_reopen_an_upstream_it_lost() {
 }
 
 /// A re-attach while the host is still down does not fail the stream, does not
-/// spin on `reset`, and is told when the host comes back (spec 7.1).
+/// spin on `reset`, and is told when the host comes back.
 ///
 /// Unreachable is **pending**, and the contrast with an id this gateway cannot
 /// resolve is what the same stream carries here: the unresolvable one is
@@ -4601,8 +4595,7 @@ async fn a_reattach_while_a_host_is_down_waits_for_it_to_return() {
 }
 
 /// A flap the host itself survived resumes **incrementally**: the client's
-/// cursor still means what it meant, so the host serves the suffix after it
-/// (spec 7.1).
+/// cursor still means what it meant, so the host serves the suffix after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reattach_after_a_reset_resumes_incrementally_when_the_epoch_survived() {
     let mut host = Upstream::start().await;
@@ -4703,8 +4696,7 @@ async fn a_reattach_after_a_reset_resumes_incrementally_when_the_epoch_survived(
 }
 
 /// A host that restarted mints fresh epochs, so the same re-attach resumes
-/// **fully**: the cursor describes a history the session no longer has
-/// (spec 6.5, 7.1).
+/// **fully**: the cursor describes a history the session no longer has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reattach_after_a_restart_resumes_fully_when_the_epoch_changed() {
     let mut host = Upstream::start().await;
@@ -4767,10 +4759,10 @@ async fn a_reattach_after_a_restart_resumes_fully_when_the_epoch_changed() {
 }
 
 // ---------------------------------------------------------------------------
-// Withdrawing an enrollment (spec 7.1's active teardown)
+// Withdrawing an enrollment
 // ---------------------------------------------------------------------------
 
-/// Removing an enrollment is active teardown, not bookkeeping (spec 7.1): the
+/// Removing an enrollment is active teardown, not bookkeeping: the
 /// host's rows leave the merged list, its upstream connections close, and its
 /// splices end with the `reset` a withdrawal owes them. Leaving them running
 /// would serve a directory that contradicts the enrollment set.
@@ -4803,7 +4795,7 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
         );
     }
     // An enrollment answers before its link has dialed, and a host this gateway
-    // holds no link to contributes no upstream at all (spec 7.1).
+    // holds no link to contributes no upstream at all.
     fixture.until_connected("leaving").await;
     fixture.until_connected("staying").await;
     let mut events = fixture
@@ -4831,8 +4823,8 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
     );
 
     // The `reset` the withdrawal owes, naming the withdrawn host's session and
-    // that one alone (spec 7.1): continuity for it is over, and re-attaching is
-    // how the client is told what became of it (spec 6.5).
+    // that one alone: continuity for it is over, and re-attaching is
+    // how the client is told what became of it.
     let torn_down = carried_until(&mut events, "the reset a withdrawal owes", |carried| {
         !carried.resets.is_empty()
     })
@@ -4924,7 +4916,7 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
     staying.stop();
 }
 
-/// The whole sequence a withdrawal sets off (spec 7.1): `reset`, re-attach,
+/// The whole sequence a withdrawal sets off: `reset`, re-attach,
 /// per-session refusal, the attachment dropped, healthy hosts untouched.
 ///
 /// The refusal being per session is what makes the `reset` safe to send at all.
@@ -4971,7 +4963,7 @@ async fn a_re_attach_after_a_withdrawal_is_refused_for_that_session_alone() {
 
     // What a client does with a `reset`: reopen the stream naming the session it
     // was sent for. It names everything it holds, because changing the attach
-    // set means reopening the stream (spec 6.5), so its healthy session travels
+    // set means reopening the stream, so its healthy session travels
     // with the refused one.
     let mut resumed = fixture
         .client
@@ -5039,7 +5031,7 @@ async fn a_re_attach_after_a_withdrawal_is_refused_for_that_session_alone() {
 }
 
 /// The last step of a withdrawal stops that host's control link and waits for it
-/// to be gone (spec 7.1): a withdrawal that has answered has nothing left
+/// to be gone: a withdrawal that has answered has nothing left
 /// dialing that host.
 ///
 /// Watched as the host seeing its control connection released, because a link
@@ -5096,8 +5088,8 @@ async fn a_withdrawal_stops_the_control_link_of_the_host_it_withdraws() {
 }
 
 /// A withdrawal interrupts an in-flight dial to the host being withdrawn, rather
-/// than waiting it out (spec 7.1: a withdrawal that has answered has nothing left
-/// dialing that host).
+/// than waiting it out: a withdrawal that has answered has nothing left
+/// dialing that host.
 ///
 /// The dials of one client's stream are sequential and each is bounded by the
 /// upstream timeout, so a host that takes the request and sits on the response
@@ -5191,7 +5183,8 @@ async fn a_withdrawal_interrupts_the_dial_of_the_host_it_withdraws() {
 }
 
 /// A withdrawal reaches a client that has stopped reading, whose upstream is
-/// parked mid-block waiting for room in that client's queue (spec 6.9's pacing).
+/// parked mid-block waiting for room in that client's queue, the way an attach
+/// block is paced.
 ///
 /// That is the one place a teardown signal delivered only where frames are read
 /// would never arrive, and it is exactly the client whose upstream costs a host
@@ -5329,7 +5322,7 @@ async fn a_withdrawal_that_was_not_recorded_leaves_the_splices_alone() {
 /// withdrawal that mutated first and rolled back afterwards presents every
 /// splice on that host with a down edge and then an up edge for a host that
 /// never went anywhere, and an up edge is what a splice answers with a `reset`
-/// (spec 7.1, and `a_reattach_while_a_host_is_down_waits_for_it_to_return` for
+/// (see `a_reattach_while_a_host_is_down_waits_for_it_to_return` for
 /// the other half of that chain). Whether a given splice observes it is down to
 /// the scheduler, which is why the assertion here is on the channel: the edge is
 /// either published or it is not.
@@ -5372,7 +5365,7 @@ async fn a_withdrawal_that_was_not_recorded_publishes_nothing() {
     assert!(
         !merged.has_changed().expect("the directory is alive"),
         "and it republished the merged directory twice over a set that never \
-         changed (spec 6.8)",
+         changed",
     );
 
     std::fs::remove_dir(&state).expect("unstage");
@@ -5381,7 +5374,7 @@ async fn a_withdrawal_that_was_not_recorded_publishes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// Flow control (spec 6.9)
+// Flow control
 // ---------------------------------------------------------------------------
 
 /// A client the gateway cannot keep up with is evicted rather than buffered
@@ -5452,9 +5445,9 @@ async fn a_client_that_stops_reading_is_evicted_and_recovers() {
 }
 
 /// A session's `error` frame ends its attach block, because it is what the
-/// server sent instead of one (spec 6.5). Everything that follows for that
+/// server sent instead of one. Everything that follows for that
 /// session is ordinary live traffic, measured against the client's bound: a
-/// client that will not read it is evicted (spec 6.9) rather than pacing the
+/// client that will not read it is evicted rather than pacing the
 /// upstream it shares with every other session on that host to a standstill.
 ///
 /// The host here keeps talking about a session it refused, which a correct one
@@ -5506,7 +5499,7 @@ async fn a_refusal_ends_the_block_it_was_sent_instead_of() {
 }
 
 /// An attach block bigger than the client's bound does not evict the client that
-/// asked for it (spec 6.9).
+/// asked for it.
 ///
 /// The bound governs live fan-out. A block measured against it would evict on
 /// the first big backfill, and the re-attach that followed would do the same
@@ -5568,10 +5561,9 @@ async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
     fake.stop();
 }
 
-/// A live frame from another host does not evict a client mid-block (spec 6.9:
-/// "the bound governs live fan-out only"; spec 7.1: a block measured against the
-/// bound would evict the very client that asked for it, and the re-attach would
-/// do the same again).
+/// A live frame from another host does not evict a client mid-block: the bound
+/// governs live fan-out only, and a block measured against it would evict the
+/// very client that asked for it, and the re-attach would do the same again.
 ///
 /// It takes two hosts, which is what a gateway is for: one host's frames are
 /// forwarded by one task in order, so a live frame of its own can never arrive
@@ -5665,7 +5657,7 @@ async fn a_live_frame_from_another_host_does_not_evict_a_client_mid_block() {
 }
 
 /// Two sessions on one host share one upstream: both blocks are paced, and a
-/// stream that breaks resets both of them (spec 6.5, 6.3).
+/// stream that breaks resets both of them.
 ///
 /// One pump carries every session a client attached on one host, and two pieces
 /// of its state are per session: the set still being backfilled, and the `reset`
@@ -5735,8 +5727,8 @@ async fn two_sessions_on_one_host_are_both_paced_and_both_reset() {
     fake.stop();
 }
 
-/// No upstream is pumped before every dial is done (spec 7.1: "returning means
-/// every upstream that could be opened is open").
+/// No upstream is pumped before every dial is done: returning means every
+/// upstream that could be opened is open.
 ///
 /// The dials are sequential and each is bounded by `upstream_timeout`, so a pump
 /// started inside that loop forwards one host's frames for as long as the
@@ -5824,7 +5816,7 @@ async fn no_upstream_is_pumped_before_every_dial_is_done() {
 /// stay silent.
 ///
 /// This bounds the response *head* only. Once the stream is open, silence is the
-/// client's own business (two missed heartbeats, spec 6.1).
+/// client's own business (two missed heartbeats).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_never_answers_an_attach_becomes_a_503() {
     let fake = FakeHost::start("fake", Script::Mute).await;
@@ -6000,7 +5992,7 @@ fn is_caught_up(frame: &Frame) -> bool {
 }
 
 /// Read frames in decoded form until `done` accepts one, which is how a test
-/// sees a kind this build does not know (spec 6.10).
+/// sees a kind this build does not know.
 async fn decoded_until(
     events: &mut RemoteEvents,
     what: &str,
@@ -6056,7 +6048,7 @@ fn fake_row(id: &str) -> SessionSummary {
     }
 }
 
-/// The frames of one attach block, as a host writes them (spec 6.5).
+/// The frames of one attach block, as a host writes them.
 fn block(session: &str, epoch: &str, last_seq: u64) -> Vec<String> {
     vec![
         state_frame(session, epoch, last_seq),
@@ -6106,7 +6098,7 @@ fn caught_up_frame(session: &str, epoch: &str, last_seq: u64) -> String {
 }
 
 /// A reliable-transient event frame, which is what a client that stops reading
-/// is measured against: it may be neither coalesced nor dropped (spec 6.4).
+/// is measured against: it may be neither coalesced nor dropped.
 fn warning_frame(session: &str, epoch: &str, text: &str) -> String {
     serde_json::to_string(&Frame::Event {
         session: session.to_string(),
@@ -6121,7 +6113,7 @@ fn warning_frame(session: &str, epoch: &str, text: &str) -> String {
     .expect("a warning frame")
 }
 
-/// The refusal a host writes instead of a session's attach block (spec 6.5).
+/// The refusal a host writes instead of a session's attach block.
 fn error_frame(session: &str, code: &str, message: &str) -> String {
     serde_json::to_string(&Frame::Error {
         session: session.to_string(),
@@ -6150,7 +6142,7 @@ enum Script {
     Flood {
         session: String,
         /// What the stream opens with: an attach block, or the refusal a server
-        /// writes instead of one (spec 6.5).
+        /// writes instead of one.
         opening: Vec<String>,
     },
     /// These frames, then the ones after `cue` is notified, then silence with
@@ -6171,9 +6163,9 @@ enum Script {
     },
     /// Not a stream at all: the host's own refusal of the attach.
     Refuse,
-    /// A refusal whose body the test writes, for the shapes spec 6.6 admits and
-    /// this build has no type for: an envelope carrying only a `message`, fields
-    /// a newer host adds to one.
+    /// A refusal whose body the test writes, for the error shapes the protocol
+    /// admits and this build has no type for: an envelope carrying only a
+    /// `message`, fields a newer host adds to one.
     RefuseRaw(&'static str),
     /// Nothing at all, not even a response head: the host took the request and
     /// went quiet.
@@ -6784,14 +6776,14 @@ async fn an_unknown_endpoint_answers_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(
         code, "unknown_endpoint",
-        "probing an endpoint is a valid capability check (spec 6.10)",
+        "probing an endpoint is a valid capability check",
     );
 
     fixture.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
-// A host this build does not fully understand (spec 6.10)
+// A host this build does not fully understand
 // ---------------------------------------------------------------------------
 
 /// A frame kind the gateway cannot read must not cost it the connection: the
@@ -7064,7 +7056,7 @@ fn the_config_flag_names_a_file_that_has_to_exist() {
 }
 
 /// The gate sits outside the routes, so a peer it refuses cannot even learn
-/// which endpoints a gateway has (spec 6.11).
+/// which endpoints a gateway has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_peer_reaches_nothing_on_a_gateway() {
     let state = TempDir::new().expect("tempdir");
@@ -7111,7 +7103,7 @@ async fn a_rejected_peer_reaches_nothing_on_a_gateway() {
 }
 
 /// A gateway is remote code execution exactly as a host is, so the identity
-/// gate's bind rule applies to it too (spec 6.11).
+/// gate's bind rule applies to it too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_local_gateway_refuses_to_serve_a_public_address() {
     let state = TempDir::new().expect("tempdir");

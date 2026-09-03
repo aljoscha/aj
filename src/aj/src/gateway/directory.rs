@@ -1,4 +1,4 @@
-//! The merged session directory (spec 7.1, 6.8).
+//! The merged session directory.
 //!
 //! One entry per enrolled host, each holding the last directory that host sent
 //! and whether its control connection is up. From those the gateway composes
@@ -11,7 +11,7 @@
 //! whatever its host last said, kept as the JSON that host wrote, with three
 //! fields the gateway owns: the namespaced id, the `host` it belongs to, and
 //! `unreachable`. Everything else on it passes through unread, which is what
-//! keeps a newer host's row a newer host's row (spec 6.10).
+//! keeps a newer host's row a newer host's row.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -39,7 +39,7 @@ pub(crate) struct Directory {
     ///
     /// A watch rather than a queue per subscriber, because every frame this
     /// carries is a cumulative `list` snapshot: the newest supersedes and a
-    /// slow reader wants only the latest (spec 6.4). Session frames are
+    /// slow reader wants only the latest. Session frames are
     /// undroppable, so they travel a client's bounded queue instead
     /// ([`crate::gateway::outbound`]).
     merged: watch::Sender<Arc<MergedDirectory>>,
@@ -51,8 +51,7 @@ pub(crate) struct Directory {
     /// republished for every row a busy host touches, and a splice watching it
     /// for reachability alone would wake once per client per refresh. A splice
     /// watches this because a host *returning* is what makes an upstream attach
-    /// possible again, and `reset` is how a client is asked to make one
-    /// (spec 7.1).
+    /// possible again, and `reset` is how a client is asked to make one.
     reachable: watch::Sender<Arc<BTreeSet<String>>>,
 }
 
@@ -67,7 +66,7 @@ struct Enrollment {
     /// [`Directory::adopt`].
     host_id: Option<String>,
     /// What the host called itself at the latest contact, republished as
-    /// [`DirectoryHost::name`] (spec 7.1).
+    /// [`DirectoryHost::name`].
     ///
     /// The id rules identity and this follows it: a host that reports a
     /// different name keeps its sessions and changes its label. `None` for a
@@ -87,7 +86,7 @@ struct Enrollment {
     /// Why the last connection attempt did not stick, for `GET /v1/hosts`.
     error: Option<String>,
     /// Cancelled when this identity stops being one this gateway serves, which
-    /// is what ends the streams spliced onto it (spec 7.1): the enrollment is
+    /// is what ends the streams spliced onto it: the enrollment is
     /// withdrawn, or a configured host answers under a different id and this
     /// token is replaced with the new identity's.
     ///
@@ -101,7 +100,7 @@ struct Enrollment {
 impl Enrollment {
     /// What a reader calls this host: the name it reports, else the id its
     /// sessions are namespaced under, else the address it is enrolled at while
-    /// it has never answered (spec 7.1).
+    /// it has never answered.
     ///
     /// For prose about the host. A message that asks its reader to *name* a
     /// host wants [`Self::candidate`] instead, because a name addresses
@@ -118,7 +117,7 @@ impl Enrollment {
     /// one, or the address while it has no id at all.
     ///
     /// The id and not the name, because a create names a host by its id
-    /// (spec 6.6) and a refusal that listed labels would be instructions that
+    /// and a refusal that listed labels would be instructions that
     /// do not work.
     fn candidate(&self, address: &HostAddress) -> String {
         match (&self.host_id, &self.name) {
@@ -129,7 +128,7 @@ impl Enrollment {
     }
 }
 
-/// What a host said about itself when this gateway last spoke to it (spec 6.1).
+/// What a host said about itself when this gateway last spoke to it.
 ///
 /// The three arrive in one handshake and are not interchangeable: the id rules
 /// identity and namespaces the host's sessions, the name is a label, and the
@@ -181,7 +180,7 @@ impl Reported {
 }
 
 /// The fields of a directory row a gateway owns, spelled as
-/// [`aj_wire::SessionSummary`] spells them (spec 6.8). Every other field on a
+/// [`aj_wire::SessionSummary`] spells them. Every other field on a
 /// row belongs to the host that wrote it.
 const ID_FIELD: &str = "id";
 const HOST_FIELD: &str = "host";
@@ -206,7 +205,7 @@ impl Row {
     /// route on, and re-emitting it under the host's own id would put an id no
     /// client here can address on the wire. An id [`addressable_session`]
     /// refuses is the same thing one step later: this gateway would publish it
-    /// and then refuse the attach for it (spec 6.5), telling a client a session
+    /// and then refuse the attach for it, telling a client a session
     /// it can see is not there.
     ///
     /// A host's `list` frame is refused at decode long before this, so it takes
@@ -229,7 +228,7 @@ impl Row {
     }
 
     /// This row as a client of this gateway sees it: the three fields a gateway
-    /// owns rewritten, everything else the host's own JSON (spec 6.10).
+    /// owns rewritten, everything else the host's own JSON.
     fn namespaced(&self, host_id: &str, connected: bool) -> RawObject {
         let mut raw = self.raw.clone();
         // A string and a bool always encode, so a failure here would be a
@@ -247,14 +246,14 @@ fn own(
     connected: bool,
 ) -> Result<(), serde_json::Error> {
     row.set(ID_FIELD, &SessionAddress::new(host_id, session).to_string())?;
-    // Clients group by this rather than parsing the id, which is opaque
-    // (spec 6.2, 6.8).
+    // Clients group by this rather than parsing the id, which is opaque to
+    // them.
     row.set(HOST_FIELD, host_id)?;
     row.set(UNREACHABLE_FIELD, &!connected)
 }
 
 /// The client-visible teardown one identity's disappearance still owes, once its
-/// rows are already out of the merged directory (spec 7.1).
+/// rows are already out of the merged directory.
 ///
 /// Two edges produce one, and both are a withdrawal in the sense that matters to
 /// a client: an enrollment removed ([`Directory::withdraw`]), and a configured
@@ -274,7 +273,7 @@ impl Withdrawn {
     ///
     /// That `reset` asks the client to attach again, and the ids it names no
     /// longer resolve here, so each is refused with its own `error` frame and
-    /// costs it that attachment and nothing else (spec 6.5). The directory,
+    /// costs it that attachment and nothing else. The directory,
     /// where those rows and that group are gone, says the same thing. See
     /// [`crate::gateway::splice`], which owns the frame.
     pub(crate) fn end_splices(self) {
@@ -300,7 +299,7 @@ pub(crate) enum Adopted {
     Unchanged,
     /// A configured host answered under a different id, so the store this
     /// gateway was namespacing is gone and the identity that named it went with
-    /// it (spec 7.1). Its rows have left, and its splices are what the caller
+    /// it. Its rows have left, and its splices are what the caller
     /// still owes.
     Replaced(Withdrawn),
 }
@@ -326,7 +325,7 @@ struct Settling {
 impl Settling {
     /// Whether applying this changes anything at all. A contact that changes
     /// nothing is neither recorded nor published: a link's every redial reaches
-    /// here, and `list` is cumulative (spec 6.8).
+    /// here, and `list` is cumulative.
     fn changes(self) -> bool {
         self.record_changes() || self.moves_directory
     }
@@ -414,7 +413,7 @@ pub(crate) struct HostTarget {
     pub(crate) host_id: String,
 }
 
-/// The sessions one client attached on one host (spec 7.1).
+/// The sessions one client attached on one host.
 ///
 /// One group is one upstream stream: the host's own ids with the client's own
 /// cursors, ready to travel as they arrived.
@@ -427,13 +426,13 @@ pub(crate) struct AttachGroup {
     /// client's whole stream, which would punish the sessions of every other
     /// host on it. Those sessions read `unreachable` in the list, which is what
     /// tells the client they carry nothing, and the host's return prompts the
-    /// `reset` that makes it attach them again (spec 7.1).
+    /// `reset` that makes it attach them again.
     pub(crate) dial: Option<HostAddress>,
     /// The attach set as the owning host names it: de-namespaced ids, the
     /// client's cursors untouched.
     pub(crate) attach: Vec<AttachRequest>,
     /// Cancelled when this host's enrollment is withdrawn, which is what ends
-    /// the upstream opened from this group (spec 7.1).
+    /// the upstream opened from this group.
     pub(crate) serving: CancellationToken,
 }
 
@@ -448,7 +447,7 @@ impl AttachGroup {
     }
 }
 
-/// How one client's attach set divides among the enrolled hosts (spec 6.5).
+/// How one client's attach set divides among the enrolled hosts.
 ///
 /// A stream never fails wholesale over one bad session, so an id this gateway
 /// cannot resolve is carried here rather than raised: the hosts it can reach
@@ -458,14 +457,15 @@ pub(crate) struct AttachPlan {
     pub(crate) refused: Vec<Unresolvable>,
 }
 
-/// A session a client named that resolves to no enrolled host (spec 6.5).
+/// A session a client named that resolves to no enrolled host. It is refused
+/// with its own `error` frame while the rest of the stream is served.
 pub(crate) struct Unresolvable {
     /// The id as the client wrote it, which is the vocabulary its refusal has
     /// to name: it is what that client asked about, and it may be no id this
     /// gateway could ever have minted.
     pub(crate) session: String,
     /// The sentence the client renders, which says why this gateway resolved
-    /// nothing (spec 6.6).
+    /// nothing.
     pub(crate) message: String,
 }
 
@@ -482,7 +482,7 @@ impl Directory {
 
     /// Enroll `address`, with what the host reported when it is already known.
     ///
-    /// Two refusals keep the enrolled set free of duplicates (spec 7.1): one
+    /// Two refusals keep the enrolled set free of duplicates: one
     /// address is one enrollment, and one host id is one namespace. The second
     /// matters more than it looks: two enrollments of one store would give every
     /// session of it two ids that both route, and a client would see it twice.
@@ -577,7 +577,7 @@ impl Directory {
     /// enrollment holds.
     ///
     /// The two enrollment kinds anchor identity differently, so they answer a
-    /// different id differently (spec 7.1). A dynamic enrollment names a host
+    /// different id differently. A dynamic enrollment names a host
     /// this gateway once shook hands with, so its recorded id is the record's
     /// referent and a different one is refused: that enrollment's host no longer
     /// exists, and the remedy is to withdraw it and enroll the address again. A
@@ -647,7 +647,7 @@ impl Directory {
 
     /// Note that the host at `address` is not there, and why.
     ///
-    /// Its rows stay in the directory and are marked `unreachable` (spec 6.8):
+    /// Its rows stay in the directory and are marked `unreachable`:
     /// a client that knows the session exists and cannot reach it is better
     /// served than one whose sidebar row vanished.
     pub(crate) fn disconnected(&self, address: &HostAddress, reason: String) {
@@ -664,7 +664,7 @@ impl Directory {
     ///
     /// The rows arrive as that host wrote them and are kept that way: only the
     /// id is read out, because it is what this gateway routes and orders on and
-    /// the field it rewrites (spec 6.10).
+    /// the field it rewrites.
     pub(crate) fn set_rows(&self, address: &HostAddress, rows: Vec<RawObject>) {
         let rows = rows.into_iter().filter_map(Row::read).collect();
         let mut hosts = self.lock();
@@ -678,10 +678,10 @@ impl Directory {
     /// Where a namespaced session id points.
     ///
     /// An id no enrollment can hold is an unknown session rather than a
-    /// malformed request: ids are opaque to clients (spec 6.2), so a client
+    /// malformed request: ids are opaque to clients, so a client
     /// cannot be expected to tell the difference and nothing it could fix is
     /// being reported. A host that is down is 503, which is the one status a
-    /// gateway has that a host does not (spec 6.1).
+    /// gateway has that a host does not.
     ///
     /// Down means "this gateway's control connection to it is down", the same
     /// thing the row's `unreachable` flag says, and a host whose port would in
@@ -701,10 +701,9 @@ impl Directory {
         })
     }
 
-    /// Group a client's attach set by the host that owns each session
-    /// (spec 7.1).
+    /// Group a client's attach set by the host that owns each session.
     ///
-    /// A stream never fails wholesale over one bad session (spec 6.5), so an id
+    /// A stream never fails wholesale over one bad session, so an id
     /// this gateway cannot resolve to an enrolled host is set aside for its own
     /// `error` frame rather than refusing the request: doing the latter would
     /// cost the client its healthy sessions on every other host. A host that is
@@ -751,7 +750,7 @@ impl Directory {
         }
     }
 
-    /// Which host a create is for (spec 6.6).
+    /// Which host a create is for.
     ///
     /// `named` is the create body's `host` field, in the vocabulary the
     /// directory rows' `host` field uses. Naming none defaults to the sole
@@ -908,7 +907,7 @@ impl Directory {
     /// Called with the map held, so what is published is what the map says: two
     /// mutations cannot interleave into a snapshot neither of them produced. An
     /// unchanged payload is not published at all, because `list` is cumulative
-    /// and an identical snapshot carries no information (spec 6.8), and because
+    /// and an identical snapshot carries no information, and because
     /// every attached client watches both of these: a host's ordinary directory
     /// refresh must not wake one of them per client per frame.
     fn publish(&self, hosts: &BTreeMap<HostAddress, Enrollment>) {
@@ -1067,14 +1066,14 @@ fn withdrawable(
 ///
 /// Ordered latest first by the session's own id, which is how a host orders its
 /// own rows (ids are minted as timestamps), with the host id breaking ties so
-/// the order is total. Clients re-sort by activity anyway (spec 9.2), so this is
+/// the order is total. Clients re-sort by activity anyway, so this is
 /// about being deterministic rather than about presentation.
 ///
 /// Every enrolled host is named here, whether or not it has rows, because it may
 /// have none for three different reasons: it is quiet, this gateway cannot reach
 /// it and never stored what it last said, or it has never answered at all. A
 /// client renders each as an empty group rather than as nothing, which is the
-/// whole point of naming the hosts (spec 7.1). The last of them is named by its
+/// whole point of naming the hosts. The last of them is named by its
 /// address, because that is all this gateway knows it by: an id is learned by
 /// asking, and a synthetic one would namespace sessions under a name that stops
 /// being theirs the moment the host answers.
@@ -1149,7 +1148,7 @@ pub(crate) enum DirectoryError {
         host: String,
     },
     /// A create named no host and there is more than one to choose from. Never
-    /// guessed at (spec 6.6).
+    /// guessed at.
     #[error(
         "this gateway has {} hosts enrolled, so a create has to name one of them: {}",
         hosts.len(),
@@ -1202,7 +1201,7 @@ mod tests {
 
     /// One row as a host writes it, plus a field this build has no type for, so
     /// that every assertion about the merge is also an assertion about what
-    /// travels (spec 6.10).
+    /// travels.
     fn row(id: &str) -> RawObject {
         let mut raw = RawObject::encode(&SessionSummary {
             id: id.to_string(),
@@ -1326,7 +1325,7 @@ mod tests {
     /// A row this gateway would publish and then refuse to route is dropped
     /// where a row with no readable id is. `SessionAddress::parse` refuses an
     /// empty session half and a dot segment, so publishing one would mean
-    /// answering the attach it invites with a refusal (spec 6.5) for a session
+    /// answering the attach it invites with a refusal for a session
     /// the client had every reason to think was there.
     #[test]
     fn a_row_this_gateway_would_refuse_to_route_is_dropped() {
@@ -1383,7 +1382,7 @@ mod tests {
 
     /// A host that has never answered has no id, so it has no namespace and
     /// cannot contribute rows. It is named all the same, by the address it is
-    /// enrolled at, which is what a client labels the empty group by (spec 7.1).
+    /// enrolled at, which is what a client labels the empty group by.
     #[test]
     fn a_host_with_no_id_yet_is_named_by_its_address() {
         let directory = Directory::new();
@@ -1404,7 +1403,7 @@ mod tests {
             }],
             "a client has a group to render, and nothing in the id position: an \
              id namespaces sessions, and a synthetic one would poison every id \
-             this client holds the moment the real one arrived (spec 7.1)",
+             this client holds the moment the real one arrived",
         );
         assert!(
             validate_host_id(&address.to_string()).is_err(),
@@ -1446,7 +1445,7 @@ mod tests {
     }
 
     /// A learned id is written down for every enrollment, not only for the ones
-    /// the state file is the record of (spec 7.1).
+    /// the state file is the record of.
     ///
     /// The two records are kept apart because they mean different things: a
     /// dynamic enrollment exists because the file says so, while a configured
@@ -1533,7 +1532,7 @@ mod tests {
 
     /// A dynamic enrollment names a host this gateway once shook hands with, so
     /// its recorded id is the record's referent and is fixed for the life of the
-    /// enrollment (spec 7.1). A different id at that address is a different
+    /// enrollment. A different id at that address is a different
     /// store, which this enrollment is not the record of, so it is refused and
     /// the refusal names the remedy that works here.
     ///
@@ -1597,7 +1596,7 @@ mod tests {
     /// A configured enrollment names an address, so the operator's intent is
     /// "whatever aj host answers here" and its id is provisional: contact
     /// presenting a different one is a rebuilt host, handled as a withdrawal of
-    /// the old identity followed by fresh contact (spec 7.1).
+    /// the old identity followed by fresh contact.
     ///
     /// Invalidating the old namespaced ids is not the hazard it looks like. The
     /// sessions they named are gone with the store that held them, so the rows
@@ -1691,8 +1690,7 @@ mod tests {
     }
 
     /// What an adoption would record is answered from a directory that has not
-    /// moved, which is what lets the record be written before the change lands
-    /// (spec 7.1).
+    /// moved, which is what lets the record be written before the change lands.
     #[test]
     fn what_an_adoption_records_is_answered_before_it_happens() {
         let directory = Directory::new();
@@ -1822,7 +1820,7 @@ mod tests {
     }
 
     /// A client's attach set groups by the host that owns each session, in that
-    /// host's own vocabulary and with the client's own cursors (spec 7.1).
+    /// host's own vocabulary and with the client's own cursors.
     ///
     /// A host that is not reachable still gets a group, with nothing to dial: its
     /// sessions contribute no upstream rather than failing the client's whole
@@ -1923,7 +1921,7 @@ mod tests {
             .collect()
     }
 
-    /// Which host a create lands on (spec 6.6): the one it names, the only one
+    /// Which host a create lands on: the one it names, the only one
     /// enrolled when it names none, and nothing guessed at in between.
     #[test]
     fn a_create_target_is_the_host_it_names_or_the_only_one_enrolled() {
@@ -2001,7 +1999,7 @@ mod tests {
     /// about a host reads as the name that host reports for itself, and a
     /// message that asks for a host to be named lists the id a create resolves
     /// against with the name beside it, because a list of labels would be
-    /// instructions that do not work (spec 6.6).
+    /// instructions that do not work.
     #[test]
     fn a_refusal_names_a_host_by_its_name_and_a_create_by_its_id() {
         let directory = Directory::new();
@@ -2231,7 +2229,7 @@ mod tests {
     }
 
     /// An unchanged directory publishes nothing, so a subscriber is not woken
-    /// for a snapshot it already has (spec 6.8).
+    /// for a snapshot it already has.
     #[tokio::test]
     async fn an_unchanged_snapshot_is_not_republished() {
         let directory = Directory::new();
@@ -2253,7 +2251,7 @@ mod tests {
     /// Reachability is a channel of its own because it moves at a different
     /// rate: the merged directory is republished for every row a busy host
     /// touches, and a splice watching that for reachability alone would wake
-    /// once per client per refresh (spec 7.1).
+    /// once per client per refresh.
     #[tokio::test]
     async fn a_row_change_does_not_republish_reachability() {
         let directory = Directory::new();

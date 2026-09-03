@@ -2,7 +2,7 @@
 //!
 //! A tag is session-scoped, not branch-scoped, so it lives in a sidecar file
 //! rather than in the log: a head switch moves the session's history and must
-//! not move its label (spec 6.8). Untagged sessions have no file, which is
+//! not move its label. Untagged sessions have no file, which is
 //! what keeps an untagged store free of tag reads.
 
 use std::fmt;
@@ -45,7 +45,7 @@ impl std::error::Error for TagError {}
 /// Validate and normalize a tag as it arrives from a user.
 ///
 /// Returns `Ok(None)` for anything that clears the tag, which is what an empty
-/// string means on the wire (spec 6.6), so a caller can treat set and clear as
+/// string means on the wire, so a caller can treat set and clear as
 /// one path. Surrounding whitespace is trimmed, because a tag that differs from
 /// another only by padding reads as the same label.
 ///

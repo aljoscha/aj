@@ -1,9 +1,9 @@
-//! Headless and embedded operation of the control port (spec section 4).
+//! Headless and embedded operation of the control port.
 //!
 //! The listen-address resolution, the identity gate's construction and the
 //! shutdown signal are shared with `aj gateway`: a gateway binds a control port
-//! under the same rules, because it is the same remote code execution behind it
-//! (spec 6.11).
+//! under the same rules, because it is the same remote code execution behind
+//! it.
 //!
 //! `aj serve` composes the same session host the interactive shell does and
 //! serves it with no terminal of its own. An interactive run given

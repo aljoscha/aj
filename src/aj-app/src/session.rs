@@ -107,7 +107,7 @@ pub enum SessionRequest {
     /// Mint a session, on `host` when the user named one of the peer's hosts.
     ///
     /// `None` leaves the choice to the peer, which is what an absent host field
-    /// on the wire asks for (spec 6.6). A peer that will not answer it is asked
+    /// on the wire asks for. A peer that will not answer it is asked
     /// the question by the frontend before the request is parked.
     New {
         host: Option<String>,

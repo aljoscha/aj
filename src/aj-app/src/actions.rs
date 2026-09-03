@@ -431,8 +431,8 @@ pub struct GlobalBinding {
 /// its editor sees the keystroke. [`AjAction::TranscriptFocus`] (bound to
 /// `tab`) is capture-phase too, but its frontend predicate gates it to the
 /// autocomplete popup being closed, so Tab focuses the transcript even with a
-/// draft, and only an open popup keeps Tab for the editor to apply a completion
-/// (Spec E section 1). The Ctrl+C ladder (`CancelTurn`, `Quit`) is not in the
+/// draft, and only an open popup keeps Tab for the editor to apply a
+/// completion. The Ctrl+C ladder (`CancelTurn`, `Quit`) is not in the
 /// table, see [`AjAction`].
 pub fn global_bindings() -> Vec<GlobalBinding> {
     let compiled = |action: AjAction, action_id: &str, phase: ChordPhase| {

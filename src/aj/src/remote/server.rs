@@ -1,4 +1,4 @@
-//! The HTTP transport over a [`SessionHost`] (spec 6.1, 6.6, 6.7).
+//! The HTTP transport over a [`SessionHost`].
 //!
 //! Commands are JSON POSTs, reads are GETs, and effects arrive on one SSE
 //! stream per connection. The server owns no protocol state of its own: it
@@ -53,8 +53,7 @@ use crate::remote::identity::{IdentityError, IdentityGate};
 ///
 /// A real `heartbeat` frame rather than an SSE comment, because a client
 /// reading decoded frames must be able to tell "the stream is alive" from
-/// "the transport buffered something", and only a frame reaches its decoder
-/// (spec 6.1).
+/// "the transport buffered something", and only a frame reaches its decoder.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// How long [`RemoteServer::shutdown`] waits for in-flight streams.
@@ -67,7 +66,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Why a server could not be started.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ServerError {
-    /// The identity gate refuses to serve this address at all (spec 6.11).
+    /// The identity gate refuses to serve this address at all: a non-loopback
+    /// bind in `local` mode fails to start rather than serving unauthenticated.
     #[error(transparent)]
     Identity(#[from] IdentityError),
     #[error("could not bind {addr}: {source}")]
@@ -184,7 +184,7 @@ impl RemoteServer {
     }
 }
 
-/// The protocol's routes (spec 6.1, 6.6, 6.7).
+/// The protocol's routes.
 fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/v1/hello", get(hello))
@@ -193,7 +193,7 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/tasks", get(tasks))
         .route("/v1/sessions/{id}/tasks/{task_id}", get(task))
         .route("/v1/sessions/{id}/tasks/{task_id}/kill", post(kill_task))
-        // The one path that is both a read and a mutation (spec 6.6, 6.7).
+        // The one path that is both a read and a mutation.
         .route("/v1/sessions/{id}/queue", get(queue).post(queue_command))
         .route("/v1/sessions/{id}/tree", get(tree))
         .route("/v1/sessions/{id}/prompt", post(prompt))
@@ -238,7 +238,7 @@ async fn sessions(State(state): State<Arc<ServerState>>) -> Result<Response, Api
     Ok(Json(state.host.sessions().await?).into_response())
 }
 
-/// Create a session, answering 200 with its id (spec 6.6).
+/// Create a session, answering 200 with its id.
 ///
 /// A create that minted a session and could not apply everything asked of it
 /// is a create: it answers 200 with the id and says what did not land, so
@@ -253,7 +253,8 @@ async fn create_session(
         prompt,
         tag,
     } = request;
-    // Refuse a create meant for another host (spec 6.6). The rule is the
+    // Refuse a create meant for another host: a plain host accepts only an
+    // absent `host` or its own id, it cannot create elsewhere. The rule is the
     // host's own, so this route and the in-process control surface refuse the
     // same request in the same words.
     state.host.creates_here(host.as_deref())?;
@@ -321,8 +322,8 @@ async fn queue(
 /// Withdraw one agent's pending message, or clear the session's queues.
 ///
 /// A withdrawal answers 200 with the text it took, which is what makes a
-/// client's dequeue-into-the-editor gesture work (spec 6.6). A clear is an
-/// ordinary mutation.
+/// client's dequeue-into-the-editor gesture work. A clear is an ordinary
+/// mutation.
 async fn queue_command(
     State(state): State<Arc<ServerState>>,
     Path(session): Path<String>,
@@ -452,7 +453,7 @@ async fn head(
     )
 }
 
-/// Set or clear the session's tag (spec 6.6).
+/// Set or clear the session's tag.
 async fn tag(
     State(state): State<Arc<ServerState>>,
     Path(session): Path<String>,
@@ -514,8 +515,8 @@ fn head_target(request: HeadRequest) -> Result<HeadTarget, ApiError> {
 /// The attach happens before the response is returned, so what comes back is
 /// a stream whose blocks are already on their way. A session the host cannot
 /// serve is refused on that stream with an `error` frame rather than failing
-/// the request (spec 6.5); a status is left for what is wrong with the
-/// request itself.
+/// the request, so one dead or locked id never costs a client its healthy
+/// sessions. A status is left for what is wrong with the request itself.
 async fn events(
     State(state): State<Arc<ServerState>>,
     Query(params): Query<Vec<(String, String)>>,
@@ -540,7 +541,7 @@ fn task_id(raw: &str) -> Result<TaskId, ApiError> {
         .map_err(|_| ApiError::invalid(format!("{raw:?} is not a task id")))
 }
 
-/// A session mutation's answer: 202, per spec 6.6.
+/// A session mutation's answer: 202, effects are observable on the stream.
 fn accepted(outcome: CommandOutcome) -> Result<Response, ApiError> {
     match outcome {
         CommandOutcome::Accepted => Ok(StatusCode::ACCEPTED.into_response()),
@@ -555,13 +556,14 @@ fn accepted(outcome: CommandOutcome) -> Result<Response, ApiError> {
 
 /// Parse the stream's repeatable `session=<id>[@<epoch>:<seq>]` parameters.
 ///
-/// Unknown parameters are ignored (spec 6.10). Attaching nothing is legal:
+/// Unknown parameters are ignored: closed schemas are for JSON command bodies,
+/// not for attach queries. Attaching nothing is legal:
 /// that is the control connection a gateway opens for `list` frames alone.
 ///
 /// The id itself is not judged here. It is opaque at this layer, and the
 /// host's own gate refuses anything its store could not hold, per session on
-/// the stream (spec 6.2, 6.5), so an empty or malformed id is answered rather
-/// than failing the request.
+/// the stream, so an empty or malformed id is answered rather than failing
+/// the request.
 fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, ApiError> {
     let mut requests = Vec::new();
     for (key, value) in params {
@@ -729,8 +731,8 @@ where
     }
 }
 
-/// An unsuccessful response: the status plus the stable `{code, message}`
-/// body of spec 6.1.
+/// An unsuccessful response: the status plus the protocol's stable
+/// `{code, message}` body.
 struct ApiError {
     status: StatusCode,
     /// A stable snake_case token, so a client can branch on the reason
@@ -778,8 +780,8 @@ impl From<HostError> for ApiError {
             tracing::warn!("the host failed internally: {err}");
         }
         Self {
-            // The code is the host's own (spec 6.1), so a refusal reads the
-            // same whether it travels as this body or as an `error` frame.
+            // The code is the host's own, so a refusal reads the same whether
+            // it travels as this body or as an `error` frame.
             code: err.code(),
             status,
             message: err.to_string(),

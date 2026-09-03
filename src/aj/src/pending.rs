@@ -8,7 +8,7 @@
 //! hint.
 //!
 //! The queue it previews comes off the [`ChatState`], which every client
-//! keeps from `QueueUpdate` frames and the queue read (spec 6.7). Reading
+//! keeps from `QueueUpdate` frames and the queue read. Reading
 //! the model rather than a live [`aj_agent::queue::MessageQueues`] handle is
 //! what makes the box work for a remote frontend, which has no such handle.
 

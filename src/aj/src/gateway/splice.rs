@@ -1,10 +1,10 @@
-//! Splicing a client's session streams onto the hosts that own them (spec 7.1).
+//! Splicing a client's session streams onto the hosts that own them.
 //!
 //! One client stream is one [`Splice`]: the merged directory, one upstream
 //! stream per host whose sessions that client attached, and one bounded queue
 //! ([`crate::gateway::outbound`]) merging what the upstreams say. Every frame
 //! travels downstream with its session id namespaced and nothing else touched,
-//! kinds this build does not know included (spec 6.10).
+//! kinds this build does not know included.
 //!
 //! A stream that attaches nothing is a splice of nothing, which is what keeps
 //! one writer for both cases: the directory and heartbeats reach a sidebar the
@@ -13,10 +13,10 @@
 //! What this deliberately does not do is redial an upstream that dropped.
 //! Resuming one needs a *current* cursor, and the client's cursor advances as it
 //! applies the frames this gateway forwarded, so tracking one here would give
-//! the gateway per-session cursor state that spec 7.1 forbids and put a second,
+//! the gateway per-session cursor state it must not hold and put a second,
 //! subtly different cursor authority in the system. A drop therefore emits
 //! `reset` downstream, which means "continuity broke, re-attach with your
-//! cursor" (spec 6.3), and the client's own re-attach is the only thing that
+//! cursor", and the client's own re-attach is the only thing that
 //! opens an upstream. Resume is then incremental when the host's epoch survived
 //! and full when it did not, inherited from the host protocol with no gateway
 //! involvement.
@@ -25,7 +25,7 @@
 //! the same way all the same, `reset` included: the host has stopped being this
 //! gateway's, so the client is asked to re-attach, and what its re-attach finds
 //! is the difference between the two. A withdrawn host's ids resolve to nothing
-//! here, so each is refused with its own `error` frame (spec 6.5), which costs
+//! here, so each is refused with its own `error` frame, which costs
 //! that client the one attachment and nothing else. That is what makes the
 //! `reset` safe to send: a client attached across several hosts keeps its stream
 //! and every other host's sessions through it, and the directory, where the
@@ -49,7 +49,7 @@ use crate::remote::{RemoteClient, RemoteError, RemoteEvents};
 /// What one client stream writes next.
 pub(crate) enum Outgoing {
     /// The merged directory, which this gateway composes from its hosts' rows
-    /// and writes as a `list` frame (spec 7.1).
+    /// and writes as a `list` frame.
     Directory(Arc<MergedDirectory>),
     /// A frame this gateway composed itself: a heartbeat, or the refusal of a
     /// session it could not resolve.
@@ -68,13 +68,13 @@ pub(crate) struct Splice {
     /// Whether the opening directory has been written.
     opened: bool,
     /// The refusal owed to each session this gateway could not resolve, in the
-    /// order the client named them (spec 6.5).
+    /// order the client named them.
     ///
     /// Written straight onto the stream rather than through the client's
     /// bounded queue, because they are part of what the attach answers: a
     /// client naming more dead ids than the bound would otherwise be evicted
     /// by its own attach, which is the mistake pacing an attach block exists
-    /// to avoid (spec 7.1).
+    /// to avoid.
     refused: VecDeque<Frame>,
     /// Cancelled when this is dropped, which is what ends the upstream streams
     /// and the tasks pumping them: a client that goes away stops costing this
@@ -90,7 +90,7 @@ impl Splice {
     /// attach block is already on its way, so a failure of the request itself
     /// is an HTTP status rather than something a client would have to look for
     /// among the frames. What is wrong with one named session is not that: it
-    /// travels as that session's own `error` frame (spec 6.5). A host this
+    /// travels as that session's own `error` frame. A host this
     /// gateway holds no link to contributes no upstream at all (see
     /// [`AttachGroup::dial`]), and so does one withdrawn while this was dialing
     /// it.
@@ -131,8 +131,7 @@ impl Splice {
             // a host that is no longer this gateway's would hold up every other
             // host on this stream, answer the client after the withdrawal already
             // has, and end in a timeout, which is a 503 for the whole stream
-            // rather than the "contributes no upstream" a withdrawn host owes it
-            // (spec 7.1).
+            // rather than the "contributes no upstream" a withdrawn host owes it.
             let events = tokio::select! {
                 _ = group.serving.cancelled() => continue,
                 events = dial(&address, &group, tuning.upstream_timeout) => events?,
@@ -176,14 +175,14 @@ impl Splice {
     ///
     /// The latest merged directory opens the stream. Then come the refusals this
     /// gateway composed for the attach. Afterwards, directory changes, spliced
-    /// upstream frames, and heartbeats are written in arrival order (spec 6.1).
-    /// The directory is a watch rather than a queued frame because `list` is a
-    /// cumulative snapshot the newest supersedes (spec 6.4).
+    /// upstream frames, and heartbeats are written in arrival order. The
+    /// directory is a watch rather than a queued frame because `list` is a
+    /// cumulative snapshot the newest supersedes.
     ///
     /// A `list` or a heartbeat can land in the middle of an attach block, which a
     /// host's own stream never does (it drains a block before its live queue).
-    /// That is harmless: the ordering spec 6.5 asks for is within one session's
-    /// frames, and neither of these belongs to a session.
+    /// That is harmless: the ordering an attach block promises is within one
+    /// session's frames, and neither of these belongs to a session.
     pub(crate) async fn next_frame(
         &mut self,
         idle: Duration,
@@ -205,7 +204,7 @@ impl Splice {
         let woken = tokio::select! {
             _ = shutdown.cancelled() => Woken::Over,
             // `None` only from an eviction, which is what ends the stream of a
-            // client this gateway could not keep up with (spec 6.9).
+            // client this gateway could not keep up with.
             frame = self.frames.recv() => match frame {
                 Some(frame) => Woken::Spliced(frame),
                 None => Woken::Over,
@@ -248,7 +247,7 @@ struct Upstream {
     address: HostAddress,
     /// The sessions this stream attached, in the host's own vocabulary.
     sessions: Vec<String>,
-    /// Cancelled when this host's enrollment is withdrawn (spec 7.1).
+    /// Cancelled when this host's enrollment is withdrawn.
     serving: CancellationToken,
 }
 
@@ -256,7 +255,7 @@ struct Upstream {
 ///
 /// The ids that travel are the host's own and the cursors are the client's,
 /// untouched: the gateway holds no cursors, so what it offers upstream is what
-/// the client offered it (spec 7.1).
+/// the client offered it.
 ///
 /// `answer_within` bounds the response head only. The body stays open for as
 /// long as the client is attached, and silence on an open stream is what the
@@ -290,7 +289,7 @@ async fn dial(
         // Not a refusal: a host this gateway believed was there did not answer.
         // Carrying its sessions silently would leave a client watching frames
         // that never come, and nothing has marked them unreachable, so this is
-        // the 503 a gateway answers for a host it cannot reach (spec 6.1).
+        // the 503 a gateway answers for a host it cannot reach.
         err => unreachable(address, err),
     })
 }
@@ -381,7 +380,7 @@ async fn forward(
         // does not know can carry this far: a known kind with one fails to
         // decode. It cannot be namespaced, and forwarding it under the host's
         // own id would put an id no client of this gateway can address on the
-        // wire. An endpoint client discards unknown kinds anyway (spec 6.10).
+        // wire. An endpoint client discards unknown kinds anyway.
         Err(err) => {
             tracing::debug!("dropping a frame whose session id cannot be read: {err}");
             return true;
@@ -389,7 +388,7 @@ async fn forward(
     };
     let Some(session) = session else {
         // Host-scoped. The merged `list` is this gateway's own composition from
-        // its control links (spec 7.1), so a host's own would put ids no client
+        // its control links, so a host's own would put ids no client
         // here can address on the stream, and a heartbeat belongs to the
         // connection it was written on rather than to what rides it. Everything
         // else travels, an unknown kind that names no session included.
@@ -426,7 +425,7 @@ async fn forward(
 }
 
 /// Whether `frame` ends a session's attach block: the `caught_up` that closes
-/// one, or the `error` frame the server sent instead of one (spec 6.5).
+/// one, or the `error` frame the server sent instead of one.
 fn ends_a_block(frame: &DecodedFrame) -> bool {
     matches!(
         frame,
@@ -447,7 +446,7 @@ struct HostReturn {
 ///
 /// The control link is the reachability oracle: it redials on its own, and its
 /// return is what makes an upstream attach succeed again. A client learns of
-/// that only by attaching, and `reset` is how it is asked to (spec 6.3, 7.1).
+/// that only by attaching, and `reset` is how it is asked to.
 ///
 /// Only the edge from down to up, and only one this stream observed. Emitting at
 /// open would spin a client whose host is down (attach, reset, re-attach, reset),
@@ -491,7 +490,7 @@ async fn returns(
     }
 }
 
-/// A `reset` for one namespaced session (spec 6.3).
+/// A `reset` for one namespaced session.
 fn reset(session: &str) -> DecodedFrame {
     DecodedFrame::try_from(Frame::Reset {
         session: session.to_string(),
@@ -499,7 +498,8 @@ fn reset(session: &str) -> DecodedFrame {
     .expect("a reset frame carries nothing that could fail validation")
 }
 
-/// The refusal one unresolvable session is owed (spec 6.3, 6.5).
+/// The refusal one unresolvable session is owed: a session-scoped `error`
+/// frame in place of its attach block.
 ///
 /// Named as the client named it: an id this gateway cannot resolve is one it
 /// could not have minted either, so there is nothing to namespace and the id
@@ -518,7 +518,7 @@ fn refusal(unresolvable: Unresolvable) -> Frame {
 }
 
 /// The code an attach refusal carries, the same one a proxied request to an
-/// unresolvable id answers with (spec 6.1).
+/// unresolvable id answers with.
 const UNKNOWN_SESSION: &str = "unknown_session";
 
 #[cfg(test)]
@@ -540,7 +540,7 @@ mod tests {
     const ROUNDS: usize = 64;
 
     /// An upstream that ended in the very poll its host was withdrawn in sends
-    /// its `reset` all the same (spec 7.1).
+    /// its `reset` all the same.
     ///
     /// Both are true at once here, which is a state the enrollment reaches for
     /// real: the pump is spawned only after every dial, so a withdrawal during
@@ -608,7 +608,7 @@ mod tests {
     }
 
     /// The merged directory is the literal first frame even when a spliced
-    /// refusal is already queued (spec 6.5, 7.1).
+    /// refusal is already queued.
     ///
     /// This is the ordering that lets a client evaluate the refusal against the
     /// gateway's latest row. Moving the queued-frame read above the opening-list

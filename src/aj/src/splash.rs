@@ -1,6 +1,5 @@
 //! The empty-state splash: an animated `aj` wordmark, a command-palette hint,
-//! and, when there are startup warnings, one bordered notices box below them
-//! (Spec E-9).
+//! and, when there are startup warnings, one bordered notices box below them.
 //!
 //! Shown in the chat slot before the conversation has any user or assistant
 //! entry. The animation is tick-driven off the frame clock the async driver
@@ -43,7 +42,7 @@ pub(crate) const SPLASH_WAKE_EVENT: &str = "aj.splash.wake";
 
 /// Decorative lavender-to-purple gradient for the logo, light to dark.
 ///
-/// Per Spec E-9 this is a widget-local gradient, deliberately NOT a theme
+/// A widget-local gradient, deliberately NOT a theme
 /// token: it is ornament, not semantic UI color, so it is fixed rather than
 /// palette-resolved. It renders through [`vaxis_color`] so it downsamples on
 /// non-truecolor terminals like every other color.

@@ -1,4 +1,5 @@
-//! Client-side fold of one session's frame stream (spec 6.5).
+//! Client-side fold of one session's frame stream: attach blocks, epoch
+//! adoption, cursor bookkeeping, and live application.
 //!
 //! [`SessionClient`] is the consumer contract a session host has to
 //! satisfy. It turns the frames of one session into reducer calls and
@@ -15,7 +16,7 @@
 //! whatever owns the session directory and the connection, not to one
 //! session's fold. Unknown frame kinds never arrive here at all:
 //! `aj-wire` decodes them into `DecodedFrame::Unknown`, which an endpoint
-//! client discards (spec 6.10, only a gateway forwards them).
+//! client discards (only a gateway forwards them).
 //!
 //! Nothing in the fold can fail. A frame is either applied or dropped, so
 //! no operation here returns a `Result`.
@@ -28,17 +29,17 @@ use crate::host::PERSISTENCE_FAILED_CODE;
 use crate::session::AgentLifecycle;
 
 /// Why a session is withheld, which names the edge in the peer's directory
-/// that re-asks for it (spec 6.5).
+/// that re-asks for it.
 ///
 /// Read off the refusal's code once, where the frame is folded, so the wire's
 /// vocabulary stays in this module and whatever watches the directory reads a
 /// decision rather than a token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// The `locked` code: a rival writer holds the session (spec section 5).
+    /// The `locked` code: a rival writer holds the session's advisory lock.
     /// Its row stays listed for as long as the hold lasts, so the edge that
     /// says the answer can have changed is the row's `locked` bit going true
-    /// then false, the rival letting go (spec 6.8). The absence edge is kept
+    /// then false, the rival letting go. The absence edge is kept
     /// besides, because a row can leave and return anyway and comes back
     /// rebuilt with the bit already false.
     Locked {
@@ -49,16 +50,16 @@ pub enum Refusal {
         /// lossy-coalescible: the rise and the fall are seconds apart by
         /// design, so a client that does not drain in between sees only the
         /// fall's snapshot and has nothing to compare it against. This is what
-        /// makes the recovery derivable from that one snapshot instead (spec
-        /// 6.5): a row reporting the lock free at this generation or beyond says
+        /// makes the recovery derivable from that one snapshot instead: a row
+        /// reporting the lock free at this generation or beyond says
         /// this conflict is over.
         generation: Option<u64>,
     },
     /// Every other code, the ones this build has never heard of included: the
     /// row's return to the list is the edge, and nothing else. An unknown
     /// refusal behaves like the refusals this build knows rather than like the
-    /// most specific one, which is spec 6.6's additive codes applied to
-    /// rejoining.
+    /// most specific one: error codes are additive, so an unknown one gets the
+    /// generic handling.
     Other,
 }
 
@@ -165,7 +166,7 @@ impl ForwardReset {
     }
 }
 
-/// Where the client stands relative to an attach block (spec 6.5).
+/// Where the client stands relative to an attach block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attach {
     /// No attach outstanding. Every frame is a live one.
@@ -268,7 +269,7 @@ impl SessionClient {
     /// The client is the one that asks for an attach, so the request is
     /// what identifies the block's opening `state` frame. Nothing in the
     /// frame itself can: the host re-emits `state` whenever any of it
-    /// changes (spec 6.3), and an on-change re-emission must neither adopt
+    /// changes, and an on-change re-emission must neither adopt
     /// an epoch nor quiesce.
     ///
     /// Contract: arm only once the attach has been served, from what the
@@ -332,7 +333,7 @@ impl SessionClient {
                         return Redraw(false);
                     }
                     // Inside an attach block the cursor does not move per
-                    // frame. Spec 6.5 makes the block atomic and its
+                    // frame. The block is atomic and its
                     // `caught_up` commits it once, which is what lets the
                     // projection order its events by thread bracketing
                     // rather than by seq. Today's projection happens to tag
@@ -349,7 +350,7 @@ impl SessionClient {
                 // An unknown event type is skipped before the reducer, but
                 // its envelope applied above: dropping it without
                 // advancing the cursor would make every reconnect refetch
-                // an event this client will never understand (spec 6.10).
+                // an event this client will never understand.
                 let DecodedAgentEvent::Known(known) = event else {
                     return Redraw(false);
                 };
@@ -430,7 +431,7 @@ impl SessionClient {
                 self.committed = Some(last_seq);
                 self.attach = Attach::Live;
                 // Neither task events nor queue updates are replayable, so
-                // both tables have to come from their reads (spec 6.7).
+                // both tables have to come from their reads.
                 self.needs_task_refetch = true;
                 self.needs_queue_refetch = true;
                 if self
@@ -455,8 +456,8 @@ impl SessionClient {
                 if !self.is_ours(&session) {
                     return Redraw(false);
                 }
-                // Not filtered by epoch, the way `reset` is not: the frames
-                // spec 6.5 filters are the ones that carry state under one, and
+                // Not filtered by epoch, the way `reset` is not: the epoch
+                // filter applies to frames that carry state under one, and
                 // a refusal for a session the server cannot resolve names none.
                 //
                 // Every error frame drops the attachment, whatever its code,
@@ -465,19 +466,20 @@ impl SessionClient {
                 // is too. The code decides only which edge asks again, never
                 // whether to let go: a refused client is following nothing
                 // either way, and a code this build has never heard of has to
-                // behave like the refusals it knows (spec 6.6).
+                // behave like the refusals it knows, codes being additive.
                 //
                 // A materialization that ended over a fused log is the one
                 // code that owes no waiting: the host rebuilds the session
-                // from disk on the next ask (spec 6.5), so the obligation is
+                // from disk on the next ask, so the obligation is
                 // taken back at once instead of waiting for a directory edge
                 // the row may never show (a durable session stays listed).
                 self.drop_attachment(Refusal::from_code(&code, lock_generation), message.clone());
                 if code == PERSISTENCE_FAILED_CODE {
                     self.owe_reattach();
                 }
-                // The message verbatim, which spec 6.6 makes sufficient on its
-                // own, so a code this build has never heard of still reads.
+                // The message verbatim: an error's message is always a
+                // sufficient human sentence on its own, so a code this build
+                // has never heard of still reads.
                 reduce(
                     chat,
                     &mut self.lifecycle,
@@ -563,7 +565,7 @@ impl SessionClient {
         self.working
     }
 
-    /// Replace the queue snapshot from the queue read (spec 6.7), which is
+    /// Replace the queue snapshot from the queue read, which is
     /// how a mid-session joiner learns about messages queued before it
     /// attached. Clears [`Self::needs_queue_refetch`].
     pub fn set_queue(&mut self, chat: &mut ChatState, queue: QueueState) {
@@ -717,7 +719,7 @@ impl SessionClient {
         self.owe_reattach();
     }
 
-    /// Drop the attachment for a session the server refused (spec 6.5).
+    /// Drop the attachment for a session the server refused.
     ///
     /// Everything the fold holds about the session comes from an attach block
     /// that is not coming: the epoch it applied under and the cursor it would
@@ -733,8 +735,8 @@ impl SessionClient {
     /// *until the peer's own directory says the answer can have changed*, which
     /// is `SessionDirectory`'s to notice, and it puts the obligation back
     /// ([`Self::owe_reattach`]). `refusal` is what tells it which edge to watch.
-    /// Spec 6.5 permits the later attach that costs a full backfill. What it
-    /// does not ask for is a retry loop.
+    /// A later attach that costs a full backfill is always permitted. What is
+    /// never permitted is a retry loop.
     ///
     /// Deliberately not what a `reset` does. That one says continuity broke on a
     /// session the server still has, so its obligation stands and is discharged
@@ -833,8 +835,8 @@ impl SessionClient {
     /// forever: no projected event carries a lifecycle bracket. Between state
     /// frames, live lifecycle events are authoritative.
     ///
-    /// Scoped to `Main`, because `working` says nothing about sub-agents
-    /// (spec 6.3). Clearing their marks here would undercount the running
+    /// Scoped to `Main`, because `working` says nothing about sub-agents.
+    /// Clearing their marks here would undercount the running
     /// agents in the footer and stop a background sub's spinner after every
     /// re-attach, while its box still reads `Running`. A sub whose
     /// `AgentEnd` this client missed is cleared by the host's
@@ -1090,7 +1092,7 @@ mod tests {
         }
     }
 
-    /// A refused attach is surfaced and ends the attachment (spec 6.5): the
+    /// A refused attach is surfaced and ends the attachment: the
     /// session is gone, so there is nothing left to offer a cursor for and
     /// nothing to fold.
     #[test]
@@ -1111,7 +1113,7 @@ mod tests {
         assert_eq!(
             errors(&chat),
             vec!["unknown session session-1"],
-            "the host's own sentence reaches the user (spec 6.6)",
+            "the host's own sentence reaches the user verbatim",
         );
         assert_eq!(
             client.cursor(),
@@ -1161,7 +1163,7 @@ mod tests {
     }
 
     /// A materialization that ended over a fused log drops the attachment
-    /// like any refusal, but owes the re-ask at once (spec 6.5): the host
+    /// like any refusal, but owes the re-ask at once: the host
     /// rebuilds the session from disk on that ask, and the row stays listed
     /// throughout, so no directory edge would ever fire.
     #[test]
@@ -1598,7 +1600,7 @@ mod tests {
     }
 
     /// Inside a block the cursor does not move per frame, so a durable
-    /// frame that came out below an earlier one still applies (spec 6.5).
+    /// frame that came out below an earlier one still applies.
     ///
     /// The block is atomic and its `caught_up` commits it once, which is
     /// what lets the projection order its events by thread bracketing
@@ -1940,7 +1942,7 @@ mod tests {
     }
 
     /// A re-attach seeds the main agent's mark and leaves the sub-agents'
-    /// alone: `working` says nothing about them (spec 6.3), and clearing a
+    /// alone: `working` says nothing about them, and clearing a
     /// running background sub's mark would stop its spinner and undercount
     /// the footer's running agents until it ends.
     #[test]

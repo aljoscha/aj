@@ -1,5 +1,4 @@
-//! The HTTP transport end to end (spec 6.1-6.11, and the equivalence
-//! harness of 11.2).
+//! The HTTP transport end to end, and the reducer-equivalence harness.
 //!
 //! Everything here runs a real host over the scripted provider behind a real
 //! loopback server, so the bytes under test are the bytes a remote client
@@ -7,13 +6,14 @@
 //!
 //! - the identity gate, against a faked whois resolver,
 //! - the routes: the handshake, the reads, the mutations, and the status
-//!   vocabulary of spec 6.1,
+//!   vocabulary,
 //! - reducer equivalence: one client attached in process as the oracle and
 //!   one through HTTP, folded with the same [`SessionClient`] and compared on
 //!   [`CanonicalState`], including the fault-injection variant that cuts the
 //!   stream and re-attaches with a cursor. The no-fault comparisons use the
-//!   full canonical form, the seeded cut sweep uses its convergent tier
-//!   (spec 11.2). The hand-placed cuts further down stay on the full form:
+//!   full canonical form, the seeded cut sweep uses its convergent tier,
+//!   which masks the rows no durable entry backs. The hand-placed cuts
+//!   further down stay on the full form:
 //!   no transient goes missing across those cuts, so the stronger tier
 //!   holds and there is no reason to give it up.
 //!
@@ -98,7 +98,7 @@ fn attach(session: &str) -> AttachRequest {
 }
 
 /// The first `error` frame on `events`: the session it refuses, its code, and
-/// its message (spec 6.3).
+/// its message.
 async fn refusal(events: &mut RemoteEvents) -> (String, String, String) {
     bounded("a session-scoped refusal", async {
         loop {
@@ -119,7 +119,7 @@ async fn refusal(events: &mut RemoteEvents) -> (String, String, String) {
 }
 
 // ---------------------------------------------------------------------------
-// The identity gate (spec 6.11)
+// The identity gate
 // ---------------------------------------------------------------------------
 
 /// A resolver with a fixed answer, recording the peers it was asked about.
@@ -229,7 +229,7 @@ async fn local_mode_accepts_loopback_and_refuses_everyone_else() {
 
 /// Serving a non-loopback address in `local` mode would serve it
 /// unauthenticated, so the gate refuses at start-up rather than answering 403
-/// forever (spec 6.11).
+/// forever.
 #[test]
 fn local_mode_refuses_an_unsafe_bind() {
     let gate = IdentityGate::local();
@@ -272,7 +272,7 @@ async fn tailscale_mode_accepts_an_allowlisted_login() {
 }
 
 /// A tagged node has no login to allowlist, so the app capability is the only
-/// way in (spec 6.11).
+/// way in.
 #[tokio::test]
 async fn tailscale_mode_accepts_a_tagged_node_carrying_the_capability() {
     let whois = FakeWhois::resolving(tagged_peer(&[AJ_CONTROL_CAPABILITY]));
@@ -545,7 +545,7 @@ impl HostHandles {
 }
 
 /// A host over `dir`'s session store, running `provider` and calling itself
-/// `name`, or deriving a name from `dir` where that is `None` (spec 6.1).
+/// `name`, or deriving a name from `dir` where that is `None`.
 ///
 /// The one recipe for a test host in this crate: the transport fixture, the
 /// second host of a lock conflict and the gateway's upstreams all come from
@@ -780,7 +780,7 @@ impl Fixture {
     }
 
     /// Create a session over the wire, which is the only way a fresh host is
-    /// reachable at all (spec 9.1).
+    /// reachable at all.
     async fn create(&self) -> String {
         self.client
             .create_session(CreateSessionRequest::default())
@@ -853,7 +853,7 @@ impl Fixture {
 /// How one client reaches the host: in process, or over HTTP.
 ///
 /// Both arms carry the attach path and the two reads a client owes after
-/// `caught_up` (spec 6.5), which is what lets one fold run against either
+/// `caught_up`, which is what lets one fold run against either
 /// transport and be compared against the other.
 enum Transport {
     Local(SessionHost),
@@ -1044,7 +1044,7 @@ impl Attached {
     /// The host's own row is the authority for "idle", not the fold's
     /// `working` flag. The `state` frame that would set that flag is lossy,
     /// and one published while this client's attach block was still being
-    /// written is dropped rather than queued (spec 6.5), so a client that
+    /// written is dropped rather than queued, so a client that
     /// attached just before a short turn may never be told the turn ran at
     /// all.
     ///
@@ -1120,7 +1120,7 @@ impl Attached {
 
     async fn apply(&mut self, frame: Frame) {
         match &frame {
-            // A block delivers whole and says so at its own mark (spec 6.5).
+            // A block delivers whole and says so at its own mark.
             Frame::CaughtUp { last_seq, .. } => self.delivered = Some(*last_seq),
             Frame::Event {
                 durability: Some(durable),
@@ -1130,7 +1130,7 @@ impl Attached {
         }
         let _ = self.client.apply(&mut self.chat, frame);
         // Neither task events nor queue updates are replayable, so every
-        // `caught_up` leaves both reads outstanding (spec 6.5, 6.7). A real
+        // `caught_up` leaves both reads outstanding. A real
         // client discharges them right there, and so does this one.
         self.discharge().await;
     }
@@ -1172,7 +1172,7 @@ fn assert_converged(remote: &Attached, oracle: &Attached, context: &str) {
 /// convergent tier, with no dangling ids on either.
 ///
 /// The tier for a client whose connection died: a reliable-transient frame
-/// published while it was away is not replayable (spec 6.4), so both sides
+/// published while it was away is not replayable, so both sides
 /// are compared with those artifacts masked out. Everything a backfill
 /// regenerates is still compared, dangling ids included.
 #[track_caller]
@@ -1279,7 +1279,7 @@ fn sub_box(state: &CanonicalState, child: usize) -> (SubAgentStatus, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// The handshake, creation, and the reads (spec 6.1, 6.6, 6.7)
+// The handshake, creation, and the reads
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1398,7 +1398,7 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
             .settings()
             .map(|settings| settings.speed.clone()),
         Some("fast".to_string()),
-        "the creator's settings are the session's settings (spec section 8)",
+        "the creator's settings are the session's settings",
     );
     assert_eq!(
         assistant_texts(&remote.canonical()),
@@ -1420,7 +1420,7 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
 }
 
 /// A create may name the host it is for, and a host serves exactly one
-/// working directory (spec 6.6): an absent field and this host's own id are
+/// working directory: an absent field and this host's own id are
 /// both a create for here, and any other host's id is refused rather than
 /// served on its behalf.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1475,7 +1475,7 @@ async fn a_create_naming_another_host_is_refused() {
         err.code(),
         Some("unsupported"),
         "a well-formed request this host cannot serve, which the same request \
-         against the named host could (spec 6.1)",
+         against the named host could",
     );
     assert!(
         err.to_string().contains(&own),
@@ -1486,7 +1486,7 @@ async fn a_create_naming_another_host_is_refused() {
 }
 
 /// Both arms of the control seam apply that same rule, so a caller that names a
-/// host is written once and runs in either mode (spec 6.6).
+/// host is written once and runs in either mode.
 ///
 /// The in-process arm has no HTTP route to enforce it and no reason to be more
 /// permissive: a host serves one working directory whether it is reached across
@@ -1647,8 +1647,7 @@ async fn control_never_drops_env_from_a_remote_create() {
 }
 
 /// A model change travels as the (api, url, name) triple and is resolved
-/// against the host's own catalog, never accepted as a catalog object
-/// (spec 6.6).
+/// against the host's own catalog, never accepted as a catalog object.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_model_change_resolves_against_the_host_catalog() {
     let fixture = Fixture::new(vec![finalized_text_message("answered")]).await;
@@ -1710,7 +1709,7 @@ async fn the_reads_answer_tasks_queue_and_tree() {
     assert!(!tree.segments.is_empty(), "the log has a branch tree");
 
     // A withdrawal answers with the text it took, which is what makes the
-    // client's dequeue gesture work (spec 6.6). Staged through the in-process
+    // client's dequeue gesture work. Staged through the in-process
     // handles, because an idle session runs a prompt instead of queueing it.
     let handles = fixture
         .host
@@ -1765,7 +1764,7 @@ async fn the_reads_answer_tasks_queue_and_tree() {
 }
 
 /// The per-task read is what backs the task-output overlay in connect mode:
-/// the host's spill file is not reachable remotely (spec 6.7).
+/// the host's spill file is not reachable remotely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_task_read_answers_a_live_task_and_404s_an_unknown_one() {
     let fixture = Fixture::new(background_task_turn()).await;
@@ -2269,7 +2268,7 @@ async fn post_tag(fixture: &Fixture, session: &str, body: serde_json::Value) -> 
 }
 
 /// The tag route sets a label and clears it, and the label reaches the row a
-/// client reads back (spec 6.6, 6.8). Clearing travels as the empty string,
+/// client reads back. Clearing travels as the empty string,
 /// which is why there is no second route for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tag_route_sets_and_clears_a_label() {
@@ -2558,7 +2557,7 @@ async fn both_control_arms_report_a_created_session_whose_label_did_not_stick() 
 }
 
 // ---------------------------------------------------------------------------
-// The status vocabulary (spec 6.1)
+// The status vocabulary
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2602,7 +2601,7 @@ async fn an_unknown_session_answers_404_on_every_route() {
         refusals.push(fixture.client.command(missing, &command).await.err());
     }
     // The stream route is the one that refuses per session rather than per
-    // request (spec 6.5), so its refusal is a frame and lives in
+    // request, so its refusal is a frame and lives in
     // `a_stream_refuses_one_session_and_serves_the_rest`.
 
     assert_eq!(refusals.len(), 12, "every session-scoped route is covered");
@@ -2614,7 +2613,7 @@ async fn an_unknown_session_answers_404_on_every_route() {
     fixture.shutdown().await;
 }
 
-/// A stream request never fails wholesale over one bad session (spec 6.5):
+/// A stream request never fails wholesale over one bad session:
 /// the refusal is a session-scoped frame on an open stream rather than a
 /// status, and every other session it named is served on that same stream.
 ///
@@ -2629,7 +2628,7 @@ async fn a_stream_refuses_one_session_and_serves_the_rest() {
         .client
         .events(&[
             // Well-formed and not in the store, and an id the store's grammar
-            // refuses outright (spec 6.2). Both refuse per session.
+            // refuses outright. Both refuse per session.
             attach("20260101-000000-000"),
             attach("../elsewhere/reachable"),
             attach(&session),
@@ -2710,7 +2709,7 @@ async fn a_traversal_id_is_refused_at_the_wire_boundary() {
 
     // The stream route carries its id in a query parameter, where nothing
     // normalizes it, so this is the one that really exercises the host's
-    // gate. It refuses per session (spec 6.5), so the refusal is a frame on
+    // gate. It refuses per session, so the refusal is a frame on
     // an open stream rather than a status. An empty id answers the same way.
     for id in ["../elsewhere/reachable", "..", ""] {
         let mut events = fixture
@@ -2869,8 +2868,8 @@ async fn a_head_switch_naming_no_target_or_two_answers_400() {
 }
 
 /// The `before` shape crosses HTTP and lands on the named entry's parent,
-/// which is what makes a branch replace the message it was taken from (spec
-/// 6.6). An unknown entry is a 404 and the session's first entry is refused,
+/// which is what makes a branch replace the message it was taken from. An
+/// unknown entry is a 404 and the session's first entry is refused,
 /// so a client cannot branch a session into having no history.
 #[tokio::test]
 async fn a_head_switch_before_an_entry_resolves_over_http() {
@@ -2949,8 +2948,8 @@ async fn a_head_switch_before_an_entry_resolves_over_http() {
 }
 
 /// A session another host holds is a 409 `locked`: materializing takes the
-/// session's advisory lock, and a second writer on one log would corrupt it
-/// (spec section 5). Every route that would materialize answers it, and the
+/// session's advisory lock, and a second writer on one log would corrupt it.
+/// Every route that would materialize answers it, and the
 /// reads that do not materialize answer for a cold session instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_another_host_holds_answers_409_locked() {
@@ -2980,7 +2979,7 @@ async fn a_session_another_host_holds_answers_409_locked() {
         "the rival shares the store, so it discovers the session",
     );
 
-    // The stream refuses per session (spec 6.5), so the lock's refusal is a
+    // The stream refuses per session, so the lock's refusal is a
     // frame on an open stream rather than a status.
     let mut events = rival
         .events(&[attach(&session)])
@@ -3017,7 +3016,7 @@ async fn a_session_another_host_holds_answers_409_locked() {
     }
 
     // The reads that do not materialize answer instead, for a session that is
-    // cold as far as this host is concerned (spec 6.7). A lock refusal here
+    // cold as far as this host is concerned. A lock refusal here
     // would be wrong: nothing about them takes the log.
     assert!(
         rival
@@ -3064,7 +3063,7 @@ async fn a_session_another_host_holds_answers_409_locked() {
 }
 
 /// A model the host cannot serve is a 409, not a 400: nothing about the
-/// request is malformed and another host may well serve it (spec 6.1).
+/// request is malformed and another host may well serve it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_model_the_host_does_not_have_answers_409() {
     let fixture = Fixture::new(Vec::new()).await;
@@ -3143,7 +3142,7 @@ async fn a_remote_settings_change_never_persists() {
 }
 
 // ---------------------------------------------------------------------------
-// The stream (spec 6.1, 6.3, 6.5)
+// The stream
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3215,8 +3214,7 @@ async fn one_stream_attaches_several_sessions() {
 }
 
 /// An idle stream heartbeats with a real frame, and the timer restarts after
-/// every write, so a client can tell a live connection from a stalled one
-/// (spec 6.1).
+/// every write, so a client can tell a live connection from a stalled one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_stream_heartbeats_with_a_real_frame() {
     let fixture = Fixture::build(
@@ -3252,7 +3250,7 @@ async fn an_idle_stream_heartbeats_with_a_real_frame() {
 }
 
 /// Silence is what a dead stream looks like to a client, and it has to end
-/// with an error the caller can reconnect from (spec 6.1).
+/// with an error the caller can reconnect from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_silent_stream_is_reported_dead() {
     // A heartbeat interval far beyond the client's tolerance, so the stream
@@ -3300,7 +3298,7 @@ async fn a_silent_stream_is_reported_dead() {
 /// every iteration and re-creates its awaiting `recv` future whenever another
 /// `select!` arm wins. A deadline measured from the call would restart on
 /// every one of those, and a host wedged mid-turn (whose spinner keeps the
-/// loop iterating) would never be declared dead (spec 6.1).
+/// loop iterating) would never be declared dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_silent_stream_is_reported_dead_to_a_polling_client() {
     let silence = Duration::from_millis(300);
@@ -3393,7 +3391,7 @@ async fn opening_a_stream_against_a_mute_host_is_abandoned() {
 }
 
 // ---------------------------------------------------------------------------
-// Client decode rules the real host cannot produce (spec 6.10)
+// Client decode rules the real host cannot produce
 // ---------------------------------------------------------------------------
 
 /// A stand-in server that answers canned bodies: a frame kind this build
@@ -3544,7 +3542,7 @@ async fn an_unknown_frame_kind_is_skipped_and_a_malformed_known_one_errors() {
 }
 
 /// The same stream read as decoded frames keeps the unknown kind, with its
-/// JSON intact. That is the form a gateway forwards from (spec 6.10), so the
+/// JSON intact. That is the form a gateway forwards from, so the
 /// discarding an endpoint client does must not be the only way to read a
 /// stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3617,7 +3615,7 @@ fn a_base_url_has_to_be_absolute_http() {
 }
 
 // ---------------------------------------------------------------------------
-// The identity gate over HTTP (spec 6.11, 11.4)
+// The identity gate over HTTP
 // ---------------------------------------------------------------------------
 
 const PROBED_ROUTES: [&str; 18] = [
@@ -3976,7 +3974,7 @@ async fn a_peer_from_the_outer_global_allow_occurrence_can_connect() {
 }
 
 // ---------------------------------------------------------------------------
-// Reducer equivalence (spec 11.2)
+// Reducer equivalence
 // ---------------------------------------------------------------------------
 
 /// The core property: a client fed through the real HTTP stack lands on the
@@ -4004,7 +4002,7 @@ async fn an_http_client_converges_with_an_in_process_oracle() {
 }
 
 /// The task table is not replayable, so a client owes the tasks read after
-/// every `caught_up` (spec 6.5, 6.7). A joiner that arrives after the task
+/// every `caught_up`. A joiner that arrives after the task
 /// started has to end up with the table a client that watched it start has,
 /// and with the same launch cell: badge, structured body and wire content.
 ///
@@ -4081,8 +4079,7 @@ async fn a_joiner_refetches_the_task_table_after_caught_up() {
 }
 
 /// A mid-session joiner learns the active settings from the attach `state`
-/// frame, which is their only carrier: no projected event names them
-/// (spec 6.3, 9.1).
+/// frame, which is their only carrier: no projected event names them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mid_session_joiner_sees_the_active_settings() {
     let fixture = Fixture::new(vec![finalized_text_message("answered")]).await;
@@ -4510,7 +4507,7 @@ async fn a_cut_with_a_tool_and_a_sub_agent_running_converges() {
 /// The named sharp edge: a re-attach where zero durable entries follow the
 /// cursor, yet a sub-agent concluded in the gap. Its `SubAgentEnd` is
 /// reliable-transient, so what has to conclude the client's box is the block
-/// itself (spec 6.5).
+/// itself: the host concludes every sub it knows to be idle after `caught_up`.
 ///
 /// The gap is real here: the client's box is `Running` when it comes back. The
 /// parent stays blocked on a slow command while the sub finishes, which is what
@@ -4532,8 +4529,7 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
     // Up to the usage update trailing the sub-agent's assistant message, which
     // is its last durable entry and the last event that entry projects. So the
     // client has applied everything the log holds, and holds the entry back
-    // from its committed cursor only because a trailing event might follow it
-    // (spec 6.5).
+    // from its committed cursor only because a trailing event might follow it.
     remote
         .pump_until("the sub-agent's usage update", |frame| {
             matches!(frame, Frame::Event { event, .. }
@@ -4561,7 +4557,7 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
     // under the epoch the fold adopted. The client applied every entry up to
     // it, it only held the last one back from its committed cursor, so this is
     // the boundary the reattach below has to be served at. A client may not
-    // turn a position it read in the directory into a cursor (spec 6.5), the
+    // turn a position it read in the directory into a cursor, the
     // test is reading ground truth to build the case.
     let epoch = remote.client.cursor().expect("a committed cursor").epoch;
     let last_seq = fixture
@@ -4616,7 +4612,7 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
 }
 
 /// A head switch mints a fresh epoch, so a client that has not re-attached
-/// drops everything the new branch produces (spec 6.5). Once it does
+/// drops everything the new branch produces. Once it does
 /// re-attach, the full backfill lands it where a client that only ever saw
 /// the new branch is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

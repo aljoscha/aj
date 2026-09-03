@@ -1,5 +1,4 @@
-//! The session host: lifecycle, fan-out, attach, commands, reads
-//! (spec section 5, 6.3-6.9).
+//! The session host: lifecycle, fan-out, attach, commands, reads.
 //!
 //! Every test drives the real host over the scripted provider, so the
 //! frames asserted on are the ones a network server would serialize and
@@ -149,7 +148,7 @@ impl Harness {
     }
 
     /// A host whose clients are evicted after `capacity` undeliverable
-    /// frames, so a test can watch the flow-control rule of spec 6.9 without
+    /// frames, so a test can watch the eviction-over-buffering rule without
     /// generating hundreds of them.
     fn with_live_capacity(messages: Vec<AssistantMessage>, capacity: usize) -> Self {
         Self::with_run_config(
@@ -484,7 +483,7 @@ fn drained(stream: &mut Attachment) -> Vec<Frame> {
 }
 
 /// The frames of one session. A stream carries every session's durable and
-/// reliable-transient frames, attached or not (spec 6.5), so a test that
+/// reliable-transient frames, attached or not, so a test that
 /// asserts on one session has to say which.
 fn only(frames: Vec<Frame>, session: &str) -> Vec<Frame> {
     frames
@@ -1015,7 +1014,7 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
     let harness = Harness::with_run_config(base, Vec::new(), None, None);
 
     // Something is stated, but not thinking, so the host defaults that axis
-    // against the model it actually runs (spec section 8).
+    // against the model it actually runs.
     let session = harness
         .host
         .create_with(
@@ -1086,7 +1085,7 @@ async fn refused_creation_leaves_no_discoverable_session() {
         ),
         (None, Some(Vec::new()), None),
         // A label the store would not keep, which is refused on the same
-        // terms as a setting it cannot serve (spec 6.6).
+        // terms as a setting it cannot serve.
         (None, None, Some("two\nlines".to_string())),
         (None, None, Some("l".repeat(aj_session::MAX_TAG_BYTES + 1))),
     ] {
@@ -1329,13 +1328,13 @@ async fn an_unknown_session_is_refused() {
 
 /// An id that could never name a log in this store is refused at every
 /// entry point, and refused off its own shape: it does not reach the store
-/// at all (spec 6.2).
+/// at all.
 ///
 /// The stream route is the one entry point whose refusal is per session
-/// rather than per request (spec 6.5), so it has its own test
+/// rather than per request, so it has its own test
 /// ([`an_attach_refuses_an_ungrammatical_id_without_asking_the_store`]) and
 /// stays out of the directory-read budget below, which an attach spends on
-/// its own account as an enumeration point (spec 6.8).
+/// its own account as an enumeration point.
 ///
 /// One of the ids points at a real, readable log just outside the store, so
 /// the refusal cannot be the file simply not being there.
@@ -1417,8 +1416,8 @@ async fn an_id_that_is_not_a_session_id_never_reaches_the_store() {
 }
 
 /// An attach reports the sessions it served, and one named twice is a
-/// malformed request: the client contract is one block per named session
-/// (spec 6.5), and the second block would open a phase the client is not
+/// malformed request: the client contract is one block per named session,
+/// and the second block would open a phase the client is not
 /// expecting and quiesce state it just applied.
 #[tokio::test]
 async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
@@ -1461,7 +1460,7 @@ async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
     assert!(matches!(err, HostError::Invalid(_)), "got {err:?}");
 
     // A session the host cannot resolve is refused on the stream rather than
-    // as the request (spec 6.5), and it is not among what was served, so a
+    // as the request, and it is not among what was served, so a
     // client has nothing to arm its fold with.
     let mut stream = harness
         .host
@@ -1487,7 +1486,7 @@ async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
     harness.host.shutdown().await;
 }
 
-/// A stream never fails wholesale over one bad session (spec 6.5): every
+/// A stream never fails wholesale over one bad session: every
 /// session it names gets either its attach block or a session-scoped `error`
 /// frame, and the rest are served in order.
 ///
@@ -1510,7 +1509,7 @@ async fn an_attach_refuses_a_session_it_cannot_resolve_and_serves_the_rest() {
             attach_request(&first),
             // In the store's grammar, and not in the store.
             attach_request("20260101-000000-000"),
-            // Not in the store's grammar at all (spec 6.2).
+            // Not in the store's grammar at all.
             attach_request("../elsewhere/reachable"),
             attach_request(&second),
         ])
@@ -1561,7 +1560,7 @@ async fn an_attach_refuses_a_session_it_cannot_resolve_and_serves_the_rest() {
         messages
             .iter()
             .all(|message| message.contains("unknown session")),
-        "a refusal carries the sentence a client renders (spec 6.6): {messages:?}",
+        "a refusal carries the sentence a client renders: {messages:?}",
     );
 
     // The refused ids are not attached, so nothing this host later publishes
@@ -1580,7 +1579,7 @@ async fn an_attach_refuses_a_session_it_cannot_resolve_and_serves_the_rest() {
 /// A session that then turned out to be unservable has to come back out: this
 /// host may hold it later, for somebody else, and its frames are undroppable
 /// by class, so they would count against a bound this client never asked to
-/// spend and could evict it over traffic it never asked for (spec 6.5, 6.9).
+/// spend and could evict it over traffic it never asked for.
 ///
 /// A lock conflict is the refusal that can be undone from outside, which is
 /// what makes this reachable at all: an id nothing could ever resolve stays
@@ -1705,7 +1704,7 @@ impl Drop for RivalWriter {
 }
 
 /// The tick asks about the sessions the host publishes as locked and nothing
-/// else, so a host with no rival anywhere pays a set check per tick (spec 6.8).
+/// else, so a host with no rival anywhere pays a set check per tick.
 ///
 /// Both halves are needed and neither is enough. That no probe happens over an
 /// empty set is also what a tick that never runs looks like, so the second half
@@ -1768,7 +1767,7 @@ async fn the_tick_probes_nothing_until_something_is_held() {
 }
 
 /// A rival that crashes frees the lock with no event of any kind, and the row
-/// still stops claiming it is held (spec 6.5, 6.8).
+/// still stops claiming it is held.
 ///
 /// The crash path is the whole reason the bit is kept current by a probe rather
 /// than by watching the lock directory: a clean release truncates the holder
@@ -1844,7 +1843,7 @@ async fn a_crashed_rivals_hold_falls_away_on_its_own() {
     host.host.shutdown().await;
 }
 
-/// The `locked` bit through the real host, end to end (spec 6.8): a rival's
+/// The `locked` bit through the real host, end to end: a rival's
 /// hold reaches the session's row, and the host's own hold never does.
 ///
 /// The row is read from the host's directory rather than from the cache,
@@ -1907,7 +1906,7 @@ async fn a_rival_writers_hold_reaches_the_row() {
 }
 
 /// Every host acquire advances one session's generation and publishes the exact
-/// post-increment value on both wire surfaces (spec 6.5, 6.8).
+/// post-increment value on both wire surfaces.
 ///
 /// Driven through real flocks and real attach streams. Reading the cache would
 /// prove the bookkeeping in isolation and not that the row and refusal a client
@@ -2362,7 +2361,7 @@ async fn two_sessions_on_one_host_stay_independent() {
 }
 
 /// A stream sees nothing at all from a session it did not attach, not even
-/// that session's durable and reliable-transient frames (spec 6.5). Only its
+/// that session's durable and reliable-transient frames. Only its
 /// row in the directory travels.
 ///
 /// The rule is what keeps a busy session a client never asked for from
@@ -2588,7 +2587,8 @@ async fn a_head_switch_replaces_the_epoch_and_resets_the_stream() {
 }
 
 /// A head switch is refused while a turn runs, and while a background task
-/// is live (spec section 11's "head switch refused while busy").
+/// is live: a mid-turn switch would let the running turn persist onto the
+/// wrong branch.
 #[tokio::test]
 async fn a_head_switch_is_refused_while_work_is_live() {
     // A slow-streaming turn, so the switch lands mid-turn.
@@ -2658,8 +2658,8 @@ async fn a_head_switch_is_refused_while_work_is_live() {
 
 /// A head switch to an entry that is not in the log is a 404, and one to a
 /// known entry whose role cannot be a head is a malformed request. The
-/// underlying log refuses both with one error, so the host tells them apart
-/// (spec 6.1).
+/// underlying log refuses both with one error, so the host tells them apart:
+/// a 404 for the first, a 400 for the second.
 #[tokio::test]
 async fn a_head_switch_to_an_unknown_entry_is_refused() {
     let harness = Harness::new(sub_agent_turn());
@@ -2711,7 +2711,7 @@ async fn a_head_switch_to_an_unknown_entry_is_refused() {
 
 /// A `before` target moves the head to the named entry's parent, which is
 /// what makes branching from a transcript message replace that message
-/// rather than continue after it (spec 6.6).
+/// rather than continue after it.
 ///
 /// The resolution is the host's, so an unknown entry is a 404 and an entry
 /// with no parent is refused rather than silently branching from nothing.
@@ -3009,7 +3009,7 @@ async fn a_live_session_holds_its_lock_until_teardown() {
     );
 
     // A second host over the same store cannot materialize it. The stream
-    // opens and the session is refused on it (spec 6.5), which is where the
+    // opens and the session is refused on it, which is where the
     // refusal a user reads now lives.
     let rival = harness.revive(Vec::new());
     let mut stream = rival
@@ -3229,7 +3229,7 @@ fn assert_rows_well_formed(sessions: &[aj_wire::SessionSummary]) {
         assert_eq!(
             row.live,
             row.last_seq.is_some(),
-            "a position is present iff the row is live (spec 6.8): {row:?}",
+            "a position is present iff the row is live: {row:?}",
         );
     }
 }
@@ -3264,7 +3264,7 @@ async fn stays_live(host: &SessionHost, session: &str, windows: u32) {
 
 /// An idle session nobody is attached to is released once the grace is up: its
 /// driver is gone, its lock is free for another writer, and the directory
-/// reports it cold with the stamp its own work left (spec section 5).
+/// reports it cold with the stamp its own work left.
 #[tokio::test]
 async fn an_idle_unattached_session_is_released() {
     let harness =
@@ -3276,7 +3276,7 @@ async fn an_idle_unattached_session_is_released() {
     let live = summary(&harness.host, &session).await.expect("listed");
     assert!(
         live.live && live.last_seq.is_some_and(|seq| seq > 0),
-        "a live row reports the position the host holds (spec 6.8)",
+        "a live row reports the position the host holds",
     );
 
     // Attached, so it stays however long it idles.
@@ -3303,7 +3303,7 @@ async fn an_idle_unattached_session_is_released() {
     harness.host.shutdown().await;
 }
 
-/// A live row's stamp moves on durable events and on nothing else (spec 6.8).
+/// A live row's stamp moves on durable events and on nothing else.
 /// Streaming chunks are lossy and carry no log position, so a turn's stamp
 /// steps once per durable entry rather than once per frame, which is also
 /// what keeps the `list` publisher's suppression from being defeated by a
@@ -3411,7 +3411,7 @@ async fn a_resumed_session_reports_its_logs_stamp_in_both_directions() {
 }
 
 /// A session's activity stamp never walks backwards, in either direction over
-/// the liveness flip (spec 6.8). The two sides read different clocks that
+/// the liveness flip. The two sides read different clocks that
 /// straddle the write: a live row reports when the driver saw the append, a
 /// cold one what the file says, and the driver's is the later of the two by
 /// however long the event took to reach it. A client stores the stamp it saw
@@ -3479,8 +3479,8 @@ async fn a_sessions_stamp_survives_a_round_trip_through_liveness() {
 /// entries (a settings record, say) reach the file only when the release
 /// flushes them, so the log's modification time by then is the moment the
 /// host tore the session down, a whole idle grace after the work that wrote
-/// them. A row carrying that reads to a client as output it has not seen
-/// (spec 6.8), on a session that produced nothing.
+/// them. A row carrying that reads to a client as output it has not seen,
+/// on a session that produced nothing.
 #[tokio::test]
 async fn a_release_does_not_stamp_a_session_with_its_own_flush() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
@@ -3535,7 +3535,7 @@ async fn a_release_does_not_stamp_a_session_with_its_own_flush() {
 }
 
 /// A client that stays attached keeps its session live: attachment is the
-/// retention signal (spec section 5), so a sidebar-era client that holds
+/// retention signal, so a sidebar-era client that holds
 /// background sessions holds their locks, deliberately.
 #[tokio::test]
 async fn an_attached_session_is_never_released() {
@@ -3628,7 +3628,7 @@ async fn a_detach_starts_the_grace_over() {
 }
 
 /// A release publishes the directory. The liveness flag flipping is the whole
-/// wire surface of a release (spec section 5), and a client watching another
+/// wire surface of a release, and a client watching another
 /// session has no other way to learn it: a released session emits no events.
 #[tokio::test]
 async fn a_release_publishes_the_directory() {
@@ -3823,7 +3823,7 @@ async fn a_session_the_host_cannot_row_is_not_released() {
 }
 
 /// A released session's activity stamp never goes backwards. The stamp is
-/// what a client derives unseen output from (spec 6.8), so a release
+/// what a client derives unseen output from, so a release
 /// publishing a row that predates the session's own work would silently erase
 /// it.
 #[tokio::test]
@@ -3865,7 +3865,7 @@ async fn a_release_never_lowers_the_stamp_it_publishes() {
 
 /// A client re-attaching after a release is served a fresh epoch and a full
 /// backfill, and folds to the same state as one that never lost the session.
-/// The epoch dies with the materialization (spec 6.5), so the cursor the
+/// The epoch dies with the materialization, so the cursor the
 /// client still holds names a history this host no longer has.
 #[tokio::test]
 async fn attaching_after_a_release_rebuilds_the_same_state() {
@@ -3907,7 +3907,7 @@ async fn attaching_after_a_release_rebuilds_the_same_state() {
 
 /// A command racing the release of its own session is neither lost nor applied
 /// twice: it either reaches the driver first, and the driver then declines to
-/// go, or it waits out the teardown and re-materializes (spec section 5).
+/// go, or it waits out the teardown and re-materializes.
 ///
 /// The commands are spaced across the sweeper's tick, so both branches are
 /// actually taken: the test asserts that at least one of them found the session
@@ -4233,7 +4233,7 @@ async fn a_release_never_drops_a_session_out_of_the_directory() {
 
 /// A release hands the session's row to the directory from the driver's own
 /// state, so a refresh reports a session this host closed without reading the
-/// log back (spec 6.8's no-disk-read rule for what the host already knows).
+/// log back: what the host already knows is never re-read from disk.
 #[tokio::test]
 async fn a_released_sessions_row_needs_no_disk_read() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
@@ -4332,8 +4332,7 @@ async fn a_released_sessions_row_needs_no_disk_read() {
 // ---------------------------------------------------------------------------
 
 /// Every queue mutation publishes a `QueueUpdate`, on the enqueue side as
-/// well as the drain side, and a second attached subscriber sees them
-/// (spec section 11's "queue enqueue visibility on a second client").
+/// well as the drain side, and a second attached subscriber sees them.
 #[tokio::test]
 async fn queue_mutations_reach_every_subscriber() {
     let harness = Harness::with_provider(scripted(
@@ -4431,7 +4430,7 @@ async fn queue_mutations_reach_every_subscriber() {
 
 /// A steer with text queues as **steering**, an empty steer promotes the
 /// pending follow-up into the steering slot, and both are visible on the
-/// stream (spec 6.6).
+/// stream.
 ///
 /// The two slots decide when the agent delivers a message: steering is
 /// injected mid-turn, a follow-up waits for the turn to end. A client reads
@@ -4609,13 +4608,13 @@ async fn every_queue_mutation_publishes_an_update() {
     harness.host.shutdown().await;
 }
 
-/// `clear` is session-wide (spec 6.6), and every agent it emptied gets its
+/// `clear` is session-wide, and every agent it emptied gets its
 /// own `QueueUpdate`: a client tracks the queues per agent and would keep
 /// showing the ones it was not told about.
 ///
 /// Both agents are made busy first, through commands, because that is the
 /// only way the command surface can reach a queued message at all: an idle
-/// agent runs a prompt instead of queueing it. The queue read (spec 6.7) is
+/// agent runs a prompt instead of queueing it. The queue read is
 /// asserted here for the same reason, against state the host itself built.
 #[tokio::test]
 async fn clearing_the_queue_empties_every_agent() {
@@ -4750,8 +4749,8 @@ async fn clearing_the_queue_empties_every_agent() {
 
 /// A settings change publishes the projected notice tagged with the entry
 /// it appended plus a refreshed `state`, and a client attaching afterwards
-/// regenerates the same notice from the backfill (spec section 11's
-/// "settings visibility for a mid-session joiner").
+/// regenerates the same notice from the backfill, which is what a mid-session
+/// joiner's settings visibility rests on.
 #[tokio::test]
 async fn a_settings_change_publishes_the_projected_notice() {
     let harness = Harness::new(vec![finalized_text_message("hello back")]);
@@ -4920,7 +4919,7 @@ async fn thinking_display_is_live_only_and_survives_bundle_rebuilds() {
 
 /// A settings change before the thread's first message projects no notice,
 /// so the host publishes the confirmation untagged: live clients still see
-/// the gesture, and no backfill regenerates a row for it (spec section 5).
+/// the gesture, and no backfill regenerates a row for it.
 #[tokio::test]
 async fn a_settings_change_before_the_first_prompt_publishes_an_untagged_notice() {
     let harness = Harness::new(vec![finalized_text_message("hello back")]);
@@ -7673,7 +7672,7 @@ async fn the_attach_block_is_contiguous_and_filters_the_boundary() {
 
 /// A cursor at the session's high-water mark is served an empty suffix, and one
 /// past it a full backfill: it names a history this host does not have, so it
-/// counts as an epoch mismatch (spec 6.5). Serving it an empty suffix plus a
+/// counts as an epoch mismatch. Serving it an empty suffix plus a
 /// `caught_up` would silently rewind the client's cursor instead.
 #[tokio::test]
 async fn a_cursor_past_the_high_water_mark_earns_a_full_backfill() {
@@ -7685,7 +7684,7 @@ async fn a_cursor_past_the_high_water_mark_earns_a_full_backfill() {
     let settled = client.canonical();
     let epoch = client.client.cursor().expect("a committed cursor").epoch;
     // The host's own mark, not the client's cursor: a client holds its last
-    // entry back until a trailing event rules one out (spec 6.5), so its
+    // entry back until a trailing event rules one out, so its
     // cursor sits one short of the boundary this test is about. A client may
     // not turn a position it read in the directory into a cursor either, the
     // test is reading ground truth to build the case.
@@ -7717,7 +7716,7 @@ async fn a_cursor_past_the_high_water_mark_earns_a_full_backfill() {
         durable(&at_mark),
     );
 
-    // Seq 0 reads as "nothing durable yet" (spec 6.4), so it is the cursor
+    // Seq 0 reads as "nothing durable yet", so it is the cursor
     // whose suffix is the whole log: the oracle for a full backfill.
     let from_the_start = client
         .reattach(
@@ -7759,7 +7758,7 @@ async fn a_cursor_past_the_high_water_mark_earns_a_full_backfill() {
 
 /// An attach whose state moved while it was projecting publishes one more
 /// `state` frame behind the block, which is what self-heals the change the
-/// block dropped as lossy (spec 6.3).
+/// block dropped as lossy.
 ///
 /// `working` and `settings` are read before the projection, and a `state` frame
 /// published during it is held and dropped, lossy frames being droppable by
@@ -7919,7 +7918,7 @@ async fn attaching_mid_turn_converges_with_a_client_attached_all_along() {
 
 /// Attaching while a sub-agent runs leaves its bracket open: no
 /// force-closed box, no spurious conclusion. Once the sub finishes both
-/// clients converge (spec section 11's "attach mid-sub-run").
+/// clients converge.
 #[tokio::test]
 async fn attaching_mid_sub_run_leaves_the_bracket_open() {
     let harness = Harness::with_provider(scripted(sub_agent_turn(), 1, Duration::from_millis(20)));
@@ -8562,8 +8561,7 @@ async fn a_resumed_session_concludes_the_sub_agents_on_disk() {
 
 /// A client that stops draining is evicted rather than buffered without
 /// bound, and the ordinary re-attach with its cursor puts it back where a
-/// client that never stalled would be (spec 6.9, and spec section 11's
-/// "slow-client eviction and recovery").
+/// client that never stalled would be.
 ///
 /// The recovery is the interesting half, so the cursor it offers is a real
 /// one: the client applied a whole turn first, so the re-attach serves an
@@ -8743,7 +8741,7 @@ const RELABEL_STEP: Duration = Duration::from_millis(5);
 
 /// Directory states that differ from one another, arriving inside one
 /// coalescing window, reach a reading client as a single `list` frame
-/// carrying the last of them (spec 6.8).
+/// carrying the last of them.
 ///
 /// This is the coalescing tick's own contract and nothing else's. Every label
 /// below is distinct, so every directory the publisher composes is a payload
@@ -8890,7 +8888,7 @@ fn directories(frames: &[Frame]) -> Vec<Vec<SessionSummary>> {
         .collect()
 }
 
-/// The refresh path performs no filesystem work at all (spec 6.8): every
+/// The refresh path performs no filesystem work at all: every
 /// directory read the host does is attributable to an enumeration point, and a
 /// streaming turn, which marks the directory dirty on every event, is not one.
 #[tokio::test]
@@ -8942,7 +8940,7 @@ async fn a_turns_refreshes_never_read_the_directory() {
 
 /// A session a sibling process leaves in the store appears at the next
 /// enumeration point and not before. The host is the single writer of its
-/// working directory (spec section 5), so a sibling's session is a conflict to
+/// working directory, so a sibling's session is a conflict to
 /// surface when asked, not a workload to poll for.
 #[tokio::test]
 async fn a_siblings_session_appears_at_the_next_enumeration_point() {
@@ -9093,10 +9091,7 @@ async fn the_hosts_own_changes_need_no_enumeration() {
         .into_iter()
         .find(|entry| entry.id == created)
         .expect("the released session's row");
-    assert_eq!(
-        released.last_seq, None,
-        "a cold row carries no position (spec 6.8)",
-    );
+    assert_eq!(released.last_seq, None, "a cold row carries no position",);
     assert_eq!(
         harness.host.store_directory_reads(),
         before,
@@ -9109,7 +9104,7 @@ async fn the_hosts_own_changes_need_no_enumeration() {
 /// No two `list` frames in a row carry the same directory. Dirty is marked on
 /// every session event and most events move nothing a directory row shows, so
 /// unsuppressed a streaming turn republishes one payload at the debounce rate
-/// for the length of the turn (spec 6.8).
+/// for the length of the turn.
 #[tokio::test]
 async fn an_unchanged_directory_is_not_published_again() {
     let harness = Harness::with_provider(scripted(
@@ -9281,7 +9276,7 @@ async fn a_new_subscriber_is_served_a_directory_the_others_already_have() {
 }
 
 /// A `list` frame's status fields are what the sidebar's glyphs and the
-/// client-side "needs attention" derivation hang on (spec 6.8), so each one
+/// client-side "needs attention" derivation hang on, so each one
 /// is asserted away from its default: a turn in flight, a pending
 /// follow-up, a live background task, and a last-activity stamp that moved.
 #[tokio::test]
@@ -9461,7 +9456,7 @@ async fn tag_of(host: &SessionHost, session: &str) -> Option<String> {
 
 /// Setting a tag puts it on the session's row and on the stream, and clearing
 /// it takes it off both. It is display metadata, so this is the only place it
-/// shows: no log entry, no `state` frame (spec 6.8).
+/// shows: no log entry, no `state` frame.
 #[tokio::test]
 async fn a_tag_reaches_the_row_and_the_directory() {
     let harness = Harness::new(Vec::new());
@@ -9551,7 +9546,7 @@ async fn a_session_can_be_created_already_tagged() {
         .create_with(
             None,
             Some(vec![UserContent::text("hi")]),
-            // Padded, because the store keeps the trimmed label (spec 6.6).
+            // Padded, because the store keeps the trimmed label.
             Some("  spike  ".to_string()),
             None,
         )
@@ -9565,7 +9560,7 @@ async fn a_session_can_be_created_already_tagged() {
 }
 
 /// A release carries the label into the cold row, so the liveness flip does
-/// not blank it. The row is published without an enumeration (spec 6.8), so
+/// not blank it. The row is published without an enumeration, so
 /// the driver's own answer is the only one available at that moment, and it is
 /// also the only current one: the label may have been set since the last scan.
 #[tokio::test]
@@ -9657,7 +9652,7 @@ async fn a_tag_survives_a_restart() {
     );
 
     // And materializing the session keeps it: a live row answers from the
-    // host's memory, which is seeded from the sidecar (spec 6.8).
+    // host's memory, which is seeded from the sidecar.
     let row = summary(&revived.host, &session).await;
     assert!(row.is_some_and(|row| !row.live), "cold to begin with");
     revived
@@ -9679,7 +9674,7 @@ async fn a_tag_survives_a_restart() {
 
 /// The label costs the directory nothing to serve. An untagged store never
 /// opens a sidecar, a live session answers from memory, and a cold one is read
-/// once and then cached against the file it came from (spec 6.8).
+/// once and then cached against the file it came from.
 #[tokio::test]
 async fn a_label_costs_at_most_one_sidecar_read() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
@@ -9809,7 +9804,7 @@ async fn an_unreadable_sidecar_does_not_cost_a_live_session_its_label() {
 }
 
 /// A tag is session-scoped, deliberately not branch-scoped, so a head switch
-/// cannot move it (spec 6.8). It lives beside the log rather than in it, and
+/// cannot move it. It lives beside the log rather than in it, and
 /// the switch that rewrites the session's history leaves both the row's label
 /// and the sidecar exactly where they were.
 #[tokio::test]
@@ -10375,7 +10370,7 @@ async fn the_reads_answer_tasks_tree_and_hello() {
         tree.segments.iter().any(|segment| segment.on_active_path),
         "the active path is marked",
     );
-    // The head travels with the read (spec 6.7). It is not derivable from the
+    // The head travels with the read. It is not derivable from the
     // segments, and a client that renders the tree needs the exact entry.
     let head = tree.head.clone().expect("a session with a turn has a head");
     assert_eq!(
@@ -10461,7 +10456,7 @@ async fn a_task_detail_read_omits_host_paths_and_cold_tasks_are_unknown() {
 }
 
 /// The task, queue and usage reads answer a session that is not live
-/// without materializing it (spec 6.7), and the directory carries its row
+/// without materializing it, and the directory carries its row
 /// with the stamp its log file bears. The tree read is the one exception: it
 /// has to parse the log, so it materializes.
 #[tokio::test]
@@ -10505,7 +10500,7 @@ async fn reads_do_not_materialize_a_cold_session() {
     );
     assert_eq!(
         cold.last_activity, log_modified,
-        "and its stamp is the log file's modification time (spec 6.8)",
+        "and its stamp is the log file's modification time",
     );
 
     assert!(
@@ -10571,7 +10566,7 @@ async fn reads_do_not_materialize_a_cold_session() {
 /// that appears is listed, one that is deleted goes away, and a pre-refactor
 /// log is no session at all.
 ///
-/// This is the correctness half of the list-production contract (spec 6.8).
+/// This is the correctness half of the list-production contract.
 /// The caches it exercises are what keep a refresh from re-reading the store,
 /// and the unit tests over `ColdSessions` are the oracle for the reads they
 /// avoid.

@@ -21,7 +21,7 @@ use serde_json::value::RawValue;
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The capability a host declares when it serves `POST
-/// /v1/sessions/{id}/archive` (spec 6.10).
+/// /v1/sessions/{id}/archive`.
 ///
 /// Honest self-description, not a gate: a client attempts the route and reads
 /// a 404 as "this host does not archive", because a gateway's own hello cannot
@@ -79,7 +79,7 @@ impl PromptInput {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
     /// Which host the session is created on, named in the same vocabulary
-    /// [`SessionSummary::host`] and [`HostSummary::id`] use (spec 6.6).
+    /// [`SessionSummary::host`] and [`HostSummary::id`] use.
     ///
     /// A gateway needs it unless exactly one host is enrolled, and refuses an
     /// ambiguous create rather than guessing. A plain host accepts its own id
@@ -212,7 +212,7 @@ impl HeadRequest {
     }
 }
 
-/// Sets or clears a session's tag (spec 6.6).
+/// Sets or clears a session's tag.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TagRequest {
     /// The label to set. Empty or whitespace-only clears the session's tag,
@@ -403,13 +403,13 @@ pub struct SessionSummary {
     pub queued: QueueCounts,
     pub tasks: usize,
     /// The session's durable high-water mark. A host sets it exactly when
-    /// [`Self::live`] is set (spec 6.8), and a reader may rely on that only as
+    /// [`Self::live`] is set, and a reader may rely on that only as
     /// far as it trusts the host: nothing on this type enforces it, because
     /// nothing reads the field without also reading `live`.
     ///
     /// A cold row has none. Nothing in a log records its entry count, so an
     /// exact position costs a read of the whole file, and the protocol
-    /// forbids using a list-observed position as a cursor anyway (spec 6.5).
+    /// forbids using a list-observed position as a cursor anyway.
     /// [`Self::last_activity`] is the signal a cold row carries instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seq: Option<u64>,
@@ -418,12 +418,12 @@ pub struct SessionSummary {
     /// cold one.
     ///
     /// A client records this at view time and compares it against later rows
-    /// to derive the unseen-output glyph (spec 6.8). Both sides of that
+    /// to derive the unseen-output glyph. Both sides of that
     /// comparison are host clock, so the client never consults its own.
     pub last_activity: DateTime<Utc>,
     /// The label the user gave the session, when it has one.
     ///
-    /// Display metadata and never an id (spec 6.8): a client shows it in a row
+    /// Display metadata and never an id: a client shows it in a row
     /// instead of the id, and addresses the session by [`Self::id`] all the
     /// same. Session-scoped rather than branch-scoped, so a head switch does
     /// not move it.
@@ -433,8 +433,7 @@ pub struct SessionSummary {
     ///
     /// A gateway fills this in as it merges its hosts' directories, and a
     /// plain host's rows carry nothing: they are all its own. Clients group by
-    /// it and must not derive it from [`Self::id`], which is opaque (spec
-    /// 6.2).
+    /// it and must not derive it from [`Self::id`], which is opaque.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(default)]
@@ -455,7 +454,7 @@ pub struct SessionSummary {
     /// session's advisory lock, so asking that host for the session would be
     /// refused right now.
     ///
-    /// Display metadata and a rejoin edge, never a gate (spec 6.8). The lock
+    /// Display metadata and a rejoin edge, never a gate. The lock
     /// itself is the only authority and this bit may lag it in either
     /// direction, so a client acts by attempting and reading the answer rather
     /// than by branching on this. A session live in the host that published the
@@ -466,13 +465,12 @@ pub struct SessionSummary {
     #[serde(default, skip_serializing_if = "unset")]
     pub locked: bool,
     /// The publishing host's latest acquire generation for this session. The
-    /// host advances it on every acquire before publishing the outcome (spec
-    /// 6.8).
+    /// host advances it on every acquire before publishing the outcome.
     ///
     /// What makes a refused client's recovery derivable from this row alone. A
     /// `locked` refusal names the generation of its refused acquire, so a row
     /// reporting the lock free at that generation or beyond says that conflict
-    /// is over, whether or not the client received the held snapshot (spec 6.5).
+    /// is over, whether or not the client received the held snapshot.
     ///
     /// Absent means no knowledge, the same rule the bit itself has: a host that
     /// has never seen a hold of this session publishes none, and neither does an
@@ -496,7 +494,7 @@ fn unset(flag: &bool) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionList {
     pub sessions: Vec<SessionSummary>,
-    /// The hosts a gateway has enrolled, empty from a plain host (spec 7.1).
+    /// The hosts a gateway has enrolled, empty from a plain host.
     ///
     /// The same field a gateway's `list` frames carry, because the read and the
     /// frames are one payload: a client that reads the directory and a client
@@ -505,7 +503,7 @@ pub struct SessionList {
     pub hosts: Vec<DirectoryHost>,
 }
 
-/// One enrolled host in a gateway's directory (spec 7.1).
+/// One enrolled host in a gateway's directory.
 ///
 /// Carried alongside the rows rather than derived from them, because a gateway
 /// holds a host's rows only for as long as that host has sent them: across a
@@ -528,7 +526,7 @@ pub struct DirectoryHost {
     /// Absent for a host the gateway has never spoken to: an id is learned by
     /// asking the host, and a gateway does not invent one, because ids namespace
     /// sessions and a made-up one would poison every client's state the moment
-    /// the real id arrived (spec 7.1). Such a host carries
+    /// the real id arrived. Such a host carries
     /// [`Self::address`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -561,12 +559,12 @@ pub struct DirectoryHost {
     pub unreachable: bool,
 }
 
-/// The directory a gateway composes from its hosts (spec 7.1): their rows as
+/// The directory a gateway composes from its hosts: their rows as
 /// they wrote them, and the hosts themselves.
 ///
 /// The writer's view of what [`SessionList`] reads. The rows stay unparsed
 /// because a gateway owns three of their fields and passes the rest through, so
-/// a typed re-encode here would drop a newer host's (spec 6.10). One value
+/// a typed re-encode here would drop a newer host's. One value
 /// serves both places the directory appears, the sessions read and the `list`
 /// frames, so the two cannot drift.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,7 +584,7 @@ impl MergedDirectory {
     }
 }
 
-/// A [`MergedDirectory`] written as a `list` frame (spec 6.3).
+/// A [`MergedDirectory`] written as a `list` frame.
 #[derive(Serialize)]
 #[serde(tag = "kind", rename = "list")]
 pub struct DirectoryFrame<'a> {
@@ -656,7 +654,7 @@ pub struct SessionTree {
     ///
     /// Not derivable from the segments: a head can sit mid-segment, and both
     /// the active-row pre-selection and the "switching to the current tip is
-    /// a no-op" rule need the exact entry (spec 6.7).
+    /// a no-op" rule need the exact entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
 }
@@ -675,7 +673,7 @@ pub struct TreeSegment {
 }
 
 /// Where an enrollment came from, which decides whether it can be withdrawn
-/// over the wire (spec 7.1).
+/// over the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostSource {
@@ -685,7 +683,7 @@ pub enum HostSource {
     Dynamic,
 }
 
-/// The address of a host to enroll on a gateway (spec 7.1).
+/// The address of a host to enroll on a gateway.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollHostRequest {
     /// `<host>:<port>` or a full `http(s)://` URL.
@@ -1089,12 +1087,12 @@ mod request {
     );
 }
 
-/// One enrolled host in a gateway's host table (spec 7.1).
+/// One enrolled host in a gateway's host table.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSummary {
     /// The id the host reports for itself, which is the namespace its sessions
     /// appear under and the vocabulary a directory row's `host` field and a
-    /// create's `host` field use (spec 6.6, 6.8).
+    /// create's `host` field use.
     ///
     /// Absent only for a configured host that has never answered: a gateway
     /// cannot invent an id for a store it has not spoken to, and a dynamic
@@ -1162,7 +1160,7 @@ pub struct DurableEvent {
 /// under, and the last durable seq it is willing to claim.
 ///
 /// A client offers this on re-attach and a server decides whether it can
-/// serve a suffix from it (spec 6.5). It travels in a stream request as
+/// serve a suffix from it. It travels in a stream request as
 /// `<epoch>:<seq>`, which is what [`fmt::Display`] and [`str::parse`]
 /// implement here.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1309,8 +1307,8 @@ impl From<AgentEvent> for DecodedAgentEvent {
 
 impl DecodedAgentEvent {
     /// The decoded event, or `None` for an event type this build does not
-    /// know. An endpoint client skips the unknown case before its reducer
-    /// (spec 6.10); only a gateway forwards it.
+    /// know. An endpoint client skips the unknown case before its reducer,
+    /// only a gateway forwards it.
     pub fn known(&self) -> Option<&AgentEvent> {
         match self {
             Self::Known(event) => Some(event.value()),
@@ -1379,17 +1377,16 @@ pub enum Frame {
     },
     List {
         sessions: Vec<SessionSummary>,
-        /// The hosts a gateway has enrolled, empty on a plain host's own frames
-        /// (spec 7.1).
+        /// The hosts a gateway has enrolled, empty on a plain host's own frames.
         hosts: Vec<DirectoryHost>,
     },
-    /// The error envelope of spec 6.6 as a stream frame, scoped to one session
-    /// (spec 6.3).
+    /// The error envelope (`code`, `message`, and per-code fields) as a stream
+    /// frame, scoped to one session.
     ///
     /// Its first use is the per-session attach refusal: a named session the
     /// server cannot resolve produces this instead of an attach block, and the
     /// stream serves every other session it named. Reliable-transient, so it
-    /// is neither dropped as lossy nor treated as durable (spec 6.4).
+    /// is neither dropped as lossy nor treated as durable.
     Error {
         session: String,
         /// The epoch the error is about, for a code that refers to one.
@@ -1399,13 +1396,13 @@ pub enum Frame {
         /// minted one.
         epoch: Option<String>,
         /// A stable snake_case token a client may branch on. A code this build
-        /// does not know renders as its `message` (spec 6.10).
+        /// does not know renders as its `message`.
         code: String,
         /// The human sentence, produced where the facts are and always
         /// sufficient on its own.
         message: String,
         /// Which acquire a `locked` refusal is about, in the vocabulary of
-        /// [`SessionSummary::lock_generation`] (spec 6.5).
+        /// [`SessionSummary::lock_generation`].
         ///
         /// This is what makes the refusal name *which* true the bit is at, so a
         /// client can read the hold's end off a later row instead of having to
@@ -1436,7 +1433,7 @@ impl Frame {
         }
     }
 
-    /// The log position a durable event frame carries (spec 6.4), `None`
+    /// The log position a durable event frame carries, `None`
     /// for every other frame.
     pub fn durable_seq(&self) -> Option<u64> {
         match self {
@@ -1449,7 +1446,7 @@ impl Frame {
     }
 
     /// Whether the frame is lossy, i.e. a cumulative snapshot that a newer
-    /// one supersedes (spec 6.4). Only these may be coalesced or dropped.
+    /// one supersedes. Only these may be coalesced or dropped.
     ///
     /// An event type this build does not know classifies as **reliable**,
     /// which is the safe side of the decision: an attach holds and flushes it
@@ -1857,15 +1854,15 @@ impl DecodedFrame {
     ///
     /// The read side of [`Self::rewrite_session`], answering for the same
     /// field on the same terms, which is what lets a gateway namespace every
-    /// frame the rewrite would touch, kinds this build does not know included
-    /// (spec 6.10). A frame decoded from the wire answers from the JSON it will
+    /// frame the rewrite would touch, kinds this build does not know included.
+    /// A frame decoded from the wire answers from the JSON it will
     /// forward, a locally built one from its variant. A `session` nested in a
     /// payload is not the frame's session and is not read. `None` comes back
     /// exactly where the rewrite returns `false`.
     ///
     /// A top-level `session` no id can be read from is an error rather than
     /// `None`: a value that is not a string, `null`, or a string token whose
-    /// escapes do not decode. Spec 6.3 mints ids as strings, so such a frame is
+    /// escapes do not decode. Session ids are strings on the wire, so such a frame is
     /// malformed, and only an unknown kind can carry one this far, a known kind
     /// is refused at decode. Both other answers would be worse. `None` would
     /// call the frame host-scoped while the rewrite still replaces the field, so
@@ -1899,7 +1896,7 @@ impl DecodedFrame {
     /// one.
     ///
     /// A gateway calls this on every frame it forwards, kinds this build does
-    /// not know included (spec 6.10). What comes back out is the frame the
+    /// not know included. What comes back out is the frame the
     /// host wrote, structurally unchanged apart from the id: top-level key
     /// order is not significant and byte identity is not promised, but nothing
     /// below the top level is parsed, so payloads and their number literals
@@ -1943,7 +1940,7 @@ impl DecodedFrame {
     /// owns `id`, `host` and `unreachable` on a row and passes everything else
     /// through, so it takes the rows unparsed rather than through
     /// [`SessionSummary`], which a re-encode would drop a newer host's fields
-    /// from (spec 6.10). A row's own nested values stay text for the same
+    /// from. A row's own nested values stay text for the same
     /// reason the rewrite leaves a payload alone.
     ///
     /// A frame decoded from the wire answers from the JSON it arrived as, a
@@ -2027,7 +2024,7 @@ struct FrameTag {
 /// Flat by design. What edits an object here owns a named field or two of it and
 /// must disturb nothing else, and keeping nested values as text is what puts a
 /// payload's own `session`, or a row's own nested `id`, out of reach. It is also
-/// what carries a peer's number literals through unrounded (spec 6.10).
+/// what carries a peer's number literals through unrounded.
 ///
 /// Key order is the order the object arrived in, and a duplicate key is kept as
 /// two fields: an object edited here is re-emitted, not normalized.
@@ -2159,7 +2156,7 @@ impl Serialize for RawObject {
     }
 }
 
-/// The field a session-scoped frame names its session in (spec 6.3), and the one
+/// The field a session-scoped frame names its session in, and the one
 /// field of a frame a gateway rewrites.
 const SESSION_FIELD: &str = "session";
 

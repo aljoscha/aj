@@ -32,7 +32,7 @@ pub(crate) const FRAME_INTERVAL_MS: u32 = 80;
 /// chain (widgets can only schedule ticks from an event handler).
 pub(crate) const STATUS_WAKE_EVENT: &str = "aj.status.wake";
 
-/// Where this client stands with the host serving its session (spec 9.1).
+/// Where this client stands with the host serving its session.
 ///
 /// A local run passes through the unsettled states only while it re-attaches
 /// a subscription the host dropped, which the shell recovers from the same way
@@ -322,7 +322,7 @@ mod tests {
     }
 
     /// An unsettled connection shows its own row even while the agent is
-    /// idle, and outranks the working label while it is not (spec 9.1).
+    /// idle, and outranks the working label while it is not.
     #[test]
     fn connection_state_labels_the_loader() {
         for (connection, label) in [

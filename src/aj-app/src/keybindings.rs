@@ -86,14 +86,14 @@ pub const ACTION_AGENT_PICKER: &str = "aj.agent.open";
 /// Shows or hides the session sidebar. Default binding: `alt+s`.
 ///
 /// Hidden by default: a lone local session has nothing to choose between, so
-/// the strip would cost width and say nothing (spec 9.2).
+/// the strip would cost width and say nothing.
 pub const ACTION_SIDEBAR_TOGGLE: &str = "aj.sidebar.toggle";
 
 /// Folds or unfolds the host group the focused session sits in. Default
 /// binding: `alt+m`, for the "n more" the folded line reads.
 ///
 /// A group shows a bounded share of the strip and holds the rest of its idle
-/// sessions behind that line, so no one host can bury the others (spec 9.2).
+/// sessions behind that line, so no one host can bury the others.
 /// This is how the keyboard opens one up and closes it again. A click on the
 /// line is the same action's second trigger.
 pub const ACTION_SIDEBAR_FOLD: &str = "aj.sidebar.fold";
@@ -123,11 +123,11 @@ pub const ACTION_SESSION_PREV: &str = "aj.session.prev";
 /// Default binding: `alt+n`.
 ///
 /// The same gesture as the `new` command, given a chord because creating a
-/// session is one of the sidebar's own interactions (spec 9.2).
+/// session is one of the sidebar's own interactions.
 pub const ACTION_SESSION_NEW: &str = "aj.session.new";
 
 /// Opens the editor for the focused session's tag, the label a client shows in
-/// place of its id (spec 6.8). Default binding: `alt+r`.
+/// place of its id. Default binding: `alt+r`.
 ///
 /// NOTE: `r` for rename rather than `t` for tag, because `alt+t` is the
 /// thinking toggle. It joins the sidebar's `alt` cluster (`alt+s`, `alt+j`,
@@ -257,8 +257,8 @@ pub const ACTION_CHAT_SCROLL_BOTTOM: &str = "aj.chat.scroll_bottom";
 /// Action ID for the "focus the transcript for keyboard navigation" chord.
 ///
 /// Bound by default to `tab`. It moves keyboard focus from the editor onto the
-/// chat transcript and steps through past user messages (Spec E section 1,
-/// transcript-focus mode). It matches in the capture phase but is gated to the
+/// chat transcript and steps through past user messages (transcript-focus
+/// mode). It matches in the capture phase but is gated to the
 /// autocomplete popup being closed, so Tab focuses the transcript even with a
 /// draft in the editor, and only an open popup keeps Tab for applying the
 /// highlighted completion. Inert while a capturing overlay is up. Esc returns
@@ -267,11 +267,11 @@ pub const ACTION_TRANSCRIPT_FOCUS: &str = "aj.transcript.focus";
 
 /// Action ID for the "copy the focused message" chord.
 ///
-/// Bound by default to `y`. Live only in transcript-focus mode (Spec E
-/// section 2): the frontend gates it on the transcript being focused, so with
-/// the editor focused `y` types normally. Pressing it copies the whole focused
-/// user message to the system clipboard through the same OSC 52 path the mouse
-/// select-to-copy uses.
+/// Bound by default to `y`. Live only in transcript-focus mode: the frontend
+/// gates it on the transcript being focused, so with the editor focused `y`
+/// types normally. Pressing it copies the whole focused user message to the
+/// system clipboard through the same OSC 52 path the mouse select-to-copy
+/// uses.
 pub const ACTION_COPY_MESSAGE: &str = "aj.transcript.copy_message";
 
 /// Action ID for the "branch from the focused message" chord.

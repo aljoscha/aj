@@ -101,9 +101,10 @@ mutation route, and placing env there would either open the mutation
 surface v1 excludes or force refusal logic into the settings path.
 Top-level placement makes create-only true by construction. A
 settings request that carries an `env` key anyway is an unknown field
-to the destination host. A protocol 2 host refuses it under 6.10 before
-settings mutation; built-in clients send no command to a protocol 1
-host and offer no such settings surface.
+to the destination host. A protocol 2 host refuses it under the
+closed-schema rule in remote-control-spec.md before settings mutation;
+built-in clients send no command to a protocol 1 host and offer no such
+settings surface.
 
 `BTreeMap` for deterministic serialization. The host applies the map
 in full or refuses the create (section 1 validation), never a partial
@@ -112,9 +113,10 @@ apply.
 ### 2.2 The answer says what happened
 
 Protocol 2 effect owners refuse unknown request fields before effects
-(spec 6.10). The connection's exact protocol check excludes a protocol
-1 host, while a protocol 2 host that predates this field refuses the
-create instead of minting a session without env. The create's answer
+(the compatibility rules in remote-control-spec.md). The connection's
+exact protocol check excludes a protocol 1 host, while a protocol 2 host
+that predates this field refuses the create instead of minting a session
+without env. The create's answer
 still carries the applied fact: it is the positive result contract and
 makes the session identity legible to its creator.
 
@@ -160,8 +162,9 @@ create validation.
 ### 2.3 Capability string
 
 Hosts advertise `session_env` in `GET /v1/hello` capabilities,
-extending the 6.10 registry (new surface past the baseline). Gateways
-do not advertise it, a gateway cannot answer for its hosts (6.10). It
+extending the capability registry in remote-control-spec.md (new surface
+past the baseline). Gateways do not advertise it, a gateway cannot
+answer for its hosts. It
 is self-description, never a gate, and aj's own client code does not
 consult it: the request refusal or `env_keys` echo is the normative
 result. It exists so
@@ -172,7 +175,8 @@ minting a session, which the workshop's cutover check wants.
 
 Nothing to build. The gateway's create route already edits the body
 as a `RawObject`, reading `host` and carrying every other field
-unread upstream, and namespaces only `id` on the way back (spec 6.10,
+unread upstream, and namespaces only `id` on the way back (the raw
+pass-through rule in remote-control-spec.md's compatibility section,
 `gateway/server.rs::create_session`). `env` rides through raw, and
 `env_keys` rides back inside the answer the gateway does not decode.
 This holds for protocol 2 gateways that predate the feature by the same
@@ -183,9 +187,9 @@ the host with the map intact and the echo intact on the way back.
 ### 2.5 Spec doc amendments
 
 `docs/remote-control-spec.md` is amended with the range that lands
-the wire change: the 6.6 create row gains env among the optional
-creation properties with the echo contract, and the 6.10 capability
-registry gains `session_env`.
+the wire change: the create row of the commands table gains env among
+the optional creation properties with the echo contract, and the
+capability registry gains `session_env`.
 
 ## 3. On-disk format (`aj-session`)
 
@@ -330,9 +334,10 @@ same on either side of a subcommand and reaches `connect`):
   unattended path.
 - **Session info** (`/info`): the digest gains an Env section under
   Settings listing keys and values. The surface is local-only today
-  (spec 9.1) and reads the same log the operator could `cat`, so
-  values are shown: verifying identity at a glance is the use case,
-  and `BEADS_ACTOR` redacted to a key name verifies nothing.
+  (connect mode refuses it, per the connect-mode action matrix in
+  remote-control-spec.md) and reads the same log the operator could
+  `cat`, so values are shown: verifying identity at a glance is the use
+  case, and `BEADS_ACTOR` redacted to a key name verifies nothing.
   `SessionStats` carries the log-level `session_env` separately from
   its branch-local inference settings.
 - **Export**: keys only, values redacted (section 3).
@@ -358,7 +363,8 @@ same on either side of a subcommand and reaches `connect`):
   strict decoder refuses the unknown env field before minting (section
   2.2).
 - Older protocol 2 client, new host: never states env, never sees
-  `env_keys` (skip-serialized), and ignores it if it ever did (6.10).
+  `env_keys` (skip-serialized), and ignores it if it ever did
+  (observation decoding is additive).
 - Older protocol 2 gateway between new ends: raw pass-through both
   directions (section 2.4). A protocol 1 gateway is incompatible.
 

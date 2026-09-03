@@ -44,7 +44,8 @@ impl ConversationPersistence {
 
     /// The directory holding session sidecars, `meta/` under the store.
     ///
-    /// The location is fixed by spec 6.8. Its payoff is that one directory read
+    /// The location is a wire-level convention shared with every reader of the
+    /// store. Its payoff is that one directory read
     /// finds every sidecar without walking the logs, which is what makes an
     /// untagged store cost nothing and a tagged one cost one read per label
     /// rather than a `stat` per session.
@@ -84,7 +85,7 @@ impl ConversationPersistence {
     /// The write is atomic: the body lands in a temporary file in the same
     /// directory and is renamed over the target, so a reader sees either the
     /// old tag or the new one and never a torn line. Callers hold the session's
-    /// lock (spec 6.6), which is what orders two writers.
+    /// lock, which is what orders two writers.
     ///
     /// `tag` is expected to have been through [`crate::tag::normalize_tag`]
     /// already, so this writes what it is given.
@@ -190,7 +191,7 @@ impl ConversationPersistence {
     /// sidecar contents at all: the label itself is read by
     /// [`Self::read_tag`], once per fingerprint this reports. An untagged
     /// store has no `meta/` directory and costs a single failed `read_dir`,
-    /// which is what makes the untagged case free (spec 6.8): a caller cannot
+    /// which is what makes the untagged case free: a caller cannot
     /// ask per session without paying a `stat` per session.
     pub fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
         self.enumerate_sidecars(TAG_SIDECAR)
@@ -280,7 +281,7 @@ impl ConversationPersistence {
     /// Driven by [`Self::enumerate_tags`], so the cost is one directory read
     /// plus one small read per sidecar that exists. An untagged store has no
     /// `meta/` directory and pays a single failed `read_dir` with no
-    /// per-session read at all (spec 6.8), which is why this cannot be a loop
+    /// per-session read at all, which is why this cannot be a loop
     /// over the sessions asking each for its tag.
     ///
     /// A label that cannot be read is dropped rather than raised: a listing
@@ -982,7 +983,7 @@ mod tests {
             .expect("clearing an untagged session is not an error");
     }
 
-    /// The sidecar lands where spec 6.8 puts it, `meta/<session id>.tag`, so
+    /// The sidecar lands at `meta/<session id>.tag`, so
     /// nothing of it appears in the store directory the logs live in and the
     /// session enumeration cannot see it.
     #[test]
@@ -1719,7 +1720,7 @@ mod tests {
     /// The labels come off one read of the sidecar directory, not off a
     /// per-session question. A sidecar whose session has no log is therefore
     /// still found, which a listing that asked each session for its tag could
-    /// not do, and which is what keeps an untagged store free (spec 6.8).
+    /// not do, and which is what keeps an untagged store free.
     #[test]
     fn the_label_map_is_driven_by_the_sidecar_directory() {
         let (_dir, persistence) = fixture();

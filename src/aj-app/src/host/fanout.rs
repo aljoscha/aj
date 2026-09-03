@@ -31,7 +31,7 @@ enum AttachState {
     /// The attach block has not been written yet, so live frames are held
     /// to keep the block contiguous and ordered on this stream.
     ///
-    /// Lossy frames are dropped rather than queued (spec 6.5): a
+    /// Lossy frames are dropped rather than queued: a
     /// cumulative snapshot delivered after the durable frame that
     /// superseded it resurrects stale transient state, and a
     /// `MessageUpdate` for a message the backfill already finalized would
@@ -54,7 +54,7 @@ struct Subscriber {
     /// subscriber that just registered has accepted nothing, and a snapshot its
     /// full queue dropped was not accepted. A queued snapshot stays the
     /// comparison point when coalescing replaces it, so a later restore of an
-    /// older delivered value is still recognized as a change (spec 6.8).
+    /// older delivered value is still recognized as a change.
     accepted_list: Option<Vec<SessionSummary>>,
 }
 
@@ -70,7 +70,7 @@ impl Subscriber {
     /// The frequent trigger for a refresh is a session event, and most events
     /// move nothing a directory row shows, so the steady state during a turn is
     /// a payload identical to the last one. `list` is cumulative and the latest
-    /// frame supersedes (spec 6.4), so an unchanged snapshot carries no
+    /// frame supersedes, so an unchanged snapshot carries no
     /// information. Compared on the payload rather than on what produced it,
     /// because the payload is what a client sees.
     fn offer_list(&mut self, sessions: &[SessionSummary]) -> bool {
@@ -79,8 +79,8 @@ impl Subscriber {
         }
         let frame = Frame::List {
             sessions: sessions.to_vec(),
-            // A plain host's rows are all its own, so it names no hosts
-            // (spec 7.1).
+            // A plain host's rows are all its own, so it names no hosts:
+            // that field is a gateway's.
             hosts: Vec::new(),
         };
         match self.deliver(&frame) {
@@ -104,7 +104,7 @@ impl Subscriber {
         match self.attached.get_mut(session) {
             None => {
                 // A session this stream did not name produces nothing but its
-                // row in `list` frames (spec 6.5). Its events would apply to
+                // row in `list` frames. Its events would apply to
                 // no state this client holds, its seqs may not be used as
                 // cursors, and its reliable-transient frames are undroppable
                 // by class, so delivering them would let a busy session evict
@@ -323,7 +323,7 @@ pub(crate) struct Fanout {
     state: StdMutex<FanoutState>,
     next_id: AtomicU64,
     /// Pinged whenever the session directory changed. The list publisher
-    /// coalesces on it (spec 6.8).
+    /// coalesces on it.
     list_dirty: Notify,
     live_capacity: NonZeroUsize,
 }
@@ -396,7 +396,7 @@ impl Fanout {
     }
 
     /// Take `session` back off a subscriber's attach set, for one its attach
-    /// could not resolve (spec 6.5).
+    /// could not resolve.
     ///
     /// A subscriber is registered for every session its request names before
     /// any of them is resolved, which is what makes an attach in flight count
@@ -488,7 +488,7 @@ impl Fanout {
     ///
     /// True from the moment a subscriber registers, not from when its attach
     /// block completes, which is what lets the release path treat an attach in
-    /// flight as use (spec section 5: attachment is the retention signal).
+    /// flight as use: attachment is the retention signal.
     pub(crate) fn attached(&self, session: &str) -> bool {
         self.lock()
             .subscribers
@@ -579,7 +579,7 @@ impl Attachment {
     ///
     /// A client arms its fold from this rather than from what it asked for:
     /// a session the attach could not resolve is answered with an `error`
-    /// frame instead of a block (spec 6.5), so it is not here, and arming for
+    /// frame instead of a block, so it is not here, and arming for
     /// a block that never comes strands that session's fold.
     pub fn attached(&self) -> &[String] {
         &self.attached
@@ -784,8 +784,7 @@ mod tests {
         }
     }
 
-    /// A session-scoped refusal (spec 6.3), reliable-transient like the rest of
-    /// its class.
+    /// A session-scoped refusal, reliable-transient like every `error` frame.
     fn refusal(code: &str) -> Frame {
         Frame::Error {
             session: SESSION.to_string(),
@@ -949,7 +948,7 @@ mod tests {
     }
 
     /// A snapshot that restores the last delivered value is still offered when
-    /// a different one was accepted in between (spec 6.8).
+    /// a different one was accepted in between.
     ///
     /// `list` coalescing can replace a queued change with the restore before
     /// either is drained. Comparing the restore against what was delivered says
@@ -1011,7 +1010,7 @@ mod tests {
     }
 
     /// A session this stream did not attach produces nothing on it, not even
-    /// its durable and reliable-transient frames (spec 6.5). The host-level
+    /// its durable and reliable-transient frames. The host-level
     /// `list` frame still flows: it belongs to the connection.
     #[test]
     fn an_unattached_session_produces_nothing_but_the_list() {
@@ -1085,7 +1084,7 @@ mod tests {
     /// window, so undoing the registration has to cover what it caught as well
     /// as what would come later: this stream was never served that session's
     /// block, and its frames are undroppable by class, so they would count
-    /// against a bound this client never asked to spend (spec 6.5, 6.9).
+    /// against a bound this client never asked to spend.
     #[test]
     fn a_detached_session_leaves_nothing_of_itself_on_the_stream() {
         let fanout = Fanout::default();
@@ -1144,7 +1143,7 @@ mod tests {
         assert!(fanout.attached(OTHER));
     }
 
-    /// A refusal is reliable-transient (spec 6.4), so neither queue rule that
+    /// A refusal is reliable-transient, so neither queue rule that
     /// exists for lossy frames may touch it: it is held behind an attach block
     /// rather than dropped, and at the bound it evicts rather than being lost.
     /// A dropped refusal is a client left waiting for an attach block that was
@@ -1246,8 +1245,8 @@ mod tests {
         assert!(drained(&mut rx).is_empty(), "eviction closes and clears");
     }
 
-    /// A durable frame may not be coalesced or dropped, whatever its event is
-    /// (spec 6.4). Nothing re-sends one: a client that lost a durable frame is
+    /// A durable frame may not be coalesced or dropped, whatever its event is.
+    /// Nothing re-sends one: a client that lost a durable frame is
     /// missing a log entry with nothing to tell it so. At the bound the
     /// subscriber is evicted instead, and the backfill of its re-attach carries
     /// the entry from its cursor.

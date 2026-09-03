@@ -1,6 +1,5 @@
 //! The host-picker overlay, and the resolution of the `--host` flag beside it:
-//! the two ways a client says which of a peer's hosts a created session is for
-//! (spec 6.6, 9.2).
+//! the two ways a client says which of a peer's hosts a created session is for.
 //!
 //! A create runs an agent in a working directory, so which host it lands on is
 //! never guessed. A peer with one answer gives it itself, which is what an
@@ -23,7 +22,7 @@
 //! their filter key is absent from the id map the confirm resolves through, so
 //! the callback returns having done nothing and the overlay stays open. Besides
 //! the sentinel that is a host the gateway has never spoken to, which has no id
-//! and so nothing a create could name it by (spec 7.1). It gets a row anyway,
+//! and so nothing a create could name it by. It gets a row anyway,
 //! saying why: a pickable row would be a lie, and no row at all would be a
 //! different one in a list of the peer's hosts.
 
@@ -49,10 +48,10 @@ const UNNAMED: &str = "an unnamed host";
 /// [`UNNAMED`] for an entry that carries no name of any kind.
 ///
 /// Held to the rule a reader applies rather than to the sender's word for
-/// itself (spec 6.1): a name reaches a terminal, and this is the one place a
+/// itself: a name reaches a terminal, and this is the one place a
 /// plain host's own hello is painted without a gateway having normalized it.
 ///
-/// Neither a name nor an address is something a create can name (spec 6.8), so
+/// Neither a name nor an address is something a create can name, so
 /// a row labelled with one of those is not necessarily a row that can be
 /// picked. See [`rows`].
 fn row_label(host: &DirectoryHost) -> String {
@@ -64,7 +63,7 @@ fn row_label(host: &DirectoryHost) -> String {
 /// address a peer has only ever known it by.
 ///
 /// The id leads because it is the only value `--host` and a peer's create route
-/// accept (spec 6.6), and a list of labels would be instructions that do not
+/// accept, and a list of labels would be instructions that do not
 /// work. The peer states its own refusals the same way, which is a rule stated
 /// twice on purpose: the two are different processes and neither can hold the
 /// other to it.
@@ -79,7 +78,7 @@ fn host_candidate(host: &DirectoryHost) -> String {
 /// Whether a create has to be told which host it is for.
 ///
 /// True from two hosts up, which is exactly where a gateway stops defaulting
-/// the absent host field and refuses instead (spec 6.6). Below that the peer
+/// the absent host field and refuses instead. Below that the peer
 /// answers the question itself, whether by having one host to default to or by
 /// having none and saying so.
 pub(crate) fn choice_is_ambiguous(hosts: &[DirectoryHost]) -> bool {
@@ -110,7 +109,7 @@ pub(crate) enum HostQueryError {
 /// An exact id wins outright. Failing that, a value that is a prefix of exactly
 /// one id resolves to it, so an operator types as much of a 32-hex id as it
 /// takes to be unique. What comes back is always the full id, because that is
-/// the only form a peer resolves a create against (spec 6.6).
+/// the only form a peer resolves a create against.
 ///
 /// A blank value is refused rather than read as a prefix, which every id starts
 /// with: a script whose host variable came out empty has named nothing, and
@@ -272,7 +271,7 @@ mod tests {
         }
     }
 
-    /// A host that reports a name for itself, as every host does (spec 6.1).
+    /// A host that reports a name for itself, as every host does.
     fn calling_itself(id: &str, name: &str) -> DirectoryHost {
         DirectoryHost {
             name: Some(name.to_string()),
@@ -281,7 +280,7 @@ mod tests {
     }
 
     /// A host a gateway has never spoken to: an address and no id, which is
-    /// also always unreachable (spec 7.1).
+    /// also always unreachable.
     fn unseen(address: &str) -> DirectoryHost {
         DirectoryHost {
             id: None,

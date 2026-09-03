@@ -1,4 +1,4 @@
-//! One client stream's bounded outbound queue (spec 6.9).
+//! One client stream's bounded outbound queue.
 //!
 //! The policy is the host's own fan-out, and deliberately not a second one: a
 //! bounded queue per attached client, lossy frames coalesced by their key and
@@ -15,7 +15,7 @@
 //! which is ordinary HTTP backpressure with the host's own producer at the far
 //! end of it.
 //!
-//! The bound governs live fan-out only (spec 6.9), so a queued block occupies
+//! The bound governs live fan-out only, so a queued block occupies
 //! the queue without occupying the bound: a client mid-backfill keeps its full
 //! slack for the live frames of every other session on its stream, and overflow
 //! there still evicts it. One difference in mechanism from a host, which travels
@@ -63,7 +63,7 @@ struct Queue {
 struct State {
     frames: VecDeque<Queued>,
     /// How many of `frames` are live, which is what an overflow is measured
-    /// against: the bound governs live fan-out only (spec 6.9).
+    /// against: the bound governs live fan-out only.
     ///
     /// Kept as a count rather than recomputed because every live frame pays for
     /// it. The invariant is `live == frames.iter().filter(coalescible).count()`,
@@ -84,7 +84,7 @@ struct Queued {
     ///
     /// False for the frames of an attach block. They have to reach the client in
     /// the order the host wrote them: the block opens with the `state` frame the
-    /// client adopts the session's epoch from (spec 6.5), so a live snapshot that
+    /// client adopts the session's epoch from, so a live snapshot that
     /// coalesced it away would leave the client applying a block under no epoch
     /// at all. A newer snapshot queues behind the block instead.
     coalescible: bool,
@@ -104,7 +104,7 @@ pub(crate) enum Offered {
     /// lossy key.
     Queued,
     /// A cumulative snapshot met the bound. The client stays: a newer snapshot
-    /// supersedes this one anyway (spec 6.4).
+    /// supersedes this one anyway.
     Dropped,
     /// The client is gone: its queue overflowed with frames that may not be
     /// dropped, or it had already left.
@@ -128,7 +128,8 @@ impl Sender {
             if let Some(index) = superseded {
                 // Dropped and re-enqueued at the tail rather than substituted in
                 // place: in-place substitution would reorder content across a
-                // queued durable boundary (spec 6.9).
+                // queued durable boundary, briefly painting one turn's text
+                // into another's bubble.
                 state.frames.remove(index);
                 state.live -= 1;
             } else if state.live >= self.0.capacity.get() {
@@ -235,7 +236,7 @@ impl Queue {
     }
 }
 
-/// Identity of one cumulative snapshot in the queue (spec 6.4).
+/// Identity of one cumulative snapshot in the queue.
 ///
 /// The classes are the protocol's, so this mirrors the host's own fan-out. The
 /// session ids in it are the namespaced ones, because a frame is rewritten
@@ -276,7 +277,7 @@ fn lossy_key(frame: &DecodedFrame) -> Option<LossyKey> {
         },
         Frame::State { session, .. } => Some(LossyKey::State(session.clone())),
         // A merged `list` reaches a client from the gateway's own control links
-        // rather than through this queue (spec 7.1). Classified anyway, so that
+        // rather than through this queue. Classified anyway, so that
         // what this says about a frame is the protocol's answer rather than a
         // claim about who happens to enqueue one.
         Frame::List { .. } => Some(LossyKey::List),
@@ -443,7 +444,7 @@ mod tests {
             .expect("an unknown frame decodes")
     }
 
-    /// One session's attach refusal (spec 6.3).
+    /// One session's attach refusal, the session-scoped `error` frame.
     fn refusal() -> DecodedFrame {
         decoded(Frame::Error {
             session: SESSION.to_string(),
@@ -497,7 +498,7 @@ mod tests {
     }
 
     /// Lossy overflow drops the snapshot and the client stays. Reliable overflow
-    /// evicts it instead of losing a frame it cannot regenerate (spec 6.9).
+    /// evicts it instead of losing a frame it cannot regenerate.
     #[tokio::test]
     async fn overflow_drops_a_snapshot_and_evicts_on_a_reliable_frame() {
         let (sender, mut receiver, cancelled) = queue(2);
@@ -530,8 +531,8 @@ mod tests {
         );
     }
 
-    /// A durable frame may not be coalesced or dropped, whatever its event is
-    /// (spec 6.4). Nothing here re-sends one: this gateway does not resume an
+    /// A durable frame may not be coalesced or dropped, whatever its event is.
+    /// Nothing here re-sends one: this gateway does not resume an
     /// upstream itself, so a client that lost a durable frame is missing a log
     /// entry with nothing to tell it so. At the bound it is evicted instead, and
     /// the backfill of its re-attach carries the entry from its cursor.
@@ -613,7 +614,7 @@ mod tests {
         assert!(cancelled.is_cancelled());
     }
 
-    /// A session-scoped refusal is reliable-transient (spec 6.4): losing one
+    /// A session-scoped refusal is reliable-transient: losing one
     /// leaves a client waiting for an attach block that was already answered,
     /// so it evicts at the bound rather than being dropped.
     #[tokio::test]
@@ -640,7 +641,7 @@ mod tests {
     }
 
     /// A queued attach block is never coalesced into: its opening `state` frame
-    /// is what the client adopts the session's epoch from (spec 6.5), so a live
+    /// is what the client adopts the session's epoch from, so a live
     /// snapshot that took its place would leave the client applying a block under
     /// no epoch at all. The newer snapshot queues behind the block.
     #[tokio::test]
@@ -658,8 +659,8 @@ mod tests {
         );
     }
 
-    /// A queued attach block occupies the queue without occupying the bound
-    /// (spec 6.9: "the bound governs live fan-out only"). A block that filled
+    /// A queued attach block occupies the queue without occupying the bound,
+    /// which governs live fan-out only. A block that filled
     /// the queue would otherwise leave zero live headroom, so the next reliable
     /// frame of any other session on the stream would evict the client the block
     /// is for, and its re-attach would reach the same state again.

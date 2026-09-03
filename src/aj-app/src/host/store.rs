@@ -1,14 +1,14 @@
 //! The on-disk part of the host's session directory.
 //!
 //! A `list` frame is produced on a coalescing tick whose frequent trigger is
-//! session events, so producing one may not touch the filesystem (spec 6.8). It
-//! does not: a refresh reads [`ColdSessions::rows`], which is memory. The rows
+//! session events, so producing one may not touch the filesystem. It does
+//! not: a refresh reads [`ColdSessions::rows`], which is memory. The rows
 //! are brought up to date at enumeration points, which are rare and externally
 //! paced (host startup, an explicit session listing, a stream attach), and by
 //! the host recording its own structural changes.
 //!
-//! The host is the single writer of its working directory's store (spec
-//! section 5), so this is not a staleness the design has to chase. A
+//! The host is the single writer of its working directory's store, so this
+//! is not a staleness the design has to chase. A
 //! concurrent writer's sessions cannot be served by this host anyway, and its
 //! activity becomes visible at the next enumeration point. That cuts both ways:
 //! a row whose log another process deleted is offered until then, and an attach
@@ -18,12 +18,12 @@
 //! An enumeration reads no log content beyond the format sniff, one first
 //! line per file, cached against the `(mtime, size)` it was read at. The only
 //! other file it opens is a session's tag sidecar, cached the same way and
-//! only for the sessions that have one (spec 6.8). The archived sidecars cost
+//! only for the sessions that have one. The archived sidecars cost
 //! one more listing of the same directory and no read at all: the file's
 //! existence is the whole answer. A row itself is built from the `stat` the
 //! enumeration already did, which is what keeps host startup off the store's
 //! bytes: deriving a cold session's `last_seq` would cost a read of every log
-//! in the directory, and the row does not carry one (spec 6.8). One case falls
+//! in the directory, and the row does not carry one. One case falls
 //! outside the cache, a log the store cannot open is retried at every
 //! enumeration, because nothing about the file moves when it becomes readable
 //! again. That costs the failed open and nothing more.
@@ -122,13 +122,13 @@ impl SessionStore for ConversationPersistence {
 /// One session the store holds that the host is not holding live.
 ///
 /// No durable position: a cold row carries an activity stamp instead, and
-/// deriving the position would cost a read of the log (spec 6.8).
+/// deriving the position would cost a read of the log.
 #[derive(Clone)]
 pub(crate) struct ColdSession {
     pub(crate) id: String,
     pub(crate) last_activity: DateTime<Utc>,
     /// The session's label, `None` when it has no sidecar or none this host
-    /// could read (spec 6.8).
+    /// could read.
     pub(crate) tag: Option<String>,
     /// Whether the user has put the session away, which is the existence of
     /// its archived sidecar.
@@ -136,7 +136,7 @@ pub(crate) struct ColdSession {
     /// Whether a writer that is not this host holds the session's lock.
     pub(crate) locked: bool,
     /// Which hold [`Self::locked`] answers about, `None` for a session no rival
-    /// has been seen holding (spec 6.8).
+    /// has been seen holding.
     pub(crate) lock_generation: Option<u64>,
 }
 
@@ -146,7 +146,7 @@ pub(crate) struct ColdSession {
 pub(crate) struct ColdSessions<S> {
     store: S,
     cache: StdMutex<Cache>,
-    /// The initial value for each session's lock counter (spec 6.8).
+    /// The initial value for each session's lock counter.
     ///
     /// Read once from the wall clock. It usually places a restarted host near
     /// its previous range without making the in-memory counter persistent.
@@ -262,7 +262,7 @@ struct Cache {
     /// listing's own report that the sidecar exists is the whole answer.
     archived: HashMap<String, bool>,
     /// The sessions a rival writer holds, as the host last established. Its
-    /// members are the rows that read `locked` (spec 6.8).
+    /// members are the rows that read `locked`.
     ///
     /// A set rather than a map of bits, because membership is the bit and the
     /// unheld answer is the overwhelmingly common one: a store whose sessions
@@ -274,11 +274,11 @@ struct Cache {
     /// sweep skips them and a won acquire clears the entry a refusal left.
     locked: HashSet<String>,
     /// One entry per session whose lock generation this host has initialized,
-    /// holding its latest acquire generation (spec 6.8).
+    /// holding its latest acquire generation.
     ///
     /// Outlives the bit deliberately, where [`Self::locked`] empties as holds
     /// end: a free row carries the latest acquire's generation, which lets a
-    /// refused client see the conflict is over (spec 6.5). The fall therefore
+    /// refused client see the conflict is over. The fall therefore
     /// leaves the entry standing. It costs one counter per session this host
     /// has acquired or observed held.
     generations: HashMap<String, u64>,
@@ -347,7 +347,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// The cold rows as they stand, in no particular order.
     ///
     /// Touches no filesystem, which is the whole point: this is what a
-    /// refresh serves (spec 6.8).
+    /// refresh serves.
     pub(crate) fn rows(&self) -> Vec<ColdSession> {
         let cache = self.cache();
         cache
@@ -392,8 +392,8 @@ impl<S: SessionStore> ColdSessions<S> {
         self.cache().archived.get(id).copied().unwrap_or(false)
     }
 
-    /// Re-read the store and bring the rows up to date. The enumeration point
-    /// (spec 6.8), and the only path here that reads the directory.
+    /// Re-read the store and bring the rows up to date. The enumeration point,
+    /// and the only path here that reads the directory.
     ///
     /// `live` names the sessions the host holds. Their logs are enumerated like
     /// any other, but nothing is derived from them: the host answers a live
@@ -470,7 +470,7 @@ impl<S: SessionStore> ColdSessions<S> {
         }
         // The second directory read, over `meta/`. A store with no tagged
         // session has no such directory, so this costs one failed open and
-        // reads nothing (spec 6.8).
+        // reads nothing.
         //
         // A sidecar directory we cannot read costs the labels their refresh
         // and nothing else: a label is display metadata, and one that cannot
@@ -500,7 +500,7 @@ impl<S: SessionStore> ColdSessions<S> {
             Err(err) => tracing::warn!("could not read the store's archived sidecars: {err}"),
         }
         // The fourth, over `locks/`, for the one axis whose fact belongs to
-        // another writer (spec 6.8). A stat per lock file, and a probe only of
+        // another writer. A stat per lock file, and a probe only of
         // the ones a stat shows a holder record on.
         //
         // A directory this host cannot read costs the axis its refresh and
@@ -583,7 +583,7 @@ impl<S: SessionStore> ColdSessions<S> {
     }
 
     /// The latest lock generation of `session_id`, `None` until this host has
-    /// acquired it or an enumeration first found a rival hold (spec 6.8).
+    /// acquired it or an enumeration first found a rival hold.
     ///
     /// Touches no filesystem. Read on two paths: every row this host publishes
     /// for the session, live or cold, and the refusal that names the acquire a
@@ -625,7 +625,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// `stat` transfer no bytes, and [`Self::tag_reads`] counts sidecar
     /// contents, which the archived axis reads none of and this reads none of
     /// either. A refresh that listed the sidecars would be invisible without
-    /// it (spec 6.8).
+    /// it.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn sidecar_directory_reads(&self) -> u64 {
         self.sidecar_directory_reads.load(Ordering::Relaxed)
@@ -634,7 +634,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// How many tag sidecars this has opened and read.
     ///
     /// The same kind of contract as [`Self::directory_reads`], for the other
-    /// per-file read an enumeration is allowed (spec 6.8). A row carries its
+    /// per-file read an enumeration is allowed. A row carries its
     /// label either way, so only this tells a cached answer from a fresh one:
     /// an untagged store must never reach a sidecar, and a settled tagged one
     /// must read each of them exactly once.
@@ -649,8 +649,8 @@ impl<S: SessionStore> ColdSessions<S> {
 
     /// How many membership questions reached the store.
     ///
-    /// The other half of the same kind of contract: spec 6.2 wants an id the
-    /// grammar rejects turned away *before* a store lookup, and a refusal
+    /// The other half of the same kind of contract: an id the grammar rejects
+    /// is turned away *before* any store lookup, and a refusal
     /// leaves no other trace to assert on, since the answer is the same
     /// either way.
     #[cfg(any(test, feature = "test-support"))]
@@ -661,8 +661,8 @@ impl<S: SessionStore> ColdSessions<S> {
     /// How many times this has read the store's lock directory.
     ///
     /// One read per enumeration point, never one per session: the same shape
-    /// the sidecar axes are swept with, and the number the spec's cost claim
-    /// for the `locked` axis is about (spec 6.8).
+    /// the sidecar axes are swept with, and the number the `locked` axis's
+    /// cost budget is about.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn lock_directory_reads(&self) -> u64 {
         self.lock_directory_reads.load(Ordering::Relaxed)
@@ -682,8 +682,8 @@ impl<S: SessionStore> ColdSessions<S> {
     ///
     /// The membership test materialization gates on. It costs one `stat` plus
     /// at most one format sniff, so it says nothing about how many sessions
-    /// the store holds: that is what the id grammar buys (spec 6.2, and
-    /// [`crate::host::validate_session_id`]).
+    /// the store holds: that is what the id grammar buys
+    /// ([`crate::host::validate_session_id`]).
     ///
     /// A log this store cannot stat is a failure rather than an absence, so
     /// a store nothing can read refuses a request loudly instead of reporting
@@ -765,7 +765,7 @@ impl<S: SessionStore> ColdSessions<S> {
 
     /// The label in `sidecar`, read once per fingerprint into the cache.
     ///
-    /// The second per-file read an enumeration is allowed (spec 6.8), and as
+    /// The second per-file read an enumeration is allowed, and as
     /// with the format sniff the cache is what makes it affordable: a settled
     /// store re-reads no sidecar, and one whose label was just rewritten reads
     /// only that one.
@@ -811,7 +811,7 @@ impl<S: SessionStore> ColdSessions<S> {
 
     /// The format verdict for `metadata`'s log, sniffed once per fingerprint.
     ///
-    /// The one log-content read an enumeration is allowed (spec 6.8), and the
+    /// The one log-content read an enumeration is allowed, and the
     /// reason it is affordable is this cache: a settled store re-sniffs
     /// nothing.
     ///
@@ -1755,8 +1755,8 @@ mod tests {
     /// A log the store cannot read for a moment does not cost the session its
     /// row. The verdict says nothing about the log, so an enumeration that
     /// hits one leaves the directory where it stands rather than dropping a
-    /// session out of it, which spec section 5 does not allow a release to be
-    /// followed by.
+    /// session out of it: a session leaves the directory only by deletion,
+    /// never by a release or a failed read.
     #[test]
     fn a_transient_read_failure_does_not_drop_a_row() {
         let store = FakeStore::default();
@@ -1957,7 +1957,7 @@ mod tests {
 
     /// The membership test answers off one `stat` and the cached format
     /// verdict. It never reads the directory, which is what makes it
-    /// independent of how many sessions the store holds (spec 6.2).
+    /// independent of how many sessions the store holds.
     #[test]
     fn membership_answers_off_one_stat_and_one_sniff() {
         let store = FakeStore::default();
@@ -1984,7 +1984,7 @@ mod tests {
 
     /// A store where nothing is labelled never opens a sidecar, however often
     /// it is enumerated. Untagged is the common case, and an implementation
-    /// that asked per session would turn it into a read per row (spec 6.8).
+    /// that asked per session would turn it into a read per row.
     #[test]
     fn an_untagged_store_reads_no_sidecar() {
         let store = FakeStore::default();
@@ -2590,7 +2590,7 @@ mod tests {
 
     /// The record is the filter, not the answer. A settled store is swept
     /// without a single probe, which is what keeps the axis's cost the readdir
-    /// and the stats (spec 6.8).
+    /// and the stats.
     #[test]
     fn a_settled_store_is_swept_without_a_probe() {
         let store = FakeStore::default();

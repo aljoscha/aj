@@ -3,7 +3,7 @@
 //! Materializing a session in a host process takes this lock and holds it
 //! for the session's live lifetime, so a second process that tries the
 //! same session refuses rather than growing a sibling branch in a shared
-//! log (spec section 5).
+//! log.
 //!
 //! The lock file doubles as the registry of minted session ids: creating
 //! a session claims its id by `create_new` on the same path (see
@@ -72,7 +72,7 @@ impl Drop for SessionLock {
 pub struct LockHolder {
     pub pid: u32,
     /// The store-level id of the host that took the lock, which is what
-    /// distinguishes two hosts over one store (spec section 4).
+    /// distinguishes two hosts over one store.
     pub host_id: String,
 }
 
@@ -178,7 +178,7 @@ impl SessionLock {
 
     /// Every lock file the store holds, one directory read plus a `stat` each.
     ///
-    /// The sweep that keeps a directory's `locked` bits current (spec 6.8).
+    /// The sweep that keeps a directory's `locked` bits current.
     /// [`LockMetadata::has_holder_record`] is the filter for which of them are
     /// worth a [`Self::is_held`] probe: a record is written under the won lock
     /// and truncated by a clean release, so an empty file is a lock nobody has

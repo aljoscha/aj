@@ -102,7 +102,7 @@ impl Widget for PromptHistoryView {
         let Event::KeyPress(key) = event else {
             return;
         };
-        // Overlay-local scope toggle (Spec F): flip, re-parks a fetch,
+        // Overlay-local scope toggle: flip, re-parks a fetch,
         // and refresh the subtitle to name the scope it would switch to.
         if action_matches(key, ACTION_HISTORY_TOGGLE_SCOPE) {
             self.scope = match self.scope {

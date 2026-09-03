@@ -40,7 +40,7 @@ pub struct Redraw(pub bool);
 /// alongside it.
 ///
 /// `entry` is the log entry the event derives from: `Some` for a durable
-/// frame (the wire envelope's `entry_id`, spec 6.4), `None` for a
+/// frame (the wire envelope's `entry_id`), `None` for a
 /// locally emitted event, for a live non-durable one, and for every
 /// event of a dead-log replay.
 ///
@@ -48,7 +48,7 @@ pub struct Redraw(pub bool);
 /// its own: a compaction checkpoint's summary row and a projected state
 /// notice. Handing it in is what lets a re-served backfill
 /// update those rows in place instead of appending a second one, which
-/// the cursor invariant cannot do for them (spec 6.5). It also tells a
+/// the cursor invariant cannot do for them. It also tells a
 /// `SubAgentStart` that names a spawn root from the entry-less bracketing
 /// glue a backfill synthesizes for a run in progress. Passing `None`
 /// for an event that is in fact durable is safe when the fold starts
@@ -219,7 +219,7 @@ pub fn reduce(
             // result there, and a snapshot arriving late (one that was in
             // flight at an attach boundary, or that raced the result)
             // must not overwrite it with a partial. Correctness never
-            // depends on a lossy frame (spec 6.4), so dropping it is the
+            // depends on a lossy frame, so dropping it is the
             // only safe reading. `TaskOutput` freezes the same way.
             match state.tool_entry_mut(agent_id, id) {
                 Some(cell) if cell.status == ToolStatus::Running => {
@@ -402,10 +402,9 @@ pub fn reduce(
             } else if let Some(summary) = summary {
                 // A successful compaction appends its checkpoint entry,
                 // and its tagged entry is the row's key. The cursor invariant is not
-                // enough on its own: it is a de-duplication optimization
-                // (spec 6.5), and a client that offers an older cursor or
-                // re-attaches under a fresh epoch is served the entry
-                // again.
+                // enough on its own: it is a de-duplication optimization,
+                // and a client that offers an older cursor or re-attaches
+                // under a fresh epoch is served the entry again.
                 let existing =
                     entry.and_then(|entry| indexed_row(state, agent_id, entry, compaction_origin));
                 match existing {
@@ -484,7 +483,7 @@ pub fn reduce(
                     // the report refresh on the sub's conclusions firing only
                     // on a `Running` box. Without it a client re-attaching
                     // during a continuation keeps the previous run's report
-                    // for good (spec 6.5).
+                    // for good.
                     //
                     // A durable start names a spawn root, and a root is
                     // minted once per run, so re-serving one for a box we
@@ -3490,7 +3489,7 @@ mod tests {
         }
     }
 
-    // ---- Idempotent re-application (spec 6.5) ---------------------------
+    // ---- Idempotent re-application --------------------------------------
     //
     // A re-attach backfill re-projects entries the client already saw, so
     // applying a projected event twice has to leave the same state. The
@@ -3983,8 +3982,8 @@ mod tests {
     #[test]
     fn a_late_tool_update_cannot_repaint_a_concluded_cell() {
         // A cumulative snapshot is lossy, so correctness never depends on
-        // one (spec 6.4). One that arrives after the call's authoritative
-        // result must therefore be dropped, not painted.
+        // one. One that arrives after the call's authoritative result must
+        // therefore be dropped, not painted.
         let mut s = state();
         let mut life = AgentLifecycle::default();
         let authoritative = ToolDetails::Text {
@@ -4543,7 +4542,7 @@ mod tests {
         }
     }
 
-    // ---- Quiesce (spec 6.5's re-attach reconciliation) ------------------
+    // ---- Quiesce (re-attach reconciliation) -----------------------------
 
     #[test]
     fn quiesce_drops_the_streaming_assistant_entry_and_keeps_finalized_ones() {
@@ -4984,9 +4983,9 @@ mod tests {
     fn canonical_form_separates_states_that_differ_only_in_hidden_settings() {
         // The footer's model line renders model id plus thinking, so a
         // difference in provider, speed or verbosity would be invisible to
-        // an oracle built on that string. Spec 6.3's `state` frame carries
-        // all four, and settings visibility for a mid-session joiner is a
-        // named sharp edge (spec 11), so the oracle carries the snapshot.
+        // an oracle built on that string. The wire's `state` frame carries
+        // all four, and a mid-session joiner learns its settings from that
+        // frame alone, so the oracle carries the snapshot.
         let life = AgentLifecycle::default();
         let reference = canon(&state(), &life);
         let mutations: [fn(&mut AgentSettings); 3] = [

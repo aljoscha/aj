@@ -1,7 +1,7 @@
 //! Read-only viewer for a background bash task's output.
 //!
-//! Drilled into from the agent picker (Part D-3a Spec E: the picker
-//! drops out, so Esc from here returns to the editor, not the picker).
+//! Drilled into from the agent picker, which drops out on the way in, so
+//! Esc from here returns to the editor, not the picker.
 //! It shows the task's command, a live status line, and the scrollable
 //! output. The body tails and the status flips on their own: locally the
 //! viewer re-reads the registry on every draw, remotely the drive loop
@@ -14,7 +14,8 @@
 //! the task persists a spill file (background bash tasks always do) the
 //! viewer reads it for the full output; otherwise it falls back to the
 //! bounded rolling tails the model sees. The remote read carries the tails
-//! only, since the spill file sits on the host's disk (spec 6.7).
+//! only, since the spill file sits on the host's disk and is not reachable
+//! over the wire.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -48,7 +49,7 @@ pub(crate) enum TaskBacking {
     /// A live registry re-read at draw. Kills still park for the drive loop so
     /// the selected session's Caught gate applies uniformly.
     Local(TaskRegistry, Rc<RefCell<Option<TaskId>>>),
-    /// The per-task read (spec 6.7): the drive loop pushes snapshots in
+    /// The host's per-task read: the drive loop pushes snapshots in
     /// through [`TaskOutputView::apply_details`], and a kill is parked in the
     /// slot for it to send as a command.
     Remote(Rc<RefCell<Option<TaskId>>>),
@@ -285,7 +286,7 @@ impl Widget for TaskOutputView {
             ctx.consume_and_redraw();
             return;
         }
-        // Overlay-local kill (Spec F): parked for the drive loop so local and
+        // Overlay-local kill: parked for the drive loop so local and
         // remote viewers share mutation gating. The status flip arrives via the
         // task's `TaskEnd` and repaints the header. Inert once terminal.
         if action_matches(key, ACTION_TASK_KILL) {
@@ -422,8 +423,8 @@ fn human_bytes(n: u64) -> String {
 }
 
 /// The scroll/kill/close subtitle, key labels resolved from keybinding
-/// data (Spec F). Scroll and close are the built-in read-only keys, so
-/// they keep the fixed convention.
+/// data so a rebind relabels them. Scroll and close are the built-in
+/// read-only keys, so they keep the fixed convention.
 fn subtitle() -> String {
     let kill = action_shortcut(ACTION_TASK_KILL).expect("aj.task.kill has a default chord");
     let up = format_keybinding("up");

@@ -1,4 +1,4 @@
-//! The session-tag overlay: name the focused session (spec 6.8).
+//! The session-tag overlay: name the focused session.
 //!
 //! A one-line editor prefilled with the label the session carries, so an edit
 //! starts from what is on screen rather than from nothing. Submitting parks a

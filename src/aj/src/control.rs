@@ -1,6 +1,6 @@
 //! The transport boundary the interactive shell sits on.
 //!
-//! The frontend is a client of a session host either way (spec section 5).
+//! The frontend is a client of a session host either way.
 //! [`Control`] is the seam where "in process" and "over HTTP" stop mattering:
 //! one async surface covering exactly what the drive loop needs, with a
 //! [`Stream`] of frames behind it. Everything above this module is written
@@ -8,12 +8,12 @@
 //!
 //! The vocabulary is the host's own: [`aj_app::host::Command`] is the one
 //! command language, and the remote arm translates it into the wire requests
-//! of spec 6.6 rather than the shell knowing two dialects. What the arms do
+//! rather than the shell knowing two dialects. What the arms do
 //! *not* share is how a loss reads: a remote stream reports the transport
 //! failure behind it, an in-process one just ends, which is why
 //! [`ControlFrame`] separates the two and [`ControlError`] keeps "the peer
 //! refused this" apart from "the transport failed". The recovery is the same
-//! either way, a re-attach with a cursor (spec 6.5).
+//! either way, a re-attach with a cursor.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -79,7 +79,7 @@ impl From<CreateError> for ControlError {
 impl ControlError {
     /// Whether the peer refused because its current state conflicts with the
     /// request: a turn in flight, background work live, a head switch that
-    /// would strand it (spec 6.1's 409).
+    /// would strand it (the wire's 409).
     ///
     /// This is the one distinction a caller acts on rather than just displays,
     /// because a busy refusal has a local remedy to name (the chord that
@@ -95,7 +95,7 @@ impl ControlError {
         }
     }
 
-    /// Whether the peer does not know an entry the request named (spec 6.1's
+    /// Whether the peer does not know an entry the request named (the wire's
     /// 404 `unknown_entry`).
     pub(crate) fn unknown_entry(&self) -> bool {
         match self {
@@ -105,13 +105,14 @@ impl ControlError {
         }
     }
 
-    /// Whether the peer does not know the endpoint the request named (spec
-    /// 6.1's 404 `unknown_endpoint`).
+    /// Whether the peer does not know the endpoint the request named (the
+    /// wire's 404 `unknown_endpoint`).
     ///
     /// Told apart from an unknown entry because it says nothing about the
-    /// session: the peer is older than the feature being asked for. Spec 6.10
-    /// allows probing an endpoint as a fallback check, which is what a caller
-    /// reading this is doing. It is the fallback and not the first choice
+    /// session: the peer is older than the feature being asked for. A
+    /// capability is self-description, never a gate, so probing an endpoint
+    /// is a valid fallback check, which is what a caller reading this is
+    /// doing. It is the fallback and not the first choice
     /// because the endpoint's capability string reaches a client only in the
     /// peer's own hello, and a gateway's hello cannot speak for the hosts
     /// behind it.
@@ -123,7 +124,7 @@ impl ControlError {
         }
     }
 
-    /// Whether the peer refused the request as malformed (spec 6.1's 400).
+    /// Whether the peer refused the request as malformed (the wire's 400).
     ///
     /// Told apart from the other refusals because the host's message quotes
     /// the entry id it was given, which a user has never seen. A caller that
@@ -137,7 +138,7 @@ impl ControlError {
     }
 
     /// Whether a create was refused for naming no host on a peer that serves
-    /// several (spec 6.6's `ambiguous_host`).
+    /// several (the `ambiguous_host` code).
     ///
     /// Only a gateway answers this, and only to a client that did not say which
     /// host it meant, so a caller that cannot ask a user says how to name one
@@ -189,7 +190,7 @@ impl Control {
     }
 
     /// Whether this frontend is a remote client, which is what decides
-    /// whether a gesture with no wire equivalent is refused (spec 9.1) and
+    /// whether a gesture with no wire equivalent is refused and
     /// whether a re-attach that fails can be waited out (only this process's
     /// own host cannot be).
     pub(crate) fn is_remote(&self) -> bool {
@@ -219,7 +220,7 @@ impl Control {
         }
     }
 
-    /// The session's branch tree, with its current head (spec 6.7).
+    /// The session's branch tree, with its current head.
     pub(crate) async fn tree(&self, session: &str) -> Result<SessionTree, ControlError> {
         match self {
             Self::Local(local) => Ok(local.host.tree(session).await?),
@@ -242,7 +243,7 @@ impl Control {
     }
 
     /// One task's detailed output, which is what backs the task-output
-    /// overlay (spec 6.7).
+    /// overlay: the spill file on the host's disk is not reachable remotely.
     pub(crate) async fn task_details(
         &self,
         session: &str,
@@ -262,14 +263,14 @@ impl Control {
     }
 
     /// Create a session with the creator's settings, an optional first prompt
-    /// and an optional tag, answering its id (spec section 8: per-session
-    /// settings follow whoever creates the session).
+    /// and an optional tag, answering its id. Per-session settings follow
+    /// whoever creates the session.
     ///
     /// `host` names which of the peer's hosts the session is for. `None` leaves
     /// that to the peer, which is what an absent host field means on the wire:
     /// the one working directory a plain host serves, or the sole host of a
     /// gateway that has one. A gateway with a choice to make refuses rather
-    /// than guessing (spec 6.6), so a caller with a user to ask asks first.
+    /// than guessing, so a caller with a user to ask asks first.
     ///
     /// `tag` is expected to have been normalized already, which is what lets
     /// the local and the remote arm hand it on unchanged.
@@ -325,7 +326,7 @@ impl Control {
     /// offering its own cursor.
     ///
     /// One stream per client, not one per session: the ordering guarantees are
-    /// per stream, and changing the attach set means reopening it (spec 6.5).
+    /// per stream, and changing the attach set means reopening it.
     /// The attach is all-or-nothing, so a refusal for any session leaves the
     /// caller with the stream it already had.
     ///
@@ -381,7 +382,7 @@ fn wire_command(command: Command) -> RemoteCommand {
         }
         Command::Settings(change) => RemoteCommand::Settings(settings_request(change)),
         // A cleared tag travels as the empty string, which is what the route
-        // reads as "clear" (spec 6.6).
+        // reads as "clear".
         Command::Tag { tag } => RemoteCommand::Tag(TagRequest {
             tag: tag.unwrap_or_default(),
         }),
@@ -397,9 +398,8 @@ fn wire_command(command: Command) -> RemoteCommand {
 /// The wire form of a settings change.
 ///
 /// Persistence is deliberately dropped: the wire has no persist axis, since
-/// the config files a host would write are the host's own (spec 6.6, section
-/// 8). The caller says so in its notice rather than silently pretending the
-/// default moved.
+/// the config files a host would write are the host's own. The caller says
+/// so in its notice rather than silently pretending the default moved.
 fn settings_request(change: SettingsChange) -> SettingsRequest {
     let SettingsChange { agent, axis, .. } = change;
     let mut wire = SessionSettings::default();
@@ -440,7 +440,7 @@ fn settings_request(change: SettingsChange) -> SettingsRequest {
 }
 
 /// The wire's agent target: absent for the main agent, which is the default
-/// every request omits (spec 6.6).
+/// every request omits.
 fn agent_target(agent: AgentId) -> Option<AgentId> {
     match agent {
         AgentId::Main => None,
@@ -461,11 +461,11 @@ pub(crate) enum Stream {
         ///
         /// The request, because the protocol gives a client no per-session
         /// answer at attach time. A stream request never fails wholesale over
-        /// one bad session (spec 6.5), and what becomes of each named session
+        /// one bad session, and what becomes of each named session
         /// arrives afterwards, in one of three shapes: its attach block, a
         /// session-scoped `error` frame, or, for a session on a host a gateway
         /// cannot currently reach, nothing at all beyond the `unreachable` mark
-        /// on its `list` row (spec 7.1).
+        /// on its `list` row.
         ///
         /// So this says which sessions the peer was asked about and nothing
         /// about which it will serve. Whoever folds a block owes it a deadline.
@@ -482,7 +482,7 @@ pub(crate) enum ControlFrame {
     ///
     /// What an in-process stream reports for every loss, since the host does
     /// not word them: the host going away, and reliable-frame overflow
-    /// evicting a shell that stopped draining (spec 6.9). The re-attach tells
+    /// evicting a shell that stopped draining. The re-attach tells
     /// those apart, because a host that is gone refuses it.
     Closed,
 }
@@ -508,8 +508,8 @@ impl Stream {
     /// has no transport to fall silent and answers the same span, so that a
     /// caller has one number to reach for in either mode.
     ///
-    /// Spec 6.1 scopes this to the stream: two missed heartbeats, and heartbeats
-    /// are host-level. So a caller bounding a wait for one *session* is
+    /// The protocol scopes this to the stream: two missed heartbeats, and
+    /// heartbeats are host-level. So a caller bounding a wait for one *session* is
     /// borrowing a scale rather than reading a budget the protocol defines for
     /// it, and inherits a minute of patience by doing so. Whether that is the
     /// right patience for a session-scoped wait is a live question, see the

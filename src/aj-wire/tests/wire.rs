@@ -136,7 +136,7 @@ fn command_request_shapes_are_pinned() {
         json!({"entry":"entry-7"})
     );
     // The branch-from-a-message shape, which the host resolves to the
-    // entry's parent (spec 6.6).
+    // entry's parent.
     assert_eq!(
         serde_json::to_value(HeadRequest::before("entry-7")).unwrap(),
         json!({"before":"entry-7"})
@@ -448,7 +448,7 @@ fn settings_use_the_cli_selection_triple_and_create_round_trips() {
     );
 }
 
-/// A create may name the host it is for (spec 6.6), in the same vocabulary a
+/// A create may name the host it is for, in the same vocabulary a
 /// directory row's `host` field and an enrolled host's id use. The field is
 /// optional and additive: a client that names none sends no key at all, which
 /// is what leaves the choice of host to the server that answers.
@@ -874,7 +874,7 @@ fn decoded_frame_rewrites_unknown_session_without_parsing_payloads() {
 }
 
 /// Every frame kind either carries a top-level `session` a gateway rewrites,
-/// or is host-scoped and forwarded as is (spec 6.10). The partition lives in
+/// or is host-scoped and forwarded as is. The partition lives in
 /// [`frame_carries_session`], whose match is exhaustive, so a new frame
 /// variant does not compile until it says which side it is on.
 ///
@@ -966,7 +966,7 @@ fn a_locally_built_frame_rewrites_through_its_typed_value() {
 }
 
 /// An unknown frame with no top-level `session` is host-scoped and forwarded
-/// as is (spec 6.10). A `session` down in a payload is not the frame's
+/// as is. A `session` down in a payload is not the frame's
 /// session, and finding one there must not turn the frame into a
 /// session-scoped one.
 #[test]
@@ -1035,7 +1035,7 @@ fn every_top_level_session_occurrence_is_rewritten() {
     assert!(!json.contains("older"), "{json}");
 }
 
-/// A gateway mints `<host_id>:<session_id>` from two opaque halves (spec 6.2),
+/// A gateway mints `<host_id>:<session_id>` from two opaque halves,
 /// so the replacement goes in as JSON rather than spliced in as text. A
 /// control character in an id would otherwise break the line-oriented framing
 /// the frame travels in.
@@ -1103,8 +1103,8 @@ fn a_rewritten_frame_can_be_rewritten_again() {
 
 /// Rewriting to the id a frame already carries changes nothing that matters.
 /// It may still change bytes, because the id is re-emitted the way serde
-/// writes a string rather than the way the host spelled it, and spec 6.10 asks
-/// only for structural equality.
+/// writes a string rather than the way the host spelled it, and forwarding
+/// promises only structural equality, not byte identity.
 #[test]
 fn rewriting_to_the_same_id_changes_nothing_that_matters() {
     let input = r#"{"kind":"future_frame","session":"a\u0062c","huge":1e400}"#;
@@ -1125,7 +1125,7 @@ fn rewriting_to_the_same_id_changes_nothing_that_matters() {
 }
 
 /// Every frame kind either belongs to a session, which the reader names, or is
-/// host-scoped (spec 6.10). The reader answers for the partition
+/// host-scoped. The reader answers for the partition
 /// [`frame_carries_session`] draws, and names the same session the typed
 /// [`Frame::session`] does.
 #[test]
@@ -1202,7 +1202,7 @@ fn an_unknown_session_scoped_frame_reads_its_id() {
 }
 
 /// An unknown frame with no top-level `session` is host-scoped and forwarded as
-/// is (spec 6.10). A `session` down in its payload is not the frame's, and
+/// is. A `session` down in its payload is not the frame's, and
 /// finding one there must not make a session-scoped frame of it: the gateway
 /// would namespace a host-scoped frame and route it to a session that does not
 /// exist.
@@ -1247,7 +1247,7 @@ fn the_session_key_is_read_after_json_unescaping() {
     assert_eq!(frame.session().unwrap().as_deref(), Some("session-1"));
 }
 
-/// A gateway mints `<host_id>:<session_id>` from two opaque halves (spec 6.2),
+/// A gateway mints `<host_id>:<session_id>` from two opaque halves,
 /// so an id may need JSON escapes. What the rewrite wrote reads back as the id
 /// rather than as its spelling, which is what makes the pair usable more than
 /// once.
@@ -1298,8 +1298,8 @@ fn a_duplicated_session_reads_the_last_occurrence() {
     assert_eq!(frame.session().unwrap().as_deref(), Some("gateway:last"));
 }
 
-/// A top-level `session` no id can be read from is malformed (spec 6.3 mints
-/// ids as strings) and there is nothing in it to namespace with, so the reader
+/// A top-level `session` no id can be read from is malformed (session ids are
+/// strings on the wire) and there is nothing in it to namespace with, so the reader
 /// says so rather than guess. `null` counts as present, the way the rewrite
 /// counts it and the way an event frame's `seq` must be omitted rather than
 /// nulled. A string token whose escapes do not decode counts as present too: a
@@ -1363,7 +1363,7 @@ fn the_session_reader_and_the_rewrite_agree_on_every_frame() {
     }
 }
 
-/// A `list` frame's rows come back as their host wrote them (spec 6.10): a
+/// A `list` frame's rows come back as their host wrote them: a
 /// gateway re-emits them under its own name, so a field this build has no type
 /// for, and a number literal no float survives, have to travel through the read
 /// and back out again.
@@ -1388,7 +1388,7 @@ fn a_list_frames_rows_are_read_as_their_host_wrote_them() {
     assert_eq!(cold.get::<String>("id").expect("an id"), Some("s-0".into()));
 }
 
-/// The three fields a gateway owns on a row it re-emits (spec 6.10), edited
+/// The three fields a gateway owns on a row it re-emits, edited
 /// through the same primitive that rewrites a frame's session: `id` and
 /// `unreachable` are replaced where they sit, `host` is added to a plain host's
 /// row that has none, and nothing else moves.
@@ -1552,8 +1552,8 @@ fn raw_objects_compare_on_the_text_they_would_emit() {
     assert_ne!(row(r#"{"id":"s-1"}"#), row(r#"{"id":"s-1","live":true}"#));
 }
 
-/// A gateway's `list` frame names the hosts it has enrolled alongside the rows
-/// (spec 7.1). Additive: a plain host's frame carries no such key, and an older
+/// A gateway's `list` frame names the hosts it has enrolled alongside the rows.
+/// Additive: a plain host's frame carries no such key, and an older
 /// peer's frame reads as naming none.
 ///
 /// A host is named by exactly one of `id` and `address`: the id once the gateway
@@ -1649,7 +1649,7 @@ fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
 
 /// The directory a gateway composes is one value serving two places: the
 /// sessions read and the `list` frames, which is what keeps a client that reads
-/// and a client that watches from disagreeing (spec 7.1). Its rows travel as
+/// and a client that watches from disagreeing. Its rows travel as
 /// their hosts wrote them, and what comes out the other side is what a typed
 /// client decodes.
 #[test]
@@ -1975,7 +1975,7 @@ fn a_hosts_name_is_absent_rather_than_empty() {
 
 /// A field this build has never heard of does not cost the handshake, which
 /// is what makes a name additive: it reached older clients as an unknown key
-/// before they had a type for it (spec 6.10).
+/// before they had a type for it.
 #[test]
 fn a_hello_from_a_newer_host_still_decodes_with_its_name() {
     let mut newer = fixture("models")["hello"].clone();
@@ -2184,11 +2184,11 @@ fn an_archived_row_says_so_and_an_unarchived_one_stays_silent() {
 
 /// A lock generation is additive knowledge: a host with no generation to
 /// report carries no key, and a host with one publishes its latest acquire or
-/// enumeration seed (spec 6.8).
+/// enumeration seed.
 ///
 /// Orthogonal to the bit deliberately. The release snapshot is `locked: false`
 /// while retaining the refused acquire's generation, which is the shape that
-/// lets a client recover when the rise was coalesced away (spec 6.5). So this
+/// lets a client recover when the rise was coalesced away. So this
 /// pins a false bit with a present generation rather than the easier held row.
 #[test]
 fn a_lock_generation_is_optional_and_outlives_the_bit() {
@@ -2245,7 +2245,7 @@ fn an_archive_request_carries_one_bool_and_defaults_to_unarchiving() {
 }
 
 /// The enrollment request: one address and nothing else, which is all an
-/// operator hands a gateway (spec 7.1). An address is required, because a
+/// operator hands a gateway. An address is required, because a
 /// gateway cannot dial what it was not told.
 #[test]
 fn an_enrollment_request_carries_one_address() {
@@ -2274,7 +2274,7 @@ fn an_enrollment_request_carries_one_address() {
 
 /// An enrolled-host row says only what the gateway knows: a host that has
 /// never answered has no id to report, and one whose connection is up has no
-/// failure to report (spec 7.1). Both are absent keys rather than empty
+/// failure to report. Both are absent keys rather than empty
 /// strings, in both directions, so a client can tell "not known" from "known
 /// to be blank" and an older gateway's row still decodes.
 #[test]
@@ -2350,12 +2350,12 @@ fn an_enrolled_host_row_reports_an_id_and_an_error_only_when_it_has_one() {
     encoded["added_later"] = json!(true);
     assert_eq!(
         serde_json::from_value::<HostSummary>(encoded)
-            .expect("a newer gateway's row decodes (spec 6.10)"),
+            .expect("a newer gateway's row decodes, unknown fields are ignored"),
         known,
     );
 }
 
-/// The tag command's body: one string, where blank means clear (spec 6.6), so
+/// The tag command's body: one string, where blank means clear, so
 /// a client needs no second route to remove a label. A blank body is the same
 /// request, which is what the server's `{}` default reads it as.
 #[test]
@@ -2394,15 +2394,14 @@ fn a_tag_request_carries_one_string_and_defaults_to_clearing() {
     );
 }
 
-/// The error frame is the error envelope of spec 6.6 with a session on it
-/// (spec 6.3): the same `code` and `message` an error body carries, plus the
+/// The error frame is the error envelope with a session on it: the same
+/// `code` and `message` an error body carries, plus the
 /// epoch when the error is about one.
 ///
 /// The epoch is an absent key rather than a null when there is none, in both
 /// directions, which is what an attach refusal writes: the session was never
 /// resolved, so there is no epoch it could be about. Additive fields ride
-/// along, and a client that does not know a `code` renders its `message`
-/// (spec 6.10).
+/// along, and a client that does not know a `code` renders its `message`.
 #[test]
 fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
     let refusal = Frame::Error {
@@ -2466,7 +2465,7 @@ fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
 }
 
 /// A locked refusal names its acquire generation, and every other error may
-/// omit that additive field (spec 6.5, 6.8).
+/// omit that additive field.
 #[test]
 fn a_locked_error_frame_carries_the_acquire_generation() {
     #[derive(serde::Deserialize)]
@@ -2624,8 +2623,8 @@ fn frame_kind(frame: &Frame) -> &'static str {
     }
 }
 
-/// Whether a frame kind carries the top-level `session` a gateway rewrites
-/// (spec 6.3), stated here rather than read off the library so that the two
+/// Whether a frame kind carries the top-level `session` a gateway rewrites,
+/// stated here rather than read off the library so that the two
 /// can be held against each other.
 ///
 /// The match is exhaustive on purpose. A new frame variant does not compile
@@ -2708,7 +2707,7 @@ fn known_session(frame: &DecodedFrame) -> Option<&str> {
 /// The top-level fields of the JSON a frame forwards, keyed by name, each
 /// value kept as the exact text that was emitted.
 ///
-/// This is the comparison spec 6.10 calls for: top-level key order is not
+/// This is the comparison forwarding is held to: top-level key order is not
 /// significant, and everything below the top level travels verbatim, which is
 /// what re-emitting a frame unchanged means for a forwarder that does not
 /// understand it. Decoding into [`Value`] would be weaker, it rounds a number

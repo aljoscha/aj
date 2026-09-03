@@ -82,7 +82,7 @@ pub(crate) fn image_cell_footprint(
 pub(crate) const MIN_BUBBLE_WIDTH: u16 = 3;
 
 /// A heavy box-drawing border painted into a bubble's existing padding
-/// frame (Spec E section 2). It marks the focused user message in
+/// frame. It marks the focused user message in
 /// transcript-focus mode without reflowing the transcript: the glyphs
 /// overwrite the one-cell tinted frame the bubble already reserves rather
 /// than wrapping the bubble in a widget that would add a frame of its own.

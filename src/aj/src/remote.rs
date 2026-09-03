@@ -1,4 +1,4 @@
-//! The remote-control protocol over HTTP (spec section 6).
+//! The remote-control protocol over HTTP.
 //!
 //! Three pieces: [`server`] serves a [`aj_app::host::SessionHost`] on a
 //! control port, [`client`] speaks to one, and [`identity`] decides which

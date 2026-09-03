@@ -1,4 +1,4 @@
-//! Enrollment: what a gateway remembers about its hosts (spec 7.1).
+//! Enrollment: what a gateway remembers about its hosts.
 //!
 //! The state file is the gateway's own memory of the hosts it was told to keep,
 //! so it is typed: an address it cannot parse back is a corrupt file, not a
@@ -29,14 +29,14 @@ pub(crate) struct EnrolledHost {
     ///
     /// Recorded rather than re-learned so that a restarted gateway can route and
     /// label a host's sessions from the first instant, including while that host
-    /// is down. An id names a session store (spec 4), so an entry here going
+    /// is down. An id names a session store, so an entry here going
     /// stale means that store is gone, and the two records answer that
     /// differently: a configured host's id is provisional and its next contact
     /// replaces it, a dynamic enrollment's is the record's referent and a
     /// different id is refused (see `Directory::adopt`).
     pub(crate) host_id: String,
     /// What the host called itself at that contact, republished as
-    /// `DirectoryHost::name` (spec 7.1).
+    /// `DirectoryHost::name`.
     ///
     /// Recorded beside the id for the same reason and to a different end: the
     /// id is what a down host's sessions are still namespaced under, this is

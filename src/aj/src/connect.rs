@@ -1,15 +1,15 @@
-//! `aj connect <url>`: the client half of connect mode (spec 9.1).
+//! `aj connect <url>`: the client half of connect mode.
 //!
 //! Everything here runs before a terminal is taken over, so an unreachable
 //! host or a protocol mismatch is a plain CLI error rather than a notice
 //! nobody sees. What it produces is the [`Control`] the shell drives, the
 //! session it opens with, and the host facts the chrome needs.
 //!
-//! Session selection is the spec's, and the command line has already been
+//! Session selection follows the connect-mode rule below, and the command line has already been
 //! read into the three states it has (`aj_app::cli::args::ConnectSession`): a
 //! session named, one this run creates, or the host's own choice. A create
 //! carries the settings this client's user actually stated, because
-//! per-session settings follow whoever creates the session (spec section 8),
+//! per-session settings follow whoever creates the session,
 //! and the host `--host` named when the peer serves more than one.
 
 use std::path::PathBuf;
@@ -65,7 +65,7 @@ pub(crate) async fn connect(
     let settings = creator_settings(args, config, stated);
     // Refused here rather than on the host: a create the host would reject
     // for its label is a round trip that reports after the terminal is gone,
-    // and the flag is this client's own input to validate (spec 6.6).
+    // and the flag is this client's own input to validate.
     let tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
     let session_env = args.launch_env().map_err(|err| anyhow!("--env: {err}"))?;
     let host = match launch.host() {
@@ -86,12 +86,12 @@ pub(crate) async fn connect(
 /// taken over.
 ///
 /// A plain host is its own single candidate, named by the id it introduced
-/// itself with, which is also the only value its create route accepts (spec
-/// 6.6). It is recognized by the working directory a gateway reports none of,
+/// itself with, which is also the only value its create route accepts. It is
+/// recognized by the working directory a gateway reports none of,
 /// and answered from the handshake alone: a directory read is an enumeration of
-/// the host's whole store (spec 6.7), and there is nothing in it this needs.
+/// the host's whole store, and there is nothing in it this needs.
 ///
-/// A gateway's candidates are the hosts it publishes (spec 7.1). `None` when it
+/// A gateway's candidates are the hosts it publishes. `None` when it
 /// publishes none, because then there is nowhere to create at all and the
 /// gateway's own refusal says so better than one invented here.
 async fn resolve_named_host(
@@ -125,8 +125,8 @@ async fn resolve_named_host(
         .map_err(|err| anyhow!("--host: {err}"))
 }
 
-/// Resolve the session to attach per spec 9.1, creating one when that is what
-/// the rule says.
+/// Resolve the session to attach, creating one when that is what the
+/// selection rule says.
 ///
 /// The default attach passes over archived rows, so a host whose sessions are
 /// all archived creates one exactly as an empty host does. An explicit id is
@@ -176,7 +176,7 @@ async fn resolve_session(
     }
 }
 
-/// Create the session connect mode opens with, per spec 9.1.
+/// Create the session connect mode opens with.
 ///
 /// A create whose session exists but whose label did not land is not a
 /// failed create: connect attaches the session it just made and says what
@@ -208,7 +208,7 @@ async fn create(
 /// Which settings a human actually stated, as opposed to what a config
 /// resolves to when nobody said anything.
 ///
-/// Provenance is the line spec section 8 draws for what travels with a create,
+/// Provenance is the line that decides what travels with a create,
 /// and it is only readable from the config *layers*: the effective [`Config`]
 /// a process runs with has the built-in fallbacks baked into the same `Option`
 /// fields, so a written `thinking = "xhigh"` and an absent one look identical
@@ -233,7 +233,7 @@ impl Stated {
 /// The settings this client *stated*, for a session it creates, or `None`
 /// when it stated nothing.
 ///
-/// Spec section 8 draws the line at provenance rather than at value: an axis
+/// The line is drawn at provenance rather than at value: an axis
 /// travels only when a human named it, through a CLI flag, an environment
 /// variable, or an entry written in this client's config. The built-in
 /// fallback a config resolves to when nothing is written is not a preference,
@@ -320,7 +320,7 @@ mod tests {
     /// A stock client states nothing, so nothing travels and the host defaults
     /// every axis itself. This is what lets a default install create a session
     /// on a host whose model has a narrower thinking vocabulary than the
-    /// built-in fallback names (spec section 8).
+    /// built-in fallback names.
     #[test]
     fn creator_settings_are_empty_when_nothing_is_stated() {
         // The fallback is baked into the effective config, which is exactly
@@ -352,7 +352,7 @@ mod tests {
     }
 
     /// The CLI wins over config, and a pinned model travels as the triple the
-    /// host resolves against its own catalog (spec 6.6).
+    /// host resolves against its own catalog.
     #[test]
     fn creator_settings_carry_the_cli_selection() {
         let mut config = Config::default();
