@@ -1586,7 +1586,8 @@ task-output overlay (backed by the per-task read, section 6.7). The
 usage overlay is not supported: its data and reset action use the
 credential store on the machine running the UI, not the session host.
 It refuses before reading that store and names running it on the host
-as the available path. The exit usage banner renders from the client's
+as the available path, and a host-side usage read is banked in
+section 13. The exit usage banner renders from the client's
 own event-derived accounting rather than a host read. One stated
 limitation of that
 choice: the accounting counts what the client observed under its
@@ -1620,13 +1621,14 @@ directory.
 
 Status, not design: five gestures still refuse over a connection, in
 two classes. The session-info overlay and HTML export read host-local
-files no endpoint serves yet. The session selector and prompt-history
-search read this client's own session store, and the usage overlay
-reads this client's credential store. Over a connection those would
-answer about the wrong machine, so they refuse instead (the sidebar
-lists a peer's sessions meanwhile, section 9.2, and cross-host history
-is banked, section 13). Each refusal surfaces a clear notice, an
-unsupported action never silently does nothing.
+files no endpoint serves yet. Prompt-history search reads this
+client's own session store, and the usage overlay and credential
+management read this client's credential store. Over a connection
+those would answer about, or write to, the wrong machine, so they
+refuse instead (the sidebar lists a peer's sessions meanwhile,
+section 9.2, and the reads are banked in section 13). Each refusal
+surfaces a clear notice, an unsupported action never silently does
+nothing.
 
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer/status line.
@@ -1999,3 +2001,22 @@ before the next begins.
   host (the same scan the local overlay runs, behind an endpoint,
   with a capability string per section 6.10), the client merges
   sources and dedupes, a gateway merges per-host reads naturally.
+- Banked, wanted: provider usage over a connection. The overlay
+  resolves its data, and spends its rate-limit reset credit, against
+  the credential store of the machine running the UI, so over a
+  connection it refuses (section 9.1) rather than describe the wrong
+  machine. Unlike the other banked reads this one is not purely a
+  read: resolving an expired OAuth credential refreshes and writes it
+  back, and the reset consumes a credit, so the host has to own both
+  ends and the client may only ask. Candidate shape: a user-paced
+  usage read on the session's host returning the facts the local
+  overlay already renders, with the reset as a separate host-side
+  action behind its own endpoint, capability strings per section 6.10,
+  a gateway routing each to the owning host. A connected client may
+  spend the host's reset credit: the reset belongs to the session the
+  user is driving, and asking them to open a second connection to
+  unblock the first one is the friction the gateway exists to remove.
+  Credential management (login, logout, the auth
+  overlay) refuses for the same ownership reason and is deliberately
+  not banked here: writing a host's credentials from a remote client
+  is its own question, not a read.
