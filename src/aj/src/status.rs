@@ -68,6 +68,10 @@ pub(crate) struct StatusState {
     /// Connection state, mirrored from the world alongside the lifecycle
     /// bits.
     pub(crate) connection: Connection,
+    /// Whether the focused session's transcript is being replayed from
+    /// nothing by an arriving attach block
+    /// ([`aj_app::client::SessionClient::rebuilding`]).
+    pub(crate) rebuilding: bool,
 }
 
 impl StatusState {

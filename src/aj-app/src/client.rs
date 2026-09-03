@@ -538,6 +538,19 @@ impl SessionClient {
         })
     }
 
+    /// Whether the attach block arriving is rebuilding the projection from
+    /// nothing rather than extending a committed one.
+    ///
+    /// A block into the epoch already applied re-projects only the suffix past
+    /// the cursor, so the transcript on screen stays and grows. A first attach,
+    /// a new epoch, and the block after a refusal or an accepted Head all reset
+    /// the chat at their opening `state` and replay the whole history, and until
+    /// their `caught_up` commits, the projection is partial. A view that paints
+    /// between frames reads this to keep a partial history off the screen.
+    pub fn rebuilding(&self) -> bool {
+        self.attach == Attach::Applying && self.cursor().is_none()
+    }
+
     /// The lifecycle sets the fold maintains: which agents are running,
     /// which are compacting.
     pub fn lifecycle(&self) -> &AgentLifecycle {
