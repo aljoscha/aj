@@ -293,6 +293,11 @@ pub struct SessionCore {
     /// restored, or why a recorded value was kept out). Pumped onto the
     /// chat scrollback by the caller after install.
     pub restore_notices: Vec<String>,
+    /// The one ephemeral recovery notice for an open whose resume repaired
+    /// an interrupted final write. Taken exactly once by the first attach
+    /// served from this materialization, so the opening client sees it and
+    /// nothing can duplicate it on later attaches or reopens.
+    recovery_notice: StdMutex<Option<String>>,
     /// Keeps the log-writing listener subscribed; dropped with the core,
     /// and replaced wholesale by
     /// [`SessionCore::install_persisting_forwarder`].
@@ -349,6 +354,7 @@ impl SessionCore {
             mut log,
             transcript,
             restore_notices,
+            recovery_notice,
             session_env,
         } = prepare_log(persistence, &source, config, &run_config, restore)?;
 
@@ -448,10 +454,20 @@ impl SessionCore {
             log,
             session_id,
             restore_notices,
+            recovery_notice: StdMutex::new(recovery_notice),
             persistence_handle,
             persistence_fence: PersistenceFence::default(),
         };
         Ok((core, seed))
+    }
+
+    /// Take the one-shot recovery notice, if this open's resume repaired an
+    /// interrupted final write and nothing has consumed the notice yet.
+    pub fn take_recovery_notice(&self) -> Option<String> {
+        self.recovery_notice
+            .lock()
+            .expect("recovery notice mutex poisoned")
+            .take()
     }
 
     /// Subscribe a channel sink to the session's event bus.

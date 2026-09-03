@@ -14,8 +14,9 @@
 //! later write reaches the OS before the call returns, so the entry survives a
 //! crash of *this* process. Writes are deliberately not `fsync`'d, so a host
 //! crash or power loss can still lose the most recent line(s).
-//! [`ConversationLog::resume`] drops a torn final line with a warning before
-//! reopening the log for append.
+//! [`ConversationLog::resume`] repairs the undelimited final line an
+//! interrupted append leaves behind and otherwise refuses without touching a
+//! byte.
 //!
 //! [`Conversation`] is the read-only linearized projection consumed
 //! by the wire layer. It carries the materialized [`AgentMessage`]
@@ -59,6 +60,15 @@ pub enum ConversationError {
     /// could not name a log in this store and is never turned into a path.
     #[error("{0:?} is not a session id")]
     InvalidSessionId(String),
+    /// The log's final physical record is damaged in a way that has no
+    /// unique safe repair. Resume left every byte exactly as it found them.
+    /// The message is the user-facing refusal; `reason` names the specific
+    /// shape for diagnostics.
+    #[error(
+        "AJ could not safely recover this session automatically ({reason}). \
+         The session log was left unchanged."
+    )]
+    UnsafeTail { reason: String },
 }
 
 impl ConversationError {
@@ -152,6 +162,19 @@ impl Write for AppendWriter {
 enum WriteState {
     Writable,
     WriteFailed(PersistenceFailure),
+}
+
+/// The repair one [`ConversationLog::resume`] performed on an undelimited
+/// final line. The opening surface consumes it once through
+/// [`ConversationLog::take_tail_repair`] to show the recovery notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailRepair {
+    /// The final record was complete and valid but lacked its framing
+    /// newline; resume appended the newline.
+    CompletedFraming,
+    /// The final line was an incomplete record prefix; resume removed its
+    /// `bytes` bytes.
+    RemovedIncompleteRecord { bytes: u64 },
 }
 
 /// Why a session environment map cannot be recorded or executed.
@@ -817,6 +840,11 @@ pub struct ConversationLog {
     /// Installed only by a hosted composition. The log reports from `fuse`, so
     /// listener appends and direct driver writers share one notification edge.
     failure_signal: Option<PersistenceFailureSender>,
+    /// The conservative repair this resume performed, if any. Consumed once
+    /// by the opening surface via [`ConversationLog::take_tail_repair`] to
+    /// show the recovery notice; later opens of a repaired file find clean
+    /// bytes and record nothing.
+    tail_repair: Option<TailRepair>,
     #[cfg(any(test, feature = "test-support"))]
     initial_publication_writer_fault: Option<test_support::AppendFaultFixture>,
 }
@@ -1073,6 +1101,7 @@ impl ConversationLog {
             pending_writes: VecDeque::new(),
             write_state: WriteState::Writable,
             failure_signal: None,
+            tail_repair: None,
             #[cfg(any(test, feature = "test-support"))]
             initial_publication_writer_fault: None,
         })
@@ -1123,11 +1152,14 @@ impl ConversationLog {
     /// Load an existing log from disk and reopen its file in append mode
     /// so subsequent appends pick up where the previous session left off.
     ///
-    /// If the final line of the file is truncated or otherwise malformed,
-    /// it is truncated from disk with a warning. A valid final record without
-    /// a newline is preserved and terminated before another record is
-    /// appended. A parse failure on any non-final line is a real corruption
-    /// and surfaces as an error.
+    /// Every delimited line must be a valid record, otherwise the log is
+    /// [`ConversationError::Corrupt`] and untouched. The final line may lack
+    /// its newline, which is what an interrupted append leaves behind: a
+    /// complete record gets its newline appended, an incomplete JSON prefix
+    /// is truncated away, and both are reported through
+    /// [`ConversationLog::take_tail_repair`]. An undelimited final line that
+    /// is neither, such as a complete value that is not a record, is
+    /// [`ConversationError::UnsafeTail`] and leaves the file byte-identical.
     pub fn resume(
         persistence: &crate::persistence::ConversationPersistence,
         session_id: &str,
@@ -1142,13 +1174,7 @@ impl ConversationLog {
         // snapshot belong to a later resume.
         let snapshot_len = file.metadata()?.len();
         let mut reader = BufReader::new(file.take(snapshot_len));
-        let mut pending_line = String::new();
-        let mut current_line = String::new();
-        let mut pending_line_number = None;
-        let mut pending_line_start = None;
-        let mut physical_line_number = 0;
-        let mut next_line_start = 0_u64;
-        let mut snapshot_ends_with_newline = snapshot_len == 0;
+        let mut physical_line_number = 0_u64;
         let mut corruption = None;
 
         let mut entries: HashMap<EntryId, ConversationEntry> = HashMap::new();
@@ -1198,52 +1224,50 @@ impl ConversationLog {
             Ok(())
         };
 
+        // Decode one delimited physical line: blank lines are tolerated, a
+        // line that is not UTF-8 or not a current record is corruption.
+        let process_delimited = |entries: &mut HashMap<EntryId, ConversationEntry>,
+                                 order: &mut Vec<EntryId>,
+                                 line: &[u8],
+                                 line_number: u64|
+         -> Result<(), ConversationError> {
+            let Ok(text) = std::str::from_utf8(line) else {
+                return Err(ConversationError::Corrupt(format!(
+                    "{}:line {line_number}: line is not valid UTF-8",
+                    path.display()
+                )));
+            };
+            let text = text.trim_end_matches(['\n', '\r']);
+            if text.trim().is_empty() {
+                return Ok(());
+            }
+            match serde_json::from_str::<ConversationEntry>(text) {
+                Ok(entry) => adopt(order, entries, entry, line_number),
+                Err(err) => Err(ConversationError::Corrupt(format!(
+                    "{}:line {line_number}: {err}",
+                    path.display()
+                ))),
+            }
+        };
+
+        // One line of lookahead: a line is decoded once a later line proves
+        // it is not final, so the final line is judged separately below.
+        let mut final_line: Option<(Vec<u8>, u64)> = None;
+        let mut line = Vec::new();
         loop {
-            current_line.clear();
-            let current_line_start = next_line_start;
-            let bytes_read = reader.read_line(&mut current_line)?;
-            if bytes_read == 0 {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
                 break;
             }
-            next_line_start += u64::try_from(bytes_read).expect("line length fits u64");
             physical_line_number += 1;
-            snapshot_ends_with_newline = current_line.ends_with('\n');
-
-            if corruption.is_some() {
-                continue;
+            if let Some((previous, line_number)) = final_line.take()
+                && corruption.is_none()
+                && let Err(err) =
+                    process_delimited(&mut entries, &mut order, &previous, line_number)
+            {
+                corruption = Some(err);
             }
-
-            if current_line.ends_with('\n') {
-                current_line.pop();
-                if current_line.ends_with('\r') {
-                    current_line.pop();
-                }
-            }
-            if current_line.trim().is_empty() {
-                continue;
-            }
-
-            if let Some(line_number) = pending_line_number {
-                match serde_json::from_str::<ConversationEntry>(&pending_line) {
-                    Ok(entry) => {
-                        if let Err(err) = adopt(&mut order, &mut entries, entry, line_number) {
-                            corruption = Some(err);
-                            continue;
-                        }
-                    }
-                    Err(err) => {
-                        corruption = Some(ConversationError::Corrupt(format!(
-                            "{}:line {line_number}: {err}",
-                            path.display()
-                        )));
-                        continue;
-                    }
-                }
-            }
-
-            std::mem::swap(&mut pending_line, &mut current_line);
-            pending_line_number = Some(physical_line_number);
-            pending_line_start = Some(current_line_start);
+            final_line = Some((line.clone(), physical_line_number));
         }
 
         let unread_snapshot_bytes = reader.get_ref().limit();
@@ -1257,38 +1281,78 @@ impl ConversationLog {
             )));
         }
 
+        // Interior corruption always wins: no tail outcome may mutate a file
+        // whose earlier records are not intact.
         if let Some(err) = corruption {
             return Err(err);
         }
 
-        let mut truncate_to = None;
-        if let Some(line_number) = pending_line_number {
-            match serde_json::from_str::<ConversationEntry>(&pending_line) {
-                Ok(entry) => adopt(&mut order, &mut entries, entry, line_number)?,
-                Err(err) => {
-                    tracing::warn!(
-                        "dropping truncated trailing entry in {}: {err}",
-                        path.display()
-                    );
-                    truncate_to = pending_line_start;
+        let mut repair = None;
+        match final_line {
+            None => {}
+            Some((line, line_number)) if line.ends_with(b"\n") => {
+                // An interrupted write cannot have produced its framing
+                // newline, so a malformed delimited final line is corruption
+                // like any interior line.
+                process_delimited(&mut entries, &mut order, &line, line_number)?;
+            }
+            Some((tail, line_number)) => {
+                // Only appends write this file and each append is one record
+                // plus its newline, so an undelimited final line is the
+                // interrupted append's partial record. The parser decides
+                // between the two shapes a cut can leave: a complete record
+                // (the cut fell between the record and its newline) or a
+                // strict prefix of one (the parser ran out of input). The cut
+                // may fall inside a multi-byte character, which is still a
+                // prefix. Anything else was not written by an append.
+                let text = match std::str::from_utf8(&tail) {
+                    Ok(text) => text,
+                    Err(err) if err.error_len().is_none() => {
+                        std::str::from_utf8(&tail[..err.valid_up_to()]).expect("validated prefix")
+                    }
+                    Err(_) => {
+                        return Err(ConversationError::UnsafeTail {
+                            reason: "the unterminated final line is not valid UTF-8".to_string(),
+                        });
+                    }
+                };
+                match serde_json::from_str::<ConversationEntry>(text) {
+                    Ok(entry) => {
+                        adopt(&mut order, &mut entries, entry, line_number)?;
+                        repair = Some(TailRepair::CompletedFraming);
+                    }
+                    Err(err) if err.is_eof() => {
+                        repair = Some(TailRepair::RemovedIncompleteRecord {
+                            bytes: u64::try_from(tail.len()).expect("line length fits u64"),
+                        });
+                    }
+                    Err(err) => {
+                        return Err(ConversationError::UnsafeTail {
+                            reason: format!("the unterminated final line is not a record: {err}"),
+                        });
+                    }
                 }
             }
         }
 
-        // Creation identity is validated before resume truncates a torn tail
-        // or adds a missing final newline. A syntactically valid but malformed
-        // env record is corruption, and refusing it must leave the source
-        // bytes untouched.
+        // Creation identity is validated before resume mutates any byte. A
+        // syntactically valid but malformed env record is corruption, and
+        // refusing it must leave the source bytes untouched.
         validate_recorded_system_prompt(&order, &entries)?;
         validate_recorded_session_env(&order, &entries)?;
 
         drop(reader);
-        if let Some(len) = truncate_to {
-            OpenOptions::new().write(true).open(&path)?.set_len(len)?;
-        }
         let mut file = OpenOptions::new().append(true).open(&path)?;
-        if truncate_to.is_none() && !snapshot_ends_with_newline {
-            file.write_all(b"\n")?;
+        match &repair {
+            None => {}
+            Some(TailRepair::CompletedFraming) => file.write_all(b"\n")?,
+            Some(TailRepair::RemovedIncompleteRecord { bytes }) => {
+                tracing::warn!(
+                    "removing interrupted final record from {}: {bytes} bytes",
+                    path.display(),
+                );
+                file.set_len(snapshot_len - bytes)?;
+            }
         }
 
         // Backfill each message entry's in-memory id from its on-disk entry
@@ -1315,6 +1379,7 @@ impl ConversationLog {
             pending_writes: VecDeque::new(),
             write_state: WriteState::Writable,
             failure_signal: None,
+            tail_repair: repair,
             #[cfg(any(test, feature = "test-support"))]
             initial_publication_writer_fault: None,
         };
@@ -1744,6 +1809,15 @@ impl ConversationLog {
             WriteState::Writable => None,
             WriteState::WriteFailed(failure) => Some(failure),
         }
+    }
+
+    /// The conservative tail repair this open performed, consumed once.
+    ///
+    /// The recovery notice belongs to the successful open that repaired, so
+    /// the first caller takes it and every later read finds nothing, exactly
+    /// like a later open of the now-clean file.
+    pub fn take_tail_repair(&mut self) -> Option<TailRepair> {
+        self.tail_repair.take()
     }
 
     /// Install the hosted driver's one-shot failure sender before the first
@@ -2964,34 +3038,31 @@ mod tests {
         assert_eq!(resumed.core.entries.len(), 2);
     }
 
+    /// A malformed record that carries its framing newline is not an
+    /// interrupted final write: an interrupted write cannot have produced its
+    /// own delimiter. It refuses as corruption and mutates nothing, even when
+    /// only whitespace follows it.
     #[test]
-    fn resume_drops_malformed_trailing_record_followed_by_whitespace() {
+    fn resume_refuses_a_malformed_delimited_final_record_without_changing_bytes() {
         let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
-        std::fs::write(
-            &path,
-            format!("{}\n{}\n{{\"id\":\n \t\r\n\r\n", records[0], records[1]),
-        )
-        .expect("rewrite fixture log");
+        let bytes = format!("{}\n{}\n{{\"id\":\n \t\r\n\r\n", records[0], records[1]).into_bytes();
+        std::fs::write(&path, &bytes).expect("rewrite fixture log");
 
-        let mut resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
-
-        assert_eq!(resumed.core.order.len(), 2);
-        assert_eq!(resumed.core.entries.len(), 2);
+        let err = ConversationLog::resume(&persistence, &session_id)
+            .err()
+            .expect("a delimited malformed record is corruption");
+        match err {
+            ConversationError::Corrupt(message) => {
+                assert!(message.contains("line 3"), "{message}");
+            }
+            other => panic!("expected corrupt log, got {other}"),
+        }
         assert_eq!(
-            std::fs::read_to_string(&path).expect("read repaired log"),
-            format!("{}\n{}\n", records[0], records[1])
+            std::fs::read(&path).expect("source bytes"),
+            bytes,
+            "refusal changed the source bytes"
         );
-
-        ConversationView::user(&mut resumed)
-            .add_message(user_text("after repair"))
-            .expect("append after repair");
-        drop(resumed);
-
-        let resumed_again =
-            ConversationLog::resume(&persistence, &session_id).expect("resume repaired log");
-        assert_eq!(resumed_again.core.order.len(), 3);
-        assert_eq!(resumed_again.core.entries.len(), 3);
     }
 
     #[test]
@@ -3018,6 +3089,128 @@ mod tests {
             ConversationLog::resume(&persistence, &session_id).expect("resume repaired log");
         assert_eq!(resumed_again.core.order.len(), 3);
         assert_eq!(resumed_again.core.entries.len(), 3);
+    }
+
+    /// An interrupted append leaves a strict prefix of one record without its
+    /// newline. Wherever the cut fell, including inside a multi-byte
+    /// character, resume removes exactly those bytes and reports the removal
+    /// once; a later open of the repaired file is ordinary.
+    #[test]
+    fn resume_removes_an_interrupted_final_record() {
+        let (_dir, persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        let base = format!("{}\n{}\n", records[0], records[1]);
+        let parent = serde_json::from_str::<ConversationEntry>(&records[1])
+            .expect("parse fixture record")
+            .id;
+        let victim = ConversationEntry {
+            id: "victim".to_string(),
+            parent_id: Some(parent),
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::Message {
+                message: user_text("caf\u{e9} with \"escapes\" and {braces}"),
+            },
+        };
+        let line = serde_json::to_string(&victim).expect("serialize victim");
+        let inside_e_acute = line.find('\u{e9}').expect("non-ascii payload") + 1;
+        assert!(!line.is_char_boundary(inside_e_acute));
+
+        for cut in [1, 8, line.len() / 2, inside_e_acute, line.len() - 1] {
+            let mut bytes = base.clone().into_bytes();
+            bytes.extend_from_slice(&line.as_bytes()[..cut]);
+            std::fs::write(&path, &bytes).expect("write cut fixture");
+
+            let mut log = ConversationLog::resume(&persistence, &session_id)
+                .unwrap_or_else(|err| panic!("cut {cut}: {err}"));
+            assert_eq!(
+                log.take_tail_repair(),
+                Some(TailRepair::RemovedIncompleteRecord {
+                    bytes: u64::try_from(cut).expect("cut fits u64"),
+                }),
+                "cut {cut}"
+            );
+            assert_eq!(log.take_tail_repair(), None, "the repair is one-shot");
+            assert_eq!(log.core.order.len(), 2, "cut {cut}");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read repaired log"),
+                base,
+                "cut {cut}"
+            );
+            drop(log);
+
+            let mut again =
+                ConversationLog::resume(&persistence, &session_id).expect("later resume");
+            assert_eq!(
+                again.take_tail_repair(),
+                None,
+                "a clean file reports nothing"
+            );
+        }
+    }
+
+    /// An undelimited final line that no interrupted append could have
+    /// produced refuses without touching a byte.
+    #[test]
+    fn resume_refuses_an_undelimited_final_line_that_is_not_a_record_prefix() {
+        let (_dir, persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        let base = format!("{}\n{}\n", records[0], records[1]);
+        let tails: [&[u8]; 5] = [
+            b"not json at all",
+            b"{\"id\":\"x\",\"type\":\"unknown_record\"}",
+            &[records[1].as_bytes(), b"}"].concat(),
+            &[records[1].as_bytes(), records[1].as_bytes()].concat(),
+            b"{\"id\":\"x\xff\",\"type\":\"message\"",
+        ];
+        for tail in tails {
+            let bytes = [base.as_bytes(), tail].concat();
+            std::fs::write(&path, &bytes).expect("write refused fixture");
+
+            let err = ConversationLog::resume(&persistence, &session_id)
+                .err()
+                .unwrap_or_else(|| panic!("{tail:?} must refuse"));
+            assert!(
+                matches!(err, ConversationError::UnsafeTail { .. }),
+                "{tail:?}: {err}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("source bytes"),
+                bytes,
+                "{tail:?}: refusal changed the source bytes"
+            );
+        }
+    }
+
+    /// A clean resume reports no repair, and a repair is consumed exactly
+    /// once: a later open of the repaired file is ordinary.
+    #[test]
+    fn tail_repair_reporting_is_consumed_once_and_absent_on_clean_opens() {
+        let (_dir, persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+
+        let mut clean = ConversationLog::resume(&persistence, &session_id).expect("clean resume");
+        assert_eq!(clean.take_tail_repair(), None);
+        drop(clean);
+
+        std::fs::write(&path, format!("{}\n{}", records[0], records[1]))
+            .expect("remove trailing newline");
+        let mut repaired =
+            ConversationLog::resume(&persistence, &session_id).expect("framing resume");
+        assert_eq!(
+            repaired.take_tail_repair(),
+            Some(TailRepair::CompletedFraming)
+        );
+        assert_eq!(repaired.take_tail_repair(), None, "the repair is one-shot");
+        drop(repaired);
+
+        let mut again = ConversationLog::resume(&persistence, &session_id).expect("later resume");
+        assert_eq!(
+            again.take_tail_repair(),
+            None,
+            "a later open of the repaired file records nothing"
+        );
     }
 
     /// A duplicated line gives one entry two append positions unless
@@ -3088,7 +3281,7 @@ mod tests {
                 format!(
                     "{}:line 2: duplicate creation identity entry id legacy-root",
                     path.display()
-                ),
+                )
             ),
             other => panic!("expected corrupt log, got {other}"),
         }
@@ -3175,13 +3368,15 @@ mod tests {
         }
     }
 
+    /// A physical line that is not UTF-8 can never be a current record, so it
+    /// refuses as corruption naming its line, leaving every byte in place.
     #[test]
-    fn resume_surfaces_invalid_utf8_as_invalid_data_io_error() {
+    fn resume_reports_invalid_utf8_as_corruption_with_its_line() {
         let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         let mut contents = records[0].as_bytes().to_vec();
         contents.extend_from_slice(b"\n\xff\n");
-        std::fs::write(&path, contents).expect("rewrite fixture log");
+        std::fs::write(&path, &contents).expect("rewrite fixture log");
 
         let err = match ConversationLog::resume(&persistence, &session_id) {
             Ok(_) => panic!("invalid UTF-8 must fail"),
@@ -3189,38 +3384,55 @@ mod tests {
         };
 
         match err {
-            ConversationError::Io(err) => {
-                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            ConversationError::Corrupt(message) => {
+                assert!(
+                    message.contains("line 2") && message.contains("not valid UTF-8"),
+                    "{message}"
+                );
             }
-            other => panic!("expected IO error, got {other}"),
+            other => panic!("expected corruption, got {other}"),
         }
+        assert_eq!(
+            std::fs::read(&path).expect("source bytes"),
+            contents,
+            "refusal changed the source bytes"
+        );
     }
 
+    /// The first malformed line names the failure even when later lines are
+    /// also damaged: refusal is deterministic over the earliest defect.
     #[test]
-    fn resume_io_error_wins_over_earlier_non_final_corruption() {
+    fn resume_reports_the_earliest_corruption_when_later_lines_are_also_damaged() {
         let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         let mut contents = records[0].as_bytes().to_vec();
         contents.extend_from_slice(b"\n{\"id\":\n");
         contents.extend_from_slice(records[1].as_bytes());
         contents.extend_from_slice(b"\n\xff\n");
-        std::fs::write(&path, contents).expect("rewrite fixture log");
+        std::fs::write(&path, &contents).expect("rewrite fixture log");
 
         let err = match ConversationLog::resume(&persistence, &session_id) {
-            Ok(_) => panic!("invalid UTF-8 must win over earlier corruption"),
+            Ok(_) => panic!("interior corruption must fail"),
             Err(err) => err,
         };
 
         match err {
-            ConversationError::Io(err) => {
-                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            ConversationError::Corrupt(message) => {
+                assert!(message.contains("line 2"), "{message}");
             }
-            other => panic!("expected IO error, got {other}"),
+            other => panic!("expected corruption, got {other}"),
         }
+        assert_eq!(
+            std::fs::read(&path).expect("source bytes"),
+            contents,
+            "refusal changed the source bytes"
+        );
     }
 
+    /// A duplicated creation identity is corruption at its own line, and a
+    /// later damaged line does not displace or reorder that refusal.
     #[test]
-    fn resume_io_error_wins_over_an_earlier_duplicate_creation_identity() {
+    fn resume_reports_a_duplicate_creation_identity_before_later_damage() {
         let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         let mut contents = records[0].as_bytes().to_vec();
@@ -3229,19 +3441,24 @@ mod tests {
         contents.extend_from_slice(b"\n");
         contents.extend_from_slice(records[1].as_bytes());
         contents.extend_from_slice(b"\n\xff\n");
-        std::fs::write(&path, contents).expect("rewrite fixture log");
+        std::fs::write(&path, &contents).expect("rewrite fixture log");
 
         let err = match ConversationLog::resume(&persistence, &session_id) {
-            Ok(_) => panic!("invalid UTF-8 must win over duplicate identity corruption"),
+            Ok(_) => panic!("duplicate creation identity must fail"),
             Err(err) => err,
         };
 
         match err {
-            ConversationError::Io(err) => {
-                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            ConversationError::Corrupt(message) => {
+                assert!(message.contains("duplicate creation identity"), "{message}");
             }
-            other => panic!("expected IO error, got {other}"),
+            other => panic!("expected corruption, got {other}"),
         }
+        assert_eq!(
+            std::fs::read(&path).expect("source bytes"),
+            contents,
+            "refusal changed the source bytes"
+        );
     }
 
     #[test]
@@ -4634,8 +4851,11 @@ mod tests {
                 env: env_map(&[("", "value")]),
             },
         };
+        // A repairable torn tail: complete canonical envelope anchors, then
+        // parser EOF inside the payload. Only the earlier invalid env record
+        // must keep resume from mutating it.
         let bytes = format!(
-            "{}\n{}\n{{torn",
+            "{}\n{}\n{{\"id\":\"torn\",\"parent_id\":\"env\",\"timestamp\":null,\"thread\":\"user\",\"type\":\"message\",\"message\":{{\"ro",
             serde_json::to_string(&root).expect("root"),
             serde_json::to_string(&invalid_env).expect("env")
         )

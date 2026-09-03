@@ -7386,6 +7386,24 @@ async fn a_persistence_failure_ends_the_materialization_and_a_reopen_rebuilds_it
         "the repair removed exactly the torn tail"
     );
 
+    // The opening client receives the one ephemeral recovery notice right
+    // after its attach block.
+    let notice = bounded("the recovery notice", reopened.stream.recv())
+        .await
+        .expect("an open reopened stream");
+    match &notice {
+        Frame::Event { event, .. } => match event.known() {
+            Some(AgentEvent::Notice { text, .. }) => {
+                assert!(
+                    text.starts_with("Recovered this session after an interrupted write."),
+                    "the recovery notice: {text}"
+                );
+            }
+            other => panic!("expected the recovery notice, got {other:?}"),
+        },
+        other => panic!("expected the recovery notice frame, got {other:?}"),
+    }
+
     // A later prompt is durable in the repaired file.
     harness.prompt(&session, "run after recovery").await;
     let after = only(until_idle(&mut reopened.stream).await, &session);

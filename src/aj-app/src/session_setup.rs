@@ -28,7 +28,8 @@ use aj_models::{
     verbosity_from_name, verbosity_name,
 };
 use aj_session::{
-    ConversationLog, ConversationPersistence, ThreadFilter, repair_interrupted_tool_uses,
+    ConversationError, ConversationLog, ConversationPersistence, TailRepair, ThreadFilter,
+    repair_interrupted_tool_uses,
 };
 use aj_tools::{BuiltinToolOptions, builtin_tools_for_model};
 use anyhow::{Context, Result};
@@ -487,9 +488,28 @@ pub struct PreparedLog {
     /// restored, or why a recorded value was kept out). Empty unless
     /// resuming with a [`RestoreContext`].
     pub restore_notices: Vec<String>,
+    /// The one ephemeral recovery notice, present exactly when this open's
+    /// resume repaired the log's interrupted final write. It belongs to this
+    /// open: a later open finds clean bytes and produces none.
+    pub recovery_notice: Option<String>,
     /// Immutable session environment from the explicit create or resumed log.
     /// `None` differs from a recorded empty map.
     pub session_env: Option<BTreeMap<String, String>>,
+}
+
+/// The user-facing text for one performed tail repair, as the failed-write
+/// recovery design words it for the reopen flow.
+fn recovery_notice_text(repair: &TailRepair) -> String {
+    match repair {
+        TailRepair::RemovedIncompleteRecord { .. } => "Recovered this session after an \
+             interrupted write. AJ removed an incomplete final record. Check the last visible \
+             action and retry it if needed."
+            .to_string(),
+        TailRepair::CompletedFraming => "Recovered this session after an interrupted write. AJ \
+             completed the final record's framing. Check the last visible action and retry it \
+             if needed."
+            .to_string(),
+    }
 }
 
 /// Resolve the log for `source`, repair any interrupted tool uses, and
@@ -511,10 +531,17 @@ pub fn prepare_log(
         SessionSource::Create { .. } => ConversationLog::create(persistence)
             .context("failed to create a fresh conversation log")?,
         SessionSource::Resume { session_id, .. } => {
-            ConversationLog::resume(persistence, session_id)
-                .with_context(|| format!("failed to resume session {session_id}"))?
+            ConversationLog::resume(persistence, session_id).map_err(|err| match &err {
+                // The refusal copy is the user-facing report the recovery
+                // design fixes; a generic resume context on top would bury
+                // it behind surfaces that show only an error's top line.
+                ConversationError::UnsafeTail { .. } => anyhow::Error::new(err),
+                _ => anyhow::Error::new(err)
+                    .context(format!("failed to resume session {session_id}")),
+            })?
         }
     };
+    let recovery_notice = log.take_tail_repair().as_ref().map(recovery_notice_text);
     let session_env = match source {
         SessionSource::Create { session_env } => session_env.clone(),
         SessionSource::Resume { .. } => log.session_env().cloned(),
@@ -559,6 +586,7 @@ pub fn prepare_log(
         log,
         transcript,
         restore_notices,
+        recovery_notice,
         session_env,
     })
 }

@@ -269,6 +269,7 @@ async fn run_inner<W: Write + Send + 'static>(
         mut log,
         transcript,
         restore_notices,
+        recovery_notice,
         session_env,
     } = prepare_log(
         &conversation_persistence,
@@ -277,6 +278,9 @@ async fn run_inner<W: Write + Send + 'static>(
         &run_config,
         restore_context.as_ref(),
     )?;
+    if let Some(notice) = &recovery_notice {
+        eprintln!("aj: {notice}");
+    }
     for notice in &restore_notices {
         eprintln!("aj: {notice}");
     }

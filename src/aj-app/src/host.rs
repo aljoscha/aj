@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use aj_agent::events::AgentId;
+use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::queue::MessageQueues;
 use aj_agent::tool::TaskId;
 use aj_agent::types::UsageSummary;
@@ -990,6 +990,25 @@ impl SessionHost {
         for request in requests {
             match self.live(&request.session).await {
                 Ok(session) => {
+                    // The open that repaired an interrupted final write owes
+                    // its opening client one ephemeral notice. Published
+                    // after the block is bound, so the attaching subscriber
+                    // retains it as a reliable transient and releases it
+                    // after its CaughtUp; taken once, so later attaches to
+                    // this materialization stay ordinary.
+                    if let Some(text) = session.core.take_recovery_notice() {
+                        let epoch = session.status().epoch.clone();
+                        self.inner.shared.fanout.publish(Frame::Event {
+                            session: request.session.clone(),
+                            epoch,
+                            durability: None,
+                            event: AgentEvent::Notice {
+                                agent_id: AgentId::Main,
+                                text,
+                            }
+                            .into(),
+                        });
+                    }
                     attached.push(request.session.clone());
                     serving.push(Serving::Block(request.clone(), session));
                 }
@@ -1954,10 +1973,11 @@ impl SessionHost {
             }
         }
         // A resume's lock is taken before the build, because the build is
-        // not read-only: `ConversationLog::resume` truncates a torn tail
-        // and the repair walk appends synthesized tool results. A
-        // materialization this host refuses must have done neither (spec
-        // section 5).
+        // not read-only: `ConversationLog::resume` may repair the sole
+        // final undelimited tail (removing an interrupted record or adding
+        // a missing framing newline) and the repair walk appends
+        // synthesized tool results. A materialization this host refuses
+        // must have done neither (spec section 5).
         //
         // A create has nothing on disk to read or repair, and it mints its
         // id by an atomic `create_new` claim on that id's lock-file path,
