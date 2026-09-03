@@ -863,43 +863,31 @@ impl AttachStall {
 ///
 /// ## What ends the block
 ///
-/// The client's own arm, not a frame kind, so the block ends on everything that
-/// ends one: the `caught_up` that commits it, and the refusal that replaces it
-/// for a session the server cannot resolve. Reading the arm rather
-/// than the wire is also what keeps a `caught_up` the fold *rejected* from
-/// reporting a block complete. A client that is not armed has no block coming,
-/// so its fold is over before it starts.
+/// The client's own arm, read after each frame is applied, not a frame kind.
+/// So the block ends on everything that ends one: the `caught_up` that commits
+/// it, the refusal that replaces it for a session the server cannot resolve,
+/// and a `caught_up` the fold rejected ends nothing. A client that is not armed
+/// has no block coming, so its fold is over before it starts.
 ///
-/// A `reset` for the session ends it too, and at once: a reset received
-/// mid-block abandons the block, since the cursor only advances at a
-/// `caught_up` that is now not coming. Folding on past it would hand a peer whose
-/// upstream is flapping one fresh deadline per flap, which is the unbounded wait
-/// the deadline exists to not have.
+/// A `reset` for the session abandons the block at once: the cursor only
+/// advances at a `caught_up` that is now not coming, and folding on would hand
+/// a peer whose upstream is flapping one fresh deadline per flap.
 ///
 /// ## The deadline
 ///
 /// Silence *about the session*, never total elapsed time. A block is
-/// producer-paced, so it is as long as the history behind it, and a
-/// client's cursor does not move until the block completes: a block
-/// cut short by a total deadline is re-served from the same cursor and cut short
-/// again, which trades a hang for a livelock. Silence about the session only runs
-/// out once the block has stopped arriving.
+/// producer-paced, so it is as long as the history behind it, and a client's
+/// cursor does not move until the block completes: a block cut short by a
+/// total deadline would be re-served from the same cursor and cut short again.
+/// Any frame naming the session moves the deadline, one under an epoch the
+/// fold drops included.
 ///
-/// Frames for the session are a coarse measure of progress: one under an epoch
-/// the fold drops still counts. That over-approximation is deliberate, the
-/// alternative being a progress signal the fold does not currently expose, and
-/// the frame that actually matters, `reset`, is handled above rather than
-/// counted.
-///
-/// The silence measured is silence as the fold sees it, not silence on the wire:
-/// the deadline moves when a frame is folded, and a driver can be elsewhere while
-/// it passes. [`Self::fold_ready`] is what keeps that from costing a block that
-/// had in fact arrived.
-///
-/// [`Self::fold`] does not enforce the deadline, because a fold that only ever sees
-/// the frames it is handed cannot notice silence. Enforcing it is the driver's:
-/// [`Self::fold_through`] times its own wait out, and the drive loop wakes at
-/// [`Self::deadline`] and gives up through [`World::abandon_attach_block`].
+/// The silence measured is silence as the fold sees it, so a driver that was
+/// elsewhere while the deadline passed folds what is already in hand before
+/// giving up ([`Self::fold_ready`]). [`Self::fold`] does not enforce the
+/// deadline: [`Self::fold_through`] times its own wait out, and the drive loop
+/// wakes at [`Self::deadline`] and gives up through
+/// [`World::abandon_attach_block`].
 struct Block {
     /// The session this block is for, which is the focused one: a fold reads the
     /// focused client for the verdict, and [`Block::fold`] asserts the two agree.
