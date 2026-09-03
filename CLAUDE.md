@@ -35,6 +35,27 @@ caller branches on failure. Render-only seams use the named opaque `BoxError`.
 Frontend-independent application composition in `aj-app` may use `anyhow` when
 callers only propagate or display the failure.
 
+### Remote control
+
+Every component should be safe and understandable on its own. Adding a wire
+field is cheap when it lets one side answer a question by itself. A mechanism
+that only works when several parts act in the right order is expensive. Prefer
+explicit state and tolerating slightly stale data over protocol dances.
+
+`docs/remote-control-spec.md` describes the wire protocol. A change that alters
+behaviour the spec describes updates the spec in the same branch.
+
+Anything the user does that needs to know about the host, such as listing
+sessions or reading their state, is implemented once against the `Control`
+trait. Whether the host is the local process or a remote one is a backend
+detail behind that trait, so the interactive UI never reads host files
+directly. Tests for backend equivalence run against the real local and remote
+adapters.
+
+Servers advertise what they support. Clients try a feature and show a clear
+notice if the server lacks it, rather than hiding or disabling features up
+front. We keep every deployment current, so that is enough.
+
 ## Runtime contracts
 
 Persistent state lives under `~/.aj/`. Secrets come from `.env` and are never
