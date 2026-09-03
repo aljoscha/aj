@@ -1311,7 +1311,7 @@ async fn apply_focus_request(
                 .control
                 .create(host, None, None, None, world.launch_env.clone())
                 .await;
-            apply_create_result(app, shell, world, created)
+            apply_create_result(app, shell, world, created).await
         }
         FocusRequest::Resume(session) if session == world.session() => {
             // Nothing to do, and doing it anyway would announce a switch that
@@ -1329,7 +1329,8 @@ async fn apply_focus_request(
                 world,
                 session.clone(),
                 PendingTransition::Switch { session, tag },
-            );
+            )
+            .await;
             Focus::Moved
         }
         FocusRequest::Branch { target, prompt } => {
@@ -1349,16 +1350,16 @@ async fn apply_focus_request(
 
 /// Apply the typed create boundary. `PartialCreate` carries a minted session,
 /// while every other error says no target is known to this client.
-fn apply_create_result(
+async fn apply_create_result(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
     created: Result<String, ControlError>,
 ) -> Focus {
     match created {
-        Ok(session) => begin_created_focus(app, shell, world, session, None),
+        Ok(session) => begin_created_focus(app, shell, world, session, None).await,
         Err(ControlError::PartialCreate { session, message }) => {
-            begin_created_focus(app, shell, world, session, Some(message))
+            begin_created_focus(app, shell, world, session, Some(message)).await
         }
         Err(err) => {
             shell.borrow().show_toast(format!(
@@ -1374,7 +1375,7 @@ fn apply_create_result(
 /// Select a session the peer already minted, retaining an incomplete-create
 /// warning as part of that durable fact rather than collapsing it into a
 /// pre-mint refusal.
-fn begin_created_focus(
+async fn begin_created_focus(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
@@ -1387,7 +1388,8 @@ fn begin_created_focus(
         world,
         session.clone(),
         PendingTransition::Create { session, partial },
-    );
+    )
+    .await;
     Focus::Moved
 }
 
@@ -1441,7 +1443,15 @@ fn settle_create_host(
 /// therefore keeps its cached transcript on screen under explicit connection
 /// state. Returning to the prior session is an ordinary later switch, never a
 /// rollback hidden in this operation.
-fn focus_session(
+///
+/// A session the live stream already serves is a view swap: its frames have
+/// been folding in the background all along, so there is no stream to reopen
+/// and the switch completes here, still connected. The stream is reopened only
+/// when the set it serves has to change: a session it does not serve, an
+/// archived session leaving the set on the way out (which the peer only learns
+/// from a stream opened without it), a session that owes a re-attach, or no
+/// live stream to swap onto.
+async fn focus_session(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
@@ -1461,6 +1471,13 @@ fn focus_session(
         replace_editor_preserving_draft(&shell.borrow().editor, &prompt);
     }
     let attaching = !world.directory.is_attached(&session);
+    let reopening = attaching
+        || world.stream.is_none()
+        || world.directory.would_retire(&session)
+        || world
+            .directory
+            .client_for(&session)
+            .is_some_and(|client| client.needs_reattach());
     let startup = match &transition {
         PendingTransition::Create { partial, .. } => Some(PendingStartup {
             fresh: true,
@@ -1484,11 +1501,6 @@ fn focus_session(
     // uses; the opening State frame supplies its real settings before Caught.
     let minted =
         attaching.then(|| seeded_chat(&world.config, unknown_settings(), 0, &world.catalog));
-    // Selection is the gesture's commit point. Dropping the stream first keeps
-    // the transition one-stream-at-a-time and makes failure leave no hidden
-    // subscription to the session the user left.
-    world.stream.take();
-    world.local = None;
     // Parks the outgoing session's transcript and brings the incoming one into
     // the cell the widgets read, which is what makes a switch back instant.
     world
@@ -1497,12 +1509,28 @@ fn focus_session(
             minted.expect("a session focused for the first time was minted a transcript")
         });
     world.sync_working_directory();
-    world.client_mut().owe_reattach();
-    world.connection = Connection::Reconnecting;
-    world.resume = Some(Resume::new());
+    // A swap reads the session's handles now; a reopen reads them once the
+    // target proves usable. A swap whose handles cannot be read has lost its
+    // host, which the reopen path is the one that knows how to report.
+    let swapped = !reopening && refresh_local_handles(world, shell).await.is_ok();
+    if !swapped {
+        // Selection is the gesture's commit point. Dropping the stream keeps the
+        // transition one-stream-at-a-time and makes failure leave no hidden
+        // subscription to the session the user left.
+        world.stream.take();
+        world.local = None;
+        world.client_mut().owe_reattach();
+        world.connection = Connection::Reconnecting;
+        world.resume = Some(Resume::new());
+    } else if world.client().attach_phase() != Attach::Live {
+        // The stream serves the session but its block is still arriving, so the
+        // loop finishes folding it before the switch counts as complete.
+        world.connection = Connection::CatchingUp;
+        world.resume = Some(Resume::launched(world));
+    }
     world.transition = Some(transition);
     // This selection is painted before the new drive loop's first bottom-of-
-    // iteration sync, so publish its disconnected state now.
+    // iteration sync, so publish its state now.
     sync_status(world);
     // Clear any armed branch anchor: the shell and its slots survive session
     // changes, so without this a stale anchor could resolve against the new
@@ -1535,6 +1563,9 @@ fn focus_session(
         name: REFOCUS_OVERLAY_EVENT.to_string(),
         data: None,
     });
+    if swapped && world.connection == Connection::Connected {
+        complete_pending_transition(app, shell, world).await;
+    }
     app.request_redraw();
 }
 
@@ -16008,12 +16039,22 @@ mod tests {
     /// terminal driver. Existing unit-composition tests use this after asserting
     /// the immediate selected/disconnected state. Responsiveness and drawn
     /// pre-Caught behavior are covered through the real [`drive`] loop.
+    ///
+    /// A swap onto a session the stream already serves completes inside the
+    /// gesture and parks nothing, so there is nothing to settle.
     async fn settle_pending_transition(
         app: &mut AsyncApp,
         shell: &Rc<RefCell<Shell>>,
         world: &mut World,
     ) -> CatchUp {
-        let mut state = world.resume.take().expect("a selected transition");
+        let Some(mut state) = world.resume.take() else {
+            assert_eq!(
+                world.connection,
+                Connection::Connected,
+                "no transition is pending, yet the selected session is not usable",
+            );
+            return CatchUp::Caught;
+        };
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
             assert!(Instant::now() < deadline, "the selected transition settled");
@@ -18958,8 +18999,19 @@ mod tests {
         assert_eq!(world.session(), first);
         assert_eq!(
             world.connection,
-            Connection::Reconnecting,
-            "selection is immediate, while usability waits for Caught",
+            Connection::Connected,
+            "a swap onto a session the stream serves never leaves the connection",
+        );
+        assert!(
+            world.resume.is_none(),
+            "a swap parked a recovery, so the stream would be reopened for nothing",
+        );
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|toast| toast.starts_with("Switched to")),
+            "the swap did not report itself: {:?}",
+            toast_lines(&shell),
         );
         shut_down(&world).await;
     }
@@ -23987,7 +24039,8 @@ mod tests {
                 session: session.clone(),
                 message: partial.to_string(),
             }),
-        );
+        )
+        .await;
         drop(writer);
         assert!(matches!(moved, Focus::Moved));
         assert_eq!(world.session(), session);
