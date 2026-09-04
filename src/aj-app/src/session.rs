@@ -240,7 +240,7 @@ pub struct MainAgentSeed {
 }
 
 /// Everything with session lifetime that a rendering backend does not
-/// touch, built fresh on every session change and never reseeded after
+/// touch, built fresh on every materialization and never reseeded after
 /// construction. Dropping the core drops the agent and its bus
 /// subscriptions in one go.
 pub struct SessionCore {
@@ -262,10 +262,9 @@ pub struct SessionCore {
     /// sub-agents spawned in this session are promptable.
     pub registry: SubAgentRegistry,
     /// Background-task registry injected into `agent`; shared with the
-    /// main loop so the wake triggers can poll notices and shutdown can
-    /// kill the task tree. Per-session; the loop shuts it down on every
-    /// exit (quit, fatal error, session switch), so tasks never outlive
-    /// their session.
+    /// driver so wake triggers can poll notices and session teardown can
+    /// close the task tree. Frontend session switches do not end this
+    /// lifetime: the host retains the core until idle release or shutdown.
     pub task_registry: TaskRegistry,
     /// Shared steering / follow-up queues injected into `agent` (and
     /// its sub-agents). The frontend's input handlers enqueue onto them
