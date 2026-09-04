@@ -15,18 +15,14 @@
 //! to it is refused, since membership is answered off the store rather than off
 //! these rows.
 //!
-//! An enumeration reads no log content beyond the format sniff, one first
-//! line per file, cached against the `(mtime, size)` it was read at. The only
-//! other file it opens is a session's tag sidecar, cached the same way and
-//! only for the sessions that have one. The archived sidecars cost
+//! An enumeration does not open session logs. The only per-session file it
+//! opens is a tag sidecar, cached against its `(mtime, size)` and only for the
+//! sessions that have one. The archived sidecars cost
 //! one more listing of the same directory and no read at all: the file's
 //! existence is the whole answer. A row itself is built from the `stat` the
 //! enumeration already did, which is what keeps host startup off the store's
 //! bytes: deriving a cold session's `last_seq` would cost a read of every log
-//! in the directory, and the row does not carry one. One case falls
-//! outside the cache, a log the store cannot open is retried at every
-//! enumeration, because nothing about the file moves when it becomes readable
-//! again. That costs the failed open and nothing more.
+//! in the directory, and the row does not carry one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,7 +43,7 @@ use chrono::{DateTime, Utc};
 /// with a store that counts them.
 pub(crate) trait SessionStore {
     /// Every session log in the store, with its fingerprint. Opens no file.
-    fn enumerate_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError>;
+    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError>;
 
     /// The fingerprint of one session's log, `Ok(None)` when the store holds
     /// no log under that id. One `stat`, no directory read.
@@ -55,10 +51,6 @@ pub(crate) trait SessionStore {
         &self,
         session_id: &str,
     ) -> Result<Option<SessionMetadata>, ConversationError>;
-
-    /// Whether the log is in the current on-disk format, or `None` when it
-    /// could not be read at all. Opens the file and reads its first line.
-    fn is_current_format(&self, session_id: &str) -> Option<bool>;
 
     /// Every tag sidecar in the store, with its fingerprint. One directory
     /// read, and none at all for a store that has no tagged session.
@@ -83,8 +75,8 @@ pub(crate) trait SessionStore {
 }
 
 impl SessionStore for ConversationPersistence {
-    fn enumerate_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
-        ConversationPersistence::enumerate_sessions(self)
+    fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
+        ConversationPersistence::list_sessions(self)
     }
 
     fn session_metadata(
@@ -92,10 +84,6 @@ impl SessionStore for ConversationPersistence {
         session_id: &str,
     ) -> Result<Option<SessionMetadata>, ConversationError> {
         ConversationPersistence::session_metadata(self, session_id)
-    }
-
-    fn is_current_format(&self, session_id: &str) -> Option<bool> {
-        ConversationPersistence::is_current_format(self, session_id)
     }
 
     fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
@@ -140,9 +128,7 @@ pub(crate) struct ColdSession {
     pub(crate) lock_generation: Option<u64>,
 }
 
-/// The store's sessions as the host last saw them. Both the row and the
-/// format verdict behind it are cached against the file they describe, so a
-/// scan over a settled store derives nothing.
+/// The store's sessions as the host last saw them.
 pub(crate) struct ColdSessions<S> {
     store: S,
     cache: StdMutex<Cache>,
@@ -174,12 +160,6 @@ impl Fingerprint {
     fn of(modified: DateTime<Utc>, size: u64) -> Self {
         Self { modified, size }
     }
-}
-
-/// A log's format verdict, plus the file state it was sniffed at.
-struct Sniffed {
-    at: Fingerprint,
-    current_format: bool,
 }
 
 /// A session's label, plus the sidecar state it came from.
@@ -241,7 +221,6 @@ struct Cache {
     /// The answer a refresh serves. What an enumeration point last found, plus
     /// what the host has recorded about its own sessions since.
     rows: HashMap<String, Row>,
-    formats: HashMap<String, Sniffed>,
     /// One entry per session that has a label. Its absence is the untagged
     /// answer, which is what makes an untagged store cost nothing.
     tags: HashMap<String, Tagged>,
@@ -416,12 +395,7 @@ impl<S: SessionStore> ColdSessions<S> {
         // for the same reason (see [`Self::record_archived`]).
         let (known, labelled, filed, locks_before) = {
             let cache = self.cache();
-            let known: HashSet<String> = cache
-                .rows
-                .keys()
-                .chain(cache.formats.keys())
-                .cloned()
-                .collect();
+            let known: HashSet<String> = cache.rows.keys().cloned().collect();
             (
                 known,
                 cache.tags.clone(),
@@ -439,24 +413,8 @@ impl<S: SessionStore> ColdSessions<S> {
             if live(&metadata.session_id) {
                 continue;
             }
-            // Sniffed outside the guard below: it can open a file.
-            let Some(current_format) = self.current_format(metadata) else {
-                // The store could not read the log at all, which says nothing
-                // about it. Dropping the row over that would take a session
-                // out of the directory on a passing EMFILE or permission blip,
-                // and a release that had just recorded its row would be the
-                // one undone. We keep what we had, and a log that never had a
-                // row still has none.
-                continue;
-            };
             let at = fingerprint(metadata);
             let mut cache = self.cache();
-            if !current_format {
-                // A pre-refactor log is no session, and one that turns into
-                // one stops being listed.
-                cache.rows.remove(&metadata.session_id);
-                continue;
-            }
             let row = cache.rows.get(&metadata.session_id);
             if row.is_none_or(|row| row.at != at) {
                 cache.rows.insert(
@@ -678,18 +636,16 @@ impl<S: SessionStore> ColdSessions<S> {
         self.lock_probes.load(Ordering::Relaxed)
     }
 
-    /// Whether the store holds a current-format log for `id`.
+    /// Whether the store holds a session log for `id`.
     ///
-    /// The membership test materialization gates on. It costs one `stat` plus
-    /// at most one format sniff, so it says nothing about how many sessions
-    /// the store holds: that is what the id grammar buys
+    /// The membership test materialization gates on. It costs one `stat`, so
+    /// it says nothing about how many sessions the store holds: that is what
+    /// the id grammar buys
     /// ([`crate::host::validate_session_id`]).
     ///
     /// A log this store cannot stat is a failure rather than an absence, so
     /// a store nothing can read refuses a request loudly instead of reporting
-    /// every session in it as gone. A log it can stat but not sniff is still
-    /// not a session this host could materialize, which is the one place the
-    /// answer folds a read failure into "no".
+    /// every session in it as gone.
     ///
     /// NOTE(aljoscha): a `stat` answers under the filesystem's own name
     /// matching, where an enumeration answered under exact string equality.
@@ -700,10 +656,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// the directory gave it.
     pub(crate) fn contains(&self, id: &str) -> Result<bool, ConversationError> {
         self.membership_lookups.fetch_add(1, Ordering::Relaxed);
-        let Some(metadata) = self.store.session_metadata(id)? else {
-            return Ok(false);
-        };
-        Ok(self.current_format(&metadata).unwrap_or(false))
+        Ok(self.store.session_metadata(id)?.is_some())
     }
 
     /// Record what the host knows about a session it just released, so a
@@ -712,8 +665,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// Touches no filesystem. The row carries its own consistency (see
     /// [`ReleasedRow`]): the fingerprint is the file state the release left
     /// behind. It is also the state the next enumeration finds, unless a rival
-    /// writer took the freed lock and appended in between, in which case the
-    /// fingerprint has moved and the format verdict simply misses.
+    /// writer took the freed lock and appended in between.
     pub(crate) fn note_released(&self, released: &ReleasedRow) {
         let ReleasedRow {
             file,
@@ -728,13 +680,6 @@ impl<S: SessionStore> ColdSessions<S> {
             Row {
                 at,
                 last_activity: *last_activity,
-            },
-        );
-        cache.formats.insert(
-            file.session_id.clone(),
-            Sniffed {
-                at,
-                current_format: true,
             },
         );
         // The label the driver held, which is the only current one: it may
@@ -765,10 +710,9 @@ impl<S: SessionStore> ColdSessions<S> {
 
     /// The label in `sidecar`, read once per fingerprint into the cache.
     ///
-    /// The second per-file read an enumeration is allowed, and as
-    /// with the format sniff the cache is what makes it affordable: a settled
-    /// store re-reads no sidecar, and one whose label was just rewritten reads
-    /// only that one.
+    /// The only per-session file read an enumeration performs. The cache keeps
+    /// a settled store from re-reading sidecars and limits a label rewrite to
+    /// its own file.
     ///
     /// A sidecar the store cannot read leaves the cache alone rather than
     /// recording "untagged". A read that failed says nothing about the label,
@@ -809,71 +753,6 @@ impl<S: SessionStore> ColdSessions<S> {
             .insert(sidecar.session_id.clone(), Tagged { at: Some(at), tag });
     }
 
-    /// The format verdict for `metadata`'s log, sniffed once per fingerprint.
-    ///
-    /// The one log-content read an enumeration is allowed, and the
-    /// reason it is affordable is this cache: a settled store re-sniffs
-    /// nothing.
-    ///
-    /// Keyed on the fingerprint rather than on the path alone, even though a
-    /// log's format never changes: a sniff can land on a file another process
-    /// is midway through creating and read a half-written first line. Keying
-    /// on the fingerprint retries that once the write lands, while a settled
-    /// pre-refactor file, whose fingerprint never moves, is still only read
-    /// once.
-    ///
-    /// `None` when the store could not read the log at all, which is a
-    /// different answer from "not the current format" and earns no cache
-    /// entry. Its fingerprint does not move when it becomes readable again
-    /// (dropping and restoring a read bit leaves size and modification time
-    /// alone), so caching that verdict would hide the session from every
-    /// client for the life of the host.
-    fn current_format(&self, metadata: &SessionMetadata) -> Option<bool> {
-        let at = fingerprint(metadata);
-        if let Some(cached) = self.sniffed(&metadata.session_id, at) {
-            return Some(cached);
-        }
-        // Outside the guard: the sniff opens and reads a file, and every other
-        // refresh would queue behind it.
-        let Some(current) = self.store.is_current_format(&metadata.session_id) else {
-            tracing::warn!(
-                session = metadata.session_id,
-                "could not read a session log to place it in the directory"
-            );
-            return None;
-        };
-        if !current {
-            // Once per fingerprint, so not the per-tick noise an uncached sniff
-            // would have produced.
-            tracing::info!(
-                session = metadata.session_id,
-                "leaving a pre-refactor log out of the session directory"
-            );
-        }
-        self.cache().formats.insert(
-            metadata.session_id.clone(),
-            Sniffed {
-                at,
-                current_format: current,
-            },
-        );
-        Some(current)
-    }
-
-    /// The cached verdict for `id`, if it was sniffed off the file we are
-    /// looking at.
-    ///
-    /// Two concurrent enumerations can hold different generations of one file,
-    /// and the loser's insert overwrites the winner's. The cost is one
-    /// redundant sniff on the next scan, so no ordering is enforced.
-    fn sniffed(&self, id: &str, at: Fingerprint) -> Option<bool> {
-        self.cache()
-            .formats
-            .get(id)
-            .filter(|sniffed| sniffed.at == at)
-            .map(|sniffed| sniffed.current_format)
-    }
-
     /// Drop what we hold for sessions the store no longer holds, so the cache
     /// stays a projection of the directory rather than of its history.
     ///
@@ -890,7 +769,6 @@ impl<S: SessionStore> ColdSessions<S> {
         let gone = |id: &String| known.contains(id) && !present.contains(id.as_str());
         let mut cache = self.cache();
         cache.rows.retain(|id, _| !gone(id));
-        cache.formats.retain(|id, _| !gone(id));
     }
 
     /// Drop the labels whose sidecars are gone, on the rule [`Self::evict`]
@@ -968,7 +846,7 @@ impl<S: SessionStore> ColdSessions<S> {
 
     fn enumerate_store(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
         self.directory_reads.fetch_add(1, Ordering::Relaxed);
-        self.store.enumerate_sessions()
+        self.store.list_sessions()
     }
 
     fn enumerate_sidecars(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
@@ -1038,14 +916,7 @@ mod tests {
         );
     }
 
-    /// A store whose directory the test edits and whose per-file reads it
-    /// counts. The counts are the point: the contract is about the reads an
-    /// enumeration avoids, which its answers cannot show.
-    ///
-    /// It can serve only the two per-file reads [`SessionStore`] asks for, a
-    /// log's first line and a tag sidecar. That is the contract's strongest
-    /// form: producing a directory row cannot reach a log's contents past its
-    /// first line.
+    /// A store whose directory and metadata the tests can edit independently.
     #[derive(Default)]
     struct FakeStore {
         files: StdMutex<Vec<FakeFile>>,
@@ -1056,10 +927,9 @@ mod tests {
         /// Set to fail the read of the sidecar directory, as a permission
         /// change on `meta/` does.
         sidecars_unreadable: StdMutex<bool>,
-        sniffs: StdMutex<Vec<String>>,
-        /// Run once inside the first sniff of a scan, so a test can act while a
-        /// scan is between its directory read and its eviction.
-        during_sniff: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Run once after a session listing has been captured, so a test can
+        /// act while a scan is between its directory read and its eviction.
+        during_session_listing: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
         /// The same, inside the first sidecar read of a scan, which is after
         /// the sidecar listing was taken and before the labels are evicted.
         during_tag_read: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -1092,8 +962,7 @@ mod tests {
     }
 
     /// One log in the fake store. `modified` and `size` are independent, as
-    /// they are on a real filesystem: a rewrite can move one without the
-    /// other, and each on its own has to invalidate the verdict we cached.
+    /// they are on a real filesystem.
     #[derive(Clone)]
     struct FakeFile {
         id: String,
@@ -1101,10 +970,6 @@ mod tests {
         /// file's modification time.
         modified: i64,
         size: u64,
-        /// Whether the format sniff can read the log. A sniff that cannot is
-        /// the transient failure the cache must not remember.
-        sniffable: bool,
-        current_format: bool,
     }
 
     /// One tag sidecar. Its fingerprint moves independently of the log's, as
@@ -1135,40 +1000,28 @@ mod tests {
     }
 
     impl FakeFile {
-        /// A current-format log last written at `modified` (epoch seconds).
-        fn current(id: &str, modified: i64) -> Self {
+        fn new(id: &str, modified: i64) -> Self {
             Self {
                 id: id.to_string(),
                 modified,
                 size: 100,
-                sniffable: true,
-                current_format: true,
             }
         }
     }
 
     impl SessionStore for FakeStore {
-        fn enumerate_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
+        fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
             // `list` preserves the store's order, and the real one is
             // latest-first. Ascending here, so assertions read in order.
             let mut files = self.files.lock().expect("files").clone();
+            if let Some(interleave) = self.during_session_listing.lock().expect("hook").take() {
+                interleave();
+            }
             files.sort_by(|left, right| left.id.cmp(&right.id));
             Ok(files
                 .iter()
                 .map(|file| SessionMetadata::new(file.id.clone(), at(file.modified), file.size))
                 .collect())
-        }
-
-        fn is_current_format(&self, session_id: &str) -> Option<bool> {
-            self.sniffs
-                .lock()
-                .expect("sniffs")
-                .push(session_id.to_string());
-            if let Some(interleave) = self.during_sniff.lock().expect("hook").take() {
-                interleave();
-            }
-            let file = self.file(session_id)?;
-            file.sniffable.then_some(file.current_format)
         }
 
         fn session_metadata(
@@ -1325,9 +1178,9 @@ mod tests {
                 .retain(|sidecar| sidecar.id != id);
         }
 
-        /// Put a current-format log last written at `modified` in the store.
+        /// Put a log last written at `modified` in the store.
         fn put(&self, id: &str, modified: i64) {
-            self.write(FakeFile::current(id, modified));
+            self.write(FakeFile::new(id, modified));
         }
 
         fn write(&self, file: FakeFile) {
@@ -1346,8 +1199,8 @@ mod tests {
             edit(file);
         }
 
-        fn during_sniff(&self, interleave: impl FnOnce() + Send + 'static) {
-            *self.during_sniff.lock().expect("hook") = Some(Box::new(interleave));
+        fn during_session_listing(&self, interleave: impl FnOnce() + Send + 'static) {
+            *self.during_session_listing.lock().expect("hook") = Some(Box::new(interleave));
         }
 
         fn during_tag_read(&self, interleave: impl FnOnce() + Send + 'static) {
@@ -1409,20 +1262,6 @@ mod tests {
                 .lock()
                 .expect("files")
                 .retain(|file| file.id != id);
-        }
-
-        /// How many times this store sniffed `id`'s first line.
-        fn sniffs_of(&self, id: &str) -> usize {
-            self.sniffs
-                .lock()
-                .expect("sniffs")
-                .iter()
-                .filter(|sniffed| *sniffed == id)
-                .count()
-        }
-
-        fn forget_sniffs(&self) {
-            self.sniffs.lock().expect("sniffs").clear();
         }
     }
 
@@ -1504,68 +1343,6 @@ mod tests {
         rows
     }
 
-    /// The core of the performance contract: a session the host holds live is
-    /// never read from disk, however many refreshes run over it.
-    #[test]
-    fn a_live_session_is_never_read_from_disk() {
-        let store = FakeStore::default();
-        store.put("live", 12);
-        store.put("cold", 3);
-        let cold = ColdSessions::new(store);
-
-        for _ in 0..20 {
-            // The live log grows under us, as an append does. Nothing about
-            // the refresh may look at it.
-            cold.store.edit("live", |file| {
-                file.size += 100;
-                file.modified += 1;
-            });
-            assert_eq!(
-                refreshed(&cold, |id| id == "live"),
-                vec![("cold".to_string(), 3)],
-                "the live session is left to the host, the cold one is served",
-            );
-        }
-        assert_eq!(
-            cold.store.sniffs_of("live"),
-            0,
-            "not even a first line is read for a live session",
-        );
-    }
-
-    /// An enumeration over a settled store reads no file at all: the only
-    /// per-file fact a row needs beyond the `stat` is the format verdict, and
-    /// that came from the cache.
-    ///
-    /// This is what makes host startup affordable. A store of hundreds of logs
-    /// costs one first-line read each, once, and nothing after that.
-    #[test]
-    fn an_unchanged_store_is_sniffed_once() {
-        let store = FakeStore::default();
-        for id in ["a", "b", "c"] {
-            store.put(id, 5);
-        }
-        let cold = ColdSessions::new(store);
-
-        for _ in 0..10 {
-            assert_eq!(
-                refreshed(&cold, |_| false),
-                [
-                    ("a".to_string(), 5),
-                    ("b".to_string(), 5),
-                    ("c".to_string(), 5),
-                ],
-            );
-        }
-        for id in ["a", "b", "c"] {
-            assert_eq!(
-                cold.store.sniffs_of(id),
-                1,
-                "{id} was sniffed once across ten refreshes",
-            );
-        }
-    }
-
     /// A row's stamp is the log file's modification time, and it follows the
     /// file: a log a sibling process appends to reports the append at the next
     /// enumeration point, without the row being read.
@@ -1590,56 +1367,6 @@ mod tests {
         );
     }
 
-    /// Both halves of the fingerprint invalidate the cached verdict on their
-    /// own. Size alone misses a rewrite that preserves the length, and
-    /// modification time alone misses two writes inside one clock tick, which
-    /// a filesystem with coarse timestamps produces.
-    ///
-    /// The verdict flips under the test's feet, which no real log does. It is
-    /// the only way to observe from the outside whether the sniff ran or the
-    /// cache answered, and the last step, where neither half moves and the
-    /// stale verdict stands, is what proves the cache is doing the answering.
-    #[test]
-    fn either_half_of_the_fingerprint_reruns_the_sniff() {
-        let store = FakeStore::default();
-        store.put("a", 5);
-        let cold = ColdSessions::new(store);
-        assert_eq!(refreshed(&cold, |_| false), [("a".to_string(), 5)]);
-
-        // Same size, later modification time: a rewrite in place.
-        cold.store.forget_sniffs();
-        cold.store.edit("a", |file| {
-            file.modified += 1;
-            file.current_format = false;
-        });
-        assert_eq!(
-            refreshed(&cold, |_| false),
-            [],
-            "a log rewritten to the same length is sniffed again",
-        );
-        assert_eq!(cold.store.sniffs_of("a"), 1);
-
-        // Same modification time, larger size: a write inside one tick.
-        cold.store.forget_sniffs();
-        cold.store.edit("a", |file| {
-            file.size += 100;
-            file.current_format = true;
-        });
-        assert_eq!(
-            refreshed(&cold, |_| false),
-            [("a".to_string(), 6)],
-            "a log that grew within one clock tick is sniffed again",
-        );
-        assert_eq!(cold.store.sniffs_of("a"), 1);
-
-        // And settles once neither half moves: the verdict is answered from
-        // the cache, so a flip the fingerprint does not show is not seen.
-        cold.store.forget_sniffs();
-        cold.store.edit("a", |file| file.current_format = false);
-        assert_eq!(refreshed(&cold, |_| false), [("a".to_string(), 6)]);
-        assert_eq!(cold.store.sniffs_of("a"), 0);
-    }
-
     /// A log that appears is picked up and one that vanishes drops out, both
     /// at the next enumeration point.
     #[test]
@@ -1657,14 +1384,9 @@ mod tests {
 
         cold.store.remove("a");
         assert_eq!(refreshed(&cold, |_| false), [("b".to_string(), 4)]);
-        assert_eq!(
-            cold.store.sniffs_of("b"),
-            1,
-            "and the log that stayed put was not re-read for any of it",
-        );
     }
 
-    /// A vanished log takes its row with it, not just its format verdict.
+    /// A vanished log takes its row with it.
     ///
     /// A row is pinned against the fingerprint it describes, so one that
     /// outlived its file would go on answering for whatever file takes the id
@@ -1695,98 +1417,6 @@ mod tests {
             refreshed(&cold, |_| false),
             [("a".to_string(), 2)],
             "the row outlived the file that produced it",
-        );
-    }
-
-    /// A pre-refactor log stays out of the listing, and the verdict costs one
-    /// sniff however many enumerations run: the format of a log is a fact
-    /// about its content, so it is cacheable.
-    #[test]
-    fn a_pre_refactor_log_is_left_out() {
-        let store = FakeStore::default();
-        store.put("current", 3);
-        store.write(FakeFile {
-            current_format: false,
-            ..FakeFile::current("ancient", 4)
-        });
-        let cold = ColdSessions::new(store);
-
-        for _ in 0..5 {
-            assert_eq!(refreshed(&cold, |_| false), [("current".to_string(), 3)]);
-        }
-        assert_eq!(cold.store.sniffs_of("ancient"), 1, "sniffed once");
-    }
-
-    /// A log the store cannot read at all is left out, and that verdict is
-    /// *not* cached: nothing about the file moves when it becomes readable
-    /// again, so a cached verdict would hide the session for the life of the
-    /// host.
-    #[test]
-    fn an_unsniffable_log_is_retried_at_an_unchanged_fingerprint() {
-        let store = FakeStore::default();
-        store.write(FakeFile {
-            sniffable: false,
-            ..FakeFile::current("shy", 6)
-        });
-        let cold = ColdSessions::new(store);
-        for _ in 0..3 {
-            assert_eq!(
-                refreshed(&cold, |_| false),
-                [],
-                "a log that cannot be read is no session",
-            );
-        }
-        assert_eq!(
-            cold.store.sniffs_of("shy"),
-            3,
-            "and every enumeration tries it again",
-        );
-
-        // Readable again with neither half of the fingerprint moved, which is
-        // exactly what restoring a read bit looks like.
-        cold.store.edit("shy", |file| file.sniffable = true);
-        assert_eq!(
-            refreshed(&cold, |_| false),
-            [("shy".to_string(), 6)],
-            "the session comes back without the file changing",
-        );
-    }
-
-    /// A log the store cannot read for a moment does not cost the session its
-    /// row. The verdict says nothing about the log, so an enumeration that
-    /// hits one leaves the directory where it stands rather than dropping a
-    /// session out of it: a session leaves the directory only by deletion,
-    /// never by a release or a failed read.
-    #[test]
-    fn a_transient_read_failure_does_not_drop_a_row() {
-        let store = FakeStore::default();
-        store.put("a", 3);
-        let cold = ColdSessions::new(store);
-        cold.note_released(&ReleasedRow {
-            file: SessionMetadata::new("a".to_string(), at(3), 100),
-            last_activity: at(9),
-            tag: None,
-            archived: false,
-        });
-        assert_eq!(listed(cold.rows()), [("a".to_string(), 9)]);
-
-        // Unreadable, at a fingerprint that does not match the release's, so
-        // the cached verdict cannot carry the row through either.
-        cold.store.edit("a", |file| {
-            file.sniffable = false;
-            file.modified = 4;
-        });
-        assert_eq!(
-            refreshed(&cold, |_| false),
-            [("a".to_string(), 9)],
-            "the row the host recorded outlives a failed sniff",
-        );
-
-        cold.store.edit("a", |file| file.sniffable = true);
-        assert_eq!(
-            refreshed(&cold, |_| false),
-            [("a".to_string(), 4)],
-            "and the file answers again once it can be read",
         );
     }
 
@@ -1835,7 +1465,6 @@ mod tests {
         cold.note_released(&released("held", 4, 400));
         assert_eq!(listed(cold.rows()), [("held".to_string(), 4)]);
         assert_eq!(cold.directory_reads(), 1, "the release read nothing");
-        assert_eq!(cold.store.sniffs_of("held"), 0);
     }
 
     /// The row a release records carries what the driver saw, not what the
@@ -1847,7 +1476,7 @@ mod tests {
         let store = FakeStore::default();
         store.write(FakeFile {
             size: 400,
-            ..FakeFile::current("held", 10)
+            ..FakeFile::new("held", 10)
         });
         let cold = ColdSessions::new(store);
         cold.note_released(&ReleasedRow {
@@ -1888,36 +1517,6 @@ mod tests {
         assert_eq!(refreshed(&cold, |id| id == "a"), [("a".to_string(), 5)]);
     }
 
-    /// Eviction covers the cached verdict too, not only the rows. A log with
-    /// no row still leaves a verdict behind, and one that outlived its file
-    /// would answer for whatever file takes the id next.
-    #[test]
-    fn a_vanished_log_leaves_no_verdict_behind() {
-        let store = FakeStore::default();
-        store.write(FakeFile {
-            current_format: false,
-            ..FakeFile::current("a", 5)
-        });
-        let cold = ColdSessions::new(store);
-        assert_eq!(
-            refreshed(&cold, |_| false),
-            [],
-            "a pre-refactor log is no row"
-        );
-
-        cold.store.remove("a");
-        assert_eq!(refreshed(&cold, |_| false), []);
-
-        // A different file, same id, and a fingerprint the old one also had,
-        // which is what a cached verdict would answer from.
-        cold.store.put("a", 5);
-        assert_eq!(
-            refreshed(&cold, |_| false),
-            [("a".to_string(), 5)],
-            "the verdict outlived the file that produced it",
-        );
-    }
-
     /// A scan may only evict rows it could have seen. A row that arrives while
     /// a scan runs was recorded by something that knew more about that session
     /// than the scan's directory read did, and a release recording the state it
@@ -1928,7 +1527,7 @@ mod tests {
         store.put("a", 2);
         let cold = Arc::new(ColdSessions::new(store));
         let releasing = Arc::downgrade(&cold);
-        cold.store.during_sniff(move || {
+        cold.store.during_session_listing(move || {
             let cold = releasing.upgrade().expect("the cache outlives the scan");
             // A session whose log the scan's directory read never saw, because
             // it was created after it.
@@ -1955,30 +1554,23 @@ mod tests {
         );
     }
 
-    /// The membership test answers off one `stat` and the cached format
-    /// verdict. It never reads the directory, which is what makes it
-    /// independent of how many sessions the store holds.
+    /// The membership test answers off one `stat`. It never reads the
+    /// directory, which is what makes it independent of how many sessions the
+    /// store holds.
     #[test]
-    fn membership_answers_off_one_stat_and_one_sniff() {
+    fn membership_answers_off_one_stat() {
         let store = FakeStore::default();
         store.put("a", 3);
-        store.write(FakeFile {
-            current_format: false,
-            ..FakeFile::current("ancient", 1)
-        });
         let cold = ColdSessions::new(store);
 
         for _ in 0..5 {
             assert!(cold.contains("a").expect("the store answered"));
-            assert!(!cold.contains("ancient").expect("the store answered"));
             assert!(!cold.contains("nobody").expect("the store answered"));
         }
-        assert_eq!(cold.store.sniffs_of("a"), 1);
-        assert_eq!(cold.store.sniffs_of("ancient"), 1);
         assert_eq!(
             cold.directory_reads(),
             0,
-            "fifteen membership questions and not one directory read",
+            "ten membership questions and not one directory read",
         );
     }
 

@@ -2681,7 +2681,7 @@ async fn a_stream_refuses_one_session_and_serves_the_rest() {
 async fn a_traversal_id_is_refused_at_the_wire_boundary() {
     let fixture = Fixture::new(Vec::new()).await;
     // A readable log just outside the store, so a resolved traversal would
-    // find something. An empty log counts as the current format.
+    // find something.
     let outside = fixture._dir.path().join("elsewhere");
     std::fs::create_dir_all(&outside).expect("a directory beside the store");
     std::fs::write(outside.join("reachable.jsonl"), "").expect("a log outside the store");

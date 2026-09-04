@@ -39,30 +39,20 @@ use tempfile::TempDir;
 /// the budgets below, few enough that writing them costs nothing.
 const COLD_LOGS: usize = 100;
 
-/// Bytes each cold log holds. Above the 8 KiB a buffered first-line read pulls
-/// in, so re-sniffing the store would cost ~800 KB per refresh and reading the
-/// logs whole ~1.6 MB.
+/// Bytes each cold log holds. Reading the logs would cost 1.6 MB per pass.
 const LOG_BYTES: usize = 16 * 1024;
 
 /// What one streaming turn's worth of refreshes may read.
 ///
-/// Sized off both sides of the gap it has to separate: honouring the contract
-/// measures ~112 bytes for the whole turn (reading `/proc/self/io` itself,
-/// nothing else), while dropping just the live session from the scan filter
-/// measures ~85 KB, and reading the logs costs megabytes. Well clear of
-/// either end, so the test fails on a regression rather than on the noise a
-/// different runtime or filesystem contributes.
+/// Honouring the contract measures ~112 bytes for the whole turn (reading
+/// `/proc/self/io` itself, nothing else), while reading the logs costs
+/// megabytes. The budget is well clear of either end, so the test fails on a
+/// regression rather than on runtime or filesystem noise.
 const BUDGET: u64 = 16 * 1024;
 
-/// What composing a host over `COLD_LOGS` logs may read.
-///
-/// Startup enumerates, and enumerating sniffs each log's first line, which a
-/// `BufReader` pulls in 8 KiB at a time. That is the whole cost and it
-/// measures ~820 KB, so the budget is that plus a little room. Reading the
-/// logs themselves would add `COLD_LOGS * LOG_BYTES` on top, 1.6 MB, which is
-/// what puts the two sides clearly apart. Sized against those two numbers, so
-/// it moves if either constant above does.
-const STARTUP_BUDGET: u64 = 900 * 1024;
+/// What composing a host over `COLD_LOGS` logs may read. Listing is a
+/// names-and-stats operation, so startup has the same byte budget as a refresh.
+const STARTUP_BUDGET: u64 = BUDGET;
 
 /// The sidecar axes an enumeration lists: labels and archived bits, one
 /// `readdir` of `meta/` each. What the assertions below are about is that the
@@ -83,19 +73,11 @@ fn read_bytes() -> u64 {
         .expect("a byte count")
 }
 
-/// Write `COLD_LOGS` current-format logs nothing will ever materialize.
+/// Write `COLD_LOGS` validly named logs nothing will ever materialize. Their
+/// deliberately malformed contents make the test detect a format gate as well
+/// as an accidental content read.
 fn seed_cold_logs(sessions_dir: &std::path::Path) {
-    let entry = serde_json::json!({
-        "id": "00000000",
-        "timestamp": "2024-01-01T00:00:00Z",
-        "thread": "meta",
-        "type": "system_prompt",
-        "text": "x".repeat(400),
-    })
-    .to_string();
-    let body: String = std::iter::repeat_n(entry, LOG_BYTES / 400)
-        .map(|line| format!("{line}\n"))
-        .collect();
+    let body = vec![0xff; LOG_BYTES];
     // Every session ever minted has a lock file, and a released one carries no
     // holder record, so this is the shape the lock sweep meets on a settled
     // store: a dense directory, a stat each, and nothing to probe. Without
@@ -157,10 +139,9 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
 /// Both halves of the directory's I/O contract, in one test because the
 /// oracle is a process-wide counter and two tests would run concurrently.
 ///
-/// Composing a host enumerates its store, before the shell paints
-/// anything. That enumeration may read a log's first line to place it in or
-/// out of the directory, and nothing else: a row's stamp comes from the
-/// `stat`, and it carries no position at all. The failure this pins is not
+/// Composing a host enumerates its store, before the shell paints anything.
+/// That enumeration may not open a log: a row's stamp comes from the `stat`,
+/// and it carries no position at all. The failure this pins is not
 /// subtle in the wild, deriving each cold row's `last_seq` means parsing every
 /// log in the store, which on a real one is a multi-second, multi-gigabyte
 /// read before first paint.
@@ -171,7 +152,7 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
 /// host, and the store's cold half is served from the cache the last
 /// enumeration point left.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
+async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
     let dir = TempDir::new().expect("tempdir");
     let sessions_dir = dir.path().join("sessions");
     std::fs::create_dir_all(&sessions_dir).expect("sessions dir");

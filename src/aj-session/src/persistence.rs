@@ -332,54 +332,18 @@ impl ConversationPersistence {
         }
     }
 
-    /// Get metadata about all conversation sessions, sorted by creation
-    /// time (latest first).
-    ///
-    /// Files whose first line does not parse as the new
-    /// [ConversationEntry] shape (e.g. pre-refactor sessions) are skipped
-    /// with a `tracing::info!` note, and so is a file that cannot be read at
-    /// all: one bad file must not fail the listing. A file whose stem is not
-    /// a session id is skipped before that, by
-    /// [`Self::enumerate_sessions`].
-    pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
-        let mut sessions = self.enumerate_sessions()?;
-        sessions.retain(|metadata| {
-            let path = self.session_path(&metadata.session_id);
-            match self.is_current_format(&metadata.session_id) {
-                Some(true) => true,
-                Some(false) => {
-                    tracing::info!(
-                        "skipping pre-refactor session file {} (old on-disk format)",
-                        path.display()
-                    );
-                    false
-                }
-                None => {
-                    tracing::warn!("skipping unreadable session file {}", path.display());
-                    false
-                }
-            }
-        });
-        Ok(sessions)
-    }
-
     /// Every `.jsonl` file in the sessions directory whose stem is a session
-    /// id, latest first, with the facts a `stat` yields.
+    /// id, latest first, with the facts a `stat` yields. Session contents are
+    /// not opened or parsed.
     ///
     /// A stem the grammar rejects (see [`crate::id`]) is skipped: this store
     /// refuses that id at every later lookup, so listing it would put a row in
     /// every directory that nothing can resolve.
     ///
-    /// No file is opened, so this says nothing about a log's format:
-    /// [`Self::is_current_format`] is that gate, applied separately. The split
-    /// is what lets a caller that refreshes a listing often cache the gate's
-    /// verdict, which is a read, while re-running the enumeration, which is
-    /// not.
-    ///
     /// A file that vanishes or turns unreadable between the directory read and
     /// its `stat` is skipped rather than failing the enumeration: a listing
     /// must not break over one file, least of all one that is no longer there.
-    pub fn enumerate_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
+    pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
         if !self.sessions_dir.exists() {
             return Ok(Vec::new());
         }
@@ -432,7 +396,7 @@ impl ConversationPersistence {
     /// The `stat` facts for one session's log, `Ok(None)` when the store
     /// holds no log under that id.
     ///
-    /// The single-id form of [`Self::enumerate_sessions`], for the membership
+    /// The single-id form of [`Self::list_sessions`], for the membership
     /// question a lookup asks. It costs one `stat` rather than a directory
     /// read, which is what keeps "is this id one of mine" off the size of the
     /// store.
@@ -469,46 +433,6 @@ impl ConversationPersistence {
         )))
     }
 
-    /// Whether `session_id`'s log is in the current on-disk format, or `None`
-    /// when the log could not be read at all.
-    ///
-    /// An empty log counts as current (it was just created and nothing has been
-    /// written yet). Otherwise its first non-empty line must parse as a
-    /// [`ConversationEntry`]. The line is read as bytes, so a log that is not
-    /// valid UTF-8 earns a verdict (it is not the current format) rather than a
-    /// read failure.
-    ///
-    /// The `None` case is separate because a caller that caches the verdict
-    /// must not cache it: the format is a durable property of the log's
-    /// content, while a failure to open the file says nothing about the log and
-    /// can clear on its own. An id the grammar rejects reads as `None` too: it
-    /// names no log here, and it must not be turned into a path to find that
-    /// out (see [`crate::id`]).
-    pub fn is_current_format(&self, session_id: &str) -> Option<bool> {
-        if !crate::id::is_valid_session_id(session_id) {
-            return None;
-        }
-        let path = self.session_path(session_id);
-        let file = File::open(&path).ok()?;
-        let mut reader = BufReader::new(file);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line) {
-                // An empty file is fine.
-                Ok(0) => return Some(true),
-                Ok(_) => {
-                    let trimmed = line.trim_ascii();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    return Some(serde_json::from_slice::<ConversationEntry>(trimmed).is_ok());
-                }
-                Err(_) => return None,
-            }
-        }
-    }
-
     /// Get the latest conversation session ID, if any exist.
     pub fn get_latest_session_id(&self) -> Result<Option<String>, ConversationError> {
         let sessions = self.list_sessions()?;
@@ -523,9 +447,8 @@ impl ConversationPersistence {
     /// and scans line by line to count `Message` entries and capture
     /// the first user-role textual block. `on_progress(loaded, total)`
     /// fires once per file as previews complete so a caller showing
-    /// a "Loading X/Y" indicator can update incrementally. Files
-    /// whose first line does not parse as the new [`ConversationEntry`]
-    /// shape are skipped (consistent with [`Self::list_sessions`]).
+    /// a "Loading X/Y" indicator can update incrementally. Malformed lines are
+    /// ignored, like a torn tail during resume.
     ///
     /// Note on streaming: this function returns the previews in one
     /// `Vec` after every file has been scanned. The callback is the
@@ -548,8 +471,7 @@ impl ConversationPersistence {
                 preview.archived = archived.contains(&preview.session_id);
                 previews.push(preview);
             }
-            // Tick progress for every file, including the pre-refactor
-            // ones that produced no row, so the counter reaches `total`.
+            // Tick progress for every file so the counter reaches `total`.
             on_progress(i + 1, total);
         }
         Ok(previews)
@@ -562,9 +484,9 @@ impl ConversationPersistence {
     /// can append rows as the scan progresses rather than blocking on
     /// the whole walk.
     ///
-    /// Mirrors the failure tolerance of [`Self::list_session_previews`]:
-    /// a pre-refactor or unreadable file is skipped (no row emitted),
-    /// and a missing or unreadable sessions directory emits nothing.
+    /// Mirrors the failure tolerance of [`Self::list_session_previews`]: an
+    /// unreadable file is skipped (no row emitted), and a missing or unreadable
+    /// sessions directory emits nothing.
     /// `cancel` is polled between files and periodically within a file so
     /// the scan, which runs on the blocking pool and can't be aborted,
     /// bails promptly once the consumer (the selector overlay) goes away.
@@ -613,15 +535,11 @@ impl ConversationPersistence {
 
     /// Enumerate the session files worth previewing, newest-first.
     ///
-    /// Every `.jsonl` file is a candidate. The current-format check runs
-    /// inline in the per-file walk ([`read_session_preview_file`]), so
-    /// each file is opened once rather than once to check the format and
-    /// again to read the preview. A pre-refactor file is dropped during
-    /// that walk, so the progress total counts it but no row appears for
-    /// it, and the counter still reaches the total.
+    /// Every session file is a candidate. Contents are opened only by the
+    /// per-file walk ([`read_session_preview_file`]).
     fn preview_candidates(&self) -> Result<Vec<(String, PathBuf)>, ConversationError> {
         Ok(self
-            .enumerate_sessions()?
+            .list_sessions()?
             .into_iter()
             .map(|metadata| {
                 let path = self.session_path(&metadata.session_id);
@@ -633,26 +551,15 @@ impl ConversationPersistence {
 
 /// Read a preview for `path`.
 ///
-/// `Ok(None)` means a pre-refactor file (its first non-empty line is not
-/// the current [`ConversationEntry`] shape). It is dropped from the
-/// listing, matching the format gate [`ConversationPersistence::list_sessions`]
-/// applies. A read error (the file vanished or became unreadable between
-/// enumeration and the open) also drops it, the same way `list_sessions`
-/// does, so the two listings stay consistent.
+/// A read error (the file vanished or became unreadable between enumeration
+/// and the open) drops it from the preview listing.
 fn read_preview(
     session_id: String,
     path: &std::path::Path,
     cancel: &dyn Fn() -> bool,
 ) -> Option<SessionPreview> {
     match read_session_preview_file(&session_id, path, cancel) {
-        Ok(Some(preview)) => Some(preview),
-        Ok(None) => {
-            tracing::info!(
-                "skipping pre-refactor session file {} (old on-disk format)",
-                path.display()
-            );
-            None
-        }
+        Ok(preview) => Some(preview),
         Err(err) => {
             tracing::warn!("skipping unreadable session file {}: {err}", path.display());
             None
@@ -677,10 +584,8 @@ pub struct SidecarMetadata {
 pub struct SessionMetadata {
     pub session_id: String,
     pub modified_at: DateTime<Utc>,
-    /// File size in bytes. Paired with `modified_at` it fingerprints the
-    /// file, which is what lets a caller cache anything it derived from
-    /// the file's contents (see
-    /// [`ConversationPersistence::is_current_format`]).
+    /// File size in bytes. Paired with `modified_at` it fingerprints the file
+    /// for callers caching values derived from it.
     pub size_bytes: u64,
 }
 
@@ -785,20 +690,15 @@ pub struct SessionPreview {
 /// Open `path`, walk every JSONL line, and assemble a
 /// [`SessionPreview`].
 ///
-/// Returns `Ok(None)` when the first non-empty line does not parse as a
-/// [`ConversationEntry`], i.e. a pre-refactor file the listing should
-/// drop. This is the current-format gate applied inline so the file is
-/// opened once (the standalone [`ConversationPersistence::is_current_format`]
-/// check stays for `list_sessions`, which doesn't otherwise read the
-/// file). A later line that fails to parse is skipped (matching the
-/// resume-time tolerance for truncated trailing lines). The walk is
-/// one-pass: we read every line so `message_count` is accurate, but we
-/// stop updating `first_user_message` once we have one.
+/// JSON lines that fail to parse are skipped. Invalid UTF-8 ends the walk at
+/// the readable prefix. Either way the entries already read produce a preview,
+/// matching the resume-time tolerance for a truncated tail. The walk is
+/// one-pass, and stops updating `first_user_message` once it has one.
 fn read_session_preview_file(
     session_id: &str,
     path: &std::path::Path,
     cancel: &dyn Fn() -> bool,
-) -> Result<Option<SessionPreview>, ConversationError> {
+) -> Result<SessionPreview, ConversationError> {
     let metadata = fs::metadata(path)?;
     let modified = metadata
         .modified()
@@ -816,8 +716,6 @@ fn read_session_preview_file(
     // writes: a tool result that lands after a streaming assistant
     // message finalised, for example.
     let mut last_message_at: Option<DateTime<Utc>> = None;
-    let mut seen_first_entry = false;
-
     for (lineno, line_res) in reader.lines().enumerate() {
         // Cooperative cancellation: this runs on the blocking pool, so we
         // poll `cancel` and stop reading once the consumer is gone. We may
@@ -836,17 +734,9 @@ fn read_session_preview_file(
         if line.trim().is_empty() {
             continue;
         }
-        let entry = match serde_json::from_str::<ConversationEntry>(&line) {
-            Ok(entry) => entry,
-            Err(_) if !seen_first_entry => {
-                // First non-empty line isn't the current entry shape: a
-                // pre-refactor file. Skip the whole file.
-                return Ok(None);
-            }
-            // A later torn/garbage line: skip it, keep what we have.
-            Err(_) => continue,
+        let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line) else {
+            continue;
         };
-        seen_first_entry = true;
         if let ConversationEntryKind::Message { message: msg } = &entry.entry {
             message_count += 1;
             if first_user_message.is_none() {
@@ -879,7 +769,7 @@ fn read_session_preview_file(
     // single-field design.
     let last_message_at = last_message_at.unwrap_or(modified);
 
-    Ok(Some(SessionPreview {
+    Ok(SessionPreview {
         session_id: session_id.to_string(),
         modified,
         created_at,
@@ -890,7 +780,7 @@ fn read_session_preview_file(
         // Not in the log: the listing fills these from the sidecars.
         tag: None,
         archived: false,
-    }))
+    })
 }
 
 /// Parse a session id minted by [`crate::log::ConversationLog::create`]
@@ -1007,10 +897,7 @@ mod tests {
             "nothing landed beside the logs",
         );
         assert!(
-            persistence
-                .enumerate_sessions()
-                .expect("enumerate")
-                .is_empty(),
+            persistence.list_sessions().expect("enumerate").is_empty(),
             "a store with only a tag holds no sessions",
         );
     }
@@ -1386,7 +1273,7 @@ mod tests {
         }
 
         let listed: Vec<String> = persistence
-            .enumerate_sessions()
+            .list_sessions()
             .expect("enumerate")
             .into_iter()
             .map(|metadata| metadata.session_id)
@@ -1446,70 +1333,23 @@ mod tests {
         }
     }
 
-    /// The format sniff reads bytes, not text, so a log that is not valid
-    /// UTF-8 earns a verdict rather than a read failure. That matters because
-    /// the caller caches the verdict against the file and treats a failure as
-    /// "try again next time", which for a file that will never decode is every
-    /// enumeration for the life of the host.
+    /// Listing is a names-and-stats operation. A validly named `.jsonl` is a
+    /// session regardless of its contents, while unrelated files and
+    /// directories remain outside the store.
     #[test]
-    fn the_format_sniff_reads_bytes_and_always_reaches_a_verdict() {
-        let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "hello", "hi");
-        let session_id = log.session_id().to_string();
-        let path = log.path().to_path_buf();
-        drop(log);
-
-        // The first two bytes of a three-byte character, as a crash mid-append
-        // leaves behind. The sniff reads the first line, so it is unaffected.
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("reopen the log");
-        std::io::Write::write_all(&mut file, &[b'{', 0xe2, 0x82]).expect("append a torn line");
-        drop(file);
-        assert_eq!(persistence.is_current_format(&session_id), Some(true));
-
-        // A whole log of invalid bytes is a verdict too, not a read failure.
-        let blob = persistence
-            .sessions_dir()
-            .join("2000-01-01-00-00-00-000.jsonl");
-        std::fs::write(&blob, [0xff, 0xfe, 0xff]).expect("write a non-utf8 log");
-        assert_eq!(
-            persistence.is_current_format("2000-01-01-00-00-00-000"),
-            Some(false),
-        );
-    }
-
-    /// The enumeration is the cheap half of a listing: it stats but never
-    /// opens, so a pre-refactor file is enumerated like any other and only
-    /// `list_sessions` (through the format gate) drops it.
-    #[test]
-    fn enumeration_keeps_what_the_format_gate_drops() {
+    fn listing_does_not_parse_session_contents() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "hi");
         let session_id = log.session_id().to_string();
         drop(log);
-        let old = persistence
+        let malformed = persistence
             .sessions_dir()
             .join("2000-01-01-00-00-00-000.jsonl");
-        std::fs::write(&old, "not json at all\n").expect("write a pre-refactor file");
+        std::fs::write(&malformed, "not json at all\n").expect("write a malformed log");
         // Neither an unrelated extension nor a directory is a session.
         std::fs::write(persistence.sessions_dir().join("host-id"), "id\n").expect("write");
         std::fs::create_dir(persistence.sessions_dir().join("nested.jsonl")).expect("mkdir");
-
-        let enumerated: Vec<String> = persistence
-            .enumerate_sessions()
-            .expect("enumerate")
-            .into_iter()
-            .map(|metadata| metadata.session_id)
-            .collect();
-        assert_eq!(
-            enumerated,
-            vec![session_id.clone(), "2000-01-01-00-00-00-000".to_string()],
-            "both logs are enumerated, latest first",
-        );
 
         let listed: Vec<String> = persistence
             .list_sessions()
@@ -1519,27 +1359,16 @@ mod tests {
             .collect();
         assert_eq!(
             listed,
-            vec![session_id.clone()],
-            "the gate drops the old one"
-        );
-        assert_eq!(persistence.is_current_format(&session_id), Some(true));
-        assert_eq!(
-            persistence.is_current_format("2000-01-01-00-00-00-000"),
-            Some(false),
-        );
-        assert_eq!(
-            persistence.is_current_format("no-such-session"),
-            None,
-            "a log that cannot be opened has no format verdict",
+            vec![session_id.clone(), "2000-01-01-00-00-00-000".to_string()],
+            "both session files are listed, latest first",
         );
     }
 
-    /// The enumeration never opens a log, which is what a caller refreshing a
-    /// listing on a timer depends on: an unreadable log is still enumerated,
-    /// and only the gate (which does open it) has no verdict for it.
+    /// Listing never opens a log, which is what the host's directory build
+    /// depends on: an unreadable log is still a session.
     #[cfg(unix)]
     #[test]
-    fn enumeration_opens_no_log() {
+    fn listing_opens_no_log() {
         use std::os::unix::fs::PermissionsExt;
 
         let (_dir, persistence) = fixture();
@@ -1557,25 +1386,19 @@ mod tests {
             return;
         }
 
-        let enumerated: Vec<String> = persistence
-            .enumerate_sessions()
-            .expect("enumerate")
+        let listed: Vec<String> = persistence
+            .list_sessions()
+            .expect("list")
             .into_iter()
             .map(|metadata| metadata.session_id)
             .collect();
         assert_eq!(
-            enumerated,
+            listed,
             vec![session_id.clone()],
-            "a log nothing can open is still enumerated, so nothing opened it",
+            "a log nothing can open is still listed, so nothing opened it",
         );
-        assert_eq!(persistence.is_current_format(&session_id), None);
-        assert!(persistence.list_sessions().expect("list").is_empty());
-
-        // And the verdict comes back the moment the file is readable again,
-        // with no change to its size or modification time.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("restore the read bit");
-        assert_eq!(persistence.is_current_format(&session_id), Some(true));
     }
 
     #[test]
@@ -1802,9 +1625,8 @@ mod tests {
             }
         }
 
-        let full = read_session_preview_file("2024-01-01-00-00-00", &path, &|| false)
-            .expect("read")
-            .expect("valid first line");
+        let full =
+            read_session_preview_file("2024-01-01-00-00-00", &path, &|| false).expect("read");
         assert_eq!(full.message_count, n);
 
         // Sticky predicate: false at the line-0 poll, true from line-1024 on.
@@ -1814,9 +1636,8 @@ mod tests {
             calls.set(c + 1);
             c > 0
         };
-        let partial = read_session_preview_file("2024-01-01-00-00-00", &path, &cancel)
-            .expect("read")
-            .expect("valid first line");
+        let partial =
+            read_session_preview_file("2024-01-01-00-00-00", &path, &cancel).expect("read");
         assert_eq!(
             partial.message_count,
             crate::SCAN_CANCEL_CHECK_LINES,
@@ -1852,25 +1673,12 @@ mod tests {
     }
 
     #[test]
-    fn list_session_previews_skips_pre_refactor_files() {
-        let (_dir, persistence) = fixture();
-        let bogus = persistence.sessions_dir.join("old.jsonl");
-        std::fs::write(&bogus, "not json at all\n").expect("write");
-
-        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
-        assert!(previews.is_empty(), "got {previews:?}");
-    }
-
-    #[test]
-    fn list_session_previews_keeps_valid_alongside_pre_refactor_and_counts_all_files() {
-        // A pre-refactor file is dropped from the rows but still counts
-        // toward the progress total (it's walked in the same single pass
-        // as the valid files), so the loaded counter reaches the total
-        // even though fewer rows appear.
+    fn list_session_previews_keeps_malformed_sessions_and_counts_all_files() {
         let (_dir, persistence) = fixture();
         let sessions_dir = persistence.sessions_dir().to_path_buf();
         std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
-        std::fs::write(sessions_dir.join("old.jsonl"), "not json at all\n").expect("write old");
+        std::fs::write(sessions_dir.join("old.jsonl"), [0xff, 0xfe, 0xff])
+            .expect("write malformed session");
 
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "hi");
@@ -1880,17 +1688,24 @@ mod tests {
             .list_session_previews(|loaded, total| progress.borrow_mut().push((loaded, total)))
             .expect("list");
 
-        assert_eq!(previews.len(), 1, "only the valid session yields a row");
-        assert_eq!(previews[0].session_id, log.session_id());
+        assert_eq!(previews.len(), 2, "every session yields a row");
+        let malformed = previews
+            .iter()
+            .find(|preview| preview.session_id == "old")
+            .expect("the malformed session");
+        assert_eq!(malformed.message_count, 0);
+        assert!(malformed.first_user_message.is_none());
+        assert!(
+            previews
+                .iter()
+                .any(|preview| preview.session_id == log.session_id())
+        );
         let progress = progress.into_inner();
         assert_eq!(progress.last(), Some(&(2, 2)), "both files tick progress");
     }
 
     #[test]
-    fn read_session_preview_file_tolerates_a_torn_later_line() {
-        // The first line gates the format (a valid entry here), so a
-        // garbage line *after* it is skipped rather than dropping the
-        // whole file, matching the resume truncated-line tolerance.
+    fn read_session_preview_file_tolerates_a_malformed_line() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "hi");
@@ -1903,13 +1718,12 @@ mod tests {
             .lines()
             .map(str::to_string)
             .collect();
-        // Insert garbage after the first valid line.
-        lines.insert(1, "}{ this is not json".to_string());
+        // A malformed first line has no special meaning: later entries still
+        // contribute to the preview.
+        lines.insert(0, "}{ this is not json".to_string());
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).expect("rewrite");
 
-        let preview = read_session_preview_file(&session_id, &path, &|| false)
-            .expect("read")
-            .expect("a valid first line keeps the file");
+        let preview = read_session_preview_file(&session_id, &path, &|| false).expect("read");
         // The two messages survive. Only the torn line is skipped.
         assert_eq!(preview.message_count, 2);
         assert_eq!(preview.first_user_message.as_deref(), Some("hello"));

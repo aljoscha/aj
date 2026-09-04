@@ -1345,8 +1345,7 @@ async fn an_unknown_session_is_refused() {
 #[tokio::test]
 async fn an_id_that_is_not_a_session_id_never_reaches_the_store() {
     let harness = Harness::new(Vec::new());
-    // An empty log counts as the current format, so this is a file the store
-    // would happily call a session if an id could name it.
+    // This is a session file the store would find if an id could name it.
     let outside = harness._dir.path().join("elsewhere");
     std::fs::create_dir_all(&outside).expect("a directory beside the store");
     std::fs::write(outside.join("reachable.jsonl"), "").expect("a log outside the store");
@@ -4236,10 +4235,10 @@ async fn a_release_never_drops_a_session_out_of_the_directory() {
 }
 
 /// A release hands the session's row to the directory from the driver's own
-/// state, so a refresh reports a session this host closed without reading the
-/// log back: what the host already knows is never re-read from disk.
+/// state, and the next enumeration preserves that answer while the file stays
+/// unchanged.
 #[tokio::test]
-async fn a_released_sessions_row_needs_no_disk_read() {
+async fn a_release_hands_its_row_to_the_directory() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
@@ -4248,7 +4247,7 @@ async fn a_released_sessions_row_needs_no_disk_read() {
     // A settings record, which is buffered rather than punctuating, so the
     // release has something to flush and the fingerprint it records is the
     // flushed file's. One recorded before the flush would not match what the
-    // next enumeration stats, and the log would be read again to settle it.
+    // next enumeration stats, and the filesystem stamp would replace it.
     harness
         .host
         .command(
@@ -4267,9 +4266,8 @@ async fn a_released_sessions_row_needs_no_disk_read() {
         .last_activity;
 
     // A second session carries the stream the release is watched on. A listing
-    // would do, but it is an enumeration point, and one between the release and
-    // the unreadable log below would derive afresh what this test is asserting
-    // came from the release.
+    // would be an enumeration point and obscure whether the release itself
+    // published the row.
     let watching = harness.create().await;
     let mut stream = harness
         .host
@@ -4303,22 +4301,6 @@ async fn a_released_sessions_row_needs_no_disk_read() {
         released.last_activity,
     );
 
-    // The log a released session left is unreadable from here on. The row
-    // still reports, which it could not if the refresh went back to the file:
-    // a log the store cannot open is left out of the directory entirely.
-    let path = harness
-        .persistence
-        .sessions_dir()
-        .join(format!("{session}.jsonl"));
-    let mode = std::fs::metadata(&path).expect("the log").permissions();
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
-        .expect("drop the read bit");
-    if std::fs::File::open(&path).is_ok() {
-        // Root ignores the permission bits, so there is nothing to prove here.
-        std::fs::set_permissions(&path, mode).expect("restore the mode");
-        harness.host.shutdown().await;
-        return;
-    }
     let still = summary(&harness.host, &session)
         .await
         .expect("the session is still listed");
@@ -4326,7 +4308,6 @@ async fn a_released_sessions_row_needs_no_disk_read() {
         still.last_activity, released.last_activity,
         "the row came from what the release recorded, not from the log",
     );
-    std::fs::set_permissions(&path, mode).expect("restore the mode");
     drop(stream);
     harness.host.shutdown().await;
 }
@@ -8864,8 +8845,8 @@ async fn distinct_directories_inside_one_window_reach_a_client_as_one_frame() {
     harness.host.shutdown().await;
 }
 
-/// Write a current-format log straight into the store, the way a sibling
-/// process in the same working directory would. Returns its session id.
+/// Write a log straight into the store, the way a sibling process in the same
+/// working directory would. Returns its session id.
 fn sibling_log(harness: &Harness, id: &str) -> String {
     let sessions_dir = harness.persistence.sessions_dir().to_path_buf();
     std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
@@ -10574,8 +10555,7 @@ async fn reads_do_not_materialize_a_cold_session() {
 /// A live session's mark comes from the host's own bookkeeping, and the cold
 /// half of the directory tracks the store rather than a snapshot of it: a log
 /// that grows behind the host's back reports its new stamp, a session file
-/// that appears is listed, one that is deleted goes away, and a pre-refactor
-/// log is no session at all.
+/// that appears is listed, and one that is deleted goes away.
 ///
 /// This is the correctness half of the list-production contract.
 /// The caches it exercises are what keep a refresh from re-reading the store,
@@ -10686,16 +10666,16 @@ async fn the_directory_follows_the_store_it_caches() {
     std::fs::remove_file(&appeared_path).expect("delete it again");
     assert_eq!(stamp(appeared).await, None, "and the deleted one is gone");
 
-    let ancient = "1999-01-01-00-00-00-000";
+    let malformed = "1999-01-01-00-00-00-000";
     std::fs::write(
-        sessions_dir.join(format!("{ancient}.jsonl")),
+        sessions_dir.join(format!("{malformed}.jsonl")),
         "not json at all\n",
     )
-    .expect("write a pre-refactor file");
+    .expect("write a malformed session file");
     assert_eq!(
-        stamp(ancient).await,
-        None,
-        "a pre-refactor log is not a session",
+        stamp(malformed).await,
+        Some(modified(malformed)),
+        "session membership does not depend on log contents",
     );
     revived.host.shutdown().await;
 }

@@ -101,9 +101,8 @@ pub(crate) async fn shutdown_background_tasks_owned(registry: &TaskRegistry) -> 
 ///
 /// Output: one row per session, as [`session_line`] formats it. Archived
 /// sessions are marked, not dropped: a listing lists, and only the
-/// interactive pickers filter. The underlying iteration,
-/// pre-refactor-format filtering, and size formatting all live
-/// in [`ConversationPersistence::list_sessions`] (`aj-session`);
+/// interactive pickers filter. The underlying iteration and size formatting
+/// live in [`ConversationPersistence::list_sessions`] (`aj-session`);
 /// this function resolves the store and prints what [`session_listing`]
 /// answers.
 pub fn handle_list_sessions() -> Result<()> {

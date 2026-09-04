@@ -28110,7 +28110,7 @@ mod tests {
 
         let local = world
             .persistence
-            .enumerate_sessions()
+            .list_sessions()
             .expect("enumerate the connecting process's store");
         assert!(
             local.is_empty(),

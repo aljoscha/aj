@@ -775,9 +775,9 @@ impl SessionHost {
         // tries again.
         //
         // Synchronous, which it can afford to be because a row costs a
-        // `readdir` entry, a `stat` and one first-line sniff. Anything that
-        // read a log to build a row would put the whole store's bytes in front
-        // of the first frame, which on a real store is gigabytes.
+        // `readdir` entry and a `stat`. Reading logs to build rows would put
+        // the whole store's bytes in front of the first frame, which on a real
+        // store is gigabytes.
         if let Err(err) = inner.cold.enumerate(|_| false) {
             tracing::warn!("could not read the session store at startup: {err}");
         }
@@ -1316,10 +1316,8 @@ impl SessionHost {
 
     /// Re-read the store into the cold cache. The enumeration point.
     async fn enumerate(&self) -> Result<(), HostError> {
-        // The live set keeps a live session's log out of the per-file work.
-        // The host holds its status, which is both cheaper and more current
-        // than the file, and a session mid-append is the last thing worth
-        // sniffing.
+        // The live set keeps the scan from replacing a live session's status
+        // with file metadata, which is both staler and less complete.
         let live: HashSet<String> = self.inner.sessions.lock().await.keys().cloned().collect();
         // The scan is blocking IO, so it runs with the session map's lock
         // already released.

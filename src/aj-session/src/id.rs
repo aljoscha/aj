@@ -9,12 +9,10 @@
 //!
 //! Every store entry point that accepts an id from a caller enforces this:
 //! [`ConversationPersistence::session_metadata`],
-//! [`ConversationPersistence::is_current_format`],
 //! [`ConversationLog::resume`], and the lock path itself, which is the one
 //! join whose callers do not already hold an enumerated id.
 //!
 //! [`ConversationPersistence::session_metadata`]: crate::persistence::ConversationPersistence::session_metadata
-//! [`ConversationPersistence::is_current_format`]: crate::persistence::ConversationPersistence::is_current_format
 //! [`ConversationLog::resume`]: crate::log::ConversationLog::resume
 
 /// Longest session id the store accepts.
@@ -120,9 +118,9 @@ mod tests {
         std::fs::create_dir_all(&sessions).expect("the store");
         let persistence = ConversationPersistence::new(sessions.clone());
 
-        // An empty log is a well-formed one: current format, resumable, and a
-        // `stat` target. Both copies are empty, so the two ids below differ in
-        // nothing but whether the grammar admits them.
+        // An empty log is a session, resumable, and a `stat` target. Both
+        // copies are empty, so the two ids below differ in nothing but whether
+        // the grammar admits them.
         const CONTROL: &str = "2026-01-01-00-00-00-000";
         std::fs::write(sessions.join(format!("{CONTROL}.jsonl")), b"").expect("a log in the store");
         std::fs::write(dir.path().join("escaped.jsonl"), b"").expect("a log outside the store");
@@ -137,7 +135,6 @@ mod tests {
                 .expect("stat")
                 .is_some(),
         );
-        assert_eq!(persistence.is_current_format(CONTROL), Some(true));
         ConversationLog::resume(&persistence, CONTROL).expect("the control log resumes");
         drop(
             SessionLock::try_acquire(&persistence, CONTROL, "host-under-test")
@@ -153,11 +150,6 @@ mod tests {
                     .expect("a rejected id is not a failure")
                     .is_none(),
                 "session_metadata resolved {id:?} to a file",
-            );
-            assert_eq!(
-                persistence.is_current_format(id),
-                None,
-                "is_current_format read the file {id:?} names",
             );
             assert!(
                 matches!(

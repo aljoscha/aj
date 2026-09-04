@@ -880,9 +880,8 @@ cancel, compact, kill, or dispatch inference.
   report survives a resume depends on how their log lines interleaved.
   Accepted while it misleads nobody, per-run scoping is the named fix.
 - Banked, wanted: previews in connect mode. The directory contract
-  forbids content reads per row, so the shape is either preview capture
-  folded into the cached head read that sniffs the log format, or an
-  on-demand per-session preview read for visible rows.
+  forbids content reads per row, so the shape is an on-demand per-session
+  preview read for visible rows.
 - Banked, wanted: prompt history across hosts, as a capped, user-paced
   history read on the host behind its own endpoint and capability
   string, with the client merging sources and a gateway merging per-host
