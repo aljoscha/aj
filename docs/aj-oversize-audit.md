@@ -8,7 +8,8 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 (smallest coherent solution, fewer concepts, natural boundary, no parallel
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
-Verdicts: 27 LOOK, 43 MAYBE, 31 FINE.
+Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
+retired 1 LOOK.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -28,11 +29,11 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27)
+## LOOK (27 total, 26 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
-- `94334b1` 2026-08-04 aj-app,aj-session: serve a list refresh from caches, not from the store
+- ~~`94334b1` 2026-08-04 aj-app,aj-session: serve a list refresh from caches, not from the store~~ Retired by `e2c349d`.
 - `529fd4e` 2026-08-05 aj-app: refresh the directory from memory, and only publish changes
 - `84db84e` 2026-08-06 aj-app,aj: bound the working set, and fix what two reviews found
 - `34fcbd8` 2026-08-07 aj-app,aj: set a session's tag from the host and the control port
@@ -110,7 +111,8 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 
 ## LOOK, details
 
-### 94334b1 2026-08-04 aj-app,aj-session: serve a list refresh from caches, not from the store
+### 94334b1 2026-08-04 aj-app,aj-session: serve a list refresh from caches, not from the store [RETIRED]
+- Status: Retired by `e2c349d`. Session listing now uses valid names and file metadata only. The format probe, verdict cache, retry machinery, and their test scaffolding are gone. The remaining store abstraction owns sidecars, locks, deterministic race seams, and release fingerprints that still serve current behavior.
 - Stats: 6 files, +1303 -199, ~451 prod / ~852 test lines (estimate: store.rs test module, tests/list_refresh_io.rs, session_host.rs)
 - Body: the 200ms list refresh re-opened every log to sniff its format, 7.4 MB/44 ms per tick on a 421-log store
 - Verdict: LOOK
