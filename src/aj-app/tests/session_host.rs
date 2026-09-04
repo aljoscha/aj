@@ -927,6 +927,10 @@ async fn session_env_survives_root_head_switch_real_bash_and_host_restart() {
         ));
         assert!(matches!(
             entries.get(2).map(|entry| &entry.entry),
+            Some(aj_session::ConversationEntryKind::Context { .. })
+        ));
+        assert!(matches!(
+            entries.get(3).map(|entry| &entry.entry),
             Some(aj_session::ConversationEntryKind::ModelChange { .. })
         ));
         log.system_prompt_id().cloned().expect("system-prompt root")
@@ -4976,12 +4980,16 @@ async fn a_settings_change_before_the_first_prompt_publishes_an_untagged_notice(
     }
     let joiner = Client::attach(&harness.host, &session).await;
     assert!(
-        joiner
+        !joiner
             .canonical()
             .agent(AgentId::Main)
             .expect("main")
             .entries
-            .is_empty(),
+            .iter()
+            .any(|entry| matches!(
+                entry,
+                aj_app::test_support::CanonicalEntry::Notice { text, .. } if text.contains("low")
+            )),
         "the backfill regenerates no notice for a seed settings entry",
     );
     assert_eq!(
@@ -5505,15 +5513,18 @@ fn task_notices(state: &CanonicalState) -> Vec<(aj_agent::message::TaskOutcome, 
 }
 
 /// The text of every plain notice the transcript carries, per agent, in
-/// order. Both agents, because a notice is tagged with the agent it is
-/// about: one raised for the child would never show up in the parent's rows.
+/// order, less the context notice every session opens with. Both agents,
+/// because a notice is tagged with the agent it is about: one raised for the
+/// child would never show up in the parent's rows.
 fn all_notices(state: &CanonicalState) -> Vec<(AgentId, String)> {
     state
         .agents
         .iter()
         .flat_map(|agent| {
             agent.entries.iter().filter_map(move |entry| match entry {
-                aj_app::test_support::CanonicalEntry::Notice { text, .. } => {
+                aj_app::test_support::CanonicalEntry::Notice { text, .. }
+                    if !text.starts_with("Context:") =>
+                {
                     Some((agent.agent, text.clone()))
                 }
                 _ => None,

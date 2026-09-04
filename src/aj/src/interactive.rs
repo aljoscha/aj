@@ -2047,15 +2047,6 @@ fn free_session_images(app: &mut AsyncApp, shell: &Rc<RefCell<Shell>>) {
     }
 }
 
-/// Strike hook for [`aj_app::notices::build_context_notice`], wrapping a
-/// disabled skill's row in the SGR strikethrough markers (`ESC[9m` on,
-/// `ESC[29m` off). The transcript notice renderer parses these into struck
-/// spans. We spell the markers out here rather than depend on a shared style
-/// helper, keeping this crate's markdown-marker use self-contained.
-fn strikethrough(s: &str) -> String {
-    format!("\x1b[9m{s}\x1b[29m")
-}
-
 /// Wrap a host-side notice in the [`AgentEvent::Notice`] shape so it
 /// folds through the same reducer arm as bus notices.
 fn notice_event(text: &str) -> AgentEvent {
@@ -2074,30 +2065,22 @@ fn warning_event(text: &str) -> AgentEvent {
     }
 }
 
-/// Notices describing the freshly-loaded env for a fresh session: the
-/// `Context:` listing as an Info notice, followed by one warning per
-/// skill-discovery diagnostic. Empty for a resume, whose assembled prompt is
-/// fixed in its log and so is not governed by the env read now.
+/// One warning per skill-discovery diagnostic of a fresh session's env. Empty
+/// for a resume, whose assembled prompt is fixed in its log and so is not
+/// governed by the env read now. The `Context:` listing itself is a record in
+/// the session log and arrives with the attach block.
 ///
 /// Both the process-start path ([`build_world`]) and the in-process
 /// new-session path ([`focus_session`]) fold these, so a `/new` surfaces the
-/// same context listing and skill problems a cold start does. The splash box
-/// shows warning- and error-level notices only, so the Info context listing
-/// stays in scrollback while a skill warning can surface in the box.
+/// same skill problems a cold start does.
 fn fresh_env_notices(fresh: bool, env: &AgentEnv) -> Vec<AgentEvent> {
     if !fresh {
         return Vec::new();
     }
-    let mut events = vec![notice_event(&aj_app::notices::build_context_notice(
-        env,
-        strikethrough,
-    ))];
-    events.extend(
-        env.skill_diagnostics
-            .iter()
-            .map(|d| warning_event(&d.to_string())),
-    );
-    events
+    env.skill_diagnostics
+        .iter()
+        .map(|d| warning_event(&d.to_string()))
+        .collect()
 }
 
 /// Fold the complete leading notice block for a local session. A fresh
@@ -8332,13 +8315,6 @@ mod tests {
 
     use super::*;
 
-    /// The context strike hook wraps a disabled skill's row in the SGR
-    /// strikethrough markers the transcript notice renderer parses back out.
-    #[test]
-    fn strikethrough_wraps_input_in_sgr_markers() {
-        assert_eq!(strikethrough("row"), "\x1b[9mrow\x1b[29m");
-    }
-
     #[test]
     fn a_connected_session_subject_points_back_to_its_peer() {
         let session = "gateway-host:remote-session";
@@ -9792,12 +9768,18 @@ mod tests {
         );
     }
 
-    /// A resumed session keeps its assembled prompt in the log, so `build_world`
-    /// folds no context notice into its scrollback.
+    /// A resumed session opens with the context it was created with. The
+    /// listing is a record in the log beside the frozen prompt it describes,
+    /// so it replays exactly once, at the top, and reads the same as it did the
+    /// day the session was made.
     #[tokio::test]
-    async fn build_world_resume_folds_no_context() {
+    async fn a_resumed_session_opens_with_the_context_it_was_created_with() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
+        let created = main_notices(&world)
+            .into_iter()
+            .find(|notice| notice.starts_with("Context:"))
+            .expect("a fresh session opens with its context");
         persist_session(&mut world).await;
         let session = world.session().to_string();
         shut_down(&world).await;
@@ -9807,11 +9789,20 @@ mod tests {
         let transcript = chat
             .transcript(chat.active_view())
             .expect("main transcript");
-        let has_context = transcript
+        let contexts: Vec<usize> = transcript
             .entries()
             .iter()
-            .any(|e| matches!(&e.kind, EntryKind::Notice(n) if n.text.contains("Context:")));
-        assert!(!has_context, "a resumed session folds no context notice");
+            .enumerate()
+            .filter_map(|(index, e)| match &e.kind {
+                EntryKind::Notice(n) if n.text == created => Some(index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            contexts,
+            vec![0],
+            "the recorded context does not open the resumed transcript exactly once",
+        );
     }
 
     /// A world built from `argv`, so a launch-flag test can state the command
@@ -10075,10 +10066,11 @@ mod tests {
         shut_down(&blank).await;
     }
 
-    /// The complete fresh-session block keeps config diagnostics, context and
-    /// skill diagnostics, sandbox, auth, and tmux warnings in their promised
-    /// order. Its environment portion is absent for a resume, whose prompt is
-    /// fixed in its log.
+    /// The complete fresh-session block keeps config diagnostics, skill
+    /// diagnostics, sandbox, auth, and tmux warnings in their promised order.
+    /// Its environment portion is absent for a resume, whose prompt is fixed in
+    /// its log. The context listing is not in this block: it is a record in
+    /// the log and arrives with the attach block.
     #[test]
     fn fresh_session_notice_block_has_one_order_and_fresh_environment() {
         let env = AgentEnv {
@@ -10100,15 +10092,13 @@ mod tests {
 
         let create = fresh_env_notices(true, &env);
         assert!(
-            matches!(&create[0], AgentEvent::Notice { text, .. } if text.contains("Context:")),
-            "the context listing leads as an Info notice: {create:?}"
-        );
-        assert!(
-            create.iter().any(|e| matches!(
-                e,
-                AgentEvent::Warning { text, .. } if text.contains("missing description")
-            )),
+            matches!(&create[0], AgentEvent::Warning { text, .. } if text.contains("missing description")),
             "a skill diagnostic folds as a warning: {create:?}"
+        );
+        assert_eq!(
+            create.len(),
+            1,
+            "a fresh env folds only its diagnostics: {create:?}"
         );
 
         let resume = fresh_env_notices(false, &env);
@@ -10130,22 +10120,20 @@ mod tests {
             matches!(&complete[0], AgentEvent::Warning { text, .. } if text == "config warning")
         );
         assert!(
-            matches!(&complete[1], AgentEvent::Notice { text, .. } if text.contains("Context:"))
+            matches!(&complete[1], AgentEvent::Warning { text, .. } if text.contains("missing description"))
         );
         assert!(
-            matches!(&complete[2], AgentEvent::Warning { text, .. } if text.contains("missing description"))
+            matches!(&complete[2], AgentEvent::Warning { text, .. } if text == aj_app::notices::SANDBOX_WARNING)
         );
-        assert!(
-            matches!(&complete[3], AgentEvent::Warning { text, .. } if text == aj_app::notices::SANDBOX_WARNING)
-        );
-        assert!(matches!(&complete[4], AgentEvent::Warning { text, .. } if text == "auth warning"));
-        assert!(matches!(&complete[5], AgentEvent::Warning { text, .. } if text == "tmux warning"));
-        assert_eq!(complete.len(), 6, "unexpected notice in the ordered block");
+        assert!(matches!(&complete[3], AgentEvent::Warning { text, .. } if text == "auth warning"));
+        assert!(matches!(&complete[4], AgentEvent::Warning { text, .. } if text == "tmux warning"));
+        assert_eq!(complete.len(), 5, "unexpected notice in the ordered block");
     }
 
     /// A created session receives the same leading notice block as the initial
-    /// one, while a resume neither regenerates its context nor repeats the
-    /// process-side warnings.
+    /// one, while a resume neither repeats its context nor the process-side
+    /// warnings. The context opens the transcript in both cases, as the log's
+    /// own record, and this process's rows land after it.
     #[tokio::test]
     async fn session_switch_folds_complete_notice_block_for_fresh_only() {
         let dir = TempDir::new().expect("tempdir");
@@ -10163,15 +10151,19 @@ mod tests {
         persist_session(&mut world).await;
         let resumable = world.session().to_string();
         // Counted, not merely looked for: switching back restores the parked
-        // transcript, which already carries the context this session folded at
-        // startup, so what a resume must not do is fold a second one.
+        // transcript, which already carries the context its block replayed, so
+        // what a resume must not do is bring a second one.
         let contexts = |world: &World| {
             main_notices(world)
                 .iter()
                 .filter(|n| n.contains("Context:"))
                 .count()
         };
-        assert_eq!(contexts(&world), 1, "startup folded this session's context");
+        assert_eq!(
+            contexts(&world),
+            1,
+            "startup replayed this session's context"
+        );
 
         let moved = apply_focus_request(
             &mut app,
@@ -10189,7 +10181,7 @@ mod tests {
         assert_eq!(
             contexts(&world),
             1,
-            "a created session folds its context: {:?}",
+            "a created session's block brings its context: {:?}",
             main_notices(&world),
         );
         let created_notices = main_notices(&world);
@@ -10210,8 +10202,9 @@ mod tests {
             .position(|notice| notice.contains("Context:"))
             .expect("the fresh-session context");
         assert!(
-            diagnostic_at < context_at,
-            "process diagnostics must lead fresh-session environment notices: {created_notices:?}",
+            context_at < diagnostic_at,
+            "the recorded context opens the transcript and this process's rows follow: \
+             {created_notices:?}",
         );
         assert_eq!(
             created_notices
@@ -10222,8 +10215,8 @@ mod tests {
             "a created session's notice block differs from initial startup",
         );
 
-        // Back onto the persisted session: a resume's prompt is fixed in its
-        // log, so nothing describes the env read now.
+        // Back onto the persisted session: a resume's prompt and context are
+        // fixed in its log, so nothing describes the env read now.
         let moved = apply_focus_request(
             &mut app,
             &shell,

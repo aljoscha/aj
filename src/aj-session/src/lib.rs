@@ -65,9 +65,10 @@ pub use lock::{LockHolder, LockMetadata, SessionLock};
 #[cfg(any(test, feature = "test-support"))]
 pub use log::test_support::{AppendFault, AppendFaultFixture};
 pub use log::{
-    Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
-    EntryId, EntryRef, LogSnapshot, PersistenceFailure, PersistenceFailureSender, SessionEnvError,
-    SessionSettings, TailRepair, ThreadFilter, ThreadKind, validate_session_env,
+    ContextFileRecord, ContextSkillRecord, Conversation, ConversationEntry, ConversationEntryKind,
+    ConversationError, ConversationLog, EntryId, EntryRef, LogSnapshot, PersistenceFailure,
+    PersistenceFailureSender, SessionContext, SessionEnvError, SessionSettings, TailRepair,
+    ThreadFilter, ThreadKind, validate_session_env,
 };
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview, SidecarMetadata};
 pub use prompt_history::{

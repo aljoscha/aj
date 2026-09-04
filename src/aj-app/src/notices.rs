@@ -1,128 +1,51 @@
-//! Frontend-agnostic startup notices for the terminal frontend:
-//! the `Context:` listing and the sandbox warning.
+//! Frontend-agnostic startup notices: the session's `Context:` record and the
+//! sandbox warning.
 //!
-//! Both are host-side text the binary surfaces above the editor at
-//! startup. Keeping them in `aj-app` keeps the notice strings
-//! independent of the frontend.
+//! The context record is written into the session log at creation and
+//! rendered by replay ([`SessionContext::notice`]), so every frontend shows
+//! the same listing at the top of a session for as long as it exists. The
+//! sandbox warning is about the process running the agent, not the session,
+//! and stays a live row.
 
 use aj_conf::{AgentEnv, SystemPromptSource, display_path};
+use aj_session::{ContextFileRecord, ContextSkillRecord, SessionContext};
 
-/// One row of the `Context:` listing, split so the bullet and the row content
-/// can be styled apart.
-///
-/// We keep the row structured rather than pre-formatted because
-/// [`build_context_notice`] strikes a disabled skill's row content without
-/// striking its `  - ` bullet, matching aj. A flat string could not express
-/// that distinction, so the split lives here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContextLine {
-    /// Leading bullet or indent, never struck. `  - ` for a listed row, empty
-    /// for the `Context:` header.
-    pub bullet: String,
-    /// The row content, rendered struck when `struck` is set.
-    pub text: String,
-    /// True only for a disabled skill row (`!skill.enabled`), the only rows aj
-    /// renders struck.
-    pub struck: bool,
+/// What `env`'s system prompt is assembled from, as the record the session
+/// log keeps: the prompt's source, every instruction file in the order they
+/// are stitched in, and every discovered skill with whether it reaches the
+/// model's listing. Paths are abbreviated the way this host displays them.
+pub fn session_context(env: &AgentEnv) -> SessionContext {
+    session_context_with_display(env, display_path)
 }
 
-/// The structured `Context:` listing: the header, the base system prompt
-/// (builtin or override file), every agents.md-style instruction file, and
-/// every discovered skill, one [`ContextLine`] each.
-///
-/// Rows carry a tildified path and a label; skill rows also carry a marker
-/// when the skill is excluded from the model's listing, either `disabled`
-/// (the user's `disabled_skills` config) or `model-invocation disabled` (the
-/// skill's own frontmatter). A disabled skill row is marked `struck`, the one
-/// visual distinction. Same content and order as [`build_context_notice`],
-/// which joins this.
-pub(crate) fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
-    context_lines_with_display(env, display_path)
-}
-
-fn context_lines_with_display(
+fn session_context_with_display(
     env: &AgentEnv,
     display: impl Fn(&std::path::Path) -> String,
-) -> Vec<ContextLine> {
-    let bullet = "  - ".to_string();
-    let mut lines = vec![ContextLine {
-        bullet: String::new(),
-        text: "Context:".to_string(),
-        struck: false,
-    }];
-    let source = &env.system_prompt.source;
-    let prompt = match source {
-        SystemPromptSource::Builtin => format!(
-            "builtin ({}; override with ~/.agents/SYSTEM_PROMPT.md)",
-            source.label()
-        ),
-        SystemPromptSource::Override(path) => {
-            format!("{} ({})", display(path), source.label())
-        }
-    };
-    lines.push(ContextLine {
-        bullet: bullet.clone(),
-        text: prompt,
-        struck: false,
-    });
-    for file in &env.context_files {
-        lines.push(ContextLine {
-            bullet: bullet.clone(),
-            text: format!("{} ({})", display(&file.path), file.kind.label()),
-            struck: false,
-        });
+) -> SessionContext {
+    SessionContext {
+        system_prompt: match &env.system_prompt.source {
+            SystemPromptSource::Builtin => None,
+            SystemPromptSource::Override(path) => Some(display(path)),
+        },
+        files: env
+            .context_files
+            .iter()
+            .map(|file| ContextFileRecord {
+                path: display(&file.path),
+                kind: file.kind.label().to_string(),
+            })
+            .collect(),
+        skills: env
+            .skills
+            .iter()
+            .map(|skill| ContextSkillRecord {
+                path: display(&skill.path),
+                name: skill.name.clone(),
+                enabled: skill.enabled,
+                model_invocation: !skill.disable_model_invocation,
+            })
+            .collect(),
     }
-    for skill in &env.skills {
-        let marker = if !skill.enabled {
-            ", disabled"
-        } else if skill.disable_model_invocation {
-            ", model-invocation disabled"
-        } else {
-            ""
-        };
-        lines.push(ContextLine {
-            bullet: bullet.clone(),
-            text: format!("{} (skill: {}{marker})", display(&skill.path), skill.name),
-            struck: !skill.enabled,
-        });
-    }
-    lines
-}
-
-/// Build the chat-scrollback "Context:" notice by joining [`context_lines`]
-/// into one flat string, one row per line as `  - <tildified path> (<label>)`.
-///
-/// The assembly is frontend-agnostic. The one visual choice, setting a
-/// disabled skill's row apart, is injected as `strike`: each frontend supplies
-/// its own strike rendering (an ANSI `\x1b[9m..\x1b[29m` strikethrough today).
-/// `strike` applies to the row content only, never the bullet, matching the
-/// structured split.
-pub fn build_context_notice(env: &AgentEnv, strike: fn(&str) -> String) -> String {
-    render_context_lines(context_lines(env), strike)
-}
-
-#[cfg(test)]
-fn build_context_notice_with_display(
-    env: &AgentEnv,
-    strike: fn(&str) -> String,
-    display: impl Fn(&std::path::Path) -> String,
-) -> String {
-    render_context_lines(context_lines_with_display(env, display), strike)
-}
-
-fn render_context_lines(lines: Vec<ContextLine>, strike: fn(&str) -> String) -> String {
-    lines
-        .into_iter()
-        .map(|line| {
-            let content = if line.struck {
-                strike(&line.text)
-            } else {
-                line.text
-            };
-            format!("{}{content}", line.bullet)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// The exact sandbox-warning string the binary emits at startup
@@ -153,20 +76,11 @@ mod tests {
         AgentEnv, ContextFile, ContextFileKind, SystemPrompt, SystemPromptSource, skills::Skill,
     };
 
-    use super::{
-        SANDBOX_WARNING, build_context_notice, build_context_notice_with_display, context_lines,
-        sandbox_warning_enabled_for,
-    };
+    use super::{SANDBOX_WARNING, sandbox_warning_enabled_for, session_context_with_display};
 
-    /// Sentinel `strike` hook: wraps the row in a visible marker so a
-    /// test can assert exactly which rows the hook fires on.
-    fn strike(s: &str) -> String {
-        format!("<s>{s}</s>")
-    }
-
-    /// Build an [`AgentEnv`] for the notice-builder tests. Working
-    /// directory / OS / date / git root are stubbed: only
-    /// `system_prompt`, `context_files`, and `skills` matter here.
+    /// Build an [`AgentEnv`] for the record tests. Working directory / OS /
+    /// date / git root are stubbed: only `system_prompt`, `context_files`, and
+    /// `skills` matter here.
     fn env_with(context_files: Vec<ContextFile>) -> AgentEnv {
         AgentEnv {
             working_directory: PathBuf::from("/tmp"),
@@ -183,119 +97,86 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_context_notice_without_files_lists_only_the_system_prompt() {
-        let env = env_with(Vec::new());
-        assert_eq!(
-            build_context_notice(&env, strike),
-            "Context:\n  - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)"
-        );
+    fn plain(path: &std::path::Path) -> String {
+        path.display().to_string()
     }
 
+    /// The record carries what the notice shows and nothing the prompt text
+    /// already holds: files by path and kind, skills by path, name and listing
+    /// status, the prompt by its override path or not at all.
     #[test]
-    fn build_context_notice_lists_files_with_label_and_display_path() {
-        let user_path = PathBuf::from("/var/user/.agents/AGENTS.md");
-        let project_path = PathBuf::from("/var/project/AGENTS.md");
-        let env = env_with(vec![
+    fn the_record_names_every_source_of_the_prompt() {
+        let skill = |name: &str, enabled: bool, dmi: bool| Skill {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            path: PathBuf::from(format!("/var/skills/{name}/SKILL.md")),
+            enabled,
+            disable_model_invocation: dmi,
+        };
+        let mut env = env_with(vec![
             ContextFile {
-                path: user_path,
+                path: PathBuf::from("/var/user/.agents/AGENTS.md"),
                 kind: ContextFileKind::UserInstructions,
                 content: String::new(),
             },
             ContextFile {
-                path: project_path,
+                path: PathBuf::from("/var/project/AGENTS.md"),
                 kind: ContextFileKind::ProjectInstructions,
                 content: String::new(),
             },
         ]);
+        env.skills = vec![skill("alpha", true, false), skill("beta", false, true)];
 
-        let notice =
-            build_context_notice_with_display(&env, strike, |path| path.display().to_string());
-        let expected = "Context:\n  \
+        let record = session_context_with_display(&env, plain);
+        assert_eq!(record.system_prompt, None, "the builtin prompt has no path");
+        assert_eq!(
+            record
+                .files
+                .iter()
+                .map(|f| (f.path.as_str(), f.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/var/user/.agents/AGENTS.md", "user instructions"),
+                ("/var/project/AGENTS.md", "project instructions"),
+            ],
+        );
+        assert_eq!(
+            record
+                .skills
+                .iter()
+                .map(|s| (s.name.as_str(), s.enabled, s.model_invocation))
+                .collect::<Vec<_>>(),
+            vec![("alpha", true, true), ("beta", false, false)],
+        );
+        assert_eq!(
+            record.notice(),
+            "Context:\n  \
              - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)\n  \
              - /var/user/.agents/AGENTS.md (user instructions)\n  \
-             - /var/project/AGENTS.md (project instructions)";
-        assert_eq!(notice, expected);
+             - /var/project/AGENTS.md (project instructions)\n  \
+             - /var/skills/alpha/SKILL.md (skill: alpha)\n  \
+             - \x1b[9m/var/skills/beta/SKILL.md (skill: beta, disabled)\x1b[29m",
+        );
     }
 
     #[test]
-    fn build_context_notice_override_shows_prompt_path() {
-        let path = PathBuf::from("/var/user/.agents/SYSTEM_PROMPT.md");
+    fn an_override_prompt_is_recorded_by_its_path() {
         let mut env = env_with(Vec::new());
         env.system_prompt = SystemPrompt {
             content: "override prompt".to_string(),
-            source: SystemPromptSource::Override(path),
+            source: SystemPromptSource::Override(PathBuf::from(
+                "/var/user/.agents/SYSTEM_PROMPT.md",
+            )),
         };
+        let record = session_context_with_display(&env, plain);
         assert_eq!(
-            build_context_notice_with_display(&env, strike, |path| path.display().to_string()),
+            record.system_prompt.as_deref(),
+            Some("/var/user/.agents/SYSTEM_PROMPT.md")
+        );
+        assert_eq!(
+            record.notice(),
             "Context:\n  - /var/user/.agents/SYSTEM_PROMPT.md (system prompt)"
         );
-    }
-
-    #[test]
-    fn build_context_notice_strikes_only_disabled_skill_rows() {
-        let skill = |name: &str, enabled: bool, dmi: bool| Skill {
-            name: name.to_string(),
-            description: format!("{name} description"),
-            path: PathBuf::from(format!("/var/skills/{name}/SKILL.md")),
-            enabled,
-            disable_model_invocation: dmi,
-        };
-        let mut env = env_with(Vec::new());
-        env.skills = vec![
-            skill("alpha", true, false),
-            skill("beta", false, false),
-            skill("gamma", true, true),
-        ];
-
-        let notice =
-            build_context_notice_with_display(&env, strike, |path| path.display().to_string());
-        // The hook fires on the disabled row (and only that one): the
-        // enabled and model-invocation-disabled rows stay unwrapped.
-        let expected = format!(
-            "Context:\n  \
-             - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)\n  \
-             - /var/skills/alpha/SKILL.md (skill: alpha)\n  \
-             - {}\n  \
-             - /var/skills/gamma/SKILL.md (skill: gamma, model-invocation disabled)",
-            strike("/var/skills/beta/SKILL.md (skill: beta, disabled)")
-        );
-        assert_eq!(notice, expected);
-        assert_eq!(notice.matches("<s>").count(), 1);
-    }
-
-    #[test]
-    fn context_lines_mark_only_disabled_skill_rows_struck() {
-        let skill = |name: &str, enabled: bool, dmi: bool| Skill {
-            name: name.to_string(),
-            description: format!("{name} description"),
-            path: PathBuf::from(format!("/var/skills/{name}/SKILL.md")),
-            enabled,
-            disable_model_invocation: dmi,
-        };
-        let mut env = env_with(Vec::new());
-        env.skills = vec![
-            skill("alpha", true, false),
-            skill("beta", false, false),
-            skill("gamma", true, true),
-        ];
-
-        let lines = context_lines(&env);
-        // Only the disabled skill row is struck; the enabled and the
-        // model-invocation-disabled rows are not.
-        let struck: Vec<&str> = lines
-            .iter()
-            .filter(|l| l.struck)
-            .map(|l| l.text.as_str())
-            .collect();
-        assert_eq!(
-            struck,
-            vec!["/var/skills/beta/SKILL.md (skill: beta, disabled)"]
-        );
-        // The header carries no bullet; every listed row carries `  - `.
-        assert_eq!(lines[0].bullet, "");
-        assert_eq!(lines[0].text, "Context:");
-        assert!(lines[1..].iter().all(|l| l.bullet == "  - "));
     }
 
     #[test]

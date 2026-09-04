@@ -622,6 +622,10 @@ pub fn freeze_and_seed(
             if let Some(session_env) = creation_env {
                 log.append_env_change(session_env.clone())?;
             }
+            // Recorded beside the prompt it describes, so the listing the
+            // user sees at the top of the session stays true to the prompt
+            // the model runs with, whatever happens to the files on disk.
+            log.append_context(crate::notices::session_context(env))?;
             log.append_model_change(ThreadFilter::USER, &model_key.0, &model_key.1)?;
             log.append_thinking_change(ThreadFilter::USER, thinking_config_name(thinking))?;
             log.append_speed_change(ThreadFilter::USER, speed_name(speed))?;

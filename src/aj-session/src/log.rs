@@ -429,6 +429,13 @@ pub enum ConversationEntryKind {
     /// recording, distinct from no entry. Values remain on disk for restore but
     /// are redacted from export.
     EnvChange { env: BTreeMap<String, String> },
+    /// The context the session was created with, as the user sees it: the base
+    /// system prompt, the instruction files stitched into it, and the skills
+    /// discovered for it. Written once as root-parented [`ThreadKind::Meta`]
+    /// metadata beside the frozen [`Self::SystemPrompt`], so the listing and
+    /// the prompt it describes stay in step for the session's life however the
+    /// files on disk change. Replay renders it as the session's opening notice.
+    Context { context: SessionContext },
     /// The structural root of a sub-agent thread, written when the
     /// sub-agent is spawned and anchored at the parent thread's head
     /// (the assistant message carrying the spawning tool call). It
@@ -510,8 +517,80 @@ impl ConversationEntryKind {
             | Self::SpeedChange { .. }
             | Self::VerbosityChange { .. }
             | Self::EnvChange { .. }
+            | Self::Context { .. }
             | Self::SubAgentSpawn { .. } => false,
         }
+    }
+}
+
+/// What a session's system prompt was assembled from, recorded for the user
+/// rather than the model: the model's copy is the frozen prompt text itself.
+///
+/// Paths are display strings as the host shows them (home abbreviated to `~`),
+/// since they name files on the host that created the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContext {
+    /// The override file the base prompt was read from, or `None` for the
+    /// builtin prompt.
+    pub system_prompt: Option<String>,
+    /// Instruction files stitched into the prompt, in the order they were.
+    pub files: Vec<ContextFileRecord>,
+    /// Skills discovered for the session, listed or not.
+    pub skills: Vec<ContextSkillRecord>,
+}
+
+/// One instruction file in a [`SessionContext`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFileRecord {
+    pub path: String,
+    /// The file's kind as shown to the user (`project instructions`, ...).
+    pub kind: String,
+}
+
+/// One discovered skill in a [`SessionContext`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSkillRecord {
+    pub path: String,
+    pub name: String,
+    /// `false` when the user's `disabled_skills` config excluded it.
+    pub enabled: bool,
+    /// `false` when the skill's own frontmatter kept it out of the model's
+    /// listing.
+    pub model_invocation: bool,
+}
+
+impl SessionContext {
+    /// The `Context:` notice: a header and one `  - <path> (<label>)` row per
+    /// prompt source, file and skill. A skill excluded from the model's listing
+    /// says why, and a skill the user disabled is struck (SGR 9), which the
+    /// transcript renders as a struck span and a plain terminal shows as is.
+    pub fn notice(&self) -> String {
+        let mut lines = vec!["Context:".to_string()];
+        lines.push(match &self.system_prompt {
+            Some(path) => format!("  - {path} (system prompt)"),
+            None => {
+                "  - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)".to_string()
+            }
+        });
+        for file in &self.files {
+            lines.push(format!("  - {} ({})", file.path, file.kind));
+        }
+        for skill in &self.skills {
+            let marker = if !skill.enabled {
+                ", disabled"
+            } else if !skill.model_invocation {
+                ", model-invocation disabled"
+            } else {
+                ""
+            };
+            let row = format!("{} (skill: {}{marker})", skill.path, skill.name);
+            if skill.enabled {
+                lines.push(format!("  - {row}"));
+            } else {
+                lines.push(format!("  - \x1b[9m{row}\x1b[29m"));
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -723,7 +802,8 @@ impl Conversation {
                 ConversationEntryKind::VerbosityChange { verbosity } => {
                     settings.verbosity = Some(verbosity.clone());
                 }
-                ConversationEntryKind::EnvChange { .. } => {}
+                ConversationEntryKind::EnvChange { .. } | ConversationEntryKind::Context { .. } => {
+                }
                 ConversationEntryKind::SubAgentSpawn { settings: snap, .. } => {
                     settings.model = Some((snap.provider.clone(), snap.model_id.clone()));
                     settings.thinking = Some(snap.thinking.clone());
@@ -2039,6 +2119,21 @@ impl ConversationLog {
             ThreadKind::Meta,
             None,
             ConversationEntryKind::EnvChange { env },
+        )
+    }
+
+    /// Record what the session's system prompt was assembled from, beside the
+    /// prompt itself (see [`ConversationEntryKind::Context`]).
+    pub fn append_context(
+        &mut self,
+        context: SessionContext,
+    ) -> Result<EntryRef, ConversationError> {
+        let parent = self.core.system_prompt_id().cloned();
+        self.append(
+            parent,
+            ThreadKind::Meta,
+            None,
+            ConversationEntryKind::Context { context },
         )
     }
 

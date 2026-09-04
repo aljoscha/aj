@@ -58,6 +58,9 @@
 //!   either.
 //! - [`ConversationEntryKind::EnvChange`]: no event. It is immutable
 //!   log-level creation metadata, not a state transition on any thread.
+//! - [`ConversationEntryKind::Context`]: one [`AgentEvent::Notice`] on the
+//!   main agent, the `Context:` listing that opens the session's
+//!   scrollback, rendered by [`crate::log::SessionContext::notice`].
 //! - [`ConversationEntryKind::SubAgentSpawn`]: no notice; the entry
 //!   feeds the sub-agent bracketing below.
 //! - [`ConversationEntryKind::Compaction`][]: an
@@ -431,11 +434,14 @@ fn included_entries(log: &LogSnapshot) -> Option<HashSet<String>> {
     // the set.
     let mut included: HashSet<String> = HashSet::new();
     let mut cursor = Some(head.clone());
+    let mut root = None;
     while let Some(id) = cursor {
         let Some(entry) = log.get(&id) else { break };
         included.insert(id.clone());
         cursor = entry.parent_id.clone();
+        root = Some(entry);
     }
+    let root_id = root.map(|entry| entry.id.clone());
 
     // Single forward pass in append order: a sub-agent entry joins the
     // set when its parent is already included. A run's first entry
@@ -444,6 +450,10 @@ fn included_entries(log: &LogSnapshot) -> Option<HashSet<String>> {
     // `Subagent` entries expand here. Expanding user entries too would
     // pull in a sibling branch's first entry, whose parent is a common
     // ancestor on the main path, and leak the abandoned branch.
+    //
+    // A meta entry hanging off the root is creation metadata about the whole
+    // session (its environment, its context), a sibling of the first message
+    // rather than an ancestor of anything, and belongs to every branch.
     for index in 0..log.len() {
         let Some(entry) = log.entry_in_append_order(index) else {
             continue;
@@ -453,7 +463,10 @@ fn included_entries(log: &LogSnapshot) -> Option<HashSet<String>> {
                 .parent_id
                 .as_ref()
                 .is_some_and(|parent| included.contains(parent));
-        if anchored_on_path {
+        let creation_metadata = entry.thread == ThreadKind::Meta
+            && entry.parent_id.is_some()
+            && entry.parent_id == root_id;
+        if anchored_on_path || creation_metadata {
             included.insert(entry.id.clone());
         }
     }
@@ -775,6 +788,7 @@ impl ReplayState {
             | ConversationEntryKind::SpeedChange { .. }
             | ConversationEntryKind::VerbosityChange { .. }
             | ConversationEntryKind::EnvChange { .. }
+            | ConversationEntryKind::Context { .. }
             | ConversationEntryKind::SystemPrompt { .. }
             | ConversationEntryKind::Compaction { .. } => {}
         }
@@ -882,6 +896,18 @@ impl ReplayState {
         log: Option<&LogSnapshot>,
         out: &mut VecDeque<TaggedEvent>,
     ) {
+        // The one meta entry with a face: the session's opening notice, on the
+        // main agent and ahead of every message, which is where it stood live.
+        if let ConversationEntryKind::Context { context } = &entry.entry {
+            out.push_back(durable(
+                at,
+                AgentEvent::Notice {
+                    agent_id: AgentId::Main,
+                    text: context.notice(),
+                },
+            ));
+            return;
+        }
         let agent_id = match agent_id_for(entry) {
             Some(id) => id,
             // [`ThreadKind::Meta`] is structural framing (system
@@ -924,6 +950,9 @@ impl ReplayState {
             // Immutable creation metadata, read at the session boundary rather
             // than announced as a branch-local state transition.
             ConversationEntryKind::EnvChange { .. } => {}
+            ConversationEntryKind::Context { .. } => {
+                unreachable!("a context entry is projected before the thread is read")
+            }
             ConversationEntryKind::SubAgentSpawn { .. } => {
                 // Seed entry: projected as the synthesized
                 // SubAgentStart by `bracket_subagent`, never as a
@@ -1414,6 +1443,103 @@ mod tests {
                 _ => None,
             })
             .expect("tool execution end")
+    }
+
+    /// The context a session was created with opens its replay: once, on the
+    /// main agent, ahead of the first message, tagged with its own entry so a
+    /// re-attach dedups it, and rendered by the record's one renderer. It
+    /// survives a reopen and stays on every branch, being a fact about the
+    /// session rather than about any head.
+    #[test]
+    fn the_recorded_context_opens_every_replay_of_the_session() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let context = crate::log::SessionContext {
+            system_prompt: None,
+            files: vec![crate::log::ContextFileRecord {
+                path: "~/proj/AGENTS.md".into(),
+                kind: "project instructions".into(),
+            }],
+            skills: vec![crate::log::ContextSkillRecord {
+                path: "~/.agents/skills/x/SKILL.md".into(),
+                name: "x".into(),
+                enabled: false,
+                model_invocation: true,
+            }],
+        };
+        let (session_id, first, context_id) = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("p".into()).expect("sp");
+            let context_id = log
+                .append_context(context.clone())
+                .expect("context record")
+                .id;
+            let first = {
+                let mut view = ConversationView::user(&mut log);
+                view.add_message(user_msg("first branch"))
+                    .expect("user message");
+                view.add_message(assistant_msg(vec![AssistantContent::Text(
+                    TextContent::new("ok"),
+                )]))
+                .expect("assistant message")
+                .id
+            };
+            (log.session_id().to_string(), first, context_id)
+        };
+
+        let mut resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        let opening = |events: &[TaggedEvent]| -> (Option<String>, String) {
+            let head = events.first().expect("a replay with entries");
+            match &head.event {
+                AgentEvent::Notice { agent_id, text } => {
+                    assert_eq!(*agent_id, AgentId::Main);
+                    (
+                        head.entry.as_ref().map(|entry| entry.id.clone()),
+                        text.clone(),
+                    )
+                }
+                other => panic!("the replay does not open with the context notice: {other:?}"),
+            }
+        };
+        let events = project_suffix(&resumed.snapshot(), None, &BTreeSet::new()).events;
+        assert_eq!(
+            opening(&events),
+            (Some(context_id.clone()), context.notice())
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(&e.event, AgentEvent::Notice { text, .. } if text.starts_with("Context:")))
+                .count(),
+            1,
+            "the context replayed more than once: {events:#?}",
+        );
+        assert!(
+            context
+                .notice()
+                .contains("\x1b[9m~/.agents/skills/x/SKILL.md (skill: x, disabled)\x1b[29m"),
+            "a disabled skill's row is struck: {}",
+            context.notice(),
+        );
+
+        // A branch off the root leaves the first branch's messages behind, and
+        // the context with neither: it is the session's, not a head's.
+        resumed
+            .set_head(resumed.system_prompt_id().cloned().expect("root"))
+            .expect("branch from the root");
+        {
+            let mut view = ConversationView::user(&mut resumed);
+            view.add_message(user_msg("second branch"))
+                .expect("user message");
+        }
+        let branched = project_suffix(&resumed.snapshot(), None, &BTreeSet::new()).events;
+        assert_eq!(opening(&branched).0, Some(context_id));
+        assert!(
+            !branched
+                .iter()
+                .any(|e| e.entry.as_ref().is_some_and(|entry| entry.id == first)),
+            "the abandoned branch leaked into the replay",
+        );
     }
 
     #[test]

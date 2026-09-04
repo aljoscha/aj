@@ -42,16 +42,15 @@ struct Client {
 }
 
 impl Client {
-    /// A client that has just attached an empty session: the host serves
-    /// the opening `state`, an empty backfill, and `caught_up` at seq 0.
-    fn attached() -> Self {
+    /// A client that attached the session as soon as it was created: the
+    /// host serves the block of the seeded log, which holds the session's
+    /// creation records (its context notice) and no turn yet.
+    fn attached(seeded: &LogSnapshot) -> Self {
         let mut this = Self {
             client: SessionClient::new(SESSION.to_string()),
             chat: ChatState::new(scripted_settings(), 200_000, Arc::new(Vec::new())),
         };
-        this.client.expect_attach();
-        this.apply(state_frame(EPOCH, 0, false));
-        this.apply(caught_up_frame(EPOCH, 0));
+        this.reattach(seeded, EPOCH);
         this
     }
 
@@ -172,7 +171,17 @@ fn scripted_settings() -> AgentSettings {
 
 /// Drive one scripted turn that calls a tool, and return its tagged live
 /// frames plus the log they were appended to.
-async fn scripted_tool_turn() -> (TempDir, Vec<TaggedEvent>, LogSnapshot) {
+/// One scripted turn as a client would have seen it: the log as seeded at
+/// creation (what the first attach block serves), the tagged live frames the
+/// turn emitted, and the finished log.
+struct Recorded {
+    _dir: TempDir,
+    seeded: LogSnapshot,
+    frames: Vec<TaggedEvent>,
+    log: LogSnapshot,
+}
+
+async fn scripted_tool_turn() -> Recorded {
     let mut calling = finalized_text_message("let me check the list");
     calling.content.push(AssistantContent::ToolCall(ToolCall {
         id: "call-1".into(),
@@ -194,7 +203,7 @@ async fn scripted_tool_turn() -> (TempDir, Vec<TaggedEvent>, LogSnapshot) {
 /// scripts are consumed in run order across both: the parent's `agent`
 /// tool call, the sub-agent's single-turn report, then the parent's
 /// concluding text.
-async fn scripted_sub_agent_turn() -> (TempDir, Vec<TaggedEvent>, LogSnapshot) {
+async fn scripted_sub_agent_turn() -> Recorded {
     let mut spawning = finalized_text_message("delegating that");
     spawning.content.push(AssistantContent::ToolCall(ToolCall {
         id: "call-sub".into(),
@@ -220,7 +229,7 @@ async fn scripted_sub_agent_turn() -> (TempDir, Vec<TaggedEvent>, LogSnapshot) {
 /// `MessageStart`/`MessageEnd` pair, so the failed partial lands on disk
 /// even though it never reaches the transcript. Only the successful one
 /// reports usage.
-async fn scripted_retried_turn() -> (TempDir, Vec<TaggedEvent>, LogSnapshot) {
+async fn scripted_retried_turn() -> Recorded {
     let mut failed = finalized_text_message("");
     failed.stop_reason = StopReason::Error;
     failed.error = Some(AssistantError::new(
@@ -241,11 +250,12 @@ async fn scripted_retried_turn() -> (TempDir, Vec<TaggedEvent>, LogSnapshot) {
 async fn recorded_turn(
     messages: Vec<aj_models::types::AssistantMessage>,
     prompt: &str,
-) -> (TempDir, Vec<TaggedEvent>, LogSnapshot) {
+) -> Recorded {
     let dir = TempDir::new().expect("tempdir");
     let persistence = ConversationPersistence::new(dir.path().to_path_buf());
     let run_config = scripted_run_config(messages);
     let (mut agent, log, _handle, mut frames) = build_tagged_test_agent(&persistence, &run_config);
+    let seeded = log.lock().await.snapshot();
 
     agent
         .prompt(prompt.to_string(), CancellationToken::new())
@@ -257,22 +267,28 @@ async fn recorded_turn(
         recorded.push(frame);
     }
     let snapshot = log.lock().await.snapshot();
-    (dir, recorded, snapshot)
+    Recorded {
+        _dir: dir,
+        seeded,
+        frames: recorded,
+        log: snapshot,
+    }
 }
 
 /// Fold every frame with no interruption: the reference state.
-fn uninterrupted(frames: &[TaggedEvent]) -> Client {
-    let mut client = Client::attached();
-    for frame in frames {
+fn uninterrupted(run: &Recorded) -> Client {
+    let mut client = Client::attached(&run.seeded);
+    for frame in &run.frames {
         client.live(frame);
     }
     client
 }
 
-/// The number of transcript rows one scripted tool turn renders: the user
-/// prompt, the tool-calling assistant message and its usage, the tool
-/// cell, then the concluding assistant message and its usage.
-const TURN_ROWS: usize = 6;
+/// The number of transcript rows a session holding one scripted tool turn
+/// renders: the context notice the log records at creation, the user prompt,
+/// the tool-calling assistant message and its usage, the tool cell, then the
+/// concluding assistant message and its usage.
+const TURN_ROWS: usize = 7;
 
 /// The sweep: for every pair `(cut, resume)` simulate a disconnect after
 /// `cut` frames and a re-attach that resumes live delivery at `resume`,
@@ -281,16 +297,17 @@ const TURN_ROWS: usize = 6;
 ///
 /// `expected_pairs` is pinned by the caller so a change that quietly
 /// shortens the recorded stream cannot shrink the sweep with it.
-fn sweep(
-    frames: &[TaggedEvent],
-    log: &LogSnapshot,
-    expected: &CanonicalState,
-    expected_pairs: usize,
-) {
+fn sweep(run: &Recorded, expected: &CanonicalState, expected_pairs: usize) {
+    let Recorded {
+        seeded,
+        frames,
+        log,
+        ..
+    } = run;
     let mut pairs = 0;
     for cut in 0..=frames.len() {
         for resume in cut..=frames.len() {
-            let mut client = Client::attached();
+            let mut client = Client::attached(seeded);
             for frame in &frames[..cut] {
                 client.live(frame);
             }
@@ -325,7 +342,8 @@ fn sweep(
 
 #[tokio::test]
 async fn every_cut_and_resume_of_a_tool_turn_converges() {
-    let (_dir, frames, log) = scripted_tool_turn().await;
+    let run = scripted_tool_turn().await;
+    let frames = &run.frames;
     assert!(
         frames.iter().any(|f| matches!(
             &f.event,
@@ -336,7 +354,7 @@ async fn every_cut_and_resume_of_a_tool_turn_converges() {
     let durable = frames.iter().filter(|f| f.entry.is_some()).count();
     assert!(durable >= 4, "the turn wrote several log entries");
 
-    let reference = uninterrupted(&frames);
+    let reference = uninterrupted(&run);
     let expected = reference.canonical();
     // The comparison is only worth making if the fold built the whole
     // turn rather than converging on something empty.
@@ -351,13 +369,13 @@ async fn every_cut_and_resume_of_a_tool_turn_converges() {
     );
     assert_no_dangling(&reference.chat);
 
-    sweep(&frames, &log, &expected, 528);
+    sweep(&run, &expected, 528);
 }
 
 #[tokio::test]
 async fn every_cut_and_resume_of_a_sub_agent_turn_converges() {
-    let (_dir, frames, log) = scripted_sub_agent_turn().await;
-    let reference = uninterrupted(&frames);
+    let run = scripted_sub_agent_turn().await;
+    let reference = uninterrupted(&run);
     let expected = reference.canonical();
     let sub = expected
         .agent(AgentId::Sub(1))
@@ -373,7 +391,7 @@ async fn every_cut_and_resume_of_a_sub_agent_turn_converges() {
     );
     assert_no_dangling(&reference.chat);
 
-    sweep(&frames, &log, &expected, 1176);
+    sweep(&run, &expected, 1176);
 }
 
 /// A host restart mints a fresh epoch, so the cursor the client offers is
@@ -382,8 +400,8 @@ async fn every_cut_and_resume_of_a_sub_agent_turn_converges() {
 /// full backfill, which has to land on the same state.
 #[tokio::test]
 async fn an_attach_under_a_new_epoch_rebuilds_the_same_state() {
-    for (_dir, frames, log) in [scripted_tool_turn().await, scripted_sub_agent_turn().await] {
-        let mut client = uninterrupted(&frames);
+    for run in [scripted_tool_turn().await, scripted_sub_agent_turn().await] {
+        let mut client = uninterrupted(&run);
         let expected = client.canonical();
         assert_eq!(
             expected
@@ -395,7 +413,7 @@ async fn an_attach_under_a_new_epoch_rebuilds_the_same_state() {
             "the compared state is a whole turn",
         );
 
-        client.reattach(&log, "epoch-2");
+        client.reattach(&run.log, "epoch-2");
 
         assert_canonical_eq(
             &client.canonical(),
@@ -413,7 +431,8 @@ async fn an_attach_under_a_new_epoch_rebuilds_the_same_state() {
 
 #[tokio::test]
 async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
-    let (_dir, frames, log) = scripted_retried_turn().await;
+    let run = scripted_retried_turn().await;
+    let (frames, log) = (&run.frames, &run.log);
 
     // The fixture only measures something if the failed attempt really was
     // persisted: that entry is what a projection can over-derive from.
@@ -448,9 +467,9 @@ async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
     // which no backfill can hand over, so the tier for a client
     // that was disconnected is the convergent one. It masks that notice and
     // nothing else: usage rows stay under comparison, which is the point here.
-    let expected = uninterrupted(&frames).canonical().convergent();
-    let mut rebuilt = Client::attached();
-    rebuilt.reattach(&log, EPOCH);
+    let expected = uninterrupted(&run).canonical().convergent();
+    let mut rebuilt = Client::attached(&run.seeded);
+    rebuilt.reattach(log, EPOCH);
     let rebuilt_state = rebuilt.canonical();
 
     // The harm is a usage row for an attempt that reported no usage, so name
@@ -469,7 +488,7 @@ async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
             })
             .collect()
     };
-    let live_rows = usage_rows(&uninterrupted(&frames).canonical());
+    let live_rows = usage_rows(&uninterrupted(&run).canonical());
     assert_eq!(
         usage_rows(&rebuilt_state),
         live_rows,
@@ -496,10 +515,21 @@ async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
 /// not allowed to stand in for.
 #[tokio::test]
 async fn reapplying_the_whole_projected_suffix_changes_nothing() {
-    for (_dir, frames, log) in [scripted_tool_turn().await, scripted_sub_agent_turn().await] {
+    for run in [scripted_tool_turn().await, scripted_sub_agent_turn().await] {
+        let Recorded {
+            seeded,
+            frames,
+            log,
+            ..
+        } = &run;
         let mut chat = ChatState::new(scripted_settings(), 200_000, Arc::new(Vec::new()));
         let mut life = AgentLifecycle::default();
-        for tagged in &frames {
+        // What a client attached at creation folded: the seeded log's block,
+        // then the turn live.
+        for tagged in &project_suffix(seeded, None, &BTreeSet::new()).events {
+            fold(&mut chat, &mut life, tagged);
+        }
+        for tagged in frames {
             fold(&mut chat, &mut life, tagged);
         }
         let before = CanonicalState::of_reduced(&chat, &life);
@@ -513,7 +543,7 @@ async fn reapplying_the_whole_projected_suffix_changes_nothing() {
             TURN_ROWS,
             "the compared state is a whole turn",
         );
-        let backfill = project_suffix(&log, None, &BTreeSet::new());
+        let backfill = project_suffix(log, None, &BTreeSet::new());
         assert!(
             !backfill.events.is_empty(),
             "the projection emits events to re-apply",
@@ -548,8 +578,9 @@ fn fold(chat: &mut ChatState, life: &mut AgentLifecycle, tagged: &TaggedEvent) {
 /// Otherwise the sweep could be passing vacuously.
 #[tokio::test]
 async fn a_fold_without_durable_identity_diverges() {
-    let (_dir, frames, log) = scripted_tool_turn().await;
-    let reference = uninterrupted(&frames);
+    let run = scripted_tool_turn().await;
+    let (frames, log) = (&run.frames, &run.log);
+    let reference = uninterrupted(&run);
 
     let mut chat = ChatState::new(scripted_settings(), 200_000, Arc::new(Vec::new()));
     let mut life = AgentLifecycle::default();
@@ -562,10 +593,10 @@ async fn a_fold_without_durable_identity_diverges() {
         }
         event
     };
-    for frame in &frames {
+    for frame in frames {
         let _ = reduce(&mut chat, &mut life, strip(frame), None);
     }
-    for frame in &project_suffix(&log, None, &BTreeSet::new()).events {
+    for frame in &project_suffix(log, None, &BTreeSet::new()).events {
         let _ = reduce(&mut chat, &mut life, strip(frame), None);
     }
 
@@ -586,9 +617,9 @@ async fn a_fold_without_durable_identity_diverges() {
 /// queued follow-up converged with one that has none.
 #[tokio::test]
 async fn a_client_with_a_queued_message_differs_from_one_without() {
-    let (_dir, frames, _log) = scripted_tool_turn().await;
-    let mut told = uninterrupted(&frames);
-    let mut untold = uninterrupted(&frames);
+    let run = scripted_tool_turn().await;
+    let mut told = uninterrupted(&run);
+    let mut untold = uninterrupted(&run);
     assert_eq!(
         told.canonical(),
         untold.canonical(),

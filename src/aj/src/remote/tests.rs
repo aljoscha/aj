@@ -1187,6 +1187,10 @@ fn assert_converged_across_a_cut(remote: &Attached, oracle: &Attached, context: 
 /// usage.
 const TURN_ROWS: usize = 6;
 
+/// The rows a session holds before its first turn: the context notice its
+/// log records at creation.
+const SESSION_ROWS: usize = 1;
+
 /// How many rows the main transcript holds, as a guard that a comparison is
 /// comparing a whole turn rather than converging on something empty.
 fn main_rows(state: &CanonicalState) -> usize {
@@ -3155,7 +3159,11 @@ async fn a_prompt_drives_a_turn_observed_on_the_stream() {
     remote.settle().await;
 
     let state = remote.canonical();
-    assert_eq!(main_rows(&state), TURN_ROWS, "the whole turn: {state:?}");
+    assert_eq!(
+        main_rows(&state),
+        SESSION_ROWS + TURN_ROWS,
+        "the whole turn: {state:?}"
+    );
     assert_eq!(
         main_tools(&state),
         vec!["todo_read".to_string()],
@@ -3993,7 +4001,7 @@ async fn an_http_client_converges_with_an_in_process_oracle() {
 
         assert_eq!(
             main_rows(&oracle.canonical()),
-            TURN_ROWS,
+            SESSION_ROWS + TURN_ROWS,
             "the compared state is a whole turn",
         );
         assert_converged(&remote, &oracle, "a whole turn over http");
@@ -4186,9 +4194,9 @@ impl CutScenario {
     /// The main-transcript rows the oracle holds once the run has settled.
     fn rows(self) -> usize {
         match self {
-            Self::ToolTurn | Self::SubAgentTurn => TURN_ROWS,
+            Self::ToolTurn | Self::SubAgentTurn => SESSION_ROWS + TURN_ROWS,
             // Both turns, and the notice row between them.
-            Self::NoticeWhileAway => 2 * TURN_ROWS + 1,
+            Self::NoticeWhileAway => SESSION_ROWS + 2 * TURN_ROWS + 1,
         }
     }
 
@@ -4427,7 +4435,7 @@ async fn a_cut_between_a_tool_end_and_its_durable_message_converges() {
     remote.reattach().await;
     remote.settle().await;
 
-    assert_eq!(main_rows(&oracle.canonical()), TURN_ROWS);
+    assert_eq!(main_rows(&oracle.canonical()), SESSION_ROWS + TURN_ROWS);
     assert_converged(&remote, &oracle, "a cut on the tool-end boundary");
     fixture.shutdown().await;
 }
