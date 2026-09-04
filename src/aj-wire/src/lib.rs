@@ -1368,6 +1368,11 @@ pub enum Frame {
         epoch: String,
         working: bool,
         settings: AgentSettings,
+        /// A problem with the host-side credentials for `settings.provider`,
+        /// when the host could not confirm that inference can authenticate.
+        /// Present on an attach block's opening state only. Live state updates
+        /// omit it, and older hosts decode as `None`.
+        credential_warning: Option<String>,
         last_seq: u64,
     },
     CaughtUp {
@@ -1553,6 +1558,8 @@ enum FrameRef<'a> {
         epoch: &'a str,
         working: bool,
         settings: &'a AgentSettings,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credential_warning: Option<&'a str>,
         last_seq: u64,
     },
     CaughtUp {
@@ -1606,12 +1613,14 @@ impl Serialize for Frame {
                 epoch,
                 working,
                 settings,
+                credential_warning,
                 last_seq,
             } => FrameRef::State {
                 session,
                 epoch,
                 working: *working,
                 settings,
+                credential_warning: credential_warning.as_deref(),
                 last_seq: *last_seq,
             },
             Self::CaughtUp {
@@ -1705,6 +1714,7 @@ impl<'de> Deserialize<'de> for Frame {
                     epoch,
                     working,
                     settings,
+                    credential_warning,
                     last_seq,
                 } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
                 Ok(Self::State {
@@ -1712,6 +1722,7 @@ impl<'de> Deserialize<'de> for Frame {
                     epoch,
                     working,
                     settings,
+                    credential_warning,
                     last_seq,
                 })
             }
@@ -1781,6 +1792,8 @@ struct StateFrameFields {
     epoch: String,
     working: bool,
     settings: AgentSettings,
+    #[serde(default)]
+    credential_warning: Option<String>,
     last_seq: u64,
 }
 

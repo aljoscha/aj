@@ -182,6 +182,7 @@ impl SessionStatus {
             epoch: self.epoch.clone(),
             working: self.working,
             settings: self.settings.clone(),
+            credential_warning: None,
             last_seq: self.last_seq,
         }
     }

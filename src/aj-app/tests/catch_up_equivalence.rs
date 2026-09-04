@@ -123,6 +123,7 @@ fn state_frame(epoch: &str, last_seq: u64, working: bool) -> Frame {
         epoch: epoch.to_string(),
         working,
         settings: scripted_settings(),
+        credential_warning: None,
         last_seq,
     }
 }

@@ -815,6 +815,28 @@ impl AuthStorage {
         self.has(provider_id).await
     }
 
+    /// Best-effort form of [`Self::has_auth`] for advisory presentation on a
+    /// latency-sensitive path. Returns `Ok(None)` when another process holds
+    /// the credential-file lock: absence is not proven then, so a caller must
+    /// omit rather than invent a missing-credential warning.
+    pub async fn try_has_auth(&self, provider_id: &str) -> Result<Option<bool>, AuthError> {
+        if self
+            .state
+            .lock()
+            .await
+            .runtime_overrides
+            .contains_key(provider_id)
+            || get_env_api_key(provider_id).is_some()
+        {
+            return Ok(Some(true));
+        }
+        let Some(_lock) = FileLock::try_acquire(&self.path)? else {
+            return Ok(None);
+        };
+        let mut data = self.read_credentials()?;
+        Ok(Some(data.remove(provider_id).is_some()))
+    }
+
     /// Resolve a usable bearer token for `provider_id`, walking the
     /// priority chain:
     ///
@@ -1525,6 +1547,25 @@ struct FileLock {
 }
 
 impl FileLock {
+    /// Try once, for a read that must not wait behind another auth operation.
+    /// A held lock answers `Ok(None)`; other I/O failures keep their exact
+    /// error. Unlike [`Self::acquire`], this deliberately does not steal a
+    /// stale lock: deciding staleness and racing a replacement is work an
+    /// advisory check can skip.
+    fn try_acquire(target_path: &Path) -> Result<Option<Self>, AuthError> {
+        let lock_path = lock_path_for(target_path);
+        prepare_auth_parent(target_path)?;
+        match create_lock_dir(&lock_path) {
+            Ok(()) => {
+                let lock = Self { path: lock_path };
+                make_existing_auth_file_private(target_path)?;
+                Ok(Some(lock))
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+            Err(err) => Err(AuthError::Io(err)),
+        }
+    }
+
     /// Acquire the lock, retrying with exponential backoff up to
     /// [`LOCK_TIMEOUT`]. Returns [`AuthError::LockTimeout`] if a
     /// sibling holds the lock the whole time (and isn't stale).
@@ -4381,5 +4422,25 @@ mod tests {
                 .is_none(),
             "removing the last real account does not leave an empty ghost set"
         );
+    }
+
+    /// An advisory credential check never waits behind the store's file lock.
+    /// A runtime override can still answer from memory; otherwise a held lock
+    /// means the check has no answer, not that the provider has no credential.
+    #[tokio::test]
+    async fn try_has_auth_omits_an_answer_while_the_file_is_locked() {
+        let (_dir, path) = scratch_path("try-has-auth-locked");
+        prepare_auth_parent(&path).unwrap();
+        let lock_path = lock_path_for(&path);
+        create_lock_dir(&lock_path).unwrap();
+        let storage = AuthStorage::new(path);
+
+        assert_eq!(storage.try_has_auth("prov-x").await.unwrap(), None);
+        storage
+            .set_runtime_api_key("prov-x", "runtime-key".into())
+            .await;
+        assert_eq!(storage.try_has_auth("prov-x").await.unwrap(), Some(true));
+
+        std::fs::remove_dir(lock_path).unwrap();
     }
 }

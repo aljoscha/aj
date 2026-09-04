@@ -501,12 +501,12 @@ fn state_and_task_detail_models_pin_the_new_phase_two_fields() {
         epoch: "epoch-1".into(),
         working: false,
         settings,
+        credential_warning: Some("host credentials are missing".into()),
         last_seq: 4,
     };
-    assert_eq!(
-        serde_json::to_value(frame).unwrap()["settings"]["thinking_display"],
-        "detailed"
-    );
+    let frame = serde_json::to_value(frame).unwrap();
+    assert_eq!(frame["settings"]["thinking_display"], "detailed");
+    assert_eq!(frame["credential_warning"], "host credentials are missing");
 
     let detail: TaskDetails = serde_json::from_value(json!({
         "id": 3,
@@ -789,7 +789,13 @@ fn frame_decode_is_forward_compatible() {
     let DecodedFrame::Known(state) = state else {
         panic!("expected known state frame");
     };
-    assert!(matches!(state.value(), Frame::State { .. }));
+    assert!(matches!(
+        state.value(),
+        Frame::State {
+            credential_warning: None,
+            ..
+        }
+    ));
 
     let expected = json!({
         "kind": "future_frame",
@@ -2667,6 +2673,7 @@ fn local_frames() -> Vec<Frame> {
                 speed: "standard".to_string(),
                 verbosity: "default".to_string(),
             },
+            credential_warning: None,
             last_seq: 7,
         },
         Frame::CaughtUp {

@@ -1018,6 +1018,7 @@ mod tests {
                 epoch: epoch.to_string(),
                 working: false,
                 settings: agent_settings(),
+                credential_warning: None,
                 last_seq: 0,
             },
         );

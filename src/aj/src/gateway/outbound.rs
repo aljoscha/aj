@@ -371,6 +371,7 @@ mod tests {
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
+            credential_warning: None,
             last_seq,
         })
     }

@@ -1644,6 +1644,17 @@ async fn complete_pending_transition(
     world: &mut World,
 ) {
     let session = world.session().to_string();
+    // Over a connection, inference authenticates from the host's store. Its
+    // opening state carries the warning from that store; fold it the first
+    // time this client shows the session, whether its first block arrived in
+    // the foreground or while it was parked in the working set. A local run
+    // performs its check after applying `--api-key`, before its stream can race
+    // that runtime override, so it keeps the process-side path.
+    if world.control.is_remote()
+        && let Some(warning) = world.client_mut().take_first_attach_credential_warning()
+    {
+        fold_warning(world, &warning);
+    }
     let startup = world.startup.remove(&session);
     let launched = startup
         .as_ref()
@@ -23331,6 +23342,14 @@ mod tests {
 
     /// A `state` frame opening a block under `epoch`, as a peer writes it.
     fn block_opening(session: &str, epoch: &str) -> String {
+        block_opening_with_warning(session, epoch, None)
+    }
+
+    fn block_opening_with_warning(
+        session: &str,
+        epoch: &str,
+        credential_warning: Option<&str>,
+    ) -> String {
         serde_json::to_string(&aj_wire::Frame::State {
             session: session.to_string(),
             epoch: epoch.to_string(),
@@ -23343,6 +23362,7 @@ mod tests {
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
+            credential_warning: credential_warning.map(str::to_string),
             last_seq: 0,
         })
         .expect("a state frame")
@@ -23611,6 +23631,54 @@ mod tests {
                 "the process block leads the connection's own lines: {notices:?}",
             );
         }
+        remote.shutdown().await;
+    }
+
+    /// A connected client reports the warning from the host's credential
+    /// store after the target's block commits. The client's own store is not
+    /// consulted: inference for this session runs on the host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connected_client_reports_the_hosts_credential_warning() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let target = "host-without-credentials".to_string();
+        let warning = "Heads up: the host has no credentials for this provider";
+        let peer = WarmPeer::start(
+            vec![
+                block_opening_with_warning(&target, "auth-epoch", Some(warning)),
+                block_end(&target, "auth-epoch", 0),
+            ],
+            Duration::from_millis(10),
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_secs(5));
+        let (mut app, writer, _root) = app_over(&shell).await;
+        assert!(matches!(
+            apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target),).await,
+            Focus::Moved,
+        ));
+        drop(writer);
+
+        let status = Rc::clone(&world.status);
+        let chat = Rc::clone(&world.chat);
+        let (exit, seen) = drive_until(&mut world, &shell, move |writer| async move {
+            let seen = settled(Duration::from_secs(3), || {
+                let connected = status.borrow().connection == Connection::Connected;
+                let warnings = notices_of(&chat.borrow())
+                    .iter()
+                    .filter(|notice| notice.as_str() == warning)
+                    .count();
+                (connected && warnings == 1).then_some(warnings)
+            })
+            .await;
+            drop(writer);
+            seen
+        })
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert_eq!(seen, Some(1), "the host warning was not shown exactly once");
         remote.shutdown().await;
     }
 

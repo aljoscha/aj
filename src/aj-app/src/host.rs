@@ -323,6 +323,29 @@ fn holder_name(holder: &Option<LockHolder>) -> String {
     }
 }
 
+/// What an attaching client needs to know about this host's credential store
+/// for `provider`. Disabled for a scripted host, whose provider deliberately
+/// needs no credential and whose setup has no restore context.
+async fn credential_warning(
+    auth: &AuthStorage,
+    provider: &str,
+    credentials_required: bool,
+) -> Option<String> {
+    if !credentials_required {
+        return None;
+    }
+    match auth.try_has_auth(provider).await {
+        Ok(Some(true)) | Ok(None) => None,
+        Ok(Some(false)) => Some(format!(
+            "Heads up: {}",
+            crate::model::missing_key_message(provider)
+        )),
+        Err(err) => Some(format!(
+            "Couldn't check credentials for {provider:?}: {err}"
+        )),
+    }
+}
+
 /// What a host is built from: the process-wide handles a frontend already
 /// assembles at startup.
 pub struct HostSetup {
@@ -2196,6 +2219,18 @@ impl SessionHost {
             .as_ref()
             .filter(|cursor| cursor.epoch == epoch)
             .map(|cursor| cursor.seq);
+        // The warning has to describe this host's credential store: over a
+        // connection that is the one inference resolves against, and the
+        // client's store says nothing about whether this session can run. The
+        // scripted path has no credential-backed restore context and needs no
+        // warning. An auth read failure is actionable for the same reason as a
+        // missing credential, so carry its exact host-side answer too.
+        let credential_warning = credential_warning(
+            &self.inner.shared.auth,
+            &settings_seen.provider,
+            self.inner.shared.restore.is_some(),
+        )
+        .await;
         // A run is live if the log names it and the host has not seen it
         // finish, or if the host is driving a turn for it (a continuation of
         // a run that did finish). Deriving it this way rather than tracking
@@ -2223,6 +2258,7 @@ impl SessionHost {
                 epoch: epoch.clone(),
                 working: working_seen,
                 settings: settings_seen.clone(),
+                credential_warning,
                 last_seq: boundary,
             },
         )
@@ -2731,6 +2767,24 @@ fn spawn_list_publisher(inner: &Arc<HostInner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Credential presentation reads the host's store, and a runtime key
+    /// changes its answer. A scripted host opts out rather than warning about
+    /// a provider that intentionally authenticates nowhere.
+    #[tokio::test]
+    async fn the_credential_warning_describes_the_hosts_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let warning = credential_warning(&auth, "anthropic", true)
+            .await
+            .expect("an empty host store warns");
+        assert!(warning.contains("no credentials for provider \"anthropic\""));
+
+        auth.set_runtime_api_key("anthropic", "host-key".into())
+            .await;
+        assert_eq!(credential_warning(&auth, "anthropic", true).await, None);
+        assert_eq!(credential_warning(&auth, "scripted", false).await, None);
+    }
 
     /// The name a host falls back to is its whole working directory, written
     /// the way a person writes it. Not its last segments: how deep two clones

@@ -208,6 +208,11 @@ pub struct SessionClient {
     settings: Option<AgentSettings>,
     working: bool,
     first_attach_settings: Option<AgentSettings>,
+    /// The host-side credential warning carried by the first attach's opening
+    /// state, for a frontend to fold once after Caught. A reconnect may carry a
+    /// newer answer, but repeating startup warnings on every reconnect is more
+    /// noise than help; explicit account actions report their own outcome.
+    first_attach_credential_warning: Option<String>,
     saw_first_attach: bool,
     needs_task_refetch: bool,
     needs_queue_refetch: bool,
@@ -248,6 +253,7 @@ impl SessionClient {
             settings: None,
             working: false,
             first_attach_settings: None,
+            first_attach_credential_warning: None,
             saw_first_attach: false,
             needs_task_refetch: false,
             needs_queue_refetch: false,
@@ -383,6 +389,7 @@ impl SessionClient {
                 epoch,
                 working,
                 settings,
+                credential_warning,
                 ..
             } => {
                 if !self.is_ours(&session) {
@@ -396,7 +403,7 @@ impl SessionClient {
                 }
                 if opens_block && !self.saw_first_attach {
                     self.first_attach_settings = Some(settings.clone());
-                    self.saw_first_attach = true;
+                    self.first_attach_credential_warning = credential_warning.clone();
                 }
                 // The host is authoritative for all of these, at every
                 // emission: neither is derivable from projected events.
@@ -430,6 +437,11 @@ impl SessionClient {
                 self.applied = Some(last_seq);
                 self.committed = Some(last_seq);
                 self.attach = Attach::Live;
+                // The first attach's presentation belongs to the first block
+                // that commits, not the first opening State observed. A block
+                // interrupted after State is replaced by the retry's answer,
+                // so its settings and credential warning cannot go stale.
+                self.saw_first_attach = true;
                 // Neither task events nor queue updates are replayable, so
                 // both tables have to come from their reads.
                 self.needs_task_refetch = true;
@@ -569,6 +581,13 @@ impl SessionClient {
     /// notice that would repeat on every reconnect.
     pub fn take_first_attach_settings(&mut self) -> Option<AgentSettings> {
         self.first_attach_settings.take()
+    }
+
+    /// Takes the host-side credential warning carried by the first attach
+    /// state exactly once. `None` means the host reported no problem or was an
+    /// older build that did not carry the observation.
+    pub fn take_first_attach_credential_warning(&mut self) -> Option<String> {
+        self.first_attach_credential_warning.take()
     }
 
     /// Whether the host reported a turn in flight, as of the last `state`
@@ -926,11 +945,21 @@ mod tests {
     }
 
     fn state_with(epoch: &str, working: bool, settings: AgentSettings) -> Frame {
+        state_with_warning(epoch, working, settings, None)
+    }
+
+    fn state_with_warning(
+        epoch: &str,
+        working: bool,
+        settings: AgentSettings,
+        credential_warning: Option<&str>,
+    ) -> Frame {
         Frame::State {
             session: SESSION.to_string(),
             epoch: epoch.to_string(),
             working,
             settings,
+            credential_warning: credential_warning.map(str::to_string),
             last_seq: 0,
         }
     }
@@ -1876,7 +1905,16 @@ mod tests {
         let mut client = SessionClient::new(SESSION.to_string());
         let mut chat = chat();
         client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(
+            &mut chat,
+            state_with_warning(
+                EPOCH,
+                false,
+                settings(),
+                Some("the host has no credentials"),
+            ),
+        );
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
         assert_eq!(
             client
                 .take_first_attach_settings()
@@ -1884,13 +1922,65 @@ mod tests {
             Some("scripted".to_string()),
         );
         assert!(client.take_first_attach_settings().is_none());
-        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+        assert_eq!(
+            client.take_first_attach_credential_warning().as_deref(),
+            Some("the host has no credentials"),
+        );
+        assert!(client.take_first_attach_credential_warning().is_none());
 
         client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(
+            &mut chat,
+            state_with_warning(
+                EPOCH,
+                false,
+                settings(),
+                Some("a reconnect found another credential problem"),
+            ),
+        );
         assert!(
             client.take_first_attach_settings().is_none(),
             "a reconnect does not regenerate the local restore summary",
+        );
+        assert!(
+            client.take_first_attach_credential_warning().is_none(),
+            "a reconnect does not repeat its credential warning",
+        );
+    }
+
+    /// First-attach presentation commits with the block. A State from a block
+    /// that never reached Caught cannot freeze a stale settings summary or
+    /// credential warning ahead of the retry that did.
+    #[test]
+    fn an_interrupted_first_attach_keeps_the_successful_blocks_presentation() {
+        let mut client = SessionClient::new(SESSION.to_string());
+        let mut chat = chat();
+        client.expect_attach();
+        let _ = client.apply(
+            &mut chat,
+            state_with_warning(EPOCH, false, settings(), Some("stale warning")),
+        );
+        client.abandon_attach();
+
+        let mut current = settings();
+        current.model_id = "current-model".into();
+        client.expect_attach();
+        let _ = client.apply(
+            &mut chat,
+            state_with_warning(EPOCH, false, current, Some("current warning")),
+        );
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+
+        assert_eq!(
+            client
+                .take_first_attach_settings()
+                .map(|settings| settings.model_id)
+                .as_deref(),
+            Some("current-model"),
+        );
+        assert_eq!(
+            client.take_first_attach_credential_warning().as_deref(),
+            Some("current warning"),
         );
     }
 
