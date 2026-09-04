@@ -41,7 +41,8 @@ pub(crate) const STATUS_WAKE_EVENT: &str = "aj.status.wake";
 pub(crate) enum Connection {
     #[default]
     Connected,
-    /// The stream dropped and a re-attach is pending.
+    /// No stream serves the selected session and one is being opened: the
+    /// stream dropped, or the user selected a session it did not serve.
     Reconnecting,
     /// The stream is back and its attach block is being folded.
     CatchingUp,
@@ -150,7 +151,7 @@ impl StatusLine {
     fn message(&self) -> String {
         let status = self.status.borrow();
         match status.connection {
-            Connection::Reconnecting => return "Reconnecting to the host…".to_string(),
+            Connection::Reconnecting => return "Connecting…".to_string(),
             Connection::CatchingUp => return "Catching up…".to_string(),
             Connection::Refused => return "The selected session refused the attach.".to_string(),
             Connection::Stalled => return "The selected session's attach stalled.".to_string(),
@@ -330,7 +331,7 @@ mod tests {
     #[test]
     fn connection_state_labels_the_loader() {
         for (connection, label) in [
-            (Connection::Reconnecting, " ⠋ Reconnecting to the host…"),
+            (Connection::Reconnecting, " ⠋ Connecting…"),
             (Connection::CatchingUp, " ⠋ Catching up…"),
             (
                 Connection::Refused,
