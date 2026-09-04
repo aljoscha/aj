@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use aj_agent::events::AgentSettings;
 use aj_agent::message::AgentMessage;
 use aj_agent::{Agent, AgentSeed};
-use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay};
+use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel};
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
 use aj_models::registry::{ModelInfo, ModelRegistry};
@@ -69,7 +69,7 @@ use crate::settings::ConfigLayers;
 /// change cannot leave a stale copy behind here.
 ///
 /// One of these belongs to exactly one session. A process serving
-/// several live sessions clones its process-wide default per session
+/// several live sessions resolves its process-wide defaults per session
 /// (see [`SessionCore::build`]), because the fields below are mutated
 /// per session: the log stamps `session_id` on it, and a resume
 /// overwrites the whole model bundle from the log's record. A shared
@@ -127,6 +127,147 @@ impl RunConfigSnapshot {
             speed: speed_name(self.speed).to_string(),
             verbosity: verbosity_name(self.stream_options.verbosity).to_string(),
         }
+    }
+}
+
+/// Resolves the process defaults for each session the host materializes.
+///
+/// Config-backed axes are read from the live effective config. Launch CLI and
+/// environment values remain fixed above them, while `model_url` is frozen in
+/// all cases because its settings contract is restart-only. The resulting run
+/// config is still a fresh snapshot owned by one session.
+pub struct RunConfigDefaults {
+    startup: RunConfigSnapshot,
+    source: DefaultSource,
+}
+
+enum DefaultSource {
+    Fixed,
+    Layered {
+        launch_model_api: Option<String>,
+        launch_model_name: Option<String>,
+        fixed_model_url: Option<String>,
+        launch_thinking: Option<ConfigThinkingLevel>,
+        launch_speed: Option<Speed>,
+        startup_model_api: Option<String>,
+        startup_model_name: Option<String>,
+        scripted: bool,
+        registry: Arc<ModelRegistry>,
+        auth: AuthStorage,
+    },
+}
+
+impl RunConfigDefaults {
+    /// A fixed seed for injected hosts and test fixtures that have no parsed
+    /// launch or registry-backed config to resolve again.
+    pub fn fixed(startup: RunConfigSnapshot) -> Self {
+        Self {
+            startup,
+            source: DefaultSource::Fixed,
+        }
+    }
+
+    /// Capture launch provenance while leaving config-backed values live.
+    pub fn layered(
+        args: &Args,
+        config: &Config,
+        startup: RunConfigSnapshot,
+        speed: Option<Speed>,
+        auth: &AuthStorage,
+        restore: Option<&RestoreContext>,
+    ) -> Self {
+        Self {
+            startup,
+            source: DefaultSource::Layered {
+                launch_model_api: args.model_api.clone(),
+                launch_model_name: args.model_name.clone(),
+                fixed_model_url: args.model_url.clone().or_else(|| config.model_url.clone()),
+                launch_thinking: args.thinking,
+                launch_speed: args.speed.is_some().then_some(speed).flatten(),
+                startup_model_api: args.model_api.clone().or_else(|| config.model_api.clone()),
+                startup_model_name: args
+                    .model_name
+                    .clone()
+                    .or_else(|| config.model_name.clone()),
+                scripted: args.scripted.is_some(),
+                registry: restore
+                    .map(|restore| Arc::clone(&restore.registry))
+                    .unwrap_or_else(|| Arc::new(ModelRegistry::load())),
+                auth: auth.clone(),
+            },
+        }
+    }
+
+    pub(crate) fn startup(&self) -> &RunConfigSnapshot {
+        &self.startup
+    }
+
+    /// Resolve one independent session snapshot from the current effective
+    /// config and the launch values captured above it.
+    pub fn resolve(&self, config: &Config) -> Result<RunConfigSnapshot> {
+        let DefaultSource::Layered {
+            launch_model_api,
+            launch_model_name,
+            fixed_model_url,
+            launch_thinking,
+            launch_speed,
+            startup_model_api,
+            startup_model_name,
+            scripted,
+            registry,
+            auth,
+        } = &self.source
+        else {
+            return Ok(self.startup.clone());
+        };
+
+        let thinking =
+            crate::model::default_thinking_from_config((*launch_thinking).or(config.thinking));
+        let speed = (*launch_speed).or_else(|| {
+            config.speed.map(|speed| match speed {
+                ConfigSpeed::Standard => Speed::Standard,
+                ConfigSpeed::Fast => Speed::Fast,
+            })
+        });
+
+        let selection = ModelSelection {
+            api: launch_model_api
+                .clone()
+                .or_else(|| config.model_api.clone()),
+            name: launch_model_name
+                .clone()
+                .or_else(|| config.model_name.clone()),
+            url: fixed_model_url.clone(),
+        };
+        let model_unchanged =
+            selection.api == *startup_model_api && selection.name == *startup_model_name;
+        if *scripted && model_unchanged {
+            let mut run = self.startup.clone();
+            run.thinking = thinking;
+            run.thinking_display = config.thinking_display;
+            run.speed = speed;
+            run.stream_options.speed = speed;
+            crate::model::apply_thinking_display(&mut run.stream_options, config.thinking_display);
+            crate::model::apply_verbosity(&mut run.stream_options, config.verbosity);
+            return Ok(run);
+        }
+
+        let ResolvedModel {
+            provider,
+            model_info,
+            stream_options,
+        } = crate::model::resolve(registry, auth, &selection, speed)
+            .context("failed to resolve current session defaults")?;
+        let model_key = (model_info.provider.clone(), model_info.id.clone());
+        Ok(build_run_config(
+            config,
+            provider,
+            model_info,
+            stream_options,
+            model_key,
+            thinking,
+            speed,
+        ))
     }
 }
 
@@ -719,6 +860,79 @@ mod tests {
         composed.host.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn scripted_host_uses_a_persisted_model_for_later_sessions() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let layers = ConfigLayers {
+            user: Config::default(),
+            project: ConfigLayer::default(),
+            project_path: Some(dir.path().join("project-config.toml")),
+        };
+        let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
+        let composed = compose_host(&args, layers, &empty_auth(&dir), &persistence, None)
+            .expect("compose scripted host");
+        let first = composed.host.create().await.expect("first session");
+        let selected = composed
+            .catalog
+            .iter()
+            .find(|model| model.provider == "openai-codex")
+            .cloned()
+            .expect("an installed model the host can resolve");
+
+        composed
+            .host
+            .command(
+                &first,
+                crate::host::Command::Settings(crate::host::SettingsChange {
+                    agent: aj_agent::events::AgentId::Main,
+                    persist: crate::settings::PersistAction::ProjectSet,
+                    axis: crate::host::SettingsAxis::Model(selected.clone()),
+                }),
+            )
+            .await
+            .expect("persist model default");
+        let second = composed.host.create().await.expect("second session");
+        let handles = composed
+            .host
+            .local_handles(&second)
+            .await
+            .expect("second session handles");
+        assert_eq!(
+            handles.run_config.lock().unwrap().model_key,
+            (selected.provider, selected.id)
+        );
+        composed.host.shutdown().await;
+    }
+
+    #[test]
+    fn scripted_launch_model_overrides_still_outrank_persisted_defaults() {
+        let dir = TempDir::new().expect("tempdir");
+        let args = Args::parse_from([
+            "aj",
+            "--scripted",
+            "streaming-text",
+            "--model-api",
+            "openai-codex",
+            "--model-name",
+            "gpt-5.2",
+        ]);
+        let auth = empty_auth(&dir);
+        let mut config = Config::default();
+        let thinking = resolve_thinking(&args, &config).expect("thinking");
+        let speed = resolve_speed(&args, &config).expect("speed");
+        let (startup, restore) = build_initial_run_config(&args, &config, &auth, thinking, speed)
+            .expect("scripted startup run config");
+        let startup_key = startup.model_key.clone();
+        let defaults =
+            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+
+        config.model_api = Some("anthropic".to_string());
+        config.model_name = Some("claude-opus-5".to_string());
+        let run = defaults.resolve(&config).expect("scripted defaults");
+        assert_eq!(run.model_key, startup_key);
+    }
+
     /// The scripted path applies the CLI > config provider-id
     /// precedence to `model_key.0` even though it does no registry
     /// lookup, and never produces a `RestoreContext`.
@@ -748,6 +962,136 @@ mod tests {
             build_initial_run_config(&args, &Config::default(), &empty_auth(&dir), None, None)
                 .expect("scripted run config");
         assert_eq!(run_config.model_key.0, crate::model::DEFAULT_PROVIDER_ID);
+    }
+
+    #[test]
+    fn session_defaults_reresolve_live_config_but_freeze_model_url() {
+        let dir = TempDir::new().expect("tempdir");
+        let args = Args::parse_from(["aj"]);
+        let mut config = Config {
+            model_api: Some("openai-codex".to_string()),
+            model_name: Some("gpt-5.2".to_string()),
+            model_url: Some("https://startup.example/v1".to_string()),
+            thinking: Some(ConfigThinkingLevel::Low),
+            thinking_display: Some(ConfigThinkingDisplay::Summarized),
+            speed: Some(ConfigSpeed::Standard),
+            verbosity: Some(aj_conf::ConfigVerbosity::Low),
+            ..Config::default()
+        };
+        let thinking = resolve_thinking(&args, &config).expect("thinking");
+        let speed = resolve_speed(&args, &config).expect("speed");
+        let (startup, restore) =
+            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed)
+                .expect("startup run config");
+        let auth = empty_auth(&dir);
+        let defaults =
+            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+
+        config.model_name = Some("gpt-5.5".to_string());
+        config.model_url = Some("https://later.example/v1".to_string());
+        config.thinking = Some(ConfigThinkingLevel::High);
+        config.thinking_display = Some(ConfigThinkingDisplay::Detailed);
+        config.speed = Some(ConfigSpeed::Fast);
+        config.verbosity = Some(aj_conf::ConfigVerbosity::High);
+        let run = defaults.resolve(&config).expect("current defaults");
+
+        assert_eq!(run.model_key.1, "gpt-5.5");
+        assert_eq!(run.model_info.base_url, "https://startup.example/v1");
+        assert_eq!(run.thinking, Some(ThinkingConfig::High));
+        assert_eq!(run.thinking_display, Some(ConfigThinkingDisplay::Detailed));
+        assert_eq!(run.speed, Some(Speed::Fast));
+        assert_eq!(verbosity_name(run.stream_options.verbosity), "high");
+    }
+
+    #[test]
+    fn launch_values_stay_above_later_config_defaults() {
+        let dir = TempDir::new().expect("tempdir");
+        let args = Args::parse_from([
+            "aj",
+            "--model-api",
+            "openai-codex",
+            "--model-name",
+            "gpt-5.2",
+            "--model-url",
+            "https://launch.example/v1",
+            "--thinking",
+            "low",
+            "--speed",
+            "standard",
+        ]);
+        let mut config = Config::default();
+        let thinking = resolve_thinking(&args, &config).expect("thinking");
+        let speed = resolve_speed(&args, &config).expect("speed");
+        let (startup, restore) =
+            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed)
+                .expect("startup run config");
+        let auth = empty_auth(&dir);
+        let defaults =
+            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+
+        config.model_api = Some("anthropic".to_string());
+        config.model_name = Some("claude-opus-5".to_string());
+        config.model_url = Some("https://later.example/v1".to_string());
+        config.thinking = Some(ConfigThinkingLevel::High);
+        config.speed = Some(ConfigSpeed::Fast);
+        let run = defaults
+            .resolve(&config)
+            .expect("launch-precedence defaults");
+
+        assert_eq!(
+            run.model_key,
+            ("openai-codex".to_string(), "gpt-5.2".to_string())
+        );
+        assert_eq!(run.model_info.base_url, "https://launch.example/v1");
+        assert_eq!(run.thinking, Some(ThinkingConfig::Low));
+        assert_eq!(run.speed, Some(Speed::Standard));
+    }
+
+    #[test]
+    fn partial_launch_model_overrides_merge_with_live_config_per_field() {
+        let dir = TempDir::new().expect("tempdir");
+
+        let args = Args::parse_from(["aj", "--model-api", "openai-codex"]);
+        let mut config = Config {
+            model_api: Some("anthropic".to_string()),
+            model_name: Some("gpt-5.2".to_string()),
+            ..Config::default()
+        };
+        let thinking = resolve_thinking(&args, &config).expect("thinking");
+        let speed = resolve_speed(&args, &config).expect("speed");
+        let (startup, restore) =
+            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed)
+                .expect("startup run config");
+        let auth = empty_auth(&dir);
+        let defaults =
+            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+        config.model_name = Some("gpt-5.5".to_string());
+        let run = defaults
+            .resolve(&config)
+            .expect("provider launch override with live model name");
+        assert_eq!(
+            run.model_key,
+            ("openai-codex".to_string(), "gpt-5.5".to_string())
+        );
+
+        let args = Args::parse_from(["aj", "--model-name", "gpt-5.2"]);
+        let mut config = Config {
+            model_api: Some("openai-codex".to_string()),
+            ..Config::default()
+        };
+        let thinking = resolve_thinking(&args, &config).expect("thinking");
+        let speed = resolve_speed(&args, &config).expect("speed");
+        let (startup, restore) =
+            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed)
+                .expect("startup run config");
+        let auth = empty_auth(&dir);
+        let defaults =
+            RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
+        config.model_api = Some("openai".to_string());
+        let run = defaults
+            .resolve(&config)
+            .expect("model launch override with live provider");
+        assert_eq!(run.model_key, ("openai".to_string(), "gpt-5.2".to_string()));
     }
 
     /// `prepare_log` stamps the opened log's id onto the run config as
@@ -871,6 +1215,8 @@ pub fn compose_host(
         .host_name()
         .map_err(|err| anyhow::anyhow!("--name: {err}"))?;
     let (run_config, restore) = build_initial_run_config(args, &config, auth, thinking, speed)?;
+    let defaults =
+        RunConfigDefaults::layered(args, &config, run_config, speed, auth, restore.as_ref());
     let catalog = crate::commands::load_model_catalog();
     let config = Arc::new(StdMutex::new(config));
     let layers = Arc::new(StdMutex::new(layers));
@@ -878,7 +1224,7 @@ pub fn compose_host(
         config: Arc::clone(&config),
         layers: Arc::clone(&layers),
         catalog: Arc::clone(&catalog),
-        run_config,
+        defaults,
         restore,
         persistence: persistence.clone(),
         auth: auth.clone(),

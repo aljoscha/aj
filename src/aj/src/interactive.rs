@@ -16016,6 +16016,13 @@ mod tests {
         idle_grace: Option<Duration>,
     ) -> (World, Rc<RefCell<Shell>>, AsyncApp, PipeWriter, WidgetRef) {
         let world = scripted_world_with(dir, demo, layers, idle_grace).await;
+        shell_app(world).await
+    }
+
+    /// Pair an already-composed world with the test shell and terminal app.
+    async fn shell_app(
+        world: World,
+    ) -> (World, Rc<RefCell<Shell>>, AsyncApp, PipeWriter, WidgetRef) {
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
@@ -16562,6 +16569,17 @@ mod tests {
                 .is_some()
         };
         assert!(recorded, "thinking change recorded on the session log");
+        let next = world.host().create().await.expect("create next session");
+        let next_handles = world
+            .host()
+            .local_handles(&next)
+            .await
+            .expect("next session handles");
+        assert_eq!(
+            next_handles.run_config.lock().unwrap().thinking,
+            None,
+            "a session-scoped selector choice did not become a host default"
+        );
     }
 
     /// The model selector's confirm updates the footer identity and is
@@ -16603,14 +16621,26 @@ mod tests {
     /// The settings window, driven through real dispatch: open it, filter to
     /// the thinking row, open its picker submenu, pick `high`. The change
     /// stages the run config and persists `thinking = "high"` to the tempdir
-    /// user config, while the window stays open.
+    /// user config, while the window stays open. A later session minted by the
+    /// same host starts at that persisted default.
     #[tokio::test]
     #[serial_test::serial]
     async fn settings_window_persists_thinking_to_user_config() {
         let dir = TempDir::new().expect("tempdir");
         let _home = HomeGuard::set(dir.path());
-        let (mut world, shell, mut app, mut writer, root) =
-            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let world = world_from_argv(
+            &dir,
+            &[
+                "aj",
+                "--model-api",
+                "openai-codex",
+                "--model-name",
+                "gpt-5.2",
+            ],
+        )
+        .await
+        .expect("registry-backed world");
+        let (mut world, shell, mut app, mut writer, root) = shell_app(world).await;
 
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenSettings).await,
@@ -16647,6 +16677,19 @@ mod tests {
         let config_path = dir.path().join(".aj").join("config.toml");
         let contents = std::fs::read_to_string(&config_path).expect("config.toml written");
         assert!(contents.contains("thinking = \"high\""), "got: {contents}");
+        // The settings window edits the process default, not only this
+        // session's snapshot. Creating through the host is the same boundary
+        // the New Session gesture reaches.
+        let next = world.host().create().await.expect("create next session");
+        let next_handles = world
+            .host()
+            .local_handles(&next)
+            .await
+            .expect("next session handles");
+        assert_eq!(
+            next_handles.run_config.lock().unwrap().thinking,
+            Some(ThinkingConfig::High)
+        );
         // The window stays open across an edit.
         assert!(shell.borrow().overlays.borrow().is_open());
     }

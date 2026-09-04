@@ -19,7 +19,7 @@ use aj_app::host::{
     AttachRequest, Attachment, Command, CommandOutcome, CreateError, HeadTarget, HostError,
     HostSetup, LOCK_PROBE_TICK, QueueOp, SessionHost, SettingsAxis, SettingsChange,
 };
-use aj_app::session_setup::RunConfigSnapshot;
+use aj_app::session_setup::{RunConfigDefaults, RunConfigSnapshot};
 use aj_app::settings::{ConfigLayers, PersistAction};
 use aj_app::test_support::{
     CanonicalState, assert_canonical_eq, assert_no_dangling, finalized_text_message,
@@ -189,7 +189,7 @@ impl Harness {
                 project_path: None,
             })),
             catalog: Arc::new(catalog),
-            run_config,
+            defaults: RunConfigDefaults::fixed(run_config),
             restore: None,
             persistence: persistence.clone(),
             auth: AuthStorage::new(dir.path().join("auth.json")),
@@ -247,7 +247,7 @@ impl Harness {
                 project_path: None,
             })),
             catalog: Arc::new(Vec::new()),
-            run_config: snapshot(scripted(messages, 0, Duration::ZERO)),
+            defaults: RunConfigDefaults::fixed(snapshot(scripted(messages, 0, Duration::ZERO))),
             restore: None,
             persistence: self.persistence.clone(),
             auth: AuthStorage::new(dir.path().join("auth.json")),
@@ -2177,7 +2177,7 @@ async fn the_host_id_is_claimed_not_written_over() {
             project_path: None,
         })),
         catalog: Arc::new(Vec::new()),
-        run_config: snapshot(scripted(Vec::new(), 0, Duration::ZERO)),
+        defaults: RunConfigDefaults::fixed(snapshot(scripted(Vec::new(), 0, Duration::ZERO))),
         restore: None,
         persistence: harness.persistence.clone(),
         auth: AuthStorage::new(harness._dir.path().join("auth.json")),
@@ -2223,7 +2223,7 @@ async fn a_host_reports_the_name_it_was_given_or_derives_one() {
                 project_path: None,
             })),
             catalog: Arc::new(Vec::new()),
-            run_config: snapshot(scripted(Vec::new(), 0, Duration::ZERO)),
+            defaults: RunConfigDefaults::fixed(snapshot(scripted(Vec::new(), 0, Duration::ZERO))),
             restore: None,
             persistence: harness.persistence.clone(),
             auth: AuthStorage::new(harness._dir.path().join("auth.json")),

@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use aj_agent::events::AgentId;
 use aj_app::host::{Command, HostSetup, SessionHost};
-use aj_app::session_setup::RunConfigSnapshot;
+use aj_app::session_setup::{RunConfigDefaults, RunConfigSnapshot};
 use aj_app::settings::ConfigLayers;
 use aj_app::test_support::{finalized_text_message, scripted_model_info};
 use aj_conf::{Config, ConfigLayer};
@@ -116,7 +116,7 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
             project_path: None,
         })),
         catalog: Arc::new(Vec::new()),
-        run_config: RunConfigSnapshot {
+        defaults: RunConfigDefaults::fixed(RunConfigSnapshot {
             provider,
             model_info: Arc::new(scripted_model_info()),
             stream_options: aj_models::types::StreamOptions::default(),
@@ -125,7 +125,7 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
             speed: None,
             model_key: ("scripted".to_string(), "scripted".to_string()),
             session_id: None,
-        },
+        }),
         restore: None,
         persistence: persistence.clone(),
         auth: AuthStorage::new(dir.path().join("auth.json")),

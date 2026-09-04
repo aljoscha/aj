@@ -77,7 +77,8 @@ use crate::host::live::{LiveSession, ReleaseOutcome, Request, SessionStatus, set
 use crate::host::store::ColdSessions;
 use crate::session::{SessionCore, SessionEntry, SessionSpec, SubAgentOverrides};
 use crate::session_setup::{
-    RestoreContext, RunConfigSnapshot, thinking_display_from_name, thinking_level_for,
+    RestoreContext, RunConfigDefaults, RunConfigSnapshot, thinking_display_from_name,
+    thinking_level_for,
 };
 use crate::settings::{ConfigLayers, PersistAction};
 
@@ -352,8 +353,8 @@ pub struct HostSetup {
     pub config: Arc<StdMutex<Config>>,
     pub layers: Arc<StdMutex<ConfigLayers>>,
     pub catalog: Arc<Vec<ModelInfo>>,
-    /// The process default every session's own run config is cloned from.
-    pub run_config: RunConfigSnapshot,
+    /// The process defaults resolved into each session's own run config.
+    pub defaults: RunConfigDefaults,
     /// Resume-time settings restoration, `None` on the scripted path.
     pub restore: Option<RestoreContext>,
     pub persistence: ConversationPersistence,
@@ -678,7 +679,7 @@ struct ShutdownState {
 struct HostInner {
     shared: Arc<HostShared>,
     persistence: ConversationPersistence,
-    base_run_config: RunConfigSnapshot,
+    run_config_defaults: RunConfigDefaults,
     host_id: String,
     working_directory: PathBuf,
     /// What this host calls itself on the wire: `--name`, else the working
@@ -751,7 +752,7 @@ impl SessionHost {
             config,
             layers,
             catalog,
-            run_config,
+            defaults,
             restore,
             persistence,
             auth,
@@ -780,7 +781,7 @@ impl SessionHost {
             }),
             cold: ColdSessions::new(persistence.clone()),
             persistence,
-            base_run_config: run_config,
+            run_config_defaults: defaults,
             host_id,
             working_directory,
             name,
@@ -920,10 +921,9 @@ impl SessionHost {
         settings: Option<&SessionSettings>,
         session_env: Option<BTreeMap<String, String>>,
     ) -> Result<String, HostError> {
-        let run_config = self.resolve_creator_settings(settings)?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
-            .materialize(&mut sessions, None, Some(run_config), session_env)
+            .materialize(&mut sessions, None, settings.cloned(), session_env)
             .await?;
         Ok(live.id().to_string())
     }
@@ -946,9 +946,9 @@ impl SessionHost {
             .find(|info| info.provider == selection.api && info.id == selection.name)
             .cloned()
             .or_else(|| {
-                (self.inner.base_run_config.model_key
+                (self.inner.run_config_defaults.startup().model_key
                     == (selection.api.clone(), selection.name.clone()))
-                    .then(|| (*self.inner.base_run_config.model_info).clone())
+                    .then(|| (*self.inner.run_config_defaults.startup().model_info).clone())
             })
             .ok_or_else(|| {
                 HostError::Unsupported(format!(
@@ -1862,8 +1862,13 @@ impl SessionHost {
     fn resolve_creator_settings(
         &self,
         settings: Option<&SessionSettings>,
+        config: &Config,
     ) -> Result<RunConfigSnapshot, HostError> {
-        let mut run = self.inner.base_run_config.clone();
+        let mut run = self
+            .inner
+            .run_config_defaults
+            .resolve(config)
+            .map_err(|err| HostError::Unsupported(err.to_string()))?;
         let default_settings = SessionSettings::default();
         let settings = settings.unwrap_or(&default_settings);
 
@@ -1876,8 +1881,7 @@ impl SessionHost {
 
         if let Some(selection) = &settings.model {
             let info = self.resolve_model_selection(selection)?;
-            let base_bundle = self.inner.base_run_config.model_key
-                == (selection.api.clone(), selection.name.clone())
+            let base_bundle = run.model_key == (selection.api.clone(), selection.name.clone())
                 && self.inner.shared.catalog.iter().all(|catalog| {
                     catalog.provider != selection.api || catalog.id != selection.name
                 });
@@ -1968,7 +1972,7 @@ impl SessionHost {
         &self,
         sessions: &mut HashMap<String, LiveEntry>,
         id: Option<&str>,
-        create_run_config: Option<RunConfigSnapshot>,
+        create_settings: Option<SessionSettings>,
         create_session_env: Option<BTreeMap<String, String>>,
     ) -> Result<Arc<LiveSession>, HostError> {
         if let Some(id) = id {
@@ -2032,9 +2036,10 @@ impl SessionHost {
             .lock()
             .expect("config mutex poisoned")
             .clone();
+        let run_config = self.resolve_creator_settings(create_settings.as_ref(), &config)?;
         let (mut core, _seed) = SessionCore::build(
             &config,
-            create_run_config.unwrap_or_else(|| self.inner.base_run_config.clone()),
+            run_config,
             &self.inner.persistence,
             &spec,
             self.inner.shared.restore.as_ref(),

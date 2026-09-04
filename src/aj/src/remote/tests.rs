@@ -570,7 +570,7 @@ fn scripted_host_with_run_config(
         config: handles.config,
         layers: handles.layers,
         catalog: Arc::new(vec![catalog_model()]),
-        run_config,
+        defaults: aj_app::session_setup::RunConfigDefaults::fixed(run_config),
         restore: None,
         persistence: ConversationPersistence::new(dir.path().join("sessions")),
         auth: AuthStorage::new(dir.path().join("auth.json")),
