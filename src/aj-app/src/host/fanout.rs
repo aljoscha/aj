@@ -48,14 +48,10 @@ enum AttachState {
 struct Subscriber {
     live: LiveSender,
     attached: HashMap<String, AttachState>,
-    /// The latest directory this subscriber's queue accepted.
-    ///
-    /// Per subscriber, because queue admission is the comparison point. A
-    /// subscriber that just registered has accepted nothing, and a snapshot its
-    /// full queue dropped was not accepted. A queued snapshot stays the
-    /// comparison point when coalescing replaces it, so a later restore of an
-    /// older delivered value is still recognized as a change.
-    accepted_list: Option<Vec<SessionSummary>>,
+    /// Whether this subscriber's queue accepted the fan-out's latest directory.
+    /// A fresh subscriber and one whose full queue dropped the frame stay false,
+    /// so the next refresh offers the current snapshot to them.
+    list_current: bool,
 }
 
 impl Subscriber {
@@ -63,36 +59,6 @@ impl Subscriber {
     /// session it belongs to.
     fn offer(&mut self, frame: &Frame) -> bool {
         self.deliver(frame) != Offered::Evicted
-    }
-
-    /// Queue a directory, unless this subscriber already has it.
-    ///
-    /// The frequent trigger for a refresh is a session event, and most events
-    /// move nothing a directory row shows, so the steady state during a turn is
-    /// a payload identical to the last one. `list` is cumulative and the latest
-    /// frame supersedes, so an unchanged snapshot carries no
-    /// information. Compared on the payload rather than on what produced it,
-    /// because the payload is what a client sees.
-    fn offer_list(&mut self, sessions: &[SessionSummary]) -> bool {
-        if self.accepted_list.as_deref() == Some(sessions) {
-            return true;
-        }
-        let frame = Frame::List {
-            sessions: sessions.to_vec(),
-            // A plain host's rows are all its own, so it names no hosts:
-            // that field is a gateway's.
-            hosts: Vec::new(),
-        };
-        match self.deliver(&frame) {
-            Offered::Queued => {
-                self.accepted_list = Some(sessions.to_vec());
-                true
-            }
-            // Not accepted, so not remembered: the next refresh offers this
-            // subscriber the directory again, unchanged or not.
-            Offered::Dropped => true,
-            Offered::Evicted => false,
-        }
     }
 
     fn deliver(&mut self, frame: &Frame) -> Offered {
@@ -333,6 +299,9 @@ struct FanoutState {
     /// atomic with every registration that could otherwise follow it.
     closed: bool,
     subscribers: HashMap<SubscriberId, Subscriber>,
+    /// The latest directory payload, compared once per publisher tick.
+    /// Subscribers retain only whether their own queue accepted it.
+    current_list: Option<Vec<SessionSummary>>,
 }
 
 impl Default for Fanout {
@@ -349,6 +318,7 @@ impl Fanout {
             state: StdMutex::new(FanoutState {
                 closed: false,
                 subscribers: HashMap::new(),
+                current_list: None,
             }),
             next_id: AtomicU64::new(1),
             list_dirty: Notify::new(),
@@ -382,7 +352,7 @@ impl Fanout {
                 Subscriber {
                     live,
                     attached,
-                    accepted_list: None,
+                    list_current: false,
                 },
             );
         }
@@ -438,12 +408,50 @@ impl Fanout {
             .retain(|_, subscriber| subscriber.offer(&frame));
     }
 
-    /// Fan a directory out to every subscriber that does not already have it
-    /// (see [`Subscriber::offer_list`]).
+    /// Fan a changed directory out, and retry it for subscribers that missed it.
+    ///
+    /// The payload comparison belongs here because there is one current
+    /// directory. Queue admission remains per subscriber: a fresh subscriber or
+    /// one whose full queue dropped the frame still needs the next refresh.
     pub(crate) fn publish_list(&self, sessions: Vec<SessionSummary>) {
-        self.lock()
+        let mut state = self.lock();
+        if state.current_list.as_deref() != Some(&sessions) {
+            state.current_list = Some(sessions);
+            for subscriber in state.subscribers.values_mut() {
+                subscriber.list_current = false;
+            }
+        }
+        if state
             .subscribers
-            .retain(|_, subscriber| subscriber.offer_list(&sessions));
+            .values()
+            .all(|subscriber| subscriber.list_current)
+        {
+            return;
+        }
+        let frame = Frame::List {
+            sessions: state
+                .current_list
+                .clone()
+                .expect("the current directory was set above"),
+            // A plain host's rows are all its own, so it names no hosts:
+            // that field is a gateway's.
+            hosts: Vec::new(),
+        };
+        state.subscribers.retain(|_, subscriber| {
+            if subscriber.list_current {
+                return true;
+            }
+            match subscriber.deliver(&frame) {
+                Offered::Queued => {
+                    subscriber.list_current = true;
+                    true
+                }
+                // The next refresh retries the current directory only for this
+                // subscriber.
+                Offered::Dropped => true,
+                Offered::Evicted => false,
+            }
+        });
     }
 
     /// Switches a session to live delivery and filters duplicate durables.

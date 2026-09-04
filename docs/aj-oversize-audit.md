@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 1 LOOK.
+retired 2 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,12 +29,12 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 26 open)
+## LOOK (27 total, 25 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
 - ~~`94334b1` 2026-08-04 aj-app,aj-session: serve a list refresh from caches, not from the store~~ Retired by `e2c349d`.
-- `529fd4e` 2026-08-05 aj-app: refresh the directory from memory, and only publish changes
+- ~~`529fd4e` 2026-08-05 aj-app: refresh the directory from memory, and only publish changes~~ Retired: list fan-out now retains one current payload rather than one full copy per subscriber.
 - `84db84e` 2026-08-06 aj-app,aj: bound the working set, and fix what two reviews found
 - `34fcbd8` 2026-08-07 aj-app,aj: set a session's tag from the host and the control port
 - `b57241c` 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar
@@ -119,7 +119,8 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why: Fixes a per-tick filesystem scan by making the scan cheap instead of asking why a tick scans at all: new `host/store.rs` (678 lines) with `SessionStore` trait, `ColdSessions<S>`, `Fingerprint`, `Derived<T>`, `Cache`, an (mtime,size) invalidation scheme, plus a bytes-not-lines rewrite of two readers in `persistence.rs` (+374) so a torn multi-byte tail stays countable. The trait exists, by its own doc comment, so tests can count reads. One day later 529fd4e concluded the refresh path should touch no filesystem at all, which is the smaller problem statement this commit skipped.
 - Simpler shape: refresh from memory and enumerate the store only at the rare external points (startup, explicit list, attach), which is what 529fd4e then did; the fingerprint cache and trait would not have been needed for the tick.
 
-### 529fd4e 2026-08-05 aj-app: refresh the directory from memory, and only publish changes
+### 529fd4e 2026-08-05 aj-app: refresh the directory from memory, and only publish changes [RETIRED]
+- Status: Retired. List fan-out now compares the payload once, retains one current directory, and keeps only an admission bit per subscriber. A fresh subscriber or one whose full queue dropped the frame remains pending, so the next refresh still serves it. The in-memory cold directory and release handoff remain because current rows carry activity, tag, archive, and lock state. Removing them would discard current behavior rather than simplify this change. `e2c349d` already removed the format and log-content caches inherited from `94334b1`.
 - Stats: 7 files, +1207 -218, ~381 prod / ~826 test lines (estimate: store.rs and fanout.rs test modules, session_host.rs +530)
 - Body: per-tick list refresh cost a directory read and a stat per log for the length of every turn, and steady state resent a byte-identical 60 KB `list` frame per client
 - Verdict: LOOK
