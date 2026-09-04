@@ -154,3 +154,8 @@ or_fun_call = "warn"
 # that needs variable inspection, override per build with
 # CARGO_PROFILE_DEV_DEBUG=2.
 debug = "line-tables-only"
+
+[profile.release]
+# Release builds are part of the local edit-install loop, not only distribution
+# builds. Preserve optimized output while reusing unchanged code generation.
+incremental = true
