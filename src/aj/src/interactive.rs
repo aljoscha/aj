@@ -170,11 +170,9 @@ struct World {
     /// Every reader either has a wire equivalent to fall back on or is a
     /// gesture connect mode refuses outright.
     local: Option<LocalHandles>,
-    /// Client-side notices every locally created session receives once. Its
-    /// environment is read when these are folded, while process-wide
-    /// diagnostics, credential status, and terminal capabilities are captured
-    /// once at launch.
-    local_session_notices: Option<LocalSessionNotices>,
+    /// What this process reports once to every session it first shows.
+    /// Captured at launch; a fresh session's env is read when they are folded.
+    process_notices: ProcessNotices,
     /// The directory the focused session runs in: this process's own for a
     /// local run, a direct host's from `hello`, or a gateway host's from the
     /// focused session's directory row.
@@ -230,11 +228,16 @@ struct World {
     launch_env: Option<BTreeMap<String, String>>,
 }
 
-/// The process-side inputs to one local fresh session's leading notice block.
+/// What this process reports once to every session it first shows, in either
+/// mode: config problems, the sandbox disclaimer, and the terminal's tmux
+/// capabilities are facts about this process and the terminal it draws in.
 #[derive(Clone)]
-struct LocalSessionNotices {
+struct ProcessNotices {
     diagnostics: Vec<AgentEvent>,
     sandbox_warning: bool,
+    /// Local runs only. Inference runs in this process against this store, so
+    /// a missing key is the user's to fix. Over a connection the host's store
+    /// runs inference and this one says nothing about the session.
     auth_warning: Option<String>,
     tmux_warning: Option<String>,
 }
@@ -268,12 +271,7 @@ async fn build_world(
     // or any hint renders. Rejected entries are surfaced as a startup warning
     // in the notice block below.
     let keybinding_problems = aj_app::actions::install_keybindings(config.keybindings.clone());
-    let mut local_session_notices = LocalSessionNotices {
-        diagnostics: startup_diagnostic_events(diagnostics, &keybinding_problems),
-        sandbox_warning: aj_app::notices::sandbox_warning_enabled(),
-        auth_warning: None,
-        tmux_warning: aj_app::tmux::options().and_then(aj_app::tmux::build_warning),
-    };
+    let mut process_notices = ProcessNotices::at_launch(diagnostics, &keybinding_problems);
 
     // `aj continue` with neither an explicit id nor a latest session
     // on disk degrades to a fresh session, matching `aj`.
@@ -362,7 +360,7 @@ async fn build_world(
         startup: HashMap::new(),
         chat: Rc::new(RefCell::new(chat)),
         status: Rc::new(RefCell::new(StatusState::default())),
-        local_session_notices: None,
+        process_notices: ProcessNotices::at_launch(diagnostics, &keybinding_problems),
         config,
         config_layers,
         catalog,
@@ -389,7 +387,7 @@ async fn build_world(
         if let Some(key) = args.api_key.clone() {
             auth.set_runtime_api_key(&provider, key).await;
         }
-        local_session_notices.auth_warning = match auth.has_auth(&provider).await {
+        process_notices.auth_warning = match auth.has_auth(&provider).await {
             Ok(true) => None,
             Ok(false) => Some(format!(
                 "Heads up: {}",
@@ -405,10 +403,7 @@ async fn build_world(
     // ones here, alongside the flags that only a create could have honored.
     let mut rows = Vec::new();
     if !fresh {
-        rows.extend(local_session_notice_events(
-            local_session_notices.clone(),
-            None,
-        ));
+        rows.extend(process_notice_events(process_notices.clone(), None));
         if args.has_launch_tag() {
             rows.push(warning_event(TAG_WITHOUT_A_CREATE));
         }
@@ -416,7 +411,7 @@ async fn build_world(
             rows.push(warning_event(ENV_WITHOUT_A_CREATE));
         }
     }
-    world.local_session_notices = Some(local_session_notices);
+    world.process_notices = process_notices;
     world.startup.insert(
         session,
         PendingStartup {
@@ -517,7 +512,7 @@ async fn build_connect_world(
         startup: HashMap::new(),
         chat: Rc::new(RefCell::new(chat)),
         status: Rc::new(RefCell::new(StatusState::default())),
-        local_session_notices: None,
+        process_notices: ProcessNotices::at_launch(diagnostics, &keybinding_problems),
         config,
         config_layers,
         catalog,
@@ -527,7 +522,12 @@ async fn build_connect_world(
     };
     world.resume = Some(Resume::launched(&world));
 
-    let mut rows = startup_diagnostic_events(diagnostics, &keybinding_problems);
+    // A created session's process notices come with its fresh-session rows.
+    let mut rows = if created {
+        Vec::new()
+    } else {
+        process_notice_events(world.process_notices.clone(), None)
+    };
     if args.listen.is_some() {
         rows.push(warning_event(
             "--listen has nothing to serve in connect mode: the sessions live on the host.",
@@ -552,7 +552,7 @@ async fn build_connect_world(
     world.startup.insert(
         world.session().to_string(),
         PendingStartup {
-            fresh: false,
+            fresh: created,
             attaching: false,
             partial_create: None,
             launch: Some(Launch {
@@ -1577,10 +1577,11 @@ fn fold_selected_startup(world: &mut World, startup: PendingStartup) {
         .local
         .as_ref()
         .map(|handles| (handles.env.clone(), handles.restore_notices.clone()));
-    if let Some((env, _)) = &local
-        && startup.fresh
-    {
-        fold_local_session_notices(world, Some(env));
+    if startup.fresh {
+        let env = local.as_ref().map(|(env, _)| env);
+        for event in process_notice_events(world.process_notices.clone(), env) {
+            fold_event(world, event);
+        }
     }
     if let Some(launch) = startup.launch {
         for event in launch.rows {
@@ -2083,22 +2084,26 @@ fn fresh_env_notices(fresh: bool, env: &AgentEnv) -> Vec<AgentEvent> {
         .collect()
 }
 
-/// Fold the complete leading notice block for a local session. A fresh
-/// session supplies its newly assembled environment; an initial resume omits
-/// it but still receives the process-side diagnostics and safety warnings.
-fn fold_local_session_notices(world: &mut World, fresh_env: Option<&AgentEnv>) {
-    let Some(notices) = world.local_session_notices.clone() else {
-        return;
-    };
-    for event in local_session_notice_events(notices, fresh_env) {
-        fold_event(world, event);
+impl ProcessNotices {
+    /// What is known at launch, before any session: the credential check is
+    /// a local run's to add once it knows the session's provider.
+    fn at_launch(
+        diagnostics: &[ConfigDiagnostic],
+        keybinding_problems: &[aj_app::actions::KeybindingProblem],
+    ) -> ProcessNotices {
+        ProcessNotices {
+            diagnostics: startup_diagnostic_events(diagnostics, keybinding_problems),
+            sandbox_warning: aj_app::notices::sandbox_warning_enabled(),
+            auth_warning: None,
+            tmux_warning: aj_app::tmux::options().and_then(aj_app::tmux::build_warning),
+        }
     }
 }
 
-fn local_session_notice_events(
-    notices: LocalSessionNotices,
-    fresh_env: Option<&AgentEnv>,
-) -> Vec<AgentEvent> {
+/// The process's notice block for a session it first shows, in one order. A
+/// fresh local session supplies its newly assembled environment for the skill
+/// diagnostics it carries; a resume and a connected session have none.
+fn process_notice_events(notices: ProcessNotices, fresh_env: Option<&AgentEnv>) -> Vec<AgentEvent> {
     let mut events = notices.diagnostics;
     if let Some(env) = fresh_env {
         events.extend(fresh_env_notices(true, env));
@@ -10107,8 +10112,8 @@ mod tests {
             "a resume folds no env notices: {resume:?}"
         );
 
-        let complete = local_session_notice_events(
-            LocalSessionNotices {
+        let complete = process_notice_events(
+            ProcessNotices {
                 diagnostics: vec![warning_event("config warning")],
                 sandbox_warning: true,
                 auth_warning: Some("auth warning".to_string()),
@@ -10141,12 +10146,7 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         let expected_notices = main_notices(&world);
         let parity_warning = warning_event("session notice parity sentinel");
-        world
-            .local_session_notices
-            .as_mut()
-            .expect("a local world has a notice policy")
-            .diagnostics
-            .push(parity_warning);
+        world.process_notices.diagnostics.push(parity_warning);
         // Persist the session so the resume path below has a log on disk.
         persist_session(&mut world).await;
         let resumable = world.session().to_string();
@@ -23559,6 +23559,58 @@ mod tests {
         );
         assert_eq!(world.connection, Connection::Connected);
         assert_eq!(world.session(), target);
+        remote.shutdown().await;
+    }
+
+    /// The process's own notices are about this process, not about where the
+    /// session runs: a connected client shows the sandbox disclaimer like a
+    /// local run does, whether it attached a session or created one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn a_connected_client_reports_its_own_process_notices() {
+        let prev = std::env::var("AJ_DISABLE_SANDBOX_WARNING").ok();
+        // SAFETY: `#[serial]` keeps other env-mutating tests out; restored below.
+        unsafe {
+            std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING");
+        }
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (created, _) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
+        let created_notices = main_notices(&created);
+        let other = TempDir::new().expect("tempdir");
+        let (attached, _) = connect_world_and_shell(&other, &remote, &[]).await;
+        let attached_notices = main_notices(&attached);
+        // SAFETY: same serial scope as the remove above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", v),
+                None => std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING"),
+            }
+        }
+
+        for (mode, notices) in [("created", created_notices), ("attached", attached_notices)] {
+            assert_eq!(
+                notices
+                    .iter()
+                    .filter(|n| n.as_str() == aj_app::notices::SANDBOX_WARNING)
+                    .count(),
+                1,
+                "the {mode} session over a connection shows the sandbox disclaimer once: \
+                 {notices:?}",
+            );
+            let sandbox = notices
+                .iter()
+                .position(|n| n.as_str() == aj_app::notices::SANDBOX_WARNING)
+                .expect("checked above");
+            let dialed = notices
+                .iter()
+                .position(|n| n.starts_with("Connected to "))
+                .expect("the dialed line");
+            assert!(
+                sandbox < dialed,
+                "the process block leads the connection's own lines: {notices:?}",
+            );
+        }
         remote.shutdown().await;
     }
 
