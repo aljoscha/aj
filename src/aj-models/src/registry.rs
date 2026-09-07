@@ -24,8 +24,7 @@ const SEED_MODELS_JSON: &str = include_str!("../data/models.json");
 
 /// Bundled overrides: shallow patches that correct known upstream
 /// inaccuracies in the catalog, applied on every load (seed and user
-/// cache alike). Currently empty; kept as the seam for authored
-/// corrections when a source ships wrong data.
+/// cache alike).
 const OVERRIDES_JSON: &str = include_str!("../data/overrides.json");
 
 /// Bundled OpenAI Codex seed. The `openai-codex` provider points at
@@ -1420,6 +1419,12 @@ mod tests {
                 entry.target.id
             );
         }
+
+        let registry = ModelRegistry::from_catalog_with_overrides(seed, overrides, "seed");
+        let astra = registry
+            .get("openai", "gpt-6-astra")
+            .expect("gpt-6-astra present in seed");
+        assert!(astra.supports_verbosity);
     }
 
     /// The bundled seed's reasoning controls drive the adaptive
@@ -1471,43 +1476,35 @@ mod tests {
             assert_eq!(m.max_tokens, 128_000);
         }
 
-        // calls out the canonical id list; spot-check the
-        // headline entries.
         let ids: std::collections::HashSet<&str> = seed.iter().map(|m| m.id.as_str()).collect();
-        for expected in [
+        let expected: std::collections::HashSet<&str> = [
+            "gpt-6-astra",
             "gpt-5.2",
             "gpt-5.5",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
-        ] {
-            assert!(ids.contains(expected), "codex seed missing {expected}");
-        }
-        // gpt-5.4 and gpt-5.4-mini are hidden in the Codex picker, so they
-        // are intentionally absent from the seed.
-        assert!(!ids.contains("gpt-5.4"), "gpt-5.4 must stay dropped");
-        assert!(
-            !ids.contains("gpt-5.4-mini"),
-            "gpt-5.4-mini must stay dropped"
-        );
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(ids, expected, "codex seed must match the visible catalog");
 
-        // Context windows are unified at 400k, the real gpt-5 window. The
-        // Codex client itself reports a lower 272k figure, but that's an
-        // artificial cost/compaction cap, not the model's true capacity.
+        // Catalog context windows describe model capacity rather than the
+        // lower compaction caps exposed by the Codex client.
         for m in &seed {
-            assert_eq!(
-                m.context_window, 400_000,
-                "unexpected context_window for {}",
-                m.id
-            );
+            let expected = if m.id == "gpt-5.2" {
+                400_000
+            } else {
+                1_050_000
+            };
+            assert_eq!(m.context_window, expected, "context_window for {}", m.id);
         }
 
-        // The gpt-5.5 and gpt-5.6 families carry a context tier that fires
-        // above 272k input tokens, reachable within the 400k window.
-        // gpt-5.2 is flat-rate with no tier.
+        // Every model after gpt-5.2 carries a context tier that fires above
+        // 272k input tokens. gpt-5.2 remains flat-rate.
         for m in &seed {
             match m.id.as_str() {
-                "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => {
+                "gpt-6-astra" | "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => {
                     assert_eq!(
                         m.cost.tiers.len(),
                         1,
@@ -1522,6 +1519,37 @@ mod tests {
                 }
                 _ => assert!(m.cost.tiers.is_empty(), "{} must have no tiers", m.id),
             }
+        }
+    }
+
+    #[test]
+    fn codex_seed_tracks_matching_openai_catalog_metadata() {
+        let openai: Catalog = serde_json::from_str(SEED_MODELS_JSON).expect("seed parses");
+
+        for codex in bundled_codex_seed() {
+            let native = openai
+                .models
+                .iter()
+                .find(|model| model.provider == "openai" && model.id == codex.id)
+                .unwrap_or_else(|| panic!("openai catalog missing {}", codex.id));
+
+            assert_eq!(codex.family, native.family, "family for {}", codex.id);
+            assert_eq!(
+                codex.input, native.input,
+                "input modalities for {}",
+                codex.id
+            );
+            assert_eq!(codex.cost, native.cost, "cost for {}", codex.id);
+            assert_eq!(
+                codex.context_window, native.context_window,
+                "context window for {}",
+                codex.id
+            );
+            assert_eq!(
+                codex.max_tokens, native.max_tokens,
+                "max output tokens for {}",
+                codex.id
+            );
         }
     }
 

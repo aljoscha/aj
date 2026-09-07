@@ -1,3 +1,14 @@
 {
-  "overrides": []
+  "overrides": [
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-6-astra"
+      },
+      "patch": {
+        "supports_verbosity": true
+      },
+      "reason": "models.dev does not carry verbosity capability; OpenAI Codex advertises it for GPT-6 Astra"
+    }
+  ]
 }

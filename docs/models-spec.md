@@ -841,8 +841,8 @@ model by overrides (§3.4.4).
 `supports_verbosity` is likewise not in models.dev. The mapper derives
 it: `true` for the OpenAI gpt-5 family on `openai-responses`, and from
 OpenRouter's `supported_parameters` (the `"verbosity"` entry) for
-OpenRouter models. The Codex seed hand-sets it (§3.4.7) and overrides
-pin exceptions (§3.4.4).
+OpenRouter models. The Codex seed hand-sets it (§3.4.7), and overrides
+pin newer OpenAI models that support it (§3.4.4).
 
 On fetch failure (network error, non-200, parse failure), the
 command exits non-zero and leaves `~/.aj/models.json` untouched —
@@ -935,24 +935,21 @@ already contain only filtered entries, so the load path does not
 re-filter.
 
 **Codex models are seeded by hand, not from models.dev.** The
-`openai-codex` provider's model list (`gpt-5.2`, `gpt-5.5`, and the
-`gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna` family) is not exposed by
-models.dev. The refresh CLI (§3.4.5) preserves the existing Codex
-entries on every run: it filters them out of the upstream diff and
-re-emits them from a small seed list maintained alongside the overrides
-file. The seed tracks the codex backend's own model manifest, so it
-changes as models are added or retired. `context_window` is `400000`,
-the real gpt-5 window: the codex client reports a lower `272000`, but
-that is an artificial cost/compaction cap, not the model's capacity.
-`max_tokens` is `128000`; pricing is hand-curated in the seed, mirroring
-the models.dev base rates for the matching `openai` model.
+`openai-codex` provider's visible model list (`gpt-6-astra`, `gpt-5.2`,
+`gpt-5.5`, and the `gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna` family)
+is not exposed by models.dev. The refresh CLI (§3.4.5) preserves the
+existing Codex entries on every run: it filters them out of the upstream
+diff and re-emits them from a small seed list maintained alongside the
+overrides file. The seed tracks the Codex backend's own model manifest,
+so it changes as visible models are added or retired. Context windows and
+pricing mirror the matching `openai` model in models.dev rather than the
+Codex client's lower compaction cap. `max_tokens` is `128000`.
 
-Context pricing tiers (§3.3) are hand-added to the `gpt-5.5` and
-`gpt-5.6` families, whose published rates roughly double above a
-`272000`-token input tier that the `400000` window can clear. `gpt-5.2`
-is flat-rate with no tier. This assumes the codex backend enforces the
-declared `context_window`, `calculate_cost` does not itself clamp usage
-to the window.
+Context pricing tiers (§3.3) are hand-added to every model after
+`gpt-5.2`, whose published rates increase above a `272000`-token input
+tier. `gpt-5.2` is flat-rate with no tier. This assumes the Codex backend
+enforces the declared `context_window`; `calculate_cost` does not itself
+clamp usage to the window.
 
 ---
 

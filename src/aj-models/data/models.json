@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "updated_at": 1788340256740,
+  "updated_at": 1788772883942,
   "source": "models.dev",
   "models": [
     {
@@ -1441,6 +1441,49 @@
             "output": 18.0,
             "cache_read": 0.4,
             "cache_write": 5.0
+          }
+        ]
+      },
+      "context_window": 1050000,
+      "max_tokens": 128000
+    },
+    {
+      "id": "gpt-6-astra",
+      "name": "GPT-6 Astra",
+      "family": "gpt-astra",
+      "api": "openai-responses",
+      "provider": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 20.0,
+            "output": 75.0,
+            "cache_read": 2.0,
+            "cache_write": 25.0
           }
         ]
       },
