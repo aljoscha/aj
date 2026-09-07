@@ -2477,7 +2477,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead as _, BufReader as StdBufReader};
+    use std::io::BufReader as StdBufReader;
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{self, Receiver};
     use std::thread::JoinHandle;
