@@ -258,7 +258,9 @@ impl Client {
 /// The consumer must distinguish three channels:
 /// - a transport-level read error is surfaced as
 ///   [`ClientError::InternalError`].
-/// - the `[DONE]` sentinel ends the stream cleanly (see [`parse_sse_event`]).
+/// - the `[DONE]` sentinel is dropped, not yielded (see [`parse_sse_event`]).
+///   The stream itself ends when the server closes the connection or the
+///   consumer stops polling at its own terminal event.
 /// - a protocol-level `error` event is not a transport error. It
 ///   deserializes into the event type (e.g. `ResponseStreamEvent::Error`)
 ///   and is yielded as `Ok` for the consumer to classify.
@@ -282,11 +284,12 @@ where
 
 /// Parse one SSE `data` payload into a stream item.
 ///
-/// `None` signals a clean end of stream: the `[DONE]` sentinel is the
+/// `None` means the payload yields no item: the `[DONE]` sentinel is the
 /// Chat Completions terminator, and is accepted harmlessly on the
 /// Responses path too, where completion is instead signaled by a
-/// `response.completed` event. A payload that isn't the expected event
-/// shape becomes [`ClientError::ParseError`].
+/// `response.completed` event. `None` does not end the stream; the caller
+/// filters it out and keeps reading until the connection closes. A payload
+/// that isn't the expected event shape becomes [`ClientError::ParseError`].
 fn parse_sse_event<T: serde::de::DeserializeOwned>(data: &str) -> Option<Result<T, ClientError>> {
     if data == "[DONE]" {
         return None;
@@ -415,7 +418,7 @@ mod tests {
     #[test]
     fn parse_sse_event_handles_done_parse_and_error() {
         // The body both streaming endpoints share via parse_sse_stream:
-        // [DONE] ends the stream, a well-formed payload parses, and a
+        // [DONE] yields nothing, a well-formed payload parses, and a
         // malformed one becomes a ParseError.
         assert!(parse_sse_event::<serde_json::Value>("[DONE]").is_none());
 
