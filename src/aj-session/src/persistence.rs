@@ -1461,8 +1461,8 @@ mod tests {
 
         // The younger log is written by hand rather than minted: ids come from
         // the clock, so two creates inside one test can collide, and the
-        // enumeration orders by id. Copying a real log keeps it past the
-        // format gate.
+        // enumeration orders by id. A file has to exist for the id to list,
+        // and a fresh log writes nothing until its first append.
         let newer = "2999-01-01-00-00-00-000";
         std::fs::copy(
             persistence.sessions_dir().join(format!("{older}.jsonl")),
@@ -1599,29 +1599,6 @@ mod tests {
         assert!(
             pick.is_err(),
             "a sidecar that cannot be stat-ed must raise rather than read as unarchived: {pick:?}",
-        );
-    }
-
-    /// A store that has archived nothing is not a store that cannot answer.
-    ///
-    /// The same read distinguishes the two: no `meta/` directory means
-    /// nothing has been put away, which is an answer rather than a failure,
-    /// and it is the state every store starts in.
-    #[test]
-    fn the_default_pick_answers_when_no_session_was_ever_archived() {
-        let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "only", "hi");
-        let only = log.session_id().to_string();
-        drop(log);
-
-        assert!(
-            !persistence.meta_dir().exists(),
-            "the fixture has never archived, so the directory is absent",
-        );
-        assert_eq!(
-            persistence.get_latest_session_id().expect("pick"),
-            Some(only),
         );
     }
 

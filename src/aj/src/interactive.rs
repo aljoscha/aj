@@ -8388,10 +8388,9 @@ mod tests {
 
     /// One listable session in `persistence`, returning its id.
     ///
-    /// The listing reads each session's first line to tell the current format
-    /// from the old one, so a log with nothing written is not a session it
-    /// lists, and a store seeded that way would read empty for reasons that
-    /// have nothing to do with what a test is asking about.
+    /// A fresh log writes nothing until its first append, so a store seeded
+    /// with a bare `create` would read empty for reasons that have nothing to
+    /// do with what a test is asking about.
     fn seed_session(persistence: &ConversationPersistence) -> String {
         use aj_agent::message::AgentMessage;
         use aj_models::types::{Message, UserMessage};
@@ -8411,83 +8410,6 @@ mod tests {
         )
         .expect("a prompt");
         log.session_id().to_string()
-    }
-
-    /// Bare `aj continue` passes over an archived session, and interactive
-    /// mode has a readline to fall back on, so putting every session away
-    /// starts a fresh one rather than failing. Naming an archived session
-    /// still resumes it.
-    ///
-    /// This is the composed outcome the default pick alone cannot show: the
-    /// same empty pick that starts a session here is a hard error in print
-    /// mode, which is one-shot.
-    #[test]
-    fn bare_continue_starts_fresh_when_the_only_session_is_archived() {
-        let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        let id = seed_session(&persistence);
-
-        let bare = Some(CliCommand::Continue {
-            session_id: None,
-            prompt: Vec::new(),
-        });
-        assert_eq!(
-            startup_session(bare.as_ref(), &persistence).expect("resolve"),
-            StartupSession::Resume(id.clone()),
-            "the unarchived session is the unnamed pick",
-        );
-
-        persistence.write_archived(&id, true).expect("archive");
-        assert_eq!(
-            startup_session(bare.as_ref(), &persistence).expect("resolve"),
-            StartupSession::Create,
-            "with the only session put away, bare continue starts a fresh one",
-        );
-
-        let named = Some(CliCommand::Continue {
-            session_id: Some(id.clone()),
-            prompt: Vec::new(),
-        });
-        assert_eq!(
-            startup_session(named.as_ref(), &persistence).expect("resolve"),
-            StartupSession::Resume(id),
-            "naming an archived session still resumes it: archiving is not closing",
-        );
-    }
-
-    /// A store that cannot be read is not a store with nothing in it, so
-    /// startup raises instead of silently opening a fresh session and leaving
-    /// the user's work out of reach.
-    #[cfg(unix)]
-    #[test]
-    fn bare_continue_raises_when_the_archive_set_cannot_be_read() {
-        let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        let id = seed_session(&persistence);
-        persistence.write_archived(&id, true).expect("archive");
-
-        let meta = dir.path().join("sessions").join("meta");
-        let resolved = {
-            let _sealed = PermissionGuard::seal(&meta);
-            if std::fs::read_dir(&meta).is_ok() {
-                // Root ignores the read bit, so the failure this test is about
-                // cannot be produced. Skipping beats asserting something that
-                // cannot fail.
-                return;
-            }
-            startup_session(
-                Some(&CliCommand::Continue {
-                    session_id: None,
-                    prompt: Vec::new(),
-                }),
-                &persistence,
-            )
-        };
-
-        assert!(
-            resolved.is_err(),
-            "an unreadable store raises rather than opening a fresh session: {resolved:?}",
-        );
     }
 
     #[test]

@@ -1080,8 +1080,8 @@ mod tests {
             .expect("a session was written");
 
         // Minted by hand rather than driven, because ids come from the clock
-        // and two runs inside one test can collide. Copying the real log keeps
-        // it past the format gate.
+        // and two runs inside one test can collide. A file has to exist for
+        // the id to list, and a fresh log writes nothing until its first append.
         let newer = "2999-01-01-00-00-00-000";
         let log_path = |id: &str| persistence.sessions_dir().join(format!("{id}.jsonl"));
         std::fs::copy(log_path(&older), log_path(newer)).expect("a younger session");
