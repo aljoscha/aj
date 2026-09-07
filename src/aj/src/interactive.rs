@@ -740,7 +740,7 @@ async fn open_stream(
     control: &Control,
     directory: &mut SessionDirectory,
 ) -> Result<Stream, ControlError> {
-    let stream = control.attach_all(&directory.attach_requests(None)).await?;
+    let stream = control.attach_all(&directory.attach_requests()).await?;
     directory.expect_attach(|session| stream.attached(session));
     Ok(stream)
 }
@@ -19278,6 +19278,89 @@ mod tests {
             rows.iter()
                 .any(|entry| entry.id == world.session() && entry.live),
             "and the focused session is live too",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A ninth visited session replaces the least recently focused attachment.
+    /// The replacement stream omits that session, so the host can release it,
+    /// while its directory row remains available for an ordinary later focus.
+    #[tokio::test]
+    async fn visiting_past_the_working_set_releases_and_can_reopen_the_oldest_session() {
+        const GRACE: Duration = Duration::from_millis(200);
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app_with_idle_grace(&dir, "streaming-text", default_layers(), Some(GRACE))
+                .await;
+        // Only persisted sessions are releasable. This also gives the first
+        // session a row that must survive its working-set entry.
+        run_prompt(&mut world, "seed").await;
+        let oldest = world.session().to_string();
+
+        // Eight admissions after the initial session cross the bound of eight.
+        for visit in 1..=8 {
+            let moved = apply_focus_request(
+                &mut app,
+                &shell,
+                &mut world,
+                FocusRequest::Create { host: None },
+            )
+            .await;
+            assert!(matches!(moved, Focus::Moved), "visit {visit} did not move");
+            assert_eq!(
+                settle_pending_transition(&mut app, &shell, &mut world).await,
+                CatchUp::Caught,
+                "visit {visit} did not attach",
+            );
+        }
+        assert!(
+            !world.directory.is_attached(&oldest),
+            "the least recently focused session stayed in the working set",
+        );
+        assert!(
+            poll_row(&mut world, &shell, &oldest, |_| true).await,
+            "the evicted session lost its directory row",
+        );
+
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let oldest_row = world
+                .host()
+                .sessions()
+                .await
+                .expect("session list")
+                .sessions
+                .into_iter()
+                .find(|row| row.id == oldest)
+                .expect("the evicted session remains listed");
+            if !oldest_row.live {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the evicted session was never released"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(oldest.clone()),
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Caught,
+            "the evicted session did not reattach",
+        );
+        assert_eq!(world.session(), oldest);
+        assert_eq!(
+            user_messages(&world),
+            vec!["seed"],
+            "the reattached session did not restore its transcript",
         );
         shut_down(&world).await;
     }

@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 2 LOOKs.
+retired 3 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,13 +29,13 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 25 open)
+## LOOK (27 total, 24 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
 - ~~`94334b1` 2026-08-04 aj-app,aj-session: serve a list refresh from caches, not from the store~~ Retired by `e2c349d`.
 - ~~`529fd4e` 2026-08-05 aj-app: refresh the directory from memory, and only publish changes~~ Retired: list fan-out now retains one current payload rather than one full copy per subscriber.
-- `84db84e` 2026-08-06 aj-app,aj: bound the working set, and fix what two reviews found
+- ~~`84db84e` 2026-08-06 aj-app,aj: bound the working set, and fix what two reviews found~~ Retired: focus now solely owns the bounded MRU set, and attach requests serialize it directly.
 - `34fcbd8` 2026-08-07 aj-app,aj: set a session's tag from the host and the control port
 - `b57241c` 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar
 - `c4a59be` 2026-08-07 aj: make the sidebar's working set and hosts legible
@@ -127,7 +127,8 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why: Corrects 94334b1's premise but keeps its whole cache apparatus (`SessionStore`, `ColdSessions`, `Fingerprint`, `Derived`) and adds more: `note_released`, `ReleasedMark` flowing from driver to store, a rule that a session that cannot produce a mark is not released, and a test-only `directory_reads: AtomicU64` counter exposed as `ColdSessions::directory_reads` and `SessionHost::store_directory_reads` in production code. The `list` dedup is per subscriber (`sent_list: Option<Vec<SessionSummary>>` cloned into every `Subscriber`, `offer_list`) to cover a fresh subscriber and a dropped frame. The body runs nine paragraphs to justify invariants ("a session is either live or rowed, never neither") that exist because the directory is now a second source of truth held in memory beside the store.
 - Simpler shape: publish the directory only when it changed (one comparison at the publisher against the last published payload) and serve the latest payload on subscriber registration, with the store enumerated only at the rare external points; drop the fingerprint cache once the tick no longer scans.
 
-### 84db84e 2026-08-06 aj-app,aj: bound the working set, and fix what two reviews found
+### 84db84e 2026-08-06 aj-app,aj: bound the working set, and fix what two reviews found [RETIRED]
+- Status: Retired. `SessionDirectory::focus` now solely owns recency and eviction, while `attach_requests` serializes the resulting working set. The prospective admission and narrowed-attach paths are gone. Directory and composed host/client coverage pin eviction, release, retained rows, successful reattachment, and transcript restoration.
 - Stats: 4 files, +734 -243, ~320 prod / ~415 test lines (estimate: added lines after `mod tests` in directory.rs/interactive.rs plus remote/tests.rs)
 - Body: Long. Bounds background attachment to WORKING_SET=8 (LRU vector), plus three review-found bugs, four non-discriminating tests rewritten, a hang-only rule given a test, and an API cleanup.
 - Verdict: LOOK

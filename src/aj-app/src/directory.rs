@@ -458,28 +458,27 @@ impl SessionDirectory {
         }
     }
 
-    /// Move focus to `session`, swapping its transcript into `focused_chat`,
-    /// and answer the session this displaced from the working set.
+    /// Move focus to `session`, swapping its transcript into `focused_chat`.
     ///
     /// `mint` builds the transcript for a session focused for the first time,
     /// which is also what attaches it. It runs only in that case, so
     /// a caller can put whatever a fresh transcript costs behind it.
     ///
-    /// A displaced session is detached, which takes effect when the caller
-    /// reopens its stream over [`Self::attach_requests`] without it. Its
-    /// transcript is dropped: re-attach reconciliation absorbs a rebuild, so
-    /// keeping it would buy nothing a cursor does not.
+    /// If the admission fills the working set, its least recently focused
+    /// session is dropped. Reopening the stream over [`Self::attach_requests`]
+    /// then detaches it from the peer. Its row and attention state remain, and
+    /// re-attach reconciliation absorbs rebuilding its transcript.
     ///
     /// Focusing the already-focused session leaves everything alone rather than
-    /// cycling its transcript out and back, and displaces nothing.
+    /// cycling its transcript out and back.
     pub fn focus(
         &mut self,
         focused_chat: &mut ChatState,
         session: &str,
         mint: impl FnOnce() -> ChatState,
-    ) -> Option<String> {
+    ) {
         if session == self.focused() {
-            return None;
+            return;
         }
         // The incoming entry goes to the front, which pushes the session being
         // left to index 1 either way. Taking the incoming transcript before
@@ -527,13 +526,9 @@ impl SessionDirectory {
         // because dropping an entry before that would take the transcript with
         // it.
         self.retire_archived(session);
-        // NOTE: the truncation here and the one `attach_requests` applies to
-        // the same admission have to agree, or the reopened stream would name a
-        // session this no longer folds (or drop one it does). Both keep the
-        // first `WORKING_SET` entries after the incoming session takes the
-        // front, and only one session is ever admitted at a time.
-        (self.attached.len() > WORKING_SET)
-            .then(|| self.attached.pop().expect("longer than the bound").session)
+        // The vector is in recency order, so truncation drops only the least
+        // recently focused sessions. Rows and attention state live outside it.
+        self.attached.truncate(WORKING_SET);
     }
 
     /// Whether the working set may hold `session` while `keep` is the one the
@@ -727,80 +722,21 @@ impl SessionDirectory {
         }
     }
 
-    /// The attach set to open a stream over, each session offering its own
-    /// cursor, focused first.
+    /// The current working set as attach requests, each session offering its
+    /// own cursor.
     ///
     /// One stream carries all of them, because a stream serves the set it was
     /// opened with and a client that lost one lost them all. The
-    /// focused session comes first so its catch-up is the first block on the new
-    /// stream, which is the one the user is waiting to see.
-    ///
-    /// `admitting` names a session about to be focused, so the answer is the set
-    /// that focus will leave: the new session first, and the session it
-    /// displaces from the working set absent, which is how the reopen detaches
-    /// it. Pass `None` to re-attach the set as it stands.
-    ///
-    /// An admitted session leads whether or not it is already attached, and is
-    /// named exactly once. A reset on a background session reopens the stream
-    /// admitting a session the set already holds, and the consumer waits for
-    /// the admitted session's catch-up before it paints the switch.
-    ///
-    /// Archived sessions are passed over, so the stream this opens is what
-    /// detaches them. The admitted one is named regardless: a user who focuses
-    /// an archived session is asking to work in it, and a focus that attached
-    /// nothing would leave the frontend on a transcript no stream feeds.
-    pub fn attach_requests(&self, admitting: Option<&str>) -> Vec<AttachRequest> {
-        let mut requests = Vec::with_capacity(WORKING_SET);
-        if let Some(session) = admitting {
-            requests.push(AttachRequest {
-                session: session.to_string(),
-                // A session already in the set offers what it folded, so the
-                // reopen serves it a suffix rather than a whole history.
-                cursor: self.client_for(session).and_then(|client| client.cursor()),
-            });
-        }
-        let kept = admitting.unwrap_or_else(|| self.focused());
-        let room = WORKING_SET - requests.len();
-        requests.extend(
-            self.attached
-                .iter()
-                .filter(|attached| Some(attached.session.as_str()) != admitting)
-                .filter(|attached| self.held(&attached.session, kept))
-                .take(room)
-                .map(|attached| AttachRequest {
-                    session: attached.session.clone(),
-                    cursor: attached.client.cursor(),
-                }),
-        );
-        requests
-    }
-
-    /// Drop every attached session except `keep`, which is what a narrowed
-    /// re-attach leaves behind on the peer, and answer the ids dropped.
-    ///
-    /// A dropped session stops being folded here, so a later focus onto it
-    /// takes the full attach path and re-attaches it rather than swapping to a
-    /// transcript the stream no longer feeds. Its `list` row and its viewed
-    /// stamp both stay: the session is still one the user is meant to be aware
-    /// of, and being detached does not make the output it produced while they
-    /// were away seen.
-    ///
-    /// The focused session is never dropped, `keep` or not. Its transcript is
-    /// the one on loan to the frontend and this type cannot repoint that cell,
-    /// so dropping it would leave the frontend rendering a session nothing
-    /// folds. In practice `keep` is the focused session, and a caller that
-    /// narrows onto another one gets both back.
-    pub fn drop_all_but(&mut self, keep: &str) -> Vec<String> {
-        let focused = self.focused().to_string();
-        let mut dropped = Vec::new();
-        self.attached.retain(|attached| {
-            if attached.session == keep || attached.session == focused {
-                return true;
-            }
-            dropped.push(attached.session.clone());
-            false
-        });
-        dropped
+    /// focused session comes first because [`Self::focus`] owns that order. Its
+    /// catch-up is therefore the first block on a newly opened stream.
+    pub fn attach_requests(&self) -> Vec<AttachRequest> {
+        self.attached
+            .iter()
+            .map(|attached| AttachRequest {
+                session: attached.session.clone(),
+                cursor: attached.client.cursor(),
+            })
+            .collect()
     }
 
     /// A background session's parked transcript, `None` for the focused session
@@ -1082,18 +1018,6 @@ mod tests {
             .iter()
             .find(|row| row.id == id)
             .is_some_and(|row| directory.is_unseen(row))
-    }
-
-    /// Exactly the focused entry's transcript is on loan to the frontend.
-    fn transcripts_are_on_loan_once(directory: &SessionDirectory) {
-        for (index, attached) in directory.attached.iter().enumerate() {
-            assert_eq!(
-                attached.chat.is_none(),
-                index == 0,
-                "{} holds the wrong side of the transcript loan",
-                attached.session,
-            );
-        }
     }
 
     /// A directory focused on `FOCUSED` with `OTHER` attached in the
@@ -1586,11 +1510,14 @@ mod tests {
     fn visiting_past_the_bound_drops_the_least_recently_focused() {
         let mut directory = SessionDirectory::new("session-0".to_string());
         let mut focused_chat = chat();
+        let rows = (0..=WORKING_SET)
+            .map(|n| row(&format!("session-{n}"), false, 0))
+            .collect();
+        let _ = directory.apply(&mut focused_chat, list(rows));
 
         // Fill the set exactly. Nothing is displaced on the way.
         for n in 1..WORKING_SET {
-            let displaced = directory.focus(&mut focused_chat, &format!("session-{n}"), chat);
-            assert_eq!(displaced, None, "the set had room at {n}");
+            directory.focus(&mut focused_chat, &format!("session-{n}"), chat);
         }
         for n in 0..WORKING_SET {
             assert!(directory.is_attached(&format!("session-{n}")));
@@ -1598,11 +1525,22 @@ mod tests {
 
         // One more, so the oldest focus goes. `session-0` was focused first and
         // never again, so it is the one.
-        let displaced = directory.focus(&mut focused_chat, "session-8", chat);
-        assert_eq!(displaced, Some("session-0".to_string()));
+        directory.focus(&mut focused_chat, "session-8", chat);
         assert!(!directory.is_attached("session-0"));
         assert!(directory.is_attached("session-8"));
-        assert_eq!(directory.attach_requests(None).len(), WORKING_SET);
+        assert!(
+            directory.rows().iter().any(|row| row.id == "session-0"),
+            "eviction removed the row that keeps the session visible",
+        );
+        let requests = directory.attach_requests();
+        assert_eq!(requests.len(), WORKING_SET);
+        assert_eq!(requests[0].session, "session-8");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.session != "session-0"),
+            "the replacement stream would keep serving the evicted session",
+        );
 
         // Re-focusing a session in the set renews it, so the next admission
         // takes the one that has now gone longest without focus.
@@ -1612,11 +1550,10 @@ mod tests {
         directory.focus(&mut focused_chat, "session-8", || {
             panic!("still in the set")
         });
-        let displaced = directory.focus(&mut focused_chat, "session-9", chat);
-        assert_eq!(
-            displaced,
-            Some("session-2".to_string()),
-            "renewing session-1 moved the axe onto session-2",
+        directory.focus(&mut focused_chat, "session-9", chat);
+        assert!(
+            !directory.is_attached("session-2"),
+            "renewing session-1 moved the eviction candidate onto session-2",
         );
         assert!(directory.is_attached("session-1"));
     }
@@ -1647,20 +1584,6 @@ mod tests {
             "archiving the session on screen detached it, so the user lost what they were reading",
         );
 
-        // The reopen this focus asks for is what detaches it on the peer, so
-        // the set that reopen names has to leave it out already. Asked before
-        // the focus, which is the order the caller works in.
-        let leaving = directory.attach_requests(Some("session-0"));
-        let named: Vec<&str> = leaving
-            .iter()
-            .map(|request| request.session.as_str())
-            .collect();
-        assert_eq!(
-            named,
-            vec!["session-0"],
-            "the reopen still names the archived session, so the host keeps holding it",
-        );
-
         directory.focus(&mut focused_chat, "session-0", || {
             panic!("still in the set")
         });
@@ -1668,7 +1591,7 @@ mod tests {
             !directory.is_attached("session-1"),
             "the archived session is still in the working set, holding a lock the host could release",
         );
-        let requests = directory.attach_requests(None);
+        let requests = directory.attach_requests();
         let named: Vec<&str> = requests
             .iter()
             .map(|request| request.session.as_str())
@@ -1699,7 +1622,8 @@ mod tests {
             ]),
         );
 
-        let requests = directory.attach_requests(Some("session-1"));
+        directory.focus(&mut focused_chat, "session-1", chat);
+        let requests = directory.attach_requests();
         let named: Vec<&str> = requests
             .iter()
             .map(|request| request.session.as_str())
@@ -1708,10 +1632,9 @@ mod tests {
             named[0], "session-1",
             "the session being focused was passed over for being archived: {named:?}",
         );
-        directory.focus(&mut focused_chat, "session-1", chat);
         assert!(
             directory.is_attached("session-1"),
-            "and the focus itself dropped it",
+            "the focus itself dropped it",
         );
     }
 
@@ -1731,7 +1654,10 @@ mod tests {
         // archived, so the two must be treated alike.
         let _ = directory.apply(&mut focused_chat, list(vec![row("session-1", false, 1)]));
 
-        let requests = directory.attach_requests(Some("session-0"));
+        directory.focus(&mut focused_chat, "session-0", || {
+            panic!("still in the set")
+        });
+        let requests = directory.attach_requests();
         let named: Vec<&str> = requests
             .iter()
             .map(|request| request.session.as_str())
@@ -1745,10 +1671,6 @@ mod tests {
             !directory.would_retire("session-0"),
             "leaving would drop a session nothing says is archived",
         );
-
-        directory.focus(&mut focused_chat, "session-0", || {
-            panic!("still in the set")
-        });
         assert!(
             directory.is_attached("session-1"),
             "a session the peer has published no row for was dropped as archived",
@@ -1805,7 +1727,7 @@ mod tests {
             }]),
         );
 
-        let requests = directory.attach_requests(None);
+        let requests = directory.attach_requests();
         let named: Vec<&str> = requests
             .iter()
             .map(|request| request.session.as_str())
@@ -2572,102 +2494,6 @@ mod tests {
         );
     }
 
-    /// The attach set a focus will leave is what the caller must attach, so the
-    /// session about to be displaced is already absent from it and the session
-    /// coming in is first. Naming the displaced session would keep the peer
-    /// holding it, and naming the incoming one last would gate the switch's
-    /// first paint behind every other session's backfill.
-    #[test]
-    fn the_attach_set_for_a_focus_leads_with_it_and_omits_what_it_displaces() {
-        let mut directory = SessionDirectory::new("session-0".to_string());
-        let mut focused_chat = chat();
-        for n in 1..WORKING_SET {
-            directory.focus(&mut focused_chat, &format!("session-{n}"), chat);
-        }
-
-        let requests = directory.attach_requests(Some("session-8"));
-        let named: Vec<&str> = requests.iter().map(|r| r.session.as_str()).collect();
-        assert_eq!(named.len(), WORKING_SET);
-        assert_eq!(
-            named[0], "session-8",
-            "the session being focused leads, so its block is served first",
-        );
-        assert!(
-            !named.contains(&"session-0"),
-            "the displaced session is unnamed, which is what detaches it: {named:?}",
-        );
-        assert_eq!(
-            requests[0].cursor, None,
-            "a session never attached offers no cursor",
-        );
-
-        // And the answer agrees with what the focus actually does.
-        let displaced = directory.focus(&mut focused_chat, "session-8", chat);
-        assert_eq!(displaced, Some("session-0".to_string()));
-        assert_eq!(
-            directory
-                .attach_requests(None)
-                .iter()
-                .map(|r| r.session.clone())
-                .collect::<Vec<_>>(),
-            named.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-            "the set predicted for the focus is the set the focus left",
-        );
-    }
-
-    /// A session already in the working set leads the attach set just the same
-    /// when it is the one being admitted, and is named once. A `reset` on a
-    /// background session drives exactly this: the reopen admits a session the
-    /// set already holds, and the consumer waits for that session's catch-up
-    /// before it paints the switch, so leading with another session gates the
-    /// first paint behind an unrelated backfill.
-    #[test]
-    fn the_attach_set_leads_with_an_admitted_session_already_attached() {
-        let (mut directory, mut focused_chat) = two_sessions();
-        // A position to offer, so leading with `OTHER` cannot be confused with
-        // the fresh-admission path, which offers none.
-        for seq in [3, 4] {
-            let _ = directory.apply(&mut focused_chat, durable(OTHER, seq, "background"));
-        }
-        // A third session, so "leads with the admitted one" cannot pass by
-        // luck: with two entries an arbitrary order is right half the time.
-        directory.focus(&mut focused_chat, "session-third", chat);
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
-
-        let requests = directory.attach_requests(Some(OTHER));
-        let named: Vec<String> = requests.iter().map(|r| r.session.clone()).collect();
-        assert_eq!(
-            named,
-            vec![
-                OTHER.to_string(),
-                FOCUSED.to_string(),
-                "session-third".to_string(),
-            ],
-            "the admitted session leads and is named once",
-        );
-        assert_eq!(
-            requests[0].cursor.as_ref().map(|c| c.seq),
-            Some(3),
-            "an admitted session already folding offers the position it reached",
-        );
-
-        // And the answer agrees, as a set, with what the focus leaves.
-        let displaced = directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
-        assert_eq!(displaced, None, "an attached session displaces nothing");
-        let mut left: Vec<String> = directory
-            .attach_requests(None)
-            .into_iter()
-            .map(|r| r.session)
-            .collect();
-        let mut predicted = named;
-        left.sort();
-        predicted.sort();
-        assert_eq!(
-            left, predicted,
-            "the set predicted for the focus is the set the focus left",
-        );
-    }
-
     /// A re-attach carries every session this client folds, each with its own
     /// cursor, focused first. One stream serves the whole set, so offering a
     /// single session's cursor would silently drop the rest.
@@ -2688,7 +2514,7 @@ mod tests {
         directory.focus(&mut focused_chat, "session-third", chat);
         directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
 
-        let requests = directory.attach_requests(None);
+        let requests = directory.attach_requests();
         assert_eq!(
             requests
                 .iter()
@@ -2703,77 +2529,5 @@ mod tests {
             Some(3),
             "the background session offers its own position, not the focused one's",
         );
-    }
-
-    /// A narrowed re-attach leaves the peer holding one session, so the rest
-    /// have to leave the working set: a later focus onto one of them must take
-    /// the attach path rather than swapping onto a transcript nothing feeds.
-    /// Their rows and their viewed positions both survive, because a detached
-    /// session is still one the user is meant to be aware of.
-    #[test]
-    fn dropping_all_but_one_detaches_the_rest_and_keeps_what_they_owe() {
-        let (mut directory, mut focused_chat) = two_sessions();
-        directory.focus(&mut focused_chat, "session-third", chat);
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![
-                row(FOCUSED, false, 0),
-                row(OTHER, false, 7),
-                row("session-third", false, 0),
-            ]),
-        );
-        assert!(
-            unseen(&directory, OTHER),
-            "`OTHER` moved on after the user left it",
-        );
-
-        let dropped = directory.drop_all_but(FOCUSED);
-
-        assert_eq!(
-            dropped,
-            vec!["session-third".to_string(), OTHER.to_string()],
-            "dropped in the order they were held, most recently focused first",
-        );
-        assert!(!directory.is_attached(OTHER));
-        assert!(!directory.is_attached("session-third"));
-        assert!(directory.is_attached(FOCUSED));
-        transcripts_are_on_loan_once(&directory);
-        assert_eq!(
-            directory.rows().len(),
-            3,
-            "a detached session is still one the peer lists",
-        );
-        assert!(
-            unseen(&directory, OTHER),
-            "being detached does not make what happened while away seen",
-        );
-
-        // A later focus onto a dropped session takes the attach path.
-        let mut minted = false;
-        directory.focus(&mut focused_chat, OTHER, || {
-            minted = true;
-            chat()
-        });
-        assert!(minted, "the dropped session is attached afresh");
-        transcripts_are_on_loan_once(&directory);
-    }
-
-    /// The focused session survives a drop that does not name it. Its
-    /// transcript is the one on loan to the frontend, and this type cannot
-    /// repoint that cell, so dropping it would leave the frontend rendering a
-    /// session nothing folds.
-    #[test]
-    fn dropping_all_but_a_background_session_spares_the_focused_one() {
-        let (mut directory, mut focused_chat) = two_sessions();
-        directory.focus(&mut focused_chat, "session-third", chat);
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
-
-        let dropped = directory.drop_all_but(OTHER);
-
-        assert_eq!(dropped, vec!["session-third".to_string()]);
-        assert!(directory.is_attached(FOCUSED));
-        assert!(directory.is_attached(OTHER));
-        transcripts_are_on_loan_once(&directory);
     }
 }
