@@ -229,35 +229,6 @@ pub struct ProviderAccounts {
     pub accounts: Vec<(String, AuthCredential)>,
 }
 
-impl ProviderAccounts {
-    /// Consume this account set as typed credential snapshots.
-    pub fn into_snapshots(self) -> Vec<AccountSnapshot> {
-        self.accounts
-            .into_iter()
-            .map(|(label, credential)| AccountSnapshot { label, credential })
-            .collect()
-    }
-}
-
-/// One exact labeled credential returned by [`AuthStorage::accounts`].
-///
-/// A snapshot preserves the raw storage key and credential from the same
-/// locked read. Callers can retain it while doing account-specific work and
-/// resolve it through [`AuthStorage::resolve_account_snapshot`] without letting
-/// runtime overrides or environment fallback change the selected account.
-#[derive(Clone)]
-pub struct AccountSnapshot {
-    label: String,
-    credential: AuthCredential,
-}
-
-impl AccountSnapshot {
-    /// The account's exact raw key in `auth.json`.
-    pub fn label(&self) -> &str {
-        &self.label
-    }
-}
-
 /// The complete credential shape stored for one provider.
 ///
 /// Account-management surfaces need the whole shape rather than the one
@@ -864,45 +835,6 @@ impl AuthStorage {
         };
         let mut data = self.read_credentials()?;
         Ok(Some(data.remove(provider_id).is_some()))
-    }
-
-    /// Resolve one exact labeled credential snapshot without fallback.
-    ///
-    /// API keys and fresh OAuth credentials are served directly from the
-    /// snapshot, without acquiring the auth-file lock again. Expired OAuth
-    /// credentials refresh the snapshot's exact raw label under the existing
-    /// read-modify-write lock. Runtime overrides, provider defaults, and
-    /// environment variables are never consulted.
-    pub async fn resolve_account_snapshot(
-        &self,
-        provider_id: &str,
-        account: &AccountSnapshot,
-    ) -> Result<Option<ResolvedCredential>, AuthError> {
-        let slot = Slot::Account(account.label.clone());
-        match &account.credential {
-            AuthCredential::ApiKey { key } => Ok(Some(ResolvedCredential {
-                key: key.clone(),
-                source: slot.source(),
-            })),
-            AuthCredential::OAuth(creds) => {
-                let Ok(provider) = self.lookup_oauth_provider(provider_id).await else {
-                    return Ok(None);
-                };
-                if !creds.is_expired_at(now_unix_ms()) {
-                    return Ok(Some(ResolvedCredential {
-                        key: provider.get_api_key(creds),
-                        source: slot.source(),
-                    }));
-                }
-                Ok(self
-                    .refresh_oauth_with_lock(provider_id, &slot, &*provider)
-                    .await?
-                    .map(|key| ResolvedCredential {
-                        key,
-                        source: slot.source(),
-                    }))
-            }
-        }
     }
 
     /// Resolve a usable bearer token for `provider_id`, walking the
@@ -3412,47 +3344,6 @@ mod tests {
             "a mutating boundary also increments"
         );
         storage.reset_credential_read_count();
-        assert_eq!(storage.credential_read_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn account_snapshot_resolution_bypasses_runtime_override_and_file_lock() {
-        let (_dir, path) = scratch_path("snapshot-resolution");
-        let storage = AuthStorage::with_providers(path, HashMap::new());
-        storage
-            .insert_account("stub", "work", api_key("stored-work"))
-            .await
-            .unwrap();
-        let snapshot = storage
-            .accounts("stub")
-            .await
-            .unwrap()
-            .unwrap()
-            .into_snapshots()
-            .into_iter()
-            .find(|account| account.label() == "work")
-            .unwrap();
-        storage
-            .set_runtime_api_key("stub", "runtime-override".into())
-            .await;
-        storage.reset_credential_read_count();
-        let file_lock = FileLock::acquire(storage.path()).await.unwrap();
-
-        let resolved = tokio::time::timeout(
-            Duration::from_millis(100),
-            storage.resolve_account_snapshot("stub", &snapshot),
-        )
-        .await
-        .expect("fresh snapshot resolution must not wait for the file lock")
-        .unwrap()
-        .unwrap();
-        drop(file_lock);
-
-        assert_eq!(resolved.key, "stored-work");
-        assert_eq!(
-            resolved.source,
-            CredentialSource::Account("work".to_string())
-        );
         assert_eq!(storage.credential_read_count(), 0);
     }
 

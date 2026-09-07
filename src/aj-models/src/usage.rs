@@ -19,20 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::auth::{AccountSnapshot, AuthError, AuthStorage, ResolvedCredential};
-
-/// Resolve either the current effective provider credential or one exact
-/// stored account snapshot.
-async fn resolve_credential(
-    auth: &AuthStorage,
-    provider_id: &str,
-    account: Option<&AccountSnapshot>,
-) -> Result<Option<ResolvedCredential>, AuthError> {
-    match account {
-        Some(account) => auth.resolve_account_snapshot(provider_id, account).await,
-        None => auth.get_api_key(provider_id, None).await,
-    }
-}
+use crate::auth::{AuthError, AuthStorage};
 
 /// One rate-limit window, ready to render.
 #[derive(Debug, Clone, PartialEq)]
@@ -153,12 +140,15 @@ pub trait UsageSource: Send + Sync {
     /// [`AuthStorage`] (e.g. `"anthropic"`).
     fn provider_id(&self) -> &str;
 
-    /// Fetch the current usage report for an exact account snapshot, or the
-    /// provider's current effective credential when `account` is `None`.
+    /// Fetch the current usage report for one stored account label, or for
+    /// the provider's effective credential when `account` is `None`.
+    /// Credentials resolve through `auth` exactly as the messages path does
+    /// (including OAuth refresh), so a label that no longer exists reports
+    /// `NotConfigured` rather than falling back to another credential.
     async fn fetch(
         &self,
         auth: &AuthStorage,
-        account: Option<&AccountSnapshot>,
+        account: Option<&str>,
     ) -> Result<UsageReport, UsageError>;
 }
 
@@ -267,7 +257,7 @@ pub mod anthropic {
     use chrono::DateTime;
 
     use super::{ProviderUsage, UsageError, UsageReport, UsageSource, UsageWindow};
-    use crate::auth::{AccountSnapshot, AuthStorage};
+    use crate::auth::AuthStorage;
 
     /// Reports plan rate-limit utilization via the Claude.ai
     /// `GET /api/oauth/usage` endpoint. Only subscription (OAuth)
@@ -284,9 +274,10 @@ pub mod anthropic {
         async fn fetch(
             &self,
             auth: &AuthStorage,
-            account: Option<&AccountSnapshot>,
+            account: Option<&str>,
         ) -> Result<UsageReport, UsageError> {
-            let Some(key) = super::resolve_credential(auth, self.provider_id(), account)
+            let Some(key) = auth
+                .get_api_key(self.provider_id(), account)
                 .await?
                 .map(|resolved| resolved.key)
             else {
@@ -767,7 +758,7 @@ pub mod codex {
         ProviderUsage, RateLimitResetCredits, RateLimitResetSource, RateLimitResetTarget,
         ResetOutcome, UsageError, UsageReport, UsageSource, UsageWindow,
     };
-    use crate::auth::{AccountSnapshot, AuthStorage};
+    use crate::auth::AuthStorage;
     use crate::oauth::openai::extract_account_id;
 
     /// Provider id this source reports on, matching the OAuth pool the
@@ -805,7 +796,7 @@ pub mod codex {
         async fn fetch(
             &self,
             auth: &AuthStorage,
-            account: Option<&AccountSnapshot>,
+            account: Option<&str>,
         ) -> Result<UsageReport, UsageError> {
             let ready = match resolve(auth, account).await? {
                 Resolved::Ready(ready) => ready,
@@ -930,15 +921,15 @@ pub mod codex {
         Unsupported,
     }
 
-    async fn resolve(
-        auth: &AuthStorage,
-        account: Option<&AccountSnapshot>,
-    ) -> Result<Resolved, UsageError> {
-        let Some(resolved) = super::resolve_credential(auth, PROVIDER_ID, account).await? else {
+    /// Resolve the Codex OAuth token for `account` (or the effective
+    /// credential), its upstream account id, and a built HTTP client, shared
+    /// by the usage read and the reset-credit consume.
+    async fn resolve(auth: &AuthStorage, account: Option<&str>) -> Result<Resolved, UsageError> {
+        let Some(resolved) = auth.get_api_key(PROVIDER_ID, account).await? else {
             return Ok(Resolved::NotConfigured);
         };
         let local_account_label = account
-            .map(|account| account.label().to_string())
+            .map(str::to_string)
             .or_else(|| resolved.source.label().map(str::to_string));
         let token = resolved.key;
         // Both endpoints authenticate the account via the
@@ -959,8 +950,11 @@ pub mod codex {
         }))
     }
 
-    /// Re-resolve the exact local account and require it to retain the upstream
-    /// identity captured by the usage report before allowing a reset POST.
+    /// Re-resolve the target's account and require it to still carry the
+    /// upstream identity the usage report saw, so a reset never lands on an
+    /// account other than the one whose credits were shown. A label that has
+    /// since been removed or re-logged-in resolves to a different identity
+    /// (or none) and is refused the same way.
     async fn resolve_reset_target(
         auth: &AuthStorage,
         target: &RateLimitResetTarget,
@@ -968,22 +962,7 @@ pub mod codex {
         if target.provider_id != PROVIDER_ID {
             return Err(UsageError::StaleResetTarget);
         }
-        let resolved = match target.account.as_deref() {
-            Some(label) => {
-                let Some(snapshot) = auth
-                    .accounts(PROVIDER_ID)
-                    .await?
-                    .into_iter()
-                    .flat_map(|accounts| accounts.into_snapshots())
-                    .find(|account| account.label() == label)
-                else {
-                    return Err(UsageError::StaleResetTarget);
-                };
-                resolve(auth, Some(&snapshot)).await?
-            }
-            None => resolve(auth, None).await?,
-        };
-        let Resolved::Ready(ready) = resolved else {
+        let Resolved::Ready(ready) = resolve(auth, target.account.as_deref()).await? else {
             return Err(UsageError::StaleResetTarget);
         };
         if ready.upstream_account_id != target.upstream_account_id {
