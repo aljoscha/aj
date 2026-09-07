@@ -102,10 +102,6 @@ pub struct Args {
     /// and images are attached inline) or a message; the messages are
     /// joined and combined with the file content into a single launch
     /// turn, which both print and interactive mode auto-submit.
-    // The full rules live in `crate::cli::initial_input`. Cross-references
-    // on clap-visible fields sit in plain comments like this one: clap renders
-    // the doc comment into `--help`, where a rustdoc link is just brackets
-    // around a private name.
     pub prompt: Vec<String>,
 
     /// Replace the live model with a scripted fake that replays a canned
@@ -119,8 +115,6 @@ pub struct Args {
     /// scripted provider in its place; every other code path (TUI,
     /// persistence, tools, commands) runs unchanged so the eyeball test
     /// exercises the real surface.
-    // The sequence is `aj_models::streaming::AssistantMessageEvent` and the
-    // stand-in is `aj_models::scripted::ScriptedProvider`.
     #[arg(long)]
     pub scripted: Option<String>,
 
@@ -554,7 +548,6 @@ pub enum PrintFormat {
     Text,
     /// One JSONL agent event per line. Stable shape suitable for piping
     /// into another process.
-    // The event is `aj_agent::events::AgentEvent`.
     Json,
 }
 
@@ -636,7 +629,6 @@ pub enum Command {
         /// that carries it, so a stale or misspelled value is refused rather
         /// than dropped. A run that ends up attaching an existing session
         /// reports that the flag had nothing to point at, as `--tag` does.
-        // That report is the `HOST_WITHOUT_A_CREATE` constant.
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
         /// Launch input for the attached session, interpreted exactly like
