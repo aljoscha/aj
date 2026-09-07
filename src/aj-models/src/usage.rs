@@ -19,7 +19,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::auth::{AuthError, AuthStorage};
+use crate::auth::{AccountSnapshot, AuthError, AuthStorage, ResolvedCredential};
+
+/// Resolve either the current effective provider credential or one exact
+/// stored account snapshot.
+async fn resolve_credential(
+    auth: &AuthStorage,
+    provider_id: &str,
+    account: Option<&AccountSnapshot>,
+) -> Result<Option<ResolvedCredential>, AuthError> {
+    match account {
+        Some(account) => auth.resolve_account_snapshot(provider_id, account).await,
+        None => auth.get_api_key(provider_id, None).await,
+    }
+}
 
 /// One rate-limit window, ready to render.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,13 +53,68 @@ pub struct ProviderUsage {
     pub windows: Vec<UsageWindow>,
     /// Free-form extra lines, e.g. a usage-credit balance.
     pub notes: Vec<String>,
-    /// Earned rate-limit reset credits the account can spend to clear
-    /// its current windows early. `None` when the provider has no such
-    /// mechanism, `Some(0)` when it has one but none are available.
-    /// Providers with a reset mechanism report `Some(_)`. The UI pairs
-    /// the count with a matching [`RateLimitResetSource`] by provider id
-    /// before offering the action.
-    pub reset_credits: Option<u32>,
+    /// Earned rate-limit reset credits and the exact account they apply to.
+    /// `None` means no safely targetable reset mechanism was reported.
+    pub reset_credits: Option<RateLimitResetCredits>,
+}
+
+/// Earned reset credits coupled to the account identity that reported them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitResetCredits {
+    /// Number of credits currently available.
+    pub available: u32,
+    /// Opaque target required to spend one of these credits.
+    pub target: RateLimitResetTarget,
+}
+
+impl RateLimitResetCredits {
+    fn from_usage(available: u32, target: RateLimitResetTarget) -> Self {
+        Self { available, target }
+    }
+
+    /// Construct a reset offer for boundary tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new(available: u32, target: RateLimitResetTarget) -> Self {
+        Self { available, target }
+    }
+}
+
+/// Opaque identity captured by a usage fetch for a later reset attempt.
+///
+/// Callers can route it by provider id, but cannot construct or alter its
+/// account identities. A reset source must revalidate them before acting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitResetTarget {
+    provider_id: String,
+    account: Option<String>,
+    upstream_account_id: String,
+}
+
+impl RateLimitResetTarget {
+    fn from_usage(provider_id: &str, account: Option<String>, upstream_account_id: String) -> Self {
+        Self {
+            provider_id: provider_id.to_string(),
+            account,
+            upstream_account_id,
+        }
+    }
+
+    /// Construct a reset target for boundary tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new(provider_id: &str, account: Option<String>, upstream_account_id: String) -> Self {
+        Self::from_usage(provider_id, account, upstream_account_id)
+    }
+
+    /// Provider whose reset source can consume this target.
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    /// Exact raw local account label, or `None` for an effective unlabeled
+    /// credential.
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
 }
 
 /// Outcome of asking one source for usage numbers.
@@ -73,6 +141,9 @@ pub enum UsageError {
     /// unparseable response).
     #[error("{0}")]
     Fetch(String),
+    /// A reset target no longer names the same stored subscription account.
+    #[error("rate-limit reset target is stale; refresh usage before retrying")]
+    StaleResetTarget,
 }
 
 /// A per-provider usage fetcher.
@@ -82,9 +153,13 @@ pub trait UsageSource: Send + Sync {
     /// [`AuthStorage`] (e.g. `"anthropic"`).
     fn provider_id(&self) -> &str;
 
-    /// Fetch the current usage report, resolving credentials through
-    /// `auth` (including OAuth refresh, same as the messages path).
-    async fn fetch(&self, auth: &AuthStorage) -> Result<UsageReport, UsageError>;
+    /// Fetch the current usage report for an exact account snapshot, or the
+    /// provider's current effective credential when `account` is `None`.
+    async fn fetch(
+        &self,
+        auth: &AuthStorage,
+        account: Option<&AccountSnapshot>,
+    ) -> Result<UsageReport, UsageError>;
 }
 
 /// Outcome of spending one earned rate-limit reset credit.
@@ -124,6 +199,7 @@ pub trait RateLimitResetSource: Send + Sync {
     async fn consume_reset_credit(
         &self,
         auth: &AuthStorage,
+        target: &RateLimitResetTarget,
         idempotency_key: &str,
     ) -> Result<ResetOutcome, UsageError>;
 }
@@ -191,7 +267,7 @@ pub mod anthropic {
     use chrono::DateTime;
 
     use super::{ProviderUsage, UsageError, UsageReport, UsageSource, UsageWindow};
-    use crate::auth::AuthStorage;
+    use crate::auth::{AccountSnapshot, AuthStorage};
 
     /// Reports plan rate-limit utilization via the Claude.ai
     /// `GET /api/oauth/usage` endpoint. Only subscription (OAuth)
@@ -205,9 +281,12 @@ pub mod anthropic {
             "anthropic"
         }
 
-        async fn fetch(&self, auth: &AuthStorage) -> Result<UsageReport, UsageError> {
-            let Some(key) = auth
-                .get_api_key(self.provider_id(), None)
+        async fn fetch(
+            &self,
+            auth: &AuthStorage,
+            account: Option<&AccountSnapshot>,
+        ) -> Result<UsageReport, UsageError> {
+            let Some(key) = super::resolve_credential(auth, self.provider_id(), account)
                 .await?
                 .map(|resolved| resolved.key)
             else {
@@ -685,10 +764,10 @@ pub mod codex {
     use std::time::Duration;
 
     use super::{
-        ProviderUsage, RateLimitResetSource, ResetOutcome, UsageError, UsageReport, UsageSource,
-        UsageWindow,
+        ProviderUsage, RateLimitResetCredits, RateLimitResetSource, RateLimitResetTarget,
+        ResetOutcome, UsageError, UsageReport, UsageSource, UsageWindow,
     };
-    use crate::auth::AuthStorage;
+    use crate::auth::{AccountSnapshot, AuthStorage};
     use crate::oauth::openai::extract_account_id;
 
     /// Provider id this source reports on, matching the OAuth pool the
@@ -723,9 +802,13 @@ pub mod codex {
             PROVIDER_ID
         }
 
-        async fn fetch(&self, auth: &AuthStorage) -> Result<UsageReport, UsageError> {
-            let (client, token, account_id) = match resolve(auth).await? {
-                Resolved::Ready(client, token, account_id) => (client, token, account_id),
+        async fn fetch(
+            &self,
+            auth: &AuthStorage,
+            account: Option<&AccountSnapshot>,
+        ) -> Result<UsageReport, UsageError> {
+            let ready = match resolve(auth, account).await? {
+                Resolved::Ready(ready) => ready,
                 Resolved::NotConfigured => return Ok(UsageReport::NotConfigured),
                 Resolved::Unsupported => {
                     return Ok(UsageReport::Unsupported {
@@ -734,10 +817,14 @@ pub mod codex {
                 }
             };
 
-            let response = authorize(client.get(USAGE_URL), &token, &account_id)
-                .send()
-                .await
-                .map_err(|err| UsageError::Fetch(err.to_string()))?;
+            let response = authorize(
+                ready.client.get(USAGE_URL),
+                &ready.token,
+                &ready.upstream_account_id,
+            )
+            .send()
+            .await
+            .map_err(|err| UsageError::Fetch(err.to_string()))?;
 
             let status = response.status();
             let body = response
@@ -754,7 +841,12 @@ pub mod codex {
             let payload: UsagePayload = serde_json::from_str(&body).map_err(|err| {
                 UsageError::Fetch(format!("could not parse usage response: {err}"))
             })?;
-            Ok(UsageReport::Usage(map_usage(&payload)))
+            let reset_target = RateLimitResetTarget::from_usage(
+                PROVIDER_ID,
+                ready.local_account_label,
+                ready.upstream_account_id,
+            );
+            Ok(UsageReport::Usage(map_usage(&payload, reset_target)))
         }
     }
 
@@ -767,34 +859,37 @@ pub mod codex {
         async fn consume_reset_credit(
             &self,
             auth: &AuthStorage,
+            target: &RateLimitResetTarget,
             idempotency_key: &str,
         ) -> Result<ResetOutcome, UsageError> {
-            // These credential errors are defensive: the UI only offers
-            // the action for a provider whose usage report came back with
-            // credits available, which already required a usable login.
-            let (client, token, account_id) = match resolve(auth).await? {
-                Resolved::Ready(client, token, account_id) => (client, token, account_id),
-                Resolved::NotConfigured => {
-                    return Err(UsageError::Fetch(
-                        "no ChatGPT subscription login configured".to_string(),
-                    ));
-                }
-                Resolved::Unsupported => {
-                    return Err(UsageError::Fetch(
-                        "only available with a ChatGPT subscription login".to_string(),
-                    ));
-                }
-            };
+            self.consume_reset_credit_at(auth, target, idempotency_key, CONSUME_URL)
+                .await
+        }
+    }
+
+    impl OpenAICodexUsageSource {
+        async fn consume_reset_credit_at(
+            &self,
+            auth: &AuthStorage,
+            target: &RateLimitResetTarget,
+            idempotency_key: &str,
+            consume_url: &str,
+        ) -> Result<ResetOutcome, UsageError> {
+            let ready = resolve_reset_target(auth, target).await?;
 
             let request = ConsumeRequest {
                 redeem_request_id: idempotency_key,
             };
-            let response = authorize(client.post(CONSUME_URL), &token, &account_id)
-                .header(CONTENT_TYPE, "application/json")
-                .json(&request)
-                .send()
-                .await
-                .map_err(|err| UsageError::Fetch(err.to_string()))?;
+            let response = authorize(
+                ready.client.post(consume_url),
+                &ready.token,
+                &ready.upstream_account_id,
+            )
+            .header(CONTENT_TYPE, "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|err| UsageError::Fetch(err.to_string()))?;
 
             let status = response.status();
             let body = response
@@ -817,11 +912,17 @@ pub mod codex {
         }
     }
 
-    /// Resolved Codex credentials, or why they can't be used against
-    /// the ChatGPT backend.
+    struct Ready {
+        client: reqwest::Client,
+        token: String,
+        upstream_account_id: String,
+        local_account_label: Option<String>,
+    }
+
+    /// Resolved Codex credentials, or why they can't be used against the
+    /// ChatGPT backend.
     enum Resolved {
-        /// A built client plus the OAuth token and its account id.
-        Ready(reqwest::Client, String, String),
+        Ready(Ready),
         /// No credential stored for the Codex pool.
         NotConfigured,
         /// A credential exists but lacks the `chatgpt_account_id` claim
@@ -829,27 +930,66 @@ pub mod codex {
         Unsupported,
     }
 
-    /// Resolve the Codex OAuth token, its account id, and a built HTTP
-    /// client, shared by the usage read and the reset-credit consume.
-    async fn resolve(auth: &AuthStorage) -> Result<Resolved, UsageError> {
-        let Some(token) = auth
-            .get_api_key(PROVIDER_ID, None)
-            .await?
-            .map(|resolved| resolved.key)
-        else {
+    async fn resolve(
+        auth: &AuthStorage,
+        account: Option<&AccountSnapshot>,
+    ) -> Result<Resolved, UsageError> {
+        let Some(resolved) = super::resolve_credential(auth, PROVIDER_ID, account).await? else {
             return Ok(Resolved::NotConfigured);
         };
+        let local_account_label = account
+            .map(|account| account.label().to_string())
+            .or_else(|| resolved.source.label().map(str::to_string));
+        let token = resolved.key;
         // Both endpoints authenticate the account via the
         // `chatgpt_account_id` JWT claim. A token without it can't call
         // them.
-        let Some(account_id) = extract_account_id(&token) else {
+        let Some(upstream_account_id) = extract_account_id(&token) else {
             return Ok(Resolved::Unsupported);
         };
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|err| UsageError::Fetch(err.to_string()))?;
-        Ok(Resolved::Ready(client, token, account_id))
+        Ok(Resolved::Ready(Ready {
+            client,
+            token,
+            upstream_account_id,
+            local_account_label,
+        }))
+    }
+
+    /// Re-resolve the exact local account and require it to retain the upstream
+    /// identity captured by the usage report before allowing a reset POST.
+    async fn resolve_reset_target(
+        auth: &AuthStorage,
+        target: &RateLimitResetTarget,
+    ) -> Result<Ready, UsageError> {
+        if target.provider_id != PROVIDER_ID {
+            return Err(UsageError::StaleResetTarget);
+        }
+        let resolved = match target.account.as_deref() {
+            Some(label) => {
+                let Some(snapshot) = auth
+                    .accounts(PROVIDER_ID)
+                    .await?
+                    .into_iter()
+                    .flat_map(|accounts| accounts.into_snapshots())
+                    .find(|account| account.label() == label)
+                else {
+                    return Err(UsageError::StaleResetTarget);
+                };
+                resolve(auth, Some(&snapshot)).await?
+            }
+            None => resolve(auth, None).await?,
+        };
+        let Resolved::Ready(ready) = resolved else {
+            return Err(UsageError::StaleResetTarget);
+        };
+        if ready.upstream_account_id != target.upstream_account_id {
+            return Err(UsageError::StaleResetTarget);
+        }
+        Ok(ready)
     }
 
     /// Attach the shared auth headers (bearer token, account id,
@@ -907,8 +1047,8 @@ pub mod codex {
     /// the primary/secondary rolling limits, the per-feature
     /// `additional_rate_limits`, and the workspace monthly credit cap.
     /// The credits balance rides along as a note. Earned reset credits
-    /// surface as the structured [`ProviderUsage::reset_credits`] count.
-    fn map_usage(payload: &UsagePayload) -> ProviderUsage {
+    /// surface as the structured [`ProviderUsage::reset_credits`].
+    fn map_usage(payload: &UsagePayload, reset_target: RateLimitResetTarget) -> ProviderUsage {
         let mut windows = Vec::new();
 
         if let Some(rate_limit) = payload.rate_limit.as_ref() {
@@ -939,10 +1079,12 @@ pub mod codex {
 
         // Negative counts shouldn't happen, but clamp defensively so a
         // bad payload can't wrap into a huge unsigned value.
-        let reset_credits = payload
-            .rate_limit_reset_credits
-            .as_ref()
-            .map(|c| u32::try_from(c.available_count.max(0)).unwrap_or(u32::MAX));
+        let reset_credits = payload.rate_limit_reset_credits.as_ref().map(|credits| {
+            RateLimitResetCredits::from_usage(
+                u32::try_from(credits.available_count.max(0)).unwrap_or(u32::MAX),
+                reset_target,
+            )
+        });
 
         ProviderUsage {
             windows,
@@ -958,7 +1100,7 @@ pub mod codex {
         additional_rate_limits: Option<Vec<AdditionalRateLimit>>,
         credits: Option<Credits>,
         spend_control: Option<SpendControl>,
-        rate_limit_reset_credits: Option<ResetCredits>,
+        rate_limit_reset_credits: Option<ResetCreditsPayload>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1065,7 +1207,7 @@ pub mod codex {
     }
 
     #[derive(Debug, Deserialize)]
-    struct ResetCredits {
+    struct ResetCreditsPayload {
         #[serde(default)]
         available_count: i64,
     }
@@ -1092,7 +1234,34 @@ pub mod codex {
 
     #[cfg(test)]
     mod tests {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+
         use super::*;
+        use crate::auth::AuthCredential;
+        use crate::oauth::OAuthCredentials;
+
+        fn reset_target(upstream_account_id: &str) -> RateLimitResetTarget {
+            RateLimitResetTarget::new(
+                PROVIDER_ID,
+                Some("work".to_string()),
+                upstream_account_id.to_string(),
+            )
+        }
+
+        fn access_token(upstream_account_id: &str) -> String {
+            let payload = serde_json::json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": upstream_account_id
+                }
+            });
+            format!(
+                "e30.{}.signature",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+            )
+        }
 
         /// A real Team-plan response captured from the live endpoint.
         const TEAM_PLAN_RESPONSE: &str = r#"{
@@ -1126,7 +1295,7 @@ pub mod codex {
         #[test]
         fn maps_primary_and_secondary_windows_with_concrete_labels() {
             let payload: UsagePayload = serde_json::from_str(TEAM_PLAN_RESPONSE).unwrap();
-            let report = map_usage(&payload);
+            let report = map_usage(&payload, reset_target("acct-work"));
 
             let labels: Vec<&str> = report.windows.iter().map(|w| w.label.as_str()).collect();
             assert_eq!(labels, vec!["5h limit", "Weekly limit"]);
@@ -1139,11 +1308,13 @@ pub mod codex {
         #[test]
         fn team_plan_reports_reset_credits_and_no_credit_note() {
             let payload: UsagePayload = serde_json::from_str(TEAM_PLAN_RESPONSE).unwrap();
-            let report = map_usage(&payload);
+            let report = map_usage(&payload, reset_target("acct-team"));
             // has_credits is false, so no credit-balance note; the two
             // available reset credits surface as the structured count.
             assert!(report.notes.is_empty());
-            assert_eq!(report.reset_credits, Some(2));
+            let offer = report.reset_credits.unwrap();
+            assert_eq!(offer.available, 2);
+            assert_eq!(offer.target.upstream_account_id, "acct-team");
         }
 
         #[test]
@@ -1182,7 +1353,7 @@ pub mod codex {
                 }"#,
             )
             .unwrap();
-            let report = map_usage(&payload);
+            let report = map_usage(&payload, reset_target("acct-work"));
 
             let labels: Vec<&str> = report.windows.iter().map(|w| w.label.as_str()).collect();
             assert_eq!(
@@ -1198,7 +1369,7 @@ pub mod codex {
             // available_count 0 keeps the note list to just the balance,
             // and surfaces the supported-but-empty reset count.
             assert_eq!(report.notes, vec!["Credits: 1234".to_string()]);
-            assert_eq!(report.reset_credits, Some(0));
+            assert_eq!(report.reset_credits.unwrap().available, 0);
         }
 
         #[test]
@@ -1215,7 +1386,7 @@ pub mod codex {
                 }"#,
             )
             .unwrap();
-            let report = map_usage(&payload);
+            let report = map_usage(&payload, reset_target("acct-work"));
             assert_eq!(report.reset_credits, None);
         }
 
@@ -1242,6 +1413,46 @@ pub mod codex {
             })
             .unwrap();
             assert_eq!(body, serde_json::json!({ "redeem_request_id": "key-123" }));
+        }
+
+        #[tokio::test]
+        async fn stale_reset_target_sends_no_post() {
+            let dir = TempDir::with_prefix("aj-usage-test-stale-reset-")
+                .expect("create scratch directory");
+            let auth = AuthStorage::new(dir.path().join("auth.json"));
+            auth.insert_account(
+                PROVIDER_ID,
+                "work",
+                AuthCredential::OAuth(OAuthCredentials::new(
+                    "refresh",
+                    access_token("account-after-rebind"),
+                    i64::MAX,
+                )),
+            )
+            .await
+            .unwrap();
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/consume", listener.local_addr().unwrap());
+            let accepted = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_ok()
+            });
+            let result = OpenAICodexUsageSource
+                .consume_reset_credit_at(
+                    &auth,
+                    &reset_target("account-from-usage"),
+                    "attempt-1",
+                    &url,
+                )
+                .await;
+
+            assert!(matches!(result, Err(UsageError::StaleResetTarget)));
+            assert!(
+                !accepted.await.unwrap(),
+                "stale target reached POST endpoint"
+            );
         }
 
         #[test]
@@ -1292,7 +1503,7 @@ mod tests {
         {
             return;
         }
-        let report = source.fetch(&auth).await.unwrap();
+        let report = source.fetch(&auth, None).await.unwrap();
         assert_eq!(report, UsageReport::NotConfigured);
     }
 
@@ -1312,7 +1523,7 @@ mod tests {
         auth.set_runtime_api_key("anthropic", "sk-ant-api-key".into())
             .await;
         let source = anthropic::AnthropicUsageSource;
-        match source.fetch(&auth).await.unwrap() {
+        match source.fetch(&auth, None).await.unwrap() {
             UsageReport::Unsupported { reason } => {
                 assert!(reason.contains("subscription"), "{reason}");
             }

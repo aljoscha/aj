@@ -3822,11 +3822,13 @@ async fn apply_command_action(
             }
             let handles = shell.borrow().overlay_handles();
             let styles = ContentStyles::from_theme(&shell.borrow().theme.read());
+            let width_method = shell.borrow().width_method();
             open_usage_overlay(
                 &handles.stack,
                 &handles.editor,
                 &handles.chrome,
                 styles,
+                width_method,
                 world.auth.clone(),
                 default_reset_sources(),
                 tokio::runtime::Handle::current(),
