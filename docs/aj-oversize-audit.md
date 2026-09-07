@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 5 LOOKs.
+retired 6 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 22 open)
+## LOOK (27 total, 21 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -38,7 +38,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`84db84e` 2026-08-06 aj-app,aj: bound the working set, and fix what two reviews found~~ Retired: focus now solely owns the bounded MRU set, and attach requests serialize it directly.
 - ~~`34fcbd8` 2026-08-07 aj-app,aj: set a session's tag from the host and the control port~~ Retired: cold labels are read at enumeration points without fingerprint caching.
 - ~~`b57241c` 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar~~ Retired: overrides accept the full chord grammar without a terminal-typeability model. Built-in defaults retain real-parser portability coverage.
-- `c4a59be` 2026-08-07 aj: make the sidebar's working set and hosts legible
+- ~~`c4a59be` 2026-08-07 aj: make the sidebar's working set and hosts legible~~ Retired without code changes: host grouping was explicitly requested, and the layout machinery serves current behavior. No worthwhile simplification identified.
 - `bbca1ad` 2026-08-11 aj: splice a client's session streams through a gateway
 - `67c3d58` 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up
 - `09f7dac` 2026-08-19 aj: close the review findings on the loop-folded catch-up
@@ -151,12 +151,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why: Eight or more unrelated changes under a "fix what reviews found" subject. The keymap work alone adds a terminal-encoding model in aj-app (`untypeable_reason`, `CTRL_ALIASES`, `ESCAPE_INTRODUCERS`, `CONTROL_CODE_KEYS`, `KeybindingProblem::Untypeable`, ~224 lines) plus a ~300-line sweep in keymap.rs re-encoding every chord to bytes to prove the model agrees with the real parser: a parallel restatement of the input parser kept in sync by test. directory.rs reverses a812f97's stamp-based unseen mark back to seq positions with a new `Attached.delivered` tracker and a "last write wins, not max" rule, one day after the stamp design landed. `drop_all_but` and a new `Attachment` struct extend the narrowing retry from 84db84e instead of removing it.
 - Simpler shape: Separate commits per ruling. For typeability, either derive the predicate from the parser crate directly or validate overrides by round-tripping through the parser at load time rather than maintaining a hand-written mirror.
 
-### c4a59be 2026-08-07 aj: make the sidebar's working set and hosts legible
+### c4a59be 2026-08-07 aj: make the sidebar's working set and hosts legible [RETIRED]
+- Status: Retired without code changes. The original brief explicitly requested host grouping before the gateway, not just the working-set encoding. `Layout`, `Group`, and `StripLine` serve current multi-host display and navigation. `Presence` names a derived presentation concept without adding stored state, and removing it would not meaningfully simplify the system.
 - Stats: 2 files, +1132 -144, ~485 prod / ~645 test lines (estimate: sidebar.rs `mod tests` at line 714)
 - Body: Three visual encodings per row (glyph color, label brightness for working set, focus marker), 24-column strip with its own rule, layout moved into pure `strip_lines`, rows grouped under per-host headers with an unreachable marker.
-- Verdict: LOOK
-- Why: Three features in one: the encoding redesign, a layout engine (`Layout`, `Group`, `StripLine` with header/overflow/create variants, `visible_run`, `cost`), and host grouping. At this commit nothing produces `host: Some(..)` or `unreachable: true` (host.rs writes `host: None, unreachable: false`; the gateway that fills them lands in 84fa171 four days later), so host headers, host ordering by activity and the unreachable header were built ahead of any producer. sidebar.rs grows from ~150 to ~1150 lines for a strip that at this point shows one host's sessions.
-- Simpler shape: Land the encoding change and the `strip_lines` extraction, and add host grouping in the commit that first fills `host`, when its real row shapes are known.
+- Verdict: Retired after investigation. No worthwhile simplification identified.
+- Why flagged: The encoding redesign and grouped layout landed before the gateway supplied host values. The size claim was overstated: sidebar.rs's non-test portion grew from 325 to 713 lines including comments, or 202 to 437 nonblank, non-comment lines. Its test section grew from 264 to 763 lines. Producer timing and diff size do not establish unnecessary machinery.
+- Disposition: Keep the implementation. Deferring grouping would change the implementation sequence, not remove functionality the user requested and now uses.
 
 ### bbca1ad 2026-08-11 aj: splice a client's session streams through a gateway
 - Stats: 7 files, +2620 -145, ~895 prod / ~1725 test lines (estimate: gateway/tests.rs +1414, `mod tests` in outbound.rs/splice.rs)
