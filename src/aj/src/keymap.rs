@@ -523,13 +523,9 @@ mod tests {
         })
     }
 
-    /// The bytes a terminal sends when the user types `spec`, or `None` when no
-    /// keystroke sends it at all.
-    ///
-    /// This is the encoding every terminal speaks. One that has negotiated the
-    /// kitty keyboard protocol sends `CSI <codepoint> ; <mods> u` for everything
-    /// instead, which would carry far more chords, but the protocol is
-    /// opportunistic and `aj` cannot require it.
+    /// Legacy terminal bytes for `spec`, or `None` when this encoding cannot
+    /// represent it. Built-in defaults must work without the Kitty keyboard
+    /// protocol, even though user overrides may require it.
     fn terminal_bytes(spec: &ChordSpec) -> Option<Vec<u8>> {
         match spec.key {
             ChordKey::Char(c) => char_bytes(c, spec),
@@ -544,8 +540,8 @@ mod tests {
         }
     }
 
-    /// The key press a terminal's bytes for `spec` decode to, or `None` when no
-    /// keystroke produces one.
+    /// The key press the legacy bytes for `spec` decode to, or `None` when
+    /// they do not produce one.
     fn terminal_key(spec: &ChordSpec) -> Option<Key> {
         let bytes = terminal_bytes(spec)?;
         let parsed = vaxis::parser::Parser::new().parse(&bytes).ok()?;
@@ -559,45 +555,6 @@ mod tests {
             Some(vaxis::event::Event::KeyPress(key)) => Some(key),
             _ => None,
         }
-    }
-
-    /// The named keys [`parse_chord`] emits.
-    const CHORD_KEY_NAMES: &[&str] = &[
-        "enter",
-        "escape",
-        "tab",
-        "backspace",
-        "delete",
-        "insert",
-        "up",
-        "down",
-        "left",
-        "right",
-        "home",
-        "end",
-        "page_up",
-        "page_down",
-    ];
-
-    /// Every chord shape the grammar can build: each key class crossed with all
-    /// sixteen modifier combinations. The characters span printable ASCII plus a
-    /// control character and two multi-byte ones, which a config file can spell
-    /// even though no keyboard has such a key.
-    fn every_chord_spec() -> impl Iterator<Item = ChordSpec> {
-        let chars = (0x20u8..=0x7e)
-            .map(|b| ChordKey::Char(char::from(b)))
-            .chain(['\t', 'ä', '€'].into_iter().map(ChordKey::Char));
-        let named = CHORD_KEY_NAMES.iter().copied().map(ChordKey::Named);
-        let fkeys = (1u8..=35).map(ChordKey::F);
-        chars.chain(named).chain(fkeys).flat_map(|key| {
-            (0u8..16).map(move |bits| ChordSpec {
-                key,
-                ctrl: bits & 1 != 0,
-                alt: bits & 2 != 0,
-                shift: bits & 4 != 0,
-                super_mod: bits & 8 != 0,
-            })
-        })
     }
 
     /// A context in which `action`'s predicate holds, so a keymap match tests
@@ -718,22 +675,6 @@ mod tests {
                     "{action_id} does not match the key its own chord produces",
                 ),
             }
-        }
-    }
-
-    /// [`aj_app::actions::untypeable_reason`] is a hand-written restatement of
-    /// what the input parser does, since `aj-app` may not depend on this crate.
-    /// This sweeps the whole chord space through the real parser and asserts the
-    /// two agree, so the restatement cannot drift from the parser it describes.
-    #[test]
-    fn untypeable_reason_agrees_with_the_parser() {
-        for spec in every_chord_spec() {
-            let round_trips = terminal_key(&spec).is_some_and(|key| activator(&spec).accepts(&key));
-            assert_eq!(
-                round_trips,
-                aj_app::actions::untypeable_reason(&spec).is_none(),
-                "the predicate and the parser disagree about {spec:?}",
-            );
         }
     }
 

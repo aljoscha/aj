@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 4 LOOKs.
+retired 5 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 23 open)
+## LOOK (27 total, 22 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -37,7 +37,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`529fd4e` 2026-08-05 aj-app: refresh the directory from memory, and only publish changes~~ Retired: list fan-out now retains one current payload rather than one full copy per subscriber.
 - ~~`84db84e` 2026-08-06 aj-app,aj: bound the working set, and fix what two reviews found~~ Retired: focus now solely owns the bounded MRU set, and attach requests serialize it directly.
 - ~~`34fcbd8` 2026-08-07 aj-app,aj: set a session's tag from the host and the control port~~ Retired: cold labels are read at enumeration points without fingerprint caching.
-- `b57241c` 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar
+- ~~`b57241c` 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar~~ Retired: overrides accept the full chord grammar without a terminal-typeability model. Built-in defaults retain real-parser portability coverage.
 - `c4a59be` 2026-08-07 aj: make the sidebar's working set and hosts legible
 - `bbca1ad` 2026-08-11 aj: splice a client's session streams through a gateway
 - `67c3d58` 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up
@@ -143,7 +143,8 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why: A display label gets a second cache layer parallel to the format sniff: `Tagged { at: Option<Fingerprint>, tag }`, `Cache.tags`, `enumerate_tags`/`read_tag` on the `SessionStore` trait, `evict_tags` mirroring `evict`, a `tag_reads` test counter, and a release path that records a tag "without a fingerprint so the next scan re-reads once and pins it". Sidecars are tiny files, so the read-avoidance machinery a812f97 needed for gigabyte logs is not obviously needed here, and 905eb22 four days later simply reads the sidecars synchronously in the selector scan. Tests assert on `tag_reads` counts, pinning the cache's internal behavior.
 - Simpler shape: Read cold sidecars at enumeration points, never on the coalescing tick. Keep the live-session in-memory answer and scan/release protection, but drop fingerprint-based read avoidance and its counter.
 
-### b57241c 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar
+### b57241c 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar [RETIRED]
+- Status: Retired. User overrides accept the full chord grammar, with syntax, reserved-key, and conflict validation intact. Protocol-dependent chords are documented rather than rejected. The production typeability predicate and its agreement sweep are gone, while built-in defaults retain real-parser dispatch coverage. Narrowed-attach machinery is absent. Viewed-position tracking and the unseen latch remain because delayed directory rows and cold sessions must not misreport what the user has seen. Sidebar responsiveness and layout fixes remain scoped behavior, not replacement machinery.
 - Stats: 7 files, +1822 -482, ~565 prod / ~1255 test lines (estimate: `mod tests` regions in five files)
 - Body: Very long. Removes busy refusals on switch/create, changes row ordering, fixes a lock-induced freeze, drops narrowed-attach sessions, moves the sidebar mirror in the drive loop, four cosmetic fixes, rewrites the sidebar tests, and extends the chord typeability guard to every modifier class including user overrides.
 - Verdict: LOOK

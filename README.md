@@ -113,6 +113,23 @@ Configuration lives in `~/.aj/config.toml`. The settings window (open it from
 the command palette) covers every option and writes your changes there. You can
 also edit the file by hand.
 
+### Keybindings
+
+Override an action's shortcut in the `[keybindings]` table:
+
+```toml
+[keybindings]
+"aj.palette.open" = "ctrl+shift+p"
+```
+
+Overrides accept the full chord grammar, including `ctrl+shift+p`, `shift+enter`,
+and function keys through `f35`. Some chords require the Kitty keyboard protocol
+and may not work, or may arrive as a different key, on other terminals. Built-in
+action shortcuts remain portable to terminals using legacy input encodings.
+Invalid syntax, unknown actions, reserved keys, and conflicting assignments are
+rejected with a startup warning. Actions can trade shortcuts when the final
+assignments are conflict-free.
+
 ## Contributing
 
 AJ is a Cargo workspace. See [`CLAUDE.md`](CLAUDE.md) for build/test commands,
