@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 3 LOOKs.
+retired 4 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,14 +29,14 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 24 open)
+## LOOK (27 total, 23 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
 - ~~`94334b1` 2026-08-04 aj-app,aj-session: serve a list refresh from caches, not from the store~~ Retired by `e2c349d`.
 - ~~`529fd4e` 2026-08-05 aj-app: refresh the directory from memory, and only publish changes~~ Retired: list fan-out now retains one current payload rather than one full copy per subscriber.
 - ~~`84db84e` 2026-08-06 aj-app,aj: bound the working set, and fix what two reviews found~~ Retired: focus now solely owns the bounded MRU set, and attach requests serialize it directly.
-- `34fcbd8` 2026-08-07 aj-app,aj: set a session's tag from the host and the control port
+- ~~`34fcbd8` 2026-08-07 aj-app,aj: set a session's tag from the host and the control port~~ Retired: cold labels are read at enumeration points without fingerprint caching.
 - `b57241c` 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar
 - `c4a59be` 2026-08-07 aj: make the sidebar's working set and hosts legible
 - `bbca1ad` 2026-08-11 aj: splice a client's session streams through a gateway
@@ -135,12 +135,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why: A "fix what two reviews found" bundle: one feature (the bound), three behavior fixes (set-wide `needs_reattach`, narrowed attach, restore-notice folding), four test rewrites and a refactor in one commit. `attach_admitting` in interactive.rs adds a retry special case (whole-set attach refused, fall back to the single session) that the host later makes unnecessary in 2f19fc2. `SessionDirectory::focus` and `attach_requests(admitting)` both compute the same truncation, with a NOTE saying they "have to agree", which is coordination the design leans on rather than one owner of the bound. About half the diff is prose rewrites of existing doc comments.
 - Simpler shape: Land the bound alone (one owner: `focus` evicts, `attach_requests` reads the set as it stands), and let the host answer per-session refusals instead of a client-side narrowing retry. Review fixes as their own small commits.
 
-### 34fcbd8 2026-08-07 aj-app,aj: set a session's tag from the host and the control port
+### 34fcbd8 2026-08-07 aj-app,aj: set a session's tag from the host and the control port [RETIRED]
+- Status: Retired. Cold labels are read from their sidecars at enumeration points, without a fingerprint cache or tag-read counter. Publication remains memory-only. The directory retains label values and publication identity so a stale scan cannot erase a release's label or clear. Tag commands still write immediately, and validation, persistence, wire, and UI behavior are unchanged.
 - Stats: 12 files, +1159 -41, ~330 prod / ~830 test lines (estimate: store.rs `mod tests` at line 583, tests/ dirs)
 - Body: `POST /v1/sessions/{id}/tag` and `tag` on create, both `Command::Tag`; live sessions answer from memory; cold rows get labels from a fingerprinted sidecar cache.
 - Verdict: LOOK
 - Why: A display label gets a second cache layer parallel to the format sniff: `Tagged { at: Option<Fingerprint>, tag }`, `Cache.tags`, `enumerate_tags`/`read_tag` on the `SessionStore` trait, `evict_tags` mirroring `evict`, a `tag_reads` test counter, and a release path that records a tag "without a fingerprint so the next scan re-reads once and pins it". Sidecars are tiny files, so the read-avoidance machinery a812f97 needed for gigabyte logs is not obviously needed here, and 905eb22 four days later simply reads the sidecars synchronously in the selector scan. Tests assert on `tag_reads` counts, pinning the cache's internal behavior.
-- Simpler shape: Read the sidecar during enumeration alongside the stat (one small open per tagged session on a coalescing tick), keep the live-session in-memory answer, and drop the fingerprint cache, eviction and counter for tags.
+- Simpler shape: Read cold sidecars at enumeration points, never on the coalescing tick. Keep the live-session in-memory answer and scan/release protection, but drop fingerprint-based read avoidance and its counter.
 
 ### b57241c 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar
 - Stats: 7 files, +1822 -482, ~565 prod / ~1255 test lines (estimate: `mod tests` regions in five files)

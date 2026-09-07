@@ -184,14 +184,12 @@ impl ConversationPersistence {
         }
     }
 
-    /// Every tag sidecar in the store, with the fingerprint of the file it was
-    /// read from.
+    /// Every tag sidecar in the store, with its file metadata.
     ///
     /// One directory read of `meta/` plus one `stat` per sidecar, and no
-    /// sidecar contents at all: the label itself is read by
-    /// [`Self::read_tag`], once per fingerprint this reports. An untagged
-    /// store has no `meta/` directory and costs a single failed `read_dir`,
-    /// which is what makes the untagged case free: a caller cannot
+    /// sidecar contents at all: callers read the labels with [`Self::read_tag`].
+    /// An untagged store has no `meta/` directory and costs a single failed
+    /// `read_dir`, which is what makes the untagged case free: a caller cannot
     /// ask per session without paying a `stat` per session.
     pub fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
         self.enumerate_sidecars(TAG_SIDECAR)

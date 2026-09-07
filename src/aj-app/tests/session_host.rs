@@ -9587,7 +9587,9 @@ async fn a_released_session_keeps_its_label_without_an_enumeration() {
         )
         .await
         .expect("the tag is accepted");
-    let reads = harness.host.store_tag_reads();
+    let directory_reads = harness.host.store_directory_reads();
+    let sidecar_directory_reads = harness.host.store_sidecar_directory_reads();
+    let lock_directory_reads = harness.host.store_lock_directory_reads();
 
     let frames = frames_until(&mut stream, "the release to be published", |frame| {
         matches!(frame, Frame::List { sessions, .. }
@@ -9606,9 +9608,19 @@ async fn a_released_session_keeps_its_label_without_an_enumeration() {
         "the cold row kept the label the driver held",
     );
     assert_eq!(
-        harness.host.store_tag_reads(),
-        reads,
-        "and it did not go to the sidecar for it",
+        harness.host.store_directory_reads(),
+        directory_reads,
+        "release publication does not enumerate sessions",
+    );
+    assert_eq!(
+        harness.host.store_sidecar_directory_reads(),
+        sidecar_directory_reads,
+        "release publication does not enumerate sidecars",
+    );
+    assert_eq!(
+        harness.host.store_lock_directory_reads(),
+        lock_directory_reads,
+        "release publication does not enumerate locks",
     );
 
     drop(stream);
@@ -9664,23 +9676,12 @@ async fn a_tag_survives_a_restart() {
     revived.host.shutdown().await;
 }
 
-/// The label costs the directory nothing to serve. An untagged store never
-/// opens a sidecar, a live session answers from memory, and a cold one is read
-/// once and then cached against the file it came from.
+/// Explicit listings observe cold labels even when sidecar metadata does not change.
 #[tokio::test]
-async fn a_label_costs_at_most_one_sidecar_read() {
+async fn listings_observe_external_cold_relabels_and_clears() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
     harness.prompt(&session, "hi").await;
-    for _ in 0..3 {
-        harness.host.sessions().await.expect("listed");
-    }
-    assert_eq!(
-        harness.host.store_tag_reads(),
-        0,
-        "an untagged store has no sidecar to read",
-    );
-
     harness
         .host
         .command(
@@ -9691,36 +9692,33 @@ async fn a_label_costs_at_most_one_sidecar_read() {
         )
         .await
         .expect("the tag is accepted");
-    for _ in 0..3 {
-        assert_eq!(
-            tag_of(&harness.host, &session).await.as_deref(),
-            Some("fix-auth"),
-        );
-    }
-    assert_eq!(
-        harness.host.store_tag_reads(),
-        0,
-        "a live session's label is the host's own, not the file's",
-    );
-
     let released = until_released(&harness.host, &session).await;
     assert_eq!(released.tag.as_deref(), Some("fix-auth"));
-    let after_release = harness.host.store_tag_reads();
-    assert!(
-        after_release <= 1,
-        "a released label costs the one read that pins it to its file, not {after_release}",
-    );
-    for _ in 0..3 {
-        assert_eq!(
-            tag_of(&harness.host, &session).await.as_deref(),
-            Some("fix-auth"),
-        );
+
+    let sidecar = harness
+        .persistence
+        .sessions_dir()
+        .join("meta")
+        .join(format!("{session}.tag"));
+    let original = std::fs::metadata(&sidecar).expect("the sidecar");
+    let modified = original.modified().expect("modification time");
+    // Whitespace is an unlabelled sidecar, so clearing can preserve its size too.
+    for (contents, expected) in [("fix-test\n", Some("fix-test")), ("        \n", None)] {
+        std::fs::write(&sidecar, contents).expect("external sidecar edit");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&sidecar)
+            .expect("open sidecar");
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore modification time");
+        let edited = file.metadata().expect("edited sidecar");
+        assert_eq!(edited.len(), original.len(), "size is unchanged");
+        assert_eq!(edited.modified().expect("modification time"), modified);
+
+        let row = summary(&harness.host, &session).await.expect("listed");
+        assert!(!row.live, "the listing does not materialize the session");
+        assert_eq!(row.tag.as_deref(), expected);
     }
-    assert_eq!(
-        harness.host.store_tag_reads(),
-        after_release,
-        "and a settled sidecar is not read again",
-    );
     harness.host.shutdown().await;
 }
 
