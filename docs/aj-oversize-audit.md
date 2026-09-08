@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 15 LOOKs.
+retired 16 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 12 open)
+## LOOK (27 total, 11 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -48,7 +48,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`e6d94fc` 2026-08-26 aj-wire,aj-app,aj,docs: harden lock generation recovery~~ Retired: locked refusals wait for explicit selection to retry. Automatic lock-release recovery and wire generations are removed.
 - ~~`a0badb0` 2026-08-28 aj-app,aj: close remaining shutdown races~~ Retired without code changes: producer cancellation, attachment completion, and session draining serve distinct lifecycle contracts. No worthwhile simplification identified.
 - ~~`434fd05` 2026-08-28 aj-app: own complete session teardown~~ Retired: one registration owns driver completion before and after spawn, and abort requests derive from the registry cutoff. Session ownership and cleanup barriers remain intact.
-- `532aaab` 2026-08-28 aj-session,aj-app: resolve session environment gate findings
+- ~~`532aaab` 2026-08-28 aj-session,aj-app: resolve session environment gate findings~~ Retired: the unused projection compatibility wrapper and its assertions are removed. Export presentation and renderer-specific escaping remain intact.
 - `2c09755` 2026-08-30 models: mark issued handshake usage partial
 - `317c06c` 2026-08-30 session: implement crash-safe environment publication
 - `48c07a9` 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account
@@ -226,12 +226,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: An empty-body ownership expansion with apparently redundant tracking. The shutdown commits landed as one reviewed range. `ProcessTeardown` belongs to the later helper changes, not this commit. A Tokio tracker does not supply selective sticky abortion or application-status finalization, and its close operation does not reject new tasks.
 - Disposition: Keep the outer session owner, cleanup leases, persistence fence, and shared shutdown completion. Retain boundary coverage distinguishing terminal status from actual completion. Process-level abandonment remains separate from successful in-process cleanup.
 
-### 532aaab 2026-08-28 aj-session,aj-app: resolve session environment gate findings
+### 532aaab 2026-08-28 aj-session,aj-app: resolve session environment gate findings [RETIRED]
+- Status: Retired after removing the unused `project_settings_entry` compatibility wrapper and its compatibility-only assertions. The production `project_state_entry` API retains backfill-parity coverage.
 - Stats: 13 files, +293 -82, ~135 prod / ~155 test lines
 - Body: empty
-- Verdict: LOOK
-- Why: A "review findings" bundle: renames settings to state across log.rs/replay.rs/template.js, adds env display to the export, and touches two spec docs. It leaves a `#[deprecated] project_settings_entry` shim in replay.rs (still at HEAD, used only by a test under `#[allow(deprecated)]`) inside a single workspace with no external callers. The JS `quoteDisplayText` escaper duplicates the Rust `quoted_env_text` added in b2f9b51 with a different grammar.
-- Simpler shape: finish the rename and delete the shim; one escaping rule for env display shared by both renderers or none.
+- Verdict: Retired after a scoped compatibility cleanup. Export labels, state filtering, and navigation address concrete display defects.
+- Why flagged: A review-fix bundle with an unused compatibility API and apparently duplicated escaping. The fix belongs to the same reviewed range as `558e77e`. `317c06cb` removed mid-session environment notices and their tests because environment is immutable creation metadata. The remaining Rust and JavaScript formatters serve distinct rendering boundaries, with terminal-specific whitespace handling in Rust.
+- Disposition: Keep serializer-boundary redaction, navigable keys-only export rows, and renderer-local escaping. No shared cross-language formatter or environment replay mechanism is needed.
 
 ### 2c09755 2026-08-30 models: mark issued handshake usage partial
 - Stats: 8 files, +390 -75, ~175 prod / ~215 test lines

@@ -227,26 +227,6 @@ impl LogSnapshot {
                     .then_some(tagged.event)
             })
     }
-
-    /// Compatibility projection for inference-settings entries.
-    ///
-    /// New state-entry callers should use [`Self::project_state_entry`]. This
-    /// wrapper retains the original settings-only contract and returns `None`
-    /// for environment and non-state entries.
-    #[deprecated(note = "use project_state_entry for notice-producing state entries")]
-    pub fn project_settings_entry(&self, entry: &EntryId) -> Option<AgentEvent> {
-        let persisted = self.get(entry)?;
-        if !matches!(
-            &persisted.entry,
-            ConversationEntryKind::ModelChange { .. }
-                | ConversationEntryKind::ThinkingChange { .. }
-                | ConversationEntryKind::SpeedChange { .. }
-                | ConversationEntryKind::VerbosityChange { .. }
-        ) {
-            return None;
-        }
-        self.project_state_entry(entry)
-    }
 }
 
 /// Walks `log` in append order and lazily yields its projected [`AgentEvent`]s.
@@ -4959,7 +4939,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn project_state_entry_answers_what_the_projection_emits() {
         let (_dir, log) = open_sub_log();
         let snapshot = log.snapshot();
@@ -4980,9 +4959,6 @@ mod tests {
         let projected = snapshot
             .project_state_entry(&entry_at(6))
             .expect("a mid-session settings entry projects a notice");
-        let compatibility = snapshot
-            .project_settings_entry(&entry_at(6))
-            .expect("the compatibility API still projects inference settings");
         let from_backfill = project_suffix(&snapshot, Some(5), &live([1]))
             .events
             .into_iter()
@@ -4993,11 +4969,6 @@ mod tests {
             wire(&projected),
             wire(&from_backfill),
             "the answer must be exactly what a backfill regenerates"
-        );
-        assert_eq!(
-            wire(&compatibility),
-            wire(&projected),
-            "the compatibility API must preserve the previous settings result"
         );
 
         // A message entry is not a notice-producing state entry.

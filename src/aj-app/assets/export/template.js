@@ -548,8 +548,7 @@
 
   // Environment values are redacted before this renderer receives them and
   // remain unread here. Keys are arbitrary persisted text. Quote delimiters
-  // and render every non-ASCII or control code point as inert ASCII text,
-  // matching the replay boundary's terminal-safe representation.
+  // and render every non-ASCII or control code point as inert ASCII text.
   function quoteDisplayText(value) {
     let out = '"';
     for (const ch of String(value)) {
