@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 9 LOOKs.
+retired 10 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 18 open)
+## LOOK (27 total, 17 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -42,7 +42,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`bbca1ad` 2026-08-11 aj: splice a client's session streams through a gateway~~ Retired: host fan-out and gateway forwarding share one outbound queue core and frame classification, with their distinct attachment delivery and lifecycle behavior intact.
 - ~~`67c3d58` 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up~~ Retired: production recovery retained. Obsolete test-only discharge logic and its tests are removed, with catch-up guarantees covered through the drive loop.
 - ~~`09f7dac` 2026-08-19 aj: close the review findings on the loop-folded catch-up~~ Retired: production recovery retained. The test helper no longer records its own connection-state assignments as evidence of screen behavior. Fresh-client convergence coverage remains.
-- `39920f0` 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model
+- ~~`39920f0` 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model~~ Retired without code changes: the requested account attribution is wired, and the single-pass aggregation and digest rows are proportionate to the feature.
 - `9fd4f0c` 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals
 - `b1e4ba9` 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows
 - `e6d94fc` 2026-08-26 aj-wire,aj-app,aj,docs: harden lock generation recovery
@@ -183,12 +183,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: An empty-body review bundle with internal-state tests. `Folded::opened` and its per-frame reset are absent, cache validity belongs to the rendering layer, and recovery survives loop exits until navigation replaces its target. The remaining test recorder asserted its own state assignments rather than production rendering.
 - Disposition: Keep the production fold and recovery ownership. Remove the helper-only state trace, retain convergence and composed input, navigation, and rendering coverage.
 
-### 39920f0 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model
+### 39920f0 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model [RETIRED]
+- Status: Retired without code changes. Provider/model breakdown and the account axis were explicitly requested. `17cc7fdd` wires the recorded account into the bucket key, so the audit's unconditional-None finding is resolved.
 - Stats: 6 files, +516 -20, ~105 prod / ~410 test lines
 - Body: empty
-- Verdict: LOOK
-- Why: `UsageBucket` is keyed on `(provider, model, account)` but the aggregation loop sets `let account = None;` unconditionally (stats.rs:166, still so at HEAD), so the account dimension is speculative generality carried in the key, sort comparator, and every test tuple. Same-day 26366f1 landed `AssistantMessage.account`, so the value was available and simply not used. ~410 test lines for a 100-line aggregation, including a 240-line test that builds a multi-thread log to check bucket counts. Empty body on a change that adds a public struct to `SessionStats`.
-- Simpler shape: bucket on `(provider, model)` only, add the account dimension when something reads it; or wire `a.account` in the same commit.
+- Verdict: Retired after investigation. One local map in the existing stats traversal, one sorted vector, and ordinary digest rows are the smallest coherent shape for the requested attribution. Response counters support current unpriced-usage annotations, and compaction retains its separate subtotal because its records identify no provider or model.
+- Why flagged: An unfilled account key and a large test diff. The account join was deliberately separated from the breakdown, not speculative functionality. The large fixture checks recorded identity, abandoned branches, sub-agent threads, arithmetic, unpriced counts, and ordering rather than merely bucket counts.
+- Disposition: Keep production and tests. Minor test-construction and boundary cleanups do not justify a separate change. All 17 targeted stats, session-info, and cost-aggregation tests passed.
 
 ### 9fd4f0c 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals
 - Stats: 11 files, +1304 -80, ~370 prod / ~935 test lines
