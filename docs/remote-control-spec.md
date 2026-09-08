@@ -100,7 +100,14 @@ The host layer depends on no terminal, which is what `aj serve` is.
   per-session `state` frames (section 5.3), and epoch/seq bookkeeping.
 - **Shutdown** (SIGTERM, or the interactive host quitting): running
   turns are cancelled through the ordinary abort path, background tasks
-  quiesced, log buffers flushed, client streams closed.
+  quiesced, log buffers flushed, client streams closed. Sessions wind down
+  concurrently. The process gives orderly teardown one 30-second grace,
+  then exits nonzero with a diagnostic if cleanup is unfinished. Another
+  stop signal during teardown exits immediately. Forced exit can lose
+  buffered work and abandon subprocess cleanup. In-process session cleanup
+  retains writer locks until its tasks and persistence listeners finish,
+  without its own host-wide deadline. The gateway uses the same process
+  exit policy.
 - **Persistence failure.** A conversation-log write error is terminal
   for that materialization: the log refuses every later write. The host
   publishes one `error` frame with code `persistence_failed` on every

@@ -99,8 +99,22 @@ mod tool_cell;
 mod transcript;
 mod usage_overlay;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    run_to_exit(async_main())
+}
+
+/// Run the application without waiting for unowned blocking work after it exits.
+fn run_to_exit(program: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(program);
+    // Application teardown owns the work that must finish. A background read
+    // stuck in filesystem I/O must not add an unbounded runtime-drop wait after
+    // that teardown has completed and its stop-signal listener has returned.
+    runtime.shutdown_background();
+    result
+}
+
+async fn async_main() -> Result<()> {
     // `~/.aj/.env` first (highest priority for env-driven config), then a
     // project-local `.env` if present. `dotenv` preserves values already set,
     // so loading in this order implements the documented precedence.

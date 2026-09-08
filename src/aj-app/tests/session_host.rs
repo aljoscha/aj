@@ -11274,11 +11274,10 @@ async fn shutdown_suppresses_a_task_wake_queued_behind_an_in_flight_command() {
     );
 }
 
-/// The host deadline escalates cleanup but does not transfer ownership. A
-/// detached driver that remains live past it keeps shutdown pending and the
-/// advisory lock held until the registry can publish terminal state.
+/// A live detached driver keeps shutdown pending and the advisory lock held
+/// until the registry can publish terminal state, however long cleanup takes.
 #[tokio::test(start_paused = true)]
-async fn shutdown_waits_past_escalation_for_detached_driver_and_lock_release() {
+async fn shutdown_waits_for_detached_driver_ownership_before_lock_release() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
     let handles = harness
@@ -11334,89 +11333,11 @@ async fn shutdown_waits_past_escalation_for_detached_driver_and_lock_release() {
     drop(rival);
 }
 
-/// An idle release can hold the live-session map while it joins the session
-/// owner. If shutdown reaches its deadline on that lock, it still cannot report
-/// completion before the owner's detached-driver and advisory-lock fences.
-#[tokio::test(start_paused = true)]
-async fn shutdown_waits_past_a_map_deadline_for_complete_session_ownership() {
-    let harness = Harness::new(Vec::new());
-    let session = harness.create().await;
-    let handles = harness
-        .host
-        .local_handles(&session)
-        .await
-        .expect("live session");
-    let registry = handles.task_registry.clone();
-    let (task, _cancel, driver) = registry.register_driver(
-        AgentId::Main,
-        "staged-call".to_string(),
-        TaskKind::Bash {
-            command: "staged detached process".to_string(),
-        },
-        "staged detached process".to_string(),
-        Arc::new(FixedTaskOutput),
-    );
-    let (release, task_held) = tokio::sync::oneshot::channel();
-    driver.spawn(async move {
-        let _ = task_held.await;
-    });
-
-    let (map_entered, map_is_held) = tokio::sync::oneshot::channel();
-    let (map_release, hold_map) = tokio::sync::oneshot::channel();
-    let map_host = harness.host.clone();
-    let map_holder = tokio::spawn(async move {
-        map_host
-            .hold_session_map_for_test(map_entered, hold_map)
-            .await;
-    });
-    map_is_held.await.expect("session map hold established");
-
-    let shutdown_host = harness.host.clone();
-    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
-    for _ in 0..31 {
-        tokio::time::advance(Duration::from_secs(1)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-    }
-    assert!(
-        !shutdown.is_finished(),
-        "the host reported shutdown while the map still owned its session"
-    );
-    assert_eq!(registry.status(task), Some(TaskStatus::Running));
-    assert!(
-        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
-            .expect("try_acquire")
-            .is_none(),
-        "the map timeout released the advisory lock before detached cleanup"
-    );
-
-    map_release.send(()).expect("release session map");
-    map_holder.await.expect("map holder task");
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        !shutdown.is_finished(),
-        "releasing the map bypassed the detached-driver ownership fence"
-    );
-    release.send(()).expect("release staged detached driver");
-    bounded("shutdown to finish complete map-held ownership", shutdown)
-        .await
-        .expect("shutdown task");
-    assert_eq!(registry.status(task), Some(TaskStatus::Killed));
-    assert!(registry.quiesce(Duration::ZERO).await);
-    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
-        .expect("try_acquire")
-        .expect("the rival lock follows complete map-held ownership");
-    drop(rival);
-}
-
-/// A host cutoff can abort the session driver before it reaches `wind_down`.
+/// Dropping the final host aborts the session driver before `wind_down`.
 /// The session owner still cancels and reaps a real detached process before its
 /// advisory lock becomes available to a rival writer.
-#[tokio::test(start_paused = true)]
-async fn forced_driver_abort_reaps_detached_bash_before_releasing_the_session_lock() {
+#[tokio::test]
+async fn host_drop_reaps_detached_bash_before_releasing_the_session_lock() {
     let harness = Harness::with_provider(scripted(
         vec![
             calling(
@@ -11453,73 +11374,43 @@ async fn forced_driver_abort_reaps_detached_bash_before_releasing_the_session_lo
         .expect("the fixture has a live detached bash driver")
         .id;
     let held = handles.log.lock().await;
-    let command_host = harness.host.clone();
-    let command_session = session.clone();
-    let command = tokio::spawn(async move {
-        command_host
-            .command(
-                &command_session,
-                Command::Settings(SettingsChange {
-                    agent: AgentId::Main,
-                    persist: PersistAction::None,
-                    axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
-                }),
-            )
-            .await
-    });
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
+    drop(harness.host);
     assert!(
-        !command.is_finished(),
-        "the held log wedges a command ahead of the shutdown request"
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "dropping the host does not synchronously release detached-process ownership"
     );
 
-    let began = tokio::time::Instant::now();
-    let shutdown_host = harness.host.clone();
-    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
-    // The detached process is real while the host deadline uses Tokio time.
-    // Advance in bounded steps so the OS child-exit and pipe-readiness events
-    // are polled between logical deadlines instead of jumping straight to 30s.
-    for _ in 0..30 {
-        tokio::time::advance(Duration::from_secs(1)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
+    let rival = bounded("host drop to release detached-process ownership", async {
+        loop {
+            if let Some(lock) =
+                SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+                    .expect("try_acquire")
+            {
+                return lock;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if shutdown.is_finished() {
-            break;
-        }
-    }
-    shutdown.await.expect("shutdown task");
-
-    assert!(
-        began.elapsed() >= Duration::from_secs(20) && began.elapsed() <= Duration::from_secs(31),
-        "the driver reached the forced host cutoff, then reaped its task inside the total budget: {:?}",
-        began.elapsed()
-    );
-    assert!(
-        command.await.expect("command task").is_err(),
-        "the forced driver refuses its blocked command"
-    );
+    })
+    .await;
     assert_eq!(
         handles.task_registry.status(task),
         Some(TaskStatus::Killed),
-        "the detached process driver reached terminal state before shutdown returned"
+        "the detached process reached terminal state before lock release"
     );
     assert!(
         handles.task_registry.quiesce(Duration::ZERO).await,
-        "terminal status includes real detached-driver completion"
+        "lock release includes real detached-driver completion"
     );
-    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
-        .expect("try_acquire")
-        .expect("the rival lock follows detached-process reap");
+    assert!(handles.persistence_fence.is_closed());
     drop(rival);
     drop(held);
 }
 
-/// Detached work observes the host stop directly through the map-independent
-/// session controls. It does not wait for `Request::Shutdown` behind a blocked
-/// command, while the session owner still retains the advisory lock.
+/// Once shutdown acquires the session map, detached work observes cancellation
+/// without waiting for `Request::Shutdown` behind a blocked command. The
+/// session owner still retains the advisory lock.
 #[tokio::test]
 async fn shutdown_cancels_detached_tasks_before_a_blocked_driver_reaches_its_request() {
     let harness = Harness::new(Vec::new());
@@ -11648,11 +11539,11 @@ async fn a_driven_foreground_turn_is_part_of_session_cleanup_ownership() {
     );
 }
 
-/// A forced inner-driver abort drops its foreground turn set. The turn and a
-/// foreground Bash process's asynchronous drop cleanup remain part of the
-/// session owner, so neither can outlive the advisory lock.
-#[tokio::test(start_paused = true)]
-async fn forced_driver_abort_reaps_foreground_bash_before_releasing_the_lock() {
+/// Dropping the final host aborts the inner driver and its foreground turn set.
+/// The turn and a foreground Bash process's asynchronous drop cleanup remain
+/// part of the session owner, so neither can outlive the advisory lock.
+#[tokio::test]
+async fn host_drop_reaps_foreground_bash_before_releasing_the_lock() {
     let process_dir = TempDir::new().expect("process tempdir");
     let pid_path = process_dir.path().join("foreground-bash.pid");
     let command = format!(
@@ -11661,7 +11552,7 @@ async fn forced_driver_abort_reaps_foreground_bash_before_releasing_the_lock() {
     );
     let harness = Harness::with_provider(scripted(
         vec![calling(
-            "running until host cutoff",
+            "running until host drop",
             "call-bash",
             "bash",
             serde_json::json!({
@@ -11702,16 +11593,12 @@ async fn forced_driver_abort_reaps_foreground_bash_before_releasing_the_lock() {
         },
     )
     .await;
-    // Tokio time is paused while the fixture process uses the OS scheduler.
-    // Yield both so the pid handshake cannot be satisfied by a timer advancing
-    // before the command has actually entered its TERM-immune loop.
-    for _ in 0..400 {
-        if std::fs::metadata(&pid_path).is_ok_and(|metadata| metadata.len() > 0) {
-            break;
+    bounded("foreground Bash to publish its pid", async {
+        while !std::fs::metadata(&pid_path).is_ok_and(|metadata| metadata.len() > 0) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        std::thread::sleep(Duration::from_millis(5));
-        tokio::task::yield_now().await;
-    }
+    })
+    .await;
     let pid: u32 = std::fs::read_to_string(&pid_path)
         .unwrap_or_default()
         .trim()
@@ -11719,7 +11606,7 @@ async fn forced_driver_abort_reaps_foreground_bash_before_releasing_the_lock() {
         .unwrap_or_else(|_| panic!("foreground Bash did not publish its pid at {pid_path:?}"));
     assert!(
         PathBuf::from(format!("/proc/{pid}")).exists(),
-        "the process must be live before shutdown or the reap assertion measures nothing"
+        "the process must be live before host drop or the reap assertion measures nothing"
     );
     let handles = harness
         .host
@@ -11727,77 +11614,36 @@ async fn forced_driver_abort_reaps_foreground_bash_before_releasing_the_lock() {
         .await
         .expect("live session");
     let held = handles.log.lock().await;
-    let command_host = harness.host.clone();
-    let command_session = session.clone();
-    let command = tokio::spawn(async move {
-        command_host
-            .command(
-                &command_session,
-                Command::Settings(SettingsChange {
-                    agent: AgentId::Main,
-                    persist: PersistAction::None,
-                    axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
-                }),
-            )
-            .await
-    });
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
     assert!(
-        !command.is_finished(),
-        "the driver is blocked ahead of shutdown"
+        !handles.task_registry.quiesce(Duration::ZERO).await,
+        "the foreground turn is owned before host drop"
     );
-
-    let shutdown_host = harness.host.clone();
-    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
-    bounded("shutdown to claim the host", async {
-        loop {
-            if harness.host.sessions().await.is_err() {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    tokio::time::advance(Duration::from_secs(21)).await;
-    for _ in 0..40 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        !shutdown.is_finished() && !handles.task_registry.quiesce(Duration::ZERO).await,
-        "foreground turn and process cleanup remain owned after driver cutoff"
-    );
+    drop(harness.host);
     assert!(
         SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
             .expect("try_acquire")
             .is_none(),
-        "foreground process cleanup retains the advisory lock"
+        "dropping the host does not synchronously release process ownership"
     );
 
-    // Advance the async grace in small steps while giving the real child and
-    // kernel wait path CPU between them. A single jump can expire the logical
-    // post-KILL bound before the OS has scheduled the kill and reap at all.
-    for _ in 0..30 {
-        tokio::time::advance(Duration::from_millis(100)).await;
-        std::thread::sleep(Duration::from_millis(2));
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
+    let rival = bounded("host drop to release foreground-process ownership", async {
+        loop {
+            if let Some(lock) =
+                SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+                    .expect("try_acquire")
+            {
+                return lock;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if shutdown.is_finished() {
-            break;
-        }
-    }
-    shutdown.await.expect("shutdown task");
+    })
+    .await;
     assert!(handles.task_registry.quiesce(Duration::ZERO).await);
-    assert!(command.await.expect("command task").is_err());
+    assert!(handles.persistence_fence.is_closed());
     assert!(
         !PathBuf::from(format!("/proc/{pid}")).exists(),
-        "shutdown released ownership before the foreground command reached reaped terminal state"
+        "lock release preceded the foreground command's reaped terminal state"
     );
-    let rival = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
-        .expect("try_acquire")
-        .expect("foreground process reap releases the session owner");
     drop(rival);
     drop(held);
 }
@@ -12282,7 +12128,7 @@ async fn shutdown_bounds_and_names_a_locked_log_flush() {
     let elapsed = began.elapsed();
     assert!(
         elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
-        "the flush used its own grace rather than the host deadline: {elapsed:?}"
+        "the flush respected its bounded grace: {elapsed:?}"
     );
     let traces = traces_since(&capture, start);
     assert!(
@@ -12335,12 +12181,10 @@ async fn shutdown_winds_session_drivers_down_concurrently() {
     drop(held);
 }
 
-/// Commands already waiting on their logs may never reach their queued
-/// Shutdown requests. One host cutoff names and aborts every unfinished
-/// driver, then joins the cancellations and releases their advisory locks.
+/// Shutdown retains every session owner while commands wait on their logs.
+/// Releasing the logs lets those commands finish before queued shutdown runs.
 #[tokio::test(start_paused = true)]
-async fn shutdown_aborts_and_names_every_driver_stuck_in_a_command() {
-    let (capture, start) = trace_capture();
+async fn shutdown_waits_for_every_driver_blocked_in_a_command() {
     let harness = Harness::new(Vec::new());
     let sessions = [harness.create().await, harness.create().await];
     let mut logs = Vec::new();
@@ -12389,56 +12233,53 @@ async fn shutdown_aborts_and_names_every_driver_stuck_in_a_command() {
             .filter(|command| !command.is_finished())
             .count(),
         sessions.len(),
-        "every held log must wedge its command or the deadline test measures nothing"
+        "every held log must wedge its command or the ownership test measures nothing"
     );
-    let began = tokio::time::Instant::now();
-
-    tokio::time::timeout(Duration::from_secs(31), harness.host.shutdown())
-        .await
-        .expect("the host-wide shutdown deadline");
-
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    for _ in 0..31 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
     assert!(
-        began.elapsed() >= Duration::from_secs(20) && began.elapsed() < Duration::from_secs(21),
-        "the graceful cutoff reserves detached-task cleanup inside the total deadline: {:?}",
-        began.elapsed()
+        !shutdown.is_finished(),
+        "blocked commands retain shutdown ownership"
     );
+    assert!(commands.iter().all(|command| !command.is_finished()));
+    for session in &sessions {
+        assert!(
+            SessionLock::try_acquire(&harness.persistence, session, "a-rival-writer")
+                .expect("try_acquire")
+                .is_none(),
+            "a blocked command retains its session lock"
+        );
+    }
+
+    drop(held);
+    for command in commands {
+        bounded("the blocked command to finish", command)
+            .await
+            .expect("command task")
+            .expect("in-flight command completes successfully");
+    }
+    bounded("shutdown to join every session owner", shutdown)
+        .await
+        .expect("shutdown task");
     for session in &sessions {
         let lock = SessionLock::try_acquire(&harness.persistence, session, "a-rival-writer")
             .expect("try_acquire")
-            .expect("the completed abort join released the session lock before shutdown returned");
+            .expect("completed shutdown released every session lock");
         drop(lock);
     }
-    for command in commands {
-        assert!(
-            command.await.expect("command task").is_err(),
-            "aborting a driver refuses the command it could not finish"
-        );
-    }
-    let traces = traces_since(&capture, start);
-    for session in &sessions {
-        let warnings = traces
-            .lines()
-            .filter(|line| {
-                line.contains(session)
-                    && line.contains("session driver join")
-                    && line.contains("aborting")
-            })
-            .count();
-        assert_eq!(
-            warnings, 1,
-            "each abandoned session gets one named phase warning: {traces}"
-        );
-    }
-    drop(held);
 }
 
-/// The total host deadline starts before acquiring the session map. An idle
-/// release can hold that map while it waits for a Release queued behind a
-/// command blocked on the log. The independent abort registry ends that driver
-/// and lets shutdown drain the map before returning.
+/// An idle release holds the session map while Release waits behind a command
+/// blocked on the log. Shutdown must wait for that real owner to finish before
+/// draining the map, closing fanout, and reporting completion.
 #[tokio::test(start_paused = true)]
-async fn shutdown_bounds_a_session_map_held_by_idle_release() {
-    let (capture, start) = trace_capture();
+async fn shutdown_waits_for_a_session_map_held_by_idle_release() {
     let harness = Harness::with_idle_grace(
         vec![finalized_text_message("on the record")],
         Duration::ZERO,
@@ -12505,44 +12346,50 @@ async fn shutdown_bounds_a_session_map_held_by_idle_release() {
     }
     let map_probe = blocked_probe
         .expect("idle release never held the session map, so the race test measures nothing");
-    let began = tokio::time::Instant::now();
-
-    tokio::time::timeout(Duration::from_secs(31), harness.host.shutdown())
-        .await
-        .expect("the map acquisition is inside the host-wide deadline");
-
+    let shutdown_host = harness.host.clone();
+    let shutdown = tokio::spawn(async move { shutdown_host.shutdown().await });
+    for _ in 0..31 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
     assert!(
-        began.elapsed() >= Duration::from_secs(20) && began.elapsed() < Duration::from_secs(21),
-        "the abort reserve recovers the held session map inside the total deadline: {:?}",
-        began.elapsed()
+        !shutdown.is_finished() && !map_probe.is_finished() && !command.is_finished(),
+        "shutdown remains pending while idle release holds the map"
     );
-    let traces = traces_since(&capture, start);
     assert!(
-        traces.lines().any(|line| line.contains(&stuck)
-            && line.contains("session map drain")
-            && line.contains("aborting")),
-        "the warning names the session and map-drain phase: {traces}"
+        SessionLock::try_acquire(&harness.persistence, &stuck, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "the map-held session retains its advisory lock"
     );
-    while bounded("fanout to close after the map deadline", stream.recv())
+
+    drop(held);
+    bounded("the blocked command to finish", command)
         .await
-        .is_some()
+        .expect("command task")
+        .expect("in-flight command completes successfully");
+    bounded("shutdown to finish map-held ownership", shutdown)
+        .await
+        .expect("shutdown task");
+    while bounded(
+        "fanout to close after session ownership ends",
+        stream.recv(),
+    )
+    .await
+    .is_some()
     {}
-
-    assert!(
-        command.await.expect("command task").is_err(),
-        "aborting the driver refuses the command it could not finish"
-    );
     bounded("the idle release to relinquish the map", map_probe)
         .await
         .expect("map probe task");
     let lock = SessionLock::try_acquire(&harness.persistence, &stuck, "a-rival-writer")
         .expect("try_acquire")
-        .expect("shutdown joined the aborted driver and released its advisory lock");
+        .expect("shutdown joined the session owner and released its advisory lock");
     drop(lock);
-    drop(held);
 }
 
-/// Deadline ceilings cost nothing on a healthy multi-session host.
+/// A healthy multi-session host completes teardown without consuming its graces.
 #[tokio::test]
 async fn shutdown_of_idle_sessions_is_fast_and_releases_every_lock() {
     let harness = Harness::new(Vec::new());

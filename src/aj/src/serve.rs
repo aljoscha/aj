@@ -16,6 +16,7 @@ use std::future::Future;
 use std::future::pending;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aj_app::cli::args::Args;
 use aj_app::host::SessionHost;
@@ -28,6 +29,9 @@ use aj_wire::Hello;
 use anyhow::{Context, Result, bail};
 
 use crate::remote::{IdentityGate, IdentityMode, RemoteServer, TailscaleWhois};
+
+/// One process-wide grace for orderly teardown before abandoning unfinished work.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// Resolve `--listen`'s address, reporting the value the user actually
 /// wrote rather than a resolver error alone.
@@ -131,7 +135,7 @@ pub(crate) async fn run(mut args: Args) -> Result<()> {
         Err(err) => {
             // The host is already holding session locks, so it has to be
             // wound down even though nothing was served.
-            host.shutdown().await;
+            finish_shutdown(host.shutdown()).await;
             return Err(err);
         }
     };
@@ -150,6 +154,15 @@ pub(crate) async fn shutdown_server(server: RemoteServer, host: &SessionHost) {
     server.stop_accepting();
     host.shutdown().await;
     server.shutdown().await;
+}
+
+/// Finish process teardown, exiting nonzero if it stalls or another stop arrives.
+///
+/// Library owners retain their resources until cleanup completes. Only the
+/// exiting frontend may abandon that work, and process exit must not be
+/// mistaken for successful library teardown.
+pub(crate) async fn finish_shutdown<F: Future>(teardown: F) -> F::Output {
+    ShutdownSignals::new().finish(teardown).await
 }
 
 /// What a `serve` run prints once it is up.
@@ -246,19 +259,27 @@ impl ShutdownSignals {
         }
     }
 
-    /// Await one stop signal, then let `teardown` finish unless another arrives.
+    /// Await a stop signal, then give teardown one grace or exit on another stop.
     pub(crate) async fn shutdown<F>(mut self, teardown: F)
     where
         F: Future<Output = ()>,
     {
         self.recv().await;
+        self.finish(teardown).await;
+    }
+
+    async fn finish<F: Future>(&mut self, teardown: F) -> F::Output {
         tokio::select! {
             biased;
             _ = self.recv() => {
                 eprintln!("aj: received a second shutdown signal; exiting immediately");
                 std::process::exit(1);
             }
-            () = teardown => {}
+            result = teardown => result,
+            () = tokio::time::sleep(SHUTDOWN_GRACE) => {
+                eprintln!("aj: shutdown grace expired; exiting with unfinished cleanup");
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -274,6 +295,142 @@ async fn recv_unix(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SHUTDOWN_TEST_CHILD: &str = "AJ_SHUTDOWN_TEST_CHILD";
+
+    async fn shutdown_test_child(test: &str) -> std::process::Output {
+        let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test, "--nocapture"])
+            .env(SHUTDOWN_TEST_CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn shutdown test child");
+
+        // Only the child pauses time. A missing shutdown deadline must fail the
+        // parent on wall time, with the stuck child killed and reaped.
+        match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+            Ok(status) => {
+                status.expect("wait for shutdown test child");
+            }
+            Err(_) => {
+                child
+                    .kill()
+                    .await
+                    .expect("kill and reap shutdown test child");
+                panic!("{test} exceeded the wall-clock deadline");
+            }
+        }
+        child.wait_with_output().await.expect("child output")
+    }
+
+    #[tokio::test]
+    async fn pending_cleanup_forces_process_exit() {
+        if std::env::var_os(SHUTDOWN_TEST_CHILD).is_some() {
+            tokio::time::pause();
+            #[cfg(unix)]
+            {
+                let signals = ShutdownSignals::new();
+                tokio::spawn(async {
+                    // Service uptime does not consume the shutdown grace.
+                    tokio::time::sleep(SHUTDOWN_GRACE * 2).await;
+                    nix::sys::signal::kill(
+                        nix::unistd::getpid(),
+                        nix::sys::signal::Signal::SIGTERM,
+                    )
+                    .expect("send the first stop signal to this test child");
+                });
+                signals
+                    .shutdown(async {
+                        println!("first signal started cleanup");
+                        std::future::pending::<()>().await;
+                    })
+                    .await;
+            }
+            #[cfg(not(unix))]
+            finish_shutdown(std::future::pending::<()>()).await;
+            panic!("pending cleanup must not return gracefully");
+        }
+
+        let output = shutdown_test_child("serve::tests::pending_cleanup_forces_process_exit").await;
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        #[cfg(unix)]
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("first signal started cleanup"),
+            "the first signal, not service uptime, starts the grace: {output:?}",
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).lines().any(|line| {
+                line == "aj: shutdown grace expired; exiting with unfinished cleanup"
+            }),
+            "{output:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_cleanup_returns_without_spending_grace() {
+        if std::env::var_os(SHUTDOWN_TEST_CHILD).is_some() {
+            tokio::time::pause();
+            let start = tokio::time::Instant::now();
+            let result = finish_shutdown(async {
+                tokio::task::yield_now().await;
+                "cleanup result"
+            })
+            .await;
+            assert_eq!(result, "cleanup result");
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            println!("cleanup returned without spending grace");
+            return;
+        }
+
+        let output =
+            shutdown_test_child("serve::tests::completed_cleanup_returns_without_spending_grace")
+                .await;
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("cleanup returned without spending grace"),
+            "{output:?}",
+        );
+    }
+
+    #[test]
+    fn completed_program_does_not_wait_for_blocking_background_work() {
+        if std::env::var_os(SHUTDOWN_TEST_CHILD).is_some() {
+            crate::run_to_exit(async {
+                let (started, running) = tokio::sync::oneshot::channel();
+                drop(tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    loop {
+                        std::thread::park();
+                    }
+                }));
+                running
+                    .await
+                    .expect("blocking work is running before application exit");
+                Ok(())
+            })
+            .expect("application finished");
+            println!("application exited without waiting for background work");
+            return;
+        }
+
+        crate::run_to_exit(async {
+            let output = shutdown_test_child(
+                "serve::tests::completed_program_does_not_wait_for_blocking_background_work",
+            )
+            .await;
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("application exited without waiting for background work"),
+                "{output:?}",
+            );
+            Ok(())
+        })
+        .expect("test process completed");
+    }
 
     #[test]
     fn a_listen_address_resolves_to_exactly_one_socket() {

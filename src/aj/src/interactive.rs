@@ -6542,7 +6542,7 @@ pub async fn run(args: Args) -> Result<()> {
         Some(host) => match crate::serve::start_server(&args, host).await {
             Ok(server) => server,
             Err(err) => {
-                shut_down_host(&world).await;
+                crate::serve::finish_shutdown(shut_down_host(&world)).await;
                 return Err(err);
             }
         },
@@ -6708,25 +6708,29 @@ pub async fn run(args: Args) -> Result<()> {
         }
     };
 
-    // Read what the banner needs before the host tears its sessions down:
-    // afterwards there is no live session to ask.
-    let banner = ExitBanner::collect(&world, completed_sessions).await;
-    // Stop accepting before host teardown, then let fanout closure end remote
-    // streams before their server join. With no control port, only the local
-    // host needs winding down. Connect mode has neither.
-    if let Some(server) = server {
-        let host = world
-            .control
-            .host()
-            .expect("a local control port serves the in-process host");
-        crate::serve::shutdown_server(server, host).await;
-    } else {
-        // Cancels every turn through the graceful path, quiesces background
-        // tasks, flushes logs, and releases locks. Connect mode has no host:
-        // dropping its stream is what deregisters it.
-        shut_down_host(&world).await;
-    }
+    // Restore the terminal before installing forced-exit handlers. Process exit
+    // cannot run destructors to leave raw mode or the alternate screen.
     app.shutdown().await;
+    let banner = crate::serve::finish_shutdown(async {
+        // Collect usage while sessions still exist, under the same exit budget
+        // as cleanup: a blocked usage read must not prevent the user quitting.
+        if let Some(server) = &server {
+            server.stop_accepting();
+        }
+        let banner = ExitBanner::collect(&world, completed_sessions).await;
+        if let Some(server) = server {
+            let host = world
+                .control
+                .host()
+                .expect("a local control port serves the in-process host");
+            crate::serve::shutdown_server(server, host).await;
+        } else {
+            // Connect mode has no host. Dropping its stream deregisters it.
+            shut_down_host(&world).await;
+        }
+        banner
+    })
+    .await;
 
     // The alt screen wiped the conversation from the terminal, so the
     // normal screen gets the usage banner and the resume hint.

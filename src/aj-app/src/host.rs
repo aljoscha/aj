@@ -69,7 +69,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::{Sender, unbounded_channel};
 use tokio::sync::oneshot;
-use tokio::task::{AbortHandle, JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::host::driver::Driver;
@@ -92,16 +92,6 @@ use fanout::Fanout;
 /// frame per event would swamp every client's queue for data that is
 /// cumulative anyway.
 const LIST_COALESCE: Duration = Duration::from_millis(200);
-
-/// Elapsed shutdown time at which unfinished ownership is reported. Currently
-/// 30 seconds. This boundary does not release or transfer that ownership.
-const HOST_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
-
-/// Forced-cleanup reserve between inner-driver abortion and the reporting
-/// boundary. Currently 10 seconds, so inner drivers are aborted at 20 seconds
-/// (`HOST_SHUTDOWN_GRACE - HOST_ABORT_GRACE`) and their outer owners get this
-/// interval before the host reports that it is continuing to wait.
-const HOST_ABORT_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a session stays live with nothing running and nobody attached
 /// before the host releases it.
@@ -623,45 +613,12 @@ struct LiveEntry {
     /// task reaping and persistence fencing, so joining it is what releases the
     /// complete writer lifetime.
     driver: JoinHandle<()>,
-    /// Map-independent stop controls for the complete session scope.
-    stop: SessionStop,
+    /// Aborts the inner driver if the host is dropped without shutdown. The
+    /// outer owner is left alive to finish cleanup before releasing its lock.
+    abort: AbortHandle,
 }
 
-/// Stop controls that remain reachable even while another task holds the async
-/// session map. Task cancellation starts at host shutdown. Driver abortion is
-/// the later cutoff that makes the outer owner begin forced cleanup.
-#[derive(Clone)]
-struct SessionStop {
-    driver: AbortHandle,
-    tasks: TaskRegistry,
-}
-
-/// Complete session stop handles retained while the host-owned teardown task
-/// owns the outer session joins.
-///
-/// If runtime teardown drops the host task, every inner driver is still
-/// cancelled. Dropping the outer join handles detaches the session owner tasks,
-/// which retain their advisory locks until task reaping and persistence fencing
-/// complete.
-struct ShutdownStops(Vec<(String, SessionStop)>);
-
-impl Drop for ShutdownStops {
-    fn drop(&mut self) {
-        for (_, stop) in &self.0 {
-            stop.tasks.shutdown();
-            stop.tasks.abort_drivers();
-            if !stop.driver.is_finished() {
-                stop.driver.abort();
-            }
-        }
-    }
-}
-
-/// Close every attachment whenever the host-owned teardown task ends.
-///
-/// On the normal path this runs after session-owner joins. If runtime teardown
-/// drops the task, [`ShutdownStops`] runs first and this still leaves no parked
-/// stream.
+/// Close every attachment when the host-owned teardown task ends.
 struct ShutdownFinish<'a>(&'a HostInner);
 
 impl Drop for ShutdownFinish<'_> {
@@ -686,10 +643,6 @@ struct HostInner {
     /// directory's abbreviation, else nothing.
     name: Option<String>,
     sessions: TokioMutex<HashMap<String, LiveEntry>>,
-    /// Complete stop controls for every session, independently of the async
-    /// session-map lock. Shutdown can cancel detached work and abort drivers
-    /// even when a release is holding that map.
-    session_stops: StdMutex<HashMap<String, SessionStop>>,
     /// Wall clock and monotonic clock read at the same moment, for
     /// projecting a task's `Instant` onto wall time (see [`wall_clock`]).
     /// Read once per host rather than per call, so the same task's start
@@ -714,25 +667,23 @@ struct HostInner {
 
 impl Drop for HostInner {
     fn drop(&mut self) {
-        // A host dropped without `shutdown` would otherwise leave its
-        // drivers running (and its session locks held) for the life of the
-        // process. Aborting is not the graceful path (no turn cancel, no
-        // task quiescing, no log flush), so `shutdown` stays the
-        // documented teardown, and this only bounds the damage, loudly.
+        // An abandoned host must still stop its drivers. Their outer owners
+        // retain writer locks through cleanup, but forced cancellation does not
+        // finish transcript events or flush pending log entries.
         let abandoned: Vec<&String> = self.sessions.get_mut().keys().collect();
         if !abandoned.is_empty() {
             tracing::warn!(
                 "host dropped without shutdown: aborting the drivers of {abandoned:?} \
-                 without cancelling turns or flushing their logs"
+                 without graceful turn completion or log flush"
             );
         }
         for entry in self.sessions.get_mut().values() {
             // Leave the outer owner task alive. It observes this inner abort,
             // reaps detached tasks, fences persistence, and only then drops
             // the advisory lock. Dropping its JoinHandle merely detaches it.
-            entry.stop.tasks.shutdown();
-            entry.stop.tasks.abort_drivers();
-            entry.stop.driver.abort();
+            entry.session.core.task_registry.shutdown();
+            entry.session.core.task_registry.abort_drivers();
+            entry.abort.abort();
         }
     }
 }
@@ -786,7 +737,6 @@ impl SessionHost {
             working_directory,
             name,
             sessions: TokioMutex::new(HashMap::new()),
-            session_stops: StdMutex::new(HashMap::new()),
             clock_anchor: (Utc::now(), Instant::now()),
             idle_grace: idle_grace.unwrap_or(DEFAULT_IDLE_GRACE),
             shut_down: AtomicBool::new(false),
@@ -1239,23 +1189,6 @@ impl SessionHost {
         self.directory().await
     }
 
-    /// Hold the live-session map until `release`, exposing entry through
-    /// `entered` once the hold is established.
-    ///
-    /// Test support for the shutdown branch an idle release exercises while it
-    /// joins a session owner. Production callers never coordinate on the map
-    /// directly.
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn hold_session_map_for_test(
-        &self,
-        entered: oneshot::Sender<()>,
-        release: oneshot::Receiver<()>,
-    ) {
-        let _sessions = self.inner.sessions.lock().await;
-        let _ = entered.send(());
-        let _ = release.await;
-    }
-
     /// Offer one frame through the production live fan-out.
     ///
     /// Composed attach tests use this seam to place a delayed forwarder
@@ -1483,18 +1416,12 @@ impl SessionHost {
 
     /// Tear every live session down and close every client stream.
     ///
-    /// Each session's turns are cancelled through the graceful path (so
-    /// transcripts stay consistent), its background tasks quiesced, and its
-    /// log given a bounded final flush. Its advisory lock is released only after
-    /// the session owner has also reaped detached tasks and fenced old
-    /// persistence listeners. Drivers wind down concurrently under one
-    /// host-wide escalation point. A driver still running at the cutoff is
-    /// named and aborted. The call continues awaiting each outer owner after
-    /// that point because returning while its detached process driver or
-    /// advisory lock remains live would report a shutdown that has not happened.
-    ///
-    /// Terminal: every later request fails rather than rebuilding a session
-    /// behind a driver nobody will ever tell to stop.
+    /// Sessions wind down concurrently. Their advisory locks remain held until
+    /// detached work and admitted persistence listeners finish. This call has no
+    /// overall timeout: a frontend that must stop waiting owns that policy, and
+    /// cannot treat cancelling this await as completion of session cleanup.
+    /// Every caller waits for the same teardown, even if an earlier caller was
+    /// cancelled. Later requests fail instead of rebuilding sessions.
     pub async fn shutdown(&self) {
         let start = {
             let mut state = self
@@ -1545,142 +1472,30 @@ impl SessionHost {
 
     async fn shutdown_owned(&self) {
         let _finish = ShutdownFinish(&self.inner);
-        // Cancel before a driver's advisory lock can be released. The producer
-        // may finish computation over a snapshot it already owns, but every
-        // later log acquisition and send prefers cancellation, so it cannot
-        // read from or emit through a rival writer.
+        // Stop producers before any advisory lock can be released. Completed
+        // blocks still deliver their queued terminal frames before fanout EOF.
         self.inner.shared.fanout.stop_blocks();
-        let deadline = tokio::time::Instant::now() + HOST_SHUTDOWN_GRACE;
-        let graceful_deadline = deadline - HOST_ABORT_GRACE;
-        let mut stops = ShutdownStops(
-            self.inner
-                .session_stops
-                .lock()
-                .expect("session stops mutex poisoned")
-                .iter()
-                .map(|(session, stop)| (session.clone(), stop.clone()))
-                .collect(),
-        );
-        // Detached work can observe its session root without waiting for a
-        // command ahead of Request::Shutdown. This also covers the map-held
-        // path below, where LiveEntry itself is not reachable until cutoff.
-        for (_, stop) in &stops.0 {
-            stop.tasks.shutdown();
+        let entries = std::mem::take(&mut *self.inner.sessions.lock().await);
+        for entry in entries.values() {
+            // Cancel detached work without waiting for an in-flight command
+            // ahead of the shutdown request to finish.
+            entry.session.core.task_registry.shutdown();
+            entry.session.request_shutdown();
         }
-        let mut map_aborted = HashSet::new();
-        let entries: Vec<LiveEntry> = match tokio::time::timeout_at(
-            graceful_deadline,
-            self.inner.sessions.lock(),
-        )
-        .await
-        {
-            Ok(mut sessions) => sessions.drain().map(|(_, entry)| entry).collect(),
-            Err(_) => {
-                // An idle release can hold the map while its request is queued
-                // behind a stuck command. The independent handles are what let
-                // the host end those drivers without first acquiring the map.
-                for (session, stop) in &stops.0 {
-                    if !stop.driver.is_finished() {
-                        tracing::warn!(
-                            session = session.as_str(),
-                            phase = "session map drain",
-                            "the live session map remained locked through the graceful cutoff; aborting its driver before the host deadline"
-                        );
-                        stop.driver.abort();
-                        map_aborted.insert(session.clone());
-                    }
-                }
-                match tokio::time::timeout_at(deadline, self.inner.sessions.lock()).await {
-                    Ok(mut sessions) => sessions.drain().map(|(_, entry)| entry).collect(),
-                    Err(_) => {
-                        tracing::warn!(
-                            phase = "session map drain",
-                            "the live session map remained locked through the host deadline; continuing to await complete session ownership"
-                        );
-                        let mut sessions = self.inner.sessions.lock().await;
-                        sessions.drain().map(|(_, entry)| entry).collect()
-                    }
-                }
-            }
-        };
-
-        let mut drivers = JoinSet::new();
-        let mut pending_reapers = HashSet::new();
-        for entry in entries {
-            let LiveEntry {
-                session,
-                driver,
-                stop,
-            } = entry;
-            let id = session.id().to_string();
-            pending_reapers.insert(id.clone());
-            session.request_shutdown();
-            // The outer owner holds the session lock through task reaping and
-            // persistence fencing, so joining it is what releases the complete
-            // writer lifetime. Dropping our own handle first keeps the session
-            // from outliving that owner.
-            drop(session);
-            if !stops.0.iter().any(|(session, _)| session == &id) {
-                stop.tasks.shutdown();
-                stops.0.push((id.clone(), stop));
-            }
-            drivers.spawn(async move { (id, driver.await) });
-        }
-
-        while !drivers.is_empty() {
-            match tokio::time::timeout_at(graceful_deadline, drivers.join_next()).await {
-                Ok(Some(joined)) => {
-                    remove_joined_session(&mut pending_reapers, &joined);
-                    warn_driver_join(joined);
-                }
-                Ok(None) => break,
-                Err(_) => break,
+        // All owners are already running and every shutdown request was sent
+        // before this first await. Joining them in order does not serialize
+        // their cleanup or defer release of another owner's writer lock.
+        for (id, entry) in entries {
+            // The outer owner retains the writer lock through task cleanup and
+            // persistence fencing. Await it rather than aborting or detaching it.
+            drop(entry.session);
+            if let Err(err) = entry.driver.await {
+                tracing::warn!(
+                    session = id,
+                    "session owner ended abnormally during shutdown: {err}"
+                );
             }
         }
-        for (session, stop) in &stops.0 {
-            if !stop.driver.is_finished() {
-                if !map_aborted.contains(session) {
-                    tracing::warn!(
-                        session = session.as_str(),
-                        phase = "session driver join",
-                        "session driver did not finish before the abort cutoff; aborting it before the host deadline"
-                    );
-                }
-                stop.driver.abort();
-            }
-        }
-        while !drivers.is_empty() {
-            match tokio::time::timeout_at(deadline, drivers.join_next()).await {
-                Ok(Some(joined)) => {
-                    remove_joined_session(&mut pending_reapers, &joined);
-                    warn_driver_join(joined);
-                }
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        if !pending_reapers.is_empty() {
-            tracing::warn!(
-                sessions = ?pending_reapers,
-                phase = "session owner reap",
-                "session cleanup remained live at the host deadline; continuing to await detached drivers and advisory-lock release"
-            );
-        }
-        // The deadline is an escalation and reporting boundary, not an
-        // ownership boundary. Each outer owner holds the advisory lock and the
-        // registry's process-reap fence, so dropping these joins would let
-        // shutdown return while work still reports Running and a rival writer
-        // still cannot acquire the session.
-        while let Some(joined) = drivers.join_next().await {
-            remove_joined_session(&mut pending_reapers, &joined);
-            warn_driver_join(joined);
-        }
-        debug_assert!(pending_reapers.is_empty());
-        self.inner
-            .session_stops
-            .lock()
-            .expect("session stops mutex poisoned")
-            .clear();
     }
 
     /// Release `session` if its driver reports it idle, answering whether it
@@ -1736,11 +1551,6 @@ impl SessionHost {
         // The driver returns right after answering. The outer owner then
         // completes task and persistence cleanup before dropping the lock.
         let _ = entry.driver.await;
-        self.inner
-            .session_stops
-            .lock()
-            .expect("session stops mutex poisoned")
-            .remove(session);
         drop(sessions);
         if reaped {
             // A reaped session left no row, so what the host knows about its
@@ -1976,11 +1786,6 @@ impl SessionHost {
                     .remove(id)
                     .expect("the entry is ours: the map has been held throughout");
                 let _ = entry.driver.await;
-                self.inner
-                    .session_stops
-                    .lock()
-                    .expect("session stops mutex poisoned")
-                    .remove(id);
             }
             if !self.on_disk(id)? {
                 return Err(HostError::UnknownSession(id.to_string()));
@@ -2100,28 +1905,15 @@ impl SessionHost {
             requests,
             persistence_failure,
         );
-        // Synchronize the terminal check with shutdown's abort snapshot. If
-        // shutdown wins, this materialization drops its lock and core without
-        // starting a driver behind a host that has already torn down.
-        let mut session_stops = self
-            .inner
-            .session_stops
-            .lock()
-            .expect("session stops mutex poisoned");
+        // The map remains locked through insertion. If shutdown starts after
+        // this check, its drain still includes this owner.
         self.alive()?;
-        // The advisory lock belongs to an outer owner task, not to the driver
-        // future that host cutoff may have to abort. Whatever way the driver
-        // ends, the owner cancels and reaps detached tasks and drains every
-        // persistence-listener invocation admitted before the fence closes.
-        // Only then can a rival writer acquire the session.
+        // The outer owner keeps the advisory lock even if the inner driver
+        // panics or is aborted when the host is dropped.
         let task_registry = session.core.task_registry.clone();
         let persistence_fence = session.core.persistence_fence.clone();
         let inner = tokio::spawn(driver.run());
         let driver_abort = inner.abort_handle();
-        let stop = SessionStop {
-            driver: driver_abort,
-            tasks: task_registry.clone(),
-        };
         let owner_session = session_id.clone();
         let handle = tokio::spawn(async move {
             if let Err(err) = inner.await
@@ -2143,14 +1935,12 @@ impl SessionHost {
             persistence_fence.close().await;
             drop(lock);
         });
-        session_stops.insert(session_id.clone(), stop.clone());
-        drop(session_stops);
         sessions.insert(
             session_id,
             LiveEntry {
                 session: Arc::clone(&session),
                 driver: handle,
-                stop,
+                abort: driver_abort,
             },
         );
         // Here rather than at the callers: a session goes live through
@@ -2373,39 +2163,6 @@ impl SessionHost {
             status.working != working_seen || status.settings != settings_seen
         });
         true
-    }
-}
-
-/// Report an abnormal session-driver join. Cancellation is the expected
-/// outcome after the host's abort cutoff.
-fn remove_joined_session(
-    pending: &mut HashSet<String>,
-    joined: &Result<(String, Result<(), tokio::task::JoinError>), tokio::task::JoinError>,
-) {
-    if let Ok((session, _)) = joined {
-        pending.remove(session);
-    }
-}
-
-fn warn_driver_join(
-    joined: Result<(String, Result<(), tokio::task::JoinError>), tokio::task::JoinError>,
-) {
-    match joined {
-        Ok((_, Ok(()))) => {}
-        Ok((_, Err(err))) if err.is_cancelled() => {}
-        Ok((session, Err(err))) => {
-            tracing::warn!(
-                session,
-                phase = "session driver join",
-                "session driver ended abnormally during shutdown: {err}"
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
-                phase = "session driver join",
-                "session driver join waiter ended abnormally during shutdown: {err}"
-            );
-        }
     }
 }
 

@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 10 LOOKs.
+retired 11 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 17 open)
+## LOOK (27 total, 16 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -43,7 +43,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`67c3d58` 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up~~ Retired: production recovery retained. Obsolete test-only discharge logic and its tests are removed, with catch-up guarantees covered through the drive loop.
 - ~~`09f7dac` 2026-08-19 aj: close the review findings on the loop-folded catch-up~~ Retired: production recovery retained. The test helper no longer records its own connection-state assignments as evidence of screen behavior. Fresh-client convergence coverage remains.
 - ~~`39920f0` 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model~~ Retired without code changes: the requested account attribution is wired, and the single-pass aggregation and digest rows are proportionate to the feature.
-- `9fd4f0c` 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals
+- ~~`9fd4f0c` 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals~~ Retired: one process-level grace owns forced exit. The host joins graceful cleanup without staged cutoffs or a parallel stop registry.
 - `b1e4ba9` 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows
 - `e6d94fc` 2026-08-26 aj-wire,aj-app,aj,docs: harden lock generation recovery
 - `a0badb0` 2026-08-28 aj-app,aj: close remaining shutdown races
@@ -191,12 +191,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: An unfilled account key and a large test diff. The account join was deliberately separated from the breakdown, not speculative functionality. The large fixture checks recorded identity, abandoned branches, sub-agent threads, arithmetic, unpriced counts, and ordering rather than merely bucket counts.
 - Disposition: Keep production and tests. Minor test-construction and boundary cleanups do not justify a separate change. All 17 targeted stats, session-info, and cost-aggregation tests passed.
 
-### 9fd4f0c 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals
+### 9fd4f0c 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals [RETIRED]
+- Status: Retired after simplifying the shutdown contract. Serve, gateway, and interactive exit give cleanup one 30-second process grace, with immediate exit on another stop signal. Host shutdown concurrently joins complete session owners, without a host-wide deadline, map-recovery timeout ladder, parallel stop registry, or abort-warning bookkeeping. Writer locks and persistence fencing remain session-owned. Interactive mode restores the terminal before cleanup can be force-abandoned.
 - Stats: 11 files, +1304 -80, ~370 prod / ~935 test lines
 - Body: empty
-- Verdict: LOOK
-- Why: Two-phase deadline (`HOST_SHUTDOWN_GRACE` minus `HOST_ABORT_GRACE`) with two nested `timeout_at` ladders for the session-map lock and again for driver joins, plus `ShutdownAborts` and `ShutdownFinish` drop guards, a `map_aborted` set to dedupe warnings, and a new `driver_aborts: StdMutex<HashMap<String, AbortHandle>>` kept in parallel with the `sessions` map that already owns each `LiveEntry`'s driver handle. `ShutdownSignals` grows a per-platform struct with a degradation loop for individually failed signal streams. Tests pin timing internals: `elapsed >= 29 && < 30`, `>= 5 && < 6`, and `trace_capture` asserting specific `tracing::warn!` phase strings (`shutdown_bounds_and_names_a_locked_log_flush`). Followed by a0badb0 ("close remaining shutdown races") and 434fd05 two days later.
-- Simpler shape: one deadline: `timeout(GRACE, join_all(drivers))`, then abort whatever is left, with the abort handles read from the existing session entries. Second signal exits the process.
+- Verdict: Retired after a scoped lifecycle simplification.
+- Why flagged: Staged cutoff machinery and tests of exact timing phases. The initial audit's proposed `timeout(join_all)` replacement missed map contention and the distinction between driver abortion and complete writer cleanup. The related shutdown commits landed together as one reviewed range, not as successive deployed redesigns.
+- Disposition: Put abandonment at process exit, not at successful library return. Keep cancellation-safe shared teardown, attachment completion semantics, and session ownership barriers. Tests observe pending cleanup and lock retention until held work is released, actual host-drop process cleanup, and process-level graceful, deadline, and second-signal exits.
 
 ### b1e4ba9 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows
 - Stats: 16 files, +1016 -72, ~350 prod / ~670 test lines

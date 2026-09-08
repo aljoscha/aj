@@ -747,7 +747,7 @@ async fn start(
     let server = match GatewayServer::bind(gateway.clone(), addr, gate).await {
         Ok(server) => server,
         Err(err) => {
-            gateway.shutdown().await;
+            crate::serve::finish_shutdown(gateway.shutdown()).await;
             return Err(anyhow::Error::new(err))
                 .with_context(|| format!("could not serve the gateway on {addr}"));
         }
