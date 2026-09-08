@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 13 LOOKs.
+retired 14 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 14 open)
+## LOOK (27 total, 13 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -46,7 +46,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`9fd4f0c` 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals~~ Retired: one process-level grace owns forced exit. The host joins graceful cleanup without staged cutoffs or a parallel stop registry.
 - ~~`b1e4ba9` 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows~~ Retired: locked refusals wait for explicit selection to retry. Automatic lock-release recovery and wire generations are removed.
 - ~~`e6d94fc` 2026-08-26 aj-wire,aj-app,aj,docs: harden lock generation recovery~~ Retired: locked refusals wait for explicit selection to retry. Automatic lock-release recovery and wire generations are removed.
-- `a0badb0` 2026-08-28 aj-app,aj: close remaining shutdown races
+- ~~`a0badb0` 2026-08-28 aj-app,aj: close remaining shutdown races~~ Retired without code changes: producer cancellation, attachment completion, and session draining serve distinct lifecycle contracts. No worthwhile simplification identified.
 - `434fd05` 2026-08-28 aj-app: own complete session teardown
 - `532aaab` 2026-08-28 aj-session,aj-app: resolve session environment gate findings
 - `2c09755` 2026-08-30 models: mark issued handshake usage partial
@@ -210,12 +210,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Stats: 11 files, +636 -230, ~200 prod / ~440 test lines at audit time.
 - Disposition: Remove generation-specific hardening and retain the host's private stale-enumeration protection for advisory lock rows. Verification covers a settled refusal, an explicit retry that is refused again, a successful retry after release, and continued operation of other sessions.
 
-### a0badb0 2026-08-28 aj-app,aj: close remaining shutdown races
+### a0badb0 2026-08-28 aj-app,aj: close remaining shutdown races [RETIRED]
+- Status: Retired without code changes. Stopping backfill production preserves queued terminal frames for completed attachments. Producer success is distinct from consumer-observed channel closure, and session draining suppresses automatic wakes independently of host-wide request admission.
 - Stats: 9 files, +469 -95, ~135 prod / ~335 test lines
 - Body: empty
-- Verdict: LOOK
-- Why: Fix-up bundle on 9fd4f0c that adds three new flags with overlapping meaning: `block_stop: CancellationToken` on the fanout (beside the existing per-attach `cancelled`), `AttachBlockCompletion(Arc<AtomicBool>)` beside the existing `block_done`, and `draining: AtomicBool` on `LiveSession` beside the host's `shut_down`. `serve_block` renames `cancelled` to `stopped` throughout. Each patches one race rather than putting shutdown under one signal.
-- Simpler shape: one host-owned shutdown token that attach serving, block delivery, and live sessions all observe.
+- Verdict: Retired after investigation. A single host shutdown token cannot replace these distinct facts. The shared stop-accepting, host-shutdown, server-join ordering is already small and native.
+- Why flagged: An empty-body race-fix bundle with apparently overlapping flags. The drain predicate was moved from the driver, not newly invented, and also serves session-local persistence failure. The shutdown commits landed together as one reviewed range, not as successive deployed redesigns.
+- Disposition: Keep production and tests. Process-level abandonment is handled by `ee6ccb6a`, while the remaining attachment and drain state preserves graceful behavior. All 24 targeted host, process-shutdown, and listener-order tests passed.
 
 ### 434fd05 2026-08-28 aj-app: own complete session teardown
 - Stats: 20 files, +1478 -179, ~415 prod / ~1065 test lines
