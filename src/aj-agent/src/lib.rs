@@ -2333,7 +2333,6 @@ struct TaskRegistryInner {
 
 struct TaskDriver {
     abort: Option<tokio::task::AbortHandle>,
-    abort_requested: bool,
     /// Agent drivers can be aborted after the graceful cutoff because every
     /// nested process resource transfers its teardown into a tracked cleanup
     /// lease when its tool future drops. A top-level bash driver remains polled
@@ -2361,48 +2360,35 @@ pub struct TaskRegistry {
     status_changed: Arc<tokio::sync::Notify>,
 }
 
-/// Registration half of one detached task driver.
+/// Owns one detached task driver from registration through completion.
 ///
 /// The task entry exists before its driver is spawned, so shutdown cannot miss
-/// work in the handoff window. [`Self::spawn`] attaches the Tokio task to the
-/// registry and a completion guard removes it only after the driver's future
-/// has fully returned. Dropping an unspawned registration settles the phantom
-/// entry as killed.
+/// work in the handoff window. [`Self::spawn`] moves this registration into the
+/// Tokio task as its completion guard.
+/// Dropping an unspawned registration settles the entry as killed.
 pub struct TaskDriverRegistration {
     registry: TaskRegistry,
     task_id: TaskId,
-    spawned: bool,
 }
 
 impl TaskDriverRegistration {
     /// Spawn `driver` and retain cancellation and completion ownership in the
     /// task registry.
-    pub fn spawn(mut self, driver: impl std::future::Future<Output = ()> + Send + 'static) {
-        let guard = TaskDriverGuard {
-            registry: self.registry.clone(),
-            task_id: self.task_id,
-        };
+    pub fn spawn(self, driver: impl std::future::Future<Output = ()> + Send + 'static) {
+        let registry = self.registry.clone();
+        let task_id = self.task_id;
         let handle = tokio::spawn(async move {
-            let _guard = guard;
+            let _guard = self;
             driver.await;
         });
-        self.spawned = true;
-        self.registry
-            .arm_driver(self.task_id, handle.abort_handle());
+        registry.arm_driver(task_id, handle.abort_handle());
     }
 }
 
 impl Drop for TaskDriverRegistration {
     fn drop(&mut self) {
-        if !self.spawned {
-            self.registry.finish_driver(self.task_id);
-        }
+        self.registry.finish_driver(self.task_id);
     }
-}
-
-struct TaskDriverGuard {
-    registry: TaskRegistry,
-    task_id: TaskId,
 }
 
 /// One non-background-task operation that belongs to the session writer
@@ -2427,12 +2413,6 @@ impl Drop for TaskCleanupGuard {
             inner.cleanups -= 1;
         }
         self.registry.status_changed.notify_waiters();
-    }
-}
-
-impl Drop for TaskDriverGuard {
-    fn drop(&mut self) {
-        self.registry.finish_driver(self.task_id);
     }
 }
 
@@ -2515,12 +2495,10 @@ impl TaskRegistry {
         let force_abort = matches!(kind, TaskKind::Agent { .. });
         let (id, cancel) = self.register_entry(owner, call_id, kind, label, output);
         let mut inner = self.inner.lock().expect("task registry mutex poisoned");
-        let abort_requested = inner.drivers_aborted && force_abort;
         inner.drivers.insert(
             id,
             TaskDriver {
                 abort: None,
-                abort_requested,
                 force_abort,
             },
         );
@@ -2531,7 +2509,6 @@ impl TaskRegistry {
             TaskDriverRegistration {
                 registry: self.clone(),
                 task_id: id,
-                spawned: false,
             },
         )
     }
@@ -2539,13 +2516,14 @@ impl TaskRegistry {
     fn arm_driver(&self, id: TaskId, abort: tokio::task::AbortHandle) {
         let abort_now = {
             let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+            let drivers_aborted = inner.drivers_aborted;
             let Some(driver) = inner.drivers.get_mut(&id) else {
                 // The driver can finish on another runtime worker before the
                 // spawning task records its abort handle.
                 return;
             };
             driver.abort = Some(abort.clone());
-            driver.abort_requested
+            drivers_aborted && driver.force_abort
         };
         if abort_now {
             abort.abort();
@@ -2822,15 +2800,9 @@ impl TaskRegistry {
             inner.drivers_aborted = true;
             inner
                 .drivers
-                .values_mut()
-                .filter_map(|driver| {
-                    if driver.force_abort {
-                        driver.abort_requested = true;
-                        driver.abort.clone()
-                    } else {
-                        None
-                    }
-                })
+                .values()
+                .filter(|driver| driver.force_abort)
+                .filter_map(|driver| driver.abort.clone())
                 .collect::<Vec<_>>()
         };
         for abort in aborts {
@@ -3055,6 +3027,7 @@ mod sub_agent_session_id_tests {
 #[cfg(test)]
 mod task_registry_tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use tokio_util::sync::CancellationToken;
 
@@ -3355,6 +3328,68 @@ mod task_registry_tests {
             registry.quiesce(std::time::Duration::from_secs(1)).await,
             "quiescence follows the real driver completion"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_an_unspawned_registration_settles_its_task() {
+        let registry = TaskRegistry::default();
+        let (id, _, driver) = registry.register_driver(
+            AgentId::Main,
+            "test-call".to_string(),
+            TaskKind::Bash {
+                command: "not spawned".to_string(),
+            },
+            "not spawned".to_string(),
+            Arc::new(StubOutput),
+        );
+        assert!(!registry.quiesce(Duration::ZERO).await);
+        drop(driver);
+        assert_eq!(registry.status(id), Some(TaskStatus::Killed));
+        assert!(registry.quiesce(Duration::ZERO).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pre_spawn_abort_cutoff_kills_agents_but_preserves_bash_cleanup() {
+        for abort_before_registration in [true, false] {
+            for kind in [
+                TaskKind::Agent {
+                    agent_id: 1,
+                    task: "pending".to_string(),
+                },
+                TaskKind::Bash {
+                    command: "pending".to_string(),
+                },
+            ] {
+                let is_agent = matches!(kind, TaskKind::Agent { .. });
+                let registry = TaskRegistry::default();
+                if abort_before_registration {
+                    registry.abort_drivers();
+                }
+                let (id, _, driver) = registry.register_driver(
+                    AgentId::Main,
+                    "test-call".to_string(),
+                    kind,
+                    "pending".to_string(),
+                    Arc::new(StubOutput),
+                );
+                if !abort_before_registration {
+                    registry.abort_drivers();
+                }
+                let (release, released) = tokio::sync::oneshot::channel();
+                driver.spawn(async move {
+                    let _ = released.await;
+                });
+                assert_eq!(registry.quiesce(Duration::from_secs(1)).await, is_agent);
+                if is_agent {
+                    assert_eq!(registry.status(id), Some(TaskStatus::Killed));
+                    assert!(release.send(()).is_err());
+                } else {
+                    assert_eq!(registry.status(id), Some(TaskStatus::Running));
+                    release.send(()).expect("bash cleanup remains polled");
+                    assert!(registry.quiesce(Duration::from_secs(1)).await);
+                }
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

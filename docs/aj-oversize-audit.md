@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 14 LOOKs.
+retired 15 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 13 open)
+## LOOK (27 total, 12 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -47,7 +47,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`b1e4ba9` 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows~~ Retired: locked refusals wait for explicit selection to retry. Automatic lock-release recovery and wire generations are removed.
 - ~~`e6d94fc` 2026-08-26 aj-wire,aj-app,aj,docs: harden lock generation recovery~~ Retired: locked refusals wait for explicit selection to retry. Automatic lock-release recovery and wire generations are removed.
 - ~~`a0badb0` 2026-08-28 aj-app,aj: close remaining shutdown races~~ Retired without code changes: producer cancellation, attachment completion, and session draining serve distinct lifecycle contracts. No worthwhile simplification identified.
-- `434fd05` 2026-08-28 aj-app: own complete session teardown
+- ~~`434fd05` 2026-08-28 aj-app: own complete session teardown~~ Retired: one registration owns driver completion before and after spawn, and abort requests derive from the registry cutoff. Session ownership and cleanup barriers remain intact.
 - `532aaab` 2026-08-28 aj-session,aj-app: resolve session environment gate findings
 - `2c09755` 2026-08-30 models: mark issued handshake usage partial
 - `317c06c` 2026-08-30 session: implement crash-safe environment publication
@@ -218,12 +218,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: An empty-body race-fix bundle with apparently overlapping flags. The drain predicate was moved from the driver, not newly invented, and also serves session-local persistence failure. The shutdown commits landed together as one reviewed range, not as successive deployed redesigns.
 - Disposition: Keep production and tests. Process-level abandonment is handled by `ee6ccb6a`, while the remaining attachment and drain state preserves graceful behavior. All 24 targeted host, process-shutdown, and listener-order tests passed.
 
-### 434fd05 2026-08-28 aj-app: own complete session teardown
-- Stats: 20 files, +1478 -179, ~415 prod / ~1065 test lines
+### 434fd05 2026-08-28 aj-app: own complete session teardown [RETIRED]
+- Status: Retired after a local bookkeeping simplification. The registration moves into its spawned driver as the completion guard, without a separate guard or handoff flag. Handle attachment derives the abort decision from the registry cutoff and driver policy.
+- Stats: 20 files, +1478 -179. The original production/test estimate misclassified production below inline test modules.
 - Body: empty
-- Verdict: LOOK
-- Why: Third shutdown commit in three days. `TaskRegistry` gains `TaskDriver { abort, abort_requested, force_abort }`, `TaskDriverRegistration` (with a `spawned` flag and Drop fallback), `TaskDriverGuard`, `TaskCleanupGuard`, a `cleanups` counter, a `drivers_aborted` latch, and `register_unowned_for_test` to keep old tests compiling. bash.rs grows `ProcessTeardown` and arming. This is a hand-built task tracker layered over tokio's `JoinHandle`s. Empty body on 1478 lines, 1065 of them tests, including a registry test that pins that display status is not the completion fence.
-- Simpler shape: a `JoinSet` or `tokio_util::task::TaskTracker` owned by the registry gives spawn tracking, close, and wait-for-all without the guard/registration/flag trio.
+- Verdict: Retired after investigation. Complete session ownership addresses a reproduced driver-abort path that released a writer lock while detached work remained live. Task status, driver completion, transferred process cleanup, and persistence admission are distinct contracts.
+- Why flagged: An empty-body ownership expansion with apparently redundant tracking. The shutdown commits landed as one reviewed range. `ProcessTeardown` belongs to the later helper changes, not this commit. A Tokio tracker does not supply selective sticky abortion or application-status finalization, and its close operation does not reject new tasks.
+- Disposition: Keep the outer session owner, cleanup leases, persistence fence, and shared shutdown completion. Retain boundary coverage distinguishing terminal status from actual completion. Process-level abandonment remains separate from successful in-process cleanup.
 
 ### 532aaab 2026-08-28 aj-session,aj-app: resolve session environment gate findings
 - Stats: 13 files, +293 -82, ~135 prod / ~155 test lines
