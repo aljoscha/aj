@@ -7,18 +7,18 @@
 //! producer awaits its separate capacity-one channel, so HTTP backpressure
 //! paces a large backfill without ever stalling a session driver.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
-use aj_agent::events::{AgentEvent, AgentId};
-use aj_agent::tool::TaskId;
 use aj_wire::{Frame, SessionSummary};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio_util::sync::CancellationToken;
+
+use crate::outbound::{self, Offered};
 
 /// Enough burst room for normal clients while bounding a stalled stream.
 const DEFAULT_LIVE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).expect("non-zero");
@@ -46,7 +46,10 @@ enum AttachState {
 }
 
 struct Subscriber {
-    live: LiveSender,
+    live: outbound::Sender<Frame>,
+    /// A child of eviction cancellation, also stopped independently during
+    /// graceful shutdown so a completed block can still drain live frames.
+    block_stop: CancellationToken,
     attached: HashMap<String, AttachState>,
     /// Whether this subscriber's queue accepted the fan-out's latest directory.
     /// A fresh subscriber and one whose full queue dropped the frame stay false,
@@ -95,192 +98,23 @@ impl Subscriber {
     }
 }
 
-/// Identity of one cumulative snapshot in the live queue.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LossyKey {
-    Message(String, AgentId),
-    Tool(String, String),
-    Task(String, TaskId),
-    State(String),
-    List,
-    Vms,
-}
-
-fn lossy_key(frame: &Frame) -> Option<LossyKey> {
-    match frame {
-        Frame::Event { session, event, .. } => match event.known()? {
-            AgentEvent::MessageUpdate { agent_id, .. } => {
-                Some(LossyKey::Message(session.clone(), *agent_id))
-            }
-            AgentEvent::ToolExecutionUpdate { call_id, .. } => {
-                Some(LossyKey::Tool(session.clone(), call_id.clone()))
-            }
-            AgentEvent::TaskOutput { task_id, .. } => {
-                Some(LossyKey::Task(session.clone(), *task_id))
-            }
-            _ => None,
-        },
-        Frame::State { session, .. } => Some(LossyKey::State(session.clone())),
-        Frame::List { .. } => Some(LossyKey::List),
-        Frame::Vms { .. } => Some(LossyKey::Vms),
-        Frame::CaughtUp { .. } | Frame::Error { .. } | Frame::Reset { .. } | Frame::Heartbeat => {
-            None
-        }
-    }
-}
-
-struct LiveQueueState {
-    frames: VecDeque<Frame>,
-    closed: bool,
-}
-
-struct LiveQueue {
-    capacity: NonZeroUsize,
-    state: StdMutex<LiveQueueState>,
-    ready: Notify,
-    /// Stops attach-block production without discarding a completed block's
-    /// queued live frames.
+/// The live queue and its host-owned attach producer cancellation.
+pub(crate) struct LiveReceiver {
+    frames: outbound::Receiver<Frame>,
     block_stop: CancellationToken,
-    cancelled: CancellationToken,
 }
 
-#[derive(Clone)]
-struct LiveSender(Arc<LiveQueue>);
-
-pub(crate) struct LiveReceiver(Arc<LiveQueue>);
-
-fn live_channel(capacity: NonZeroUsize) -> (LiveSender, LiveReceiver, CancellationToken) {
-    let block_stop = CancellationToken::new();
-    let cancelled = CancellationToken::new();
-    let queue = Arc::new(LiveQueue {
-        capacity,
-        state: StdMutex::new(LiveQueueState {
-            frames: VecDeque::with_capacity(capacity.get()),
-            closed: false,
-        }),
-        ready: Notify::new(),
-        block_stop,
-        cancelled: cancelled.clone(),
-    });
-    (
-        LiveSender(Arc::clone(&queue)),
-        LiveReceiver(queue),
-        cancelled,
-    )
-}
-
-/// What became of an offered frame.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Offered {
-    /// The subscriber has it: queued, coalesced onto a queued frame of the same
-    /// lossy key, or already in the backfill it was served.
-    Queued,
-    /// Not delivered, and the subscriber stays. A lossy frame met a full queue,
-    /// or the session it belongs to is one this subscriber is not watching.
-    Dropped,
-    /// The subscriber is gone: its queue overflowed with frames that may not be
-    /// dropped, or it had already been closed.
-    Evicted,
-}
-
-impl LiveSender {
-    /// Queues a frame without blocking. Reliable overflow closes the stream.
-    fn offer(&self, frame: Frame) -> Offered {
-        let key = lossy_key(&frame);
-        let mut state = self.0.state.lock().expect("live queue mutex poisoned");
-        if state.closed {
-            return Offered::Evicted;
-        }
-        if let Some(key) = key {
-            if let Some(index) = state
-                .frames
-                .iter()
-                .position(|queued| lossy_key(queued).as_ref() == Some(&key))
-            {
-                state.frames.remove(index);
-            } else if state.frames.len() >= self.0.capacity.get() {
-                return Offered::Dropped;
-            }
-        } else if state.frames.len() >= self.0.capacity.get() {
-            state.frames.clear();
-            state.closed = true;
-            drop(state);
-            self.0.block_stop.cancel();
-            self.0.cancelled.cancel();
-            self.0.ready.notify_waiters();
-            return Offered::Evicted;
-        }
-        state.frames.push_back(frame);
-        drop(state);
-        self.0.ready.notify_one();
-        Offered::Queued
-    }
-
-    fn retain(&self, mut keep: impl FnMut(&Frame) -> bool) {
-        self.0
-            .state
-            .lock()
-            .expect("live queue mutex poisoned")
-            .frames
-            .retain(|frame| keep(frame));
-    }
-
-    fn close(&self) {
-        let mut state = self.0.state.lock().expect("live queue mutex poisoned");
-        state.closed = true;
-        drop(state);
-        self.0.block_stop.cancel();
-        self.0.ready.notify_waiters();
-    }
-
-    fn stop_block(&self) {
-        self.0.block_stop.cancel();
-    }
-
-    fn evict(&self) {
-        let mut state = self.0.state.lock().expect("live queue mutex poisoned");
-        state.frames.clear();
-        state.closed = true;
-        drop(state);
-        self.0.block_stop.cancel();
-        self.0.cancelled.cancel();
-        self.0.ready.notify_waiters();
-    }
-}
-
-// The queue is behind a mutex, so neither receive needs `&mut` to be sound.
-// They take it to say there is one reader: two tasks receiving concurrently
-// would interleave a session's frames, and the stream's whole contract is that
-// they arrive in order.
-#[allow(clippy::needless_pass_by_ref_mut)]
 impl LiveReceiver {
     pub(crate) fn block_stop_token(&self) -> CancellationToken {
-        self.0.block_stop.clone()
+        self.block_stop.clone()
     }
 
     async fn recv(&mut self) -> Option<Frame> {
-        loop {
-            let ready = self.0.ready.notified();
-            {
-                let mut state = self.0.state.lock().expect("live queue mutex poisoned");
-                if let Some(frame) = state.frames.pop_front() {
-                    return Some(frame);
-                }
-                if state.closed {
-                    return None;
-                }
-            }
-            ready.await;
-        }
+        self.frames.recv().await
     }
 
     fn try_recv(&mut self) -> Option<Frame> {
-        self.0
-            .state
-            .lock()
-            .expect("live queue mutex poisoned")
-            .frames
-            .pop_front()
+        self.frames.try_recv()
     }
 }
 
@@ -338,19 +172,27 @@ impl Fanout {
         sessions: &[String],
     ) -> (SubscriberId, LiveReceiver, CancellationToken) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (live, receiver, cancelled) = live_channel(self.live_capacity);
+        let cancelled = CancellationToken::new();
+        let block_stop = cancelled.child_token();
+        let (live, frames) = outbound::channel(self.live_capacity, cancelled.clone());
+        let receiver = LiveReceiver {
+            frames,
+            block_stop: block_stop.clone(),
+        };
         let attached = sessions
             .iter()
             .map(|session| (session.clone(), AttachState::Attaching))
             .collect();
         let mut state = self.lock();
         if state.closed {
+            block_stop.cancel();
             live.close();
         } else {
             state.subscribers.insert(
                 id,
                 Subscriber {
                     live,
+                    block_stop,
                     attached,
                     list_current: false,
                 },
@@ -479,7 +321,7 @@ impl Fanout {
     /// its live queue; an aborted partial sequence ends at its channel close.
     pub(crate) fn stop_blocks(&self) {
         for subscriber in self.lock().subscribers.values() {
-            subscriber.live.stop_block();
+            subscriber.block_stop.cancel();
         }
     }
 
@@ -488,6 +330,7 @@ impl Fanout {
         let mut state = self.lock();
         state.closed = true;
         for (_, subscriber) in state.subscribers.drain() {
+            subscriber.block_stop.cancel();
             subscriber.live.close();
         }
     }
@@ -661,10 +504,6 @@ mod tests {
     use std::time::Duration;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
-    use aj_agent::message::AgentMessage;
-    use aj_agent::tool::ToolDetails;
-    use aj_models::streaming::AssistantMessageEvent;
-    use aj_models::types::{AssistantMessage, Message};
 
     use super::*;
 
@@ -730,69 +569,6 @@ mod tests {
         }
     }
 
-    /// A streaming message update: the highest-volume lossy class, keyed by the
-    /// session and the agent whose message it is about.
-    fn streaming(agent_id: AgentId) -> Frame {
-        let partial = AssistantMessage::empty();
-        Frame::Event {
-            session: SESSION.to_string(),
-            epoch: EPOCH.to_string(),
-            durability: None,
-            event: AgentEvent::MessageUpdate {
-                agent_id,
-                message: AgentMessage::wire(Message::Assistant(partial.clone())),
-                event: AssistantMessageEvent::TextDelta {
-                    content_index: 0,
-                    delta: "tick".to_string(),
-                    partial,
-                },
-            }
-            .into(),
-        }
-    }
-
-    /// A background task's cumulative output snapshot, keyed by the session and
-    /// the task it is about.
-    /// A streaming tool update for `call_id`, the frame class whose key has to
-    /// discriminate one in-flight tool call from another.
-    fn tool_update(call_id: &str) -> Frame {
-        Frame::Event {
-            session: SESSION.to_string(),
-            epoch: EPOCH.to_string(),
-            durability: None,
-            event: AgentEvent::ToolExecutionUpdate {
-                agent_id: AgentId::Main,
-                call_id: call_id.to_string(),
-                tool: "bash".to_string(),
-                args: serde_json::json!({}),
-                partial: ToolDetails::Text {
-                    summary: "running".to_string(),
-                    body: String::new(),
-                },
-                content: Arc::from(Vec::new()),
-            }
-            .into(),
-        }
-    }
-
-    fn task_output(task_id: TaskId) -> Frame {
-        Frame::Event {
-            session: SESSION.to_string(),
-            epoch: EPOCH.to_string(),
-            durability: None,
-            event: AgentEvent::TaskOutput {
-                agent_id: AgentId::Main,
-                task_id,
-                call_id: "call-1".to_string(),
-                partial: ToolDetails::Text {
-                    summary: "running".to_string(),
-                    body: String::new(),
-                },
-            }
-            .into(),
-        }
-    }
-
     /// A session-scoped refusal, reliable-transient like every `error` frame.
     fn refusal(code: &str) -> Frame {
         Frame::Error {
@@ -833,22 +609,6 @@ mod tests {
             });
         }
         out
-    }
-
-    /// How many frames are waiting on `id`'s live queue.
-    ///
-    /// The bound is on this queue, so a test about the bound has to be able to
-    /// say that its fixture reached it, and a test about coalescing that two
-    /// snapshots stayed two frames.
-    fn queued(fanout: &Fanout, id: SubscriberId) -> usize {
-        fanout.lock().subscribers[&id]
-            .live
-            .0
-            .state
-            .lock()
-            .expect("live queue mutex poisoned")
-            .frames
-            .len()
     }
 
     /// Reliable live frames collect while a block is produced. Lossy frames
@@ -1226,109 +986,27 @@ mod tests {
     fn live_overflow_drops_lossy_and_evicts_on_reliable() {
         let fanout = Fanout::new(NonZeroUsize::new(2));
         let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
+        let block_stop = rx.block_stop_token();
         fanout.finish_block(id, SESSION, 0);
         fanout.publish(reliable("one"));
         fanout.publish(reliable("two"));
-        assert_eq!(
-            queued(&fanout, id),
-            2,
-            "the queue is at the bound, or nothing below this measures anything",
-        );
         fanout.publish(Frame::List {
             sessions: Vec::new(),
             hosts: Vec::new(),
         });
         assert!(!cancelled.is_cancelled(), "lossy overflow is only dropped");
-        assert_eq!(
-            queued(&fanout, id),
-            2,
-            "and the snapshot the bound turned away did not land anyway",
-        );
 
         fanout.publish(reliable("three"));
         assert!(cancelled.is_cancelled());
+        assert!(
+            block_stop.is_cancelled(),
+            "eviction stops attach production"
+        );
         assert!(
             fanout.lock().subscribers.is_empty(),
             "the subscriber was evicted"
         );
         assert!(drained(&mut rx).is_empty(), "eviction closes and clears");
-    }
-
-    /// A durable frame may not be coalesced or dropped, whatever its event is.
-    /// Nothing re-sends one: a client that lost a durable frame is
-    /// missing a log entry with nothing to tell it so. At the bound the
-    /// subscriber is evicted instead, and the backfill of its re-attach carries
-    /// the entry from its cursor.
-    #[test]
-    fn a_durable_frame_is_neither_coalesced_nor_dropped() {
-        let fanout = Fanout::new(NonZeroUsize::new(2));
-        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
-
-        fanout.publish(durable(1));
-        fanout.publish(durable(2));
-        assert_eq!(
-            queued(&fanout, id),
-            2,
-            "two durable frames of one session are two frames, and the queue is \
-             at the bound, or the eviction below measures nothing",
-        );
-
-        fanout.publish(durable(3));
-
-        assert!(
-            cancelled.is_cancelled(),
-            "a durable frame that met the bound was dropped instead of evicting: {:?}",
-            drained(&mut rx),
-        );
-    }
-
-    /// A snapshot supersedes the queued one of its own key and no other. The key
-    /// names what the snapshot is about: the session, and within it the agent or
-    /// the task. A key blind to any of those would let one session's, agent's or
-    /// task's snapshot swallow another's, and a swallowed snapshot is never
-    /// re-sent, so the client holds stale state for it until it re-attaches.
-    #[test]
-    fn coalescing_discriminates_by_what_a_snapshot_is_about() {
-        let fanout = Fanout::default();
-        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
-        fanout.finish_block(id, SESSION, 0);
-        fanout.finish_block(id, OTHER, 0);
-
-        fanout.publish(lossy(1));
-        fanout.publish(other(lossy(2)));
-        fanout.publish(streaming(AgentId::Main));
-        fanout.publish(streaming(AgentId::Sub(1)));
-        fanout.publish(task_output(7));
-        fanout.publish(task_output(8));
-        fanout.publish(tool_update("call-a"));
-        fanout.publish(tool_update("call-b"));
-
-        assert_eq!(
-            drained(&mut rx),
-            vec![
-                "state 1",
-                "state 2",
-                "update Main",
-                "update Sub(1)",
-                "task 7",
-                "task 8",
-                "tool call-a",
-                "tool call-b",
-            ],
-            "two sessions, two agents, two tasks and two tool calls are eight \
-             keys, not one",
-        );
-
-        // The same key does supersede, which is what says the six above are six
-        // keys rather than a queue that coalesces nothing at all.
-        fanout.publish(streaming(AgentId::Main));
-        fanout.publish(streaming(AgentId::Main));
-        assert_eq!(
-            drained(&mut rx),
-            vec!["update Main"],
-            "one key, one queued snapshot",
-        );
     }
 
     /// The attach channel has capacity one and live frames remain hidden until
@@ -1432,6 +1110,7 @@ mod tests {
     fn dropping_an_attachment_deregisters_it() {
         let fanout = Arc::new(Fanout::default());
         let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
+        let block_stop = live.block_stop_token();
         let (attachment, _block_tx, _block_complete) = Attachment::new(
             id,
             live,
@@ -1444,5 +1123,9 @@ mod tests {
         drop(attachment);
 
         assert!(fanout.lock().subscribers.is_empty());
+        assert!(
+            block_stop.is_cancelled(),
+            "departure stops attach production"
+        );
     }
 }

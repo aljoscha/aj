@@ -41,7 +41,7 @@ pub(crate) struct Directory {
     /// carries is a cumulative `list` snapshot: the newest supersedes and a
     /// slow reader wants only the latest. Session frames are
     /// undroppable, so they travel a client's bounded queue instead
-    /// ([`crate::gateway::outbound`]).
+    /// ([`aj_app::outbound`]).
     merged: watch::Sender<Arc<MergedDirectory>>,
     /// The ids of the hosts whose control connection is up, republished
     /// whenever that set changes.

@@ -37,6 +37,7 @@ pub mod keybindings;
 pub mod markdown;
 pub mod model;
 pub mod notices;
+pub mod outbound;
 pub mod print;
 pub mod scripted;
 pub mod session;

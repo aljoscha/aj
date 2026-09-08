@@ -2,7 +2,7 @@
 //!
 //! One client stream is one [`Splice`]: the merged directory, one upstream
 //! stream per host whose sessions that client attached, and one bounded queue
-//! ([`crate::gateway::outbound`]) merging what the upstreams say. Every frame
+//! ([`aj_app::outbound`]) merging what the upstreams say. Every frame
 //! travels downstream with its session id namespaced and nothing else touched,
 //! kinds this build does not know included.
 //!
@@ -35,6 +35,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aj_app::outbound::{self, Offered, Sender};
 use aj_wire::{DecodedFrame, Frame, MergedDirectory};
 use tokio::sync::watch;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -42,7 +43,6 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use crate::gateway::config::HostAddress;
 use crate::gateway::directory::{AttachGroup, AttachPlan, Unresolvable};
 use crate::gateway::naming::SessionAddress;
-use crate::gateway::outbound::{self, Offered, Sender};
 use crate::gateway::{GatewayError, Tuning};
 use crate::remote::{RemoteClient, RemoteError, RemoteEvents};
 
@@ -62,7 +62,7 @@ pub(crate) enum Outgoing {
 /// Everything one client stream reads from.
 pub(crate) struct Splice {
     /// The spliced frames of the sessions this client attached.
-    frames: outbound::Receiver,
+    frames: outbound::Receiver<DecodedFrame>,
     /// The merged directory, which every client stream carries.
     directory: watch::Receiver<Arc<MergedDirectory>>,
     /// Whether the opening directory has been written.
@@ -314,7 +314,7 @@ fn unreachable(address: &HostAddress, source: RemoteError) -> GatewayError {
 async fn pump(
     upstream: Upstream,
     mut events: RemoteEvents,
-    queue: Sender,
+    queue: Sender<DecodedFrame>,
     cancel: CancellationToken,
 ) {
     let ended = tokio::select! {
@@ -342,7 +342,7 @@ async fn pump(
 async fn carry(
     upstream: &Upstream,
     events: &mut RemoteEvents,
-    queue: &Sender,
+    queue: &Sender<DecodedFrame>,
     cancel: &CancellationToken,
 ) -> Option<String> {
     // The sessions whose attach block is still being written. Their frames are
@@ -372,7 +372,7 @@ async fn forward(
     host_id: &str,
     mut frame: DecodedFrame,
     attaching: &mut HashSet<String>,
-    queue: &Sender,
+    queue: &Sender<DecodedFrame>,
 ) -> bool {
     let session = match frame.session() {
         Ok(session) => session,
@@ -463,7 +463,7 @@ struct HostReturn {
 async fn returns(
     mut hosts: Vec<HostReturn>,
     mut reachable: watch::Receiver<Arc<BTreeSet<String>>>,
-    queue: Sender,
+    queue: Sender<DecodedFrame>,
     cancel: CancellationToken,
 ) {
     loop {

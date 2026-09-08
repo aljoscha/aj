@@ -16,7 +16,7 @@
 //! - [`splice`] is one client stream: the upstreams of the sessions it
 //!   attached, and the `reset` frames an upstream that broke or was withdrawn
 //!   earns them.
-//! - [`outbound`] is that stream's bounded queue.
+//! - [`aj_app::outbound`] is the bounded queue shared with host fan-out.
 //! - [`server`] is the HTTP surface, including the proxy.
 
 mod config;
@@ -24,7 +24,6 @@ mod directory;
 mod enrollment;
 mod link;
 mod naming;
-mod outbound;
 mod server;
 mod splice;
 

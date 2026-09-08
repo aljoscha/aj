@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 6 LOOKs.
+retired 7 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 21 open)
+## LOOK (27 total, 20 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -39,7 +39,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`34fcbd8` 2026-08-07 aj-app,aj: set a session's tag from the host and the control port~~ Retired: cold labels are read at enumeration points without fingerprint caching.
 - ~~`b57241c` 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar~~ Retired: overrides accept the full chord grammar without a terminal-typeability model. Built-in defaults retain real-parser portability coverage.
 - ~~`c4a59be` 2026-08-07 aj: make the sidebar's working set and hosts legible~~ Retired without code changes: host grouping was explicitly requested, and the layout machinery serves current behavior. No worthwhile simplification identified.
-- `bbca1ad` 2026-08-11 aj: splice a client's session streams through a gateway
+- ~~`bbca1ad` 2026-08-11 aj: splice a client's session streams through a gateway~~ Retired: host fan-out and gateway forwarding share one outbound queue core and frame classification, with their distinct attachment delivery and lifecycle behavior intact.
 - `67c3d58` 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up
 - `09f7dac` 2026-08-19 aj: close the review findings on the loop-folded catch-up
 - `39920f0` 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model
@@ -159,12 +159,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: The encoding redesign and grouped layout landed before the gateway supplied host values. The size claim was overstated: sidebar.rs's non-test portion grew from 325 to 713 lines including comments, or 202 to 437 nonblank, non-comment lines. Its test section grew from 264 to 763 lines. Producer timing and diff size do not establish unnecessary machinery.
 - Disposition: Keep the implementation. Deferring grouping would change the implementation sequence, not remove functionality the user requested and now uses.
 
-### bbca1ad 2026-08-11 aj: splice a client's session streams through a gateway
+### bbca1ad 2026-08-11 aj: splice a client's session streams through a gateway [RETIRED]
+- Status: Retired. `aj-app::outbound` owns the shared fixed-policy queue for typed and retained-wire frames. Host attachment filtering, separate backfill delivery, and graceful shutdown remain host-owned. The gateway retains ordered paced/live delivery and raw forwarding. Queue contracts have one shared test suite, with composed host and gateway coverage retained.
 - Stats: 7 files, +2620 -145, ~895 prod / ~1725 test lines (estimate: gateway/tests.rs +1414, `mod tests` in outbound.rs/splice.rs)
 - Body: Gateway `/v1/events` opens one upstream per host named, forwards frames namespaced, `reset` on upstream loss, no gateway-held cursors, bounded per-client queue with the host fan-out's policy.
-- Verdict: LOOK
-- Why: outbound.rs (451 lines) is a second implementation of aj-app's `host/fanout.rs` LiveQueue: same `Queue`/`State`/`Sender`/`Receiver`/`Offered::{Queued,Dropped,Evicted}` shape, same lossy-key coalescing, same evict-on-reliable-overflow, same paced attach blocks. Its own module doc says the policy is "deliberately not a second one", yet it is a second copy of the mechanism, with its own six tests re-proving the queue semantics already tested in fanout.rs. splice.rs adds `Splice`, `Outgoing`, `Woken`, `Upstream`, `HostReturn` on top.
-- Simpler shape: Lift the fan-out queue out of aj-app into a shared module generic over the frame type (it already lives in a crate the gateway depends on) and have the gateway use it, leaving splice.rs as the only new mechanism.
+- Verdict: Retired after a scoped queue consolidation.
+- Why flagged: The live admission algorithm and frame keys were duplicated. The audit overstated the overlap in attachment delivery: the host uses a separate backfill channel, while the gateway mixes paced and live frames in one FIFO. The forwarding and reset machinery serves the requested multi-host behavior rather than speculative scope.
+- Disposition: Share classification, queue admission, and synchronization without unifying attachment delivery or recovery. No protocol or persistence changes.
 
 ### 67c3d58 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up
 - Stats: 3 files, +710 -240, ~200 prod / ~510 test lines (estimate: interactive.rs +510 test / +138 prod by hunk classification; client.rs +59 and control.rs +29 prod)
