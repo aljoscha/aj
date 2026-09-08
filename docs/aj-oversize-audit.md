@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 7 LOOKs.
+retired 8 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 20 open)
+## LOOK (27 total, 19 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -40,7 +40,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`b57241c` 2026-08-07 aj,aj-app: fix what two reviews found in the sidebar~~ Retired: overrides accept the full chord grammar without a terminal-typeability model. Built-in defaults retain real-parser portability coverage.
 - ~~`c4a59be` 2026-08-07 aj: make the sidebar's working set and hosts legible~~ Retired without code changes: host grouping was explicitly requested, and the layout machinery serves current behavior. No worthwhile simplification identified.
 - ~~`bbca1ad` 2026-08-11 aj: splice a client's session streams through a gateway~~ Retired: host fan-out and gateway forwarding share one outbound queue core and frame classification, with their distinct attachment delivery and lifecycle behavior intact.
-- `67c3d58` 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up
+- ~~`67c3d58` 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up~~ Retired: production recovery retained. Obsolete test-only discharge logic and its tests are removed, with catch-up guarantees covered through the drive loop.
 - `09f7dac` 2026-08-19 aj: close the review findings on the loop-folded catch-up
 - `39920f0` 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model
 - `9fd4f0c` 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals
@@ -167,12 +167,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: The live admission algorithm and frame keys were duplicated. The audit overstated the overlap in attachment delivery: the host uses a separate backfill channel, while the gateway mixes paced and live frames in one FIFO. The forwarding and reset machinery serves the requested multi-host behavior rather than speculative scope.
 - Disposition: Share classification, queue admission, and synchronization without unifying attachment delivery or recovery. No protocol or persistence changes.
 
-### 67c3d58 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up
-- Stats: 3 files, +710 -240, ~200 prod / ~510 test lines (estimate: interactive.rs +510 test / +138 prod by hunk classification; client.rs +59 and control.rs +29 prod)
-- Body: two adversarial reviews; outcome back to a bool, three fold defects fixed, `focus_session` guard restored, `discharge_reattach` acts on the answer, six tests four of which exist because a mutation survived.
-- Verdict: LOOK
-- Why: A "fix what N reviews found" bundle of +710/-240 landed 59 minutes after the commit it fixes, reverting that commit's `CatchUp` enum to a bool and its give-up notice while adding `World::abandon_attach_block`, `Attach` phase enum on `SessionClient` (`attach_phase()` replacing `awaiting_attach()`), and a rebuilt `WarmPeer` fixture with `redirect_to`, `block_opening`, `poll_for`, `settled` helpers. 510 test lines, explicitly justified by mutation survival rather than by a distinct promise per test, and the headline test ("a block whose frames keep arriving is not cut off") pins the doc comment's argument. Two review findings that would change the recovery's shape are deferred to beads, so the commit is fixing a shape it already suspects is wrong.
-- Simpler shape: Land the three fold defects as one small fix with one test each, leave the outcome type alone until the refusal policy (settled next commit) is decided, and skip the `Attach` phase enum until a caller needs to tell Requested from Applying.
+### 67c3d58 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up [RETIRED]
+- Status: Retired after test cleanup. The test-only `discharge_reattach` implementation and its two tests are removed. Slow-backfill coverage uses the composed drive-loop test rather than a duplicate awaiting-driver test. Production recovery is unchanged.
+- Stats: 3 files, +710 -240. Production +200/-152, tests +510/-88, including comments and blank lines. Net production growth was 48 lines.
+- Body: two adversarial reviews, three fold defects fixed, focus guard restored, and a temporary reversal of refusal policy.
+- Verdict: Retired after investigation. The fold fixes serve the observed session catch-up wedge, and the session-silence deadline permits a slow backfill to finish without repeated restarts.
+- Why flagged: Review churn and a large test diff. The audit overstated the mechanism: `Attach` already existed and was exposed, not introduced. Current callers distinguish its phases. Refusal policy was corrected before merge, and catch-up runs inside the drive loop. Mutation-origin tests covered distinct promises, but tests of a test-only recovery path preserve implementation rather than user behavior.
+- Disposition: Keep the production fold, attachment state, and scripted peer fixture. Test recovery through the drive loop and remove obsolete helper-only coverage.
 
 ### 09f7dac 2026-08-19 aj: close the review findings on the loop-folded catch-up
 - Stats: 1 files, +405 -48, ~130 prod / ~275 test lines (estimate: hunk classification; four new async tests of ~60 lines each)
