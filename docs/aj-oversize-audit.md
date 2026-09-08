@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 8 LOOKs.
+retired 9 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 19 open)
+## LOOK (27 total, 18 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -41,7 +41,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`c4a59be` 2026-08-07 aj: make the sidebar's working set and hosts legible~~ Retired without code changes: host grouping was explicitly requested, and the layout machinery serves current behavior. No worthwhile simplification identified.
 - ~~`bbca1ad` 2026-08-11 aj: splice a client's session streams through a gateway~~ Retired: host fan-out and gateway forwarding share one outbound queue core and frame classification, with their distinct attachment delivery and lifecycle behavior intact.
 - ~~`67c3d58` 2026-08-19 aj,aj-app: fix a review pass over bounding the catch-up~~ Retired: production recovery retained. Obsolete test-only discharge logic and its tests are removed, with catch-up guarantees covered through the drive loop.
-- `09f7dac` 2026-08-19 aj: close the review findings on the loop-folded catch-up
+- ~~`09f7dac` 2026-08-19 aj: close the review findings on the loop-folded catch-up~~ Retired: production recovery retained. The test helper no longer records its own connection-state assignments as evidence of screen behavior. Fresh-client convergence coverage remains.
 - `39920f0` 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model
 - `9fd4f0c` 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals
 - `b1e4ba9` 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows
@@ -175,12 +175,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: Review churn and a large test diff. The audit overstated the mechanism: `Attach` already existed and was exposed, not introduced. Current callers distinguish its phases. Refusal policy was corrected before merge, and catch-up runs inside the drive loop. Mutation-origin tests covered distinct promises, but tests of a test-only recovery path preserve implementation rather than user behavior.
 - Disposition: Keep the production fold, attachment state, and scripted peer fixture. Test recovery through the drive loop and remove obsolete helper-only coverage.
 
-### 09f7dac 2026-08-19 aj: close the review findings on the loop-folded catch-up
-- Stats: 1 files, +405 -48, ~130 prod / ~275 test lines (estimate: hunk classification; four new async tests of ~60 lines each)
+### 09f7dac 2026-08-19 aj: close the review findings on the loop-folded catch-up [RETIRED]
+- Status: Retired after test cleanup. The connection-state recorder in `drive_resume` and the assertion on that helper's own assignments are removed. The surrounding fresh-client convergence test remains. Production recovery is unchanged.
+- Stats: 1 file, +405 -48. Production +129/-31, tests +276/-17, including comments and blank lines. Excluding comments and blank lines, production was +52/-7.
 - Body: empty
-- Verdict: LOOK
-- Why: Empty body on a +405 review-fix bundle 95 minutes after b68b4ec. It adds a `Folded { redraw, opened }` return struct so the drive loop can `reset_to_tail()` on the block's opening frame, `Block::fold_ready()` to drain queued frames before a missed deadline, a `debug_assert_eq!` that the fold and focus agree, a settled-block early return in `fold()`, and an on-exit `resume.take()` cleanup. Each is a separate finding with no stated motivation in the commit. Tests `a_settled_block_does_not_re_decide_itself` and `a_block_reports_its_opening_and_its_repaints` pin `Block` internals (`settled`, the `opened` bit) rather than a user-visible promise; the epoch-cache repaint bug the `opened` bit fixes is the one user-facing item and is not named in the message.
-- Simpler shape: Three commits with bodies (drain-before-abandon, epoch adoption repaint, leave-loop cleanup), and the repaint pinned by what the screen shows rather than by `Folded::opened`.
+- Verdict: Retired after investigation. The queued-frame rescue and settled-verdict guard are small responses to catch-up interruption and timeout behavior.
+- Why flagged: An empty-body review bundle with internal-state tests. `Folded::opened` and its per-frame reset are absent, cache validity belongs to the rendering layer, and recovery survives loop exits until navigation replaces its target. The remaining test recorder asserted its own state assignments rather than production rendering.
+- Disposition: Keep the production fold and recovery ownership. Remove the helper-only state trace, retain convergence and composed input, navigation, and rendering coverage.
 
 ### 39920f0 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model
 - Stats: 6 files, +516 -20, ~105 prod / ~410 test lines

@@ -12005,7 +12005,7 @@ mod tests {
             "the failed append surfaced as the actionable error row: {errors:?}",
         );
 
-        let _ = drive_resume(&mut world, &shell)
+        drive_resume(&mut world, &shell)
             .await
             .expect("the loop's ordinary rejoin");
         assert_eq!(world.session(), failed_session);
@@ -12106,8 +12106,7 @@ mod tests {
         );
     }
 
-    /// Drive a lost stream's recovery to completion, answering the connection
-    /// states it passed through in order.
+    /// Drive a lost stream's recovery to completion.
     ///
     /// A recovery needs two things the loop provides: the gate on when a step may
     /// run, and something folding the block in between, since a block nothing
@@ -12121,16 +12120,12 @@ mod tests {
     async fn drive_resume(
         world: &mut World,
         shell: &Rc<RefCell<Shell>>,
-    ) -> Result<Vec<Connection>, ControlError> {
-        let mut seen = Vec::new();
+    ) -> Result<(), ControlError> {
         let mut pending = Some(Resume::new());
         let deadline = Instant::now() + SETTLE_DEADLINE;
         world.connection = Connection::Reconnecting;
         while let Some(mut state) = pending.take() {
             assert!(Instant::now() < deadline, "the re-attach never settled");
-            if seen.last() != Some(&world.connection) {
-                seen.push(world.connection);
-            }
             if state.ready() {
                 match advance_resume(world, shell, state).await? {
                     ResumeAdvance::Pending(state) => {
@@ -12171,7 +12166,7 @@ mod tests {
             pending = Some(state);
         }
         world.connection = Connection::Connected;
-        Ok(seen)
+        Ok(())
     }
 
     /// An in-process subscriber is evicted like any other when the shell stops
@@ -23152,19 +23147,11 @@ mod tests {
             "the cut stream reports the loss"
         );
 
-        // The drive loop's own recovery: re-attach with the client's cursor,
+        // Recover through the helper: re-attach with the client's cursor,
         // fold the block, discharge the reads.
-        let seen = drive_resume(&mut world, &shell)
+        drive_resume(&mut world, &shell)
             .await
             .expect("a connection's re-attach is never fatal");
-        // The two steps exist so that the catching-up state is painted before the
-        // block is folded, which only holds if the recovery passes through both.
-        assert_eq!(
-            seen,
-            vec![Connection::Reconnecting, Connection::CatchingUp],
-            "the recovery skipped a connection state, so one of them is never on \
-             screen",
-        );
         assert!(
             main_notices(&world)
                 .iter()
