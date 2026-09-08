@@ -28,62 +28,22 @@ use crate::chat::{ChatState, Redraw, reduce};
 use crate::host::PERSISTENCE_FAILED_CODE;
 use crate::session::AgentLifecycle;
 
-/// Why a session is withheld, which names the edge in the peer's directory
-/// that re-asks for it.
-///
-/// Read off the refusal's code once, where the frame is folded, so the wire's
-/// vocabulary stays in this module and whatever watches the directory reads a
-/// decision rather than a token.
+/// Why a session is withheld and what can ask for it again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// The `locked` code: a rival writer holds the session's advisory lock.
-    /// Its row stays listed for as long as the hold lasts, so the edge that
-    /// says the answer can have changed is the row's `locked` bit going true
-    /// then false, the rival letting go. The absence edge is kept
-    /// besides, because a row can leave and return anyway and comes back
-    /// rebuilt with the bit already false.
-    Locked {
-        /// The generation of the acquire this refusal answered, as the peer
-        /// named it. `None` from a peer that publishes no generations.
-        ///
-        /// The transitions above are read out of `list`, which is
-        /// lossy-coalescible: the rise and the fall are seconds apart by
-        /// design, so a client that does not drain in between sees only the
-        /// fall's snapshot and has nothing to compare it against. This is what
-        /// makes the recovery derivable from that one snapshot instead: a row
-        /// reporting the lock free at this generation or beyond says
-        /// this conflict is over.
-        generation: Option<u64>,
-    },
-    /// Every other code, the ones this build has never heard of included: the
-    /// row's return to the list is the edge, and nothing else. An unknown
-    /// refusal behaves like the refusals this build knows rather than like the
-    /// most specific one: error codes are additive, so an unknown one gets the
-    /// generic handling.
+    /// A rival writer holds the session. Only an explicit user retry reopens it.
+    Locked,
+    /// Other codes, including unknown ones, recover when the row leaves and returns.
     Other,
 }
 
 impl Refusal {
-    /// Classify a peer refusal from its wire code and optional lock generation.
-    ///
-    /// Unknown codes deliberately use [`Self::Other`], whose recovery waits for
-    /// the session row to leave and return instead of assuming lock semantics.
-    pub fn from_code(code: &str, lock_generation: Option<u64>) -> Self {
+    /// Classify a peer refusal. Unknown codes use directory-return recovery.
+    pub fn from_code(code: &str) -> Self {
         if code == "locked" {
-            Self::Locked {
-                generation: lock_generation,
-            }
+            Self::Locked
         } else {
             Self::Other
-        }
-    }
-
-    /// The acquire generation this refusal names, `None` unless it is a
-    /// `locked` one from a peer that publishes generations.
-    pub(crate) fn generation(self) -> Option<u64> {
-        match self {
-            Self::Locked { generation } => generation,
-            Self::Other => None,
         }
     }
 }
@@ -302,10 +262,6 @@ impl SessionClient {
     pub fn expect_attach(&mut self) {
         self.attach = Attach::Requested;
         self.needs_reattach = false;
-        // Not only the edges' business. A reconnect arms every session
-        // `attach_requests` names, withheld ones included, so an arm that left
-        // this set would leave a client attached and still marked refused, and
-        // the next row transition would re-ask for a session it already holds.
         self.withheld = None;
     }
 
@@ -462,7 +418,6 @@ impl SessionClient {
                 session,
                 code,
                 message,
-                lock_generation,
                 ..
             } => {
                 if !self.is_ours(&session) {
@@ -485,7 +440,7 @@ impl SessionClient {
                 // from disk on the next ask, so the obligation is
                 // taken back at once instead of waiting for a directory edge
                 // the row may never show (a durable session stays listed).
-                self.drop_attachment(Refusal::from_code(&code, lock_generation), message.clone());
+                self.drop_attachment(Refusal::from_code(&code), message.clone());
                 if code == PERSISTENCE_FAILED_CODE {
                     self.owe_reattach();
                 }
@@ -511,13 +466,11 @@ impl SessionClient {
                 // An armed attach stays armed, so a `reset` that overtakes
                 // the block the client already asked for cannot disarm it.
                 //
-                // Through `owe_reattach` rather than by assignment, so that one
-                // function stays the only place the obligation is taken on and
-                // the withheld state released. A reset reaches a refused
-                // session too (a gateway sends one per session when a host's
-                // link returns), and one that left it marked refused would have
-                // the client re-ask on a later row for a session this reset is
-                // already sending it back to.
+                // A link reset does not retry an attachment the user must
+                // explicitly request. Other sessions still recover normally.
+                if self.withheld == Some(Refusal::Locked) {
+                    return Redraw(false);
+                }
                 self.owe_reattach();
                 Redraw(true)
             }
@@ -723,8 +676,8 @@ impl SessionClient {
     /// has to ask for it again.
     ///
     /// [`Self::needs_reattach`] is the only record that one is owed, so every
-    /// path that leaves the client not following has to end here or nothing
-    /// anywhere will ask.
+    /// recovery path that intends to ask again ends here. Settled refusals
+    /// deliberately leave that obligation withdrawn.
     pub fn owe_reattach(&mut self) {
         self.needs_reattach = true;
         self.withheld = None;
@@ -760,19 +713,8 @@ impl SessionClient {
     /// the next `state` frame to arrive would be taken for the block this
     /// refusal replaced.
     ///
-    /// Withdrawing the re-attach obligation is half a rule, and the other half
-    /// is not here. Asking again immediately is noise, because nothing has
-    /// changed since the refusal, and never asking again strands the client on a
-    /// session whose host was only restarting. So the obligation is withdrawn
-    /// *until the peer's own directory says the answer can have changed*, which
-    /// is `SessionDirectory`'s to notice, and it puts the obligation back
-    /// ([`Self::owe_reattach`]). `refusal` is what tells it which edge to watch.
-    /// A later attach that costs a full backfill is always permitted. What is
-    /// never permitted is a retry loop.
-    ///
-    /// Deliberately not what a `reset` does. That one says continuity broke on a
-    /// session the server still has, so its obligation stands and is discharged
-    /// at once.
+    /// A locked refusal waits for an explicit retry. Other refusals wait for
+    /// directory-return evidence. Neither immediately retries the failed attach.
     fn drop_attachment(&mut self, refusal: Refusal, message: String) {
         self.attach = Attach::Live;
         self.epoch = None;
@@ -1130,7 +1072,6 @@ mod tests {
             epoch: None,
             code: code.to_string(),
             message: message.to_string(),
-            lock_generation: None,
         }
     }
 

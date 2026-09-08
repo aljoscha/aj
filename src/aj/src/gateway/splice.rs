@@ -511,9 +511,6 @@ fn refusal(unresolvable: Unresolvable) -> Frame {
         epoch: None,
         code: UNKNOWN_SESSION.to_string(),
         message: unresolvable.message,
-        // A hold is a host's fact about a session it has, and this one resolved
-        // to no host at all.
-        lock_generation: None,
     }
 }
 
@@ -610,9 +607,7 @@ mod tests {
     /// The merged directory is the literal first frame even when a spliced
     /// refusal is already queued.
     ///
-    /// This is the ordering that lets a client evaluate the refusal against the
-    /// gateway's latest row. Moving the queued-frame read above the opening-list
-    /// branch strands a release whose row changes no further.
+    /// Queued upstream traffic must not overtake the gateway's opening list.
     #[tokio::test]
     async fn the_opening_directory_precedes_an_already_queued_spliced_refusal() {
         let (_directory_tx, directory) = watch::channel(Arc::new(MergedDirectory::default()));
@@ -624,7 +619,6 @@ mod tests {
             epoch: None,
             code: "locked".to_string(),
             message: "held".to_string(),
-            lock_generation: Some(23),
         })
         .expect("a locked refusal");
         assert!(
@@ -651,19 +645,19 @@ mod tests {
             matches!(
                 splice.next_frame(Duration::from_secs(1), &shutdown).await,
                 Some(Outgoing::Spliced(DecodedFrame::Known(known)))
-                    if matches!(known.value(), Frame::Error { lock_generation: Some(23), .. })
+                    if matches!(known.value(), Frame::Error { session, code, .. }
+                        if session == "left:s-1" && code == "locked")
             ),
             "the queued refusal did not follow the opening directory",
         );
     }
 
     /// Namespacing a host's locked refusal rewrites only its session id. The
-    /// generation and fields this gateway does not know travel from the raw
-    /// frame unchanged.
+    /// fields this gateway does not know travel from the raw frame unchanged.
     #[tokio::test]
-    async fn a_locked_refusals_generation_survives_the_raw_gateway_rewrite() {
+    async fn a_refusals_unknown_metadata_survives_the_raw_gateway_rewrite() {
         let frame: DecodedFrame = serde_json::from_str(
-            r#"{"kind":"error","session":"s-1","code":"locked","message":"held","lock_generation":23,"added_later":{"kept":true}}"#,
+            r#"{"kind":"error","session":"s-1","code":"locked","message":"held","added_later":{"kept":true}}"#,
         )
         .expect("a locked refusal");
         let cancel = CancellationToken::new();
@@ -681,21 +675,17 @@ mod tests {
                 known.value(),
                 Frame::Error {
                     session,
-                    lock_generation: Some(23),
+                    code,
+                    message,
                     ..
-                } if session == "left:s-1"
+                } if session == "left:s-1" && code == "locked" && message == "held"
             ),
-            "the typed refusal lost its namespace or generation: {:?}",
+            "the typed refusal lost its namespace or envelope: {:?}",
             known.value(),
         );
         let raw = known
             .raw_json()
             .expect("a rewritten wire frame retains JSON");
-        assert!(
-            raw.get().contains(r#""lock_generation":23"#),
-            "the raw rewrite dropped the generation: {}",
-            raw.get(),
-        );
         assert!(
             raw.get().contains(r#""added_later":{"kept":true}"#),
             "the raw rewrite re-encoded away an additive field: {}",

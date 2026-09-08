@@ -6044,7 +6044,6 @@ fn fake_row(id: &str) -> SessionSummary {
         unreachable: false,
         archived: false,
         locked: false,
-        lock_generation: None,
     }
 }
 
@@ -6121,7 +6120,6 @@ fn error_frame(session: &str, code: &str, message: &str) -> String {
         epoch: None,
         code: code.to_string(),
         message: message.to_string(),
-        lock_generation: None,
     })
     .expect("an error frame")
 }

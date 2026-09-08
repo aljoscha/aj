@@ -201,7 +201,7 @@ internally tagged with `kind`:
   directory (section 5.8). `hosts` is present only from a gateway
   (section 6.1). Cumulative, the latest frame supersedes all earlier
   ones.
-- `error`: `{kind, session, epoch?, code, message, lock_generation?}`.
+- `error`: `{kind, session, epoch?, code, message}`.
   The error envelope (section 5.6) as a session-scoped stream frame.
   Every per-session resolution failure travels this way with its own
   code (`unknown_session`, `locked`, `persistence_failed`, ...). Only
@@ -385,36 +385,20 @@ Client application rules:
   discarding the partial application is safe. A re-attach that fails
   because the session no longer exists fails as a session-scoped `error`
   frame, never as the stream.
-- **Re-asking after a refusal.** A client whose attach was refused stops
-  asking and never retries on a timer. What re-asks is a transition the
-  directory shows, and the refusal's code names which:
-  - `unknown_session`, and any code the client does not know: the
-    session's row absent from one folded `list`, present in the next.
-  - `locked`: that edge, plus the row's `locked` bit going true then
-    false across folded lists, plus the generation rule below.
-  - `persistence_failed`: immediately, as soon as the frame folds. The
-    host treats the failed materialization as absent and rebuilds from
-    disk. This immediate edge belongs to `persistence_failed` alone.
-
-  Directory edges are transitions between one folded list and the next,
-  so a change during a disconnect is seen at the first frame after it.
-  They are set-wide. A client holding no rows yet re-asks on the first
-  list it folds.
-
-  **Lock generation rule.** `list` is lossy, so a lock's rise and fall
-  can be coalesced into one snapshot. The host therefore publishes
-  `lock_generation` beside the bit (section 5.8), and a `locked` error
-  frame carries the generation of the refused acquire in its own
-  `lock_generation` field. A folded row with `locked` false and
-  generation greater than or equal to the refusal's re-asks, whether or
-  not the client saw the rise, evaluated both when a list folds and when
-  a refusal folds against the current row. A gateway sends its latest
-  merged list before a spliced refusal. A fire consumes the row's
-  generation, so a peer republishing the same released generation is
-  asked once. A re-refusal re-arms the edges and carries the next
-  generation. Against a peer that publishes neither bit nor generation,
-  a locked refusal waits for the absent-then-present edge indefinitely,
-  never a retry loop.
+- **Re-asking after a refusal.** An attach refusal ends the attempt, never
+  starting a timer or a retry loop. Recovery depends on its code:
+  - `locked`: keep the session selected and its cached transcript available,
+    show that another process holds it, and offer explicit retry by selecting
+    it again, including from the sidebar or session selector. Directory updates
+    and `reset` frames do not retry it. Omit it from subsequent stream opens
+    until the user selects it, so reconnecting or following another session
+    cannot silently acquire it in the background.
+  - `unknown_session`, and any code the client does not know: re-ask when the
+    session's row is absent from one folded `list` and present in the next.
+    These transitions are set-wide and include the first list after a refusal
+    if the client held no rows. Explicit selection also retries.
+  - `persistence_failed`: re-ask immediately when the frame folds. The host
+    treats the failed materialization as absent and rebuilds from disk.
 
 ### 5.6 Commands
 
@@ -515,16 +499,6 @@ Per-session row fields in `list` frames and `GET /v1/sessions`:
   the lock is the only authority and the bit may lag it in either
   direction, so a client acts by attempting and reading the answer.
   Absent reads false. A gateway relays it untouched.
-- `lock_generation`: optional `u64` naming the publishing host's latest
-  acquire of this session. The counter is seeded from unix milliseconds
-  at host boot, and every acquire increments it before either outcome is
-  published: a refusal carries the post-increment value, a re-refusal
-  while the same rival hold remains carries the next value, and a
-  successful acquire increments before its free live row is published. A
-  release clears the bit without incrementing, so a free row at
-  generation G says the acquire refused at G no longer blocks this host
-  (section 5.5). Absent is no knowledge. Comparable only against
-  generations from the same host. A gateway relays it untouched.
 - `host`: which enrolled host the row belongs to, filled by a gateway
   and absent from a plain host's rows. Clients group by it and must not
   derive it from the id.

@@ -127,17 +127,12 @@ pub(crate) fn persistence_failure_message(failure: &PersistenceFailure) -> Strin
 
 /// How often the host re-probes the sessions it publishes as locked.
 ///
-/// The falling edge of the `locked` bit, and the only recurring question the
-/// host owes: a rival letting go is invisible otherwise, cleanly or by
-/// crashing, and a client refused with `locked` waits for the directory to
-/// say the bit fell rather than asking on a schedule. Rising edges are
-/// events the host already has, its own refusal and the enumeration sweep,
-/// so this tick only ever clears.
+/// Keeps the advisory directory bit current when a rival releases or crashes.
+/// Rising edges come from acquire refusals and enumeration, so this tick only
+/// clears. Attachment refusals remain settled until an explicit user retry.
 ///
-/// Deliberately its own constant rather than a share of the idle grace: the two
-/// pace unrelated things, and tuning one must not silently move the other. The
-/// scale is a rejoin the user is waiting through, and a tick over an empty set
-/// is one set check, so seconds is what this costs nothing to make.
+/// Independent of the idle grace because they pace unrelated things. A tick
+/// over a host with no rival holds touches only memory.
 pub const LOCK_PROBE_TICK: Duration = Duration::from_secs(2);
 
 /// File in the session store holding this store's stable host id.
@@ -181,12 +176,6 @@ pub enum HostError {
     Locked {
         session: String,
         holder: Option<LockHolder>,
-        /// The generation of this refused acquire, in the vocabulary of the
-        /// row's `lock_generation`.
-        ///
-        /// Captured by the same cache update that advances the row, so later
-        /// acquires cannot change what this refusal carries.
-        generation: Option<u64>,
     },
     /// The request is well formed and conflicts with nothing, but this host
     /// cannot serve it: a model it has no credentials for, a settings
@@ -221,21 +210,6 @@ impl HostError {
             Self::Unsupported(_) => "unsupported",
             Self::Invalid(_) => "invalid_request",
             Self::Internal(_) => "internal",
-        }
-    }
-
-    /// The acquire generation a `locked` refusal names, `None` from every other
-    /// failure.
-    ///
-    /// Beside [`Self::code`] for the same reason that one is here: the frame
-    /// that refuses one session's attach is assembled from this error, and the
-    /// generation is part of what the refusal says rather than something the
-    /// assembling code could look up. Asking the directory for it there would
-    /// read whatever the bit had moved to since.
-    fn lock_generation(&self) -> Option<u64> {
-        match self {
-            Self::Locked { generation, .. } => *generation,
-            _ => None,
         }
     }
 }
@@ -998,9 +972,6 @@ impl SessionHost {
                         epoch: None,
                         code: err.code().to_string(),
                         message: err.to_string(),
-                        // A locked refusal names its acquire generation, and
-                        // every other code carries none.
-                        lock_generation: err.lock_generation(),
                     }));
                 }
             }
@@ -1129,7 +1100,6 @@ impl SessionHost {
                         unreachable: false,
                         archived: session.archived,
                         locked: session.locked,
-                        lock_generation: session.lock_generation,
                     },
                 )
             })
@@ -1139,12 +1109,7 @@ impl SessionHost {
         // answers only the host's own is current.
         for session in &live {
             let id = session.id();
-            // The one field a live row still takes from the cold cache. The
-            // generation describes the session's lock history, not who holds it
-            // now, so it survives this host taking the session: a client refused
-            // over the hold that ended is owed the same evidence either way.
-            let generation = self.inner.cold.lock_generation(id);
-            summaries.insert(id.to_string(), summarize(session, generation));
+            summaries.insert(id.to_string(), summarize(session));
         }
         // Latest first: session ids are minted as timestamps, so their
         // descending order is chronological.
@@ -1636,22 +1601,17 @@ impl SessionHost {
     /// it.
     ///
     /// Either answer records the session's `locked` bit: a refusal
-    /// says a rival holds it, and a won lock clears any stale rival bit. Every
-    /// answer advances the session's generation before its row is published.
+    /// says a rival holds it, and a won lock clears any stale rival bit.
     fn acquire(&self, id: &str) -> Result<SessionLock, HostError> {
         let taken = SessionLock::try_acquire(&self.inner.persistence, id, &self.inner.host_id)
             .map_err(|err| HostError::Internal(Box::new(err)))?;
-        // Keep the post-increment value from the same cache guard that writes
-        // the row. Re-reading later could stamp this refusal with another
-        // acquire's generation.
-        let generation = self.inner.cold.note_acquire(id, taken.is_none());
+        self.inner.cold.note_locked(id, taken.is_none());
         self.inner.shared.fanout.mark_list_dirty();
         taken.ok_or_else(|| HostError::Locked {
             session: id.to_string(),
             // Read only on the refusal path, and the record is cleared on
             // release, so what it names is a holder that has the lock now.
             holder: SessionLock::holder(&self.inner.persistence, id),
-            generation: Some(generation),
         })
     }
 
@@ -2245,10 +2205,7 @@ fn log_modified_at(log: &ConversationLog) -> Option<DateTime<Utc>> {
 }
 
 /// Project one live session onto its directory entry.
-///
-/// `lock_generation` comes from the host's lock bookkeeping rather than from the
-/// session, which knows nothing about the holds that preceded it.
-fn summarize(session: &Arc<LiveSession>, lock_generation: Option<u64>) -> SessionSummary {
+fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
     let (steering, follow_up) = session.core.message_queues.pending_counts();
     let tasks = session
         .core
@@ -2276,7 +2233,6 @@ fn summarize(session: &Arc<LiveSession>, lock_generation: Option<u64>) -> Sessio
         // Never locked: the bit names a rival, and this host holds this
         // session's lock for as long as it is live.
         locked: false,
-        lock_generation,
     }
 }
 
@@ -2425,15 +2381,9 @@ fn spawn_idle_sweeper(inner: &Arc<HostInner>) {
 
 /// Clear the `locked` bit of any session whose rival has let go.
 ///
-/// The host's half of the rejoin contract. A client refused with `locked` is
-/// forbidden to ask on a schedule and waits for the row's bit to fall instead,
-/// which buys it the host's diligence, and this is where that debt is paid:
-/// the rising edges are events the host already has, its own refusal and the
-/// enumeration sweep, and the falling edge has none at all. A clean release
-/// truncates the holder record and a crash releases by closing a descriptor,
-/// and neither reaches this process. Asking the flock is
-/// the only read the fact supports, so this paces that read rather than standing
-/// in for a signal.
+/// Rising edges come from acquire refusals and enumeration. A clean release
+/// truncates the holder record, but a crash only closes a descriptor, so the
+/// advisory bit needs a flock probe rather than filesystem notifications.
 ///
 /// Both release paths are bounded by the same constant, because a probe asks
 /// whether the lock is held rather than waiting to be told that it was dropped.

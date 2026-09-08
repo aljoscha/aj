@@ -932,8 +932,17 @@ impl Block {
             session: world.session().to_string(),
             silence,
             deadline: Instant::now() + silence,
-            settled: (world.client().attach_phase() == Attach::Live)
-                .then_some(CatchUp::Stalled(AttachStall::Unserved)),
+            settled: if world.client().withheld() == Some(Refusal::Locked) {
+                // This session was deliberately omitted from a stream reopened
+                // for other sessions or connection recovery. No block is owed.
+                Some(CatchUp::Refused {
+                    reason: aj_app::directory::WITHHELD_LOCKED_NOTICE.to_string(),
+                    refusal: Refusal::Locked,
+                })
+            } else {
+                (world.client().attach_phase() == Attach::Live)
+                    .then_some(CatchUp::Stalled(AttachStall::Unserved))
+            },
         }
     }
 
@@ -1034,12 +1043,9 @@ impl Block {
         }
         let mine = frame.session() == Some(self.session.as_str());
         let refusal = match &frame {
-            aj_wire::Frame::Error {
-                code,
-                message,
-                lock_generation,
-                ..
-            } if mine => Some((message.clone(), Refusal::from_code(code, *lock_generation))),
+            aj_wire::Frame::Error { code, message, .. } if mine => {
+                Some((message.clone(), Refusal::from_code(code)))
+            }
             _ => None,
         };
         // A `reset` mid-block abandons the block: the cursor only advances at
@@ -1328,7 +1334,9 @@ async fn apply_focus_request(
                 .await;
             apply_create_result(app, shell, world, created).await
         }
-        FocusRequest::Resume(session) if session == world.session() => {
+        FocusRequest::Resume(session)
+            if session == world.session() && world.client().withheld().is_none() =>
+        {
             // Nothing to do, and doing it anyway would announce a switch that
             // did not happen, discard an armed branch anchor and reset the
             // scroll. Reachable from a stepping chord answered off a mirror
@@ -1337,6 +1345,7 @@ async fn apply_focus_request(
             return Focus::Same;
         }
         FocusRequest::Resume(session) => {
+            let moved = session != world.session();
             let tag = directory_tag(world, &session);
             focus_session(
                 app,
@@ -1346,7 +1355,7 @@ async fn apply_focus_request(
                 PendingTransition::Switch { session, tag },
             )
             .await;
-            Focus::Moved
+            if moved { Focus::Moved } else { Focus::Same }
         }
         FocusRequest::Branch { target, prompt } => {
             branch_focused_session(app, shell, world, target, prompt).await;
@@ -1492,7 +1501,7 @@ async fn focus_session(
         || world
             .directory
             .client_for(&session)
-            .is_some_and(|client| client.needs_reattach());
+            .is_some_and(|client| client.needs_reattach() || client.withheld().is_some());
     let startup = match &transition {
         PendingTransition::Create { partial, .. } => Some(PendingStartup {
             fresh: true,
@@ -1542,6 +1551,8 @@ async fn focus_session(
         // loop finishes folding it before the switch counts as complete.
         world.connection = Connection::CatchingUp;
         world.resume = Some(Resume::launched(world));
+    } else {
+        world.connection = Connection::Connected;
     }
     world.transition = Some(transition);
     // This selection is painted before the new drive loop's first bottom-of-
@@ -1799,7 +1810,7 @@ fn fail_pending_transition(
                 toast.push_str(" Your message is back in the editor.");
             }
             let (error, warning) = match failure.refusal() {
-                Some((reason, Refusal::Locked { .. })) => (
+                Some((reason, Refusal::Locked)) => (
                     Some(reason.to_string()),
                     aj_app::directory::WITHHELD_LOCKED_NOTICE.to_string(),
                 ),
@@ -1816,7 +1827,9 @@ fn fail_pending_transition(
                 }
             };
             world.client_mut().recover_committed_head(error, warning);
-            world.client_mut().owe_reattach();
+            if world.client().withheld() != Some(Refusal::Locked) {
+                world.client_mut().owe_reattach();
+            }
             shell.borrow().show_toast(toast);
         }
     }
@@ -5170,14 +5183,12 @@ struct ChatSlot {
 impl Widget for ChatSlot {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
         let conversation = self.chat.borrow().has_conversation();
-        let (rebuilding, connected) = {
+        let (rebuilding, connection) = {
             let status = self.status.borrow();
-            (
-                status.rebuilding,
-                status.connection == Connection::Connected,
-            )
+            (status.rebuilding, status.connection)
         };
-        if rebuilding || (!conversation && !connected) {
+        let refused = connection == Connection::Refused;
+        if rebuilding || (!conversation && connection != Connection::Connected && !refused) {
             // A flex parent's measuring pass draws under an unbounded height,
             // and the slot has no inherent height, so report zero there.
             return Surface::with_size(vaxis::vxfw::Size {
@@ -5185,7 +5196,9 @@ impl Widget for ChatSlot {
                 height: ctx.max.height.unwrap_or(0),
             });
         }
-        let child = if conversation {
+        // Even an empty session has refusal and retry guidance to show. Use the
+        // transcript for those notices, not the ready-to-chat splash.
+        let child = if conversation || refused {
             draw_widget(&to_widget_ref(Rc::clone(&self.transcript)), ctx)
         } else {
             draw_widget(&to_widget_ref(Rc::clone(&self.splash)), ctx)
@@ -7132,7 +7145,9 @@ async fn advance_resume(
                     // passive rejoin consume that answer instead of racing an
                     // immediate drain. The block deadline bounds peers that
                     // answer with neither a block nor an error.
-                    if world.client().attach_phase() == Attach::Live {
+                    if world.client().attach_phase() == Attach::Live
+                        && world.client().withheld() != Some(Refusal::Locked)
+                    {
                         world.client_mut().expect_attach();
                     }
                     state.step = ResumeStep::CatchingUp(Block::open(world));
@@ -8013,9 +8028,9 @@ async fn drive(
                             TransitionFailure::Attach(refused),
                         );
                         world.connection = Connection::Refused;
-                        // An accepted Head re-owes its forward recovery. An
-                        // ordinary refusal waits for the directory's rejoin
-                        // edge instead of polling the peer.
+                        // Locked refusals require explicit selection, including
+                        // after a Head command. Other refusals retain their
+                        // directory-return or forward-recovery behavior.
                         if world.client().needs_reattach() {
                             state.failed();
                             resume = Some(state);
@@ -10589,12 +10604,130 @@ mod tests {
             "the exact refusal remains in the selected transcript: {:?}",
             main_notices(&world),
         );
+        sync_status(&world);
+        // The persistent guidance must remain after the transient toast is gone.
+        shell.borrow().toasts.borrow_mut().clear();
+        let drawn = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            drawn.contains("In use by another process."),
+            "refusal guidance is visible even without a conversation: {drawn}"
+        );
         assert!(
             world.directory.rows().iter().any(|row| row.id == fresh),
             "the previous session remains available for an ordinary switch",
         );
 
+        // A refused focus must not leave a healthy cached session unusable.
+        drain_stream(&mut world).await;
+        let background = world.directory.client_for(&fresh).expect("cached session");
+        assert!(background.holds_attachment());
+        assert_eq!(background.attach_phase(), Attach::Live);
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(fresh.clone()),
+        )
+        .await;
+        assert_eq!(world.connection, Connection::Connected);
+        assert!(world.resume.is_none(), "a healthy session is a view swap");
+        assert!(!refuse_while_attaching(&world, &shell, "send a message"));
+        assert!(
+            !world
+                .directory
+                .attach_requests()
+                .iter()
+                .any(|request| request.session == held)
+        );
+
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(held.clone()),
+        )
+        .await;
+        assert!(matches!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Refused { .. }
+        ));
+
+        // Selecting the same session is an explicit retry, even while the
+        // rival still owns it. A second refusal settles just like the first.
+        assert!(matches!(
+            apply_focus_request(
+                &mut app,
+                &shell,
+                &mut world,
+                FocusRequest::Resume(held.clone())
+            )
+            .await,
+            Focus::Same
+        ));
+        assert!(matches!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Refused { .. }
+        ));
+        assert!(!world.directory.needs_reattach());
+
         drop(rival);
+        let released = world
+            .control
+            .sessions()
+            .await
+            .expect("the directory after release");
+        assert!(
+            released
+                .sessions
+                .iter()
+                .any(|row| row.id == held && !row.locked)
+        );
+        let _ = world.directory.apply(
+            &mut world.chat.borrow_mut(),
+            aj_wire::Frame::List {
+                sessions: released.sessions,
+                hosts: released.hosts,
+            },
+        );
+        assert_eq!(world.client().withheld(), Some(Refusal::Locked));
+        assert!(
+            !world.directory.needs_reattach(),
+            "release alone must not retry"
+        );
+        // Connection recovery must reopen the healthy working set without
+        // acquiring the released session or waiting for its absent block.
+        world.resume = Some(Resume::new());
+        assert!(matches!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Refused { .. }
+        ));
+        assert!(world.stream().attached(&fresh));
+        assert!(!world.stream().attached(&held));
+        let unclaimed = aj_session::SessionLock::try_acquire(&store_of(&dir), &held, "probe")
+            .expect("probe released lock")
+            .expect("connection recovery did not silently acquire the session");
+        drop(unclaimed);
+        let before_retry = main_notices(&world);
+
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(held.clone()),
+        )
+        .await;
+        assert_eq!(world.session(), held);
+        assert_eq!(
+            main_notices(&world),
+            before_retry,
+            "selection keeps the cached transcript"
+        );
+        assert_eq!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Caught
+        );
+        assert!(world.client().holds_attachment());
+        assert_eq!(world.connection, Connection::Connected);
         shut_down(&world).await;
     }
 
@@ -18222,8 +18355,8 @@ mod tests {
         );
     }
 
-    /// Confirming the pre-selected current session is a no-op close (parks
-    /// nothing); Esc cancels the same way.
+    /// Confirming the current session reaches the frontend, which leaves a
+    /// healthy session unchanged. Esc closes without asking.
     #[tokio::test]
     async fn session_selector_current_is_noop_and_esc_cancels() {
         let dir = TempDir::new().expect("tempdir");
@@ -18231,7 +18364,7 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "current session prompt").await;
 
-        // Confirm the pre-selected current row: no switch parked.
+        // Confirm the pre-selected current row through the real input parser.
         apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
         focus_overlay(&mut app, &root);
         let scan = shell.borrow().take_session_scan().expect("scan parked");
@@ -18244,9 +18377,17 @@ mod tests {
         writer.write_all(b"\r").expect("enter on the current row");
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
+        let Some(SessionRequest::Resume(session)) = shell.borrow().take_session_request() else {
+            panic!("confirming the current row must reach the frontend");
+        };
+        assert_eq!(session, world.session());
+        assert!(matches!(
+            apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(session)).await,
+            Focus::Same
+        ));
         assert!(
-            shell.borrow().take_session_request().is_none(),
-            "the current row is a no-op"
+            world.resume.is_none(),
+            "a healthy current session does not reopen"
         );
         assert!(
             !shell.borrow().overlays.borrow().is_open(),
@@ -24152,13 +24293,13 @@ mod tests {
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
         let target = "selected-rejoining-target".to_string();
-        let reason = "the target is locked for the first attach";
+        let reason = "the target is unavailable for the first attach";
         let peer = WarmPeer::answering(
             vec![
                 vec![
-                    list_lock_at(&target, true, 7, 0),
-                    locked_refusal_at(&target, 7, reason),
-                    list_lock_at(&target, false, 7, 0),
+                    refusal_frame(&target, "unknown_session", reason),
+                    list_of(&[]),
+                    list_of(&[&target]),
                 ],
                 vec![
                     block_opening(&target, "rejoined-epoch"),
@@ -24453,8 +24594,8 @@ mod tests {
     }
 
     /// Once Head is accepted, recovery only moves forward. A late refusal keeps
-    /// the branch prompt unsent and restores it to the editor. A later passive
-    /// Caught replaces the stale projection without delayed success or submit.
+    /// the branch prompt unsent and restores it to the editor. Explicit retry
+    /// replaces the stale projection without delayed branch success or submit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_accepted_head_failure_recovers_forward_without_submitting() {
         let dir = TempDir::new().expect("tempdir");
@@ -24557,21 +24698,34 @@ mod tests {
         );
         world.local = None;
 
+        // A newer draft must survive restoring the held branch prompt when
+        // the attach refusal settles. Recovery waits for explicit selection.
+        shell.borrow().editor.borrow_mut().set_text("newer draft");
+        assert!(matches!(
+            settle_pending_transition(&mut app, &shell, &mut world).await,
+            CatchUp::Refused {
+                refusal: Refusal::Locked,
+                ..
+            }
+        ));
+        assert_eq!(world.connection, Connection::Refused);
+        assert_eq!(
+            peer.opens(),
+            1,
+            "the locked Head follow retried automatically"
+        );
+        assert!(world.resume.is_none());
+
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(session.clone()),
+        )
+        .await;
         let status = Rc::clone(&world.status);
-        let observed_shell = Rc::clone(&shell);
         let chat = Rc::clone(&world.chat);
-        let (exit, observed) = drive_until(&mut world, &shell, move |writer| async move {
-            let catching = settled(Duration::from_secs(3), || {
-                (status.borrow().connection == Connection::CatchingUp).then_some(())
-            })
-            .await;
-            observed_shell
-                .borrow()
-                .editor
-                .borrow_mut()
-                .set_text("newer draft");
-            let drafted =
-                (observed_shell.borrow().editor.borrow().text() == "newer draft").then_some(());
+        let (exit, recovered) = drive_until(&mut world, &shell, move |writer| async move {
             let recovered = settled(Duration::from_secs(4), || {
                 let connected = status.borrow().connection == Connection::Connected;
                 let row = notices_of(&chat.borrow())
@@ -24581,16 +24735,15 @@ mod tests {
             })
             .await;
             drop(writer);
-            (catching, drafted, recovered)
+            recovered
         })
         .await;
-
         assert!(matches!(exit, Ok(SessionExit::Quit)));
-        let (catching, drafted, recovered) = observed;
-        assert!(catching.is_some(), "Head catch-up was never visible");
-        assert!(drafted.is_some(), "the newer editor draft did not land");
-        assert!(recovered.is_some(), "forward recovery never reached Caught");
-        assert!(peer.opens() >= 2, "the failed Head follow did not retry");
+        assert!(
+            recovered.is_some(),
+            "explicit forward recovery never reached Caught"
+        );
+        assert_eq!(peer.opens(), 2, "the explicit retry opens one stream");
         assert_eq!(peer.prompts(), 0, "the held branch prompt was submitted");
         assert_eq!(peer.heads(), 0, "recovery issued a compensating Head");
         assert_eq!(
@@ -25053,7 +25206,6 @@ mod tests {
                 epoch: None,
                 code: "unknown_session".to_string(),
                 message: refusal.to_string(),
-                lock_generation: None,
             })
             .expect("an error frame"),
         ];
@@ -25506,7 +25658,6 @@ mod tests {
             unreachable: false,
             archived: false,
             locked: false,
-            lock_generation: None,
         }
     }
 
@@ -25549,21 +25700,6 @@ mod tests {
         .expect("a list frame")
     }
 
-    /// One row carrying the lock bit and generation, at a position that makes
-    /// repeated snapshots distinguishable to the test.
-    fn list_lock_at(session: &str, locked: bool, generation: u64, last_seq: u64) -> String {
-        serde_json::to_string(&aj_wire::Frame::List {
-            sessions: vec![aj_wire::SessionSummary {
-                locked,
-                lock_generation: Some(generation),
-                last_seq: Some(last_seq),
-                ..listed_row(session)
-            }],
-            hosts: Vec::new(),
-        })
-        .expect("a list frame")
-    }
-
     /// A per-session attach refusal carrying `code`, as a peer sends one.
     fn refusal_frame(session: &str, code: &str, message: &str) -> String {
         serde_json::to_string(&aj_wire::Frame::Error {
@@ -25571,41 +25707,12 @@ mod tests {
             epoch: None,
             code: code.to_string(),
             message: message.to_string(),
-            lock_generation: None,
         })
         .expect("an error frame")
     }
 
-    /// A locked refusal naming which hold refused this attach.
-    fn locked_refusal_at(session: &str, generation: u64, message: &str) -> String {
-        serde_json::to_string(&aj_wire::Frame::Error {
-            session: session.to_string(),
-            epoch: None,
-            code: "locked".to_string(),
-            message: message.to_string(),
-            lock_generation: Some(generation),
-        })
-        .expect("an error frame")
-    }
-
-    /// A peer that keeps refusing is asked once, not once per retry, and a peer
-    /// whose rows never carry the `locked` bit leaves a locked refusal waiting
-    /// rather than spinning.
-    ///
-    /// Two claims, one property, one fixture. The recovery once retried on a
-    /// backoff and folded the peer's `error` frame again on every attempt,
-    /// measured at thirteen rows in the first minute against a real gateway,
-    /// which is why a refusal is an answer and never a schedule.
-    ///
-    /// `locked` is the code that makes this the hard case, and the reason this
-    /// test asserts about it rather than about a session the peer cannot
-    /// resolve. It is the one refusal with two edges armed (the row returning
-    /// to the list, and the row's `locked` bit falling), and
-    /// against a peer whose rows carry no bit the second of them can never
-    /// fire, so this is where a client has most to gain from asking anyway and
-    /// must not: the wait is the gap an old peer always had, chosen over a
-    /// timer, and either edge read as presence instead of as a transition spins
-    /// here.
+    /// A locked refusal stays settled through release and disappearance/return
+    /// updates, without retrying or repeating the notice while the loop runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refusal_is_folded_once_however_long_the_client_waits() {
         let dir = TempDir::new().expect("tempdir");
@@ -25615,30 +25722,12 @@ mod tests {
 
         let refusal = "another writer holds this session";
         let script = vec![
+            list_holding(&[(&session, true)]),
             refusal_frame(&session, "locked", refusal),
-            // And then the peer keeps listing the session, which is the other way
-            // a client could be tempted to ask again: on the row being present
-            // rather than on it having returned, or on the bit reading false
-            // rather than on it having fallen. Nothing has changed here, so
-            // nothing has answered differently, and a rule that reads presence
-            // instead of the transition spins against exactly this peer: a
-            // session held by a rival writer, listed throughout, on rows that
-            // say nothing about the hold.
-            // Distinguishable, so the assertion at the end can tell that both
-            // were folded. Identical lists would leave the premise satisfied by
-            // the leading one alone, and deleting these two, which is the whole
-            // pressure this test applies, would not fail anything.
             list_holding_at(&[(&session, false)], 1),
+            list_of(&[]),
             list_holding_at(&[(&session, false)], 2),
         ];
-        // The leading `list` is load-bearing and goes FIRST, before the refusal.
-        // The rule reads a transition against the rows it already holds, and a
-        // client that has folded no list yet holds none, so a first row arriving
-        // after a refusal is new information and legitimately does ask again.
-        // Without this frame the test would be measuring that instead.
-        let script = std::iter::once(list_of(&[&session]))
-            .chain(script)
-            .collect::<Vec<_>>();
         let peer = WarmPeer::start(script, Duration::from_millis(20)).await;
         redirect_to(&mut world, &peer, Duration::from_millis(400));
 
@@ -25704,110 +25793,6 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// A release reconstructed from one folded snapshot re-asks once, and the
-    /// generation it fired on cannot turn unchanged snapshots into a retry loop.
-    ///
-    /// The first stream never carries the hold's rise. Its baseline says free at
-    /// generation 6, then the gateway's opening list says free at 7 before the
-    /// spliced refusal names 7. No list follows that refusal. The current row is
-    /// therefore the only recovery evidence, since `list` frames may be
-    /// coalesced. The second stream
-    /// refuses again with 7 and keeps publishing that same released generation.
-    /// A client that does not consume the fire opens a third stream, then more,
-    /// one per list.
-    ///
-    /// Driven through the real connection loop and asserted at the peer. Folding
-    /// these frames into the directory by hand would prove the clause and not
-    /// that its re-attach obligation reaches the stream machinery, while reading
-    /// the client's bookkeeping would look right even if no request left it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_released_generation_rejoins_once_and_is_then_consumed() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-        let session = world.session().to_string();
-        let refusal = "another writer still claims this session";
-
-        let peer = WarmPeer::answering(
-            vec![
-                vec![
-                    // The last row received before hold 7. The rise at 7 was
-                    // superseded in the lossy queue and never reaches us.
-                    list_lock_at(&session, false, 6, 1),
-                    // A gateway opens with its latest merged list, then forwards
-                    // the spliced refusal. There is no post-refusal list.
-                    list_lock_at(&session, false, 7, 2),
-                    locked_refusal_at(&session, 7, refusal),
-                ],
-                vec![
-                    // A contradictory peer reuses the generation it just
-                    // published as free. Consumption is what bounds this case,
-                    // not the comparison against the refusal.
-                    locked_refusal_at(&session, 7, refusal),
-                    list_lock_at(&session, false, 7, 8),
-                    list_lock_at(&session, false, 7, 9),
-                    list_lock_at(&session, false, 7, 10),
-                ],
-            ],
-            Duration::from_millis(30),
-            After::Warm,
-        )
-        .await;
-        redirect_to(&mut world, &peer, Duration::from_millis(400));
-
-        let asked = Arc::clone(&peer.opens);
-        let chat = Rc::clone(&world.chat);
-        let (exit, settled_after_second) = crate::remote::tests::bounded(
-            "the release to rejoin once and consume its generation",
-            drive_until(&mut world, &shell, |writer| async move {
-                let settled_after_second = settled(Duration::from_secs(10), || {
-                    let refused_twice = notices_of(&chat.borrow())
-                        .iter()
-                        .filter(|text| text.as_str() == refusal)
-                        .count()
-                        >= 2;
-                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 2 && refused_twice)
-                        .then_some(())
-                })
-                .await;
-                if settled_after_second.is_some() {
-                    // Long enough for every repeated row above and several
-                    // heartbeats after it. A third open cannot hide behind the
-                    // loop ending as soon as the second refusal lands.
-                    tokio::time::sleep(Duration::from_millis(600)).await;
-                }
-                drop(writer);
-                settled_after_second
-            }),
-        )
-        .await;
-
-        assert!(matches!(exit, Ok(SessionExit::Quit)));
-        assert!(
-            settled_after_second.is_some(),
-            "the client did not re-attach on the released generation and fold \
-             the second refusal: {:?}",
-            main_notices(&world),
-        );
-        assert_eq!(
-            peer.opens(),
-            2,
-            "the peer served {} streams: one initial attach and one release are \
-             two, so any more is the consumed generation firing again",
-            peer.opens(),
-        );
-        assert!(
-            world.directory.rows().iter().any(|row| row.id == session
-                && !row.locked
-                && row.lock_generation == Some(7)
-                && row.last_seq == Some(10)),
-            "the client did not fold all repeated released snapshots, so the \
-             spin pressure this test claims to apply never reached it: {:?}",
-            world.directory.rows(),
-        );
-        remote.shutdown().await;
-    }
-
     /// A refused session re-attaches by itself when its row returns to the
     /// peer's list, with no gesture from the user.
     ///
@@ -25841,7 +25826,6 @@ mod tests {
                         epoch: None,
                         code: "unknown_session".to_string(),
                         message: "no host serves this session any more".to_string(),
-                        lock_generation: None,
                     })
                     .expect("an error frame"),
                     list_of(&[]),
@@ -25932,7 +25916,6 @@ mod tests {
                 epoch: None,
                 code: "unknown_session".to_string(),
                 message: "no host serves this session any more".to_string(),
-                lock_generation: None,
             })
             .expect("an error frame")
         };
@@ -25999,206 +25982,6 @@ mod tests {
                 .count(),
             1,
             "the replacement lost or duplicated the latest exact refusal: {rows:?}",
-        );
-        remote.shutdown().await;
-    }
-
-    /// A session a rival writer holds rejoins by itself when the rival lets go.
-    ///
-    /// The second edge, through the real loop. A held session's row stays on the
-    /// peer's list for as long as the hold lasts, so the absence edge this
-    /// client already had has nothing to fire on and the release is the only
-    /// thing that says the answer changed. It arrives as the row's `locked` bit
-    /// going false. Without this the client stops asking and
-    /// never starts, and the rival letting go is invisible to it forever.
-    ///
-    /// Asserted at the peer, because the claim is that the client asks again on
-    /// its own and the discharge path folds no notice: the transcript of a
-    /// client that rejoined reads exactly like the transcript of one that gave
-    /// up.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_locked_session_rejoins_when_the_rival_lets_go() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-        let session = world.session().to_string();
-        let epoch = "epoch-released";
-
-        let peer = WarmPeer::answering(
-            vec![
-                vec![
-                    // The rival's hold, published on the row and answered on the
-                    // attach with the code that names it. The row goes first, so
-                    // the fall below is a transition and not a first sighting.
-                    list_holding(&[(&session, true)]),
-                    refusal_frame(&session, "locked", "held by another writer"),
-                    // The rival lets go. The row never left the list, so this one
-                    // bit is the whole of what changed.
-                    list_holding(&[(&session, false)]),
-                ],
-                // The second attach is served, which is the rejoin.
-                vec![
-                    block_opening(&session, epoch),
-                    block_end(&session, epoch, 0),
-                ],
-            ],
-            Duration::from_millis(30),
-            After::Warm,
-        )
-        .await;
-        redirect_to(&mut world, &peer, Duration::from_millis(400));
-
-        let asked = Arc::clone(&peer.opens);
-        let (exit, rejoined) = crate::remote::tests::bounded(
-            "the client to rejoin its session when the hold ends",
-            drive_until(&mut world, &shell, |writer| async move {
-                // No keystroke anywhere in here on purpose: the writer is only
-                // dropped, to end the loop once the rejoin has happened.
-                let rejoined = settled(Duration::from_secs(10), || {
-                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 2).then_some(())
-                })
-                .await;
-                if rejoined.is_some() {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                }
-                drop(writer);
-                rejoined
-            }),
-        )
-        .await;
-
-        assert!(matches!(exit, Ok(SessionExit::Quit)));
-        // The premise before the claim: this was a locked refusal that the
-        // client waited out, not some other way of losing an attachment.
-        let notices = main_notices(&world);
-        assert!(
-            notices.iter().any(|text| text == "held by another writer"),
-            "the client never withheld the session as held by a rival, so \
-             nothing here was waiting on the bit: {notices:?}",
-        );
-        assert!(
-            rejoined.is_some(),
-            "the client did not re-attach: either the rival's hold never \
-             reached it, leaving the release with no true to fall from, or it \
-             did and the fall did not ask again. The peer sent the hold first \
-             on the same stream, so the second is the likelier: {notices:?}",
-        );
-        assert_eq!(
-            peer.opens(),
-            2,
-            "the peer served {} streams: the rejoin is a second attach, and \
-             any more than two is a client asking on something other than the \
-             edge",
-            peer.opens(),
-        );
-        assert!(
-            world.client().holds_attachment(),
-            "the client is following its session again",
-        );
-        assert!(
-            !world.directory.needs_reattach(),
-            "and owes nothing further",
-        );
-        remote.shutdown().await;
-    }
-
-    /// The bit's fall is read against the rows the client already held, so an
-    /// edge that spans a lost connection still fires.
-    ///
-    /// Both edges are transitions between the rows one folded list replaces and
-    /// the next, never a live watch, and losing a stream replaces no
-    /// rows. So a hold that ended while the client was away is seen at the first
-    /// list after it comes back. A client that rebuilt its baseline on
-    /// reconnect, or that armed the edge from the rows on the connection the
-    /// refusal arrived on, would have nothing to compare this fall against.
-    ///
-    /// The hold is folded before the redirect, which is the disconnect: the
-    /// peer's very first list carries the release, so the only true the client
-    /// can measure against is the one it kept.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_locked_edge_reads_across_a_lost_connection() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-        let session = world.session().to_string();
-        let epoch = "epoch-released-while-away";
-
-        let held = aj_wire::Frame::List {
-            sessions: vec![aj_wire::SessionSummary {
-                locked: true,
-                ..listed_row(&session)
-            }],
-            hosts: Vec::new(),
-        };
-        let _ = world
-            .directory
-            .apply(&mut world.chat.borrow_mut(), held.clone());
-        assert!(
-            world
-                .directory
-                .rows()
-                .iter()
-                .any(|row| row.id == session && row.locked),
-            "the baseline this test spans a disconnect with was never folded, \
-             so the release below has no true to fall from. This assertion and \
-             the seeding above are one unit: without them the client holds no \
-             rows, the peer's first list is an absent-then-present edge, and \
-             every assertion below passes having measured the other edge",
-        );
-
-        let peer = WarmPeer::answering(
-            vec![
-                vec![
-                    // A new connection, and the rival still had the session when
-                    // this attach reached the peer.
-                    refusal_frame(&session, "locked", "held by another writer"),
-                    // The first list this connection carries already says the
-                    // hold is over. Nothing on this stream ever said it was on.
-                    list_holding(&[(&session, false)]),
-                ],
-                vec![
-                    block_opening(&session, epoch),
-                    block_end(&session, epoch, 0),
-                ],
-            ],
-            Duration::from_millis(30),
-            After::Warm,
-        )
-        .await;
-        redirect_to(&mut world, &peer, Duration::from_millis(400));
-
-        let asked = Arc::clone(&peer.opens);
-        let (exit, rejoined) = crate::remote::tests::bounded(
-            "the client to rejoin on a hold that ended while it was away",
-            drive_until(&mut world, &shell, |writer| async move {
-                let rejoined = settled(Duration::from_secs(10), || {
-                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 2).then_some(())
-                })
-                .await;
-                if rejoined.is_some() {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                }
-                drop(writer);
-                rejoined
-            }),
-        )
-        .await;
-
-        assert!(matches!(exit, Ok(SessionExit::Quit)));
-        let notices = main_notices(&world);
-        assert!(
-            notices.iter().any(|text| text == "held by another writer"),
-            "the client never withheld the session as held by a rival, so \
-             nothing here was waiting on the bit: {notices:?}",
-        );
-        assert!(
-            rejoined.is_some(),
-            "the release landed on the connection after the one that carried \
-             the hold, and the client did not read it: {notices:?}",
-        );
-        assert!(
-            world.client().holds_attachment(),
-            "the client is following its session again",
         );
         remote.shutdown().await;
     }

@@ -1,9 +1,9 @@
 //! The session-selector overlay: resume a previous session in place.
 //!
 //! A [`FilterableSelect`] over the sessions available to this frontend.
-//! Confirming a row parks a [`SessionRequest::Resume`] for the host, which
-//! tears the current session down and rebuilds onto the chosen one. Choosing
-//! the session already active is a no-op close, and Esc cancels.
+//! Confirming any session row parks a [`SessionRequest::Resume`] and closes
+//! the overlay. The frontend treats the current session as a no-op unless
+//! retrying a refused attachment. Esc cancels without a request.
 //!
 //! A local selector fills progressively from a preview scan run off the drive
 //! loop. A selector over a connection is built synchronously from the merged
@@ -65,8 +65,7 @@ const TAG_SCOPE_SIGIL: char = '#';
 /// side; the spawned scan produces only the (Send) previews.
 pub(crate) struct SessionScan {
     pub(crate) select: Rc<RefCell<FilterableSelect>>,
-    /// The active session id, for the `(current)` tag, the pre-selection,
-    /// and the no-op-on-current confirm check.
+    /// The active session id, for the `(current)` tag and pre-selection.
     current: String,
     /// filter_key -> session_id, filled by [`extend_session_scan`] and read
     /// by the confirm callback (which sees only the row's filter key).
@@ -132,10 +131,10 @@ struct OpenedSelector {
 }
 
 /// Open the session selector, showing a loading placeholder and parking a
-/// scan for the host in `handles.session_scan`. A confirmed non-current row
-/// lands a [`SessionRequest::Resume`] in `handles.session_request`; the
-/// current row (or Esc) just closes. Does not move focus: the caller posts
-/// the refocus event.
+/// scan for the host in `handles.session_scan`. Any confirmed session row
+/// lands a [`SessionRequest::Resume`] in `handles.session_request` and closes
+/// the overlay. Esc closes without a request. Does not move focus: the caller
+/// posts the refocus event.
 ///
 /// A switch is never refused for being busy. The session left behind stays
 /// attached and keeps folding, so its turn finishes unwatched.
@@ -203,7 +202,6 @@ fn push_session_selector(
         sel.set_show_scrollbar(true);
         sel.set_scope_sigil(TAG_SCOPE_SIGIL);
         let ids_c = Rc::clone(&ids);
-        let current_c = current.clone();
         let request_c = Rc::clone(&handles.session_request);
         let stack_c = Rc::clone(&handles.stack);
         let editor_c = Rc::clone(&handles.editor);
@@ -213,11 +211,8 @@ fn push_session_selector(
             let Some(session_id) = ids_c.borrow().get(&item.filter_key).cloned() else {
                 return;
             };
-            // Choosing the active session changes nothing, so just close.
-            if session_id == current_c {
-                close_all(&stack_c, ctx, &editor_c);
-                return;
-            }
+            // The frontend decides whether selecting the current session is a
+            // no-op or an explicit retry of a refused attachment.
             *request_c.borrow_mut() = Some(SessionRequest::Resume(session_id));
             // A confirmed pick is terminal: tear the whole stack down
             // (palette included) back to the transcript. Cancel below uses
@@ -685,7 +680,6 @@ mod tests {
             unreachable: false,
             archived: false,
             locked: false,
-            lock_generation: None,
         }
     }
 
@@ -698,39 +692,16 @@ mod tests {
         }
     }
 
-    fn scan_over(
-        previews: Vec<SessionPreview>,
-        current: &str,
-    ) -> (SessionScan, Rc<RefCell<Option<SessionRequest>>>) {
-        let select = Rc::new(RefCell::new(FilterableSelect::new(
-            loading_items(),
-            SelectStyles::default(),
-        )));
-        let ids = Rc::new(RefCell::new(HashMap::new()));
-        let request_slot: Rc<RefCell<Option<SessionRequest>>> = Rc::new(RefCell::new(None));
-        {
-            let mut sel = select.borrow_mut();
-            let ids_c = Rc::clone(&ids);
-            let current_c = current.to_string();
-            let request_c = Rc::clone(&request_slot);
-            sel.on_confirm = Some(Box::new(move |_ctx, item| {
-                let Some(session_id) = ids_c.borrow().get(&item.filter_key).cloned() else {
-                    return;
-                };
-                if session_id != current_c {
-                    *request_c.borrow_mut() = Some(SessionRequest::Resume(session_id));
-                }
-            }));
-        }
-        let scan = SessionScan {
-            select,
-            current: current.to_string(),
-            ids,
-            seen: Rc::new(RefCell::new(Vec::new())),
-            reveal: Rc::new(Cell::new(false)),
-        };
+    fn scan_over(previews: Vec<SessionPreview>, current: &str) -> (SessionScan, OverlayHandles) {
+        let handles = OverlayHandles::for_tests();
+        open_session_selector(&handles, current.to_string());
+        let scan = handles
+            .session_scan
+            .borrow_mut()
+            .take()
+            .expect("open parked a scan");
         extend_session_scan(&scan, &previews, Utc::now(), true, true);
-        (scan, request_slot)
+        (scan, handles)
     }
 
     #[test]
@@ -946,7 +917,7 @@ mod tests {
             preview("2025-05-10", Some("newest"), 1, Duration::minutes(1)),
             preview("2025-05-09", Some("older"), 1, Duration::hours(1)),
         ];
-        let (scan, request) = scan_over(previews, "2025-05-09");
+        let (scan, handles) = scan_over(previews, "2025-05-09");
         // The current row (older) is pre-selected; move down onto the
         // first row and confirm it.
         scan.select
@@ -959,22 +930,29 @@ mod tests {
             cb(&mut ctx, &picked);
         }
         assert!(
-            matches!(request.borrow().as_ref(), Some(SessionRequest::Resume(id)) if id == "2025-05-10"),
+            matches!(handles.session_request.borrow().as_ref(), Some(SessionRequest::Resume(id)) if id == "2025-05-10"),
             "parked a resume for the picked id: {:?}",
-            request.borrow().as_ref().map(|_| ()),
+            handles.session_request.borrow().as_ref().map(|_| ()),
         );
     }
 
     #[test]
-    fn confirming_the_current_row_parks_nothing() {
+    fn confirming_the_current_row_parks_resume_and_closes() {
         let previews = vec![preview("2025-05-09", Some("only"), 1, Duration::hours(1))];
-        let (scan, request) = scan_over(previews, "2025-05-09");
+        let (scan, handles) = scan_over(previews, "2025-05-09");
         let picked = scan.select.borrow().selected().expect("a row is selected");
         if let Some(cb) = scan.select.borrow_mut().on_confirm.as_mut() {
             let mut ctx = vaxis::vxfw::EventContext::new();
             cb(&mut ctx, &picked);
         }
-        assert!(request.borrow().is_none(), "the current row is a no-op");
+        assert!(
+            matches!(handles.session_request.borrow().as_ref(), Some(SessionRequest::Resume(id)) if id == "2025-05-09"),
+            "the frontend decides whether the current row is a no-op or retry",
+        );
+        assert!(
+            !handles.stack.borrow().is_open(),
+            "confirm closes the overlay"
+        );
     }
 
     /// Drive the REAL confirm closure `open_session_selector` builds, over a

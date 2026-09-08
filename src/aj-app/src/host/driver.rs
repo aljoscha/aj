@@ -1148,7 +1148,6 @@ impl Driver {
             epoch: Some(epoch),
             code: PERSISTENCE_FAILED_CODE.to_string(),
             message: persistence_failure_message(&failure),
-            lock_generation: None,
         });
         self.shared.fanout.detach_all(self.session.id());
         self.wind_down().await;

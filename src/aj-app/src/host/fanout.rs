@@ -576,7 +576,6 @@ mod tests {
             epoch: None,
             code: code.to_string(),
             message: format!("no {code} here"),
-            lock_generation: None,
         }
     }
 
@@ -663,7 +662,6 @@ mod tests {
             unreachable: false,
             archived: false,
             locked: false,
-            lock_generation: None,
         }]
     }
 

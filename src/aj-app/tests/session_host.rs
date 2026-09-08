@@ -1809,10 +1809,6 @@ async fn a_crashed_rivals_hold_falls_away_on_its_own() {
         "the refusal did not publish the rival's hold, so the fall below would \
          be from a bit that was never set",
     );
-    let generation = held
-        .lock_generation
-        .expect("the refusal did not publish its acquire generation");
-
     // The rival dies without releasing. The record it wrote stays behind, which
     // is what makes this a crash rather than a release.
     rival.crash();
@@ -1833,15 +1829,9 @@ async fn a_crashed_rivals_hold_falls_away_on_its_own() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let released = released.expect(
+    released.expect(
         "a crashed rival's hold is published forever: nothing tells this host \
          the lock was freed, so only a probe can find out",
-    );
-    assert_eq!(
-        released.lock_generation,
-        Some(generation),
-        "the probe cleared the generation with the bit, so a client that missed \
-         the rise cannot derive this release from the latest row",
     );
     host.host.shutdown().await;
 }
@@ -1904,125 +1894,6 @@ async fn a_rival_writers_hold_reaches_the_row() {
     let taken = row(host.host.sessions().await.expect("sessions"));
     assert!(taken.live, "the attach must have materialized the session");
     assert!(!taken.locked, "a session this host now holds reads locked");
-    drop(served);
-    host.host.shutdown().await;
-}
-
-/// Every host acquire advances one session's generation and publishes the exact
-/// post-increment value on both wire surfaces.
-///
-/// Driven through real flocks and real attach streams. Reading the cache would
-/// prove the bookkeeping in isolation and not that the row and refusal a client
-/// receives agree. The second refusal leaves the same rival hold in place, then
-/// the release and a successful acquire pin which operations advance.
-#[tokio::test]
-async fn host_acquires_advance_the_row_and_refusal_generation_together() {
-    let harness = Harness::new(vec![finalized_text_message("on the record")]);
-    let session = harness.create().await;
-    let mut writer = Client::attach(&harness.host, &session).await;
-    harness.prompt(&session, "hi").await;
-    writer.pump_until_idle().await;
-    drop(writer);
-    harness.host.shutdown().await;
-
-    let row = |list: aj_wire::SessionList| {
-        list.sessions
-            .into_iter()
-            .find(|row| row.id == session)
-            .expect("the session is in the directory")
-    };
-    let refusal_generation = |frames: &[Frame]| {
-        let Some(Frame::Error {
-            code,
-            message,
-            lock_generation,
-            ..
-        }) = frames.last()
-        else {
-            panic!("a locked session is refused on the stream: {frames:?}");
-        };
-        assert_eq!(code, "locked", "{message}");
-        lock_generation.expect("a locked refusal names its acquire generation")
-    };
-
-    let first_hold = SessionLock::try_acquire(&harness.persistence, &session, "first-rival-writer")
-        .expect("try_acquire")
-        .expect("the first rival takes the free lock");
-    let host = harness.revive(vec![finalized_text_message("after the lock")]);
-    let mut first_attach = host
-        .host
-        .attach(&[attach_request(&session)])
-        .await
-        .expect("the stream opens");
-    let first_refusal = frames_until(&mut first_attach, "the first refusal", |frame| {
-        matches!(frame, Frame::Error { .. })
-    })
-    .await;
-    let first_generation = refusal_generation(&first_refusal);
-    let first_row = row(host.host.published_directory().await);
-    assert!(first_row.locked, "the row does not report the first hold");
-    assert_eq!(
-        first_row.lock_generation,
-        Some(first_generation),
-        "the row and refusal name different acquire generations",
-    );
-
-    // The same rival still holds the lock. A re-refusal is another host acquire,
-    // so it advances and the refusal captures that exact post-increment value.
-    let mut second_attach = host
-        .host
-        .attach(&[attach_request(&session)])
-        .await
-        .expect("the stream opens");
-    let second_refusal = frames_until(&mut second_attach, "the repeated refusal", |frame| {
-        matches!(frame, Frame::Error { .. })
-    })
-    .await;
-    let second_generation = refusal_generation(&second_refusal);
-    assert_eq!(
-        second_generation,
-        first_generation + 1,
-        "a repeated refusal while the same rival hold remained did not advance",
-    );
-    let second_row = row(host.host.published_directory().await);
-    assert!(
-        second_row.locked,
-        "the row stopped reporting the rival hold"
-    );
-    assert_eq!(
-        second_row.lock_generation,
-        Some(second_generation),
-        "the row and repeated refusal carry different generations",
-    );
-
-    // A release only lowers the bit. Its row retains the repeated refusal's
-    // generation, which is the latest snapshot a refused client compares.
-    drop(first_hold);
-    let released = row(host.host.sessions().await.expect("sessions"));
-    assert!(!released.locked, "the released row still claims the hold");
-    assert_eq!(
-        released.lock_generation,
-        Some(second_generation),
-        "the release advanced or discarded the latest refusal's generation",
-    );
-
-    // This host now wins the lock. A successful acquire advances before its
-    // free live row is published.
-    let served = Client::attach(&host.host, &session).await;
-    let acquired = row(host.host.published_directory().await);
-    assert!(
-        acquired.live,
-        "the successful attach did not materialize the session"
-    );
-    assert!(
-        !acquired.locked,
-        "the host published its own hold as a rival's"
-    );
-    assert_eq!(
-        acquired.lock_generation,
-        Some(second_generation + 1),
-        "a successful host acquire did not advance before publishing its row",
-    );
     drop(served);
     host.host.shutdown().await;
 }

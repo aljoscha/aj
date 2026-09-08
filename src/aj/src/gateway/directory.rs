@@ -1219,7 +1219,6 @@ mod tests {
             unreachable: false,
             archived: false,
             locked: false,
-            lock_generation: Some(7),
         })
         .expect("a row is an object");
         raw.set("preview", &format!("what {id} was doing"))
@@ -1279,11 +1278,6 @@ mod tests {
         assert_eq!(sessions[0].0.host.as_deref(), Some("left"));
         assert_eq!(sessions[1].0.host.as_deref(), Some("right"));
         assert!(sessions.iter().all(|(row, _)| !row.unreachable));
-        assert_eq!(
-            sessions[0].0.lock_generation,
-            Some(7),
-            "the gateway rewrote a field the host owns",
-        );
         assert_eq!(
             sessions[0].0.last_seq,
             Some(2),

@@ -153,7 +153,9 @@ impl StatusLine {
         match status.connection {
             Connection::Reconnecting => return "Connecting…".to_string(),
             Connection::CatchingUp => return "Catching up…".to_string(),
-            Connection::Refused => return "The selected session refused the attach.".to_string(),
+            Connection::Refused => {
+                return "Attach refused. Select this session again to retry.".to_string();
+            }
             Connection::Stalled => return "The selected session's attach stalled.".to_string(),
             Connection::Connected => {}
         }
@@ -335,7 +337,7 @@ mod tests {
             (Connection::CatchingUp, " ⠋ Catching up…"),
             (
                 Connection::Refused,
-                " × The selected session refused the attach.",
+                " × Attach refused. Select this session again to retry.",
             ),
             (
                 Connection::Stalled,

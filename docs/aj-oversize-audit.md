@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 11 LOOKs.
+retired 13 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 16 open)
+## LOOK (27 total, 14 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -44,8 +44,8 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`09f7dac` 2026-08-19 aj: close the review findings on the loop-folded catch-up~~ Retired: production recovery retained. The test helper no longer records its own connection-state assignments as evidence of screen behavior. Fresh-client convergence coverage remains.
 - ~~`39920f0` 2026-08-26 aj-session,aj-app,aj: break session usage down by provider and model~~ Retired without code changes: the requested account attribution is wired, and the single-pass aggregation and digest rows are proportionate to the feature.
 - ~~`9fd4f0c` 2026-08-26 aj-app,aj: bound host shutdown and escalate stop signals~~ Retired: one process-level grace owns forced exit. The host joins graceful cleanup without staged cutoffs or a parallel stop registry.
-- `b1e4ba9` 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows
-- `e6d94fc` 2026-08-26 aj-wire,aj-app,aj,docs: harden lock generation recovery
+- ~~`b1e4ba9` 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows~~ Retired: locked refusals wait for explicit selection to retry. Automatic lock-release recovery and wire generations are removed.
+- ~~`e6d94fc` 2026-08-26 aj-wire,aj-app,aj,docs: harden lock generation recovery~~ Retired: locked refusals wait for explicit selection to retry. Automatic lock-release recovery and wire generations are removed.
 - `a0badb0` 2026-08-28 aj-app,aj: close remaining shutdown races
 - `434fd05` 2026-08-28 aj-app: own complete session teardown
 - `532aaab` 2026-08-28 aj-session,aj-app: resolve session environment gate findings
@@ -199,19 +199,16 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: Staged cutoff machinery and tests of exact timing phases. The initial audit's proposed `timeout(join_all)` replacement missed map contention and the distinction between driver abortion and complete writer cleanup. The related shutdown commits landed together as one reviewed range, not as successive deployed redesigns.
 - Disposition: Put abandonment at process exit, not at successful library return. Keep cancellation-safe shared teardown, attachment completion semantics, and session ownership barriers. Tests observe pending cleanup and lock retention until held work is released, actual host-drop process cleanup, and process-level graceful, deadline, and second-signal exits.
 
-### b1e4ba9 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows
-- Stats: 16 files, +1016 -72, ~350 prod / ~670 test lines
-- Body: empty
-- Verdict: LOOK
-- Why: Adds a wire-protocol field `lock_generation` to both `SessionSummary` and `Frame::Error`, a wall-clock-seeded per-session counter in the host store (`lock_seed`, `generations: HashMap`, `set_locked` minting rules), a `>=` comparison clause in the client making three re-ask edges, spec changes disclosing clock-regression as a new failure corner, and a rework of fanout dedup semantics (queue admission vs delivered). All of this to cover a `list` coalescing race that c94f2d9 introduced the day before. Gateway splice has to relay and preserve ordering for the new field. e6d94fc re-hardens the minting rules the same day.
-- Simpler shape: the refusal itself is evidence the bit was true, so a locked refusal can treat any later row with `locked: false` for that session as the fall, no generation needed on the wire.
+### b1e4ba9 2026-08-26 aj-wire,aj-app,aj,docs: recover locked refusals from latest rows [RETIRED]
+- Status: Retired after simplifying the behavior. A locked refusal keeps the session selected and its cached transcript available, with guidance to select it again to retry. Locked sessions are omitted from automatic stream reopens. Other refusal and connection recovery remain intact.
+- Stats: 16 files, +1016 -72, ~350 prod / ~670 test lines at audit time.
+- Why flagged: Cross-layer generation bookkeeping for automatic recovery despite coalesced directory updates. A bare unlocked row cannot safely replace the generation comparison because arrival order does not establish observation freshness.
+- Disposition: Remove automatic lock-release recovery, wire generations, host generation minting, client consumption history, and their tests. Keep advisory lock rows, raw gateway forwarding, and the queue's latest-snapshot behavior. The fanout comparison and gateway opening order were documented and tested, not newly implemented in this range.
 
-### e6d94fc 2026-08-26 aj-wire,aj-app,aj,docs: harden lock generation recovery
-- Stats: 11 files, +636 -230, ~200 prod / ~440 test lines
-- Body: empty
-- Verdict: LOOK
-- Why: Same-day fix-up of b1e4ba9: `set_locked` splits into `acquired` and `observed` with different minting rules, `note_locked` becomes `note_acquire`/`note_unlocked`, a `LockState` struct appears, the spec gains a paragraph on which of three sources may increment, plus a new gateway ordering constraint (merged list before spliced refusal). `the_lock_seed_comes_from_unix_milliseconds` pins the seed's clock source. Three commits in two days on one recovery edge is the signal.
-- Simpler shape: see b1e4ba9; if generations stay, one writer function with one rule.
+### e6d94fc 2026-08-26 aj-wire,aj-app,aj,docs: harden lock generation recovery [RETIRED]
+- Status: Retired with the explicit-retry simplification above. This was the review-fix commit of the same range, not a separate deployed redesign.
+- Stats: 11 files, +636 -230, ~200 prod / ~440 test lines at audit time.
+- Disposition: Remove generation-specific hardening and retain the host's private stale-enumeration protection for advisory lock rows. Verification covers a settled refusal, an explicit retry that is refused again, a successful retry after release, and continued operation of other sessions.
 
 ### a0badb0 2026-08-28 aj-app,aj: close remaining shutdown races
 - Stats: 9 files, +469 -95, ~135 prod / ~335 test lines

@@ -241,7 +241,6 @@ fn snapshots_drop_but_durable_reliable_and_unknown_frames_evict() {
             epoch: None,
             code: "unknown_session".into(),
             message: "no session here".into(),
-            lock_generation: None,
         },
         serde_json::from_value(json!({
             "kind": "event", "session": "s", "epoch": "e",
