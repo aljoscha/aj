@@ -24,6 +24,7 @@
 
 use std::cell::RefCell;
 
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Bonus added to the raw nucleo score when query and text are equal
@@ -42,7 +43,6 @@ const EXACT_MATCH_BONUS: u16 = 100;
 pub struct FuzzyMatcher {
     inner: Matcher,
     haystack_buf: Vec<char>,
-    needle_buf: Vec<char>,
 }
 
 impl FuzzyMatcher {
@@ -51,7 +51,6 @@ impl FuzzyMatcher {
         Self {
             inner: Matcher::new(Config::DEFAULT),
             haystack_buf: Vec::new(),
-            needle_buf: Vec::new(),
         }
     }
 
@@ -72,10 +71,17 @@ impl FuzzyMatcher {
     /// `u16::MAX` scores.
     pub fn score(&mut self, query: &str, text: &str) -> Option<u16> {
         self.haystack_buf.clear();
-        self.needle_buf.clear();
         let haystack = Utf32Str::new(text, &mut self.haystack_buf);
-        let needle = Utf32Str::new(query, &mut self.needle_buf);
-        let base = self.inner.fuzzy_match(haystack, needle)?;
+        // Atom handles the case folding and normalization required by Matcher.
+        // Use a literal atom so punctuation and whitespace remain query text.
+        let needle = Atom::new(
+            query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+            false,
+        );
+        let base = needle.score(haystack, &mut self.inner)?;
         let bonus = if query.eq_ignore_ascii_case(text) {
             EXACT_MATCH_BONUS
         } else {
@@ -225,6 +231,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn score_is_case_insensitive_for_gapped_matches() {
+        let mut m = FuzzyMatcher::new();
+        for (query, text) in [("AB", "AxxB"), ("ÄB", "ÄxxB")] {
+            let lowercase = m.score(&query.to_lowercase(), text).expect("matches");
+            assert_eq!(m.score(query, text), Some(lowercase));
+        }
+    }
+
+    #[test]
+    fn score_treats_pattern_syntax_and_whitespace_literally() {
+        let mut m = FuzzyMatcher::new();
+        for query in ["^ab", "ab$", "!ab", "'ab", "a b", r"a\ b"] {
+            assert!(m.score(query, query).is_some(), "{query:?}");
+            assert_eq!(m.score(query, "xxabxx"), None, "{query:?}");
+        }
+    }
 
     #[test]
     fn score_fields_rejects_token_spanning_two_fields() {
