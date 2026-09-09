@@ -36,7 +36,6 @@ const EVENT_TYPES: &[&str] = &[
     "error",
     "stream_retry",
     "usage_update",
-    "compaction_usage_update",
     "compaction_start",
     "compaction_progress",
     "compaction_end",
@@ -55,8 +54,8 @@ const FRAME_KINDS: &[&str] = &[
 ];
 
 #[test]
-fn strict_commands_are_protocol_generation_two() {
-    assert_eq!(PROTOCOL_VERSION, 2);
+fn committed_compaction_usage_is_protocol_generation_three() {
+    assert_eq!(PROTOCOL_VERSION, 3);
 }
 
 /// Frames in the shapes that make the session reader's and the rewrite's rules
@@ -724,6 +723,25 @@ fn every_agent_event_has_a_pinned_round_trip_fixture() {
         assert!(matches!(decoded, DecodedAgentEvent::Known(_)));
         assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
     }
+}
+
+#[test]
+fn compaction_end_without_usage_preserves_unknown_spend() {
+    let expected = json!({
+        "type": "compaction_end",
+        "agent_id": "main",
+        "reason": "manual",
+        "tokens_before": 1000,
+        "tokens_after": 250,
+        "summary": "summary"
+    });
+    let event: AgentEvent = serde_json::from_value(expected.clone()).unwrap();
+    assert!(matches!(
+        event,
+        AgentEvent::CompactionEnd { usage: None, .. }
+    ));
+    assert_eq!(serde_json::to_value(event).unwrap(), expected);
+    assert_round_trip::<DecodedAgentEvent>(&expected);
 }
 
 #[test]
@@ -2642,7 +2660,6 @@ fn agent_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::Error { .. } => "error",
         AgentEvent::StreamRetry { .. } => "stream_retry",
         AgentEvent::UsageUpdate { .. } => "usage_update",
-        AgentEvent::CompactionUsageUpdate { .. } => "compaction_usage_update",
         AgentEvent::CompactionStart { .. } => "compaction_start",
         AgentEvent::CompactionProgress { .. } => "compaction_progress",
         AgentEvent::CompactionEnd { .. } => "compaction_end",

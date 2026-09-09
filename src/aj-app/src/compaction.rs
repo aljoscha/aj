@@ -208,19 +208,14 @@ pub async fn run_compaction(
         let after = planning::estimate_conversation_context(&conversation).tokens;
         agent.reseed_transcript(messages);
 
-        let checkpoint_id = checkpoint.id.clone();
         let _handoff_guard = handoff.file(checkpoint);
-        // The pair happens under the guard on purpose: a durable append landing
-        // between the checkpoint, its CompactionEnd, and its usage would make
-        // the forwarded seqs non-monotone. EventBus delivers the pair to one
-        // stable listener cohort, and the usage event carries `checkpoint_id`
-        // so attach filtering can safely retain it on its own. A listener must
-        // not take the log lock for either event.
+        // Keep publication under the log guard so a concurrent append cannot
+        // forward a higher sequence before this checkpoint. Listeners must not
+        // take the log lock for CompactionEnd.
         if let Err(err) = agent
             .account_usage(
                 &summarizer_usage,
                 UsageAccounting::CommittedCompaction {
-                    checkpoint_id,
                     reason,
                     tokens_before: plan.tokens_before,
                     tokens_after: after,
@@ -229,7 +224,7 @@ pub async fn run_compaction(
             )
             .await
         {
-            tracing::warn!("failed to emit committed compaction events: {err}");
+            tracing::warn!("failed to emit committed compaction: {err}");
         }
         after
     };
@@ -354,7 +349,7 @@ async fn finish_failed(
             reason,
             tokens_before,
             tokens_after: 0,
-            has_usage: false,
+            usage: None,
             summary: None,
             error: Some(error.clone()),
         })
@@ -380,7 +375,7 @@ async fn finish_canceled(
             reason,
             tokens_before,
             tokens_after: 0,
-            has_usage: false,
+            usage: None,
             summary: None,
             error: None,
         })
@@ -739,7 +734,7 @@ mod tests {
             let hold = matches!(
                 event,
                 AgentEvent::CompactionEnd {
-                    has_usage: true,
+                    usage: Some(_),
                     summary: Some(_),
                     ..
                 }
@@ -813,7 +808,7 @@ mod tests {
                 reason: CompactionReason::Threshold,
                 tokens_before: 100,
                 tokens_after: 100,
-                has_usage: false,
+                usage: None,
                 summary: None,
                 error: Some("later failure".into()),
             })

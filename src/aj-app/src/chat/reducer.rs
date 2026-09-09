@@ -344,18 +344,6 @@ pub fn reduce(
             upsert_usage_row(state, agent_id, usage, source_entry);
             Redraw(true)
         }
-        AgentEvent::CompactionUsageUpdate {
-            agent_id,
-            checkpoint_id,
-            usage,
-        } => {
-            // Checkpoint spend owns its identity and never describes model
-            // context occupancy. This stays idempotent when attach filtering
-            // drops a duplicate CompactionEnd but retains this update.
-            upsert_usage_row(state, agent_id, usage, durable_id(&checkpoint_id));
-            Redraw(true)
-        }
-
         // ---- Compaction lifecycle ----------------------------------------------
         //
         // Compaction is host-orchestrated and does not bracket itself
@@ -379,6 +367,7 @@ pub fn reduce(
             tokens_after,
             summary,
             error,
+            usage,
             ..
         } => {
             lifecycle.clear_compacting(agent_id);
@@ -428,9 +417,10 @@ pub fn reduce(
                         );
                     }
                 }
-                // Refresh occupancy directly to the post-compaction estimate.
-                // The following CompactionUsageUpdate accounts summarizer
-                // spend and is deliberately ignored by the occupancy fold above.
+                if let Some(usage) = usage {
+                    upsert_usage_row(state, agent_id, usage, entry.cloned());
+                }
+                // Summarizer spend does not describe the retained model context.
                 state.footers.set_context_tokens(agent_id, tokens_after);
             } else {
                 record_notice(
@@ -3060,7 +3050,7 @@ mod tests {
                 reason: CompactionReason::Manual,
                 tokens_before: 1_200,
                 tokens_after: 300,
-                has_usage: true,
+                usage: Some(token_usage([900, 50, 20, 30])),
                 summary: Some("did stuff".into()),
                 error: None,
             },
@@ -3076,97 +3066,11 @@ mod tests {
             }
             other => panic!("unexpected kind: {other:?}"),
         }
-        let _ = reduce(
-            &mut s,
-            &mut life,
-            AgentEvent::CompactionUsageUpdate {
-                agent_id: AgentId::Main,
-                checkpoint_id: checkpoint.clone(),
-                usage: token_usage([900, 50, 20, 30]),
-            },
-            None,
-        );
         let usage = usage_rows(&s, AgentId::Main);
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].source_entry.as_deref(), Some("checkpoint"));
         // The summarizer's prompt is spend, not the model's retained context.
         assert_eq!(s.footers().context_usage(AgentId::Main).tokens, Some(300));
-    }
-
-    #[test]
-    fn duplicate_compaction_usage_without_its_end_keeps_later_assistant_usage() {
-        let mut s = state();
-        let mut life = AgentLifecycle::default();
-        let checkpoint = "checkpoint".to_string();
-        let _ = reduce(
-            &mut s,
-            &mut life,
-            AgentEvent::CompactionEnd {
-                agent_id: AgentId::Main,
-                reason: CompactionReason::Manual,
-                tokens_before: 1_200,
-                tokens_after: 300,
-                has_usage: true,
-                summary: Some("summary".into()),
-                error: None,
-            },
-            Some(&checkpoint),
-        );
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::CompactionUsageUpdate {
-                agent_id: AgentId::Main,
-                checkpoint_id: checkpoint.clone(),
-                usage: token_usage([1_000, 100, 0, 0]),
-            },
-        );
-
-        apply(
-            &mut s,
-            &mut life,
-            with_id(assistant_message_end(text_partial("later")), "assistant"),
-        );
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::UsageUpdate {
-                agent_id: AgentId::Main,
-                usage: token_usage([10, 1, 0, 70]),
-            },
-        );
-        let occupancy = s.footers().context_usage(AgentId::Main);
-
-        // Attach filtering may remove the duplicate durable CompactionEnd while
-        // retaining its transient usage event after a later assistant pair.
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::CompactionUsageUpdate {
-                agent_id: AgentId::Main,
-                checkpoint_id: checkpoint,
-                usage: token_usage([1_000, 100, 0, 0]),
-            },
-        );
-
-        let rows = usage_rows(&s, AgentId::Main);
-        assert_eq!(rows.len(), 2, "one row per durable source");
-        let assistant = rows
-            .iter()
-            .find(|row| row.source_entry.as_deref() == Some("assistant"))
-            .expect("assistant usage row");
-        assert_eq!(assistant.usage.turn_input, 10);
-        assert_eq!(assistant.usage.turn_cache_read, 70);
-        let checkpoint = rows
-            .iter()
-            .find(|row| row.source_entry.as_deref() == Some("checkpoint"))
-            .expect("checkpoint usage row");
-        assert_eq!(checkpoint.usage.turn_input, 1_000);
-        assert_eq!(
-            s.footers().context_usage(AgentId::Main),
-            occupancy,
-            "summarizer usage replaced assistant context occupancy"
-        );
     }
 
     #[test]
@@ -3181,7 +3085,7 @@ mod tests {
                 reason: CompactionReason::Manual,
                 tokens_before: 0,
                 tokens_after: 0,
-                has_usage: false,
+                usage: None,
                 summary: None,
                 error: Some("summarizer failed".into()),
             },
@@ -3194,7 +3098,7 @@ mod tests {
                 reason: CompactionReason::Manual,
                 tokens_before: 0,
                 tokens_after: 0,
-                has_usage: false,
+                usage: None,
                 summary: None,
                 error: None,
             },
@@ -3807,7 +3711,7 @@ mod tests {
             reason: CompactionReason::Manual,
             tokens_before: 1_000,
             tokens_after,
-            has_usage: false,
+            usage: None,
             summary: Some(summary.to_string()),
             error: None,
         }
@@ -4432,19 +4336,22 @@ mod tests {
                 usage: token_usage([100, 0, 0, 0]),
             },
         );
-        apply(&mut s, &mut life, compaction_end("summary", 300));
-
         let entry = "e-checkpoint".to_string();
         let mut checkpoint_usage = token_usage([900, 0, 0, 0]);
         checkpoint_usage.turn_incomplete = true;
-        apply(
+        let _ = reduce(
             &mut s,
             &mut life,
-            AgentEvent::CompactionUsageUpdate {
+            AgentEvent::CompactionEnd {
                 agent_id: AgentId::Main,
-                checkpoint_id: entry,
-                usage: checkpoint_usage,
+                reason: CompactionReason::Manual,
+                tokens_before: 100,
+                tokens_after: 300,
+                summary: Some("summary".into()),
+                error: None,
+                usage: Some(checkpoint_usage),
             },
+            Some(&entry),
         );
         assert_eq!(
             s.footers().context_usage(AgentId::Main),

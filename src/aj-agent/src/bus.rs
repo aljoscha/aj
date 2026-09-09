@@ -8,11 +8,9 @@
 //! is never more than one event behind reality") falls out for free
 //! — when a listener is awaited inline, the agent cannot move on
 //! until the listener has handled the event. A listener that returns
-//! `Err` propagates the error back to the caller of [`EventBus::emit`] or
-//! [`EventBus::emit_sequence`], which the agent surfaces as
-//! [`crate::TurnError::Fatal`] so disk failures abort the run instead of
-//! silently continuing. A sequence snapshots one listener cohort and completes
-//! all its events for one listener before advancing to the next.
+//! `Err` propagates the error back to the caller of [`EventBus::emit`], which
+//! the agent surfaces as [`crate::TurnError::Fatal`] so disk failures abort
+//! the run instead of silently continuing.
 //!
 //! Channel-style subscribers (where the listener forwards events into
 //! a `tokio::sync::mpsc` queue) compose on top of [`EventBus::subscribe`]
@@ -118,39 +116,22 @@ impl EventBus {
     /// observed (or rejected) the event. If a listener returns
     /// `Err`, that error is propagated and remaining listeners are
     /// not invoked for this event.
+    /// Registrations and removals during delivery affect only subsequent emits.
+    /// The listener list is cloned without holding its lock across listener code
+    /// or an await. Concurrent emits are not globally serialized by the bus.
     pub async fn emit(&self, event: AgentEvent) -> Result<(), BoxError> {
-        self.emit_sequence(std::slice::from_ref(&event)).await
-    }
-
-    /// Emit an ordered event sequence to one stable listener cohort.
-    ///
-    /// The listener list is snapshotted once, then each listener receives the
-    /// complete sequence before the next listener starts. If listener `N`
-    /// rejects an event, every earlier listener has already received the whole
-    /// sequence and no later listener runs. Registrations and removals during
-    /// delivery affect only subsequent bus operations. Separate `emit` or
-    /// `emit_sequence` futures are not globally serialized by the bus; callers
-    /// that require one history serialize their own operations.
-    pub async fn emit_sequence(&self, events: &[AgentEvent]) -> Result<(), BoxError> {
-        let listeners = self.listener_snapshot();
-        for listener in listeners {
-            for event in events {
-                listener(event).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Clone the current listener cohort without holding the registration lock
-    /// across listener code or an await.
-    fn listener_snapshot(&self) -> Vec<Listener> {
-        self.inner
+        let listeners: Vec<Listener> = self
+            .inner
             .listeners
             .lock()
             .expect("event bus listeners mutex poisoned")
             .iter()
             .map(|slot| Arc::clone(&slot.listener))
-            .collect()
+            .collect();
+        for listener in listeners {
+            listener(&event).await?;
+        }
+        Ok(())
     }
 
     /// Number of currently-registered listeners. Test helper.
@@ -287,49 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_sequence_completes_earlier_listeners_before_a_later_failure() {
-        let bus = EventBus::new();
-        let first = Arc::new(Mutex::new(Vec::new()));
-        let first_record = Arc::clone(&first);
-        let _first_handle = bus.subscribe(listener_from_sync(move |event| {
-            first_record.lock().unwrap().push(event_kind(event));
-        }));
-        let second = Arc::new(Mutex::new(Vec::new()));
-        let second_record = Arc::clone(&second);
-        let _second_handle = bus.subscribe(Arc::new(move |event| {
-            second_record.lock().unwrap().push(event_kind(event));
-            let reject = matches!(event, AgentEvent::Notice { .. });
-            Box::pin(async move {
-                if reject {
-                    Err(BoxError::from("injected sequence failure"))
-                } else {
-                    Ok(())
-                }
-            })
-        }));
-        let events = [
-            AgentEvent::Notice {
-                agent_id: AgentId::Main,
-                text: "first".into(),
-            },
-            AgentEvent::Warning {
-                agent_id: AgentId::Main,
-                text: "second".into(),
-            },
-        ];
-
-        let error = bus
-            .emit_sequence(&events)
-            .await
-            .expect_err("later listener rejects the sequence");
-
-        assert_eq!(error.to_string(), "injected sequence failure");
-        assert_eq!(first.lock().unwrap().as_slice(), ["notice", "warning"]);
-        assert_eq!(second.lock().unwrap().as_slice(), ["notice"]);
-    }
-
-    #[tokio::test]
-    async fn emit_sequence_uses_one_listener_snapshot() {
+    async fn emit_uses_one_listener_snapshot() {
         let bus = EventBus::new();
         let late_events = Arc::new(Mutex::new(Vec::new()));
         let late_handles = Arc::new(Mutex::new(Vec::new()));
@@ -345,21 +284,15 @@ mod tests {
                 registered_handles.lock().unwrap().push(handle);
             }
         }));
-        let sequence = [
-            AgentEvent::Notice {
-                agent_id: AgentId::Main,
-                text: "first".into(),
-            },
-            AgentEvent::Warning {
-                agent_id: AgentId::Main,
-                text: "second".into(),
-            },
-        ];
-
-        bus.emit_sequence(&sequence).await.expect("emit sequence");
+        bus.emit(AgentEvent::Notice {
+            agent_id: AgentId::Main,
+            text: "first".into(),
+        })
+        .await
+        .expect("emit event");
         assert!(
             late_events.lock().unwrap().is_empty(),
-            "listener added during the sequence joined its cohort"
+            "listener added during delivery received the in-flight event"
         );
         bus.emit(AgentEvent::Error {
             agent_id: AgentId::Main,

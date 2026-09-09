@@ -383,17 +383,6 @@ pub enum AgentEvent {
         agent_id: AgentId,
         usage: TokenUsage,
     },
-    /// Cumulative usage for one committed compaction checkpoint. Kept as a
-    /// distinct wire event so protocol-1 clients that predate compaction spend
-    /// ignore it instead of treating the summarizer prompt as assistant context.
-    /// `checkpoint_id` makes duplicate delivery independently idempotent even
-    /// when attach filtering removes the preceding [`AgentEvent::CompactionEnd`].
-    CompactionUsageUpdate {
-        agent_id: AgentId,
-        checkpoint_id: String,
-        usage: TokenUsage,
-    },
-
     // --- Compaction --------------------------------------------------------
     /// Compaction has started for this agent. Renderers show a
     /// "compacting…" indicator. Transient — not persisted.
@@ -424,19 +413,18 @@ pub enum AgentEvent {
     /// - both `None` — the run ended without writing (cancelled before
     ///   the persist step).
     ///
-    /// `has_usage` says a checkpoint-owned
-    /// [`AgentEvent::CompactionUsageUpdate`] follows this event. It is false for
-    /// unsuccessful runs and legacy checkpoints whose spend is unknown.
+    /// `usage` carries the accounted summarizer spend on success. It is absent
+    /// for unsuccessful runs and checkpoints whose spend is unknown.
     ///
-    /// Transient — not persisted; the conversation log's compaction
-    /// entry is the durable record.
+    /// The event is not stored verbatim. Successful ends carry the checkpoint's
+    /// durable tag during forwarding and replay. Unsuccessful ends are transient.
     CompactionEnd {
         agent_id: AgentId,
         reason: CompactionReason,
         tokens_before: u64,
         tokens_after: u64,
-        #[serde(default)]
-        has_usage: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -477,7 +465,6 @@ impl AgentEvent {
             | Self::Error { agent_id, .. }
             | Self::StreamRetry { agent_id, .. }
             | Self::UsageUpdate { agent_id, .. }
-            | Self::CompactionUsageUpdate { agent_id, .. }
             | Self::CompactionStart { agent_id, .. }
             | Self::CompactionProgress { agent_id, .. }
             | Self::CompactionEnd { agent_id, .. }
@@ -648,7 +635,18 @@ mod tests {
             reason: CompactionReason::Overflow,
             tokens_before: 1200,
             tokens_after: 300,
-            has_usage: true,
+            usage: Some(TokenUsage {
+                accumulated_input: 10,
+                turn_input: 20,
+                accumulated_output: 1,
+                turn_output: 2,
+                accumulated_cache_write: 3,
+                turn_cache_write: 4,
+                accumulated_cache_read: 5,
+                turn_cache_read: 6,
+                turn_incomplete: true,
+                accumulated_incomplete: false,
+            }),
             summary: Some("did stuff".into()),
             error: None,
         };
@@ -657,7 +655,10 @@ mod tests {
         assert_eq!(json["reason"], "overflow");
         assert_eq!(json["tokens_before"], 1200);
         assert_eq!(json["tokens_after"], 300);
-        assert_eq!(json["has_usage"], serde_json::Value::Bool(true));
+        assert_eq!(json["usage"]["turn_input"], 20);
+        assert_eq!(json["usage"]["turn_incomplete"], true);
+        let decoded: AgentEvent = serde_json::from_value(json.clone()).expect("usage decodes");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json);
         assert_eq!(json["summary"], "did stuff");
         // `error` is `None`, so it is skipped on the wire.
         assert!(json.get("error").is_none());
@@ -670,13 +671,16 @@ mod tests {
             "tokens_after": 10,
             "summary": "legacy"
         }))
-        .expect("an older event without has_usage still decodes");
+        .expect("an older event without usage still decodes");
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("usage")
+                .is_none()
+        );
         assert!(matches!(
             legacy,
-            AgentEvent::CompactionEnd {
-                has_usage: false,
-                ..
-            }
+            AgentEvent::CompactionEnd { usage: None, .. }
         ));
     }
 }

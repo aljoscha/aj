@@ -234,11 +234,13 @@ Every frame is in exactly one class:
 
   At most one frame per log entry is durable. An entry can project
   several events (a tool-result entry projects a tool bracket around its
-  `MessageEnd`, assistant entries project a trailing `UsageUpdate`,
-  priced compactions project a trailing `CompactionUsageUpdate`) and
-  only one of them carries the tag, in live flow and backfill alike. A
-  `CompactionUsageUpdate` carries the checkpoint entry id in its payload
-  even though it carries no durable tag.
+  `MessageEnd`, assistant entries project a trailing `UsageUpdate`) and
+  only one of them carries the tag, in live flow and backfill alike.
+  A committed compaction projects one durable `CompactionEnd` containing
+  optional cumulative `TokenUsage` in `usage`. Its envelope's `entry_id`
+  identifies both summary and spend, so cursor filtering treats them as one
+  event. Backfill regenerates the same event. Legacy log entries without usage
+  omit that field and leave spend unknown, not zero.
 - **Lossy** frames are the three cumulative-snapshot events,
   `MessageUpdate` (keyed by agent id), `ToolExecutionUpdate` (keyed by
   call id), `TaskOutput` (keyed by task id), plus the `list` and `state`
@@ -565,12 +567,14 @@ never be silently dropped for a connected client.
 Both ends of every connection are aj, but versions skew. Rules:
 
 - `GET /v1/hello` carries `protocol` and `capabilities`. Protocol 1 is
-  the generation whose servers ignore unknown request fields, protocol 2
-  the strict-command generation this document describes. The exact
-  version check is the boundary: a protocol-2 client sends no create or
-  command after a protocol-1 hello, and a gateway opens no link to a
-  host whose checked hello failed. Mixed generations are unavailable
-  rather than degraded. Hosts and gateways roll before clients.
+  the generation whose servers ignore unknown request fields. Protocol 2
+  requires strict commands. Protocol 3 also combines committed compaction and
+  its optional usage in one durable `compaction_end` event. Removing the
+  separate usage event changes semantics, so this requires a protocol bump
+  rather than additive decoding. The exact version check is the boundary:
+  a protocol-3 client sends no create or command after a mismatched hello,
+  and a gateway opens no link to a host whose checked hello failed. Mixed generations are
+  unavailable rather than degraded. Hosts and gateways roll before clients.
 - Every protocol-defined JSON command has a closed schema. The component
   that owns the command's effect rejects unknown fields recursively
   (nested settings, model selections, prompt content included) before
@@ -613,7 +617,7 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `archive` | `POST /v1/sessions/{id}/archive` | hosts |
   | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
   | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
-  | `compaction_usage` | the `compaction_usage_update` event, including its checkpoint entry id | hosts |
+  | `compaction_usage` | optional cumulative `usage` on durable `compaction_end`, identified by the frame's `entry_id` | hosts |
 
   A capability is self-description, never a gate: probing an endpoint
   (404 `unknown_endpoint` vs 2xx) is a valid fallback check. A gateway's
@@ -706,7 +710,7 @@ Enrollment routes, strict at the gateway (section 5.10):
 | Route | Body | Semantics |
 |---|---|---|
 | `GET /v1/hosts` | | `{hosts: [{id?, address, source, connected, sessions, error?}]}`. `source` is `config` or `dynamic`. |
-| `POST /v1/hosts` | `{address}`, `<host>:<port>` or an `http(s)://` URL | Enroll a host dynamically. Completes a checked protocol-2 hello before adding or recording it. Answers 200 with the host's row. 409 `already_enrolled` for an address already enrolled, 409 `duplicate_host` for an id another enrollment holds, 409 `unusable_host_id` for an id that cannot namespace sessions. |
+| `POST /v1/hosts` | `{address}`, `<host>:<port>` or an `http(s)://` URL | Enroll a host dynamically. Completes a checked protocol-3 hello before adding or recording it. Answers 200 with the host's row. 409 `already_enrolled` for an address already enrolled, 409 `duplicate_host` for an id another enrollment holds, 409 `unusable_host_id` for an id that cannot namespace sessions. |
 | `DELETE /v1/hosts/{id}` | | Withdraw a dynamic enrollment. 204. 404 `unknown_host`, 409 `static_host` for a configured host, which is removed from the file instead. |
 
 Static host addresses come from the config file (`--config <file>`,
@@ -714,7 +718,7 @@ default `~/.aj/gateway.toml`, which need not exist). Dynamic enrollments
 and the gateway's own id live under `~/.aj/gateway/`. An unreachable or
 incompatible hello leaves a configured or remembered enrollment in place
 but disconnected: nothing is marked connected, published as reachable,
-or routed to until a protocol-2 hello succeeds.
+or routed to until a protocol-3 hello succeeds.
 
 ### 6.2 Process supervision
 
@@ -770,10 +774,10 @@ map records an empty overlay. `--env KEY=VALUE` supplies this map to every
 create the invocation performs, including connected in-TUI new sessions.
 Attaching or resuming does not apply the launch map to an existing session.
 
-A protocol-2 receiver that predates the field refuses it before minting under
+A current-protocol receiver that lacks the field refuses it before minting under
 the closed-schema rule (section 5.10). The client surfaces the refusal and
-never retries with env removed. Protocol-1 peers are refused at hello. The
-ordinary successful create response needs no env echo or proof exchange.
+never retries with env removed. Mismatched protocol versions are refused at hello.
+The ordinary successful create response needs no env echo or proof exchange.
 Gateways forward the map to the owning host without interpreting it.
 
 ## 8. Client TUI

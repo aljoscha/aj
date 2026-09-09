@@ -186,14 +186,12 @@ pub fn delivered_report(conclusion: SubAgentConclusion, report: &str) -> String 
 /// Selects the protocol transition emitted for one accounted usage delta.
 ///
 /// Assistant terminals emit one [`AgentEvent::UsageUpdate`]. A committed
-/// compaction emits its successful [`AgentEvent::CompactionEnd`] and
-/// self-identifying [`AgentEvent::CompactionUsageUpdate`] to one stable
-/// listener cohort. Failed and canceled operations do not enter this boundary.
+/// compaction emits one successful [`AgentEvent::CompactionEnd`] carrying usage.
+/// Failed and canceled operations do not enter this boundary.
 #[derive(Debug)]
 pub enum UsageAccounting {
     AssistantTerminal,
     CommittedCompaction {
-        checkpoint_id: String,
         reason: CompactionReason,
         tokens_before: u64,
         tokens_after: u64,
@@ -532,11 +530,7 @@ impl Agent {
         if matches!(
             &event,
             AgentEvent::UsageUpdate { .. }
-                | AgentEvent::CompactionUsageUpdate { .. }
-                | AgentEvent::CompactionEnd {
-                    has_usage: true,
-                    ..
-                }
+                | AgentEvent::CompactionEnd { usage: Some(_), .. }
                 | AgentEvent::CompactionEnd {
                     summary: Some(_),
                     error: None,
@@ -608,10 +602,8 @@ impl Agent {
     /// spend already incurred.
     ///
     /// Callers selecting [`UsageAccounting::CommittedCompaction`] must invoke
-    /// this only after the checkpoint append commits. Its end and usage update
-    /// are delivered through one listener snapshot, with each earlier
-    /// successful listener receiving the complete pair before a later listener
-    /// can reject it.
+    /// this only after the checkpoint append commits. The successful end carries
+    /// usage in the same event, so listeners observe both together.
     pub async fn account_usage(
         &mut self,
         delta: &Usage,
@@ -628,29 +620,21 @@ impl Agent {
                     .await
             }
             UsageAccounting::CommittedCompaction {
-                checkpoint_id,
                 reason,
                 tokens_before,
                 tokens_after,
                 summary,
             } => {
                 self.bus
-                    .emit_sequence(&[
-                        AgentEvent::CompactionEnd {
-                            agent_id: self.agent_id,
-                            reason,
-                            tokens_before,
-                            tokens_after,
-                            has_usage: true,
-                            summary: Some(summary),
-                            error: None,
-                        },
-                        AgentEvent::CompactionUsageUpdate {
-                            agent_id: self.agent_id,
-                            checkpoint_id,
-                            usage,
-                        },
-                    ])
+                    .emit(AgentEvent::CompactionEnd {
+                        agent_id: self.agent_id,
+                        reason,
+                        tokens_before,
+                        tokens_after,
+                        usage: Some(usage),
+                        summary: Some(summary),
+                        error: None,
+                    })
                     .await
             }
         };
@@ -4504,16 +4488,6 @@ mod event_protocol_tests {
             event_kind: &'static str,
         },
         UsageUpdate(AgentId),
-        CompactionEnd {
-            agent_id: AgentId,
-            reason: CompactionReason,
-            tokens_before: u64,
-            tokens_after: u64,
-            has_usage: bool,
-            summary: Option<String>,
-            error: Option<String>,
-        },
-        CompactionUsageUpdate(AgentId, String),
         Other(&'static str),
     }
 
@@ -4574,11 +4548,6 @@ mod event_protocol_tests {
                 agent_id, attempt, ..
             } => EventLabel::StreamRetry(*agent_id, *attempt),
             AgentEvent::UsageUpdate { agent_id, .. } => EventLabel::UsageUpdate(*agent_id),
-            AgentEvent::CompactionUsageUpdate {
-                agent_id,
-                checkpoint_id,
-                ..
-            } => EventLabel::CompactionUsageUpdate(*agent_id, checkpoint_id.clone()),
             AgentEvent::TurnEnd { .. } => EventLabel::Other("TurnEnd"),
             AgentEvent::MessageStart { agent_id, message } => EventLabel::Message {
                 agent_id: *agent_id,
@@ -4603,23 +4572,7 @@ mod event_protocol_tests {
             AgentEvent::TaskEnd { .. } => EventLabel::Other("TaskEnd"),
             AgentEvent::CompactionStart { .. } => EventLabel::Other("CompactionStart"),
             AgentEvent::CompactionProgress { .. } => EventLabel::Other("CompactionProgress"),
-            AgentEvent::CompactionEnd {
-                agent_id,
-                reason,
-                tokens_before,
-                tokens_after,
-                has_usage,
-                summary,
-                error,
-            } => EventLabel::CompactionEnd {
-                agent_id: *agent_id,
-                reason: *reason,
-                tokens_before: *tokens_before,
-                tokens_after: *tokens_after,
-                has_usage: *has_usage,
-                summary: summary.clone(),
-                error: error.clone(),
-            },
+            AgentEvent::CompactionEnd { .. } => EventLabel::Other("CompactionEnd"),
         }
     }
 
@@ -4834,26 +4787,21 @@ mod event_protocol_tests {
                 agent_id: AgentId::Main,
                 usage: usage(),
             },
-            AgentEvent::CompactionUsageUpdate {
+            AgentEvent::CompactionEnd {
                 agent_id: AgentId::Main,
-                checkpoint_id: "checkpoint".to_string(),
-                usage: usage(),
+                reason: CompactionReason::Manual,
+                tokens_before: 200,
+                tokens_after: 100,
+                usage: Some(usage()),
+                summary: None,
+                error: Some("failed with fabricated usage".to_string()),
             },
             AgentEvent::CompactionEnd {
                 agent_id: AgentId::Main,
                 reason: CompactionReason::Manual,
                 tokens_before: 200,
                 tokens_after: 100,
-                has_usage: true,
-                summary: Some("summary".to_string()),
-                error: None,
-            },
-            AgentEvent::CompactionEnd {
-                agent_id: AgentId::Main,
-                reason: CompactionReason::Manual,
-                tokens_before: 200,
-                tokens_after: 100,
-                has_usage: false,
+                usage: None,
                 summary: Some("legacy summary".to_string()),
                 error: None,
             },
@@ -4877,7 +4825,7 @@ mod event_protocol_tests {
                 reason: CompactionReason::Manual,
                 tokens_before: 200,
                 tokens_after: 0,
-                has_usage: false,
+                usage: None,
                 summary: None,
                 error: Some("summary failed".to_string()),
             })
@@ -4893,7 +4841,9 @@ mod event_protocol_tests {
         let recorded = Arc::clone(&updates);
         let _subscription = agent.subscribe(listener_from_sync(move |event| match event {
             AgentEvent::UsageUpdate { usage, .. }
-            | AgentEvent::CompactionUsageUpdate { usage, .. } => {
+            | AgentEvent::CompactionEnd {
+                usage: Some(usage), ..
+            } => {
                 recorded.lock().unwrap().push(usage.clone());
             }
             _ => {}
@@ -4943,7 +4893,6 @@ mod event_protocol_tests {
             .account_usage(
                 &second,
                 UsageAccounting::CommittedCompaction {
-                    checkpoint_id: "checkpoint-2".to_string(),
                     reason: CompactionReason::Manual,
                     tokens_before: 200,
                     tokens_after: 100,
@@ -5023,25 +4972,15 @@ mod event_protocol_tests {
     }
 
     #[tokio::test]
-    async fn compaction_accounting_completes_earlier_listener_pairs_before_failure() {
+    async fn compaction_accounting_delivers_one_complete_event_before_listener_failure() {
         let mut agent = build_agent(Vec::new(), Vec::new());
-        let first_events = Arc::new(Mutex::new(Vec::new()));
-        let first_recorded = Arc::clone(&first_events);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&events);
         let _first = agent.subscribe(listener_from_sync(move |event| {
-            first_recorded.lock().unwrap().push(label(event));
+            recorded.lock().unwrap().push(event.clone());
         }));
-        let second_events = Arc::new(Mutex::new(Vec::new()));
-        let second_recorded = Arc::clone(&second_events);
-        let _second = agent.subscribe(Arc::new(move |event| {
-            second_recorded.lock().unwrap().push(label(event));
-            let fail = matches!(event, AgentEvent::CompactionEnd { .. });
-            Box::pin(async move {
-                if fail {
-                    Err(crate::BoxError::from("injected prerequisite failure"))
-                } else {
-                    Ok(())
-                }
-            })
+        let _second = agent.subscribe(Arc::new(|_| {
+            Box::pin(async { Err(crate::BoxError::from("injected listener failure")) })
         }));
         let delta = Usage {
             input: 7,
@@ -5053,7 +4992,6 @@ mod event_protocol_tests {
             .account_usage(
                 &delta,
                 UsageAccounting::CommittedCompaction {
-                    checkpoint_id: "checkpoint-7".to_string(),
                     reason: CompactionReason::Manual,
                     tokens_before: 200,
                     tokens_after: 100,
@@ -5061,38 +4999,27 @@ mod event_protocol_tests {
                 },
             )
             .await
-            .expect_err("prerequisite failure remains fatal");
+            .expect_err("listener failure remains fatal");
 
         assert!(matches!(error, crate::TurnError::Fatal(_)));
-        assert_eq!(
-            first_events.lock().unwrap().as_slice(),
-            [
-                EventLabel::CompactionEnd {
-                    agent_id: AgentId::Main,
-                    reason: CompactionReason::Manual,
-                    tokens_before: 200,
-                    tokens_after: 100,
-                    has_usage: true,
-                    summary: Some("checkpoint".to_string()),
-                    error: None,
-                },
-                EventLabel::CompactionUsageUpdate(AgentId::Main, "checkpoint-7".to_string()),
-            ],
-            "the earlier listener receives the complete pair"
-        );
-        assert_eq!(
-            second_events.lock().unwrap().as_slice(),
-            [EventLabel::CompactionEnd {
+        let events = events.lock().unwrap();
+        let [
+            AgentEvent::CompactionEnd {
                 agent_id: AgentId::Main,
                 reason: CompactionReason::Manual,
                 tokens_before: 200,
                 tokens_after: 100,
-                has_usage: true,
-                summary: Some("checkpoint".to_string()),
+                usage: Some(usage),
+                summary: Some(summary),
                 error: None,
-            }],
-            "the rejecting listener receives no dependent event"
-        );
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one complete compaction event: {events:?}");
+        };
+        assert_eq!(summary, "checkpoint");
+        assert_eq!(usage.accumulated_input, 0);
+        assert_eq!(usage.turn_input, 7);
         assert_eq!(agent.accumulated_usage().input, 7);
     }
 
@@ -5123,7 +5050,6 @@ mod event_protocol_tests {
         let mut accounting = Box::pin(agent.account_usage(
             &delta,
             UsageAccounting::CommittedCompaction {
-                checkpoint_id: "checkpoint-7".to_string(),
                 reason: CompactionReason::Manual,
                 tokens_before: 200,
                 tokens_after: 100,

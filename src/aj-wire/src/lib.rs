@@ -19,7 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
 /// The current remote-control protocol version.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The capability a host declares when it serves `POST
 /// /v1/sessions/{id}/archive`.
@@ -30,8 +30,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const ARCHIVE_CAPABILITY: &str = "archive";
 
 /// The capability a host declares when compaction spend is published through
-/// the additive `compaction_usage_update` event. Older clients ignore that
-/// unknown event instead of folding it as assistant-turn context.
+/// optional cumulative `usage` on the durable `compaction_end` event.
 pub const COMPACTION_USAGE_CAPABILITY: &str = "compaction_usage";
 
 /// The capability for reading and editing a session's active-branch environment.
@@ -2316,7 +2315,6 @@ fn is_known_event_type(event_type: &str) -> bool {
             | "error"
             | "stream_retry"
             | "usage_update"
-            | "compaction_usage_update"
             | "compaction_start"
             | "compaction_progress"
             | "compaction_end"

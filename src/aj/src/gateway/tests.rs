@@ -2237,7 +2237,9 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
     let (status, code, message) = refusal(response).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{message}");
     assert_eq!(code, "host_unreachable");
-    assert!(message.contains("protocol 1") && message.contains("speaks 2"));
+    assert!(
+        message.contains("protocol 1") && message.contains(&format!("speaks {PROTOCOL_VERSION}"))
+    );
     assert!(
         dynamic.hosts().await.hosts.is_empty(),
         "a failed dynamic handshake still enrolled the host",
@@ -2285,7 +2287,8 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
         configured_summary
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("protocol 1") && error.contains("speaks 2")),
+            .is_some_and(|error| error.contains("protocol 1")
+                && error.contains(&format!("speaks {PROTOCOL_VERSION}"))),
         "unexpected mismatch: {configured_summary:?}",
     );
     let configured_directory = configured
@@ -3610,7 +3613,7 @@ async fn a_control_create_environment_reaches_the_owning_host_log() {
     host.stop().await;
 }
 
-/// The protocol-2 create envelope from 4dee971. The host, not a capability
+/// A current-protocol create envelope without env. The host, not a capability
 /// gate in either intermediary, owns rejection of unknown top-level fields.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3626,7 +3629,7 @@ struct EnvlessCreateRequest {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_envless_protocol_two_host_refuses_create_directly_and_through_gateway() {
+async fn an_envless_current_protocol_host_refuses_create_directly_and_through_gateway() {
     let recorder = Recorder::serve_with_schema("envless", true, true).await;
     let fixture = Fixture::over(
         TempDir::new().expect("tempdir"),
@@ -3639,7 +3642,7 @@ async fn an_envless_protocol_two_host_refuses_create_directly_and_through_gatewa
         .enumerate()
     {
         let client = RemoteClient::new(&url).unwrap();
-        assert_eq!(client.hello().await.unwrap().protocol, 2);
+        assert_eq!(client.hello().await.unwrap().protocol, PROTOCOL_VERSION);
         let control = crate::control::Control::remote(client);
         control
             .create(Some("envless".to_string()), None, None, None, None)
@@ -3746,7 +3749,7 @@ impl Recorder {
         let proxied: Arc<StdMutex<Vec<ProxiedRequest>>> = Arc::new(StdMutex::new(Vec::new()));
         let minted = Arc::new(AtomicUsize::new(0));
         let hello = serde_json::json!({
-            "protocol": if envless { 2 } else { PROTOCOL_VERSION },
+            "protocol": PROTOCOL_VERSION,
             "capabilities": [],
             "app_version": "0",
             "host_id": host_id,

@@ -6102,18 +6102,6 @@ fn assert_unsuccessful_summary_frames(
         "the fixture entered compaction",
     );
     assert_eq!(
-        frames
-            .iter()
-            .filter(|frame| matches!(
-                frame,
-                Frame::Event { event, .. }
-                    if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate { .. }))
-            ))
-            .count(),
-        0,
-        "an unsuccessful summary has no accounted checkpoint usage",
-    );
-    assert_eq!(
         frames.iter().any(|frame| matches!(
             frame,
             Frame::Event { event, .. }
@@ -6133,20 +6121,20 @@ fn assert_unsuccessful_summary_frames(
                 durability, event, ..
             } => match event.known() {
                 Some(AgentEvent::CompactionEnd {
-                    has_usage,
+                    usage,
                     summary,
                     error,
                     ..
-                }) => Some((durability, has_usage, summary, error)),
+                }) => Some((durability, usage, summary, error)),
                 _ => None,
             },
             _ => None,
         })
         .collect();
     assert_eq!(ends.len(), 1, "one terminal compaction event");
-    let (durability, has_usage, summary, error) = ends[0];
+    let (durability, usage, summary, error) = ends[0];
     assert!(durability.is_none(), "an unsuccessful end is not durable");
-    assert!(!has_usage, "an unsuccessful end promises no usage update");
+    assert!(usage.is_none(), "an unsuccessful end carries no usage");
     assert!(summary.is_none(), "an unsuccessful end owns no checkpoint");
     match expected_error {
         Some(expected) => assert!(
@@ -6181,7 +6169,7 @@ async fn nothing_to_compact_leaves_every_usage_surface_unchanged() {
         frame,
         Frame::Event { event, .. }
             if matches!(event.known(), Some(AgentEvent::CompactionStart { .. }
-                | AgentEvent::CompactionUsageUpdate { .. }))
+                | AgentEvent::CompactionEnd { .. }))
     )));
     let after = compaction_accounting_snapshot(&harness, &session, &client).await;
     assert_eq!(after, before);
@@ -6322,67 +6310,55 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         .expect("compact on an idle session");
     let frames = client.pump_until_idle().await;
 
-    let end = frames
-        .iter()
-        .find_map(|frame| match frame {
-            Frame::Event {
-                durability, event, ..
-            } => match event.known() {
-                Some(AgentEvent::CompactionEnd { summary, .. }) => {
-                    Some((durability.clone(), summary.clone()))
-                }
-                _ => None,
-            },
-            _ => None,
-        })
-        .expect("the compaction ended");
-    assert!(
-        end.1.is_some(),
-        "the compaction wrote a summary, so it appended a checkpoint",
-    );
-    let durability = end.0.expect("a successful compaction's end is durable");
-    let checkpoint_updates: Vec<_> = frames
+    let checkpoints: Vec<_> = frames
         .iter()
         .filter_map(|frame| match frame {
             Frame::Event {
                 durability, event, ..
             } => match event.known() {
-                Some(AgentEvent::CompactionUsageUpdate {
-                    checkpoint_id,
-                    usage,
-                    ..
-                }) if usage.turn_input == compaction_total[0] => {
-                    Some((durability, checkpoint_id, usage))
+                Some(AgentEvent::CompactionEnd { summary, usage, .. }) => {
+                    Some((durability, summary, usage))
                 }
                 _ => None,
             },
             _ => None,
         })
         .collect();
-    assert_eq!(
-        checkpoint_updates.len(),
-        1,
-        "one aggregate checkpoint update"
-    );
-    assert!(
-        checkpoint_updates[0].0.is_none(),
-        "CompactionEnd alone carries the checkpoint's durable tag",
-    );
-    assert_eq!(
-        checkpoint_updates[0].1, &durability.entry_id,
-        "the transient update identifies its durable checkpoint",
-    );
+    assert_eq!(checkpoints.len(), 1, "one complete checkpoint event");
+    let (durability, summary, usage) = checkpoints[0];
+    assert!(summary.is_some(), "the checkpoint carries its summary");
+    let durability = durability
+        .as_ref()
+        .expect("a successful checkpoint is durable");
+    let usage = usage.as_ref().expect("the checkpoint carries its usage");
+    let checkpoint_events = |frames: &[Frame]| {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Event {
+                    durability: Some(seen),
+                    event,
+                    ..
+                } if seen.entry_id == durability.entry_id => {
+                    Some(serde_json::to_value(event).expect("serialize checkpoint event"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let live_checkpoint = checkpoint_events(&frames);
+    assert_eq!(live_checkpoint.len(), 1);
     assert_eq!(
         [
-            checkpoint_updates[0].2.turn_input,
-            checkpoint_updates[0].2.turn_output,
-            checkpoint_updates[0].2.turn_cache_write,
-            checkpoint_updates[0].2.turn_cache_read,
+            usage.turn_input,
+            usage.turn_output,
+            usage.turn_cache_write,
+            usage.turn_cache_read
         ],
         compaction_total,
     );
-    assert!(checkpoint_updates[0].2.turn_incomplete);
-    assert!(!checkpoint_updates[0].2.accumulated_incomplete);
+    assert!(usage.turn_incomplete);
+    assert!(!usage.accumulated_incomplete);
     assert!(
         !frames.iter().any(|frame| matches!(
             frame,
@@ -6526,15 +6502,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     assert_eq!(after_sources[3].as_deref(), Some(later_id.as_str()));
 
     let reattached = client.reattach(&harness.host, older_cursor).await;
-    assert!(reattached.iter().any(|frame| matches!(
-        frame,
-        Frame::Event { event, .. }
-            if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate {
-                checkpoint_id,
-                usage,
-                ..
-            }) if checkpoint_id == &durability.entry_id && usage.turn_incomplete)
-    )));
+    assert_eq!(checkpoint_events(&reattached), live_checkpoint);
     assert_eq!(usage_sources(&client.chat), after_sources);
     assert_eq!(compaction_rows(&client.chat), 1);
     let reattached_usage = client.chat.usage_summary();
@@ -6545,15 +6513,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     harness.host.shutdown().await;
     let revived = harness.revive(Vec::new());
     let replayed = client.reattach(&revived.host, stale_cursor).await;
-    assert!(replayed.iter().any(|frame| matches!(
-        frame,
-        Frame::Event { event, .. }
-            if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate {
-                checkpoint_id,
-                usage,
-                ..
-            }) if checkpoint_id == &durability.entry_id && usage.turn_incomplete)
-    )));
+    assert_eq!(checkpoint_events(&replayed), live_checkpoint);
     assert_eq!(usage_sources(&client.chat), after_sources);
     assert_eq!(compaction_rows(&client.chat), 1);
     let replayed_usage = client.chat.usage_summary();
@@ -6562,10 +6522,9 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     revived.host.shutdown().await;
 }
 
-/// A compaction usage update is a one-shot frame, not a cumulative painting
-/// snapshot. When its durable checkpoint is both in an attach backfill and
-/// queued live, fan-out filters the duplicate end at the boundary but must
-/// retain the update behind `CaughtUp`.
+/// A complete checkpoint in attach backfill is applied once. Fan-out filters
+/// its queued durable live duplicate without changing later assistant usage
+/// or occupancy when the paced attach releases.
 #[tokio::test]
 async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
     fn priced(text: &str, usage: [u64; 4]) -> AssistantMessage {
@@ -6619,36 +6578,19 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         ))
         .cloned()
         .expect("the durable checkpoint end");
-    let checkpoint_usage = compacted
-        .iter()
-        .find(|frame| {
-            matches!(
-                frame,
-                Frame::Event { event, .. }
-                    if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate { usage, .. })
-                        if usage.turn_input == checkpoint_total[0])
-            )
-        })
-        .cloned()
-        .expect("the checkpoint usage update");
-    let checkpoint_id = match &checkpoint_usage {
-        Frame::Event { event, .. } => match event.known() {
-            Some(AgentEvent::CompactionUsageUpdate { checkpoint_id, .. }) => checkpoint_id.clone(),
-            other => panic!("checkpoint usage frame changed kind: {other:?}"),
-        },
-        other => panic!("checkpoint usage changed frame kind: {other:?}"),
-    };
-    let (checkpoint_seq, checkpoint_end_id) = match &checkpoint_end {
+    let (checkpoint_seq, checkpoint_id) = match &checkpoint_end {
         Frame::Event {
             durability: Some(durability),
+            event,
             ..
-        } => (durability.seq, durability.entry_id.clone()),
+        } => {
+            assert!(matches!(event.known(), Some(AgentEvent::CompactionEnd {
+                usage: Some(usage), ..
+            }) if usage.turn_input == checkpoint_total[0]));
+            (durability.seq, durability.entry_id.clone())
+        }
         other => panic!("checkpoint end is not durable: {other:?}"),
     };
-    assert_eq!(
-        checkpoint_end_id, checkpoint_id,
-        "both halves identify the same checkpoint",
-    );
 
     harness.prompt(&session, "after compaction").await;
     let later_frames = warm.pump_until_idle().await;
@@ -6704,13 +6646,10 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
     // Reading only the opening frame leaves the capacity-one block producer
     // parked inside its backfill. These offers therefore cross Fanout while
     // this subscriber is still Attaching. `finish_block` must later remove the
-    // duplicate durable end and retain the one-shot usage update.
+    // duplicate complete checkpoint before releasing the sentinel.
     harness
         .host
         .publish_live_frame_for_test(checkpoint_end.clone());
-    harness
-        .host
-        .publish_live_frame_for_test(checkpoint_usage.clone());
     harness.host.publish_live_frame_for_test(Frame::Event {
         session: session.clone(),
         epoch,
@@ -6741,6 +6680,21 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         1,
         "the checkpoint appears once in the backfill",
     );
+    let backfilled_checkpoint = block
+        .iter()
+        .find(|frame| {
+            matches!(
+                frame,
+                Frame::Event { durability: Some(seen), .. }
+                    if seen.entry_id == checkpoint_id
+            )
+        })
+        .expect("the complete checkpoint is backfilled with its identity");
+    assert_eq!(
+        serde_json::to_value(backfilled_checkpoint).expect("serialize backfill"),
+        serde_json::to_value(&checkpoint_end).expect("serialize live checkpoint"),
+        "backfill carries the whole live checkpoint, including usage and occupancy",
+    );
 
     let released = frames_until(&mut stream, "the post-caught-up sentinel", |frame| {
         matches!(
@@ -6758,28 +6712,13 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         )),
         "finish_block filters the queued durable duplicate",
     );
-    assert_eq!(
-        released
-            .iter()
-            .filter(|frame| matches!(
-                frame,
-                Frame::Event { event, .. }
-                    if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate {
-                        checkpoint_id: seen,
-                        ..
-                    }) if seen == &checkpoint_id)
-            ))
-            .count(),
-        1,
-        "the checkpoint's one-shot usage crosses the real attach release",
-    );
     for frame in released {
         let _ = client.apply(&mut chat, frame);
     }
     assert_eq!(
         summary_dimensions(&chat.usage_summary()),
         session_total,
-        "the released stale checkpoint update does not become the current total",
+        "filtering the duplicate checkpoint preserves the current total",
     );
     assert!(!chat.usage_summary().incomplete);
 
@@ -6806,7 +6745,7 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
             checkpoint_rows[0].usage.turn_cache_read,
         ],
         checkpoint_total,
-        "the retained frame carries the checkpoint spend",
+        "the backfilled checkpoint carries its spend",
     );
     assert!(!checkpoint_rows[0].usage.turn_incomplete);
     let assistant = usage_rows
@@ -6926,10 +6865,16 @@ async fn legacy_compaction_without_usage_stays_unknown_across_an_older_cursor() 
     );
 
     let epoch = client.client.cursor().expect("attached cursor").epoch;
-    client
+    let frames = client
         .reattach(&harness.host, aj_wire::Cursor { epoch, seq: 0 })
         .await;
 
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        Frame::Event { durability: Some(seen), event, .. }
+            if seen.entry_id == checkpoint.id && matches!(event.known(),
+                Some(AgentEvent::CompactionEnd { summary: Some(_), usage: None, error: None, .. }))
+    )), "the legacy checkpoint remains a complete event with unknown spend");
     assert_eq!(usage_sources(&client.chat), sources);
     assert_eq!(
         client.chat.usage_summary().main_agent_usage.input_tokens,
@@ -7104,8 +7049,7 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         !frames.iter().any(|frame| matches!(
             frame,
             Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::CompactionUsageUpdate { usage, .. })
-                    if usage.turn_input == summarizer[0])
+                if matches!(event.known(), Some(AgentEvent::CompactionEnd { usage: Some(_), .. }))
         )),
         "uncommitted summarizer usage reached the live fold",
     );

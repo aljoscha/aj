@@ -123,8 +123,8 @@ The host validates the map before minting and records it as the initial branch
 environment. An explicitly empty map is recorded as empty, while an absent map
 records no environment. Gateways forward it without interpreting its contents.
 
-A protocol-2 host predating this field refuses it under strict request decoding,
-before minting a session. Protocol-1 peers are refused at hello. Clients do not
+A current-protocol host lacking this field refuses it under strict request decoding,
+before minting a session. Mismatched protocol versions are refused at hello. Clients do not
 retry after stripping the map, and no environment echo, proof exchange, or
 capability pre-gate is needed. Successful creation keeps the ordinary
 `SessionCreated` response and existing partial-create behavior.

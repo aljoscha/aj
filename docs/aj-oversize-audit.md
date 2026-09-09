@@ -10,7 +10,7 @@ abstractions, tests at the stable boundary). Reference case at audit time:
 `c4b977b` (retired below).
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 21 LOOKs.
+retired 23 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -30,7 +30,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 6 open)
+## LOOK (27 total, 4 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -55,8 +55,8 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`48c07a9` 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account~~ Retired: ordinary label validation and direct picker actions replace the Unicode and inspection machinery. Reauthentication uses one request path, and account presentation uses one formatter.
 - ~~`854f4a7` 2026-08-30 usage: mark undisclosed provider totals partial~~ Retired without code changes: latest-turn and cumulative completeness serve distinct views, with one provider-owned fact propagated through existing snapshots. No worthwhile simplification identified.
 - ~~`c4b977b` 2026-08-30 aj-app,aj: keep failed transitions on the selected session~~ Retired: redundant recovery error plumbing is removed. Responsive one-stream transitions, target-specific success, and forward branch recovery remain intact.
-- `bdaefe6` 2026-08-30 aj-app: preserve checkpoint usage dependencies
-- `e1139c6` 2026-08-30 aj-app: preserve committed compaction usage atomically
+- ~~`bdaefe6` 2026-08-30 aj-app: preserve checkpoint usage dependencies~~ Retired: committed compaction publishes one durable event containing optional usage, with append handoff and exclusive accounting safeguards retained.
+- ~~`e1139c6` 2026-08-30 aj-app: preserve committed compaction usage atomically~~ Retired: committed compaction publishes one durable event containing optional usage, with append handoff and exclusive accounting safeguards retained.
 - `70e7ee6` 2026-08-31 aj-tools: bound direct command reap after sigkill
 - `be726be` 2026-08-31 aj-wire: reject unknown command fields
 - `5fc079e` 2026-08-31 agent: serialize live usage accounting
@@ -275,19 +275,19 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: A broad empty-body commit with seven new types and repeated admission gates. The types separate recovery, one-shot action feedback, and session-owned startup or projection obligations rather than defining seven recovery machines. `a7c9c4cc` centralized the gates and identical constructors, `d3436240` removed duplicated connection state, and `225ee03b` restored already-served view swaps.
 - Disposition: Keep responsive attachment, exact refusal feedback, startup obligations, and accepted-Head projection and prompt safety. Sequentially awaiting a complete block would sacrifice responsiveness. All 1,197 binary tests, affected-package all-target Clippy and build, formatting, and diff checks passed for the cleanup.
 
-### bdaefe6 2026-08-30 aj-app: preserve checkpoint usage dependencies
+### bdaefe6 2026-08-30 aj-app: preserve checkpoint usage dependencies [RETIRED]
 - Stats: 13 files, +275 -71, ~90 prod / ~160 test lines (estimate: session_host.rs +91, lib.rs and events.rs test hunks)
 - Body: empty
-- Verdict: LOOK
-- Why: Adds `prerequisite: Option<AgentEvent>` to `Agent::account_usage` so a usage-accounting function emits an arbitrary event first and suppresses its own update if that fails (lib.rs `account_usage`), plus a `has_usage: bool` on `CompactionEnd` so the reducer knows whether to expect a follow-up event, plus `let _ = handoff.take()` cleanup at the call site (compaction.rs). Three coordinating flags to protect an ordering dependency between two events that only exists because the usage row's identity lived in reducer state. Superseded the same evening by e1139c6.
-- Simpler shape: Put the checkpoint id on the usage event itself (as e1139c6 later did) so there is no ordering dependency to defend.
+- Verdict: Retired by scoped consolidation into one durable `CompactionEnd` containing optional cumulative usage.
+- Why flagged: An arbitrary prerequisite, a usage-presence flag, and manual handoff cleanup defended an ambient usage-row identity. The identity dependency and manual cleanup were replaced before the twelve-commit range landed together. The surviving event pair still required coordinated delivery.
+- Disposition: Summary and usage share the checkpoint tag in live delivery and replay. No event pair or listener cohort is needed. `AppendHandoff` and its owning guard, log lock ordering, and exclusive accounting remain required safeguards.
 
-### e1139c6 2026-08-30 aj-app: preserve committed compaction usage atomically
+### e1139c6 2026-08-30 aj-app: preserve committed compaction usage atomically [RETIRED]
 - Stats: 15 files, +837 -226, ~230 prod / ~560 test lines (estimate: bus.rs, compaction.rs, client.rs, listener.rs test hunks plus session_host.rs)
 - Body: empty
-- Verdict: LOOK
-- Why: Third reshape of the same path in one day. Adds `EventBus::emit_sequence` (stable-cohort delivery of an event pair), `Agent::account_compaction_usage`, `CompactionUsageUpdate.checkpoint_id`, and turns `AppendHandoff` into a token-numbered slot with an `AppendHandoffGuard` Drop impl (listener.rs) to handle cancellation between two emits. Tests include a select!-based cancellation-mid-listener test and a `client.rs` attach-filtering test that replays a 4-frame sequence. This is the reference pattern: a second layer of coordination machinery (cohort semantics, guard tokens) to recover ordering that a single event, or a single durable append followed by one emit, would give for free.
-- Simpler shape: Emit exactly one event per committed checkpoint (`CompactionEnd` carrying the usage and its entry id) so there is no pair to keep atomic and no handoff to guard.
+- Verdict: Retired by scoped consolidation into one durable `CompactionEnd` containing optional cumulative usage.
+- Why flagged: Listener-cohort delivery and independently identified transient usage repaired concrete failures of a split checkpoint event. The repair was part of the same unlanded range, not a separate deployed redesign. Combining the event removes that pairing machinery, but does not remove the handoff's separate durable-position and cancellation responsibilities.
+- Disposition: Summary and usage share the checkpoint tag in live delivery and replay. No event pair or listener cohort is needed. `AppendHandoff` and its owning guard, log lock ordering, and exclusive accounting remain required safeguards.
 
 ### 70e7ee6 2026-08-31 aj-tools: bound direct command reap after sigkill
 - Stats: 2 files, +423 -62, ~150 prod / ~280 test lines (estimate: bash.rs test module +230, session_host.rs +46)
@@ -306,7 +306,7 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 ### 5fc079e 2026-08-31 agent: serialize live usage accounting
 - Stats: 9 files, +465 -182, ~190 prod / ~200 test lines (estimate: lib.rs event_protocol_tests hunk +200; docs excluded)
 - Body: empty
-- Verdict: LOOK
+- Verdict: LOOK. Open: the exclusive accounting API, event-emission guards, and subscription capability remain in place.
 - Why: Fourth reshape of `account_usage` in 27 hours (bf3a5eb -> bdaefe6 -> e1139c6 -> this). Introduces `UsageAccounting { AssistantTerminal, CommittedCompaction { checkpoint_id, reason, tokens_before, tokens_after, summary } }` so the agent constructs `CompactionEnd` itself, makes `account_usage` take `&mut self` for serialization, adds an `EventSubscriptions` capability type so hosts can subscribe without being able to emit, and adds a runtime rejection inside `emit_event` (`"accounting events must be emitted through Agent::account_usage"`) matching on event shape. A runtime guard against misuse of one's own API plus a capability split are parallel abstractions layered on top of the emit_sequence/guard machinery from e1139c6.
 - Simpler shape: One accounting method with one event per committed operation and a doc comment on `emit_event`; serialization comes from the caller already holding the agent lock.
 

@@ -64,8 +64,8 @@ aj-session::replay       replay arm mapping a `Compaction` entry onto
 aj-agent                 generic mechanisms only: `Agent::complete_oneshot`
                          (bus-silent completion), `Agent::reseed_transcript`,
                          and the exclusive `Agent::account_usage` transition;
-                         the `CompactionStart`, `CompactionEnd`, and
-                         `CompactionUsageUpdate` events.
+                         the `CompactionStart`, `CompactionProgress`, and
+                         `CompactionEnd` events.
 
 aj-conf                  `auto_compact` + `compact_threshold` config
                          options; `ValueKind::Number`.
@@ -492,7 +492,6 @@ transition. Its public API is exclusive and typed:
 pub enum UsageAccounting {
     AssistantTerminal,
     CommittedCompaction {
-        checkpoint_id: String,
         reason: CompactionReason,
         tokens_before: u64,
         tokens_after: u64,
@@ -515,17 +514,11 @@ or listener failure cannot erase spend that already happened. Assistant terminal
 select `AssistantTerminal` and emit `UsageUpdate`.
 
 Only a committed checkpoint selects `CommittedCompaction`, after its append
-succeeds. The Agent constructs the successful tagged `CompactionEnd` itself, so
-the caller cannot substitute an arbitrary prerequisite, then delivers it with
-`CompactionUsageUpdate` through one `EventBus::emit_sequence` operation. The bus
-snapshots one listener cohort and gives each listener both events in order before
-advancing to the next. An earlier successful listener therefore keeps the whole
-pair if a later listener rejects the end, and a listener registered between the
-two events does not observe half of the operation. The additive usage event also
-carries the checkpoint's durable id, so attach filtering may retain it without
-its duplicate end and current clients still update the right row. Older clients
-ignore the unknown event instead of treating summarizer input as assistant
-context.
+succeeds. The Agent constructs one successful `CompactionEnd` containing the
+cumulative `TokenUsage` snapshot. The checkpoint's durable tag identifies both
+the summary and its usage. Replay regenerates this same event from the log,
+so attach filtering accepts or discards the checkpoint and its spend together.
+There is no separate transient usage update or paired-event delivery cohort.
 
 ### 6.4 Compaction events
 
@@ -540,34 +533,28 @@ CompactionStart { agent_id: AgentId, reason: CompactionReason },
 /// estimated occupancy on either side (for a "freed ~N tokens"
 /// notice). `summary` is the generated text so the renderer can show
 /// a compaction-summary row live (resume gets it from the log via
-/// replay, §8). Transient — not persisted; the `Compaction` log
-/// entry is the durable record. `error` is set when compaction failed
-/// (e.g. summarizer error) and nothing was written.
+/// replay, §8). A committed checkpoint carries its durable tag and
+/// optional cumulative usage, regenerated from the `Compaction` log entry.
+/// An unsuccessful end is transient, with no usage. `error` is set when
+/// compaction failed (e.g. summarizer error) and nothing was written.
 CompactionEnd {
     agent_id: AgentId,
     reason: CompactionReason,
     tokens_before: u64,
     tokens_after: u64,
-    /// Whether a checkpoint-owned CompactionUsageUpdate follows this event.
-    has_usage: bool,
+    /// Cumulative checkpoint spend. Absence means unknown, not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<TokenUsage>,
     summary: Option<String>,
     error: Option<String>,
-},
-
-/// Cumulative spend for one committed checkpoint. `checkpoint_id` is the
-/// durable Compaction entry this transient update reports on.
-CompactionUsageUpdate {
-    agent_id: AgentId,
-    checkpoint_id: String,
-    usage: TokenUsage,
 },
 ```
 
 `CompactionReason` is `Manual | Threshold | Overflow` (serde
 `snake_case`). The host owns orchestration and emits `CompactionStart`,
 `CompactionProgress`, and unsuccessful `CompactionEnd` through the Agent's
-non-accounting `emit_event` passthrough. A successful checkpoint end and both
-usage-update variants are rejected there and belong only to the exclusive
+non-accounting `emit_event` passthrough. A successful checkpoint end, any end
+carrying usage, and `UsageUpdate` are rejected there and belong only to the exclusive
 `Agent::account_usage` transition. Components that need to observe events after
 the Agent is shared retain an `EventSubscriptions` capability, not an emitter.
 Concretely we reuse the pump path (`world.pump.handle(tui, &event)`) for the live
@@ -665,13 +652,16 @@ Steps:
    (now compaction-aware) → `reseed_transcript(...)` on the borrowed
    agent, trimming a trailing failed assistant (below).
 6. Compute `tokens_after` (occupancy of the reseeded projection), file the
-   checkpoint's append handoff under an owning guard, then pass its id, terminal
-   fields, and `summarizer_usage` through
+   checkpoint's `AppendHandoff` under its owning guard while holding the log
+   lock. Keep publication under that same log guard so a concurrent append
+   cannot publish a higher sequence first. Listeners must not acquire the log
+   lock for `CompactionEnd`. Pass the terminal fields and `summarizer_usage` through
    `Agent::account_usage(CommittedCompaction { .. })`. Accounting is folded
-   synchronously before the first listener await. The Agent constructs the
-   successful `CompactionEnd`; one stable-cohort bus operation emits it followed
-   by one cumulative self-identifying `CompactionUsageUpdate`. Dropping the
-   in-flight future clears an unconsumed handoff through its owner guard.
+   synchronously before the first listener await. The Agent emits one successful
+   `CompactionEnd` containing the cumulative usage. Persistence consumes the
+   handoff to tag that event with the committed checkpoint's identity and position.
+   Dropping the in-flight future clears an unconsumed handoff through its owner
+   guard, without clearing another append's handoff or erasing committed spend.
 7. Return `Compacted { tokens_before, tokens_after, summary }`.
 
 Cancellation (`cancel`) is selected against the `complete_oneshot`
@@ -863,19 +853,19 @@ this session" entry point is needed.
 
 `replay` (`aj-session/src/replay.rs`) maps each persisted entry onto
 renderer events so a resumed session looks like a live one. The
-`Compaction` arm of `ReplayState::project_entry` emits:
+`Compaction` arm of `ReplayState::project_entry` emits one durable
+`CompactionEnd { reason: Manual, tokens_before, tokens_after, usage,
+summary: Some(summary), error: None }`. Its `tokens_after` is
+`estimate_conversation_context` of the user thread linearized up to the
+compaction (the reduced projection's occupancy). The retained tail's usage
+is stale, so this keeps a resumed footer from showing pre-compaction occupancy.
 
-- `CompactionEnd { reason: Manual, tokens_before, tokens_after, has_usage,
-  summary: Some(summary), error: None }`, where `tokens_after` is
-  `estimate_conversation_context` of the user thread linearized up to the
-  compaction (the reduced projection's occupancy). The retained tail's usage
-  is stale, so this keeps a resumed footer from showing pre-compaction
-  occupancy.
-- One transient cumulative `CompactionUsageUpdate` when the checkpoint's `usage` is
-  `Some`. It carries the checkpoint entry id, the replay accumulator before the
-  compaction, and the checkpoint delta, then advances that accumulator. Legacy `usage: None`
-  sets `has_usage: false` and projects no spend, so stale-cursor replay leaves
-  the preceding accounted source intact.
+When the checkpoint's persisted `usage` is `Some`, the event's optional
+`TokenUsage` contains the replay accumulator before the compaction and the
+checkpoint delta, then replay advances that accumulator. A legacy checkpoint
+with `usage: None` projects `usage: None`, not fabricated zero spend, and leaves
+the preceding accounted source intact. Summary and usage share one durable tag
+in live delivery and replay, with no separate transient update.
 
 Crucially, replay's other arms are unaffected: the summarized prefix
 entries are still in the log and `replay` still walks them in order, so
@@ -887,9 +877,8 @@ replay `Compaction` row marks the boundary in the scrollback.
 
 The checkpoint usage row is keyed directly by the event's durable compaction id,
 not by ambient reducer state or the preceding assistant. Re-serving an older
-cursor, retaining a transient duplicate after filtering its durable end, or
-rebuilding from a fresh epoch therefore updates that row rather than duplicating
-it or overwriting later assistant usage.
+cursor or rebuilding from a fresh epoch therefore updates that row rather than
+duplicating it or overwriting later assistant usage.
 
 ## 9. Configuration
 

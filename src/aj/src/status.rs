@@ -406,7 +406,7 @@ mod tests {
                 reason: CompactionReason::Manual,
                 tokens_before: 100,
                 tokens_after: 50,
-                has_usage: false,
+                usage: None,
                 summary: Some("s".into()),
                 error: None,
             },

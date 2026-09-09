@@ -222,13 +222,7 @@
     "reason": "overflow",
     "tokens_before": 1000,
     "tokens_after": 250,
-    "has_usage": true,
-    "summary": "summary"
-  },
-  {
-    "type": "compaction_usage_update",
-    "agent_id": "main",
-    "checkpoint_id": "checkpoint-usage-1",
+    "summary": "summary",
     "usage": {
       "accumulated_input": 10,
       "turn_input": 20,
