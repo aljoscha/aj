@@ -3871,7 +3871,7 @@ async fn apply_command_action(
                         filter_key: format!(
                             "{id} {name} Unnamed account existing credential reauthenticate"
                         ),
-                        summary: Some("log in again and replace the bare credential".to_string()),
+                        summary: Some("log in again and replace this account".to_string()),
                     }),
                     Some(StoredProviderCredentials::Accounts(set)) => {
                         rows.extend(set.accounts.into_iter().map(|(account_label, _)| {
@@ -3883,7 +3883,7 @@ async fn apply_command_action(
                             };
                             AuthRow {
                                 request: AuthPickerRequest::ApplyAccount(action),
-                                label: format!("{name} — {shown}"),
+                                label: format!("{name} · {shown}"),
                                 filter_key: format!("{id} {name} {search} reauthenticate"),
                                 summary: Some("log in again and replace this account".to_string()),
                             }
@@ -3951,7 +3951,7 @@ async fn apply_command_action(
                             };
                             AuthRow {
                                 request: AuthPickerRequest::ApplyAccount(action),
-                                label: format!("{id} — {shown}"),
+                                label: format!("{id} · {shown}"),
                                 filter_key: format!("{id} {search}"),
                                 summary: Some(format!("remove this {suffix}")),
                             }
@@ -4004,9 +4004,9 @@ async fn apply_command_action(
                     AuthRow {
                         request: AuthPickerRequest::ApplyAccount(action),
                         label: if is_current {
-                            format!("{id} — {shown} (current)")
+                            format!("{id} · {shown} (current)")
                         } else {
-                            format!("{id} — {shown}")
+                            format!("{id} · {shown}")
                         },
                         filter_key: format!("{id} {search}"),
                         summary: None,
@@ -14360,6 +14360,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_labels_render_consistently_before_and_after_adding_an_account() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        let provider = "anthropic";
+        let (_, name) = world
+            .auth
+            .oauth_provider_ids()
+            .await
+            .into_iter()
+            .find(|(id, _)| id == provider)
+            .expect("OAuth provider");
+        world
+            .auth
+            .insert_bare(
+                provider,
+                AuthCredential::OAuth(OAuthCredentials::new(
+                    "fake-refresh",
+                    "fake-access",
+                    i64::MAX,
+                )),
+            )
+            .await
+            .unwrap();
+
+        for grown in [false, true] {
+            if grown {
+                world
+                    .auth
+                    .insert_account(
+                        provider,
+                        "work",
+                        AuthCredential::ApiKey {
+                            key: "fake-work-key".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let statuses = aj_app::auth::collect_statuses(&world.auth).await;
+            let unnamed = statuses
+                .iter()
+                .find(|status| {
+                    status.provider_id == provider
+                        && status.account_label.as_deref().is_none_or(str::is_empty)
+                })
+                .unwrap();
+            assert_eq!(unnamed.summary, format!("subscription · {name}"));
+
+            for (action, prefix) in [
+                (CommandAction::OpenLoginSelector, name.as_str()),
+                (CommandAction::OpenLogoutSelector, provider),
+                (CommandAction::OpenDefaultAccountSelector, provider),
+            ] {
+                assert!(matches!(
+                    apply_command(&mut world, &shell, action).await,
+                    ActionEffect::OpenedOverlay
+                ));
+                focus_overlay(&mut app, &root);
+                let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+                assert!(
+                    painted.contains(&format!("{prefix} · Unnamed account")),
+                    "{painted}"
+                );
+                if grown {
+                    assert!(painted.contains(&format!("{prefix} · work")), "{painted}");
+                }
+                assert!(!painted.contains("bare credential"), "{painted}");
+                press(&mut app, &mut writer, b"\x1b").await;
+                assert_eq!(shell.borrow().overlays.borrow().depth(), 0);
+            }
+        }
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
     async fn auth_fetch_aligns_accounts_with_the_shells_active_width_method() {
         let dir = TempDir::new().expect("tempdir");
         let (world, shell) = world_and_shell(&dir, "streaming-text").await;
@@ -15095,7 +15171,7 @@ mod tests {
         let picker = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(picker.contains("Default account"), "{picker}");
         assert!(
-            picker.contains("provider — personal (current)"),
+            picker.contains("provider · personal (current)"),
             "current default is visible and tagged: {picker}"
         );
         assert!(!picker.contains("current default account"), "{picker}");

@@ -92,7 +92,7 @@ pub async fn provider_status(
         }
         Ok(Some(AuthCredential::OAuth(creds))) => {
             let summary = match oauth_name {
-                Some(name) => format!("subscription — {name}"),
+                Some(name) => format!("subscription · {name}"),
                 None => "subscription".to_string(),
             };
             return ProviderAuthStatus {
@@ -155,7 +155,7 @@ fn account_status(
         AuthCredential::ApiKey { .. } => ("API key (stored)".to_string(), None),
         AuthCredential::OAuth(creds) => {
             let summary = oauth_name
-                .map(|name| format!("subscription — {name}"))
+                .map(|name| format!("subscription · {name}"))
                 .unwrap_or_else(|| "subscription".to_string());
             (
                 summary,
