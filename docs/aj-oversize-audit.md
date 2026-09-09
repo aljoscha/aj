@@ -6,10 +6,11 @@ from `b787396` (2026-08-03, "add remote control wire foundations") to `1e20fcf`
 non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 101 in total. Each was read by an auditor against the engineering standard
 (smallest coherent solution, fewer concepts, natural boundary, no parallel
-abstractions, tests at the stable boundary). Reference case: `c4b977b`.
+abstractions, tests at the stable boundary). Reference case at audit time:
+`c4b977b` (retired below).
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 20 LOOKs.
+retired 21 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +30,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 7 open)
+## LOOK (27 total, 6 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -53,7 +54,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`317c06c` 2026-08-30 session: implement crash-safe environment publication~~ Retired: RTK runs its hook answer unchanged, without PATH defenses or helper-specific teardown machinery. Transactional log publication and global CLI aggregation remain.
 - ~~`48c07a9` 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account~~ Retired: ordinary label validation and direct picker actions replace the Unicode and inspection machinery. Reauthentication uses one request path, and account presentation uses one formatter.
 - ~~`854f4a7` 2026-08-30 usage: mark undisclosed provider totals partial~~ Retired without code changes: latest-turn and cumulative completeness serve distinct views, with one provider-owned fact propagated through existing snapshots. No worthwhile simplification identified.
-- `c4b977b` 2026-08-30 aj-app,aj: keep failed transitions on the selected session
+- ~~`c4b977b` 2026-08-30 aj-app,aj: keep failed transitions on the selected session~~ Retired: redundant recovery error plumbing is removed. Responsive one-stream transitions, target-specific success, and forward branch recovery remain intact.
 - `bdaefe6` 2026-08-30 aj-app: preserve checkpoint usage dependencies
 - `e1139c6` 2026-08-30 aj-app: preserve committed compaction usage atomically
 - `70e7ee6` 2026-08-31 aj-tools: bound direct command reap after sigkill
@@ -266,12 +267,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: A large cross-crate diff with apparently duplicated sticky state. The footer replaces its latest-turn value rather than accumulating it, and `ContextUsage` is a returned view. The separate truncating formatter was removed before the seven-commit range landed. Current reducer arms distinguish assistant occupancy from compaction spend without the tagged-event guard.
 - Disposition: Keep production and tests. The shared anchor predicate prevents incomplete usage from becoming an exact context estimate. Ordinary token formatting remains shared. All 479 provider-library tests, 17 targeted app/session tests, and the export smoke test passed, covering provider evidence, persistence, replay, compatibility, aggregation, context planning, and rendering.
 
-### c4b977b 2026-08-30 aj-app,aj: keep failed transitions on the selected session
+### c4b977b 2026-08-30 aj-app,aj: keep failed transitions on the selected session [RETIRED]
+- Status: Retired after `0df31d99` removed the unused outer recovery Result and unreachable remote retry after local-handle failure. Transition behavior is unchanged.
 - Stats: 4 files, +2732 -869, ~1100 prod / ~1600 test lines (estimate: hunks past `mod tests` at interactive.rs:7746 and client.rs:1043)
 - Body: empty
-- Verdict: LOOK
-- Why: Reference case. Modest outcome (failed switch keeps target selected and toasts) delivered by re-platforming every session switch onto the lost-stream recovery machine, with seven new types (`PendingTransition`, `PendingStartup`, `TransitionFailure`, `ResumeAdvance`, `ForwardReset`, `AttachStall`, `RecoveryRows`) and eight copies of the "until the selected session finishes attaching" gate across handlers. ~1400 test lines, many pinning internal sequencing.
-- Simpler shape: Keep the sequential switch and, on failure, leave the selection pointer where it is and post the toast, instead of introducing a pending-transition state machine.
+- Verdict: Retired after a scoped error-handling cleanup. The selected-target failure behavior was explicitly chosen, replacing an unlanded exact-preservation transaction. Existing loop-driven attachment keeps input and painting responsive while success waits for the target's own Caught.
+- Why flagged: A broad empty-body commit with seven new types and repeated admission gates. The types separate recovery, one-shot action feedback, and session-owned startup or projection obligations rather than defining seven recovery machines. `a7c9c4cc` centralized the gates and identical constructors, `d3436240` removed duplicated connection state, and `225ee03b` restored already-served view swaps.
+- Disposition: Keep responsive attachment, exact refusal feedback, startup obligations, and accepted-Head projection and prompt safety. Sequentially awaiting a complete block would sacrifice responsiveness. All 1,197 binary tests, affected-package all-target Clippy and build, formatting, and diff checks passed for the cleanup.
 
 ### bdaefe6 2026-08-30 aj-app: preserve checkpoint usage dependencies
 - Stats: 13 files, +275 -71, ~90 prod / ~160 test lines (estimate: session_host.rs +91, lib.rs and events.rs test hunks)
