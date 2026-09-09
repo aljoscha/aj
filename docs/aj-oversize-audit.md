@@ -10,7 +10,7 @@ abstractions, tests at the stable boundary). Reference case at audit time:
 `c4b977b` (retired below).
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 23 LOOKs.
+retired 24 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -30,7 +30,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 4 open)
+## LOOK (27 total, 3 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -57,7 +57,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`c4b977b` 2026-08-30 aj-app,aj: keep failed transitions on the selected session~~ Retired: redundant recovery error plumbing is removed. Responsive one-stream transitions, target-specific success, and forward branch recovery remain intact.
 - ~~`bdaefe6` 2026-08-30 aj-app: preserve checkpoint usage dependencies~~ Retired: committed compaction publishes one durable event containing optional usage, with append handoff and exclusive accounting safeguards retained.
 - ~~`e1139c6` 2026-08-30 aj-app: preserve committed compaction usage atomically~~ Retired: committed compaction publishes one durable event containing optional usage, with append handoff and exclusive accounting safeguards retained.
-- `70e7ee6` 2026-08-31 aj-tools: bound direct command reap after sigkill
+- ~~`70e7ee6` 2026-08-31 aj-tools: bound direct command reap after sigkill~~ Retired without code changes: the existing process guard owns bounded reap and resource release, while capture joins distinguish intentional cancellation from real failure. No worthwhile simplification identified.
 - `be726be` 2026-08-31 aj-wire: reject unknown command fields
 - `5fc079e` 2026-08-31 agent: serialize live usage accounting
 - `fe5d661` 2026-09-01 aj-models: make auth hardening guarantees load-bearing
@@ -289,12 +289,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: Listener-cohort delivery and independently identified transient usage repaired concrete failures of a split checkpoint event. The repair was part of the same unlanded range, not a separate deployed redesign. Combining the event removes that pairing machinery, but does not remove the handoff's separate durable-position and cancellation responsibilities.
 - Disposition: Summary and usage share the checkpoint tag in live delivery and replay. No event pair or listener cohort is needed. `AppendHandoff` and its owning guard, log lock ordering, and exclusive accounting remain required safeguards.
 
-### 70e7ee6 2026-08-31 aj-tools: bound direct command reap after sigkill
-- Stats: 2 files, +423 -62, ~150 prod / ~280 test lines (estimate: bash.rs test module +230, session_host.rs +46)
+### 70e7ee6 2026-08-31 aj-tools: bound direct command reap after sigkill [RETIRED]
+- Status: Retired without code changes. The existing process guard retains child, capture, and cleanup ownership across the bounded reap, then releases them without another suspension point. Ordinary TERM grace and reaping remain intact.
+- Stats: 2 files, +423 -62. Production +146/-52, tests +277/-10, including comments and blank lines.
 - Body: empty
-- Verdict: LOOK
-- Why: For the edge case "leader stays unreapable after SIGKILL", the change adds `ProcessTermination { Reaped, OwnershipReleased }`, `CaptureEnd::ReapReleased`, `ProcessGuard::terminate_user_command`, and threads a `reader_cancellation_expected: bool` through `drain_capture` -> `drain_round` -> `await_reader` only to suppress a JoinError log, then overrides the drain result afterwards (`let capture_end = if capture_released { ReapReleased } else { capture_end }`) at both call sites (bash.rs execute and `drive_background_bash`). Two ~100-line tests drive a real D-state-like child.
-- Simpler shape: When the bounded reap fails, release the guard and skip `drain_capture` entirely, returning `ReapReleased` directly, so no flag has to travel through three drain functions.
+- Verdict: Retired after investigation. Bounded command cleanup and accurate incomplete-output reporting are proportionate to the feature. No worthwhile simplification identified.
+- Why flagged: A rare unavailable-reap case acquired result types and cancellation plumbing through the capture drain. The flag prevents a model-facing false capture failure, not merely a log message. Tokio abortion schedules cancellation rather than completing it, so skipping the drain would also discard bounded reader joins and their failure observation. The fixtures safely model an unavailable reap with a live child and nonexistent recorded process group, not a real kernel D-state.
+- Disposition: Keep production and tests. Process ownership, background completion notices, and composed session-lock release are distinct boundaries. RTK retains only its basic optional rewrite hook, without helper-specific teardown. All eight focused reap, cancellation, timeout, capture-error, and host-drop checks passed.
 
 ### be726be 2026-08-31 aj-wire: reject unknown command fields
 - Stats: 9 files, +1495 -116, ~450 prod / ~950 test lines (estimate: wire.rs +157, gateway/tests.rs +366, remote/tests.rs +444 are test files)
