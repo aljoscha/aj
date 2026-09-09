@@ -10,7 +10,7 @@ abstractions, tests at the stable boundary). Reference case at audit time:
 `c4b977b` (retired below).
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired all 27 LOOKs.
+retired all 27 LOOKs and all 43 MAYBEs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -62,53 +62,58 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`5fc079e` 2026-08-31 agent: serialize live usage accounting~~ Retired without further code changes: one exclusive accounting operation publishes one complete event, and subscription-only access shares the existing bus. No worthwhile simplification identified.
 - ~~`fe5d661` 2026-09-01 aj-models: make auth hardening guarantees load-bearing~~ Retired by `9a0a3ae1`: credential writes have one writer path, with temporal permissions and failure atomicity covered through AuthStorage rather than duplicate helper tests.
 
-## MAYBE (43)
+## MAYBE (43 total, 0 open)
 
-Large but plausibly proportionate, with one specific thing worth a second look.
+Retired after a lightweight sweep against `35113366`, without further code
+changes. The sweep compared original changes and available work records with
+current implementation and test boundaries. No substantial behavior-preserving
+simplification remained. Small unused protocol vocabulary, fixture duplication,
+and oracle limitations do not justify reopening these oversized-change concerns.
+This was a source investigation, not a fresh executable correctness gate.
 
-- `004dc2e` 2026-08-03 aj-app: close the host's ordering and teardown edges
-- `0234e5d` 2026-08-03 aj-app,aj: rest reducer catch-up on idempotent application
-- `b787396` 2026-08-03 aj-agent,aj-wire,docs: add remote control wire foundations
-- `bc94ef0` 2026-08-03 aj-app: lock a session before its log is read, and derive live subs from finished ones
-- `cfabd6a` 2026-08-03 aj-session,aj-app: key durable tagging per run and per append
-- `8c04079` 2026-08-04 aj-agent,aj-wire,aj-app,aj: prepare the phase 2 transport boundary
-- `d39d48a` 2026-08-04 aj: run the TUI against a remote host
-- `0542858` 2026-08-05 aj-app,aj-session: release a session the moment nothing needs it
-- `a812f97` 2026-08-06 aj-app,aj-session,aj-wire: build a directory row from a stat, not from a log
-- `c207347` 2026-08-06 aj-app,aj: switch sessions by swapping, not rebuilding
-- `c45a206` 2026-08-06 aj-session,aj-app,aj: make the id-gate tests back their claims
-- `180f147` 2026-08-07 aj: give the session sidebar pointer gestures
-- `84fa171` 2026-08-11 aj,aj-app,aj-conf: aggregate hosts behind aj gateway
-- `f73c6a3` 2026-08-11 aj-wire,aj: a create names the host it is for
-- `4bdc6d6` 2026-08-12 aj-app,aj: give the canonical form a convergent tier
-- `64bd1e6` 2026-08-12 aj: a configured host's id is provisional, a dynamic one's is the record
-- `65473dc` 2026-08-12 aj: draw a host the peer holds no rows for as an empty group
-- `7cead11` 2026-08-13 aj,aj-app,docs: refuse a --host that names nothing, and say when it went unused
-- `dbdc5ad` 2026-08-13 aj,aj-app: ask which host a create is for
-- `6d704ae` 2026-08-14 aj,aj-app: put a session away, and show it again
-- `86d366f` 2026-08-14 aj-app,aj: archive a session from the host and the control port
-- `b97dd9e` 2026-08-14 aj,aj-app,docs: bound a host's share of the sidebar, and hold it still
-- `0765d8b` 2026-08-19 aj: a gateway learns a host's name, keeps it, and republishes it
-- `57db2b1` 2026-08-19 aj,aj-app: bound the wait for an attach block that never comes
-- `86c76ed` 2026-08-19 aj,aj-app: stop asking after a refused attach, rejoin when the row returns
-- `b68b4ec` 2026-08-19 aj: fold a catch-up from the drive loop instead of parking it
-- `9705a42` 2026-08-23 aj-wire,aj-app: publish the locked row bit
-- `0d705c6` 2026-08-24 aj-tools: pin what a cancelled turn does to a command's processes
-- `0c8b2a9` 2026-08-25 aj-models: labeled credentials per provider in the auth store
-- `c94f2d9` 2026-08-25 aj-app,aj,docs: re-ask a locked refusal when the rival lets go
-- `cb3730a` 2026-08-26 aj-app: pin detached sub-agent cancel routing
-- `cd18620` 2026-08-26 aj-agent,aj-models,aj-app: preserve disclosed facts when cancelling a turn
-- `34dd548` 2026-08-27 aj-agent,aj-tools: overlay session env on tool subshells
-- `b2f9b51` 2026-08-28 aj-app,aj: show session environment in info
-- `a28b751` 2026-08-29 aj-models,aj-app: pin openai terminal retry boundaries
-- `bf3a5eb` 2026-08-30 aj-app: account committed compaction usage live
-- `8bf9e0a` 2026-08-31 aj: close account login composition gaps
-- `0bd1045` 2026-08-31 session, aj-app: fuse logs after persistence failures
-- `763c87b` 2026-08-31 models: preserve cancellation priority before request issuance
-- `26a2f6a` 2026-08-31 aj-app: close compaction accounting evidence gaps
-- `7c71560` 2026-08-31 aj-models: write auth storage atomically
-- `882ef4d` 2026-09-01 aj: follow the focused host working directory
-- `c056f34` 2026-09-01 tools: use absolute gutters for read file output
+- ~~`004dc2e` 2026-08-03 aj-app: close the host's ordering and teardown edges~~ Retired without further code changes.
+- ~~`0234e5d` 2026-08-03 aj-app,aj: rest reducer catch-up on idempotent application~~ Retired without further code changes.
+- ~~`b787396` 2026-08-03 aj-agent,aj-wire,docs: add remote control wire foundations~~ Retired without further code changes.
+- ~~`bc94ef0` 2026-08-03 aj-app: lock a session before its log is read, and derive live subs from finished ones~~ Retired without further code changes.
+- ~~`cfabd6a` 2026-08-03 aj-session,aj-app: key durable tagging per run and per append~~ Retired without further code changes.
+- ~~`8c04079` 2026-08-04 aj-agent,aj-wire,aj-app,aj: prepare the phase 2 transport boundary~~ Retired without further code changes.
+- ~~`d39d48a` 2026-08-04 aj: run the TUI against a remote host~~ Retired without further code changes.
+- ~~`0542858` 2026-08-05 aj-app,aj-session: release a session the moment nothing needs it~~ Retired without further code changes.
+- ~~`a812f97` 2026-08-06 aj-app,aj-session,aj-wire: build a directory row from a stat, not from a log~~ Retired without further code changes.
+- ~~`c207347` 2026-08-06 aj-app,aj: switch sessions by swapping, not rebuilding~~ Retired without further code changes.
+- ~~`c45a206` 2026-08-06 aj-session,aj-app,aj: make the id-gate tests back their claims~~ Retired without further code changes.
+- ~~`180f147` 2026-08-07 aj: give the session sidebar pointer gestures~~ Retired without further code changes.
+- ~~`84fa171` 2026-08-11 aj,aj-app,aj-conf: aggregate hosts behind aj gateway~~ Retired without further code changes.
+- ~~`f73c6a3` 2026-08-11 aj-wire,aj: a create names the host it is for~~ Retired without further code changes.
+- ~~`4bdc6d6` 2026-08-12 aj-app,aj: give the canonical form a convergent tier~~ Retired without further code changes.
+- ~~`64bd1e6` 2026-08-12 aj: a configured host's id is provisional, a dynamic one's is the record~~ Retired without further code changes.
+- ~~`65473dc` 2026-08-12 aj: draw a host the peer holds no rows for as an empty group~~ Retired without further code changes.
+- ~~`7cead11` 2026-08-13 aj,aj-app,docs: refuse a --host that names nothing, and say when it went unused~~ Retired without further code changes.
+- ~~`dbdc5ad` 2026-08-13 aj,aj-app: ask which host a create is for~~ Retired without further code changes.
+- ~~`6d704ae` 2026-08-14 aj,aj-app: put a session away, and show it again~~ Retired without further code changes.
+- ~~`86d366f` 2026-08-14 aj-app,aj: archive a session from the host and the control port~~ Retired without further code changes.
+- ~~`b97dd9e` 2026-08-14 aj,aj-app,docs: bound a host's share of the sidebar, and hold it still~~ Retired without further code changes.
+- ~~`0765d8b` 2026-08-19 aj: a gateway learns a host's name, keeps it, and republishes it~~ Retired without further code changes.
+- ~~`57db2b1` 2026-08-19 aj,aj-app: bound the wait for an attach block that never comes~~ Retired without further code changes.
+- ~~`86c76ed` 2026-08-19 aj,aj-app: stop asking after a refused attach, rejoin when the row returns~~ Retired without further code changes.
+- ~~`b68b4ec` 2026-08-19 aj: fold a catch-up from the drive loop instead of parking it~~ Retired without further code changes.
+- ~~`9705a42` 2026-08-23 aj-wire,aj-app: publish the locked row bit~~ Retired without further code changes.
+- ~~`0d705c6` 2026-08-24 aj-tools: pin what a cancelled turn does to a command's processes~~ Retired without further code changes.
+- ~~`0c8b2a9` 2026-08-25 aj-models: labeled credentials per provider in the auth store~~ Retired without further code changes.
+- ~~`c94f2d9` 2026-08-25 aj-app,aj,docs: re-ask a locked refusal when the rival lets go~~ Retired without further code changes.
+- ~~`cb3730a` 2026-08-26 aj-app: pin detached sub-agent cancel routing~~ Retired without further code changes.
+- ~~`cd18620` 2026-08-26 aj-agent,aj-models,aj-app: preserve disclosed facts when cancelling a turn~~ Retired without further code changes.
+- ~~`34dd548` 2026-08-27 aj-agent,aj-tools: overlay session env on tool subshells~~ Retired without further code changes.
+- ~~`b2f9b51` 2026-08-28 aj-app,aj: show session environment in info~~ Retired without further code changes.
+- ~~`a28b751` 2026-08-29 aj-models,aj-app: pin openai terminal retry boundaries~~ Retired without further code changes.
+- ~~`bf3a5eb` 2026-08-30 aj-app: account committed compaction usage live~~ Retired without further code changes.
+- ~~`8bf9e0a` 2026-08-31 aj: close account login composition gaps~~ Retired without further code changes.
+- ~~`0bd1045` 2026-08-31 session, aj-app: fuse logs after persistence failures~~ Retired without further code changes.
+- ~~`763c87b` 2026-08-31 models: preserve cancellation priority before request issuance~~ Retired without further code changes.
+- ~~`26a2f6a` 2026-08-31 aj-app: close compaction accounting evidence gaps~~ Retired without further code changes.
+- ~~`7c71560` 2026-08-31 aj-models: write auth storage atomically~~ Retired without further code changes.
+- ~~`882ef4d` 2026-09-01 aj: follow the focused host working directory~~ Retired without further code changes.
+- ~~`c056f34` 2026-09-01 tools: use absolute gutters for read file output~~ Retired without further code changes.
 
 ## LOOK, details
 
@@ -324,261 +329,304 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 
 ## MAYBE, details
 
-### 004dc2e 2026-08-03 aj-app: close the host's ordering and teardown edges
+### 004dc2e 2026-08-03 aj-app: close the host's ordering and teardown edges [RETIRED]
+- Status: Retired without further code changes. The unnecessary boundary reset is gone. Remaining event-ordering and failed-command safeguards are local correctness measures.
 - Stats: 5 files, +531 -76, ~105 prod / ~426 test lines (estimate: added lines after `#[cfg(test)] mod tests` in fanout.rs plus tests/session_host.rs)
 - Body: four ordering/teardown fixes from a review pass over the host, plus a blank-prompt refusal
-- Verdict: MAYBE
-- Why: A "fixes from the review pass" bundle: settings-notice splice position, head-switch queue clearing, boundary reset vs in-flight attach, leaked cancel entry, plus an unrelated blank-prompt refusal. Production delta is small and each fix is local. The 225 lines of unit tests in `host/fanout.rs` (`an_attach_block_flushes_held_frames_against_its_boundary`, `resetting_boundaries_leaves_an_in_flight_attach_alone`) pin a `pub(crate)` module's delivery rules directly rather than the host's observable stream, worth checking they survive a fan-out redesign.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: A "fixes from the review pass" bundle: settings-notice splice position, head-switch queue clearing, boundary reset vs in-flight attach, leaked cancel entry, plus an unrelated blank-prompt refusal. Production delta is small and each fix is local. The 225 lines of unit tests in `host/fanout.rs` (`an_attach_block_flushes_held_frames_against_its_boundary`, `resetting_boundaries_leaves_an_in_flight_attach_alone`) pin a `pub(crate)` module's delivery rules directly rather than the host's observable stream, worth checking they survive a fan-out redesign.
 
-### 0234e5d 2026-08-03 aj-app,aj: rest reducer catch-up on idempotent application
+### 0234e5d 2026-08-03 aj-app,aj: rest reducer catch-up on idempotent application [RETIRED]
+- Status: Retired without further code changes. Durable-origin reduction is proportionate. The canonical projection has concrete observers, and its remaining index-target limitation does not establish a substantial simplification.
 - Stats: 12 files, +1732 -606, ~690 prod / ~1040 test lines (estimate: reducer.rs test module ~900 added lines plus test_support.rs)
 - Body: re-attach backfill re-applies part of a log entry regardless of cursor, so every durable-derived reducer effect must be idempotent; keys effects on the log entry id
-- Verdict: MAYBE
-- Why: Second same-day pass over the problem c4cef46 opened (c4cef46 kept `CompactionEnd` and notices append-only, this reverses that; it also deletes the `pending_task_cells` linkage map and the `TaskInfo` cell snapshot). The `reduce(entry: Option<String>, ...)` signature and the origin helpers (`usage_origin`, `notice_origin`, `compaction_origin`, `indexed_row`) are proportionate to a spec-mandated invariant. The thing to look at is `test_support::CanonicalState` (+223 here, +265 in c4cef46): a hand-maintained parallel projection of `ChatState` that has to be extended every time the model grows a field, or the equivalence tests go blind.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Second same-day pass over the problem c4cef46 opened (c4cef46 kept `CompactionEnd` and notices append-only, this reverses that; it also deletes the `pending_task_cells` linkage map and the `TaskInfo` cell snapshot). The `reduce(entry: Option<String>, ...)` signature and the origin helpers (`usage_origin`, `notice_origin`, `compaction_origin`, `indexed_row`) are proportionate to a spec-mandated invariant. The thing to look at is `test_support::CanonicalState` (+223 here, +265 in c4cef46): a hand-maintained parallel projection of `ChatState` that has to be extended every time the model grows a field, or the equivalence tests go blind.
 
-### b787396 2026-08-03 aj-agent,aj-wire,docs: add remote control wire foundations
+### b787396 2026-08-03 aj-agent,aj-wire,docs: add remote control wire foundations [RETIRED]
+- Status: Retired without further code changes. Raw-preserving codecs serve gateway forwarding. The unused VM vocabulary is small residue, not a substantial mechanism-removal opportunity.
 - Stats: 12 files, +1815 -11, ~853 prod / ~962 test lines (estimate: tests/wire.rs and JSON fixtures counted as test)
 - Body: empty
-- Verdict: MAYBE
-- Why: Empty body on a +1815 change that introduces a new crate. Content is spec-driven protocol models plus a forwarding-tolerant codec (`DecodedAgentEvent`/`DecodedKnown` retaining raw JSON, `RawObject`, `FrameRef`, `MetadataField`, hand-written `Serialize for Frame`), which the later gateway does use. `Frame::Vms`, `VmSummary`, `VmList`, `VmStatus` still have no producer anywhere outside tests on today's main, so that part was speculative.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Empty body on a +1815 change that introduces a new crate. Content is spec-driven protocol models plus a forwarding-tolerant codec (`DecodedAgentEvent`/`DecodedKnown` retaining raw JSON, `RawObject`, `FrameRef`, `MetadataField`, hand-written `Serialize for Frame`), which the later gateway does use. `Frame::Vms`, `VmSummary`, `VmList`, `VmStatus` still have no producer anywhere outside tests on today's main, so that part was speculative.
 
-### bc94ef0 2026-08-03 aj-app: lock a session before its log is read, and derive live subs from finished ones
+### bc94ef0 2026-08-03 aj-app: lock a session before its log is read, and derive live subs from finished ones [RETIRED]
+- Status: Retired without further code changes. Lock-before-build and finished-run tracking protect distinct materialization and append-ordering contracts. No redundant lifecycle owner was identified.
 - Stats: 6 files, +486 -46, ~138 prod / ~348 test lines (estimate: tests/session_host.rs)
 - Body: materialization fixes (lock before build, terminal shutdown, dirty on materialize, drop warning) and inverting the live-sub set to a finished-sub set
-- Verdict: MAYBE
-- Why: Five distinct fixes in one commit, four of them under a "Materialization fixes" bullet list. The finished-set inversion (`host.rs` tracking "seen finish" and deriving live) is a knowingly accepted heuristic that trades a fabricated conclusion for a bracket left open too long, worth a second look as the sub-agent projection gets more callers.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Five distinct fixes in one commit, four of them under a "Materialization fixes" bullet list. The finished-set inversion (`host.rs` tracking "seen finish" and deriving live) is a knowingly accepted heuristic that trades a fabricated conclusion for a bracket left open too long, worth a second look as the sub-agent projection gets more callers.
 
-### cfabd6a 2026-08-03 aj-session,aj-app: key durable tagging per run and per append
+### cfabd6a 2026-08-03 aj-session,aj-app: key durable tagging per run and per append [RETIRED]
+- Status: Retired without further code changes. The append handoff carries exact identity through emission under the log guard. Returning it after emission would not preserve the ordering contract.
 - Stats: 8 files, +1471 -326, ~376 prod / ~1095 test lines (estimate: replay.rs and listener.rs test modules, compaction.rs race test)
 - Body: two ordering bugs in the durable-event seam (single open bracket force-closed per transition, `CompactionEnd` tagged after the guard dropped), plus cursor-beyond-last fix and type unification
-- Verdict: MAYBE
-- Why: Per-run `OpenRun` bracketing and merging `ProjectedEvent`/`PersistedEvent` into `TaggedEvent` reduce concepts. `AppendHandoff` (a `file`/`take` cell that carries an `EntryRef` from the append site to the emit site so the event goes out under the guard) is a side channel between two call sites rather than a return value, and the ~1100 test lines for ~380 prod is heavy even at the `project_suffix` boundary.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Per-run `OpenRun` bracketing and merging `ProjectedEvent`/`PersistedEvent` into `TaggedEvent` reduce concepts. `AppendHandoff` (a `file`/`take` cell that carries an `EntryRef` from the append site to the emit site so the event goes out under the guard) is a side channel between two call sites rather than a return value, and the ~1100 test lines for ~380 prod is heavy even at the `project_suffix` boundary.
 
-### 8c04079 2026-08-04 aj-agent,aj-wire,aj-app,aj: prepare the phase 2 transport boundary
+### 8c04079 2026-08-04 aj-agent,aj-wire,aj-app,aj: prepare the phase 2 transport boundary [RETIRED]
+- Status: Retired without further code changes. Host and gateway share outbound queue admission. Coalescing, reliable overflow, and attachment pacing cannot be replaced by a bounded channel alone.
 - Stats: 34 files, +1943 -380, ~1095 prod / ~848 test lines (estimate: session_host.rs, wire.rs, fanout/client test modules)
 - Body: five spec-amendment items: wire command models, thinking display as a settings axis, validated creation, producer-paced attach blocks, client fold reconciliation
-- Verdict: MAYBE
-- Why: A five-bullet bundle across 34 files where each bullet could have landed alone. The producer-paced attach (`LiveQueue`, `LiveSender`, `LiveReceiver`, `LiveQueueState`, `LossyKey`, `live_channel`) is a hand-rolled bounded channel with per-key coalescing and eviction in `host/fanout.rs`; spec 6.9 asks for the behavior, but a custom channel primitive is the piece worth a second look for whether a bounded mpsc plus a coalescing map at the producer would do.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: A five-bullet bundle across 34 files where each bullet could have landed alone. The producer-paced attach (`LiveQueue`, `LiveSender`, `LiveReceiver`, `LiveQueueState`, `LossyKey`, `live_channel`) is a hand-rolled bounded channel with per-key coalescing and eviction in `host/fanout.rs`; spec 6.9 asks for the behavior, but a custom channel primitive is the piece worth a second look for whether a bounded mpsc plus a coalescing map at the producer would do.
 
-### d39d48a 2026-08-04 aj: run the TUI against a remote host
+### d39d48a 2026-08-04 aj: run the TUI against a remote host [RETIRED]
+- Status: Retired without further code changes. Reconnect and responsive catch-up share the drive-loop recovery path. Redundant outer error plumbing has already been removed.
 - Stats: 16 files, +2698 -527, ~1727 prod / ~971 test lines (estimate: interactive.rs test module plus remote/tests.rs)
 - Body: `aj connect <url>` runs the shell as a client of a remote host via one `Control` boundary
-- Verdict: MAYBE
-- Why: Foundational connect mode with one transport enum (`Control`/`Stream`/`ControlFrame`/`ControlError`) reusing `host::Command`, which is the right shape. The thing to look at is the reconnect machinery inside `interactive.rs` (`Resume`, `advance_resume`, backoff constants, `Connection` status states): it is the first layer of a drive-loop recovery state machine that d546b21 then extends with `Retry`/`ResumeStep` and c4b977b re-platforms session switching onto, so the growth path starts here.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Foundational connect mode with one transport enum (`Control`/`Stream`/`ControlFrame`/`ControlError`) reusing `host::Command`, which is the right shape. The thing to look at is the reconnect machinery inside `interactive.rs` (`Resume`, `advance_resume`, backoff constants, `Connection` status states): it is the first layer of a drive-loop recovery state machine that d546b21 then extends with `Retry`/`ResumeStep` and c4b977b re-platforms session switching onto, so the growth path starts here.
 
-### 0542858 2026-08-05 aj-app,aj-session: release a session the moment nothing needs it
+### 0542858 2026-08-05 aj-app,aj-session: release a session the moment nothing needs it [RETIRED]
+- Status: Retired without further code changes. Idle release, holder reporting, and local handle refresh serve distinct ownership and rendering needs. No substantial reduction was identified.
 - Stats: 16 files, +1645 -92, ~617 prod / ~1028 test lines (estimate: tests/session_host.rs +798, interactive.rs and lock.rs test modules)
 - Body: a host held every session and its lock forever, blocking other aj processes; quiescent unattached sessions are released after an idle grace
-- Verdict: MAYBE
-- Why: The release itself (sweeper asks, driver decides via `release_if_idle`/`wind_down`/`ReleaseOutcome`/`ReleasedMark`, two monotonic clocks) is argued carefully and proportionate to a real lock-contention bug. Folded in are two adjacent pieces: the lock file now records and reports its holder (`LockHolder`, `record_holder`, `held_by`, `SessionLock::holder`), and the frontend grows `refresh_local_handles`/`rebind_handles` so it never renders through a released core. The holder naming is a separate UX decision that could have been its own change.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: The release itself (sweeper asks, driver decides via `release_if_idle`/`wind_down`/`ReleaseOutcome`/`ReleasedMark`, two monotonic clocks) is argued carefully and proportionate to a real lock-contention bug. Folded in are two adjacent pieces: the lock file now records and reports its holder (`LockHolder`, `record_holder`, `held_by`, `SessionLock::holder`), and the frontend grows `refresh_local_handles`/`rebind_handles` so it never renders through a released core. The holder naming is a separate UX decision that could have been its own change.
 
-### a812f97 2026-08-06 aj-app,aj-session,aj-wire: build a directory row from a stat, not from a log
+### a812f97 2026-08-06 aj-app,aj-session,aj-wire: build a directory row from a stat, not from a log [RETIRED]
+- Status: Retired without further code changes. The sequence field drives unseen output, and activity stamps serve ordering, latest-session selection, and displayed age. Log-content enumeration caches are gone.
 - Stats: 15 files, +845 -550, ~210 prod / ~635 test lines (estimate: tests/ dirs plus `mod tests` regions)
 - Body: Enumeration read and JSON-validated every log (992 ms, 1.95 GB per launch on a real store). Rows now carry mtime-derived stamps, `last_seq` only for live rows.
-- Verdict: MAYBE
-- Why: Measured problem, net deletion in persistence.rs (`stored_last_seq` gone), fewer moving parts overall. Worth a second look: `SessionSummary.last_seq` becomes `Option<u64>` "present iff live" with no production reader (only tests read it), so it is half-removed rather than removed. The stamp monotonicity logic (`ReleasedMark.last_activity` as max of two clocks, `opening_stamp` on materialize) exists only to keep the unseen glyph honest, and b57241c the next day moves that glyph back to seq positions, so the stamp machinery's justification lasted one day.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Measured problem, net deletion in persistence.rs (`stored_last_seq` gone), fewer moving parts overall. Worth a second look: `SessionSummary.last_seq` becomes `Option<u64>` "present iff live" with no production reader (only tests read it), so it is half-removed rather than removed. The stamp monotonicity logic (`ReleasedMark.last_activity` as max of two clocks, `opening_stamp` on materialize) exists only to keep the unseen glyph honest, and b57241c the next day moves that glyph back to seq positions, so the stamp machinery's justification lasted one day.
 
-### c207347 2026-08-06 aj-app,aj: switch sessions by swapping, not rebuilding
+### c207347 2026-08-06 aj-app,aj: switch sessions by swapping, not rebuilding [RETIRED]
+- Status: Retired without further code changes. Focus owns the bounded working set and attachment serializes it. The small fixture hook does not justify a separate rewrite.
 - Stats: 2 files, +501 -242, ~180 prod / ~320 test lines (estimate: interactive.rs `mod tests` at line 6215)
 - Body: World holds a SessionDirectory instead of session+client. focus_session splits into swap (already attached) vs reopen over the whole set. Switch no longer detaches the outgoing session.
-- Verdict: MAYBE
-- Why: Foundational and mostly mechanical (`world.session` -> `world.session()`, `world.client` -> `world.client()`). Production change is small. Second look: `rename_focused` is a `test-support` hook that fabricates a state the message admits "no honest gesture produces", to stage a permanently refused attach in frontend tests. That is a test seam into internals rather than a boundary test. The semantic change that a switch now retains the outgoing session's lock indefinitely is stated as spec-conformant but is a real UX consequence landed inside a refactor commit.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Foundational and mostly mechanical (`world.session` -> `world.session()`, `world.client` -> `world.client()`). Production change is small. Second look: `rename_focused` is a `test-support` hook that fabricates a state the message admits "no honest gesture produces", to stage a permanently refused attach in frontend tests. That is a test seam into internals rather than a boundary test. The semantic change that a switch now retains the outgoing session's lock indefinitely is stated as spec-conformant but is a real UX consequence landed inside a refactor commit.
 
-### c45a206 2026-08-06 aj-session,aj-app,aj: make the id-gate tests back their claims
+### c45a206 2026-08-06 aj-session,aj-app,aj: make the id-gate tests back their claims [RETIRED]
+- Status: Retired without further code changes. Membership errors remain visible and nonzero capacity is explicit. The lookup counter is minor instrumentation, not a substantial abstraction to remove.
 - Stats: 9 files, +360 -171, ~130 prod / ~230 test lines (estimate)
 - Body: Adversarial review found three assertions non-discriminating and one degenerate; also membership stops folding an unreadable store into 404.
-- Verdict: MAYBE
-- Why: Test hardening is legitimate and the `on_disk` -> `Result<bool>` fix is right. Second look: `SessionHost::store_membership_lookups` is a test-support counter added so a test can pin that the id grammar runs before the store lookup, i.e. a test pinning internal ordering via a counter seam (`ColdSessions::membership_lookups`). Also bundles an unrelated `usize` -> `NonZeroUsize` change through fanout.rs and HostSetup.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Test hardening is legitimate and the `on_disk` -> `Result<bool>` fix is right. Second look: `SessionHost::store_membership_lookups` is a test-support counter added so a test can pin that the id grammar runs before the store lookup, i.e. a test pinning internal ordering via a counter seam (`ColdSessions::membership_lookups`). Also bundles an unrelated `usize` -> `NonZeroUsize` change through fanout.rs and HostSetup.
 
-### 180f147 2026-08-07 aj: give the session sidebar pointer gestures
+### 180f147 2026-08-07 aj: give the session sidebar pointer gestures [RETIRED]
+- Status: Retired without further code changes. Wheel anchoring, painted-layout hit testing, and overlay input suppression serve distinct pointer interactions through the existing gesture path.
 - Stats: 2 files, +1073 -66, ~365 prod / ~705 test lines (estimate: sidebar.rs and interactive.rs `mod tests` regions)
 - Body: Click on a row or `+ new` parks the same request the chords do; hover band; wheel scroll with an anchor that lapses on focus change.
-- Verdict: MAYBE
-- Why: Click resolves to `StripGesture` and funnels into `park_session_request`, which is the right shape. Second look: the wheel introduces `Anchor { at, focused }` with a "lapses when the focused session changes" rule, `scroll_by`, `run_from`, `last_anchor`, and capture-phase hover handling, all in one commit with the click. Scroll and hover are adjacent scope to "click switches", and 700 test lines for three gestures is heavy.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Click resolves to `StripGesture` and funnels into `park_session_request`, which is the right shape. Second look: the wheel introduces `Anchor { at, focused }` with a "lapses when the focused session changes" rule, `scroll_by`, `run_from`, `last_anchor`, and capture-phase hover handling, all in one commit with the click. Scroll and hover are adjacent scope to "click switches", and 700 test lines for three gestures is heavy.
 
-### 84fa171 2026-08-11 aj,aj-app,aj-conf: aggregate hosts behind aj gateway
+### 84fa171 2026-08-11 aj,aj-app,aj-conf: aggregate hosts behind aj gateway [RETIRED]
+- Status: Retired without further code changes. Persisted dynamic enrollment and restart recovery were explicit pre-implementation requirements. Config-only enrollment would remove requested functionality.
 - Stats: 19 files, +4145 -50, ~1760 prod / ~2385 test lines (estimate: gateway/tests.rs 1192, remote/tests.rs, plus `mod tests` in each module)
 - Body: New `aj gateway` binary: one control link per enrolled host, merged `<host>:<session>` directory, wildcard proxy, REST enrollment persisted to hosts.json, static hosts from gateway.toml; attach and create refused at this stage.
-- Verdict: MAYBE
-- Why: Foundational feature, seven modules with clear ownership, proxy kept as one unread-body route (good for version skew). Second look: the enrollment surface is large for a first stage: `GET/POST/DELETE /v1/hosts`, `EnrollmentFile`/`Persisted`/`HostSource`/`EnrollHostRequest`/`HostSummary`/`HostList`, dynamic-vs-static persistence rules, and `Directory::adopt` with "an adopted id is fixed for the life of the enrollment". Persisting dynamic enrollments to `~/.aj/gateway/hosts.json` is persistence plus a schema without a stated user need beyond restart recovery, when gateway.toml already exists.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Foundational feature, seven modules with clear ownership, proxy kept as one unread-body route (good for version skew). Second look: the enrollment surface is large for a first stage: `GET/POST/DELETE /v1/hosts`, `EnrollmentFile`/`Persisted`/`HostSource`/`EnrollHostRequest`/`HostSummary`/`HostList`, dynamic-vs-static persistence rules, and `Directory::adopt` with "an adopted id is fixed for the life of the enrollment". Persisting dynamic enrollments to `~/.aj/gateway/hosts.json` is persistence plus a schema without a stated user need beyond restart recovery, when gateway.toml already exists.
 
-### f73c6a3 2026-08-11 aj-wire,aj: a create names the host it is for
+### f73c6a3 2026-08-11 aj-wire,aj: a create names the host it is for [RETIRED]
+- Status: Retired without further code changes. Create forwarding uses the shared raw-object codec to preserve unknown fields and number literals. Routing refusals describe distinct actionable outcomes.
 - Stats: 12 files, +1138 -84, ~355 prod / ~780 test lines (estimate)
 - Body: `CreateSessionRequest.host`; a plain host refuses a foreign id with 409; the gateway resolves the target (named, or sole enrolled) and edits exactly `host` up and `id` back.
-- Verdict: MAYBE
-- Why: Reasonable resolution of the create-on-gateway gap. Second look: the raw-JSON body editing (`JsonObject`, `string_field`/`set_string_field`, preserving unknown fields and number literals) exists so the gateway does not decode `CreateSessionRequest`, and four new error codes (`ambiguous_host`, `no_host_enrolled`, `unknown_host`, `host_unreachable`) for one route. ~780 test lines for one route's resolution rules is heavy.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Reasonable resolution of the create-on-gateway gap. Second look: the raw-JSON body editing (`JsonObject`, `string_field`/`set_string_field`, preserving unknown fields and number literals) exists so the gateway does not decode `CreateSessionRequest`, and four new error codes (`ambiguous_host`, `no_host_enrolled`, `unknown_host`, `host_unreachable`) for one route. ~780 test lines for one route's resolution rules is heavy.
 
-### 4bdc6d6 2026-08-12 aj-app,aj: give the canonical form a convergent tier
+### 4bdc6d6 2026-08-12 aj-app,aj: give the canonical form a convergent tier [RETIRED]
+- Status: Retired without further code changes. The convergent tier filters the existing canonical projection and renumbers locations. It is not a second maintained schema.
 - Stats: 2 files, +563 -29, ~0 prod / ~565 test lines (estimate: test_support.rs is test-support, remote/tests.rs)
 - Body: Spec 11.2's claim that the fault sweep masks transient-only artifacts was untrue; a `ConvergentState` tier masks them and a sweep run proves the mask carries weight.
-- Verdict: MAYBE
-- Why: Test-support only, and it makes an existing claim true. Second look: a second oracle type (`ConvergentState` wrapping `CanonicalState`, `is_transient_only`, `renumber`, `assert_convergent_eq`, `assert_tier_eq`) rather than filtering the transient rows out of the one form before comparison, and the sweep now depends on a specific scripted "compact finds nothing" turn to reach the masked state.
-### 64bd1e6 2026-08-12 aj: a configured host's id is provisional, a dynamic one's is the record
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Test-support only, and it makes an existing claim true. Second look: a second oracle type (`ConvergentState` wrapping `CanonicalState`, `is_transient_only`, `renumber`, `assert_convergent_eq`, `assert_tier_eq`) rather than filtering the transient rows out of the one form before comparison, and the sweep now depends on a specific scripted "compact finds nothing" turn to reach the masked state.
+### 64bd1e6 2026-08-12 aj: a configured host's id is provisional, a dynamic one's is the record [RETIRED]
+- Status: Retired without further code changes. Recording and adoption share one settlement decision under the writing lock. No substantially smaller shape was established that preserves identity rules, restart recovery, and splice teardown.
 - Stats: 4 files, +817 -122, ~240 prod / ~580 test lines (estimate: tests.rs +391 plus the `mod tests` hunks in directory.rs ~+180; rest is prod)
 - Body: configured and dynamic enrollments must answer a host reporting a new id differently (spec 7.1); adoption becomes write-ahead like withdrawal.
-- Verdict: MAYBE
-- Why: The behavior is spec-driven and the prod change is modest, but the settlement now has three parallel shapes for one decision: `Adopted` (Learned/Unchanged/Replaced(Withdrawn)), a private `Settling` enum with the same three variants, and `settling()` computed twice (once in `record_adopting`, once in `adopt`) so the write-ahead record and the mutation agree under one lock. `record()` grows an `adopting: Option<(&HostAddress, &str)>` override parameter to simulate the post-adopt set. Test volume is 2.5x prod and several tests assert on the write-ahead ordering (`record_adopting` refused where `adopt` is refused), which is internal sequencing rather than a client-visible promise.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: The behavior is spec-driven and the prod change is modest, but the settlement now has three parallel shapes for one decision: `Adopted` (Learned/Unchanged/Replaced(Withdrawn)), a private `Settling` enum with the same three variants, and `settling()` computed twice (once in `record_adopting`, once in `adopt`) so the write-ahead record and the mutation agree under one lock. `record()` grows an `adopting: Option<(&HostAddress, &str)>` override parameter to simulate the post-adopt set. Test volume is 2.5x prod and several tests assert on the write-ahead ordering (`record_adopting` refused where `adopt` is refused), which is internal sequencing rather than a client-visible promise.
 
-### 65473dc 2026-08-12 aj: draw a host the peer holds no rows for as an empty group
+### 65473dc 2026-08-12 aj: draw a host the peer holds no rows for as an empty group [RETIRED]
+- Status: Retired without further code changes. Empty-host headers convey required reachability information. The small shared height budget and composed rendering coverage serve that behavior.
 - Stats: 2 files, +635 -60, ~145 prod / ~490 test lines (estimate: sidebar.rs `mod tests` hunks ~+330 plus a 105-line composed-strip test in interactive.rs)
 - Body: a host with no rows (down across a gateway restart) was drawn as nothing, reading as "no such host" instead of "unreachable" (spec 7.1).
-- Verdict: MAYBE
-- Why: Group identity moving from row-derived to directory-derived is the right fix and small. The second look is the new `Budget { empty, rows }` struct plus `Layout::split()` that hand-divides the strip height so empty-host headers outrank rows and the overflow count keeps a line; that priority policy is defended at length in comments and pinned by many tests for a case (strip too short for its headers) that is rare. The interactive.rs test re-pins what sidebar.rs unit tests already cover.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Group identity moving from row-derived to directory-derived is the right fix and small. The second look is the new `Budget { empty, rows }` struct plus `Layout::split()` that hand-divides the strip height so empty-host headers outrank rows and the overflow count keeps a line; that priority policy is defended at length in comments and pinned by many tests for a case (strip too short for its headers) that is rare. The interactive.rs test re-pins what sidebar.rs unit tests already cover.
 
-### 7cead11 2026-08-13 aj,aj-app,docs: refuse a --host that names nothing, and say when it went unused
+### 7cead11 2026-08-13 aj,aj-app,docs: refuse a --host that names nothing, and say when it went unused [RETIRED]
+- Status: Retired without further code changes. Blank-query refusal, empty-id filtering, and unused-flag notices are small native checks. Historical bundling is not surviving excess machinery.
 - Stats: 8 files, +406 -141, ~170 prod / ~235 test lines (estimate: interactive.rs test hunks ~+110, host_picker.rs tests ~+70, rest prod incl. 30 doc lines)
 - Body: review pass over the host picker: blank `--host` matched everything, empty published id hijacked the sentinel, `--host` silently dropped on attach, plus renames/docs/tests.
-- Verdict: MAYBE
-- Why: Four real fixes, each a few lines (`named()` helper in host_picker.rs, blank-query refusal in `resolve_host`, the unused-flag notice in connect.rs). It is a "fix what the reviews found" bundle that also carries renames (`park_new_session` -> `settle_create_host`), a visibility change on `mod server`, and a spec/docs update in one commit, so the behavioral fixes are hard to see or revert individually. Not over-engineered, just over-bundled.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Four real fixes, each a few lines (`named()` helper in host_picker.rs, blank-query refusal in `resolve_host`, the unused-flag notice in connect.rs). It is a "fix what the reviews found" bundle that also carries renames (`park_new_session` -> `settle_create_host`), a visibility change on `mod server`, and a spec/docs update in one commit, so the behavioral fixes are hard to see or revert individually. Not over-engineered, just over-bundled.
 
-### dbdc5ad 2026-08-13 aj,aj-app: ask which host a create is for
+### dbdc5ad 2026-08-13 aj,aj-app: ask which host a create is for [RETIRED]
+- Status: Retired without further code changes. Creation has one host-choice gate using the ordinary picker. Real-gateway tests observe routing effects that picker unit tests cannot establish.
 - Stats: 11 files, +1547 -90, ~550 prod / ~1000 test lines (estimate: interactive.rs is +74 prod / +941 test by hunk-header classification; host_picker.rs ~210 prod / ~125 test; remote/tests.rs +54)
 - Body: multi-host gateway creates were impossible; host travels on `SessionRequest::New`, a picker opens when ambiguous, `--host <id>` for scripts; two honesty fixes ride along.
-- Verdict: MAYBE
-- Why: The feature is real and the prod side is proportionate (host_picker.rs is a ~200-line module, `park_new_session` settles the question in one place). The second look is the ~940 test lines in interactive.rs, roughly 300 of which are a `RemoteGateway` fixture that boots a real gateway over real hosts with bounded polling helpers (`until`, `until_sessions`, `host_ids`) inside a unit-test module, to exercise a picker whose logic is already unit-tested in host_picker.rs. Two adjacent fixes (`peer_refusal` wording, moving the cwd rule onto the host) are folded in rather than called out separately.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: The feature is real and the prod side is proportionate (host_picker.rs is a ~200-line module, `park_new_session` settles the question in one place). The second look is the ~940 test lines in interactive.rs, roughly 300 of which are a `RemoteGateway` fixture that boots a real gateway over real hosts with bounded polling helpers (`until`, `until_sessions`, `host_ids`) inside a unit-test module, to exercise a picker whose logic is already unit-tested in host_picker.rs. Two adjacent fixes (`peer_refusal` wording, moving the cwd rule onto the host) are folded in rather than called out separately.
 
-### 6d704ae 2026-08-14 aj,aj-app: put a session away, and show it again
+### 6d704ae 2026-08-14 aj,aj-app: put a session away, and show it again [RETIRED]
+- Status: Retired without further code changes. Scan, reveal, and confirmation share the same allocations rather than mirrored state. Connected snapshots reuse the selector widget.
 - Stats: 12 files, +1586 -67, ~600 prod / ~980 test lines (estimate: per-file `mod tests` hunks: connect.rs +197, interactive.rs +346, session_selector.rs +170, sidebar.rs +153, directory.rs +112)
 - Body: the archive bit reached the wire with nothing reading it; sidebar filters archived rows, two chords, selector reveal, bare connect skips them, list-sessions marks them.
-- Verdict: MAYBE
-- Why: One coherent feature across five surfaces, and each piece is small except session_selector.rs, where the overlay becomes a new `SessionSelector` widget wrapping `FilterableSelect` for one chord, sharing four `Rc` fields (`select`, `ids`, `seen`, `reveal`) with the existing `SessionScan` struct so that both a batch arriving and a toggle rebuild the same rows. Two structs mirroring each other's state for a boolean toggle is the thing to revisit. Test volume is 1.6x prod, with connect.rs growing its own `Peer` fixture (~100 lines) for three tests.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: One coherent feature across five surfaces, and each piece is small except session_selector.rs, where the overlay becomes a new `SessionSelector` widget wrapping `FilterableSelect` for one chord, sharing four `Rc` fields (`select`, `ids`, `seen`, `reveal`) with the existing `SessionScan` struct so that both a batch arriving and a toggle rebuild the same rows. Two structs mirroring each other's state for a boolean toggle is the thing to revisit. Test volume is 1.6x prod, with connect.rs growing its own `Peer` fixture (~100 lines) for three tests.
 
-### 86d366f 2026-08-14 aj-app,aj: archive a session from the host and the control port
+### 86d366f 2026-08-14 aj-app,aj: archive a session from the host and the control port [RETIRED]
+- Status: Retired without further code changes. Archive fingerprint caching is gone. Archive membership and tag contents require different reconciliation, so a generic sidecar framework would obscure their contracts.
 - Stats: 12 files, +969 -48, ~260 prod / ~710 test lines (estimate: session_host.rs +279, gateway/tests.rs +148, remote/tests.rs +76, store.rs `mod tests` ~+195)
 - Body: archive command mirrors the tag at every layer; cold cache gains a second sidecar axis; gateway unchanged but its pass-through pinned by tests.
-- Verdict: MAYBE
-- Why: The archive path itself is a faithful copy of the tag path and proportionate. The second look is store.rs: `Archived { at, archived }` beside `Tagged`, `enumerate_archived` beside `enumerate_tags`, `record_archived` beside the tag recording, and a fake-store `during_archived_listing` interleave hook beside `during_tag_read`. Two hand-mirrored axes in the cold cache (a third arrives in 9705a42) suggest the sidecar-axis machinery wants one shape rather than N copies. 148 lines of gateway tests for a change the gateway does not have is a lot of pinning for a pass-through.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: The archive path itself is a faithful copy of the tag path and proportionate. The second look is store.rs: `Archived { at, archived }` beside `Tagged`, `enumerate_archived` beside `enumerate_tags`, `record_archived` beside the tag recording, and a fake-store `during_archived_listing` interleave hook beside `during_tag_read`. Two hand-mirrored axes in the cold cache (a third arrives in 9705a42) suggest the sidecar-axis machinery wants one shape rather than N copies. 148 lines of gateway tests for a change the gateway does not have is a lot of pinning for a pass-through.
 
-### b97dd9e 2026-08-14 aj,aj-app,docs: bound a host's share of the sidebar, and hold it still
+### b97dd9e 2026-08-14 aj,aj-app,docs: bound a host's share of the sidebar, and hold it still [RETIRED]
+- Status: Retired without further code changes. Stable ordering was requested alongside the per-host cap. Composed gesture tests cover dispatch and overlay suppression rather than repeating layout arithmetic.
 - Stats: 6 files, +1517 -274, ~470 prod / ~1050 test lines (estimate: sidebar.rs +830 test / +394 prod by hunk classification; interactive.rs +221 test / +24 prod)
 - Body: one busy host filled the strip and rows moved under the pointer; per-group cap of five boring rows behind a fold line, and ordering no longer follows activity.
-- Verdict: MAYBE
-- Why: The user problem is clearly stated and the mechanism (`GROUP_CAP`, `SidebarRow::boring()`, `Unfolded` newtype over `Vec<Option<String>>`, `held_back()`, `fold_label()`, one chord plus click) is about the smallest that gives cap and fold. Two things to look at: the ordering rewrite (activity to label/insertion order, with ~120 lines of existing tests rewritten) lands in the same commit as the cap, and the test body is 2.2x prod including three async drive-loop tests for the chord/click that duplicate the layout tests' coverage.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: The user problem is clearly stated and the mechanism (`GROUP_CAP`, `SidebarRow::boring()`, `Unfolded` newtype over `Vec<Option<String>>`, `held_back()`, `fold_label()`, one chord plus click) is about the smallest that gives cap and fold. Two things to look at: the ordering rewrite (activity to label/insertion order, with ~120 lines of existing tests rewritten) lands in the same commit as the cap, and the test body is 2.2x prod including three async drive-loop tests for the chord/click that duplicate the layout tests' coverage.
 
-### 0765d8b 2026-08-19 aj: a gateway learns a host's name, keeps it, and republishes it
+### 0765d8b 2026-08-19 aj: a gateway learns a host's name, keeps it, and republishes it [RETIRED]
+- Status: Retired without further code changes. Handshake input, settlement classification, and withdrawal effects have distinct roles. One decision separates persisted names from live-only working directories.
 - Stats: 7 files, +614 -108, ~215 prod / ~400 test lines (estimate: gateway/tests.rs +212, directory.rs `mod tests` ~+180)
 - Body: the gateway records the name beside the id so an unreachable host's header survives a restart; refusals read the name, create candidates lead with the id.
-- Verdict: MAYBE
-- Why: The name rides the same adopt/record path as the id, which is right, but the settlement layer grows again: `Reported { host_id, name }`, `Settling { identity: Identity, renames: bool }` with a `changes()` method, the old `Settling` enum renamed to `Identity`, and `Adopted` still separate. Three types now describe one handshake outcome, on top of `Enrollment::label()` vs `Enrollment::candidate()` for two prose contexts. Each step is small; the accumulated shape (see 64bd1e6) is what to revisit.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: The name rides the same adopt/record path as the id, which is right, but the settlement layer grows again: `Reported { host_id, name }`, `Settling { identity: Identity, renames: bool }` with a `changes()` method, the old `Settling` enum renamed to `Identity`, and `Adopted` still separate. Three types now describe one handshake outcome, on top of `Enrollment::label()` vs `Enrollment::candidate()` for two prose contexts. Each step is small; the accumulated shape (see 64bd1e6) is what to revisit.
 
-### 57db2b1 2026-08-19 aj,aj-app: bound the wait for an attach block that never comes
+### 57db2b1 2026-08-19 aj,aj-app: bound the wait for an attach block that never comes [RETIRED]
+- Status: Retired without further code changes. Refusal and target-session silence require different recovery outcomes. The local silence deadline keeps catch-up bounded without restarting a progressing backfill.
 - Stats: 5 files, +467 -58, ~200 prod / ~270 test lines (estimate: interactive.rs test hunks +269 incl. a ~90-line `WarmPeer` fixture; client.rs/control.rs are prod)
 - Body: the shell froze forever in "Catching up" when a peer served `error` or `reset` instead of a block; wait now ends on the client's own arm with a silence deadline, three-valued outcome.
-- Verdict: MAYBE
-- Why: Real hang, and the silence-not-total deadline argument is sound. The second look is `CatchUp { Caught, Unattached, Stalled }` and the give-up-on-refusal policy attached to it: an hour later 67c3d58 collapses it back to a bool because spec 6.5 permits re-asking, then 86c76ed brings the enum back. Policy decided inside a bug fix, then thrashed within one afternoon.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Real hang, and the silence-not-total deadline argument is sound. The second look is `CatchUp { Caught, Unattached, Stalled }` and the give-up-on-refusal policy attached to it: an hour later 67c3d58 collapses it back to a bool because spec 6.5 permits re-asking, then 86c76ed brings the enum back. Policy decided inside a bug fix, then thrashed within one afternoon.
 
-### 86c76ed 2026-08-19 aj,aj-app: stop asking after a refused attach, rejoin when the row returns
+### 86c76ed 2026-08-19 aj,aj-app: stop asking after a refused attach, rejoin when the row returns [RETIRED]
+- Status: Retired without further code changes. The separate notice latch is gone. Non-lock rejoin compares existing directory snapshots, while client refusal state prevents repeated automatic requests.
 - Stats: 3 files, +572 -55, ~240 prod / ~335 test lines (estimate: interactive.rs test hunks +335 incl. `listed_row`/`list_of` helpers; client.rs +68 and directory.rs +91 prod)
 - Body: a refused re-attach was retried with backoff, folding one refusal row per attempt (13/minute measured); refusal withdraws the obligation and a `list` row's absent-then-present edge re-owes it.
-- Verdict: MAYBE
-- Why: Measured problem, protocol-signal fix, and the body records a known gap (`locked` rows never leave). What to look at: `CatchUp` returns as a three-valued enum an hour after 67c3d58 removed it; `SessionClient` gains a `withheld: bool` beside the epoch and arm as a third piece of attach state, plus `holds_attachment()`/`withheld()`/`owe_reattach()`; and `SessionDirectory::rows_returned()` with a per-session `noticed` flag is a set-wide edge detector layered on the directory for one consumer. Two of three tests exist because a mutation survived.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Measured problem, protocol-signal fix, and the body records a known gap (`locked` rows never leave). What to look at: `CatchUp` returns as a three-valued enum an hour after 67c3d58 removed it; `SessionClient` gains a `withheld: bool` beside the epoch and arm as a third piece of attach state, plus `holds_attachment()`/`withheld()`/`owe_reattach()`; and `SessionDirectory::rows_returned()` with a per-session `noticed` flag is a set-wide edge detector layered on the directory for one consumer. Two of three tests exist because a mutation survived.
 
-### b68b4ec 2026-08-19 aj: fold a catch-up from the drive loop instead of parking it
+### b68b4ec 2026-08-19 aj: fold a catch-up from the drive loop instead of parking it [RETIRED]
+- Status: Retired without further code changes. The second production awaiting driver is gone. Production catch-up folds incrementally through the drive loop, preserving input and rendering responsiveness.
 - Stats: 1 files, +570 -227, ~250 prod / ~320 test lines (estimate: hunk classification, +318 -140 in `mod tests`)
 - Body: the block was folded in an await off the loop body, freezing paint and input for the whole catch-up; the per-frame rule becomes a `Block` fed from the select's frame arm, with a deadline wake.
-- Verdict: MAYBE
-- Why: Foundational and motivated (frozen UI on any large backfill). The mechanism is the state machine the reference commit later re-platforms onto: `Block { session, silence, deadline, settled }` with `open/settle/settled/deadline/fold/fold_through`, `Resume::block_mut()`/`arriving()`, `ResumeStep::CatchingUp(Block)`, and two drivers of the same rule (loop-fed for recovery, awaited `fold_through` with timeout for swap/branch/discharge). Worth checking whether the awaited driver could have been retired instead of kept as a second path.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Foundational and motivated (frozen UI on any large backfill). The mechanism is the state machine the reference commit later re-platforms onto: `Block { session, silence, deadline, settled }` with `open/settle/settled/deadline/fold/fold_through`, `Resume::block_mut()`/`arriving()`, `ResumeStep::CatchingUp(Block)`, and two drivers of the same rule (loop-fed for recovery, awaited `fold_through` with timeout for swap/branch/discharge). Worth checking whether the awaited driver could have been retired instead of kept as a second path.
 
-### 9705a42 2026-08-23 aj-wire,aj-app: publish the locked row bit
+### 9705a42 2026-08-23 aj-wire,aj-app: publish the locked row bit [RETIRED]
+- Status: Retired without further code changes. Lock observation differs from sidecar reads and must preserve authoritative acquisitions against stale scans. No generic metadata abstraction would simplify that contract.
 - Stats: 13 files, +610 -16, ~235 prod / ~375 test lines (estimate: store.rs +272 test / +159 prod, session_host.rs +62, list_refresh_io.rs +34)
 - Body: a row now says when a rival writer holds the session's lock (spec 6.5/6.8): refused/won acquires set/clear it, enumeration sweeps the lock dir; the third writer is deliberately absent.
-- Verdict: MAYBE
-- Why: Spec-mandated field, body is honest about the open design question and the ten wire/struct-literal touches are mechanical. The second look is store.rs: a third hand-mirrored cold-cache axis (`enumerate_locks`/`probe_lock` on `SessionStore`, `probe()`/`record_locked()`/`note_locked()`, `FakeLock` with its own `during_lock_listing` interleave hook, `lock_directory_reads()`/`lock_probes()` counters exposed for tests). With tags (existing), archived (86d366f) and now locks, the sidecar-axis pattern is copied three times.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Spec-mandated field, body is honest about the open design question and the ten wire/struct-literal touches are mechanical. The second look is store.rs: a third hand-mirrored cold-cache axis (`enumerate_locks`/`probe_lock` on `SessionStore`, `probe()`/`record_locked()`/`note_locked()`, `FakeLock` with its own `during_lock_listing` interleave hook, `lock_directory_reads()`/`lock_probes()` counters exposed for tests). With tags (existing), archived (86d366f) and now locks, the sidecar-axis pattern is copied three times.
 
-### 0d705c6 2026-08-24 aj-tools: pin what a cancelled turn does to a command's processes
+### 0d705c6 2026-08-24 aj-tools: pin what a cancelled turn does to a command's processes [RETIRED]
+- Status: Retired without further code changes. Process teardown tests exercise distinct reader-release, descendant-grace, escalation, and cleanup-lifetime promises. No substantial redundant harness was established.
 - Stats: 2 files, +1128 -7, ~0 prod / ~1130 test lines (bash.rs changes are all inside `mod tests`, +744; new tests/cancel_teardown.rs +384)
 - Body: three seam tests through a live agent and real bash tool for cancel teardown, plus ~13 unit tests covering drop windows, grace, pipe read ends, host exit; several exist to hold the teardown to one path.
-- Verdict: MAYBE
-- Why: Test-only, and the seam tests (cancel kills the group, returns fast, background survives) pin real contracts the suite lacked. The rest is the thing to weigh: sixteen new test fns, several targeting internal windows ("a drop landing mid-drain after the child was reaped", "a failure between the spawn and the first await", "a guard dropped after its runtime is gone") whose descriptions in the body run to nine paragraphs. By the standard that each kept test pins a distinct promise, some of these will only ever fail alongside the seam tests.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Test-only, and the seam tests (cancel kills the group, returns fast, background survives) pin real contracts the suite lacked. The rest is the thing to weigh: sixteen new test fns, several targeting internal windows ("a drop landing mid-drain after the child was reaped", "a failure between the spawn and the first await", "a guard dropped after its runtime is gone") whose descriptions in the body run to nine paragraphs. By the standard that each kept test pins a distinct promise, some of these will only ever fail alongside the seam tests.
 
-### 0c8b2a9 2026-08-25 aj-models: labeled credentials per provider in the auth store
+### 0c8b2a9 2026-08-25 aj-models: labeled credentials per provider in the auth store [RETIRED]
+- Status: Retired without further code changes. Account storage APIs have management and model-selection consumers. Strict resolution and refresh-slot ownership protect credential attribution.
 - Stats: 5 files, +837 -66, ~400 prod / ~440 test lines (estimate: auth.rs `mod tests` hunks +437; callers are one-line `None` additions)
 - Body: auth.json entries become either a bare credential (unchanged bytes) or a labeled set with a default; `get_api_key` gains an account dimension with strict no-fallback resolution; six account-aware methods.
-- Verdict: MAYBE
-- Why: Storage-format work with backward compatibility handled cleanly (`StoredEntry` shares the `type` tag space, `Slot` keeps OAuth refresh writing back to the slot it read). The second look is that six public methods (`get_account`, `accounts`, `set_account`, `set_default_account`, `remove_account`, `login_account`) land with no caller: every existing call site passes `None`. That is a surface designed ahead of its consumer, which is fine if the account UI lands next and speculative if not.
-### c94f2d9 2026-08-25 aj-app,aj,docs: re-ask a locked refusal when the rival lets go
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Storage-format work with backward compatibility handled cleanly (`StoredEntry` shares the `type` tag space, `Slot` keeps OAuth refresh writing back to the slot it read). The second look is that six public methods (`get_account`, `accounts`, `set_account`, `set_default_account`, `remove_account`, `login_account`) land with no caller: every existing call site passes `None`. That is a surface designed ahead of its consumer, which is fine if the account UI lands next and speculative if not.
+### c94f2d9 2026-08-25 aj-app,aj,docs: re-ask a locked refusal when the rival lets go [RETIRED]
+- Status: Retired without further code changes. Automatic locked-edge recovery and its edge tests are gone. Locked refusals wait for explicit selection.
 - Stats: 5 files, +662 -99, ~150 prod / ~510 test lines (added lines after `#[cfg(test)]` per file)
 - Body: a `locked` refusal's row never leaves the peer's list, so the absence edge alone strands it; add the `locked` bit falling as a second re-ask edge, and word the notice per edge.
-- Verdict: MAYBE
-- Why: Production change is small and native: `Refusal { Locked, Other }` on `SessionClient.withheld`, `rows_returned` becomes `rejoin_edges_fired` with one extra `released` predicate, and a second notice constant. The 3.4x test ratio is what to look at: five new unit tests in directory.rs plus two full interactive-loop tests (`a_locked_session_rejoins_when_the_rival_lets_go`, `the_locked_edge_reads_across_a_lost_connection`) pin the same edge at two layers, and the 40-line commit body spends a paragraph justifying a test rewrite. Superseded the next day by b1e4ba9, which suggests the edge was known to be racy when it landed.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Production change is small and native: `Refusal { Locked, Other }` on `SessionClient.withheld`, `rows_returned` becomes `rejoin_edges_fired` with one extra `released` predicate, and a second notice constant. The 3.4x test ratio is what to look at: five new unit tests in directory.rs plus two full interactive-loop tests (`a_locked_session_rejoins_when_the_rival_lets_go`, `the_locked_edge_reads_across_a_lost_connection`) pin the same edge at two layers, and the 40-line commit body spends a paragraph justifying a test rewrite. Superseded the next day by b1e4ba9, which suggests the edge was known to be racy when it landed.
 
-### cb3730a 2026-08-26 aj-app: pin detached sub-agent cancel routing
+### cb3730a 2026-08-26 aj-app: pin detached sub-agent cancel routing [RETIRED]
+- Status: Retired without further code changes. The real-host harness compares cancel gestures across parent states and observes task, transcript, and parent outcomes. No substantial removable mechanism was identified.
 - Stats: 1 files, +614 -1, ~0 prod / ~615 test lines
 - Body: empty
-- Verdict: MAYBE
-- Why: Test-only, pinning behaviour that already existed. The cost is a bespoke harness (`EndDetached`, `ParentTurn`, `DetachedEnding` with a `end_detached_sub` matrix runner) at 600 lines for four tests, one of which asserts two gestures produce identical `DetachedEnding` values. Worth asking whether the equivalence test adds a promise the two direct tests don't already pin.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Test-only, pinning behaviour that already existed. The cost is a bespoke harness (`EndDetached`, `ParentTurn`, `DetachedEnding` with a `end_detached_sub` matrix runner) at 600 lines for four tests, one of which asserts two gestures produce identical `DetachedEnding` values. Worth asking whether the equivalence test adds a promise the two direct tests don't already pin.
 
-### cd18620 2026-08-26 aj-agent,aj-models,aj-app: preserve disclosed facts when cancelling a turn
+### cd18620 2026-08-26 aj-agent,aj-models,aj-app: preserve disclosed facts when cancelling a turn [RETIRED]
+- Status: Retired without further code changes. Provider-owned pricing and queued-fact harvesting preserve distinct cancellation outcomes. Composed tests observe persisted content, usage, identity, and aborted status.
 - Stats: 12 files, +955 -68, ~70 prod / ~885 test lines
 - Body: empty
-- Verdict: MAYBE
-- Why: Production change is right-shaped: providers seal every partial, the agent stops re-pricing on cancel, and `drain_ready` flushes queued events before the aborted terminal. The 13:1 test ratio is the thing to look at: a new `HeldSseServer` fixture, unit tests per adapter, and a 400-line `cancelled_turns.rs` with three tests whose names overlap (`cancellation_drains_a_queued_priced_terminal_before_persisting`, `cancellation_keeps_the_queued_providers_exact_price`, `cancellation_persists_an_anthropic_shaped_priced_partial`); the first pins the drain mechanism rather than the persisted outcome.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Production change is right-shaped: providers seal every partial, the agent stops re-pricing on cancel, and `drain_ready` flushes queued events before the aborted terminal. The 13:1 test ratio is the thing to look at: a new `HeldSseServer` fixture, unit tests per adapter, and a 400-line `cancelled_turns.rs` with three tests whose names overlap (`cancellation_drains_a_queued_priced_terminal_before_persisting`, `cancellation_keeps_the_queued_providers_exact_price`, `cancellation_persists_an_anthropic_shaped_priced_partial`); the first pins the drain mechanism rather than the persisted outcome.
 
-### 34dd548 2026-08-27 aj-agent,aj-tools: overlay session env on tool subshells
+### 34dd548 2026-08-27 aj-agent,aj-tools: overlay session env on tool subshells [RETIRED]
+- Status: Retired without further code changes. One child-construction site applies the environment overlay. Sub-agent inheritance is a separate composition promise, not implied by independent-agent isolation tests.
 - Stats: 4 files, +368 -5, ~15 prod / ~355 test lines
 - Body: empty
-- Verdict: MAYBE
-- Why: Production is 15 lines (`session_env` on session state, `cmd.envs(ctx.session_env())`). Four end-to-end agent tests at 350 lines pin layering, per-agent isolation, sub-agent inheritance, and background spill; the last two follow from the first two given how `session_env()` is read, so two may suffice.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Production is 15 lines (`session_env` on session state, `cmd.envs(ctx.session_env())`). Four end-to-end agent tests at 350 lines pin layering, per-agent isolation, sub-agent inheritance, and background spill; the last two follow from the first two given how `session_env()` is read, so two may suffice.
 
-### b2f9b51 2026-08-28 aj-app,aj: show session environment in info
+### b2f9b51 2026-08-28 aj-app,aj: show session environment in info [RETIRED]
+- Status: Retired without further code changes. Environment quoting preserves exact value distinctions that one-line sanitization would lose. Digest, bounded rendering, and composed info tests cover different promises.
 - Stats: 4 files, +416 -24, ~55 prod / ~360 test lines
 - Body: empty
-- Verdict: MAYBE
-- Why: `InfoRow::Env` plus an Env section is the right shape. Tests at three layers (digest rows, overlay rendering, two interactive-loop tests) for one display section is heavy, and `quoted_env_text` introduces a bespoke `\x20`-style quoting grammar for values that `text::one_line` already sanitises for other rows.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: `InfoRow::Env` plus an Env section is the right shape. Tests at three layers (digest rows, overlay rendering, two interactive-loop tests) for one display section is heavy, and `quoted_env_text` introduces a bespoke `\x20`-style quoting grammar for values that `text::one_line` already sanitises for other rows.
 
-### a28b751 2026-08-29 aj-models,aj-app: pin openai terminal retry boundaries
+### a28b751 2026-08-29 aj-models,aj-app: pin openai terminal retry boundaries [RETIRED]
+- Status: Retired without further code changes. The scripted retry server and held-response provider fixture have different capabilities. No substantial shared fixture simplification was established.
 - Stats: 2 files, +605 -0, ~0 prod / ~605 test lines
 - Body: empty
-- Verdict: MAYBE
-- Why: Test-only, laying down the contract a300297 then implements against. The new `openai_stream_terminals.rs` builds its own scripted HTTP server (`ResponseScript`, `read_request`) because `provider_test_support` is crate-private; two SSE fixture servers now exist in the workspace.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Test-only, laying down the contract a300297 then implements against. The new `openai_stream_terminals.rs` builds its own scripted HTTP server (`ResponseScript`, `read_request`) because `provider_test_support` is crate-private; two SSE fixture servers now exist in the workspace.
 
-### bf3a5eb 2026-08-30 aj-app: account committed compaction usage live
+### bf3a5eb 2026-08-30 aj-app: account committed compaction usage live [RETIRED]
+- Status: Retired without further code changes. Compaction usage travels with its durable checkpoint and is keyed by that identity. The ambient assistant-versus-compaction ownership mechanism is gone.
 - Stats: 17 files, +779 -213, ~170 prod / ~550 test lines (estimate: session_host.rs +374 and test modules; lib.rs event_protocol_tests +140)
 - Body: empty
-- Verdict: MAYBE
-- Why: Feature-shaped and mostly at the right boundary: summarizer usage is persisted on the `Compaction` entry, `complete_oneshot` returns the priced message, `Agent::account_usage` is shared with the turn path. The thing to revisit is `UsageOrigin { Assistant, Compaction }` replacing `last_finalized_assistant` in `AgentRender` so the reducer infers a usage row's owner from ambient state; within three hours (bdaefe6, e1139c6) this was patched with `has_usage` and then replaced by a self-identifying `checkpoint_id` on the event, which is what the row key should have been from the start.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Feature-shaped and mostly at the right boundary: summarizer usage is persisted on the `Compaction` entry, `complete_oneshot` returns the priced message, `Agent::account_usage` is shared with the turn path. The thing to revisit is `UsageOrigin { Assistant, Compaction }` replacing `last_finalized_assistant` in `AgentRender` so the reducer infers a usage row's owner from ambient state; within three hours (bdaefe6, e1139c6) this was patched with `has_usage` and then replaced by a self-identifying `checkpoint_id` on the event, which is what the row key should have been from the start.
 
-### 8bf9e0a 2026-08-31 aj: close account login composition gaps
+### 8bf9e0a 2026-08-31 aj: close account login composition gaps [RETIRED]
+- Status: Retired without further code changes. The account-label engine and inspection flow are gone. Remaining padding uses the renderer width method, with coverage for its actual propagation.
 - Stats: 5 files, +307 -61, ~50 prod / ~260 test lines (estimate: content_overlay.rs and interactive.rs test hunks)
 - Body: empty
-- Verdict: MAYBE
-- Why: Mostly doc-comment rewording plus one real change: `Shell.width_method: Cell<Method>` snapshotted at draw and threaded via new `spawn_shell_overlay_fetch` into `auth_rows(.., width_method)` so emoji/CJK account labels align in the auth overlay. Reasonable, but the "gaps" bundle shape and ~250 lines of rendering tests (`👋🏿` vs `個` under two width methods) for a column-padding fix are worth a glance. The account-inspection flow this commit routes through was deleted two days later (a5e691b).
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Mostly doc-comment rewording plus one real change: `Shell.width_method: Cell<Method>` snapshotted at draw and threaded via new `spawn_shell_overlay_fetch` into `auth_rows(.., width_method)` so emoji/CJK account labels align in the auth overlay. Reasonable, but the "gaps" bundle shape and ~250 lines of rendering tests (`👋🏿` vs `個` under two width methods) for a column-padding fix are worth a glance. The account-inspection flow this commit routes through was deleted two days later (a5e691b).
 
-### 0bd1045 2026-08-31 session, aj-app: fuse logs after persistence failures
+### 0bd1045 2026-08-31 session, aj-app: fuse logs after persistence failures [RETIRED]
+- Status: Retired without further code changes. One-way failed-log containment remains small. Pending-record assertions retain some internal coupling, but no substantial reduction was established without changing durability behavior.
 - Stats: 15 files, +1436 -225, ~300 prod / ~1100 test lines (estimate: log.rs `test_support` module ~180 and test hunks ~400, session_host.rs +341)
 - Body: A partial append makes the descriptor unsafe; fuse the log one-way on first I/O failure, signal the driver via oneshot, drain the session, and let the client re-ask.
-- Verdict: MAYBE
-- Why: Good body, real durability problem, and the core is small: `WriteState { Writable, WriteFailed }`, `ensure_writable()` at each mutation, `fuse()`, one oneshot. Worth a second look: `AppendWriter` enum gains a `#[cfg(test)] Faulting(FaultingAppendWriter)` variant and a ~180-line `test_support` fault fixture inside the production module, and the test suite pins fine-grained pending-record ownership after each failure kind (`pending_write_failure_releases_only_completed_record_ownership`, `pending_flush_failure_keeps_every_record_owned`, ...), which mirrors the internal `pending_writes` bookkeeping rather than the contract.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Good body, real durability problem, and the core is small: `WriteState { Writable, WriteFailed }`, `ensure_writable()` at each mutation, `fuse()`, one oneshot. Worth a second look: `AppendWriter` enum gains a `#[cfg(test)] Faulting(FaultingAppendWriter)` variant and a ~180-line `test_support` fault fixture inside the production module, and the test suite pins fine-grained pending-record ownership after each failure kind (`pending_write_failure_releases_only_completed_record_ownership`, `pending_flush_failure_keeps_every_record_owned`, ...), which mirrors the internal `pending_writes` bookkeeping rather than the contract.
 
-### 763c87b 2026-08-31 models: preserve cancellation priority before request issuance
+### 763c87b 2026-08-31 models: preserve cancellation priority before request issuance [RETIRED]
+- Status: Retired without further code changes. One local poll tracker preserves cancellation priority and distinguishes unissued zero usage from potentially issued partial usage. No separate issuance machinery exists.
 - Stats: 6 files, +229 -115, ~90 prod / ~130 test lines (estimate: cancel.rs and provider test hunks)
 - Body: empty
-- Verdict: MAYBE
-- Why: Replaces `select_cancel_after_poll` with `select_request` returning `RequestSelectOutcome { Ready, CancelledBeforePoll, CancelledAfterPoll }`, tracking whether the request future was polled once so a cancel before the first poll stays "complete zero" while one after stays "partial". Proportionate in size, but this is fine-grained semantics for the `incomplete` marker from 854f4a7: whether an aborted, zero-token request is marked partial is unlikely to matter to a user, and four providers now carry the three-way match.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Replaces `select_cancel_after_poll` with `select_request` returning `RequestSelectOutcome { Ready, CancelledBeforePoll, CancelledAfterPoll }`, tracking whether the request future was polled once so a cancel before the first poll stays "complete zero" while one after stays "partial". Proportionate in size, but this is fine-grained semantics for the `incomplete` marker from 854f4a7: whether an aborted, zero-token request is marked partial is unlikely to matter to a user, and four providers now carry the three-way match.
 
-### 26a2f6a 2026-08-31 aj-app: close compaction accounting evidence gaps
+### 26a2f6a 2026-08-31 aj-app: close compaction accounting evidence gaps [RETIRED]
+- Status: Retired without further code changes. The accounting snapshot observes existing durable, live, and host surfaces across unsuccessful compactions. No substantial duplicate accounting mechanism was identified.
 - Stats: 1 files, +467 -40, ~0 prod / ~450 test lines (single integration test file)
 - Body: empty
-- Verdict: MAYBE
-- Why: Test-only, but the shape is telling: a `CompactionAccountingSnapshot` struct collecting 12 fields (durable stats, per-row `source_entry` plus an 8-tuple of accumulated/turn counters and two incomplete flags, live and host totals) compared across live, shutdown, durable, replay and attach boundaries. "Evidence gaps" is review-driven language; the snapshot pins the `TokenUsage` split and row identity internals, so it will fail on any legitimate redesign of the accounting events it exercises.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Test-only, but the shape is telling: a `CompactionAccountingSnapshot` struct collecting 12 fields (durable stats, per-row `source_entry` plus an 8-tuple of accumulated/turn counters and two incomplete flags, live and host totals) compared across live, shutdown, durable, replay and attach boundaries. "Evidence gaps" is review-driven language; the snapshot pins the `TokenUsage` split and row identity internals, so it will fail on any legitimate redesign of the accounting events it exercises.
 
-### 7c71560 2026-08-31 aj-models: write auth storage atomically
+### 7c71560 2026-08-31 aj-models: write auth storage atomically [RETIRED]
+- Status: Retired without further code changes. Auth storage has one atomic writer path without the injectable writer parameter. Privacy before writing was part of the original credential-safety requirement.
 - Stats: 1 files, +452 -27, ~140 prod / ~310 test lines (estimate: hunks past `mod tests`)
 - Body: empty
-- Verdict: MAYBE
-- Why: Atomic tempfile-and-rename for credentials is the right fix and the prod part is compact (`replace_auth_file`, `prepare_auth_parent`, `make_existing_auth_file_private`, `create_lock_dir`). Worth a second look: `replace_auth_file` takes an injectable `write: impl FnOnce(&mut File, &[u8])` purely for test fault injection, and the commit widens scope beyond "atomic" into absolute-path requirement, symlink rejection, and permission repair on every locked read, with ten tests and an empty body. That injection seam then grew into fe5d661.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Atomic tempfile-and-rename for credentials is the right fix and the prod part is compact (`replace_auth_file`, `prepare_auth_parent`, `make_existing_auth_file_private`, `create_lock_dir`). Worth a second look: `replace_auth_file` takes an injectable `write: impl FnOnce(&mut File, &[u8])` purely for test fault injection, and the commit widens scope beyond "atomic" into absolute-path requirement, symlink rejection, and permission repair on every locked read, with ten tests and an empty body. That injection seam then grew into fe5d661.
 
-### 882ef4d 2026-09-01 aj: follow the focused host working directory
+### 882ef4d 2026-09-01 aj: follow the focused host working directory [RETIRED]
+- Status: Retired without further code changes. Focused-host working-directory reconciliation is local and uses the specified hello omission rule. Adding a role field would not remove substantial machinery.
 - Stats: 13 files, +481 -48, ~180 prod / ~300 test lines (estimate: gateway/tests.rs +65, interactive.rs and wire tests hunks)
 - Body: empty
-- Verdict: MAYBE
-- Why: Feature across wire (`DirectoryHost.working_directory`), gateway directory (`Enrollment.working_directory`, `Settling.moves_directory`, `record_changes` vs `changes` split), and client (`World.sync_working_directory`, `Shell.rebind_working_directory`). Proportionate, but `World.working_directory_follows_focus` is derived from "the remote hello omitted its directory" as the gateway discriminator, an implicit protocol heuristic that should probably be an explicit fact from `Hello`.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: Feature across wire (`DirectoryHost.working_directory`), gateway directory (`Enrollment.working_directory`, `Settling.moves_directory`, `record_changes` vs `changes` split), and client (`World.sync_working_directory`, `Shell.rebind_working_directory`). Proportionate, but `World.working_directory_follows_focus` is derived from "the remote hello omitted its directory" as the gateway discriminator, an implicit protocol heuristic that should probably be an explicit fact from `Hello`.
 
-### c056f34 2026-09-01 tools: use absolute gutters for read file output
+### c056f34 2026-09-01 tools: use absolute gutters for read file output [RETIRED]
+- Status: Retired without further code changes. Shared absolute gutters enable existing tool-result deduplication. Persistence, replay, and export coverage protect single-copy storage and exact post-hook reconstruction.
 - Stats: 4 files, +415 -45, ~30 prod / ~360 test lines (estimate: new tests/read_file_persistence.rs 278, read_file.rs test hunks)
 - Body: empty
-- Verdict: MAYBE
-- Why: The prod change is a simplification (one `format_numbered_lines` for both model and display body). The second look is the new 278-line integration test `real_read_file_results_compact_and_preserve_post_hook_bodies` that walks persistence, projection, replay and HTML export for a gutter-numbering change, plus 100k-line fixture tests for gutter width; ~12x test-to-prod ratio for a display tweak.
+- Verdict: Retired after investigation. No substantial simplification identified.
+- Why flagged: The prod change is a simplification (one `format_numbered_lines` for both model and display body). The second look is the new 278-line integration test `real_read_file_results_compact_and_preserve_post_hook_bodies` that walks persistence, projection, replay and HTML export for a gutter-numbering change, plus 100k-line fixture tests for gutter width; ~12x test-to-prod ratio for a display tweak.
 
 
 ## FINE (31)
