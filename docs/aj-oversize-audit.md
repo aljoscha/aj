@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 19 LOOKs.
+retired 20 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 8 open)
+## LOOK (27 total, 7 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -52,7 +52,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`2c09755` 2026-08-30 models: mark issued handshake usage partial~~ Retired without code changes: cancellation-first request selection distinguishes unissued zero usage from potentially issued partial usage with one local poll tracker.
 - ~~`317c06c` 2026-08-30 session: implement crash-safe environment publication~~ Retired: RTK runs its hook answer unchanged, without PATH defenses or helper-specific teardown machinery. Transactional log publication and global CLI aggregation remain.
 - ~~`48c07a9` 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account~~ Retired: ordinary label validation and direct picker actions replace the Unicode and inspection machinery. Reauthentication uses one request path, and account presentation uses one formatter.
-- `854f4a7` 2026-08-30 usage: mark undisclosed provider totals partial
+- ~~`854f4a7` 2026-08-30 usage: mark undisclosed provider totals partial~~ Retired without code changes: latest-turn and cumulative completeness serve distinct views, with one provider-owned fact propagated through existing snapshots. No worthwhile simplification identified.
 - `c4b977b` 2026-08-30 aj-app,aj: keep failed transitions on the selected session
 - `bdaefe6` 2026-08-30 aj-app: preserve checkpoint usage dependencies
 - `e1139c6` 2026-08-30 aj-app: preserve committed compaction usage atomically
@@ -258,12 +258,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: The account-name feature acquired a formal Unicode, reversible-display, and legacy-inspection contract during design and review. The original commit includes 4,368 lines of Unicode data, a 239-line generator, and an 846-line label module. Its six-commit range landed together, not as successive deployed redesigns.
 - Disposition: Keep duplicate-safe insertion, explicit reauthentication, exact raw picker targets, and default-removal choices. The test-support read observer protects connected-client credential ownership, and auth-row bounds protect renderer geometry. Neither needs the removed label engine. Composed reauthentication coverage observes the selected credential changing while its sibling stays intact, rather than requiring a particular request variant.
 
-### 854f4a7 2026-08-30 usage: mark undisclosed provider totals partial
+### 854f4a7 2026-08-30 usage: mark undisclosed provider totals partial [RETIRED]
+- Status: Retired without code changes. A complete turn restores measured context occupancy while an earlier disclosure gap keeps cumulative spend partial. Existing usage events, footer views, and summaries preserve those distinct populations without reconstructing history.
 - Stats: 30 files, +962 -144, ~250 prod / ~700 test lines (estimate: added lines past each file's `mod tests` plus tests/, roundtrip, smoke_test.mjs)
 - Body: empty
-- Verdict: LOOK
-- Why: One fact ("the provider did not disclose final usage") is stored in five places: `Usage.incomplete` (aj-models/types.rs), `TokenUsage.turn_incomplete` + `TokenUsage.accumulated_incomplete` (aj-agent/types.rs), `UsageSummary.incomplete`, `ContextUsage.incomplete` and `AgentFooter.last_turn_incomplete` (aj-app/footer.rs), each with its own sticky-OR plumbing, and then rendered at five surfaces (footer `≥20k/200k`, transcript row title, shutdown summary line, session_info row, export template). It also bundles an unrelated reducer rule (`if entry.is_none() { record_turn_usage }` so tagged checkpoint usage does not replace footer occupancy) and a compaction.rs anchor rewrite (`assistant_usage_anchor`). A 30-file cross-crate semantic change with an empty body and ~700 lines of tests, several asserting legacy JSON re-encodes byte-identically.
-- Simpler shape: Carry `incomplete` on `Usage` only, derive the rendered marker from the last usage at display time, and land the checkpoint-occupancy reducer rule separately with its own explanation.
+- Verdict: Retired after investigation. One provider-owned bit, existing aggregation, and additive projections are proportionate to marking recorded subtotals without estimating spend or retrying for usage.
+- Why flagged: A large cross-crate diff with apparently duplicated sticky state. The footer replaces its latest-turn value rather than accumulating it, and `ContextUsage` is a returned view. The separate truncating formatter was removed before the seven-commit range landed. Current reducer arms distinguish assistant occupancy from compaction spend without the tagged-event guard.
+- Disposition: Keep production and tests. The shared anchor predicate prevents incomplete usage from becoming an exact context estimate. Ordinary token formatting remains shared. All 479 provider-library tests, 17 targeted app/session tests, and the export smoke test passed, covering provider evidence, persistence, replay, compatibility, aggregation, context planning, and rendering.
 
 ### c4b977b 2026-08-30 aj-app,aj: keep failed transitions on the selected session
 - Stats: 4 files, +2732 -869, ~1100 prod / ~1600 test lines (estimate: hunks past `mod tests` at interactive.rs:7746 and client.rs:1043)
