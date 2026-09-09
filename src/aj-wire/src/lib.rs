@@ -41,6 +41,7 @@ pub const SESSION_ACCOUNTS_CAPABILITY: &str = "session_accounts";
 
 /// A creator-selected model, resolved against the receiving host's catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelSelection {
     pub api: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,6 +60,7 @@ pub struct AccountSelection {
 
 /// Optional creator overrides for a session.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
@@ -146,6 +148,7 @@ pub struct PromptRequest {
 
 /// Queues steering text for an optional viewed agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SteerRequest {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,6 +157,7 @@ pub struct SteerRequest {
 
 /// Cancels an optional viewed agent.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentId>,
@@ -169,6 +173,7 @@ pub enum QueueOperation {
 
 /// Withdraws one agent's pending message or clears all session queues.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueueRequest {
     pub op: QueueOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,6 +189,7 @@ pub struct QueueOutcome {
 
 /// Starts a manual compaction with optional instructions.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -233,6 +239,7 @@ pub struct AccountList {
 /// parent read plus a switch. A read would be an endpoint with a single
 /// consumer, and every client would have to repeat the same resolution.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeadRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
@@ -269,6 +276,7 @@ pub struct EnvRequest {
 
 /// Sets or clears a session's tag.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TagRequest {
     /// The label to set. Empty or whitespace-only clears the session's tag,
     /// so setting and clearing are one route, and an absent field reads the
@@ -279,6 +287,7 @@ pub struct TagRequest {
 
 /// Sets or clears a session's archived bit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveRequest {
     /// The bit to leave the session with. `false` unarchives, so setting and
     /// clearing are one route, and an absent field reads as `false` the same
@@ -291,7 +300,7 @@ pub struct ArchiveRequest {
 ///
 /// This is distinct from a bodyless HTTP method. A route that uses this type is
 /// a JSON command whose accepted bodies are absent, blank, or `{}`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct EmptyRequest {}
 
 /// A protocol-defined JSON command body.
@@ -725,6 +734,7 @@ pub enum HostSource {
 
 /// The address of a host to enroll on a gateway.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnrollHostRequest {
     /// `<host>:<port>` or a full `http(s)://` URL.
     ///
@@ -735,10 +745,10 @@ pub struct EnrollHostRequest {
 
 /// Closed request-context representations.
 ///
-/// Public wire models stay ordinary serde models because callers also use some
-/// of their children in observations and persisted messages. The HTTP request
-/// codec enters through this sealed module and converts only after the complete
-/// command body has matched its schema.
+/// Simple commands decode directly through their strict public models. Private
+/// schemas handle flattened requests and keep shared content models tolerant in
+/// observations and persisted messages. Conversion happens only after the
+/// complete command body has matched its schema.
 mod request {
     use super::*;
 
@@ -754,55 +764,6 @@ mod request {
                 }
             }
         };
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictModelSelection {
-        api: String,
-        #[serde(default)]
-        url: Option<String>,
-        name: String,
-    }
-
-    impl From<StrictModelSelection> for ModelSelection {
-        fn from(selection: StrictModelSelection) -> Self {
-            Self {
-                api: selection.api,
-                url: selection.url,
-                name: selection.name,
-            }
-        }
-    }
-
-    #[derive(Default, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictSessionSettings {
-        #[serde(default)]
-        model: Option<StrictModelSelection>,
-        #[serde(default)]
-        thinking: Option<String>,
-        #[serde(default)]
-        thinking_display: Option<String>,
-        #[serde(default)]
-        speed: Option<String>,
-        #[serde(default)]
-        verbosity: Option<String>,
-        #[serde(default)]
-        account: Option<AccountSelection>,
-    }
-
-    impl From<StrictSessionSettings> for SessionSettings {
-        fn from(settings: StrictSessionSettings) -> Self {
-            Self {
-                model: settings.model.map(Into::into),
-                thinking: settings.thinking,
-                thinking_display: settings.thinking_display,
-                speed: settings.speed,
-                verbosity: settings.verbosity,
-                account: settings.account,
-            }
-        }
     }
 
     #[derive(Deserialize)]
@@ -880,7 +841,7 @@ mod request {
         #[serde(default)]
         host: Option<String>,
         #[serde(default)]
-        settings: Option<StrictSessionSettings>,
+        settings: Option<SessionSettings>,
         #[serde(default)]
         prompt: Option<StrictPromptInput>,
         #[serde(default)]
@@ -894,7 +855,7 @@ mod request {
         StrictCreateSessionRequest,
         |request: StrictCreateSessionRequest| CreateSessionRequest {
             host: request.host,
-            settings: request.settings.map(Into::into),
+            settings: request.settings,
             prompt: request.prompt.map(Into::into),
             tag: request.tag,
             env: request.env,
@@ -941,69 +902,13 @@ mod request {
         }
     );
 
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictSteerRequest {
-        text: String,
-        #[serde(default)]
-        agent: Option<AgentId>,
-    }
+    request_body!(SteerRequest, SteerRequest, |request| request);
 
-    request_body!(
-        SteerRequest,
-        StrictSteerRequest,
-        |request: StrictSteerRequest| SteerRequest {
-            text: request.text,
-            agent: request.agent,
-        }
-    );
+    request_body!(CancelRequest, CancelRequest, |request| request);
 
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictCancelRequest {
-        #[serde(default)]
-        agent: Option<AgentId>,
-    }
+    request_body!(QueueRequest, QueueRequest, |request| request);
 
-    request_body!(
-        CancelRequest,
-        StrictCancelRequest,
-        |request: StrictCancelRequest| CancelRequest {
-            agent: request.agent,
-        }
-    );
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictQueueRequest {
-        op: QueueOperation,
-        #[serde(default)]
-        agent: Option<AgentId>,
-    }
-
-    request_body!(
-        QueueRequest,
-        StrictQueueRequest,
-        |request: StrictQueueRequest| QueueRequest {
-            op: request.op,
-            agent: request.agent,
-        }
-    );
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictCompactRequest {
-        #[serde(default)]
-        instructions: Option<String>,
-    }
-
-    request_body!(
-        CompactRequest,
-        StrictCompactRequest,
-        |request: StrictCompactRequest| CompactRequest {
-            instructions: request.instructions,
-        }
-    );
+    request_body!(CompactRequest, CompactRequest, |request| request);
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -1011,7 +916,7 @@ mod request {
         #[serde(default)]
         agent: Option<AgentId>,
         #[serde(default)]
-        model: Option<StrictModelSelection>,
+        model: Option<ModelSelection>,
         #[serde(default)]
         thinking: Option<String>,
         #[serde(default)]
@@ -1028,7 +933,7 @@ mod request {
         |request: StrictSettingsRequest| SettingsRequest {
             agent: request.agent,
             change: SessionSettings {
-                model: request.model.map(Into::into),
+                model: request.model,
                 thinking: request.thinking,
                 thinking_display: request.thinking_display,
                 speed: request.speed,
@@ -1038,56 +943,16 @@ mod request {
         }
     );
 
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictHeadRequest {
-        #[serde(default)]
-        entry: Option<String>,
-        #[serde(default)]
-        before: Option<String>,
-    }
-
-    request_body!(
-        HeadRequest,
-        StrictHeadRequest,
-        |request: StrictHeadRequest| HeadRequest {
-            entry: request.entry,
-            before: request.before,
-        }
-    );
+    request_body!(HeadRequest, HeadRequest, |request| request);
 
     request_body!(EnvRequest, EnvRequest, |request| request);
     request_body!(AccountRequest, AccountRequest, |request| request);
 
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictTagRequest {
-        #[serde(default)]
-        tag: String,
-    }
+    request_body!(TagRequest, TagRequest, |request| request);
 
-    request_body!(TagRequest, StrictTagRequest, |request: StrictTagRequest| {
-        TagRequest { tag: request.tag }
-    });
+    request_body!(ArchiveRequest, ArchiveRequest, |request| request);
 
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictArchiveRequest {
-        #[serde(default)]
-        archived: bool,
-    }
-
-    request_body!(
-        ArchiveRequest,
-        StrictArchiveRequest,
-        |request: StrictArchiveRequest| ArchiveRequest {
-            archived: request.archived,
-        }
-    );
-
-    struct StrictEmptyRequest {}
-
-    impl<'de> Deserialize<'de> for StrictEmptyRequest {
+    impl<'de> Deserialize<'de> for EmptyRequest {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
             D: Deserializer<'de>,
@@ -1095,7 +960,7 @@ mod request {
             struct EmptyObjectVisitor;
 
             impl<'de> Visitor<'de> for EmptyObjectVisitor {
-                type Value = StrictEmptyRequest;
+                type Value = EmptyRequest;
 
                 fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                     formatter.write_str("an empty JSON object")
@@ -1108,7 +973,7 @@ mod request {
                     if map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
                         return Err(A::Error::custom("unexpected field in empty request"));
                     }
-                    Ok(StrictEmptyRequest {})
+                    Ok(EmptyRequest {})
                 }
             }
 
@@ -1116,25 +981,9 @@ mod request {
         }
     }
 
-    request_body!(
-        EmptyRequest,
-        StrictEmptyRequest,
-        |_request: StrictEmptyRequest| EmptyRequest {}
-    );
+    request_body!(EmptyRequest, EmptyRequest, |request| request);
 
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictEnrollHostRequest {
-        address: String,
-    }
-
-    request_body!(
-        EnrollHostRequest,
-        StrictEnrollHostRequest,
-        |request: StrictEnrollHostRequest| EnrollHostRequest {
-            address: request.address,
-        }
-    );
+    request_body!(EnrollHostRequest, EnrollHostRequest, |request| request);
 }
 
 /// One enrolled host in a gateway's host table.
