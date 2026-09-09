@@ -7333,7 +7333,7 @@ async fn advance_resume(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     state: Resume,
-) -> Result<ResumeAdvance, ControlError> {
+) -> ResumeAdvance {
     let mut state = state;
     match state.step {
         ResumeStep::Waiting => {
@@ -7356,9 +7356,9 @@ async fn advance_resume(
                         world.client_mut().expect_attach();
                     }
                     state.step = ResumeStep::CatchingUp(Block::open(world));
-                    Ok(ResumeAdvance::Pending(state))
+                    ResumeAdvance::Pending(state)
                 }
-                Err(error) => Ok(ResumeAdvance::OpenFailed { state, error }),
+                Err(error) => ResumeAdvance::OpenFailed { state, error },
             }
         }
         ResumeStep::CatchingUp(ref mut block) => {
@@ -7377,7 +7377,7 @@ async fn advance_resume(
             // Opening it at the new tail is what this is for: the caches keyed
             // by entry id need no telling (see `EntryRenderCache::retire`).
             shell.borrow().transcript.borrow_mut().reset_to_tail();
-            Ok(ResumeAdvance::Settled { state, caught })
+            ResumeAdvance::Settled { state, caught }
         }
     }
 }
@@ -8174,11 +8174,11 @@ async fn drive(
         if resume.as_ref().is_some_and(Resume::ready) {
             let state = resume.take().expect("checked just above");
             match advance_resume(world, shell, state).await {
-                Ok(ResumeAdvance::Pending(next)) => {
+                ResumeAdvance::Pending(next) => {
                     world.connection = Connection::CatchingUp;
                     resume = Some(next);
                 }
-                Ok(ResumeAdvance::OpenFailed { mut state, error }) => {
+                ResumeAdvance::OpenFailed { mut state, error } => {
                     let reason = peer_refusal(&error);
                     let presented = fail_pending_transition(
                         app,
@@ -8197,33 +8197,18 @@ async fn drive(
                     world.connection = Connection::Reconnecting;
                     resume = Some(state);
                 }
-                Ok(ResumeAdvance::Settled { mut state, caught }) => match caught {
+                ResumeAdvance::Settled { mut state, caught } => match caught {
                     CatchUp::Caught => {
                         // A local stream retains the materialization. Only now,
                         // after the target proved usable, bind its direct read
-                        // handles into the shell. Failure keeps the selection
-                        // and returns to paced recovery.
+                        // handles into the shell. A failed read means this
+                        // process's host is gone. Remote mode has no handles.
                         if let Err(error) = refresh_local_handles(world, shell).await {
-                            if !world.control.is_remote() {
-                                break Err(anyhow::anyhow!("the session host is gone: {error}"));
-                            }
-                            let reason = peer_refusal(&error);
-                            fail_pending_transition(
-                                app,
-                                shell,
-                                world,
-                                TransitionFailure::Open(reason),
-                            );
-                            world.stream.take();
-                            world.client_mut().owe_reattach();
-                            state.failed();
-                            world.connection = Connection::Reconnecting;
-                            resume = Some(state);
-                        } else {
-                            world.connection = Connection::Connected;
-                            complete_pending_transition(app, shell, world).await;
-                            resume = None;
+                            break Err(anyhow::anyhow!("the session host is gone: {error}"));
                         }
+                        world.connection = Connection::Connected;
+                        complete_pending_transition(app, shell, world).await;
+                        resume = None;
                     }
                     refused @ CatchUp::Refused { .. } => {
                         fail_pending_transition(
@@ -8266,7 +8251,6 @@ async fn drive(
                         resume = Some(state);
                     }
                 },
-                Err(err) => break Err(anyhow::anyhow!("the session host is gone: {err}")),
             }
             app.request_redraw();
         }
@@ -12469,7 +12453,7 @@ mod tests {
         while let Some(mut state) = pending.take() {
             assert!(Instant::now() < deadline, "the re-attach never settled");
             if state.ready() {
-                match advance_resume(world, shell, state).await? {
+                match advance_resume(world, shell, state).await {
                     ResumeAdvance::Pending(state) => {
                         world.connection = Connection::CatchingUp;
                         pending = Some(state);
@@ -12572,7 +12556,7 @@ mod tests {
         assert!(
             matches!(
                 advance_resume(&mut world, &shell, Resume::new()).await,
-                Ok(ResumeAdvance::OpenFailed { .. })
+                ResumeAdvance::OpenFailed { .. }
             ),
             "a local host that cannot serve its own session is gone"
         );
@@ -16553,10 +16537,7 @@ mod tests {
                 }
                 continue;
             }
-            match advance_resume(world, shell, state)
-                .await
-                .expect("the recovery driver returns a typed outcome")
-            {
+            match advance_resume(world, shell, state).await {
                 ResumeAdvance::Pending(next) => state = next,
                 ResumeAdvance::OpenFailed { error, .. } => {
                     panic!("the selected transition could not open: {error}")
@@ -26076,9 +26057,8 @@ mod tests {
         let epoch = "epoch-in-hand";
         let silence = Duration::from_millis(300);
 
-        let ResumeAdvance::Pending(mut state) = advance_resume(&mut world, &shell, Resume::new())
-            .await
-            .expect("a connection's recovery is never fatal")
+        let ResumeAdvance::Pending(mut state) =
+            advance_resume(&mut world, &shell, Resume::new()).await
         else {
             panic!("the peer answered the open, so a block is arriving");
         };
@@ -26118,9 +26098,7 @@ mod tests {
              one that gives up and this test measures nothing",
         );
 
-        let left = advance_resume(&mut world, &shell, state)
-            .await
-            .expect("a connection's recovery is never fatal");
+        let left = advance_resume(&mut world, &shell, state).await;
         assert!(
             matches!(
                 left,
@@ -26169,9 +26147,7 @@ mod tests {
         .await;
         redirect_to(&mut world, &peer, silence);
 
-        let ResumeAdvance::Pending(state) = advance_resume(&mut world, &shell, Resume::new())
-            .await
-            .expect("a connection's recovery is never fatal")
+        let ResumeAdvance::Pending(state) = advance_resume(&mut world, &shell, Resume::new()).await
         else {
             panic!("the peer answered the open, so a block is arriving");
         };
@@ -26184,9 +26160,7 @@ mod tests {
              one that gives up and this test measures nothing",
         );
 
-        let left = advance_resume(&mut world, &shell, state)
-            .await
-            .expect("a connection's recovery is never fatal");
+        let left = advance_resume(&mut world, &shell, state).await;
         let landed = matches!(
             left,
             ResumeAdvance::Settled {
@@ -26326,9 +26300,8 @@ mod tests {
         let silence = Duration::from_secs(120);
         let peer = WarmPeer::start(Vec::new(), Duration::from_millis(20)).await;
         redirect_to(&mut world, &peer, silence);
-        let ResumeAdvance::Pending(resuming) = advance_resume(&mut world, &shell, Resume::new())
-            .await
-            .expect("a connection's recovery is never fatal")
+        let ResumeAdvance::Pending(resuming) =
+            advance_resume(&mut world, &shell, Resume::new()).await
         else {
             panic!("the peer answered the open, so a block is now awaited");
         };
