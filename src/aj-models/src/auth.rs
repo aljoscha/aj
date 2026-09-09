@@ -1424,7 +1424,7 @@ fn migrate_legacy_openai_oauth(data: &mut AuthData) {
 /// power-loss durability, which requires syncing both the file and directory.
 fn write_auth_file(path: &Path, data: &AuthData) -> Result<(), AuthError> {
     let content = serde_json::to_string_pretty(data).map_err(AuthError::Serialize)?;
-    replace_auth_file(path, content.as_bytes(), write_credentials)
+    replace_auth_file(path, content.as_bytes())
 }
 
 /// The production byte writer behind [`write_auth_file`].
@@ -1440,15 +1440,10 @@ fn write_credentials(file: &mut std::fs::File, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)
 }
 
-/// Replace `path` only after `write` succeeds.
-///
-/// The byte writer is separate from publication so any write error drops the
-/// private temporary file while the destination remains unchanged.
-fn replace_auth_file(
-    path: &Path,
-    content: &[u8],
-    write: impl FnOnce(&mut std::fs::File, &[u8]) -> io::Result<()>,
-) -> Result<(), AuthError> {
+/// Replace `path` only after the credential write succeeds.
+/// Any write error drops the private temporary file and leaves the destination
+/// unchanged.
+fn replace_auth_file(path: &Path, content: &[u8]) -> Result<(), AuthError> {
     prepare_auth_parent(path)?;
     make_existing_auth_file_private(path)?;
 
@@ -1469,7 +1464,7 @@ fn replace_auth_file(
         0o600,
     )?;
 
-    write(replacement.as_file_mut(), content)?;
+    write_credentials(replacement.as_file_mut(), content)?;
     replacement
         .persist(path)
         .map_err(|error| AuthError::Io(error.error))?;
@@ -2852,104 +2847,6 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
     }
 
-    #[test]
-    fn an_injected_partial_write_preserves_the_prior_complete_store() {
-        let (_dir, path) = scratch_path("atomic-failure");
-        let previous = br#"{"provider":{"type":"api_key","key":"complete-old-secret"}}"#;
-        std::fs::write(&path, previous).expect("seed prior complete store");
-
-        let result = replace_auth_file(
-            &path,
-            br#"{"provider":{"type":"api_key","key":"replacement-secret"}}"#,
-            |file, bytes| {
-                file.write_all(&bytes[..bytes.len() / 2])?;
-                Err(io::Error::other("injected auth write failure"))
-            },
-        );
-
-        assert!(
-            matches!(result, Err(AuthError::Io(error)) if error.to_string() == "injected auth write failure")
-        );
-        assert_eq!(
-            std::fs::read(&path).expect("read store after failed replacement"),
-            previous
-        );
-        let entries = std::fs::read_dir(path.parent().expect("auth parent"))
-            .expect("list auth parent")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read auth parent entries");
-        assert_eq!(entries.len(), 1, "failed replacement left a temp file");
-        assert_eq!(entries[0].path(), path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn successful_replacement_is_private_before_writing_and_replaces_the_inode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root =
-            TempDir::with_prefix("aj-auth-test-atomic-success-").expect("create scratch root");
-        let parent = root.path().join("credentials");
-        let path = parent.join("auth.json");
-        let prior_link = root.path().join("prior-auth.json");
-        let previous = b"complete-old-secret";
-        let replacement = b"complete-new-secret";
-        std::fs::create_dir(&parent).expect("create auth parent");
-        std::fs::write(&path, previous).expect("seed prior store");
-        std::fs::hard_link(&path, &prior_link).expect("retain prior inode");
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
-            .expect("make parent permissive");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
-            .expect("make auth file permissive");
-
-        replace_auth_file(&path, replacement, |file, bytes| {
-            assert_eq!(mode(&parent), 0o700);
-            assert_eq!(mode(&path), 0o600);
-            assert_eq!(
-                file.metadata().expect("temp metadata").permissions().mode() & 0o777,
-                0o600
-            );
-
-            let temporary = std::fs::read_dir(&parent)
-                .expect("list replacement directory")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("read replacement entries")
-                .into_iter()
-                .map(|entry| entry.path())
-                .filter(|entry| entry != &path)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                temporary.len(),
-                1,
-                "replacement must use one same-directory temp file"
-            );
-            assert!(
-                temporary[0]
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(".auth.json.tmp-"))
-            );
-
-            file.write_all(bytes)
-        })
-        .expect("atomically replace auth store");
-
-        assert_eq!(std::fs::read(&path).expect("read replacement"), replacement);
-        assert_eq!(
-            std::fs::read(&prior_link).expect("read retained prior inode"),
-            previous,
-            "replacement wrote through the destination instead of swapping it"
-        );
-        assert_eq!(mode(&parent), 0o700);
-        assert_eq!(mode(&path), 0o600);
-        let entries = std::fs::read_dir(&parent)
-            .expect("list final auth parent")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read final auth entries");
-        assert_eq!(entries.len(), 1, "successful replacement left a temp file");
-        assert_eq!(entries[0].path(), path);
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn a_storage_mutation_replaces_the_destination_inode() {
@@ -3018,87 +2915,103 @@ mod tests {
         );
     }
 
-    /// The temporal first-create guarantee: on a missing destination, the
-    /// production writer receives credential bytes only through an
-    /// already-private temporary file in an already-private parent, never
-    /// through the destination path. Observed during the write, not after it,
-    /// so a write-then-chmod regression cannot pass on final modes alone.
+    /// Credential bytes land on a private temporary file in a private parent,
+    /// both on first creation and when repairing permissive existing storage.
+    /// Observe permissions before writing, since final modes cannot distinguish
+    /// private creation from write-then-chmod.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_first_credential_write_is_private_before_its_first_byte() {
-        use std::cell::RefCell;
+    async fn credential_writes_are_private_before_their_first_byte() {
+        use std::cell::Cell;
         use std::os::unix::fs::PermissionsExt;
         use std::rc::Rc;
 
-        let root =
-            TempDir::with_prefix("aj-auth-test-temporal-create-").expect("create scratch root");
-        let parent = root.path().join("credentials");
-        let path = parent.join("auth.json");
+        for existing in [false, true] {
+            let root =
+                TempDir::with_prefix("aj-auth-test-temporal-write-").expect("create scratch root");
+            let parent = root.path().join("credentials");
+            let path = parent.join("auth.json");
+            if existing {
+                std::fs::create_dir(&parent).expect("create auth parent");
+                std::fs::write(
+                    &path,
+                    br#"{"existing":{"type":"api_key","key":"old-secret"}}"#,
+                )
+                .expect("seed prior store");
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+                    .expect("make parent permissive");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                    .expect("make auth file permissive");
+            }
 
-        let observed = Rc::new(RefCell::new(None));
-        let record = Rc::clone(&observed);
-        let observer_path = path.clone();
-        let observer_parent = parent.clone();
-        let _guard = fault::install_write_hook(Box::new(move |file, _bytes| {
-            let file_mode = file
-                .metadata()
-                .expect("replacement file metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            let same_directory_temp = std::fs::read_dir(&observer_parent)
-                .expect("list auth parent during write")
-                .filter_map(|entry| {
-                    entry
-                        .expect("read auth parent entry")
+            let observed = Rc::new(Cell::new(false));
+            let record = Rc::clone(&observed);
+            let observer_path = path.clone();
+            let observer_parent = parent.clone();
+            let _guard = fault::install_write_hook(Box::new(move |file, _bytes| {
+                record.set(true);
+                assert_eq!(
+                    file.metadata()
+                        .expect("replacement metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600,
+                    "credential bytes must land on an already-private file"
+                );
+                assert_eq!(mode(&observer_parent), 0o700);
+                if existing {
+                    assert_eq!(mode(&observer_path), 0o600);
+                } else {
+                    assert!(
+                        !observer_path.exists(),
+                        "first-create bytes must go through the temporary file"
+                    );
+                }
+                let temporary = std::fs::read_dir(&observer_parent)
+                    .expect("list auth parent during write")
+                    .map(|entry| entry.expect("read auth parent entry").path())
+                    .filter(|entry| {
+                        entry != &observer_path && entry != &lock_path_for(&observer_path)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(temporary.len(), 1, "one same-directory replacement file");
+                assert!(
+                    temporary[0]
                         .file_name()
-                        .into_string()
-                        .ok()
-                })
-                .any(|name| name.starts_with(".auth.json.tmp-"));
-            *record.borrow_mut() = Some((
-                file_mode,
-                mode(&observer_parent),
-                observer_path.exists(),
-                same_directory_temp,
-            ));
-            None
-        }));
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".auth.json.tmp-"))
+                );
+                None
+            }));
 
-        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
-        storage
-            .insert_bare(
-                "anthropic",
-                AuthCredential::ApiKey {
-                    key: "first-secret".into(),
-                },
-            )
-            .await
-            .expect("write first credential");
+            let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+            storage
+                .insert_bare(
+                    "anthropic",
+                    AuthCredential::ApiKey {
+                        key: "new-secret".into(),
+                    },
+                )
+                .await
+                .expect("write credential");
 
-        let (file_mode, parent_mode, destination_existed, same_directory_temp) = observed
-            .borrow_mut()
-            .take()
-            .expect("the first create must cross the production credential writer");
-        assert_eq!(
-            file_mode, 0o600,
-            "credential bytes must land on an already-private file"
-        );
-        assert_eq!(
-            parent_mode, 0o700,
-            "credential bytes must land in an already-private parent"
-        );
-        assert!(
-            !destination_existed,
-            "first-create bytes must go through the temporary file, not the destination"
-        );
-        assert!(
-            same_directory_temp,
-            "the replacement file must live in the destination's own directory"
-        );
-        assert_eq!(mode(&path), 0o600);
-        let stored = std::fs::read_to_string(&path).expect("read first store");
-        assert!(stored.contains("first-secret"));
+            assert!(observed.get(), "storage must cross the credential writer");
+            assert_eq!(mode(&parent), 0o700);
+            assert_eq!(mode(&path), 0o600);
+            let stored: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read store"))
+                    .expect("complete credential store");
+            assert_eq!(stored["anthropic"]["key"], "new-secret");
+            if existing {
+                assert_eq!(stored["existing"]["key"], "old-secret");
+            }
+            let entries = std::fs::read_dir(&parent)
+                .expect("list final auth parent")
+                .map(|entry| entry.expect("read final auth entry").path())
+                .collect::<Vec<_>>();
+            assert_eq!(entries, [path], "successful write left residue");
+        }
     }
 
     /// Each hardening chmod is failed in isolation and the storage operation
@@ -3197,7 +3110,7 @@ mod tests {
             // replace_auth_file's own hardening calls are shadowed by the
             // lock's on the storage path above; they are the only defense for
             // a future direct caller, so their propagation is pinned here.
-            let direct = replace_auth_file(&path, b"{}", write_credentials);
+            let direct = replace_auth_file(&path, b"{}");
             assert!(
                 matches!(
                     direct,
