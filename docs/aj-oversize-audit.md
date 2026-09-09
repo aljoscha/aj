@@ -10,7 +10,7 @@ abstractions, tests at the stable boundary). Reference case at audit time:
 `c4b977b` (retired below).
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 26 LOOKs.
+retired all 27 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -30,7 +30,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 1 open)
+## LOOK (27 total, 0 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -60,7 +60,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`70e7ee6` 2026-08-31 aj-tools: bound direct command reap after sigkill~~ Retired without code changes: the existing process guard owns bounded reap and resource release, while capture joins distinguish intentional cancellation from real failure. No worthwhile simplification identified.
 - ~~`be726be` 2026-08-31 aj-wire: reject unknown command fields~~ Retired by `6073d92b`: simple requests and creation settings use their public schemas, while specialized views preserve flattened and shared-content behavior.
 - ~~`5fc079e` 2026-08-31 agent: serialize live usage accounting~~ Retired without further code changes: one exclusive accounting operation publishes one complete event, and subscription-only access shares the existing bus. No worthwhile simplification identified.
-- `fe5d661` 2026-09-01 aj-models: make auth hardening guarantees load-bearing
+- ~~`fe5d661` 2026-09-01 aj-models: make auth hardening guarantees load-bearing~~ Retired by `9a0a3ae1`: credential writes have one writer path, with temporal permissions and failure atomicity covered through AuthStorage rather than duplicate helper tests.
 
 ## MAYBE (43)
 
@@ -313,12 +313,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: Repeated accounting reshapes and apparent defensive layering. The twelve-commit range landed together, not as successive deployed redesigns. The concurrency finding concerned legal public API calls, reproduced with a scheduling yield, rather than an observed live-host race. Enforcing exclusive access adds no runtime serialization machinery.
 - Disposition: Keep production and tests. Replacing the emission guard with a caller convention or exposing the full bus would weaken ownership without a worthwhile simplification. All 12 targeted accounting, listener-failure, cancellation, live/replay, attach-release, and unsuccessful-compaction tests passed.
 
-### fe5d661 2026-09-01 aj-models: make auth hardening guarantees load-bearing
-- Stats: 1 files, +501 -19, ~160 prod / ~350 test lines (estimate: `mod fault` ~90 and `PermissionSite` wrappers ~60 are production-file code behind cfg(test))
+### fe5d661 2026-09-01 aj-models: make auth hardening guarantees load-bearing [RETIRED]
+- Status: Retired by `9a0a3ae1`. The helper-supplied writer and two helper-only tests are removed. A composed AuthStorage test observes private permissions before credential bytes for both first creation and permissive-store repair. Composed rollback, inode replacement, and permission-failure coverage remain intact.
+- Stats: 1 file, +501 -19. Most additions are tests and test-only fault machinery, with small non-test writer and permission wrappers.
 - Body: Three verification gaps let hardening regress silently; add named writer, per-site chmod wrapper, thread-local fault points and a /dev/full swap so tests cross the exact production path.
-- Verdict: LOOK
-- Why: Production code is restructured solely to give tests hooks: `PermissionSite { ReplacementFile, Parent, ExistingFile }`, `set_unix_permissions`/`set_unix_file_permissions` wrappers with `#[cfg(test)] fault::injected_permission_failure(site)?`, `write_credentials` with a `#[cfg(test)]` intercept, and a `mod fault` with thread-local `RefCell<Option<WriteHook>>` and `HookGuard`. The tests then prove that each `?` after a chmod propagates, i.e. they mirror the internal structure site by site (the body itself concedes the injection "cannot catch a swallow of the chmod syscall itself"). ~500 lines to defend three `?` operators that the type system already makes visible.
-- Simpler shape: Keep the one black-box test that matters (a failed write leaves the prior store byte-identical, which `/dev/full` already gives) and drop the per-site injection scaffolding.
+- Verdict: Retired after scoped test consolidation. Private creation, surfaced permission errors, and atomic replacement are proportionate credential-safety guarantees.
+- Why flagged: A large verification-only diff and fault-injection wrappers. The repair addressed demonstrated test gaps in the same atomic-write range. The audit overstated production growth and proposed dropping distinct guarantees: the /dev/full test itself uses the write hook and does not establish privacy before writing.
+- Disposition: Keep the atomic storage implementation and its temporal observer, composed partial-write and real-device failures, and per-site permission-failure coverage. The permission injection's syscall-level limitation remains explicit. No power-loss durability or lock redesign is introduced.
 
 
 ## MAYBE, details
