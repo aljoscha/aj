@@ -63,9 +63,10 @@ Layering in a tool child is:
 
 Removing a session key exposes any inherited value. It is not an instruction to
 unset a host-process variable. Collisions with fixed overrides are allowed but
-those overrides win. Host-side helpers such as the `rtk` formatter keep their
-host-owned environment. The frozen system prompt's workspace `<env>` block is
-unrelated to this map.
+those overrides win. The optional `rtk hook check` inherits the host environment,
+and its answer runs unchanged in the tool shell. AJ does not adjust PATH or bind
+executables to protect RTK from session or command-local environment changes.
+The frozen system prompt's workspace `<env>` block is unrelated to this map.
 
 ## Validation and persistence
 

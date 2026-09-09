@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 17 LOOKs.
+retired 18 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 10 open)
+## LOOK (27 total, 9 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -50,7 +50,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`434fd05` 2026-08-28 aj-app: own complete session teardown~~ Retired: one registration owns driver completion before and after spawn, and abort requests derive from the registry cutoff. Session ownership and cleanup barriers remain intact.
 - ~~`532aaab` 2026-08-28 aj-session,aj-app: resolve session environment gate findings~~ Retired: the unused projection compatibility wrapper and its assertions are removed. Export presentation and renderer-specific escaping remain intact.
 - ~~`2c09755` 2026-08-30 models: mark issued handshake usage partial~~ Retired without code changes: cancellation-first request selection distinguishes unissued zero usage from potentially issued partial usage with one local poll tracker.
-- `317c06c` 2026-08-30 session: implement crash-safe environment publication
+- ~~`317c06c` 2026-08-30 session: implement crash-safe environment publication~~ Retired: RTK runs its hook answer unchanged, without PATH defenses or helper-specific teardown machinery. Transactional log publication and global CLI aggregation remain.
 - `48c07a9` 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account
 - `854f4a7` 2026-08-30 usage: mark undisclosed provider totals partial
 - `c4b977b` 2026-08-30 aj-app,aj: keep failed transitions on the selected session
@@ -242,12 +242,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: A request-first selector and polling-order test made accounting change cancellation behavior. `763c87b` replaced both before the seven-commit range landed. `Usage.incomplete` originated in `854f4a7`, not this commit. First-poll tracking is a conservative boundary, not proof of network delivery or a persisted issuance protocol.
 - Disposition: Keep production and tests. Marking every cancellation incomplete would let an entirely unissued request leave durable session and bucket totals partial through sticky aggregation. All 13 focused cancellation, handshake, and issued-error tests and five composed terminal tests passed, covering request counts, persistence, reload, and replay.
 
-### 317c06c 2026-08-30 session: implement crash-safe environment publication
+### 317c06c 2026-08-30 session: implement crash-safe environment publication [RETIRED]
+- Status: Retired after removing RTK executable probing, absolute-path binding, shell-name checks, and helper-specific process teardown. Optional rewriting retains its basic hook timeout and fallback. Session and command-local PATH changes are the caller's responsibility. User-command cleanup remains intact.
 - Stats: 29 files, +3822 -443, ~760 prod / ~3060 test lines
 - Body: empty
-- Verdict: LOOK
-- Why: One commit bundles at least three features: a global `--env` flag with a hand-rolled argv pre-scan (`global_env_arguments`, `CliParser` wrapper, `LaunchEnvError`), a transactional first-publication protocol in log.rs (stage file plus `hard_link`, `InitialPublicationFault` enum and `AJ_TEST_INITIAL_PUBLICATION_CHECKPOINT` env hooks compiled into production code under `#[cfg(test)]`, crash-child subprocess tests), a frozen `pre_env_codec_fixture.rs`, and ~990 lines in bash.rs reworking rtk hook resolution (`find_rtk_on_path` with absolute-path checks, `bind_rtk_rewrite`, `ProcessTeardown`, `RTK_HOOK_TIMEOUT`, descendant reaping) with 20 new tests. Empty body on 4265 lines. Tests like `resume_refuses_every_malformed_env_creation_layout_without_changing_bytes` pin log layout internals.
-- Simpler shape: the env record already buffers with the other seeds (558e77e); first publication is write-to-temp, fsync, rename, no in-tree fault injection. `--env` is a clap global arg. rtk hardening is its own change.
+- Verdict: Retired after a scoped RTK simplification.
+- Why flagged: CLI, persistence, and RTK work arrived in one large commit with an empty body. The RTK change was +286/-48 production lines and +646/-12 test lines. Atomic no-replace publication serves the log contract, while the CLI scan preserves global append arguments that clap otherwise drops across subcommands. The crash checkpoints are test-only.
+- Disposition: Keep publication, CLI aggregation, and persisted-format coverage. Remove RTK-specific defenses and their tests, retaining composed coverage of basic rewriting, disabled or unavailable hooks, and fallback. Environment editing uses branch-local state with legacy Meta creation records still readable.
 
 ### 48c07a9 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account
 - Stats: 17 files, +9350 -406, ~6030 prod / ~3275 test lines (4368 of prod is the vendored `DerivedGeneralCategory.txt`)
