@@ -481,6 +481,42 @@ mod tests {
     }
 
     #[test]
+    fn export_preserves_account_choices_and_branch_framing() {
+        let (_dir, mut log) = log_from_jsonl(&[SYSTEM, USER]);
+        let fork = log.head().cloned().expect("user head");
+        let named = log
+            .append_account_change("openai", Some("</script><b>Work 界</b>"))
+            .expect("named");
+        log.set_head(fork.clone()).expect("branch");
+        let unnamed = log
+            .append_account_change("anthropic", Some(""))
+            .expect("unnamed");
+        let reset = log.append_account_change("openai", None).expect("reset");
+        let html = render_session_html(&log);
+        assert!(!data_island(&html).contains('<'));
+        let data: serde_json::Value =
+            serde_json::from_str(&decoded_island(&html)).expect("export JSON");
+        assert_eq!(data["leaf_id"], reset.id);
+        for (at, parent, provider, account) in [
+            (&named, &fork, "openai", Some("</script><b>Work 界</b>")),
+            (&unnamed, &fork, "anthropic", Some("")),
+            (&reset, &unnamed.id, "openai", None),
+        ] {
+            let entry = data["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == at.id)
+                .expect("account entry");
+            assert_eq!(entry["type"], "account_change");
+            assert_eq!(entry["parent_id"], *parent);
+            assert_eq!(entry["thread"], "user");
+            assert_eq!(entry["provider"], provider);
+            assert_eq!(entry["account"], serde_json::json!(account));
+        }
+    }
+
+    #[test]
     fn export_redacts_env_values_in_the_embedded_entries_without_mutating_the_log() {
         let env = r#"{"id":"e0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:00Z","thread":"meta","type":"env_change","env":{"BEADS_ACTOR":"session-actor","SECRET_TOKEN":"hunter2"}}"#;
         let user = r#"{"id":"u0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:01Z","thread":"user","type":"message","message":{"role":"user","content":[{"type":"text","text":"Hello"}],"timestamp":1704067201000}}"#;

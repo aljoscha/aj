@@ -188,6 +188,7 @@ fn bucket_key(bucket: &UsageBucket) -> String {
     let model = without_control_characters(&bucket.model);
     let key = format!("{provider} / {model}");
     match &bucket.account {
+        Some(account) if account.is_empty() => format!("{key} (Unnamed account)"),
         Some(account) => format!("{key} ({})", without_control_characters(account)),
         None => key,
     }
@@ -332,6 +333,7 @@ mod tests {
             compaction_usage: Usage::default(),
             compactions_with_usage: 0,
             settings: SessionSettings {
+                accounts: Default::default(),
                 model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
                 thinking: Some("medium".to_string()),
                 speed: None,

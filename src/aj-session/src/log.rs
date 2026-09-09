@@ -413,6 +413,13 @@ pub enum ConversationEntryKind {
     /// The active model changed (or was first recorded). `provider`
     /// and `model_id` key into the model catalog.
     ModelChange { provider: String, model_id: String },
+    /// A session-wide account choice on the user branch. `None` removes the
+    /// provider's pin, `Some("")` pins its unnamed account, and any other label
+    /// pins that exact account. Sub-agent snapshots do not store account choices.
+    AccountChange {
+        provider: String,
+        account: Option<String>,
+    },
     /// The active thinking effort changed (or was first recorded).
     /// `level` is one of "off", "minimal", "low", "medium", "high",
     /// "xhigh", "max". Stored as a string so the on-disk
@@ -521,6 +528,7 @@ impl ConversationEntryKind {
             Self::Message { .. } | Self::Compaction { .. } => true,
             Self::SystemPrompt { .. }
             | Self::ModelChange { .. }
+            | Self::AccountChange { .. }
             | Self::ThinkingChange { .. }
             | Self::SpeedChange { .. }
             | Self::VerbosityChange { .. }
@@ -647,6 +655,10 @@ pub struct SessionSettings {
     /// back to the most recent assistant message's (provider, model)
     /// for logs that carry no settings entries.
     pub model: Option<(String, String)>,
+    /// Session-wide provider account pins folded on the user path. An absent
+    /// provider uses its default, an empty label pins its unnamed account, and
+    /// other labels are exact pins. Logs without account entries yield no pins.
+    pub accounts: BTreeMap<String, String>,
     /// Last recorded thinking level string, from the most recent
     /// [`ConversationEntryKind::ThinkingChange`] entry. `None` means
     /// "nothing recorded" (inherit the current default) — distinct
@@ -790,17 +802,20 @@ impl Conversation {
     /// inference axes. The complete branch environment is read separately via
     /// [`LogSnapshot::session_env`], without compaction filtering.
     pub fn settings(&self) -> SessionSettings {
-        let mut settings = SessionSettings {
-            model: None,
-            thinking: None,
-            speed: None,
-            verbosity: None,
-        };
+        let mut settings = SessionSettings::default();
         for entry in &self.entries {
             match &entry.entry {
                 ConversationEntryKind::ModelChange { provider, model_id } => {
                     settings.model = Some((provider.clone(), model_id.clone()));
                 }
+                ConversationEntryKind::AccountChange { provider, account } => match account {
+                    Some(label) => {
+                        settings.accounts.insert(provider.clone(), label.clone());
+                    }
+                    None => {
+                        settings.accounts.remove(provider);
+                    }
+                },
                 ConversationEntryKind::ThinkingChange { level } => {
                     settings.thinking = Some(level.clone());
                 }
@@ -2068,6 +2083,25 @@ impl ConversationLog {
             ConversationEntryKind::ModelChange {
                 provider: provider.to_string(),
                 model_id: model_id.to_string(),
+            },
+        )
+    }
+
+    /// Record a session-wide account choice on the active user branch.
+    ///
+    /// `None` removes the provider's pin (Provider default), `Some("")` pins the
+    /// unnamed account, and `Some(label)` pins that exact label. Like other
+    /// state entries, this buffers until the next punctuation append.
+    pub fn append_account_change(
+        &mut self,
+        provider: &str,
+        account: Option<&str>,
+    ) -> Result<EntryRef, ConversationError> {
+        self.append_state_entry(
+            ThreadFilter::USER,
+            ConversationEntryKind::AccountChange {
+                provider: provider.to_string(),
+                account: account.map(str::to_string),
             },
         )
     }
@@ -5203,6 +5237,137 @@ mod tests {
             Some(&expected),
             "a branch lost its ancestral seed"
         );
+    }
+
+    #[test]
+    fn account_pins_and_resets_round_trip_independently() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        let root = log.set_system_prompt("p".into()).expect("root");
+        let mut checkpoints = vec![(root.id, BTreeMap::new())];
+        for (provider, account, expected) in [
+            (
+                "anthropic",
+                Some(" Work 界 "),
+                vec![("anthropic", " Work 界 ")],
+            ),
+            (
+                "openai",
+                Some(""),
+                vec![("anthropic", " Work 界 "), ("openai", "")],
+            ),
+            (
+                "anthropic",
+                Some("personal"),
+                vec![("anthropic", "personal"), ("openai", "")],
+            ),
+            ("anthropic", None, vec![("openai", "")]),
+            ("anthropic", None, vec![("openai", "")]),
+            ("openai", None, vec![]),
+        ] {
+            let previous_head = log
+                .head()
+                .cloned()
+                .or_else(|| log.system_prompt_id().cloned());
+            let at = log
+                .append_account_change(provider, account)
+                .expect("account change");
+            assert_eq!(log.head(), Some(&at.id));
+            assert_eq!(log.parent_of(&at.id), previous_head.as_ref());
+            assert_eq!(log.last_seq(), at.seq);
+            let entry = log.entries_in_order().pop().expect("appended entry");
+            assert_eq!(entry.thread, ThreadKind::User);
+            assert_eq!(entry.agent_id, None);
+            let json = serde_json::to_value(entry).expect("serialize account change");
+            assert_eq!(json["type"], "account_change");
+            assert_eq!(json["provider"], provider);
+            assert_eq!(json["account"], serde_json::json!(account));
+            checkpoints.push((
+                at.id,
+                expected
+                    .into_iter()
+                    .map(|(p, a)| (p.into(), a.into()))
+                    .collect(),
+            ));
+        }
+        assert!(
+            !log.path().exists(),
+            "account choices are ordinary buffered state"
+        );
+        let tip = punctuation(&mut log, "publish choices").expect("message");
+        let resumed = ConversationLog::resume(&persistence, log.session_id()).expect("resume");
+        for reader in [&log, &resumed] {
+            for (head, expected) in &checkpoints {
+                let conversation = reader.linearize(head, ThreadFilter::USER);
+                assert_eq!(&conversation.settings().accounts, expected);
+                assert!(
+                    conversation.messages().is_empty(),
+                    "account state is not model input"
+                );
+            }
+            assert_eq!(
+                reader
+                    .linearize(&tip.id, ThreadFilter::USER)
+                    .message_count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn account_settings_follow_the_selected_branch_on_resume() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        log.set_system_prompt("p".into()).expect("root");
+        let legacy = punctuation(&mut log, "no account history").expect("legacy message");
+        log.append_account_change("anthropic", Some("work"))
+            .expect("pin");
+        log.append_account_change("openai", Some("shared"))
+            .expect("other provider");
+        let fork = punctuation(&mut log, "fork here").expect("fork point");
+        log.append_account_change("anthropic", None).expect("reset");
+        let reset_tip = punctuation(&mut log, "default branch").expect("reset branch");
+        log.set_head(fork.id.clone()).expect("select fork");
+        let unnamed = log
+            .append_account_change("anthropic", Some(""))
+            .expect("unnamed pin");
+        assert_eq!(log.parent_of(&unnamed.id), Some(&fork.id));
+        let unnamed_tip = punctuation(&mut log, "unnamed branch").expect("unnamed branch");
+        log.append_compaction(
+            ThreadFilter::USER,
+            "summary".into(),
+            unnamed_tip.id,
+            100,
+            None,
+            None,
+        )
+        .expect("compact branch");
+        let session_id = log.session_id().to_string();
+        let active_tip = log.head().cloned().expect("active tip");
+        drop(log);
+
+        let mut resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        assert_eq!(resumed.head(), Some(&active_tip));
+        for (head, expected) in [
+            (active_tip, vec![("anthropic", ""), ("openai", "shared")]),
+            (reset_tip.id, vec![("openai", "shared")]),
+            (fork.id, vec![("anthropic", "work"), ("openai", "shared")]),
+            (legacy.id, vec![]),
+        ] {
+            resumed.set_head(head).expect("select branch");
+            let settings = resumed
+                .linearize(resumed.head().unwrap(), ThreadFilter::USER)
+                .settings();
+            assert_eq!(
+                settings.accounts,
+                expected
+                    .into_iter()
+                    .map(|(p, a)| (p.into(), a.into()))
+                    .collect()
+            );
+        }
     }
 
     #[test]

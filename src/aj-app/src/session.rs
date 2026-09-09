@@ -402,6 +402,16 @@ impl SessionCore {
             speed,
             verbosity,
         )?;
+        if matches!(source, SessionSource::Create { .. }) {
+            let accounts = run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .accounts
+                .snapshot();
+            for (provider, account) in accounts {
+                log.append_account_change(&provider, Some(&account))?;
+            }
+        }
 
         // Fresh, empty registry: only sub-agents spawned in this session
         // become promptable.

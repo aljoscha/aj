@@ -87,10 +87,18 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::OpenLogoutSelector,
     },
     Command {
-        name: "auth-default",
-        title: "default account",
+        name: "account",
+        title: "account",
         category: "auth",
-        description: "Choose the account used when no account is named.",
+        description: "Choose this session's account for the viewed model's provider. Applies next inference.",
+        action_id: None,
+        action: CommandAction::OpenAccountSelector,
+    },
+    Command {
+        name: "auth-default",
+        title: "Provider default · shared",
+        category: "auth",
+        description: "Affects every session following this provider default, including running work. Pinned accounts stay unchanged.",
         action_id: None,
         action: CommandAction::OpenDefaultAccountSelector,
     },
@@ -288,6 +296,8 @@ pub enum CommandAction {
     /// affects the current session only. Use the settings window to
     /// change the default for new sessions.
     OpenModelSelector,
+    /// Choose a session-specific account for the viewed model's provider.
+    OpenAccountSelector,
     /// Open the OAuth provider/account picker. Adding an account opens the login
     /// dialog, which prompts for a label before OAuth begins when the provider
     /// is already configured.

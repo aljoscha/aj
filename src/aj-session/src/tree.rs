@@ -269,6 +269,7 @@ fn kind_placeholder(kind: &ConversationEntryKind) -> &'static str {
         ConversationEntryKind::Message { .. } => "(message)",
         ConversationEntryKind::SystemPrompt { .. } => "(system prompt)",
         ConversationEntryKind::ModelChange { .. }
+        | ConversationEntryKind::AccountChange { .. }
         | ConversationEntryKind::ThinkingChange { .. }
         | ConversationEntryKind::SpeedChange { .. }
         | ConversationEntryKind::VerbosityChange { .. } => "(settings)",
@@ -472,6 +473,19 @@ mod tests {
         assert_eq!(seg.label, "(settings)");
         assert_eq!(seg.message_count, 0);
         assert!(seg.is_leaf);
+    }
+
+    #[test]
+    fn account_only_segment_is_settings_state() {
+        let (_dir, mut log) = new_log();
+        let account = log
+            .append_account_change("openai", Some(""))
+            .expect("account");
+        let tree = log.session_tree();
+        let segment = segment_with_head(&tree, &account.id);
+        assert_eq!(segment.label, "(settings)");
+        assert_eq!(segment.message_count, 0);
+        assert!(segment.on_active_path);
     }
 
     /// `on_active_path` marks exactly the segments on the head's root->head

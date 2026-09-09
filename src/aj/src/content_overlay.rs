@@ -642,7 +642,7 @@ pub(crate) fn auth_rows(
                 // As stored, folded to one row exactly like a session tag: a
                 // control character in a hand-edited legacy label must not
                 // reach the terminal through this read-only surface.
-                let folded = crate::text::one_line(label);
+                let folded = crate::login::account_label_text(label);
                 account_label_for_auth_row(&folded, account_cell_budget, width_method)
             })
         })
@@ -737,7 +737,10 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyle
         .map(|status| {
             (
                 status.provider_id.as_str(),
-                status.account.as_deref().map(one_line),
+                status
+                    .account
+                    .as_deref()
+                    .map(crate::login::account_label_text),
                 usage_status_rows(status, now_ms),
             )
         })
@@ -1194,11 +1197,20 @@ mod tests {
                     summary: "API key (stored)".into(),
                     detail: None,
                 },
+                ProviderAuthStatus {
+                    provider_id: "anthropic".into(),
+                    account_label: Some(String::new()),
+                    is_default: false,
+                    configured: true,
+                    summary: "subscription".into(),
+                    detail: None,
+                },
             ],
             &test_styles(),
             Method::Unicode,
         ));
         assert!(rows.contains("work"), "{rows}");
+        assert!(rows.contains("Unnamed account"), "{rows}");
         assert_eq!(
             rows.matches("work").count(),
             2,
@@ -1768,6 +1780,7 @@ mod tests {
                 thinking: Some("medium".to_string()),
                 speed: None,
                 verbosity: None,
+                accounts: Default::default(),
             },
             session_env: None,
         }

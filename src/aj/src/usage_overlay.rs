@@ -51,7 +51,6 @@ use crate::overlay::{
     subtitle_close,
 };
 use crate::settings_ui::push_window;
-use crate::text::one_line;
 
 /// Where the overlay is in the reset-credit interaction. `Display` is the
 /// read-only usage page. The rest are the steps of spending one credit.
@@ -125,11 +124,14 @@ impl MenuItem {
     }
 }
 
-/// The picker and confirm text for one reset target: the provider id and,
-/// for a labeled account, the label as stored (folded through `one_line`).
+/// The picker and confirm text for one reset target, including unnamed accounts.
 fn target_display(target: &RateLimitResetTarget) -> String {
     match target.account() {
-        Some(account) => format!("{} / {}", target.provider_id(), one_line(account)),
+        Some(account) => format!(
+            "{} / {}",
+            target.provider_id(),
+            crate::login::account_label_text(account)
+        ),
         None => target.provider_id().to_string(),
     }
 }

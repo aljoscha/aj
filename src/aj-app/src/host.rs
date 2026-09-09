@@ -405,6 +405,12 @@ pub enum Command {
         instructions: Option<String>,
     },
     Settings(SettingsChange),
+    /// Change this session's choice for one provider. None follows its shared
+    /// default, and an empty string pins the unnamed credential.
+    Account {
+        provider: String,
+        account: Option<String>,
+    },
     /// Edit the selected branch overlay. None removes a key, Some("") sets it empty.
     /// Refused while any work is live.
     Env {
@@ -755,6 +761,7 @@ impl SessionHost {
                 ARCHIVE_CAPABILITY.to_string(),
                 COMPACTION_USAGE_CAPABILITY.to_string(),
                 aj_wire::SESSION_ENV_CAPABILITY.to_string(),
+                aj_wire::SESSION_ACCOUNTS_CAPABILITY.to_string(),
             ],
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.host_id.clone(),
@@ -1337,6 +1344,50 @@ impl SessionHost {
         Ok(env)
     }
 
+    /// Account names and selection policy on the host, never bearer material.
+    pub async fn accounts(
+        &self,
+        session: &str,
+        provider: Option<&str>,
+    ) -> Result<aj_wire::AccountList, HostError> {
+        let live = self.live(session).await?;
+        let (provider, selected) = {
+            let cfg = live
+                .core
+                .run_config
+                .lock()
+                .expect("run config mutex poisoned");
+            let provider = provider.unwrap_or(&cfg.model_key.0).to_string();
+            let selected = cfg.accounts.get(&provider);
+            (provider, selected)
+        };
+        let provider = provider.as_str();
+        let auth = &self.inner.shared.auth;
+        let (default, accounts) = match auth
+            .stored_credentials(provider)
+            .await
+            .map_err(|err| HostError::Internal(err.into()))?
+        {
+            Some(aj_models::auth::StoredProviderCredentials::Bare(_)) => {
+                (Some(String::new()), vec![String::new()])
+            }
+            Some(aj_models::auth::StoredProviderCredentials::Accounts(set)) => (
+                Some(set.default),
+                set.accounts.into_iter().map(|(label, _)| label).collect(),
+            ),
+            None => (None, Vec::new()),
+        };
+        let status = crate::auth::provider_status(auth, provider, None).await;
+        Ok(aj_wire::AccountList {
+            provider: provider.to_string(),
+            selected,
+            default,
+            accounts,
+            override_active: auth.has_runtime_override(provider).await,
+            source: status.summary,
+        })
+    }
+
     /// The session's branch tree, for a tree view and head switching.
     ///
     /// This read materializes: the tree is derived from
@@ -1645,7 +1696,7 @@ impl SessionHost {
         let mut run = self
             .inner
             .run_config_defaults
-            .resolve(config)
+            .resolve(config, &self.inner.shared.auth)
             .map_err(|err| HostError::Unsupported(err.to_string()))?;
         let default_settings = SessionSettings::default();
         let settings = settings.unwrap_or(&default_settings);
@@ -1734,6 +1785,10 @@ impl SessionHost {
             }
         }
 
+        if let Some(selection) = &settings.account {
+            run.accounts.set(&run.model_key.0, selection.name.clone());
+        }
+        run.bind_accounts(&self.inner.shared.auth);
         Ok(run)
     }
 
@@ -1810,6 +1865,18 @@ impl SessionHost {
             .expect("config mutex poisoned")
             .clone();
         let run_config = self.resolve_creator_settings(create_settings.as_ref(), &config)?;
+        if let Some(selection) = create_settings
+            .as_ref()
+            .and_then(|settings| settings.account.as_ref())
+        {
+            crate::model::validate_account_selection(
+                &self.inner.shared.auth,
+                &run_config.model_key.0,
+                selection.name.as_deref(),
+            )
+            .await
+            .map_err(HostError::Invalid)?;
+        }
         let (mut core, _seed) = SessionCore::build(
             &config,
             run_config,

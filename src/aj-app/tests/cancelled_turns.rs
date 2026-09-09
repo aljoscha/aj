@@ -45,6 +45,7 @@ fn provider_run_config(
     model: ModelInfo,
 ) -> Arc<Mutex<RunConfigSnapshot>> {
     Arc::new(Mutex::new(RunConfigSnapshot {
+        accounts: Default::default(),
         provider,
         model_info: Arc::new(model),
         stream_options: StreamOptions::default(),

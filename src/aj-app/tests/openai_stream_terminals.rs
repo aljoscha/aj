@@ -166,6 +166,7 @@ fn model(api: &str, base_url: String) -> ModelInfo {
 
 fn run_config(provider: Arc<dyn Provider>, model: ModelInfo) -> Arc<Mutex<RunConfigSnapshot>> {
     Arc::new(Mutex::new(RunConfigSnapshot {
+        accounts: Default::default(),
         provider,
         model_info: Arc::new(model),
         stream_options: StreamOptions {

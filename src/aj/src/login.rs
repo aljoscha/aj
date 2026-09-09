@@ -734,7 +734,7 @@ impl DialogCallbacks {
         let mut omitted = 0;
         for label in existing {
             // As stored, folded to the prompt's one line like any label row.
-            let folded = crate::text::one_line(label);
+            let folded = account_label_text(label);
             let separator = usize::from(!labels.is_empty()) * 2;
             if represented_bytes + separator + folded.len() <= REPRESENTATION_BUDGET {
                 represented_bytes += separator + folded.len();
@@ -848,6 +848,12 @@ pub(crate) enum AccountAction {
 /// keystroke.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AuthPickerRequest {
+    /// Select for the captured session/provider, regardless of later UI focus.
+    SelectAccount {
+        session: String,
+        provider: String,
+        account: Option<String>,
+    },
     /// Start the provider's OAuth flow for an explicit creation or replacement.
     Login {
         provider_id: String,
@@ -866,6 +872,15 @@ pub(crate) struct AuthRow {
     pub(crate) label: String,
     pub(crate) filter_key: String,
     pub(crate) summary: Option<String>,
+}
+
+/// Render an exact stored identity without turning presentation into identity.
+pub(crate) fn account_label_text(raw: &str) -> String {
+    if raw.is_empty() {
+        "Unnamed account".to_string()
+    } else {
+        crate::text::one_line(raw)
+    }
 }
 
 /// Build one selectable row: the friendly label as the primary column, an
@@ -898,7 +913,7 @@ fn picker_requests(rows: Vec<AuthRow>) -> HashMap<String, AuthPickerRequest> {
 ///
 /// Confirmation resolves the row's opaque `SelectItem::value`. Display and
 /// filter text participate only in presentation and search, never identity.
-fn open_auth_picker(
+pub(crate) fn open_auth_picker(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
     chrome: &OverlayChrome,
@@ -980,7 +995,14 @@ pub(crate) fn open_default_account_picker(
     request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
     rows: Vec<AuthRow>,
 ) {
-    open_auth_picker(stack, editor, chrome, request_slot, "Default account", rows);
+    open_auth_picker(
+        stack,
+        editor,
+        chrome,
+        request_slot,
+        "Provider default · shared",
+        rows,
+    );
 }
 
 /// Open the explicit resolution picker for removing a default account that

@@ -290,6 +290,7 @@ fn scripted(
 
 fn snapshot(provider: Arc<ScriptedProvider>) -> RunConfigSnapshot {
     RunConfigSnapshot {
+        accounts: Default::default(),
         provider,
         model_info: Arc::new(scripted_model_info()),
         stream_options: aj_models::types::StreamOptions::default(),
@@ -859,6 +860,7 @@ async fn explicit_creation_applies_settings_before_its_first_prompt() {
         .host
         .create_with(
             Some(SessionSettings {
+                account: None,
                 model: Some(ModelSelection {
                     api: "scripted".into(),
                     url: None,

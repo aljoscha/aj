@@ -602,6 +602,7 @@ pub async fn confirm_model_for_main(
                 cfg.model_info = model_info;
                 cfg.stream_options = stream_options;
                 cfg.model_key = (info.provider.clone(), info.id.clone());
+                cfg.bind_accounts(auth);
                 cfg.settings()
             };
             // Record the new settings identity so the footer's model
@@ -691,8 +692,13 @@ pub async fn confirm_model_for_sub(
         Ok(ResolvedModel {
             provider,
             model_info,
-            stream_options,
+            mut stream_options,
         }) => {
+            core.run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .accounts
+                .install(&mut stream_options, auth, &info.provider);
             // Stage the standing bundle choice; the sub's next turn
             // applies it.
             //
@@ -863,6 +869,7 @@ pub async fn confirm_speed_for_main(
                 cfg.model_info = model_info;
                 cfg.stream_options = stream_options;
                 cfg.speed = speed;
+                cfg.bind_accounts(auth);
                 (cfg.settings(), cfg.model_info.context_window)
             };
             // Record the change on the session log's user thread so a

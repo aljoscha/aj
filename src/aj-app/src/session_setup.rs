@@ -85,6 +85,8 @@ pub struct RunConfigSnapshot {
     pub model_info: Arc<ModelInfo>,
     /// Per-call stream options (thinking-display mode, etc.).
     pub stream_options: StreamOptions,
+    /// Provider-local choices shared with this session's inference resolvers.
+    pub accounts: crate::model::SessionAccounts,
     /// Default thinking effort for the next turn.
     pub thinking: Option<ThinkingConfig>,
     /// Canonical reasoning-display choice for the next turn.
@@ -113,6 +115,12 @@ pub struct RunConfigSnapshot {
 }
 
 impl RunConfigSnapshot {
+    /// Rebind a replaced model bundle to this session's account choices.
+    pub fn bind_accounts(&mut self, auth: &AuthStorage) {
+        self.accounts
+            .install(&mut self.stream_options, auth, &self.model_info.provider);
+    }
+
     /// The settings identity the next turn runs against.
     ///
     /// The run config is what a turn is stamped from, so this is the
@@ -204,7 +212,11 @@ impl RunConfigDefaults {
 
     /// Resolve one independent session snapshot from the current effective
     /// config and the launch values captured above it.
-    pub fn resolve(&self, config: &Config) -> Result<RunConfigSnapshot> {
+    pub fn resolve(
+        &self,
+        config: &Config,
+        session_auth: &AuthStorage,
+    ) -> Result<RunConfigSnapshot> {
         let DefaultSource::Layered {
             launch_model_api,
             launch_model_name,
@@ -218,7 +230,10 @@ impl RunConfigDefaults {
             auth,
         } = &self.source
         else {
-            return Ok(self.startup.clone());
+            let mut run = self.startup.clone();
+            run.accounts = crate::model::SessionAccounts::default();
+            run.bind_accounts(session_auth);
+            return Ok(run);
         };
 
         let thinking =
@@ -243,6 +258,8 @@ impl RunConfigDefaults {
             selection.api == *startup_model_api && selection.name == *startup_model_name;
         if *scripted && model_unchanged {
             let mut run = self.startup.clone();
+            run.accounts = crate::model::SessionAccounts::default();
+            run.bind_accounts(session_auth);
             run.thinking = thinking;
             run.thinking_display = config.thinking_display;
             run.speed = speed;
@@ -259,7 +276,7 @@ impl RunConfigDefaults {
         } = crate::model::resolve(registry, auth, &selection, speed)
             .context("failed to resolve current session defaults")?;
         let model_key = (model_info.provider.clone(), model_info.id.clone());
-        Ok(build_run_config(
+        let mut run = build_run_config(
             config,
             provider,
             model_info,
@@ -267,7 +284,9 @@ impl RunConfigDefaults {
             model_key,
             thinking,
             speed,
-        ))
+        );
+        run.bind_accounts(session_auth);
+        Ok(run)
     }
 }
 
@@ -320,6 +339,7 @@ fn build_run_config(
         provider,
         model_info,
         stream_options,
+        accounts: crate::model::SessionAccounts::default(),
         thinking,
         thinking_display: config.thinking_display,
         speed,
@@ -353,7 +373,7 @@ pub fn build_initial_run_config(
             model_info,
         } = crate::scripted::resolve_or_explain(name)?;
         let model_key = (selection.provider_id().to_string(), model_info.id.clone());
-        let run_config = build_run_config(
+        let mut run_config = build_run_config(
             config,
             provider,
             model_info,
@@ -362,6 +382,7 @@ pub fn build_initial_run_config(
             thinking,
             speed,
         );
+        run_config.bind_accounts(auth);
         Ok((run_config, None))
     } else {
         let registry = ModelRegistry::load();
@@ -372,7 +393,7 @@ pub fn build_initial_run_config(
         } = crate::model::resolve(&registry, auth, &selection, speed)
             .context("failed to resolve model from registry")?;
         let model_key = (model_info.provider.clone(), model_info.id.clone());
-        let run_config = build_run_config(
+        let mut run_config = build_run_config(
             config,
             provider,
             model_info,
@@ -381,6 +402,7 @@ pub fn build_initial_run_config(
             thinking,
             speed,
         );
+        run_config.bind_accounts(auth);
         let restore = RestoreContext {
             registry: Arc::new(registry),
             auth: auth.clone(),
@@ -422,6 +444,7 @@ pub(crate) fn restore_session_settings(
 ) -> Vec<String> {
     let mut notices = Vec::new();
     let mut cfg = run_config.lock().expect("run config mutex poisoned");
+    cfg.accounts.replace(settings.accounts.clone());
 
     // Speed. `None` and `Some(Standard)` are equivalent on the wire,
     // so changes are tracked by canonical name.
@@ -456,6 +479,7 @@ pub(crate) fn restore_session_settings(
                 cfg.provider = resolved.provider;
                 cfg.model_info = resolved.model_info;
                 cfg.stream_options = resolved.stream_options;
+                cfg.bind_accounts(&restore.auth);
                 let display = cfg.thinking_display;
                 crate::model::apply_thinking_display(&mut cfg.stream_options, display);
                 crate::model::apply_verbosity(&mut cfg.stream_options, config.verbosity);
@@ -478,6 +502,7 @@ pub(crate) fn restore_session_settings(
                 cfg.provider = resolved.provider;
                 cfg.model_info = resolved.model_info;
                 cfg.stream_options = resolved.stream_options;
+                cfg.bind_accounts(&restore.auth);
                 let display = cfg.thinking_display;
                 crate::model::apply_thinking_display(&mut cfg.stream_options, display);
                 crate::model::apply_verbosity(&mut cfg.stream_options, config.verbosity);
@@ -697,6 +722,13 @@ pub fn prepare_log(
             .cloned()
             .expect("post-repair head exists when pre-repair head did");
         let conversation = log.linearize(&head, ThreadFilter::USER);
+        if source.is_resume() {
+            run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .accounts
+                .replace(conversation.settings().accounts);
+        }
         if source.is_resume()
             && let Some(restore) = restore
         {
@@ -929,7 +961,7 @@ mod tests {
 
         config.model_api = Some("anthropic".to_string());
         config.model_name = Some("claude-opus-5".to_string());
-        let run = defaults.resolve(&config).expect("scripted defaults");
+        let run = defaults.resolve(&config, &auth).expect("scripted defaults");
         assert_eq!(run.model_key, startup_key);
     }
 
@@ -993,7 +1025,7 @@ mod tests {
         config.thinking_display = Some(ConfigThinkingDisplay::Detailed);
         config.speed = Some(ConfigSpeed::Fast);
         config.verbosity = Some(aj_conf::ConfigVerbosity::High);
-        let run = defaults.resolve(&config).expect("current defaults");
+        let run = defaults.resolve(&config, &auth).expect("current defaults");
 
         assert_eq!(run.model_key.1, "gpt-5.5");
         assert_eq!(run.model_info.base_url, "https://startup.example/v1");
@@ -1035,7 +1067,7 @@ mod tests {
         config.thinking = Some(ConfigThinkingLevel::High);
         config.speed = Some(ConfigSpeed::Fast);
         let run = defaults
-            .resolve(&config)
+            .resolve(&config, &auth)
             .expect("launch-precedence defaults");
 
         assert_eq!(
@@ -1067,7 +1099,7 @@ mod tests {
             RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
         config.model_name = Some("gpt-5.5".to_string());
         let run = defaults
-            .resolve(&config)
+            .resolve(&config, &auth)
             .expect("provider launch override with live model name");
         assert_eq!(
             run.model_key,
@@ -1089,7 +1121,7 @@ mod tests {
             RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
         config.model_api = Some("openai".to_string());
         let run = defaults
-            .resolve(&config)
+            .resolve(&config, &auth)
             .expect("model launch override with live provider");
         assert_eq!(run.model_key, ("openai".to_string(), "gpt-5.2".to_string()));
     }

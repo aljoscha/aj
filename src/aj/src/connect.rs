@@ -74,6 +74,22 @@ pub(crate) async fn connect(
     };
     let (session, created) =
         resolve_session(&control, launch.session(), host, settings, tag, session_env).await?;
+    if !created && let Some(selection) = args.account_selection() {
+        let current = control
+            .accounts(&session, None)
+            .await
+            .context("could not read the host's current account selection")?;
+        control
+            .command(
+                &session,
+                aj_app::host::Command::Account {
+                    provider: current.provider,
+                    account: selection.name,
+                },
+            )
+            .await
+            .context("could not apply the session account choice")?;
+    }
     Ok(Connected {
         control,
         session,
@@ -272,6 +288,7 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
     let thinking = args.thinking.or(config.thinking);
     let settings = SessionSettings {
         model,
+        account: args.account_selection(),
         // The effective config carries the value, the layers carry whether
         // anyone asked for it, so both are consulted per axis.
         thinking: (args.thinking.is_some() || stated.has("thinking")).then(|| {
@@ -570,6 +587,70 @@ mod tests {
             self.host.shutdown().await;
             self.server.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn account_flags_select_host_credentials_on_create_and_attach() {
+        let peer = Peer::start().await;
+        let auth = aj_models::auth::AuthStorage::new(peer._dir.path().join("auth.json"));
+        for label in ["", "work"] {
+            auth.insert_account(
+                "scripted",
+                label,
+                aj_models::auth::AuthCredential::ApiKey {
+                    key: format!("fake-{label}"),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let created = peer.dial(&["--new", "--account", "work"]).await;
+        assert!(created.created);
+        let session = created.session;
+        assert_eq!(
+            peer.control
+                .accounts(&session, None)
+                .await
+                .unwrap()
+                .selected
+                .as_deref(),
+            Some("work")
+        );
+        for (flags, selected) in [
+            (vec!["--account", ""], Some("")),
+            (vec![], Some("")),
+            (vec!["--default-account"], None),
+        ] {
+            let mut argv = vec![session.as_str()];
+            argv.extend(flags);
+            let attached = peer.dial(&argv).await;
+            assert!(!attached.created);
+            assert_eq!(attached.session, session);
+            assert_eq!(
+                peer.control
+                    .accounts(&session, None)
+                    .await
+                    .unwrap()
+                    .selected
+                    .as_deref(),
+                selected
+            );
+        }
+        let error = peer
+            .try_dial(&[&session, "--account", "missing"])
+            .await
+            .err()
+            .expect("missing account refused");
+        assert!(format!("{error:#}").contains("missing"));
+        assert_eq!(
+            peer.control
+                .accounts(&session, None)
+                .await
+                .unwrap()
+                .selected,
+            None
+        );
+        peer.shutdown().await;
     }
 
     #[tokio::test]

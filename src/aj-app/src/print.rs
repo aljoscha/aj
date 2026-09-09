@@ -382,6 +382,18 @@ async fn run_inner<W: Write + Send + 'static>(
         verbosity,
     )?;
 
+    if let Some(selection) = args.account_selection() {
+        crate::model::validate_account_selection(&auth, &model_key.0, selection.name.as_deref())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        log.append_account_change(&model_key.0, selection.name.as_deref())?;
+        run_config
+            .lock()
+            .expect("run config mutex poisoned")
+            .accounts
+            .set(&model_key.0, selection.name);
+    }
+
     let log = Arc::new(TokioMutex::new(log));
 
     // Register the JSONL listener BEFORE the persistence listener so
@@ -565,6 +577,9 @@ fn print_final_assistant_text<W: Write>(agent: &Agent, out: &Arc<Mutex<W>>) -> R
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod account_tests;
 
 #[cfg(test)]
 mod tests {

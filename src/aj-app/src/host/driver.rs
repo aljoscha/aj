@@ -507,6 +507,7 @@ impl Driver {
             Command::Queue(op) => Ok(self.queue_op(op)),
             Command::Compact { instructions } => self.compact(instructions),
             Command::Settings(change) => self.settings(change).await,
+            Command::Account { provider, account } => self.account(provider, account).await,
             Command::Env { key, value } => self.environment(key, value).await,
             Command::Tag { tag } => self.tag(tag),
             Command::Archive { archived } => self.archive(archived),
@@ -913,6 +914,51 @@ impl Driver {
         drop(guard);
     }
 
+    async fn account(
+        &mut self,
+        provider: String,
+        account: Option<String>,
+    ) -> Result<CommandOutcome, HostError> {
+        crate::model::validate_account_selection(&self.shared.auth, &provider, account.as_deref())
+            .await
+            .map_err(HostError::Invalid)?;
+        let choices = self
+            .session
+            .core
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned")
+            .accounts
+            .clone();
+        if choices.get(&provider) == account {
+            return Ok(CommandOutcome::Accepted);
+        }
+        let entry = self
+            .session
+            .core
+            .log
+            .lock()
+            .await
+            .append_account_change(&provider, account.as_deref())
+            .map_err(internal)?;
+        choices.set(&provider, account.clone());
+        let selection = match account.as_deref() {
+            None => "Provider default".to_string(),
+            Some("") => "Unnamed account".to_string(),
+            Some(label) => format!("{label:?}"),
+        };
+        self.publish_state_entry(
+            AgentId::Main,
+            &entry,
+            &format!(
+                "{provider} account: {selection}. Applies to subsequent requests in this session."
+            ),
+        )
+        .await;
+        self.publish_state();
+        Ok(CommandOutcome::Accepted)
+    }
+
     async fn environment(
         &mut self,
         key: String,
@@ -1099,6 +1145,13 @@ impl Driver {
             let conversation = log.linearize(&head, ThreadFilter::USER);
             // The branch records its own settings, so restoring them
             // mirrors what resuming onto this head would do.
+            self.session
+                .core
+                .run_config
+                .lock()
+                .expect("run config mutex poisoned")
+                .accounts
+                .replace(conversation.settings().accounts);
             if let Some(restore) = &self.shared.restore {
                 let config = self
                     .shared

@@ -461,6 +461,54 @@ check('tree shows branch sibling', treeText.includes('alternative branch'));
 check('tree draws branch connectors', treeText.includes('\u251c') || treeText.includes('\u2514'));
 check('default tree hides state', !treeText.includes('[environment:'));
 
+console.log('account choices');
+{
+  const accountEntries = [
+    entries[0], entries[1],
+    { id: 'account1', parent_id: 'u1', thread: 'user', type: 'account_change',
+      provider: 'openai<&>', account: '<b>Work 界</b>' },
+    { id: 'account2', parent_id: 'account1', thread: 'user', type: 'account_change',
+      provider: 'anthropic', account: '' },
+    { id: 'account3', parent_id: 'account2', thread: 'user', type: 'account_change',
+      provider: 'openai', account: null },
+    { id: 'account4', parent_id: 'u1', thread: 'user', type: 'account_change',
+      provider: 'openai', account: 'sibling pin' },
+  ];
+  const view = await renderData({ session_id: 'accounts', leaf_id: 'account3', entries: accountEntries });
+  const tree = () => view.elements['tree-container'].children;
+  const transcript = view.elements['messages'].innerHTML;
+  check('account transcript distinguishes named, unnamed, and default',
+    transcript.includes('Account for openai&lt;&amp;&gt;: &lt;b&gt;Work 界&lt;/b&gt;') &&
+      transcript.includes('Account for anthropic: unnamed account') &&
+      transcript.includes('Account for openai: Provider default'));
+  check('account labels are inert HTML', !transcript.includes('<b>Work') && !transcript.includes('openai<&>'));
+  check('account transcript follows the active branch', !transcript.includes('sibling pin'));
+  check('account rows are hidden by the default state filter', !tree().some((node) => node.dataset.id.startsWith('account')));
+  const stateToggle = view.entryFilterButtons.find((button) => button.dataset.entryFilter === 'state');
+  fire(stateToggle, 'click');
+  check('state filter exposes account rows', tree().filter((node) => node.dataset.id.startsWith('account')).length === 4);
+  check('account tree escapes labels', tree().map(nodeText).join('').includes('&lt;b&gt;Work 界&lt;/b&gt;'));
+  for (const [query, ids] of [
+    ['Work 界', ['account1']],
+    ['anthropic', ['account2']],
+    ['unnamed account', ['account2']],
+    ['Provider default', ['account3']],
+  ]) {
+    view.elements['tree-search'].value = query;
+    fire(view.elements['tree-search'], 'input');
+    check('account search: ' + query, JSON.stringify(tree().map((node) => node.dataset.id)) === JSON.stringify(ids));
+  }
+  fire(stateToggle, 'click');
+  check('account search respects the state filter', tree().length === 0);
+  fire(stateToggle, 'click');
+  const resetNode = tree().find((node) => node.dataset.id === 'account3');
+  check('account row is navigable', !!resetNode);
+  if (resetNode) {
+    fire(resetNode, 'click');
+    check('account navigation reaches its transcript target', view.scrollCalls.some((call) => call.id === 'entry-account3'));
+  }
+}
+
 console.log('filters');
 {
   const byCategory = (category) => entryFilterButtons.find((button) => button.dataset.entryFilter === category);

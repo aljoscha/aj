@@ -3,13 +3,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_models::types::{ImageContent, TextContent, UserContent};
 use aj_wire::{
-    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent,
-    DecodedFrame, DirectoryHost, EmptyRequest, EnrollHostRequest, EnvRequest, ErrorResponse, Frame,
-    HeadRequest, Hello, HostList, HostNameError, HostSource, HostSummary, MAX_HOST_NAME_BYTES,
-    MergedDirectory, ModelSelection, PROTOCOL_VERSION, PromptInput, PromptRequest, QueueCounts,
-    QueueOperation, QueueOutcome, QueueRequest, QueueState, RawObject, RequestBody, SessionCreated,
-    SessionList, SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest,
-    TagRequest, TaskDetails, TaskTable, VmList, decode_request, normalize_host_name,
+    AccountList, AccountRequest, AccountSelection, ArchiveRequest, CancelRequest, CompactRequest,
+    CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame, DirectoryHost, EmptyRequest,
+    EnrollHostRequest, EnvRequest, ErrorResponse, Frame, HeadRequest, Hello, HostList,
+    HostNameError, HostSource, HostSummary, MAX_HOST_NAME_BYTES, MergedDirectory, ModelSelection,
+    PROTOCOL_VERSION, PromptInput, PromptRequest, QueueCounts, QueueOperation, QueueOutcome,
+    QueueRequest, QueueState, RawObject, RequestBody, SessionCreated, SessionList, SessionSettings,
+    SessionSummary, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
+    VmList, decode_request, normalize_host_name,
 };
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -383,7 +384,120 @@ fn session_settings() -> SessionSettings {
         thinking_display: Some("detailed".into()),
         speed: Some("standard".into()),
         verbosity: Some("medium".into()),
+        account: None,
     }
+}
+
+#[test]
+fn account_creation_distinguishes_unchanged_reset_and_exact_pins() {
+    for (wire, expected) in [
+        (json!({}), None),
+        (json!({"account": null}), None),
+        (
+            json!({"account": {}}),
+            Some(AccountSelection { name: None }),
+        ),
+        (
+            json!({"account": {"name": null}}),
+            Some(AccountSelection { name: None }),
+        ),
+        (
+            json!({"account": {"name": ""}}),
+            Some(AccountSelection {
+                name: Some("".into()),
+            }),
+        ),
+        (
+            json!({"account": {"name": "work"}}),
+            Some(AccountSelection {
+                name: Some("work".into()),
+            }),
+        ),
+    ] {
+        let body = serde_json::to_vec(&json!({"settings": wire})).unwrap();
+        let request = decode_request::<CreateSessionRequest>(&body).unwrap();
+        assert_eq!(request.settings.as_ref().unwrap().account, expected);
+        assert_public_request_round_trip(request);
+        let settings = SessionSettings {
+            account: expected.clone(),
+            ..SessionSettings::default()
+        };
+        let encoded = serde_json::to_value(settings).unwrap();
+        match expected {
+            None => assert_eq!(encoded, json!({})),
+            Some(selection) => assert_eq!(encoded, json!({"account": {"name": selection.name}})),
+        }
+    }
+}
+
+#[test]
+fn account_commands_reset_or_pin_and_reject_misrouted_or_unknown_fields() {
+    for (body, expected) in [
+        (json!({"provider": "openai"}), None),
+        (json!({"provider": "openai", "account": null}), None),
+        (
+            json!({"provider": "openai", "account": ""}),
+            Some("".to_string()),
+        ),
+        (
+            json!({"provider": "openai", "account": "Work / personal"}),
+            Some("Work / personal".to_string()),
+        ),
+    ] {
+        let request =
+            decode_request::<AccountRequest>(&serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(request.provider, "openai");
+        assert_eq!(request.account, expected);
+        assert_public_request_round_trip(request);
+    }
+    for body in [
+        json!({"account": "work"}),
+        json!({"provider": "openai", "account": 1}),
+        json!({"provider": "openai", "account": "work", "future": true}),
+    ] {
+        assert!(decode_request::<AccountRequest>(&serde_json::to_vec(&body).unwrap()).is_err());
+    }
+    assert!(
+        decode_request::<CreateSessionRequest>(
+            br#"{"settings":{"account":{"name":"work","future":true}}}"#,
+        )
+        .is_err()
+    );
+    // Even null must be rejected here, not ignored alongside a valid inference axis.
+    for selection in [
+        json!(null),
+        json!({"name": null}),
+        json!({"name": ""}),
+        json!({"name": "work"}),
+    ] {
+        let body = serde_json::to_vec(&json!({"thinking": "high", "account": selection})).unwrap();
+        assert!(decode_request::<SettingsRequest>(&body).is_err());
+    }
+}
+
+#[test]
+fn account_list_preserves_labels_nulls_and_additive_observations() {
+    let expected = AccountList {
+        provider: "openai".into(),
+        selected: None,
+        default: Some("".into()),
+        accounts: vec!["".into(), "work".into()],
+        override_active: false,
+        source: "Provider default".into(),
+    };
+    let mut encoded = serde_json::to_value(&expected).unwrap();
+    assert_eq!(
+        encoded,
+        json!({
+            "provider": "openai", "selected": null, "default": "",
+            "accounts": ["", "work"], "override_active": false, "source": "Provider default"
+        })
+    );
+    encoded["future"] = json!(true);
+    assert_eq!(
+        serde_json::from_value::<AccountList>(encoded).unwrap(),
+        expected
+    );
 }
 
 #[test]

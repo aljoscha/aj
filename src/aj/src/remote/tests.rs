@@ -584,6 +584,7 @@ fn scripted_host_with_run_config(
 
 fn snapshot(provider: Arc<dyn Provider>) -> RunConfigSnapshot {
     RunConfigSnapshot {
+        accounts: Default::default(),
         provider,
         model_info: Arc::new(scripted_model_info()),
         stream_options: aj_models::types::StreamOptions::default(),

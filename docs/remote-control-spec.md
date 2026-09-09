@@ -416,7 +416,8 @@ agent" locally take an optional `agent` field (default: the main agent).
 | `.../{id}/cancel` | `{agent?}` | Cancel the targeted agent through the mechanism that owns its run: its driven turn, a detached sub-agent's background task, or the foreground-sub-agent-cancels-main cascade. A running mark with no owning turn or task is 409 `conflict`. An idle or completed target is accepted. |
 | `.../{id}/queue` | `{op: "remove", agent?}` or `{op: "clear"}` | Withdraw one agent's pending message, or clear the session's queues. A withdrawal answers 200 `{text?}` with the text it took, which is what makes the dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index. A clear answers 202. |
 | `.../{id}/compact` | `{instructions?}` | Manual compaction. |
-| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, optional `agent` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. A remote change never persists to the host's config files. |
+| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, optional `agent` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. A remote change never persists to the host's config files. |
+| `.../{id}/account` | `{provider, account?}` | Select an account for this session and provider from the host-local auth store. Missing or null `account` resets to Provider default, `""` pins the unnamed account, any other string pins that exact label. Does not change the provider's auth-store default. Read the result through `accounts`. Capability `session_accounts` (section 5.10). |
 | `.../{id}/env` | `{key, value}` | Set one session environment value, including the empty string. Null or an absent `value` removes the key from the map, not from the inherited process environment. Idle-only: 409 `conflict` while a turn or background task is live. Validates before mutation and persists the full resulting active-branch map. Capability `session_env` (section 5.10). |
 | `.../{id}/tag` | `{tag}`, empty or absent clears | Set the session's tag (section 5.8): one trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
 | `.../{id}/archive` | `{archived: bool}`, absent reads false | Set or clear the archived bit (section 5.8). Materializes like any command, so a rival's lock refuses it. Nothing else refuses it: a session working through a turn takes it and goes on working. Capability `archive` (section 5.10). |
@@ -452,7 +453,7 @@ code.
   hosts?}`. Includes every session of the host's working directory,
   on-disk as well as live, with a liveness flag. Attaching or commanding
   a non-live session materializes it (lock permitting). A read never
-  does, except for the tree and environment reads, which parse the log
+  does, except for the tree, environment, and account reads, which parse the log
   and materialize like a command. This is the discovery surface, there is
   no separate on-disk listing.
 - `GET /v1/sessions/{id}/tasks`: `{tasks: [{id, owner, call_id, kind,
@@ -474,6 +475,16 @@ code.
   unredacted on the trusted control port. Export-only redaction does not
   apply. This reads the session overlay, not the host process environment.
   Capability `session_env` (section 5.10).
+- `GET /v1/sessions/{id}/accounts?provider=...`: `{provider, selected,
+  default, accounts, override_active, source}` from the host-local auth store.
+  `provider` is URL-encoded by clients. Omitting it selects the session's
+  current main-model provider, returned in `provider`. `selected` is the session
+  pin, or null for Provider default. `default` is the provider's default
+  account label, or null when none exists. `accounts` contains exact labels,
+  including `""` for the unnamed account. `override_active` reports whether a
+  credential override is active, and `source` describes the credential source
+  without exposing a secret. No keys, tokens, or credential contents travel.
+  Capability `session_accounts` (section 5.10).
 
 ### 5.8 Status model
 
@@ -601,6 +612,7 @@ Both ends of every connection are aj, but versions skew. Rules:
   |---|---|---|
   | `archive` | `POST /v1/sessions/{id}/archive` | hosts |
   | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
+  | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
   | `compaction_usage` | the `compaction_usage_update` event, including its checkpoint entry id | hosts |
 
   A capability is self-description, never a gate: probing an endpoint
@@ -729,6 +741,19 @@ After creation the settings command mutates the axes, from any client,
 as peers, under the same strictness. Thinking display is an inference
 setting because it changes what the provider is asked to emit.
 
+Creation may also supply `settings.account: {name: ...}` for the initial
+provider. An absent or null outer `account` leaves the choice unchanged.
+An object with absent or null `name` explicitly resets to Provider default,
+`{name: ""}` pins the unnamed account, and `{name: "label"}` pins that exact
+provider-local label. Unknown nested fields are rejected. This choice is
+validated by the host with the other creation settings before minting.
+After creation, selection uses the account route rather than the inference
+settings route. Account choices are session-scoped and provider-local,
+never changes to config or auth-store defaults. There is no account footer
+field and no new config setting. Login, logout, and auth default management
+remain local operations. The wire carries selection and non-secret account
+metadata only, not credentials.
+
 The session environment overlay is separate from inference settings. Any
 client can read or edit it after creation through the environment routes
 (section 5.6 and 5.7). An edit changes only the session's active branch,
@@ -780,7 +805,8 @@ that `--host` and `--tag` had nothing to point at.
 The boundary of what works over the wire is explicit. Supported: prompt,
 steer, cancel, queue withdraw and clear, settings including model switch
 and thinking display, compaction, task kill, the task-output overlay,
-tagging, archiving, environment overlay reads and edits, the tree view and
+tagging, archiving, environment overlay reads and edits, session account
+reads and selection, the tree view and
 head switching, and session
 creation and switching. The prompt recall ring holds this run's own
 submissions only. The exit usage banner renders from the client's own
@@ -789,6 +815,10 @@ session-info overlay and HTML export (host-local files no endpoint
 serves), prompt-history search (this client's own store), and the usage
 overlay and credential management (this client's credential store). An
 unsupported action never silently does nothing.
+
+Account selection attempts the host's endpoint and shows the ordinary
+unsupported-endpoint notice if the peer lacks it. It does not fall back to
+reading or modifying the client's auth store.
 
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer.

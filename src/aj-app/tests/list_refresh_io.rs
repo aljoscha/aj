@@ -117,6 +117,7 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
         })),
         catalog: Arc::new(Vec::new()),
         defaults: RunConfigDefaults::fixed(RunConfigSnapshot {
+            accounts: Default::default(),
             provider,
             model_info: Arc::new(scripted_model_info()),
             stream_options: aj_models::types::StreamOptions::default(),

@@ -20,10 +20,10 @@ use std::time::Duration;
 use aj_agent::tool::TaskId;
 use aj_app::host::{AttachRequest, CommandOutcome};
 use aj_wire::{
-    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, DecodedFrame, EnvRequest,
-    Frame, HeadRequest, Hello, PROTOCOL_VERSION, PromptRequest, QueueOperation, QueueOutcome,
-    QueueRequest, QueueState, SessionCreated, SessionList, SessionTree, SettingsRequest,
-    SteerRequest, TagRequest, TaskDetails, TaskTable,
+    AccountList, AccountRequest, ArchiveRequest, CancelRequest, CompactRequest,
+    CreateSessionRequest, DecodedFrame, EnvRequest, Frame, HeadRequest, Hello, PROTOCOL_VERSION,
+    PromptRequest, QueueOperation, QueueOutcome, QueueRequest, QueueState, SessionCreated,
+    SessionList, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
 };
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures::{Stream, StreamExt};
@@ -124,6 +124,7 @@ pub(crate) enum RemoteCommand {
     Compact(CompactRequest),
     Settings(SettingsRequest),
     Env(EnvRequest),
+    Account(AccountRequest),
     Tag(TagRequest),
     Archive(ArchiveRequest),
     Head(HeadRequest),
@@ -140,6 +141,7 @@ impl RemoteCommand {
             Self::Queue(_) => "queue".to_string(),
             Self::Compact(_) => "compact".to_string(),
             Self::Env(_) => "env".to_string(),
+            Self::Account(_) => "account".to_string(),
             Self::Settings(_) => "settings".to_string(),
             Self::Tag(_) => "tag".to_string(),
             Self::Archive(_) => "archive".to_string(),
@@ -156,6 +158,7 @@ impl RemoteCommand {
             Self::Queue(request) => encode(request),
             Self::Compact(request) => encode(request),
             Self::Env(request) => encode(request),
+            Self::Account(request) => encode(request),
             Self::Settings(request) => encode(request),
             Self::Tag(request) => encode(request),
             Self::Archive(request) => encode(request),
@@ -283,6 +286,26 @@ impl RemoteClient {
 
     pub(crate) async fn tree(&self, session: &str) -> Result<SessionTree, RemoteError> {
         self.get(&format!("/v1/sessions/{session}/tree")).await
+    }
+
+    pub(crate) async fn accounts(
+        &self,
+        session: &str,
+        provider: Option<&str>,
+    ) -> Result<AccountList, RemoteError> {
+        let response = self
+            .http
+            .get(format!("{}/v1/sessions/{session}/accounts", self.base))
+            .query(
+                &provider
+                    .map(|provider| ("provider", provider))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+        decode(refusal(response).await?).await
     }
 
     /// Apply one mutation. Every command but the queue withdrawal answers

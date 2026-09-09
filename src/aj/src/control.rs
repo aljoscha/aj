@@ -28,10 +28,10 @@ use aj_app::session_setup::thinking_display_name;
 use aj_models::types::UserContent;
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{
-    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, EnvRequest, Frame,
-    HeadRequest, ModelSelection, PromptInput, PromptRequest, QueueOperation, QueueRequest,
-    QueueState, SessionList, SessionSettings, SessionTree, SettingsRequest, SteerRequest,
-    TagRequest, TaskDetails, TaskTable,
+    AccountList, AccountRequest, ArchiveRequest, CancelRequest, CompactRequest,
+    CreateSessionRequest, EnvRequest, Frame, HeadRequest, ModelSelection, PromptInput,
+    PromptRequest, QueueOperation, QueueRequest, QueueState, SessionList, SessionSettings,
+    SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
 };
 use futures::FutureExt;
 use reqwest::StatusCode;
@@ -246,6 +246,18 @@ impl Control {
         }
     }
 
+    /// The host's non-secret account choices for a provider and this session's pin.
+    pub(crate) async fn accounts(
+        &self,
+        session: &str,
+        provider: Option<&str>,
+    ) -> Result<AccountList, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.accounts(session, provider).await?),
+            Self::Remote(remote) => Ok(remote.client.accounts(session, provider).await?),
+        }
+    }
+
     pub(crate) async fn queue(&self, session: &str) -> Result<QueueState, ControlError> {
         match self {
             Self::Local(local) => Ok(local.host.queue(session).await?),
@@ -387,6 +399,9 @@ fn wire_command(command: Command) -> RemoteCommand {
             RemoteCommand::Compact(CompactRequest { instructions })
         }
         Command::Env { key, value } => RemoteCommand::Env(EnvRequest { key, value }),
+        Command::Account { provider, account } => {
+            RemoteCommand::Account(AccountRequest { provider, account })
+        }
         Command::Settings(change) => RemoteCommand::Settings(settings_request(change)),
         // A cleared tag travels as the empty string, which is what the route
         // reads as "clear".

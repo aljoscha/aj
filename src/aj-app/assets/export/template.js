@@ -574,6 +574,12 @@
     return keys.length ? keys.map(quoteDisplayText).join(', ') : 'none';
   }
 
+  function formatAccountChange(entry) {
+    const label = entry.account == null ? 'Provider default'
+      : entry.account === '' ? 'unnamed account' : entry.account;
+    return 'Account for ' + entry.provider + ': ' + label;
+  }
+
   function renderEntry(entry) {
     if (entry.type === 'message') {
       const msg = entry.message;
@@ -600,6 +606,9 @@
     }
     if (entry.type === 'verbosity_change') {
       return '<div class="notice" id="entry-' + escapeHtml(entry.id) + '">verbosity: ' + escapeHtml(entry.verbosity) + '</div>';
+    }
+    if (entry.type === 'account_change') {
+      return '<div class="notice" id="entry-' + escapeHtml(entry.id) + '">' + escapeHtml(formatAccountChange(entry)) + '</div>';
     }
     if (entry.type === 'env_change') {
       return '<div class="notice" id="entry-' + escapeHtml(entry.id) + '">session environment keys: ' +
@@ -1067,6 +1076,7 @@
       case 'thinking_change': return treeMuted('[thinking: ' + escapeHtml(entry.level) + ']');
       case 'speed_change': return treeMuted('[speed: ' + escapeHtml(entry.speed) + ']');
       case 'verbosity_change': return treeMuted('[verbosity: ' + escapeHtml(entry.verbosity) + ']');
+      case 'account_change': return treeMuted('[' + escapeHtml(formatAccountChange(entry)) + ']');
       case 'env_change': return treeMuted('[environment: ' + escapeHtml(formatEnvKeys(entry)) + ']');
       default: return treeMuted('[' + escapeHtml(entry.type) + ']');
     }
@@ -1088,6 +1098,8 @@
       parts.push(entry.summary || '');
     } else if (entry.type === 'model_change') {
       parts.push(entry.model_id || '');
+    } else if (entry.type === 'account_change') {
+      parts.push(formatAccountChange(entry));
     } else if (entry.type === 'env_change') {
       parts.push(...Object.keys(entry.env || {}));
     }
@@ -1103,7 +1115,7 @@
   const entryFilters = Object.assign({}, DEFAULT_FILTERS);
   const STATE_TYPES = new Set([
     'system_prompt', 'model_change', 'thinking_change', 'speed_change',
-    'verbosity_change', 'env_change', 'compaction',
+    'verbosity_change', 'account_change', 'env_change', 'compaction',
   ]);
 
   function entryCategory(entry) {

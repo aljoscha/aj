@@ -29,10 +29,10 @@ use aj_conf::ConfigVerbosity;
 use aj_models::{speed_from_name, thinking_config_from_name};
 use aj_session::normalize_tag;
 use aj_wire::{
-    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, EmptyRequest,
-    EnvRequest, ErrorResponse, Frame, HeadRequest, PromptRequest, QueueOperation, QueueOutcome,
-    QueueRequest, RequestBody, SessionCreated, SessionSettings, SettingsRequest, SteerRequest,
-    TagRequest, decode_request,
+    AccountRequest, ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor,
+    EmptyRequest, EnvRequest, ErrorResponse, Frame, HeadRequest, PromptRequest, QueueOperation,
+    QueueOutcome, QueueRequest, RequestBody, SessionCreated, SessionSettings, SettingsRequest,
+    SteerRequest, TagRequest, decode_request,
 };
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
@@ -196,6 +196,8 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/queue", get(queue).post(queue_command))
         .route("/v1/sessions/{id}/tree", get(tree))
         .route("/v1/sessions/{id}/env", get(environment).post(env_command))
+        .route("/v1/sessions/{id}/accounts", get(accounts))
+        .route("/v1/sessions/{id}/account", post(account))
         .route("/v1/sessions/{id}/prompt", post(prompt))
         .route("/v1/sessions/{id}/steer", post(steer))
         .route("/v1/sessions/{id}/cancel", post(cancel))
@@ -374,6 +376,45 @@ async fn tree(
     Path(session): Path<String>,
 ) -> Result<Response, ApiError> {
     Ok(Json(state.host.tree(&session).await?).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct AccountsQuery {
+    provider: Option<String>,
+}
+
+async fn accounts(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    query: Result<Query<AccountsQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::invalid("invalid accounts query"))?;
+    Ok(Json(
+        state
+            .host
+            .accounts(&session, query.provider.as_deref())
+            .await?,
+    )
+    .into_response())
+}
+
+async fn account(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(request): Body<AccountRequest>,
+) -> Result<Response, ApiError> {
+    accepted(
+        state
+            .host
+            .command(
+                &session,
+                Command::Account {
+                    provider: request.provider,
+                    account: request.account,
+                },
+            )
+            .await?,
+    )
 }
 
 async fn prompt(
@@ -661,7 +702,14 @@ fn settings_change(
         thinking_display,
         speed,
         verbosity,
+        account,
     } = change;
+
+    if account.is_some() {
+        return Err(ApiError::invalid(
+            "account changes use the account endpoint",
+        ));
+    }
 
     let mut axes = Vec::new();
     // Counted before anything is resolved, so a body naming two axes reads as

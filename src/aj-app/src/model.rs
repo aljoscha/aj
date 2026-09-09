@@ -21,7 +21,8 @@
 //! (e.g. so the user can log in later) and lets a mid-session login
 //! take effect on the next turn without a restart.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use aj_conf::{Config, ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity};
 use aj_models::ThinkingConfig;
@@ -40,6 +41,102 @@ use crate::cli::args::Args;
 /// one. Anthropic is the default so existing user setups keep
 /// working without an explicit `MODEL_API=anthropic` env var.
 pub const DEFAULT_PROVIDER_ID: &str = "anthropic";
+
+/// Provider-local account choices shared by this session's inference resolvers.
+///
+/// A missing provider follows its live store default. An empty label pins the
+/// unnamed credential. Requests copy their choice before resolving credentials,
+/// so edits affect subsequent requests without changing an in-flight request.
+#[derive(Clone, Default)]
+pub struct SessionAccounts(Arc<RwLock<BTreeMap<String, String>>>);
+
+impl SessionAccounts {
+    pub fn snapshot(&self) -> BTreeMap<String, String> {
+        self.0.read().expect("session accounts poisoned").clone()
+    }
+
+    pub fn get(&self, provider: &str) -> Option<String> {
+        self.0
+            .read()
+            .expect("session accounts poisoned")
+            .get(provider)
+            .cloned()
+    }
+
+    pub fn set(&self, provider: &str, account: Option<String>) {
+        let mut choices = self.0.write().expect("session accounts poisoned");
+        match account {
+            Some(account) => {
+                choices.insert(provider.to_string(), account);
+            }
+            None => {
+                choices.remove(provider);
+            }
+        }
+    }
+
+    pub fn replace(&self, accounts: BTreeMap<String, String>) {
+        *self.0.write().expect("session accounts poisoned") = accounts;
+    }
+
+    /// Bind a bundle to this session, including bundles retained by subagents.
+    pub fn install(&self, options: &mut StreamOptions, auth: &AuthStorage, provider: &str) {
+        let choices = self.clone();
+        let auth = auth.clone();
+        let provider = provider.to_string();
+        options.set_api_key_resolver(Some(ApiKeyResolver::new(move || {
+            let auth = auth.clone();
+            let account = choices.get(&provider);
+            let provider = provider.clone();
+            async move {
+                match auth.get_api_key(&provider, account.as_deref()).await {
+                    Ok(Some(resolved)) => Ok(ResolvedApiKey {
+                        key: resolved.key,
+                        account: resolved.source.label().map(str::to_string),
+                    }),
+                    Ok(None) => Err(match account {
+                        Some(label) => format!(
+                            "No credential for {provider} account {}. Use /account to choose another account, or /login to authenticate it.",
+                            if label.is_empty() { "(unnamed)".to_string() } else { format!("{label:?}") }
+                        ),
+                        None => missing_key_message(&provider),
+                    }),
+                    Err(err) => Err(format!("failed to resolve credentials for {provider:?}: {err}")),
+                }
+            }
+        })));
+    }
+}
+
+/// Validate an explicit account gesture without refreshing or reading secrets
+/// outside the host. Restoring a saved choice does not call this: a missing
+/// restored credential must leave the session open for account selection.
+pub async fn validate_account_selection(
+    auth: &AuthStorage,
+    provider: &str,
+    account: Option<&str>,
+) -> Result<(), String> {
+    if provider.is_empty() {
+        return Err("An account choice must name a provider.".to_string());
+    }
+    if auth.has_runtime_override(provider).await {
+        return Err(format!(
+            "{provider} uses --api-key. Account selection cannot take effect while that override is set."
+        ));
+    }
+    if let Some(label) = account
+        && auth
+            .get_account(provider, label)
+            .await
+            .map_err(|err| err.to_string())?
+            .is_none()
+    {
+        return Err(format!(
+            "No stored {provider} account {label:?}. Use /login to add it, or /account to choose another account."
+        ));
+    }
+    Ok(())
+}
 
 /// Preferred default model per provider, used when the user hasn't
 /// pinned a `model_name`. This is selection *policy* and deliberately
@@ -199,26 +296,9 @@ fn install_api_key_resolver(
     provider_id: &str,
     account: Option<&str>,
 ) {
-    let auth = auth.clone();
-    let provider_id = provider_id.to_string();
-    let account = account.map(str::to_string);
-    options.set_api_key_resolver(Some(ApiKeyResolver::new(move || {
-        let auth = auth.clone();
-        let provider_id = provider_id.clone();
-        let account = account.clone();
-        async move {
-            match auth.get_api_key(&provider_id, account.as_deref()).await {
-                Ok(Some(resolved)) => Ok(ResolvedApiKey {
-                    key: resolved.key,
-                    account: resolved.source.label().map(str::to_string),
-                }),
-                Ok(None) => Err(missing_key_message(&provider_id)),
-                Err(err) => Err(format!(
-                    "failed to resolve credentials for {provider_id:?}: {err}"
-                )),
-            }
-        }
-    })));
+    let choices = SessionAccounts::default();
+    choices.set(provider_id, account.map(str::to_string));
+    choices.install(options, auth, provider_id);
 }
 
 /// Human-readable "no credential" message naming the env vars we'd

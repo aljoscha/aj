@@ -414,6 +414,27 @@ async fn build_world(
             )),
         };
     }
+    if let Some(selection) = args.account_selection() {
+        let provider = world
+            .local
+            .as_ref()
+            .expect("a local world has session handles")
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned")
+            .settings()
+            .provider;
+        world
+            .control
+            .command(
+                &session,
+                Command::Account {
+                    provider,
+                    account: selection.name,
+                },
+            )
+            .await?;
+    }
     // A fresh session's notices carry its env, which the fold reads off the
     // handles once the block has committed. A resume reports the process-level
     // ones here, alongside the flags that only a create could have honored.
@@ -2222,6 +2243,7 @@ fn fold_warning(world: &mut World, text: &str) {
 /// (Esc/Ctrl+C) flips, and the spawned task's handle the loop awaits.
 struct LoginSession {
     provider_name: String,
+    target: LoginTarget,
     cancel: Arc<AtomicBool>,
     handle: tokio::task::JoinHandle<Result<(), AuthError>>,
 }
@@ -2279,6 +2301,7 @@ fn start_login(
     let redraw = redraw_tx.clone();
     let task_state = Arc::clone(&state);
     let task_pending = Arc::clone(&pending_input);
+    let completion_target = target.clone();
     let handle = tokio::spawn(async move {
         let callbacks = DialogCallbacks::new(task_state, task_pending, redraw);
         match target {
@@ -2310,6 +2333,7 @@ fn start_login(
 
     *login_session = Some(LoginSession {
         provider_name,
+        target: completion_target,
         cancel,
         handle,
     });
@@ -2400,14 +2424,71 @@ async fn open_default_logout_resolution(
 /// Represent a stored account label for display and filtering in a picker:
 /// the label as stored, folded to one line exactly like a session tag.
 fn account_picker_text(raw: &str) -> (String, String) {
-    let represented = crate::text::one_line(raw);
+    let represented = crate::login::account_label_text(raw);
     (represented.clone(), represented)
 }
 
 /// Post-action account text for transcript prose: the label as stored,
 /// folded to one line.
 fn account_notice_text(raw: &str) -> String {
-    crate::text::one_line(raw)
+    crate::login::account_label_text(raw)
+}
+
+/// Removal changes stored credentials, not environment or runtime overrides.
+async fn logout_notice(world: &World, provider: &str, removed: &str) -> String {
+    let status = aj_app::auth::provider_status(&world.auth, provider, None).await;
+    format!(
+        "{removed} Provider default authentication: {}. Sessions pinned to a removed account need re-selection.",
+        crate::text::one_line(&status.summary),
+    )
+}
+
+/// Each row carries its captured target. Following the default and pinning
+/// that same exact account are distinct choices, even when their source agrees.
+fn session_account_rows(session: &str, provider: &str, list: aj_wire::AccountList) -> Vec<AuthRow> {
+    let request = |account| AuthPickerRequest::SelectAccount {
+        session: session.to_string(),
+        provider: provider.to_string(),
+        account,
+    };
+    let default = list.default.as_deref().map(account_notice_text);
+    let source = crate::text::one_line(&list.source);
+    let mut rows = vec![AuthRow {
+        request: request(None),
+        label: "Provider default".to_string(),
+        filter_key: "Provider default shared follow".to_string(),
+        summary: Some(format!(
+            "{}{}",
+            default
+                .map(|name| format!("Currently {name} · {source}"))
+                .unwrap_or(source),
+            if list.selected.is_none() {
+                " · selected"
+            } else {
+                ""
+            },
+        )),
+    }];
+    rows.extend(list.accounts.into_iter().map(|account| {
+        let shown = account_notice_text(&account);
+        let selected = list.selected.as_ref() == Some(&account);
+        let is_default = list.default.as_ref() == Some(&account);
+        AuthRow {
+            request: request(Some(account)),
+            label: shown.clone(),
+            filter_key: shown,
+            summary: Some(format!(
+                "Pin this exact account{}{}",
+                if is_default {
+                    " · current provider default"
+                } else {
+                    ""
+                },
+                if selected { " · selected" } else { "" },
+            )),
+        }
+    }));
+    rows
 }
 
 /// Apply a confirmed authentication picker request. Login mounts the dialog
@@ -2422,6 +2503,25 @@ async fn apply_auth_request(
     request: AuthPickerRequest,
 ) {
     match request {
+        AuthPickerRequest::SelectAccount {
+            session,
+            provider,
+            account,
+        } => {
+            if let Err(err) = world
+                .control
+                .command(&session, Command::Account { provider, account })
+                .await
+            {
+                let message = if err.unknown_endpoint() {
+                    "This host does not support session account selection.".to_string()
+                } else {
+                    format!("Account not changed: {}", peer_refusal(&err))
+                };
+                fold_notice(world, &message);
+            }
+            app.request_redraw();
+        }
         AuthPickerRequest::Login {
             provider_id,
             provider_name,
@@ -2438,7 +2538,14 @@ async fn apply_auth_request(
         ),
         AuthPickerRequest::LogoutBare { provider_id } => {
             let notice = match world.auth.remove_bare(&provider_id).await {
-                Ok(()) => format!("Logged out of {provider_id}."),
+                Ok(()) => {
+                    logout_notice(
+                        world,
+                        &provider_id,
+                        &format!("Logged out of {provider_id} (Unnamed account)."),
+                    )
+                    .await
+                }
                 Err(err) => format!("Failed to log out of {provider_id}: {err}"),
             };
             fold_notice(world, &notice);
@@ -2469,10 +2576,13 @@ async fn apply_auth_request(
             {
                 Ok(()) => {
                     let shown = account_notice_text(&account_label);
-                    fold_notice(
+                    let notice = logout_notice(
                         world,
+                        &provider_id,
                         &format!("Logged out of {provider_id} account {shown}."),
-                    );
+                    )
+                    .await;
+                    fold_notice(world, &notice);
                     app.request_redraw();
                 }
                 Err(AuthError::RemovingDefault { .. }) => {
@@ -2508,7 +2618,9 @@ async fn apply_auth_request(
                     .set_default_account(&provider_id, &account_label)
                     .await
                 {
-                    Ok(()) => format!("{shown} is now {provider_id}'s default account."),
+                    Ok(()) => format!(
+                        "{shown} is now {provider_id}'s shared provider default. Subsequent requests of every session following it change, including running work. Pinned accounts stay unchanged."
+                    ),
                     Err(err) => format!("Failed to change {provider_id}'s default account: {err}"),
                 };
                 fold_notice(world, &notice);
@@ -2526,9 +2638,9 @@ async fn apply_auth_request(
                     .remove_default_account(&provider_id, &account_label, &new_default)
                     .await
                 {
-                    Ok(()) => format!(
-                        "Logged out of {provider_id} account {removed}; {selected} is now default."
-                    ),
+                    Ok(()) => logout_notice(world, &provider_id, &format!(
+                        "Logged out of {provider_id} account {removed}. {selected} is now the shared provider default for followers' subsequent requests."
+                    )).await,
                     Err(err) => format!("Failed to update {provider_id}'s accounts: {err}"),
                 };
                 fold_notice(world, &notice);
@@ -2543,7 +2655,14 @@ async fn apply_auth_request(
                     .remove_all_accounts(&provider_id, &expected_accounts)
                     .await
                 {
-                    Ok(()) => format!("Logged out of all {provider_id} accounts."),
+                    Ok(()) => {
+                        logout_notice(
+                            world,
+                            &provider_id,
+                            &format!("Logged out of all {provider_id} accounts."),
+                        )
+                        .await
+                    }
                     Err(err) => format!("Failed to log out of {provider_id}: {err}"),
                 };
                 fold_notice(world, &notice);
@@ -2584,7 +2703,15 @@ async fn cancel_login(
     // behind a stuck filesystem operation here, which is preferable to stating
     // an outcome before the commit boundary has resolved.
     let outcome = session.handle.await;
-    complete_login(world, shell, app, session.provider_name, outcome, true);
+    complete_login(
+        world,
+        shell,
+        app,
+        session.provider_name,
+        session.target,
+        outcome,
+        true,
+    );
 }
 
 /// Handle the login task completing: close the dialog, fold the outcome
@@ -2605,7 +2732,15 @@ fn finish_login(
     let Some(session) = login_session.take() else {
         return;
     };
-    complete_login(world, shell, app, session.provider_name, outcome, false);
+    complete_login(
+        world,
+        shell,
+        app,
+        session.provider_name,
+        session.target,
+        outcome,
+        false,
+    );
 }
 
 /// Close the login dialog and report the task outcome after its termination
@@ -2617,12 +2752,22 @@ fn complete_login(
     shell: &Rc<RefCell<Shell>>,
     app: &mut AsyncApp,
     provider_name: String,
+    target: LoginTarget,
     outcome: Result<Result<(), AuthError>, tokio::task::JoinError>,
     cancellation_requested: bool,
 ) {
     close_login_overlay(shell, app);
     match outcome {
-        Ok(Ok(())) => fold_notice(world, &format!("Logged in to {provider_name}.")),
+        Ok(Ok(())) => {
+            let detail = match target {
+                LoginTarget::NewAccount => "Account added. Adding does not select an account for this session. Use /account to choose, or follow the provider default.".to_string(),
+                LoginTarget::ExistingAccount(label) => format!(
+                    "Replaced {}. Subsequent requests using this credential use the new login.",
+                    account_notice_text(label.as_deref().unwrap_or("")),
+                ),
+            };
+            fold_notice(world, &format!("Logged in to {provider_name}. {detail}"));
+        }
         Ok(Err(err)) => fold_warning(world, &format!("Login to {provider_name} failed: {err}")),
         Err(join) if join.is_cancelled() && cancellation_requested => {
             fold_notice(world, &format!("Login to {provider_name} cancelled."))
@@ -3354,6 +3499,7 @@ async fn apply_command_action(
         CommandAction::ExportHtml => Some("export the session"),
         CommandAction::OpenThinkingSelector => Some("change thinking effort"),
         CommandAction::OpenModelSelector => Some("change the model"),
+        CommandAction::OpenAccountSelector => Some("change the account"),
         CommandAction::OpenSessionTag => Some("change the session tag"),
         CommandAction::OpenSessionEnv => Some("edit the session environment"),
         _ => None,
@@ -3649,6 +3795,45 @@ async fn apply_command_action(
             );
             ActionEffect::OpenedOverlay
         }
+        CommandAction::OpenAccountSelector => {
+            let session = world.session().to_string();
+            let target = world.chat.borrow().active_view();
+            let (provider, _) = viewed_model(world, target);
+            match world.control.accounts(&session, Some(&provider)).await {
+                Ok(list) if list.override_active => {
+                    fold_notice(
+                        world,
+                        "--api-key overrides stored account choices. Remove the runtime override before selecting an account.",
+                    );
+                    ActionEffect::Redraw
+                }
+                Ok(list) => {
+                    let rows = session_account_rows(&session, &provider, list);
+                    let handles = shell.borrow().overlay_handles();
+                    crate::login::open_auth_picker(
+                        &handles.stack,
+                        &handles.editor,
+                        &handles.chrome,
+                        &handles.auth_request,
+                        &format!(
+                            "Account · {} · next inference",
+                            crate::text::one_line(&provider)
+                        ),
+                        rows,
+                    );
+                    ActionEffect::OpenedOverlay
+                }
+                Err(err) => {
+                    let message = if err.unknown_endpoint() {
+                        "This host does not support session account selection.".to_string()
+                    } else {
+                        format!("Could not read accounts: {}", peer_refusal(&err))
+                    };
+                    fold_notice(world, &message);
+                    ActionEffect::Redraw
+                }
+            }
+        }
         CommandAction::OpenLoginSelector => {
             if world.control.is_remote() {
                 fold_notice(
@@ -3694,8 +3879,10 @@ async fn apply_command_action(
                             provider_name: name.clone(),
                             target: LoginTarget::ExistingAccount(None),
                         },
-                        label: format!("{name} — existing credential"),
-                        filter_key: format!("{id} {name} existing credential reauthenticate"),
+                        label: format!("{name} · Unnamed account"),
+                        filter_key: format!(
+                            "{id} {name} Unnamed account existing credential reauthenticate"
+                        ),
                         summary: Some("log in again and replace the bare credential".to_string()),
                     }),
                     Some(StoredProviderCredentials::Accounts(set)) => {
@@ -3757,8 +3944,8 @@ async fn apply_command_action(
                         request: AuthPickerRequest::LogoutBare {
                             provider_id: id.clone(),
                         },
-                        label: id.clone(),
-                        filter_key: format!("{id} bare credential"),
+                        label: format!("{id} · Unnamed account"),
+                        filter_key: format!("{id} Unnamed account bare credential"),
                         summary: Some("remove the stored credential".to_string()),
                     }),
                     Ok(Some(StoredProviderCredentials::Accounts(set))) => {
@@ -3810,11 +3997,16 @@ async fn apply_command_action(
             stored.sort();
             let mut rows = Vec::new();
             for id in stored {
-                let Ok(Some(set)) = world.auth.accounts(&id).await else {
+                let Ok(Some(stored)) = world.auth.stored_credentials(&id).await else {
                     continue;
                 };
-                let default = set.default;
-                rows.extend(set.accounts.into_iter().map(|(account_label, _)| {
+                let (default, accounts) = match stored {
+                    StoredProviderCredentials::Bare(credential) => {
+                        (String::new(), vec![(String::new(), credential)])
+                    }
+                    StoredProviderCredentials::Accounts(set) => (set.default, set.accounts),
+                };
+                rows.extend(accounts.into_iter().map(|(account_label, _)| {
                     let is_current = account_label == default;
                     let (shown, search) = account_picker_text(&account_label);
                     let action = AccountAction::SetDefault {
@@ -3829,12 +4021,15 @@ async fn apply_command_action(
                             format!("{id} — {shown}")
                         },
                         filter_key: format!("{id} {search}"),
-                        summary: None,
+                        summary: Some("Every following session, including running work · subsequent requests · pins unchanged".to_string()),
                     }
                 }));
             }
             if rows.is_empty() {
-                fold_notice(world, "No labeled account can become a new default.");
+                fold_notice(
+                    world,
+                    "No stored account can become a new provider default.",
+                );
                 return ActionEffect::Redraw;
             }
             let handles = shell.borrow().overlay_handles();
@@ -14573,7 +14768,7 @@ mod tests {
     #[tokio::test]
     async fn logout_removes_stored_credential_and_notes_it() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut app, _writer, mut world, shell, _root) =
+        let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
         world
             .auth
@@ -14583,12 +14778,19 @@ mod tests {
             )
             .await
             .expect("seed stored credential");
+        world
+            .auth
+            .set_runtime_api_key("anthropic", "override".to_string())
+            .await;
 
-        // The picker would list it.
         let effect = apply_command(&mut world, &shell, CommandAction::OpenLogoutSelector).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+        let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(painted.contains("Unnamed account"), "{painted}");
+        press(&mut app, &mut writer, b"\r").await;
+        let request = shell.borrow().take_auth_request().expect("logout request");
 
-        // Confirming parks a Logout request; drain it the way the loop does.
         let (tx, _rx) = unbounded_channel();
         let mut login_session = None;
         apply_auth_request(
@@ -14597,9 +14799,7 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            AuthPickerRequest::LogoutBare {
-                provider_id: "anthropic".to_string(),
-            },
+            request,
         )
         .await;
 
@@ -14610,7 +14810,9 @@ mod tests {
         assert!(
             main_notices(&world)
                 .iter()
-                .any(|n| n.contains("Logged out of anthropic")),
+                .any(|n| n.contains("Logged out of anthropic")
+                    && n.contains("Unnamed account")
+                    && n.contains("API key (--api-key override)")),
             "{:?}",
             main_notices(&world)
         );
@@ -15136,14 +15338,13 @@ mod tests {
         login_session.take().unwrap().handle.abort();
     }
 
-    /// The login-task completion arm closes the dialog and folds a success
-    /// notice on `Ok(Ok(()))`.
     #[tokio::test]
-    async fn finish_login_success_closes_dialog_and_notes() {
+    async fn first_login_stays_unnamed_without_a_prompt_and_explains_selection() {
         let dir = TempDir::new().expect("tempdir");
         let (mut app, _writer, mut world, shell, _root) =
             init_app_with_world(&dir, "streaming-text").await;
-
+        let provider = "first-login";
+        register_controlled_oauth(&world, provider, "first-access", LoginGate::Ready).await;
         let (tx, _rx) = unbounded_channel();
         let mut login_session = None;
         start_login(
@@ -15152,23 +15353,38 @@ mod tests {
             &mut app,
             &mut login_session,
             &tx,
-            "anthropic".to_string(),
-            "Anthropic".to_string(),
+            provider.to_string(),
+            "Controlled OAuth".to_string(),
             LoginTarget::NewAccount,
         );
-        login_session.as_mut().unwrap().handle.abort();
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
-
-        finish_login(&mut world, &shell, &mut app, &mut login_session, Ok(Ok(())));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            &mut login_session.as_mut().unwrap().handle,
+        )
+        .await
+        .expect("first login requires no account-name input");
+        assert!(matches!(outcome, Ok(Ok(()))), "{outcome:?}");
+        finish_login(&mut world, &shell, &mut app, &mut login_session, outcome);
         assert!(login_session.is_none(), "session cleared");
         assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
+        let accounts = world
+            .control
+            .accounts(world.session(), Some(provider))
+            .await
+            .unwrap();
+        assert_eq!(accounts.accounts, [""]);
+        assert_eq!(accounts.default.as_deref(), Some(""));
+        assert_eq!(accounts.selected, None);
         assert!(
             main_notices(&world)
                 .iter()
-                .any(|n| n.contains("Logged in to Anthropic")),
+                .any(|n| n.contains("Logged in to Controlled OAuth")
+                    && n.contains("Adding does not select an account for this session")),
             "{:?}",
             main_notices(&world)
         );
+        shut_down(&world).await;
     }
 
     /// A failed login folds a warning and still closes the dialog.
@@ -15312,15 +15528,14 @@ mod tests {
         register_controlled_oauth(&world, provider_id, "work-access", LoginGate::Ready).await;
         world
             .auth
-            .insert_account(
+            .insert_bare(
                 provider_id,
-                "personal",
                 AuthCredential::ApiKey {
                     key: "personal-key".to_string(),
                 },
             )
             .await
-            .expect("seed existing personal account");
+            .expect("seed existing unnamed account");
 
         let effect = apply_command(&mut world, &shell, CommandAction::OpenLoginSelector).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
@@ -15366,6 +15581,10 @@ mod tests {
             .expect("login dialog redraw channel remains open");
         let prompt = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(prompt.contains("Account name"), "account prompt: {prompt}");
+        assert!(
+            prompt.contains("Unnamed account"),
+            "existing account: {prompt}"
+        );
 
         writer.write_all(b"work\r").expect("type account label");
         for _ in 0..5 {
@@ -15391,7 +15610,7 @@ mod tests {
         assert!(matches!(
             world
                 .auth
-                .get_account(provider_id, "personal")
+                .get_account(provider_id, "")
                 .await
                 .unwrap(),
             Some(AuthCredential::ApiKey { key }) if key == "personal-key"
@@ -15406,8 +15625,9 @@ mod tests {
             .await
             .expect("read account set")
             .expect("labeled account set");
-        assert_eq!(accounts.default, "personal", "existing default preserved");
+        assert_eq!(accounts.default, "", "existing unnamed default preserved");
         assert_eq!(accounts.accounts.len(), 2, "one exact account inserted");
+        assert!(main_notices(&world).iter().any(|notice| notice.contains("Adding does not select an account for this session")));
     }
 
     /// Esc reaches the same abort-and-join barrier through the drive loop. The
@@ -15632,7 +15852,9 @@ mod tests {
         assert!(
             notices
                 .last()
-                .is_some_and(|notice| notice == "Logged in to Controlled OAuth."),
+                .is_some_and(|notice| notice == &format!(
+                    "Logged in to Controlled OAuth. Replaced {account}. Subsequent requests using this credential use the new login."
+                )),
             "committed outcome: {notices:?}"
         );
         assert!(
@@ -21933,6 +22155,242 @@ mod tests {
         assert_eq!(
             shell.borrow().take_session_request(),
             Some(SessionRequest::New { host: None }),
+        );
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn session_account_picker_keeps_default_and_exact_pins_distinct_locally_and_remotely() {
+        for connected in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let remote = if connected {
+                Some(RemoteHost::start(&dir, "streaming-text").await)
+            } else {
+                None
+            };
+            let (mut world, shell) = match &remote {
+                Some(remote) => connect_world_and_shell(&dir, remote, &["--new"]).await,
+                None => world_and_shell(&dir, "streaming-text").await,
+            };
+            let session = world.session().to_string();
+            let (provider, _) = viewed_model(&world, AgentId::Main);
+            assert!(!provider.is_empty());
+            // This is the host's store in both modes. The remote client's own
+            // store stays empty, so reading it cannot satisfy the test.
+            let auth = AuthStorage::new(dir.path().join("auth.json"));
+            for label in ["", "Provider default", "Unnamed account", "default"] {
+                auth.insert_account(
+                    &provider,
+                    label,
+                    AuthCredential::ApiKey {
+                        key: "secret".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            auth.set_default_account(&provider, "default")
+                .await
+                .unwrap();
+            let initial = world
+                .control
+                .accounts(&session, Some(&provider))
+                .await
+                .unwrap();
+            assert_eq!(
+                initial.accounts,
+                ["", "Provider default", "Unnamed account", "default"]
+            );
+            assert_eq!(initial.default.as_deref(), Some("default"));
+            assert_eq!(initial.selected, None);
+            if connected {
+                assert!(world.auth.list().await.unwrap().is_empty());
+            }
+            let (mut app, mut writer, root) = app_over(&shell).await;
+            let (tx, _rx) = unbounded_channel();
+            let mut login_session = None;
+            for (index, expected) in [
+                (4, Some("default")),
+                (0, None),
+                (1, Some("")),
+                (2, Some("Provider default")),
+                (3, Some("Unnamed account")),
+            ] {
+                assert!(matches!(
+                    apply_command(&mut world, &shell, CommandAction::OpenAccountSelector).await,
+                    ActionEffect::OpenedOverlay
+                ));
+                focus_overlay(&mut app, &root);
+                let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+                assert!(painted.contains("Provider default"), "{painted}");
+                assert!(painted.contains("Unnamed account"), "{painted}");
+                assert!(painted.contains("Currently default"), "{painted}");
+                for _ in 0..index {
+                    press(&mut app, &mut writer, b"\x1b[B").await;
+                }
+                press(&mut app, &mut writer, b"\r").await;
+                let request = shell
+                    .borrow()
+                    .take_auth_request()
+                    .expect("confirmed account");
+                assert_eq!(
+                    request,
+                    AuthPickerRequest::SelectAccount {
+                        session: session.clone(),
+                        provider: provider.clone(),
+                        account: expected.map(String::from),
+                    }
+                );
+                apply_auth_request(
+                    &mut world,
+                    &shell,
+                    &mut app,
+                    &mut login_session,
+                    &tx,
+                    request,
+                )
+                .await;
+                let selected = world
+                    .control
+                    .accounts(&session, Some(&provider))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    selected.selected.as_deref(),
+                    expected,
+                    "connected={connected}"
+                );
+                assert_eq!(
+                    selected.default.as_deref(),
+                    Some("default"),
+                    "selection never changes the shared default"
+                );
+            }
+            if let Some(remote) = remote {
+                remote.shutdown().await;
+            } else {
+                shut_down(&world).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_account_picker_refuses_runtime_override_and_keeps_captured_target() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        let session = world.session().to_string();
+        let (provider, _) = viewed_model(&world, AgentId::Main);
+        install_busy_script(world.handles());
+        assert!(handle_submit(&mut world, "keep working".to_string()).await);
+        fold_ready_frames(&mut world);
+        assert!(view_busy(&world, AgentId::Main));
+        world
+            .auth
+            .insert_account(
+                &provider,
+                "",
+                AuthCredential::ApiKey {
+                    key: "stored".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenAccountSelector).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+        let mut changed = world.client().settings().unwrap().clone();
+        changed.provider = "another-provider".to_string();
+        world
+            .chat
+            .borrow_mut()
+            .footers_mut()
+            .note_settings(AgentId::Main, changed, 0);
+        assert_eq!(viewed_model(&world, AgentId::Main).0, "another-provider");
+        press(&mut app, &mut writer, b"\x1b[B").await;
+        press(&mut app, &mut writer, b"\r").await;
+        let request = shell.borrow().take_auth_request().expect("pin unnamed");
+
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
+        assert_ne!(world.session(), session);
+        let (tx, _rx) = unbounded_channel();
+        let mut login_session = None;
+        apply_auth_request(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            request,
+        )
+        .await;
+        assert_eq!(
+            world
+                .control
+                .accounts(&session, Some(&provider))
+                .await
+                .unwrap()
+                .selected,
+            Some(String::new())
+        );
+        assert_eq!(
+            world
+                .control
+                .accounts(world.session(), Some(&provider))
+                .await
+                .unwrap()
+                .selected,
+            None
+        );
+
+        // Return to a fully attached view before testing override refusal, so
+        // an attachment guard cannot accidentally be the reason it refuses.
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(session.clone()),
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        world
+            .auth
+            .set_runtime_api_key(&provider, "override".into())
+            .await;
+        assert!(
+            world
+                .control
+                .accounts(&session, Some(&provider))
+                .await
+                .unwrap()
+                .override_active
+        );
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenAccountSelector).await,
+            ActionEffect::Redraw
+        ));
+        assert!(!shell.borrow().overlays.borrow().is_open());
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|notice| notice.contains("--api-key overrides stored account choices"))
+        );
+        assert_eq!(
+            world
+                .control
+                .accounts(&session, Some(&provider))
+                .await
+                .unwrap()
+                .selected,
+            Some(String::new())
         );
         shut_down(&world).await;
     }

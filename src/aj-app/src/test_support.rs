@@ -92,6 +92,7 @@ pub fn finalized_text_message_with_usage(text: &str, input_tokens: u64) -> Assis
 /// extra inference fail loudly.
 pub fn scripted_run_config(messages: Vec<AssistantMessage>) -> Arc<StdMutex<RunConfigSnapshot>> {
     Arc::new(StdMutex::new(RunConfigSnapshot {
+        accounts: Default::default(),
         provider: Arc::new(
             ScriptedProvider::from_messages(messages, 0, Duration::ZERO)
                 .on_exhausted(ExhaustedBehavior::Panic),
@@ -116,6 +117,7 @@ pub fn scripted_run_config_with_window(
     let mut model_info = scripted_model_info();
     model_info.context_window = context_window;
     Arc::new(StdMutex::new(RunConfigSnapshot {
+        accounts: Default::default(),
         provider: Arc::new(
             ScriptedProvider::from_messages(messages, 0, Duration::ZERO)
                 .on_exhausted(ExhaustedBehavior::Panic),

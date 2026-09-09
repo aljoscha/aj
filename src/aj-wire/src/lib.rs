@@ -37,6 +37,9 @@ pub const COMPACTION_USAGE_CAPABILITY: &str = "compaction_usage";
 /// The capability for reading and editing a session's active-branch environment.
 pub const SESSION_ENV_CAPABILITY: &str = "session_env";
 
+/// The capability for reading and selecting provider-local session accounts.
+pub const SESSION_ACCOUNTS_CAPABILITY: &str = "session_accounts";
+
 /// A creator-selected model, resolved against the receiving host's catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSelection {
@@ -46,7 +49,16 @@ pub struct ModelSelection {
     pub name: String,
 }
 
-/// Optional inference-setting overrides for a session.
+/// An account choice for the session's initial provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountSelection {
+    /// None resets to Provider default. An empty string pins the unnamed account,
+    /// and any other string pins that exact label in the host's auth store.
+    pub name: Option<String>,
+}
+
+/// Optional creator overrides for a session.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,6 +71,9 @@ pub struct SessionSettings {
     pub speed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbosity: Option<String>,
+    /// Creation-only account choice. Absence leaves the choice unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountSelection>,
 }
 
 /// A prompt represented either as plain text or typed content blocks.
@@ -175,13 +190,37 @@ pub struct CompactRequest {
     pub instructions: Option<String>,
 }
 
-/// Applies one or more session setting changes.
+/// Applies an inference setting change. Account mutations use [`AccountRequest`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentId>,
     #[serde(flatten)]
     pub change: SessionSettings,
+}
+
+/// Selects a provider-local account for one session, without changing auth defaults.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountRequest {
+    pub provider: String,
+    /// Null or absence resets to Provider default. Empty pins the unnamed account.
+    pub account: Option<String>,
+}
+
+/// Non-secret account choices and selection state from the host's auth store.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountList {
+    pub provider: String,
+    /// The session pin, or None for Provider default.
+    pub selected: Option<String>,
+    /// The provider's default account label, if one exists.
+    pub default: Option<String>,
+    /// Exact labels, including the empty string for an unnamed account.
+    pub accounts: Vec<String>,
+    pub override_active: bool,
+    /// Human-readable credential source, never a credential value.
+    pub source: String,
 }
 
 /// Switches a session's active branch head.
@@ -750,6 +789,8 @@ mod request {
         speed: Option<String>,
         #[serde(default)]
         verbosity: Option<String>,
+        #[serde(default)]
+        account: Option<AccountSelection>,
     }
 
     impl From<StrictSessionSettings> for SessionSettings {
@@ -760,6 +801,7 @@ mod request {
                 thinking_display: settings.thinking_display,
                 speed: settings.speed,
                 verbosity: settings.verbosity,
+                account: settings.account,
             }
         }
     }
@@ -992,6 +1034,7 @@ mod request {
                 thinking_display: request.thinking_display,
                 speed: request.speed,
                 verbosity: request.verbosity,
+                account: None,
             },
         }
     );
@@ -1015,6 +1058,7 @@ mod request {
     );
 
     request_body!(EnvRequest, EnvRequest, |request| request);
+    request_body!(AccountRequest, AccountRequest, |request| request);
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]

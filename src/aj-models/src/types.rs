@@ -104,13 +104,9 @@ pub struct AssistantMessage {
     pub provider: String,
     /// Exact model ID used.
     pub model: String,
-    /// The account label whose credential served this turn's inference.
-    ///
-    /// Absent when no LABELED account served it: a provider holding one
-    /// bare credential, a runtime `--api-key` override, or an
-    /// environment variable. That also makes every log line written
-    /// before accounts existed valid, since absent was the only thing
-    /// those lines could say.
+    /// The account label whose stored credential served this inference.
+    /// An empty label identifies the unnamed account. Absent for runtime
+    /// overrides, environment credentials, or messages without attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     /// Provider-specific response/message ID.
@@ -566,10 +562,9 @@ impl std::fmt::Debug for OnPayload {
 
 /// A credential a resolver produced, with the account it belongs to.
 ///
-/// `account` is the label of the credential that actually served this
-/// request, and it is absent when no LABELED account did: a bare stored
-/// credential, a runtime `--api-key` override, or an environment
-/// variable. See [`AssistantMessage::account`], which records it.
+/// `account` is the label of the stored credential that served this request,
+/// including the empty unnamed identity. It is absent for runtime overrides
+/// and environment credentials. See [`AssistantMessage::account`].
 #[derive(Clone)]
 pub struct ResolvedApiKey {
     /// The bearer token to send upstream.

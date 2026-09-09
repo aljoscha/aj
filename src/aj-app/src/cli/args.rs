@@ -66,8 +66,22 @@ pub struct Args {
     /// written to disk. Intentionally has no `env =` binding so the
     /// only way to supply it is the explicit flag (provider-specific
     /// env vars like `ANTHROPIC_API_KEY` remain the env path).
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["account", "default_account"])]
     pub api_key: Option<String>,
+
+    /// Pin the resolved provider to this stored account for the session being
+    /// opened, including resume. An empty value selects the unnamed account.
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        conflicts_with = "default_account"
+    )]
+    pub account: Option<String>,
+
+    /// Use the resolved provider's shared default in the session being opened.
+    #[arg(long, global = true, conflicts_with = "account")]
+    pub default_account: bool,
 
     /// Inference speed mode: `standard` (default) or `fast`. Fast mode
     /// is Anthropic-only — it sends `speed: "fast"` in the request body
@@ -255,7 +269,40 @@ impl Args {
         if let Some(allow) = explicit_global_arguments(&argv, "--allow", Some(',')) {
             parsed.allow = allow;
         }
+        // Clap checks conflicts within each command. These flags can arrive
+        // on opposite sides of a subcommand, so validate the complete choice.
+        if (parsed.account.is_some() && parsed.default_account)
+            || (parsed.api_key.is_some() && (parsed.account.is_some() || parsed.default_account))
+        {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--account, --default-account, and --api-key cannot be combined",
+            ));
+        }
+        if parsed.account_selection().is_some()
+            && !matches!(
+                parsed.command,
+                None | Some(Command::Continue { .. }) | Some(Command::Connect { .. })
+            )
+        {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--account and --default-account require a session to open",
+            ));
+        }
         Ok(parsed)
+    }
+
+    /// An explicit session-account choice. Omission preserves the saved choice,
+    /// while `--default-account` clears the resolved provider's pin.
+    pub fn account_selection(&self) -> Option<aj_wire::AccountSelection> {
+        if self.default_account {
+            Some(aj_wire::AccountSelection { name: None })
+        } else {
+            self.account
+                .clone()
+                .map(|name| aj_wire::AccountSelection { name: Some(name) })
+        }
     }
 
     /// Build the clap command for help, completion, and grammar introspection.
@@ -681,6 +728,49 @@ mod tests {
 
     fn parse(argv: &[&str]) -> Args {
         Args::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?} should parse: {err}"))
+    }
+
+    #[test]
+    fn account_flags_distinguish_omission_default_and_exact_empty_identity() {
+        assert!(parse(&["aj"]).account_selection().is_none());
+        for (flag, expected) in [
+            ("--default-account", None),
+            ("--account=", Some("")),
+            ("--account=default", Some("default")),
+        ] {
+            for argv in [
+                vec!["aj", flag, "continue"],
+                vec!["aj", "continue", flag],
+                vec!["aj", "connect", "http://localhost:6161", flag],
+            ] {
+                assert_eq!(
+                    parse(&argv).account_selection().unwrap().name.as_deref(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn account_flags_refuse_conflicts_and_commands_without_a_session() {
+        for argv in [
+            vec!["aj", "--account=work", "--default-account"],
+            vec!["aj", "--api-key=key", "--account=work"],
+            vec!["aj", "--api-key=key", "--default-account"],
+            vec!["aj", "--api-key=key", "continue", "--account=work"],
+            vec!["aj", "--api-key=key", "continue", "--default-account"],
+            vec!["aj", "--account=personal", "continue", "--default-account"],
+            vec!["aj", "--default-account", "continue", "--account=personal"],
+            vec!["aj", "--account=work", "serve"],
+            vec!["aj", "gateway", "--default-account"],
+            vec!["aj", "--account=", "list-sessions"],
+            vec!["aj", "update-models", "--default-account"],
+        ] {
+            assert!(
+                Args::try_parse_from(&argv).is_err(),
+                "accepted ineffective account choice: {argv:?}"
+            );
+        }
     }
 
     /// The control-port flags are global, so a subcommand does not hide them:

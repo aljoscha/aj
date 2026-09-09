@@ -47,6 +47,7 @@
 //!   around the tool_result is also emitted so persistence listeners
 //!   replaying the stream see the same shape live runs produce.
 //! - [`ConversationEntryKind::ModelChange`] /
+//!   [`ConversationEntryKind::AccountChange`] /
 //!   [`ConversationEntryKind::ThinkingChange`] /
 //!   [`ConversationEntryKind::SpeedChange`] /
 //!   [`ConversationEntryKind::VerbosityChange`]: one
@@ -764,6 +765,7 @@ impl ReplayState {
             // bracket; the first `Message` entry does. A compaction
             // marker likewise opens no bracket.
             ConversationEntryKind::ModelChange { .. }
+            | ConversationEntryKind::AccountChange { .. }
             | ConversationEntryKind::ThinkingChange { .. }
             | ConversationEntryKind::SpeedChange { .. }
             | ConversationEntryKind::VerbosityChange { .. }
@@ -905,6 +907,19 @@ impl ReplayState {
                     agent_id,
                     at,
                     format!("Model set to {provider}/{model_id}."),
+                    out,
+                );
+            }
+            ConversationEntryKind::AccountChange { provider, account } => {
+                let label = match account.as_deref() {
+                    None => "Provider default",
+                    Some("") => "unnamed account",
+                    Some(label) => label,
+                };
+                self.state_notice(
+                    agent_id,
+                    at,
+                    format!("Account for {provider}: {label}"),
                     out,
                 );
             }
@@ -2865,6 +2880,76 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::Notice { .. })),
             "seed settings entries must be silent, got {events:#?}"
         );
+    }
+
+    #[test]
+    fn account_notices_follow_settings_gating_branch_selection_and_suffix_tags() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        log.set_system_prompt("p".into()).expect("root");
+        let seed = log
+            .append_account_change("openai", Some("seed"))
+            .expect("seed");
+        let fork = ConversationView::user(&mut log)
+            .add_message(user_msg("hi"))
+            .expect("message");
+        let abandoned = log
+            .append_account_change("openai", Some("abandoned"))
+            .expect("sibling");
+        log.set_head(fork.id.clone()).expect("branch");
+        let mut expected = Vec::new();
+        for (provider, account, label) in [
+            ("openai", Some("work <&界>"), "work <&界>"),
+            ("anthropic", Some(""), "unnamed account"),
+            ("openai", None, "Provider default"),
+        ] {
+            let at = log
+                .append_account_change(provider, account)
+                .expect("change");
+            expected.push((at, format!("Account for {provider}: {label}")));
+        }
+        ConversationView::user(&mut log)
+            .add_message(user_msg("publish"))
+            .expect("message");
+        let resumed = ConversationLog::resume(&persistence, log.session_id()).expect("resume");
+        let snapshot = resumed.snapshot();
+        assert!(snapshot.project_state_entry(&seed.id).is_none());
+        assert!(snapshot.project_state_entry(&abandoned.id).is_none());
+        let notices: Vec<_> = replay(&resumed)
+            .filter_map(|event| match event {
+                AgentEvent::Notice { agent_id, text } => {
+                    assert_eq!(agent_id, AgentId::Main);
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            expected
+                .iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>()
+        );
+        let suffix = project_suffix(&snapshot, Some(fork.seq), &BTreeSet::new());
+        let tagged_notices: Vec<_> = suffix
+            .events
+            .into_iter()
+            .filter_map(|tagged| match tagged.event {
+                AgentEvent::Notice { text, .. } => {
+                    Some((tagged.entry.expect("state entry tag"), text))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tagged_notices, expected);
+        for (at, expected_text) in expected {
+            let Some(AgentEvent::Notice { text, .. }) = snapshot.project_state_entry(&at.id) else {
+                panic!("account entry must project a notice");
+            };
+            assert_eq!(text, expected_text);
+        }
     }
 
     #[test]
