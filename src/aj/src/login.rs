@@ -819,11 +819,6 @@ pub(crate) enum LoginTarget {
 /// An action over one or more labeled accounts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AccountAction {
-    ReplaceLogin {
-        provider_id: String,
-        provider_name: String,
-        account_label: String,
-    },
     Logout {
         provider_id: String,
         account_label: String,

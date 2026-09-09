@@ -81,8 +81,8 @@ use crate::image_store::ImageStore;
 use crate::keymap::{HostCtx, build_keymap};
 use crate::login::{
     AccountAction, AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, LoginTarget,
-    open_default_account_picker, open_default_logout_picker, open_login_dialog, open_login_picker,
-    open_logout_picker,
+    account_label_text, open_default_account_picker, open_default_logout_picker, open_login_dialog,
+    open_login_picker, open_logout_picker,
 };
 use crate::overlay::{MouseBlocker, OverlayChrome, OverlayStack, Scrim, close_key_label};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
@@ -2382,7 +2382,7 @@ async fn open_default_logout_resolution(
         .iter()
         .filter(|(label, _)| label != &account_label)
         .map(|(new_default, _)| {
-            let (shown, search) = account_picker_text(new_default);
+            let shown = account_label_text(new_default);
             let action = AccountAction::LogoutWithNewDefault {
                 provider_id: provider_id.clone(),
                 account_label: account_label.clone(),
@@ -2390,8 +2390,8 @@ async fn open_default_logout_resolution(
             };
             AuthRow {
                 request: AuthPickerRequest::ApplyAccount(action),
+                filter_key: format!("{provider_id} {shown}"),
                 label: shown,
-                filter_key: format!("{provider_id} {search}"),
                 summary: Some("make default, then remove the selected account".to_string()),
             }
         })
@@ -2421,19 +2421,6 @@ async fn open_default_logout_resolution(
     true
 }
 
-/// Represent a stored account label for display and filtering in a picker:
-/// the label as stored, folded to one line exactly like a session tag.
-fn account_picker_text(raw: &str) -> (String, String) {
-    let represented = crate::login::account_label_text(raw);
-    (represented.clone(), represented)
-}
-
-/// Post-action account text for transcript prose: the label as stored,
-/// folded to one line.
-fn account_notice_text(raw: &str) -> String {
-    crate::login::account_label_text(raw)
-}
-
 /// Removal changes stored credentials, not environment or runtime overrides.
 async fn logout_notice(world: &World, provider: &str, removed: &str) -> String {
     let status = aj_app::auth::provider_status(&world.auth, provider, None).await;
@@ -2455,7 +2442,7 @@ fn session_account_rows(session: &str, provider: &str, list: aj_wire::AccountLis
         provider: provider.to_string(),
         account,
     };
-    let default = list.default.as_deref().map(account_notice_text);
+    let default = list.default.as_deref().map(account_label_text);
     let source = crate::text::one_line(&list.source);
     let mut rows = vec![AuthRow {
         request: request(None),
@@ -2468,7 +2455,7 @@ fn session_account_rows(session: &str, provider: &str, list: aj_wire::AccountLis
         summary: Some(default.unwrap_or(source)),
     }];
     rows.extend(list.accounts.into_iter().map(|account| {
-        let shown = account_notice_text(&account);
+        let shown = account_label_text(&account);
         let selected = list.selected.as_ref() == Some(&account);
         AuthRow {
             request: request(Some(account)),
@@ -2545,20 +2532,6 @@ async fn apply_auth_request(
             app.request_redraw();
         }
         AuthPickerRequest::ApplyAccount(action) => match action {
-            AccountAction::ReplaceLogin {
-                provider_id,
-                provider_name,
-                account_label,
-            } => start_login(
-                world,
-                shell,
-                app,
-                login_session,
-                redraw_tx,
-                provider_id,
-                provider_name,
-                LoginTarget::ExistingAccount(Some(account_label)),
-            ),
             AccountAction::Logout {
                 provider_id,
                 account_label,
@@ -2568,7 +2541,7 @@ async fn apply_auth_request(
                 .await
             {
                 Ok(()) => {
-                    let shown = account_notice_text(&account_label);
+                    let shown = account_label_text(&account_label);
                     let notice = logout_notice(
                         world,
                         &provider_id,
@@ -2605,7 +2578,7 @@ async fn apply_auth_request(
                 provider_id,
                 account_label,
             } => {
-                let shown = account_notice_text(&account_label);
+                let shown = account_label_text(&account_label);
                 let notice = match world
                     .auth
                     .set_default_account(&provider_id, &account_label)
@@ -2622,8 +2595,8 @@ async fn apply_auth_request(
                 account_label,
                 new_default,
             } => {
-                let removed = account_notice_text(&account_label);
-                let selected = account_notice_text(&new_default);
+                let removed = account_label_text(&account_label);
+                let selected = account_label_text(&new_default);
                 let notice = match world
                     .auth
                     .remove_default_account(&provider_id, &account_label, &new_default)
@@ -2754,7 +2727,7 @@ fn complete_login(
                 LoginTarget::NewAccount => "Account added.".to_string(),
                 LoginTarget::ExistingAccount(label) => format!(
                     "Replaced {}.",
-                    account_notice_text(label.as_deref().unwrap_or("")),
+                    account_label_text(label.as_deref().unwrap_or("")),
                 ),
             };
             fold_notice(world, &format!("Logged in to {provider_name}. {detail}"));
@@ -3875,16 +3848,16 @@ async fn apply_command_action(
                     }),
                     Some(StoredProviderCredentials::Accounts(set)) => {
                         rows.extend(set.accounts.into_iter().map(|(account_label, _)| {
-                            let (shown, search) = account_picker_text(&account_label);
-                            let action = AccountAction::ReplaceLogin {
+                            let shown = account_label_text(&account_label);
+                            let request = AuthPickerRequest::Login {
                                 provider_id: id.clone(),
                                 provider_name: name.clone(),
-                                account_label,
+                                target: LoginTarget::ExistingAccount(Some(account_label)),
                             };
                             AuthRow {
-                                request: AuthPickerRequest::ApplyAccount(action),
+                                request,
                                 label: format!("{name} · {shown}"),
-                                filter_key: format!("{id} {name} {search} reauthenticate"),
+                                filter_key: format!("{id} {name} {shown} reauthenticate"),
                                 summary: Some("log in again and replace this account".to_string()),
                             }
                         }));
@@ -3939,7 +3912,7 @@ async fn apply_command_action(
                     Ok(Some(StoredProviderCredentials::Accounts(set))) => {
                         let default = set.default;
                         rows.extend(set.accounts.into_iter().map(|(account_label, _)| {
-                            let (shown, search) = account_picker_text(&account_label);
+                            let shown = account_label_text(&account_label);
                             let suffix = if account_label == default {
                                 "default account"
                             } else {
@@ -3952,7 +3925,7 @@ async fn apply_command_action(
                             AuthRow {
                                 request: AuthPickerRequest::ApplyAccount(action),
                                 label: format!("{id} · {shown}"),
-                                filter_key: format!("{id} {search}"),
+                                filter_key: format!("{id} {shown}"),
                                 summary: Some(format!("remove this {suffix}")),
                             }
                         }));
@@ -3996,7 +3969,7 @@ async fn apply_command_action(
                 };
                 rows.extend(accounts.into_iter().map(|(account_label, _)| {
                     let is_current = account_label == default;
-                    let (shown, search) = account_picker_text(&account_label);
+                    let shown = account_label_text(&account_label);
                     let action = AccountAction::SetDefault {
                         provider_id: id.clone(),
                         account_label: account_label.clone(),
@@ -4008,7 +3981,7 @@ async fn apply_command_action(
                         } else {
                             format!("{id} · {shown}")
                         },
-                        filter_key: format!("{id} {search}"),
+                        filter_key: format!("{id} {shown}"),
                         summary: None,
                     }
                 }));
@@ -14707,11 +14680,10 @@ mod tests {
     fn account_presentation_does_not_collapse_long_common_prefixes() {
         let left = format!("{}x", "a".repeat(96));
         let right = format!("{}y", "a".repeat(96));
-        assert_ne!(account_picker_text(&left).0, account_picker_text(&right).0);
-        assert_ne!(account_notice_text(&left), account_notice_text(&right));
+        assert_ne!(account_label_text(&left), account_label_text(&right));
 
-        let one_space = account_notice_text("a b");
-        let many_spaces = account_notice_text("a    b");
+        let one_space = account_label_text("a b");
+        let many_spaces = account_label_text("a    b");
         assert_ne!(one_space, many_spaces);
         assert_eq!(one_space, "a b", "a label shows as stored");
         assert_eq!(many_spaces, "a    b", "a label shows as stored");
@@ -15539,14 +15511,6 @@ mod tests {
             .borrow()
             .take_auth_request()
             .expect("existing account row parks a request");
-        assert!(matches!(
-            &request,
-            AuthPickerRequest::ApplyAccount(AccountAction::ReplaceLogin {
-                provider_id: selected,
-                account_label,
-                ..
-            }) if selected == provider_id && account_label == "work"
-        ));
 
         let (tx, _rx) = unbounded_channel();
         let mut login_session = None;
@@ -22305,7 +22269,7 @@ mod tests {
                     "resolved default is visible: {painted}"
                 );
                 let current_label = current
-                    .map(account_notice_text)
+                    .map(account_label_text)
                     .unwrap_or_else(|| "Provider default".to_string());
                 assert!(
                     painted.contains(&format!("{current_label} (current)")),
