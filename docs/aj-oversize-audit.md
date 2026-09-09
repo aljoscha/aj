@@ -9,7 +9,7 @@ non-doc lines changed plus 13 empty-body commits in the 300 to 499 range,
 abstractions, tests at the stable boundary). Reference case: `c4b977b`.
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 18 LOOKs.
+retired 19 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -29,7 +29,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 9 open)
+## LOOK (27 total, 8 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -51,7 +51,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`532aaab` 2026-08-28 aj-session,aj-app: resolve session environment gate findings~~ Retired: the unused projection compatibility wrapper and its assertions are removed. Export presentation and renderer-specific escaping remain intact.
 - ~~`2c09755` 2026-08-30 models: mark issued handshake usage partial~~ Retired without code changes: cancellation-first request selection distinguishes unissued zero usage from potentially issued partial usage with one local poll tracker.
 - ~~`317c06c` 2026-08-30 session: implement crash-safe environment publication~~ Retired: RTK runs its hook answer unchanged, without PATH defenses or helper-specific teardown machinery. Transactional log publication and global CLI aggregation remain.
-- `48c07a9` 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account
+- ~~`48c07a9` 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account~~ Retired: ordinary label validation and direct picker actions replace the Unicode and inspection machinery. Reauthentication uses one request path, and account presentation uses one formatter.
 - `854f4a7` 2026-08-30 usage: mark undisclosed provider totals partial
 - `c4b977b` 2026-08-30 aj-app,aj: keep failed transitions on the selected session
 - `bdaefe6` 2026-08-30 aj-app: preserve checkpoint usage dependencies
@@ -250,12 +250,14 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: CLI, persistence, and RTK work arrived in one large commit with an empty body. The RTK change was +286/-48 production lines and +646/-12 test lines. Atomic no-replace publication serves the log contract, while the CLI scan preserves global append arguments that clap otherwise drops across subcommands. The crash checkpoints are test-only.
 - Disposition: Keep publication, CLI aggregation, and persisted-format coverage. Remove RTK-specific defenses and their tests, retaining composed coverage of basic rewriting, disabled or unavailable hooks, and fallback. Environment editing uses branch-local state with legacy Meta creation records still readable.
 
-### 48c07a9 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account
+### 48c07a9 2026-08-30 aj-models,aj-app,aj: manage OAuth credentials by account [RETIRED]
+- Status: Retired after local cleanup. `1df73223` removes the Unicode table, generator, and reversible-label engine, and `a5e691bc` removes dedicated account inspection and confirmation. Labeled reauthentication uses the same login request as bare reauthentication, and picker and notice text share the account formatter directly.
 - Stats: 17 files, +9350 -406, ~6030 prod / ~3275 test lines (4368 of prod is the vendored `DerivedGeneralCategory.txt`)
 - Body: empty
-- Verdict: LOOK
-- Why: Labeled accounts per provider is a real feature, but the label is treated as an adversarial identifier: a vendored Unicode 17 General Category table plus a 239-line `build.rs` generator, `account_label.rs` (846 lines) with compile-time version asserts against three crates, NFC-exactness, grapheme-starter rules, a "reversible display" grammar with two modes and injectivity tests over generated adversarial labels, `ACCOUNT_INSPECTION_CELL_LIMIT = 65_535` with over-limit acknowledgement dialogs, and an `AccountConfirmation` widget. `AuthStorage` grows `credential_read_count`/`reset_credential_read_count` instrumentation for tests (`connected_auth_refusals_use_a_positively_calibrated_zero_read_oracle`). interactive.rs +1493 and login.rs +984 for pickers and prompts. Empty body on 9350 lines.
-- Simpler shape: label rules of non-empty, no control characters, byte bound, stored as a map with a default key; display via the existing `text::one_line`. No UCD table, no build script, no reversible grammar.
+- Verdict: Retired after investigation. Account management is proportionate without a separate identifier and inspection system.
+- Why flagged: The account-name feature acquired a formal Unicode, reversible-display, and legacy-inspection contract during design and review. The original commit includes 4,368 lines of Unicode data, a 239-line generator, and an 846-line label module. Its six-commit range landed together, not as successive deployed redesigns.
+- Disposition: Keep duplicate-safe insertion, explicit reauthentication, exact raw picker targets, and default-removal choices. The test-support read observer protects connected-client credential ownership, and auth-row bounds protect renderer geometry. Neither needs the removed label engine. Composed reauthentication coverage observes the selected credential changing while its sibling stays intact, rather than requiring a particular request variant.
+
 ### 854f4a7 2026-08-30 usage: mark undisclosed provider totals partial
 - Stats: 30 files, +962 -144, ~250 prod / ~700 test lines (estimate: added lines past each file's `mod tests` plus tests/, roundtrip, smoke_test.mjs)
 - Body: empty
