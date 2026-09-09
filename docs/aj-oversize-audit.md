@@ -10,7 +10,7 @@ abstractions, tests at the stable boundary). Reference case at audit time:
 `c4b977b` (retired below).
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 24 LOOKs.
+retired 25 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -30,7 +30,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 3 open)
+## LOOK (27 total, 2 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -58,7 +58,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`bdaefe6` 2026-08-30 aj-app: preserve checkpoint usage dependencies~~ Retired: committed compaction publishes one durable event containing optional usage, with append handoff and exclusive accounting safeguards retained.
 - ~~`e1139c6` 2026-08-30 aj-app: preserve committed compaction usage atomically~~ Retired: committed compaction publishes one durable event containing optional usage, with append handoff and exclusive accounting safeguards retained.
 - ~~`70e7ee6` 2026-08-31 aj-tools: bound direct command reap after sigkill~~ Retired without code changes: the existing process guard owns bounded reap and resource release, while capture joins distinguish intentional cancellation from real failure. No worthwhile simplification identified.
-- `be726be` 2026-08-31 aj-wire: reject unknown command fields
+- ~~`be726be` 2026-08-31 aj-wire: reject unknown command fields~~ Retired by `6073d92b`: simple requests and creation settings use their public schemas, while specialized views preserve flattened and shared-content behavior.
 - `5fc079e` 2026-08-31 agent: serialize live usage accounting
 - `fe5d661` 2026-09-01 aj-models: make auth hardening guarantees load-bearing
 
@@ -297,12 +297,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: A rare unavailable-reap case acquired result types and cancellation plumbing through the capture drain. The flag prevents a model-facing false capture failure, not merely a log message. Tokio abortion schedules cancellation rather than completing it, so skipping the drain would also discard bounded reader joins and their failure observation. The fixtures safely model an unavailable reap with a live child and nonexistent recorded process group, not a real kernel D-state.
 - Disposition: Keep production and tests. Process ownership, background completion notices, and composed session-lock release are distinct boundaries. RTK retains only its basic optional rewrite hook, without helper-specific teardown. All eight focused reap, cancellation, timeout, capture-error, and host-drop checks passed.
 
-### be726be 2026-08-31 aj-wire: reject unknown command fields
+### be726be 2026-08-31 aj-wire: reject unknown command fields [RETIRED]
+- Status: Retired by `6073d92b`. Eight command types, model selection, and creation settings decode through their strict public schemas. `EmptyRequest` owns its map-only decoder. Eleven redundant private types and their conversions are removed, reducing production code by 151 net lines without changing tests.
 - Stats: 9 files, +1495 -116, ~450 prod / ~950 test lines (estimate: wire.rs +157, gateway/tests.rs +366, remote/tests.rs +444 are test files)
 - Body: empty
-- Verdict: LOOK
-- Why: To reject unknown fields in JSON command bodies it builds a parallel shadow hierarchy: a sealed `request::Sealed` trait, `RequestBody` marker trait, `request_body!` macro, `EmptyRequest`, `RequestDecodeError`, and ~15 private `Strict*` mirrors (`StrictModelSelection`, `StrictSessionSettings`, `StrictUserContent`, `StrictPromptInput`, `StrictCreateSessionRequest`, ... 74 mentions in lib.rs) each with a `From` impl back to the public type, plus a protocol version bump. Every future request field must now be added twice. ~950 test lines, empty body for a wire-contract change.
-- Simpler shape: `#[serde(deny_unknown_fields)]` on the request types themselves, splitting only the one or two nested models that are genuinely shared with tolerant observation decoding.
+- Verdict: Retired after scoped schema consolidation. Strict commands and tolerant observations were explicitly requested to avoid silently executing a smaller command.
+- Why flagged: A private schema for every command duplicated ordinary request fields. There were 22 `Strict*` types, not approximately 15. Shared content and flattened prompts do need specialized decoding, and settings edits deliberately exclude creation-only account selection. The five-commit range landed together after review, not as successive deployed redesigns.
+- Disposition: Keep the eleven specialized request types, the single codec entry point, generic errors, blank-body defaults, and gateway effect ownership. The empty-object visitor still rejects arrays. Public-serializer round trips, refusal-before-effects tests, and tolerant observation coverage remain intact.
 
 ### 5fc079e 2026-08-31 agent: serialize live usage accounting
 - Stats: 9 files, +465 -182, ~190 prod / ~200 test lines (estimate: lib.rs event_protocol_tests hunk +200; docs excluded)
