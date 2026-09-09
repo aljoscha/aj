@@ -2437,10 +2437,14 @@ fn account_notice_text(raw: &str) -> String {
 /// Removal changes stored credentials, not environment or runtime overrides.
 async fn logout_notice(world: &World, provider: &str, removed: &str) -> String {
     let status = aj_app::auth::provider_status(&world.auth, provider, None).await;
-    format!(
-        "{removed} Provider default authentication: {}. Sessions pinned to a removed account need re-selection.",
-        crate::text::one_line(&status.summary),
-    )
+    if status.configured {
+        format!(
+            "{removed} Provider default: {}.",
+            crate::text::one_line(&status.summary)
+        )
+    } else {
+        removed.to_string()
+    }
 }
 
 /// Each row carries its captured target. Following the default and pinning
@@ -2455,37 +2459,26 @@ fn session_account_rows(session: &str, provider: &str, list: aj_wire::AccountLis
     let source = crate::text::one_line(&list.source);
     let mut rows = vec![AuthRow {
         request: request(None),
-        label: "Provider default".to_string(),
+        label: if list.selected.is_none() {
+            "Provider default (current)".to_string()
+        } else {
+            "Provider default".to_string()
+        },
         filter_key: "Provider default shared follow".to_string(),
-        summary: Some(format!(
-            "{}{}",
-            default
-                .map(|name| format!("Currently {name} · {source}"))
-                .unwrap_or(source),
-            if list.selected.is_none() {
-                " · selected"
-            } else {
-                ""
-            },
-        )),
+        summary: Some(default.unwrap_or(source)),
     }];
     rows.extend(list.accounts.into_iter().map(|account| {
         let shown = account_notice_text(&account);
         let selected = list.selected.as_ref() == Some(&account);
-        let is_default = list.default.as_ref() == Some(&account);
         AuthRow {
             request: request(Some(account)),
-            label: shown.clone(),
+            label: if selected {
+                format!("{shown} (current)")
+            } else {
+                shown.clone()
+            },
             filter_key: shown,
-            summary: Some(format!(
-                "Pin this exact account{}{}",
-                if is_default {
-                    " · current provider default"
-                } else {
-                    ""
-                },
-                if selected { " · selected" } else { "" },
-            )),
+            summary: None,
         }
     }));
     rows
@@ -2618,9 +2611,7 @@ async fn apply_auth_request(
                     .set_default_account(&provider_id, &account_label)
                     .await
                 {
-                    Ok(()) => format!(
-                        "{shown} is now {provider_id}'s shared provider default. Subsequent requests of every session following it change, including running work. Pinned accounts stay unchanged."
-                    ),
+                    Ok(()) => format!("{provider_id} default account: {shown}."),
                     Err(err) => format!("Failed to change {provider_id}'s default account: {err}"),
                 };
                 fold_notice(world, &notice);
@@ -2639,7 +2630,7 @@ async fn apply_auth_request(
                     .await
                 {
                     Ok(()) => logout_notice(world, &provider_id, &format!(
-                        "Logged out of {provider_id} account {removed}. {selected} is now the shared provider default for followers' subsequent requests."
+                        "Logged out of {provider_id} account {removed}. {provider_id} default account: {selected}."
                     )).await,
                     Err(err) => format!("Failed to update {provider_id}'s accounts: {err}"),
                 };
@@ -2760,9 +2751,9 @@ fn complete_login(
     match outcome {
         Ok(Ok(())) => {
             let detail = match target {
-                LoginTarget::NewAccount => "Account added. Adding does not select an account for this session. Use /account to choose, or follow the provider default.".to_string(),
+                LoginTarget::NewAccount => "Account added.".to_string(),
                 LoginTarget::ExistingAccount(label) => format!(
-                    "Replaced {}. Subsequent requests using this credential use the new login.",
+                    "Replaced {}.",
                     account_notice_text(label.as_deref().unwrap_or("")),
                 ),
             };
@@ -3815,10 +3806,7 @@ async fn apply_command_action(
                         &handles.editor,
                         &handles.chrome,
                         &handles.auth_request,
-                        &format!(
-                            "Account · {} · next inference",
-                            crate::text::one_line(&provider)
-                        ),
+                        &format!("Account · {}", crate::text::one_line(&provider)),
                         rows,
                     );
                     ActionEffect::OpenedOverlay
@@ -4021,7 +4009,7 @@ async fn apply_command_action(
                             format!("{id} — {shown}")
                         },
                         filter_key: format!("{id} {search}"),
-                        summary: Some("Every following session, including running work · subsequent requests · pins unchanged".to_string()),
+                        summary: None,
                     }
                 }));
             }
@@ -14810,9 +14798,7 @@ mod tests {
         assert!(
             main_notices(&world)
                 .iter()
-                .any(|n| n.contains("Logged out of anthropic")
-                    && n.contains("Unnamed account")
-                    && n.contains("API key (--api-key override)")),
+                .any(|n| n == "Logged out of anthropic (Unnamed account). Provider default: API key (--api-key override)."),
             "{:?}",
             main_notices(&world)
         );
@@ -15107,11 +15093,14 @@ mod tests {
         focus_overlay(&mut app, &root);
         app.render(&root).expect("render default-account picker");
         let picker = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(picker.contains("Default account"), "{picker}");
         assert!(
             picker.contains("provider — personal (current)"),
             "current default is visible and tagged: {picker}"
         );
         assert!(!picker.contains("current default account"), "{picker}");
+        assert!(!picker.contains("Every following session"), "{picker}");
+        assert!(!picker.contains("shared"), "{picker}");
         assert!(
             !picker.contains("make this the default account"),
             "{picker}"
@@ -15379,8 +15368,7 @@ mod tests {
         assert!(
             main_notices(&world)
                 .iter()
-                .any(|n| n.contains("Logged in to Controlled OAuth")
-                    && n.contains("Adding does not select an account for this session")),
+                .any(|n| n == "Logged in to Controlled OAuth. Account added."),
             "{:?}",
             main_notices(&world)
         );
@@ -15627,7 +15615,11 @@ mod tests {
             .expect("labeled account set");
         assert_eq!(accounts.default, "", "existing unnamed default preserved");
         assert_eq!(accounts.accounts.len(), 2, "one exact account inserted");
-        assert!(main_notices(&world).iter().any(|notice| notice.contains("Adding does not select an account for this session")));
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|notice| notice.ends_with("Account added."))
+        );
     }
 
     /// Esc reaches the same abort-and-join barrier through the drive loop. The
@@ -15852,9 +15844,8 @@ mod tests {
         assert!(
             notices
                 .last()
-                .is_some_and(|notice| notice == &format!(
-                    "Logged in to Controlled OAuth. Replaced {account}. Subsequent requests using this credential use the new login."
-                )),
+                .is_some_and(|notice| notice
+                    == &format!("Logged in to Controlled OAuth. Replaced {account}.")),
             "committed outcome: {notices:?}"
         );
         assert!(
@@ -22209,6 +22200,7 @@ mod tests {
             let (mut app, mut writer, root) = app_over(&shell).await;
             let (tx, _rx) = unbounded_channel();
             let mut login_session = None;
+            let mut current = None;
             for (index, expected) in [
                 (4, Some("default")),
                 (0, None),
@@ -22224,7 +22216,37 @@ mod tests {
                 let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
                 assert!(painted.contains("Provider default"), "{painted}");
                 assert!(painted.contains("Unnamed account"), "{painted}");
-                assert!(painted.contains("Currently default"), "{painted}");
+                let default_row = painted
+                    .lines()
+                    .find(|line| line.contains("Provider default"))
+                    .unwrap();
+                assert!(
+                    default_row
+                        .split_once("Provider default")
+                        .unwrap()
+                        .1
+                        .contains("default"),
+                    "resolved default is visible: {painted}"
+                );
+                let current_label = current
+                    .map(account_notice_text)
+                    .unwrap_or_else(|| "Provider default".to_string());
+                assert!(
+                    painted.contains(&format!("{current_label} (current)")),
+                    "{painted}"
+                );
+                for explanation in [
+                    "Currently",
+                    "Pin this exact account",
+                    "current provider default",
+                    "API key (stored)",
+                    "next inference",
+                ] {
+                    assert!(
+                        !painted.contains(explanation),
+                        "unexpected explanation {explanation:?}: {painted}"
+                    );
+                }
                 for _ in 0..index {
                     press(&mut app, &mut writer, b"\x1b[B").await;
                 }
@@ -22265,6 +22287,7 @@ mod tests {
                     Some("default"),
                     "selection never changes the shared default"
                 );
+                current = expected;
             }
             if let Some(remote) = remote {
                 remote.shutdown().await;

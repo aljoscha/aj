@@ -950,9 +950,7 @@ impl Driver {
         self.publish_state_entry(
             AgentId::Main,
             &entry,
-            &format!(
-                "{provider} account: {selection}. Applies to subsequent requests in this session."
-            ),
+            &format!("{provider} account: {selection}."),
         )
         .await;
         self.publish_state();

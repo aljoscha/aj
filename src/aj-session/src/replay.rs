@@ -913,15 +913,10 @@ impl ReplayState {
             ConversationEntryKind::AccountChange { provider, account } => {
                 let label = match account.as_deref() {
                     None => "Provider default",
-                    Some("") => "unnamed account",
+                    Some("") => "Unnamed account",
                     Some(label) => label,
                 };
-                self.state_notice(
-                    agent_id,
-                    at,
-                    format!("Account for {provider}: {label}"),
-                    out,
-                );
+                self.state_notice(agent_id, at, format!("{provider} account: {label}."), out);
             }
             ConversationEntryKind::ThinkingChange { level } => {
                 self.state_notice(
@@ -2901,13 +2896,13 @@ mod tests {
         let mut expected = Vec::new();
         for (provider, account, label) in [
             ("openai", Some("work <&界>"), "work <&界>"),
-            ("anthropic", Some(""), "unnamed account"),
+            ("anthropic", Some(""), "Unnamed account"),
             ("openai", None, "Provider default"),
         ] {
             let at = log
                 .append_account_change(provider, account)
                 .expect("change");
-            expected.push((at, format!("Account for {provider}: {label}")));
+            expected.push((at, format!("{provider} account: {label}.")));
         }
         ConversationView::user(&mut log)
             .add_message(user_msg("publish"))

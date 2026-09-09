@@ -995,14 +995,7 @@ pub(crate) fn open_default_account_picker(
     request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
     rows: Vec<AuthRow>,
 ) {
-    open_auth_picker(
-        stack,
-        editor,
-        chrome,
-        request_slot,
-        "Provider default · shared",
-        rows,
-    );
+    open_auth_picker(stack, editor, chrome, request_slot, "Default account", rows);
 }
 
 /// Open the explicit resolution picker for removing a default account that
