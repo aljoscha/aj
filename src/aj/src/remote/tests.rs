@@ -31,7 +31,7 @@ use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_app::chat::{ChatState, SubAgentStatus};
 use aj_app::cli::args::Args;
 use aj_app::client::SessionClient;
-use aj_app::host::{AttachRequest, Attachment, CommandOutcome, HostSetup, SessionHost};
+use aj_app::host::{AttachRequest, Attachment, Command, CommandOutcome, HostSetup, SessionHost};
 use aj_app::session_setup::RunConfigSnapshot;
 use aj_app::settings::ConfigLayers;
 use aj_app::test_support::{
@@ -3626,7 +3626,7 @@ fn a_base_url_has_to_be_absolute_http() {
 // The identity gate over HTTP
 // ---------------------------------------------------------------------------
 
-const PROBED_ROUTES: [&str; 18] = [
+const PROBED_ROUTES: [&str; 20] = [
     "GET /v1/hello",
     "GET /v1/sessions",
     "POST /v1/sessions",
@@ -3634,10 +3634,12 @@ const PROBED_ROUTES: [&str; 18] = [
     "GET /v1/sessions/{id}/tasks/1",
     "GET /v1/sessions/{id}/queue",
     "GET /v1/sessions/{id}/tree",
+    "GET /v1/sessions/{id}/env",
     "GET /v1/events",
     "POST /v1/sessions/{id}/cancel",
     "POST /v1/sessions/{id}/queue",
     "POST /v1/sessions/{id}/settings",
+    "POST /v1/sessions/{id}/env",
     "POST /v1/sessions/{id}/tag",
     "POST /v1/sessions/{id}/archive",
     "POST /v1/sessions/{id}/head",
@@ -3749,6 +3751,10 @@ async fn probe_every_route(
                 ..SessionSettings::default()
             },
         }),
+        RemoteCommand::Env(aj_wire::EnvRequest {
+            key: "TOKEN".to_string(),
+            value: Some("probe".to_string()),
+        }),
         RemoteCommand::Tag(TagRequest {
             tag: "probe".to_string(),
         }),
@@ -3790,6 +3796,9 @@ async fn probe_every_route(
         http.get(format!("{base}/v1/sessions/{session}/tree"))
             .build()
             .expect("build the tree probe"),
+        http.get(format!("{base}/v1/sessions/{session}/env"))
+            .build()
+            .expect("build the environment probe"),
         http.get(format!("{base}/v1/events"))
             .query(&[("session", session)])
             .build()
@@ -4699,4 +4708,187 @@ async fn frames_from_a_stale_epoch_are_dropped_until_a_reattach() {
         "the client adopted the epoch of the block it was served",
     );
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn environment_reads_and_edits_are_equal_through_both_control_arms() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+    assert!(
+        fixture
+            .client
+            .hello()
+            .await
+            .unwrap()
+            .capabilities
+            .iter()
+            .any(|cap| cap == aj_wire::SESSION_ENV_CAPABILITY)
+    );
+    let controls = [
+        Control::local(fixture.host.clone()),
+        Control::remote(fixture.client()),
+    ];
+    controls[0]
+        .command(
+            &session,
+            Command::Env {
+                key: "UNCHANGED".to_string(),
+                value: Some("keep".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let mut expected = BTreeMap::from([("UNCHANGED".to_string(), "keep".to_string())]);
+    for control in &controls {
+        for value in [
+            Some("secret=value\nnext".to_string()),
+            Some(String::new()),
+            None,
+        ] {
+            control
+                .command(
+                    &session,
+                    Command::Env {
+                        key: "TOKEN".to_string(),
+                        value: value.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            match value {
+                Some(value) => {
+                    expected.insert("TOKEN".to_string(), value);
+                }
+                None => {
+                    expected.remove("TOKEN");
+                }
+            }
+            for reader in &controls {
+                assert_eq!(reader.environment(&session).await.unwrap(), expected);
+            }
+        }
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_environment_requests_leave_the_map_unchanged() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+    let control = Control::remote(fixture.client());
+    control
+        .command(
+            &session,
+            Command::Env {
+                key: "TOKEN".to_string(),
+                value: Some("keep".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let expected = control.environment(&session).await.unwrap();
+    for body in [
+        serde_json::json!({"key": "TOKEN", "vaule": "replace"}),
+        serde_json::json!({"key": "TOKEN", "value": "replace", "agent": "main"}),
+        serde_json::json!({"key": "TOKEN", "value": 3}),
+        serde_json::json!({"key": "", "value": "replace"}),
+        serde_json::json!({"key": "BAD=KEY", "value": "replace"}),
+        serde_json::json!({"key": "TOKEN", "value": "bad\0value"}),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/sessions/{session}/env",
+                fixture.server.url()
+            ))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            response.json::<ErrorResponse>().await.unwrap().code,
+            "invalid_request"
+        );
+        assert_eq!(
+            control.environment(&session).await.unwrap(),
+            expected,
+            "{body}"
+        );
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_busy_environment_edit_forwards_the_host_refusal() {
+    let fixture = Fixture::with_provider(scripted(
+        vec![finalized_text_message("a fairly long answer to stream")],
+        1,
+        Duration::from_millis(20),
+    ))
+    .await;
+    let session = fixture.create().await;
+    let mut remote = fixture.remote(&session).await;
+    fixture.prompt(&session, "hi").await;
+    remote
+        .pump_until("Main to start working", |frame| {
+            matches!(frame, Frame::State { working: true, .. })
+        })
+        .await;
+    let control = Control::remote(fixture.client());
+    let before = control.environment(&session).await.unwrap();
+    let err = control
+        .command(
+            &session,
+            Command::Env {
+                key: "TOKEN".to_string(),
+                value: Some("new".to_string()),
+            },
+        )
+        .await
+        .expect_err("busy edit refused");
+    assert!(err.conflict(), "{err}");
+    assert_eq!(control.environment(&session).await.unwrap(), before);
+    remote.settle().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stale_environment_endpoint_surfaces_the_usual_unsupported_error() {
+    let app = axum::Router::new().fallback(|| async {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "code": "unknown_endpoint", "message": "no such endpoint"
+            })),
+        )
+    });
+    let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+        .await
+        .unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let serving = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let control = Control::remote(RemoteClient::new(&url).unwrap());
+    assert!(
+        control
+            .environment("session")
+            .await
+            .unwrap_err()
+            .unknown_endpoint()
+    );
+    assert!(
+        control
+            .command(
+                "session",
+                Command::Env {
+                    key: "TOKEN".to_string(),
+                    value: None,
+                }
+            )
+            .await
+            .unwrap_err()
+            .unknown_endpoint()
+    );
+    serving.abort();
 }

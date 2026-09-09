@@ -405,6 +405,12 @@ pub enum Command {
         instructions: Option<String>,
     },
     Settings(SettingsChange),
+    /// Edit the selected branch overlay. None removes a key, Some("") sets it empty.
+    /// Refused while any work is live.
+    Env {
+        key: String,
+        value: Option<String>,
+    },
     /// Set the session's label, `None` clears it.
     ///
     /// The value is expected to have been through
@@ -748,6 +754,7 @@ impl SessionHost {
             capabilities: vec![
                 ARCHIVE_CAPABILITY.to_string(),
                 COMPACTION_USAGE_CAPABILITY.to_string(),
+                aj_wire::SESSION_ENV_CAPABILITY.to_string(),
             ],
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.host_id.clone(),
@@ -783,7 +790,7 @@ impl SessionHost {
     }
 
     /// Creates a session with creator-selected settings, a first prompt, a tag,
-    /// and an immutable environment map.
+    /// and an initial environment map.
     ///
     /// Creation is the operation that either happens or does not. Every
     /// setting, the prompt, tag, and environment are validated before a
@@ -1316,9 +1323,23 @@ impl SessionHost {
         Ok(QueueState { queues })
     }
 
+    /// The selected branch's environment overlay, materializing the session if needed.
+    pub async fn environment(&self, session: &str) -> Result<BTreeMap<String, String>, HostError> {
+        let live = self.live(session).await?;
+        let env = live
+            .core
+            .log
+            .lock()
+            .await
+            .session_env()
+            .cloned()
+            .unwrap_or_default();
+        Ok(env)
+    }
+
     /// The session's branch tree, for a tree view and head switching.
     ///
-    /// The one read that materializes: the tree is derived from
+    /// This read materializes: the tree is derived from
     /// the log's parent chains, so answering it means parsing the log, which
     /// is what a materialization does anyway.
     pub async fn tree(&self, session: &str) -> Result<SessionTree, HostError> {

@@ -452,8 +452,9 @@ impl Agent {
 
     /// Replace the environment overlay for this session's tool subshells.
     ///
-    /// An empty map means no overlay. Sub-agents copy the current map when
-    /// they spawn, so callers must set it before driving a turn.
+    /// An empty map means no overlay. Spawned sub-agents share this carrier,
+    /// so updates reach their subsequent tool calls too. Already spawned
+    /// processes keep their environment. Callers must keep edits between turns.
     pub fn set_session_env(&mut self, session_env: BTreeMap<String, String>) {
         self.session_state.set_session_env(session_env);
     }
@@ -2880,12 +2881,13 @@ impl TaskRegistry {
 #[derive(Clone)]
 pub(crate) struct SessionState {
     inner: Arc<StdMutex<SessionStateInner>>,
+    // Shared across the agent hierarchy without sharing per-agent bookkeeping.
+    session_env: Arc<StdMutex<BTreeMap<String, String>>>,
 }
 
 #[derive(Debug)]
 struct SessionStateInner {
     working_directory: PathBuf,
-    session_env: BTreeMap<String, String>,
     todo_list: Vec<TodoItem>,
     turn_counter: usize,
     accumulated_usage: Usage,
@@ -2898,13 +2900,13 @@ impl SessionState {
         Self {
             inner: Arc::new(StdMutex::new(SessionStateInner {
                 working_directory,
-                session_env: BTreeMap::new(),
                 todo_list: Vec::new(),
                 turn_counter: 0,
                 accumulated_usage: Usage::default(),
                 sub_agent_counter: 0,
                 sub_agent_usage: HashMap::new(),
             })),
+            session_env: Arc::new(StdMutex::new(BTreeMap::new())),
         }
     }
 
@@ -2917,11 +2919,14 @@ impl SessionState {
     }
 
     fn session_env(&self) -> BTreeMap<String, String> {
-        self.lock().session_env.clone()
+        self.session_env
+            .lock()
+            .expect("session env mutex poisoned")
+            .clone()
     }
 
     fn set_session_env(&self, session_env: BTreeMap<String, String>) {
-        self.lock().session_env = session_env;
+        *self.session_env.lock().expect("session env mutex poisoned") = session_env;
     }
 
     fn get_todo_list(&self) -> Vec<TodoItem> {
@@ -3603,7 +3608,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             sub_agent.set_block_images(self.block_images);
             // Tool subshells inherit the session overlay through the child's
             // own context rather than through its shared tool instances.
-            sub_agent.set_session_env(self.session_state.session_env());
+            sub_agent.session_state.session_env = Arc::clone(&self.session_state.session_env);
             // Sub-agents inherit the parent's thinking level so they
             // reason at the same effort and so a `None` default never
             // gets serialized as an explicit `disabled` for models

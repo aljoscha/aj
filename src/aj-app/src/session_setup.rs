@@ -633,7 +633,7 @@ pub struct PreparedLog {
     /// resume repaired the log's interrupted final write. It belongs to this
     /// open: a later open finds clean bytes and produces none.
     pub recovery_notice: Option<String>,
-    /// Immutable session environment from the explicit create or resumed log.
+    /// Initial overlay from creation or the resumed log's selected branch.
     /// `None` differs from a recorded empty map.
     pub session_env: Option<BTreeMap<String, String>>,
 }

@@ -168,7 +168,7 @@ pub struct Args {
     #[arg(long, global = true)]
     pub tag: Option<String>,
 
-    /// Add one fixed environment entry to sessions this invocation creates.
+    /// Add one initial environment entry to sessions this invocation creates.
     ///
     /// Repeatable and create-only. The first `=` separates key from value, so
     /// values may contain additional equals signs. Intentionally has no

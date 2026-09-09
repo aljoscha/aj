@@ -402,8 +402,9 @@ Client application rules:
 
 ### 5.6 Commands
 
-Commands are JSON POSTs. Effects are observable on the stream. Mutations
-against a specific session return 202 on acceptance. `POST /v1/sessions`
+Commands are JSON POSTs. Effects are observable on the stream or the
+corresponding read. Mutations against a specific session return 202 on
+acceptance. `POST /v1/sessions`
 returns 200 with the new session's id. Commands that act on "the viewed
 agent" locally take an optional `agent` field (default: the main agent).
 
@@ -416,6 +417,7 @@ agent" locally take an optional `agent` field (default: the main agent).
 | `.../{id}/queue` | `{op: "remove", agent?}` or `{op: "clear"}` | Withdraw one agent's pending message, or clear the session's queues. A withdrawal answers 200 `{text?}` with the text it took, which is what makes the dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index. A clear answers 202. |
 | `.../{id}/compact` | `{instructions?}` | Manual compaction. |
 | `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, optional `agent` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. A remote change never persists to the host's config files. |
+| `.../{id}/env` | `{key, value}` | Set one session environment value, including the empty string. Null or an absent `value` removes the key from the map, not from the inherited process environment. Idle-only: 409 `conflict` while a turn or background task is live. Validates before mutation and persists the full resulting active-branch map. Capability `session_env` (section 5.10). |
 | `.../{id}/tag` | `{tag}`, empty or absent clears | Set the session's tag (section 5.8): one trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
 | `.../{id}/archive` | `{archived: bool}`, absent reads false | Set or clear the archived bit (section 5.8). Materializes like any command, so a rival's lock refuses it. Nothing else refuses it: a session working through a turn takes it and goes on working. Capability `archive` (section 5.10). |
 | `.../{id}/head` | `{entry}` or `{before: <entry_id>}` | Switch the session head. 409 `conflict` while working or tasks live. Clears queues, new epoch, `reset` frame. `before` resolves the named entry to its parent server-side, atomically with the switch. An unknown entry is 404 `unknown_entry`, an entry with no parent is refused. Exactly one of the two fields. |
@@ -450,8 +452,8 @@ code.
   hosts?}`. Includes every session of the host's working directory,
   on-disk as well as live, with a liveness flag. Attaching or commanding
   a non-live session materializes it (lock permitting). A read never
-  does, with one exception: the tree read parses the log, so it
-  materializes like a command. This is the discovery surface, there is
+  does, except for the tree and environment reads, which parse the log
+  and materialize like a command. This is the discovery surface, there is
   no separate on-disk listing.
 - `GET /v1/sessions/{id}/tasks`: `{tasks: [{id, owner, call_id, kind,
   label, status, started_at}]}`, the background task table with
@@ -467,6 +469,11 @@ code.
   segment-collapsed branch tree for the tree view and head switching.
   `head` is the current head entry id, absent only while the log has no
   head, and not derivable from the segments.
+- `GET /v1/sessions/{id}/env`: a JSON object mapping strings to strings,
+  the full environment map selected by the active branch. Values are
+  unredacted on the trusted control port. Export-only redaction does not
+  apply. This reads the session overlay, not the host process environment.
+  Capability `session_env` (section 5.10).
 
 ### 5.8 Status model
 
@@ -593,6 +600,7 @@ Both ends of every connection are aj, but versions skew. Rules:
   | Capability | Covers | Advertised by |
   |---|---|---|
   | `archive` | `POST /v1/sessions/{id}/archive` | hosts |
+  | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
   | `compaction_usage` | the `compaction_usage_update` event, including its checkpoint entry id | hosts |
 
   A capability is self-description, never a gate: probing an endpoint
@@ -721,6 +729,20 @@ After creation the settings command mutates the axes, from any client,
 as peers, under the same strictness. Thinking display is an inference
 setting because it changes what the provider is asked to emit.
 
+The session environment overlay is separate from inference settings. Any
+client can read or edit it after creation through the environment routes
+(section 5.6 and 5.7). An edit changes only the session's active branch,
+never the host process environment or config files. Keys must be nonempty
+and contain neither `=` nor NUL, and values must not contain NUL. Unknown
+request fields are refused before mutation. Removal exposes any inherited
+process value rather than masking it. The environment read reports only
+entries remaining in the overlay.
+
+Remote launch/create environment input is not part of the creation wire
+contract. `CreateSessionRequest` and `SessionSettings` carry no environment
+map, and a client asked to send one on a remote create refuses rather than
+dropping it. Creation-wire support is separate scope.
+
 ## 8. Client TUI
 
 ### 8.1 Connect mode
@@ -750,7 +772,8 @@ that `--host` and `--tag` had nothing to point at.
 The boundary of what works over the wire is explicit. Supported: prompt,
 steer, cancel, queue withdraw and clear, settings including model switch
 and thinking display, compaction, task kill, the task-output overlay,
-tagging, archiving, the tree view and head switching, and session
+tagging, archiving, environment overlay reads and edits, the tree view and
+head switching, and session
 creation and switching. The prompt recall ring holds this run's own
 submissions only. The exit usage banner renders from the client's own
 event-derived accounting. Refused, each with a notice naming why: the
@@ -788,7 +811,8 @@ row. The promises the host relies on:
   attached rows as the only exemptions, behind an explicit reveal that
   is client state and never sent anywhere.
 - **Switching and creating are never refused because a turn is
-  running.** The one busy refusal is the host's head-switch 409.
+  running.** Head switching and environment editing are idle-only and can
+  return the host's 409.
 - **Creating through a multi-host gateway names the host explicitly**
   through a selector over the directory's hosts. A confirm that names no
   host creates nothing.

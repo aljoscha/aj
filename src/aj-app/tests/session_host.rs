@@ -895,9 +895,86 @@ async fn explicit_creation_applies_settings_before_its_first_prompt() {
 }
 
 #[tokio::test]
-async fn session_env_survives_root_head_switch_real_bash_and_host_restart() {
-    let harness = Harness::new(env_bash_turn("first-env"));
-    let env = BTreeMap::from([
+async fn environment_edits_validate_and_preserve_full_selected_map() {
+    let harness = Harness::new(vec![finalized_text_message("ready")]);
+    let session = harness.host.create().await.unwrap();
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "start").await;
+    client.pump_until_idle().await;
+
+    for (key, value) in [("A", Some("secret")), ("B", Some("")), ("A", None)] {
+        harness
+            .host
+            .command(
+                &session,
+                Command::Env {
+                    key: key.into(),
+                    value: value.map(str::to_string),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        harness.host.environment(&session).await.unwrap(),
+        BTreeMap::from([("B".into(), "".into())])
+    );
+    let frames = client.drain_into_fold();
+    let positions = durable(&frames);
+    assert_eq!(positions.len(), 3, "every edit has a durable notice");
+    assert!(positions.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert!(
+        !format!("{frames:?}").contains("secret"),
+        "live notices leaked a value"
+    );
+    let replay = Client::attach(&harness.host, &session).await;
+    assert!(
+        !format!("{:?}", replay.canonical()).contains("secret"),
+        "replay leaked a value"
+    );
+    assert_eq!(client.canonical(), replay.canonical());
+    let seq = handles.log.lock().await.last_seq();
+    for (key, value) in [("B", Some("")), ("missing", None)] {
+        harness
+            .host
+            .command(
+                &session,
+                Command::Env {
+                    key: key.into(),
+                    value: value.map(str::to_string),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    for (key, value) in [("", None), ("A=B", None), ("A", Some("bad\0value"))] {
+        assert!(matches!(
+            harness
+                .host
+                .command(
+                    &session,
+                    Command::Env {
+                        key: key.into(),
+                        value: value.map(str::to_string),
+                    }
+                )
+                .await,
+            Err(HostError::Invalid(_))
+        ));
+    }
+    assert_eq!(handles.log.lock().await.last_seq(), seq);
+    assert_eq!(
+        harness.host.environment(&session).await.unwrap(),
+        BTreeMap::from([("B".into(), "".into())])
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_env_edits_follow_branches_in_real_bash_and_after_restart() {
+    let harness = Harness::new([env_bash_turn("first-env"), env_bash_turn("root-env")].concat());
+    let mut env = BTreeMap::from([
         ("BEADS_ACTOR".to_string(), "session-actor".to_string()),
         ("AJ_CASE".to_string(), "upper".to_string()),
         ("aj_case".to_string(), "lower".to_string()),
@@ -944,16 +1021,15 @@ async fn session_env_survives_root_head_switch_real_bash_and_host_restart() {
         .host
         .command(
             &session,
-            Command::Head {
-                target: HeadTarget::Entry(root.clone()),
+            Command::Env {
+                key: "BEADS_ACTOR".into(),
+                value: Some("edited-actor".into()),
             },
         )
         .await
-        .expect("the system-prompt root remains a legal head");
-    assert!(
-        !canonical.exists(),
-        "head switching flushed seed-only identity"
-    );
+        .expect("edit env");
+    env.insert("BEADS_ACTOR".into(), "edited-actor".into());
+    let edited_head = handles.log.lock().await.head().cloned().unwrap();
 
     let mut client = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "check identity").await;
@@ -962,30 +1038,59 @@ async fn session_env_survives_root_head_switch_real_bash_and_host_restart() {
     assert!(
         main_tool_content(&first, "first-env")
             .to_string()
-            .contains("actor=session-actor case=upper/lower fixed=aj"),
+            .contains("actor=edited-actor case=upper/lower fixed=aj"),
         "the real Bash child did not observe exact session layering: {first:?}"
     );
-    {
-        let log = handles.log.lock().await;
-        assert_eq!(log.session_env(), Some(&env));
-        let first_user = log
-            .entries_in_order()
-            .into_iter()
-            .find(|entry| {
-                matches!(
-                    &entry.entry,
-                    aj_session::ConversationEntryKind::Message { message }
-                        if matches!(message.as_stored_wire(), Some(aj_models::types::Message::User(_)))
-                )
-            })
-            .expect("first user message on root branch");
-        assert_eq!(
-            first_user.parent_id.as_ref(),
-            Some(&root),
-            "the fixture's active branch did not omit every inference-setting seed"
-        );
-    }
-    drop((client, handles));
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(root),
+            },
+        )
+        .await
+        .expect("root switch");
+    assert!(harness.host.environment(&session).await.unwrap().is_empty());
+    let mut root_client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "check root").await;
+    root_client.pump_until_idle().await;
+    let inherited = format!(
+        "actor={} case={}/{} fixed=aj",
+        std::env::var("BEADS_ACTOR").unwrap_or_default(),
+        std::env::var("AJ_CASE").unwrap_or_default(),
+        std::env::var("aj_case").unwrap_or_default()
+    );
+    assert!(
+        main_tool_content(&root_client.canonical(), "root-env")
+            .to_string()
+            .contains(&inherited)
+    );
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(edited_head),
+            },
+        )
+        .await
+        .expect("restore edited branch");
+    assert_eq!(harness.host.environment(&session).await.unwrap(), env);
+    // Resume selects the latest appended user leaf, not an in-memory head pick.
+    harness
+        .host
+        .command(
+            &session,
+            Command::Env {
+                key: "AJ_CASE".into(),
+                value: Some("reselected".into()),
+            },
+        )
+        .await
+        .expect("edit on selected branch");
+    env.insert("AJ_CASE".into(), "reselected".into());
+    drop((root_client, client, handles));
     harness.host.shutdown().await;
 
     let revived = harness.revive(env_bash_turn("revived-env"));
@@ -996,7 +1101,7 @@ async fn session_env_survives_root_head_switch_real_bash_and_host_restart() {
     assert!(
         main_tool_content(&after_restart, "revived-env")
             .to_string()
-            .contains("actor=session-actor case=upper/lower fixed=aj"),
+            .contains("actor=edited-actor case=reselected/lower fixed=aj"),
         "materialization did not restore log-level session identity: {after_restart:?}"
     );
     let handles = revived
@@ -2465,6 +2570,37 @@ async fn a_head_switch_replaces_the_epoch_and_resets_the_stream() {
 /// wrong branch.
 #[tokio::test]
 async fn a_head_switch_is_refused_while_work_is_live() {
+    async fn assert_env_edit_refused(harness: &Harness, session: &str) {
+        let handles = harness.host.local_handles(session).await.unwrap();
+        let env_entries = |log: &aj_session::ConversationLog| {
+            log.entries_in_order()
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.entry,
+                        aj_session::ConversationEntryKind::EnvChange { .. }
+                    )
+                })
+                .count()
+        };
+        let before = env_entries(&*handles.log.lock().await);
+        assert!(matches!(
+            harness
+                .host
+                .command(
+                    session,
+                    Command::Env {
+                        key: "BUSY_EDIT".into(),
+                        value: Some("not installed".into()),
+                    }
+                )
+                .await,
+            Err(HostError::Conflict { .. })
+        ));
+        assert_eq!(env_entries(&*handles.log.lock().await), before);
+        assert!(harness.host.environment(session).await.unwrap().is_empty());
+    }
+
     // A slow-streaming turn, so the switch lands mid-turn.
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message("a fairly long answer to stream")],
@@ -2486,6 +2622,8 @@ async fn a_head_switch_is_refused_while_work_is_live() {
         .await
         .expect_err("a mid-turn head switch is refused");
     assert!(matches!(err, HostError::Conflict { .. }), "got {err:?}");
+    assert_env_edit_refused(&harness, &session).await;
+
     stream.pump_until_idle().await;
 
     // Now with a live background task instead of a turn.
@@ -2527,6 +2665,8 @@ async fn a_head_switch_is_refused_while_work_is_live() {
         .await
         .expect_err("a head switch with live background work is refused");
     assert!(matches!(err, HostError::Conflict { .. }), "got {err:?}");
+    assert_env_edit_refused(&harness, &session).await;
+
     harness.host.shutdown().await;
 }
 

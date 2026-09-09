@@ -13,14 +13,15 @@
 //! ([`aj_app::client::SessionClient`]), which is what keeps the local and the
 //! remote client one implementation.
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
 
 use aj_agent::tool::TaskId;
 use aj_app::host::{AttachRequest, CommandOutcome};
 use aj_wire::{
-    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, DecodedFrame, Frame,
-    HeadRequest, Hello, PROTOCOL_VERSION, PromptRequest, QueueOperation, QueueOutcome,
+    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, DecodedFrame, EnvRequest,
+    Frame, HeadRequest, Hello, PROTOCOL_VERSION, PromptRequest, QueueOperation, QueueOutcome,
     QueueRequest, QueueState, SessionCreated, SessionList, SessionTree, SettingsRequest,
     SteerRequest, TagRequest, TaskDetails, TaskTable,
 };
@@ -122,6 +123,7 @@ pub(crate) enum RemoteCommand {
     Queue(QueueRequest),
     Compact(CompactRequest),
     Settings(SettingsRequest),
+    Env(EnvRequest),
     Tag(TagRequest),
     Archive(ArchiveRequest),
     Head(HeadRequest),
@@ -137,6 +139,7 @@ impl RemoteCommand {
             Self::Cancel(_) => "cancel".to_string(),
             Self::Queue(_) => "queue".to_string(),
             Self::Compact(_) => "compact".to_string(),
+            Self::Env(_) => "env".to_string(),
             Self::Settings(_) => "settings".to_string(),
             Self::Tag(_) => "tag".to_string(),
             Self::Archive(_) => "archive".to_string(),
@@ -152,6 +155,7 @@ impl RemoteCommand {
             Self::Cancel(request) => encode(request),
             Self::Queue(request) => encode(request),
             Self::Compact(request) => encode(request),
+            Self::Env(request) => encode(request),
             Self::Settings(request) => encode(request),
             Self::Tag(request) => encode(request),
             Self::Archive(request) => encode(request),
@@ -268,6 +272,13 @@ impl RemoteClient {
 
     pub(crate) async fn queue(&self, session: &str) -> Result<QueueState, RemoteError> {
         self.get(&format!("/v1/sessions/{session}/queue")).await
+    }
+
+    pub(crate) async fn environment(
+        &self,
+        session: &str,
+    ) -> Result<BTreeMap<String, String>, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/env")).await
     }
 
     pub(crate) async fn tree(&self, session: &str) -> Result<SessionTree, RemoteError> {

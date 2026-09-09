@@ -95,6 +95,8 @@ pub(crate) enum SelectorActivity {
     SettingClear { id: String, inherited: String },
     /// A skills-window toggle: enable or disable `name` for new sessions.
     SkillToggle { name: String, disable: bool },
+    /// A confirmed field edit in the session environment window.
+    EnvironmentEdit(crate::session_env::EnvEdit),
 }
 
 /// Handles the drive loop keeps for a live settings window: the row list
@@ -551,8 +553,9 @@ pub(crate) struct SettingList {
     pub(crate) on_change: Option<Box<dyn FnMut(&mut EventContext, &str, &str)>>,
     /// Fires on Enter over a [`RowKind::Submenu`] row with `(id, value)`.
     pub(crate) on_open: Option<Box<dyn FnMut(&mut EventContext, &str, &str)>>,
-    /// Fires on the clear chord over a project override with `(id,
-    /// inherited_value)`. The widget has already reverted the row's display.
+    /// Fires on the clear chord with `(id, inherited_value)`. In project mode
+    /// the widget first reverts the override's display. Other lists own the
+    /// clear's meaning and update their rows after the host accepts it.
     pub(crate) on_clear: Option<Box<dyn FnMut(&mut EventContext, &str, &str)>>,
     /// Fires on Escape.
     pub(crate) on_close: Option<Box<dyn FnMut(&mut EventContext)>>,
@@ -897,17 +900,14 @@ impl Widget for SettingList {
             ctx.consume_and_redraw();
             return;
         }
-        // The clear chord is overlay-local: matched here at-target
-        // rather than by the global keymap, and only in project mode over an
-        // actual override.
-        if self.project_mode && action_matches(key, ACTION_SETTINGS_CLEAR) {
-            if self.selected_is_override()
+        if self.on_clear.is_some() && action_matches(key, ACTION_SETTINGS_CLEAR) {
+            if (!self.project_mode || self.selected_is_override())
                 && let Some(sel) = self.selected()
             {
-                // Revert the row optimistically (value + muted marker) so the
-                // window never shows an override the host is about to drop.
-                self.set_value(&sel.id, &sel.clear_to);
-                self.set_inherited(&sel.id, true);
+                if self.project_mode {
+                    self.set_value(&sel.id, &sel.clear_to);
+                    self.set_inherited(&sel.id, true);
+                }
                 if let Some(cb) = self.on_clear.as_mut() {
                     cb(ctx, &sel.id, &sel.clear_to);
                 }
@@ -997,6 +997,15 @@ impl TextEditOverlay {
         self.field.borrow_mut().on_submit = Some(Box::new(move |ctx, text| {
             on_submit(ctx, text.trim());
         }));
+    }
+
+    /// Install a submit handler that preserves significant leading and trailing
+    /// whitespace and retains the draft on submit, for fields whose values can
+    /// be refused by validation rather than closing the editor.
+    pub(crate) fn set_on_submit_raw(&self, on_submit: Box<dyn FnMut(&mut EventContext, &str)>) {
+        let mut field = self.field.borrow_mut();
+        field.clear_on_submit = false;
+        field.on_submit = Some(on_submit);
     }
 }
 
@@ -1373,15 +1382,17 @@ pub(crate) fn open_settings(
             );
         }));
         // Project clears: the widget already reverted the row.
-        let activity_clear = Rc::clone(activity);
-        l.on_clear = Some(Box::new(move |_ctx, id, inherited_value| {
-            activity_clear
-                .borrow_mut()
-                .push(SelectorActivity::SettingClear {
-                    id: id.to_string(),
-                    inherited: inherited_value.to_string(),
-                });
-        }));
+        if project_mode {
+            let activity_clear = Rc::clone(activity);
+            l.on_clear = Some(Box::new(move |_ctx, id, inherited_value| {
+                activity_clear
+                    .borrow_mut()
+                    .push(SelectorActivity::SettingClear {
+                        id: id.to_string(),
+                        inherited: inherited_value.to_string(),
+                    });
+            }));
+        }
         // Esc closes and releases the host's live handles.
         let stack_close = Rc::clone(stack);
         let editor_close = Rc::clone(editor);
@@ -2017,14 +2028,39 @@ mod tests {
 
     #[test]
     fn user_window_ignores_the_clear_chord() {
-        let mut list = SettingList::new(vec![cycle_row("theme", "dark")], styles(), false);
-        let fired = Rc::new(RefCell::new(false));
-        let fired_c = Rc::clone(&fired);
-        list.on_clear = Some(Box::new(move |_ctx, _id, _v| *fired_c.borrow_mut() = true));
-        send(&mut list, &key(u32::from('x'), Modifiers::CTRL));
+        let handles = crate::interactive::OverlayHandles::for_tests();
+        let config = Config::default();
+        open_settings(
+            &handles.stack,
+            &handles.editor,
+            &handles.chrome,
+            &handles.activity,
+            &handles.settings_ui,
+            ConfigTarget::User,
+            SettingsValues::from_config(&config, &[]),
+            SettingsValues::from_config(&config, &[]),
+            BTreeSet::new(),
+            SettingsCatalogs {
+                models: Arc::new(Vec::new()),
+                themes: Vec::new(),
+                tools: Vec::new(),
+                skills: Vec::new(),
+            },
+        );
+        let ui = handles.settings_ui.borrow();
+        let list = &ui.as_ref().expect("the user window opened").list;
+        let before = list.borrow().selected().expect("selected setting").value;
+        send(
+            &mut list.borrow_mut(),
+            &key(u32::from('x'), Modifiers::CTRL),
+        );
         assert!(
-            !*fired.borrow(),
-            "the clear chord is inert outside project mode"
+            handles.activity.borrow().is_empty(),
+            "the user window must not request a project clear"
+        );
+        assert_eq!(
+            list.borrow().selected().expect("selected setting").value,
+            before
         );
     }
 

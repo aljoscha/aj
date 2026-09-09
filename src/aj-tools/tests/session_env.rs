@@ -239,7 +239,7 @@ async fn spawned_sub_agents_bash_child_inherits_the_parent_session_env() {
     assert_host_env_absent(KEY);
     let dir = TempDir::new().expect("tempdir");
     let command = format!(r#"printf '%s\n' "${{{KEY}-<unset>}}""#);
-    let scripts = vec![
+    let mut scripts = vec![
         tool_call(
             "parent-agent",
             "agent",
@@ -262,6 +262,8 @@ async fn spawned_sub_agents_bash_child_inherits_the_parent_session_env() {
         text("child done"),
         text("parent done"),
     ];
+    scripts.extend(bash_turn(&command, false));
+    let registry = aj_agent::SubAgentRegistry::default();
     let mut agent = agent_with(
         dir.path(),
         vec![
@@ -270,6 +272,7 @@ async fn spawned_sub_agents_bash_child_inherits_the_parent_session_env() {
         ],
         scripts,
     );
+    agent.set_sub_agent_registry(registry.clone());
     agent.set_session_env(BTreeMap::from([(
         KEY.to_string(),
         "parent-session".to_string(),
@@ -284,7 +287,21 @@ async fn spawned_sub_agents_bash_child_inherits_the_parent_session_env() {
     assert_eq!(
         only_output(&outputs, AgentId::Sub(1), "bash"),
         "parent-session\n",
-        "the real spawn path must copy the parent overlay onto the child's context"
+        "the real spawn path must share the parent overlay onto the child's context"
+    );
+    outputs.lock().unwrap().clear();
+    agent.set_session_env(BTreeMap::from([(KEY.into(), "edited-parent".into())]));
+    registry
+        .get(1)
+        .expect("parked child")
+        .lock()
+        .await
+        .prompt("read again".into(), CancellationToken::new())
+        .await
+        .expect("child continuation");
+    assert_eq!(
+        only_output(&outputs, AgentId::Sub(1), "bash"),
+        "edited-parent\n"
     );
 }
 

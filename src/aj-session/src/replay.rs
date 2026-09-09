@@ -56,8 +56,8 @@
 //!   resumed scrollback while keeping seed entries (session
 //!   creation) silent — they never produced a visible notice live
 //!   either.
-//! - [`ConversationEntryKind::EnvChange`]: no event. It is immutable
-//!   log-level creation metadata, not a state transition on any thread.
+//! - [`ConversationEntryKind::EnvChange`]: a keys-only, ASCII-escaped state
+//!   notice after a user message. Seeds and legacy Meta records stay silent.
 //! - [`ConversationEntryKind::Context`]: one [`AgentEvent::Notice`] on the
 //!   main agent, the `Context:` listing that opens the session's
 //!   scrollback, rendered by [`crate::log::SessionContext::notice`].
@@ -432,8 +432,8 @@ fn included_entries(log: &LogSnapshot) -> Option<HashSet<String>> {
     // ancestor on the main path, and leak the abandoned branch.
     //
     // A meta entry hanging off the root is creation metadata about the whole
-    // session (its environment, its context), a sibling of the first message
-    // rather than an ancestor of anything, and belongs to every branch.
+    // session (its legacy environment baseline, its context). It is a sibling
+    // of the first message rather than an ancestor, and belongs to every branch.
     for index in 0..log.len() {
         let Some(entry) = log.entry_in_append_order(index) else {
             continue;
@@ -927,9 +927,14 @@ impl ReplayState {
                     out,
                 );
             }
-            // Immutable creation metadata, read at the session boundary rather
-            // than announced as a branch-local state transition.
-            ConversationEntryKind::EnvChange { .. } => {}
+            ConversationEntryKind::EnvChange { env } => {
+                let keys = env
+                    .keys()
+                    .map(|key| format!("\"{}\"", key.escape_default()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.state_notice(agent_id, at, format!("Environment set to [{keys}]."), out);
+            }
             ConversationEntryKind::Context { .. } => {
                 unreachable!("a context entry is projected before the thread is read")
             }
@@ -2903,6 +2908,70 @@ mod tests {
                 "env value {value:?} leaked into the replay event stream: {stream}"
             );
         }
+    }
+
+    #[test]
+    fn replay_env_edits_emit_only_ascii_escaped_keys_and_match_state_projection() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        let root = log.set_system_prompt("p".into()).expect("root");
+        let legacy = log
+            .append(
+                Some(root.id),
+                ThreadKind::Meta,
+                None,
+                ConversationEntryKind::EnvChange {
+                    env: BTreeMap::from([("LEGACY".into(), "legacy-secret".into())]),
+                },
+            )
+            .expect("legacy baseline");
+        let seed = log.append_env_change(BTreeMap::new()).expect("seed");
+        ConversationView::user(&mut log)
+            .add_message(user_msg("hi"))
+            .expect("publish");
+        let edit = log
+            .append_env_change(BTreeMap::from([(
+                "KEY\n\x1b\"é".into(),
+                "edit-secret".into(),
+            )]))
+            .expect("edit");
+        let clear = log.append_env_change(BTreeMap::new()).expect("clear");
+        log.flush_pending().expect("flush");
+        let resumed = ConversationLog::resume(&persistence, log.session_id()).expect("resume");
+        let snapshot = resumed.snapshot();
+        assert!(snapshot.project_state_entry(&legacy.id).is_none());
+        assert!(snapshot.project_state_entry(&seed.id).is_none());
+        let events: Vec<_> = replay(&resumed).collect();
+        let notices: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                r#"Environment set to ["KEY\n\u{1b}\"\u{e9}"]."#,
+                "Environment set to []."
+            ]
+        );
+        assert!(
+            notices
+                .iter()
+                .all(|text| text.is_ascii() && !text.contains('\n') && !text.contains('\x1b'))
+        );
+        for (entry, expected) in [(edit, notices[0]), (clear, notices[1])] {
+            let Some(AgentEvent::Notice { text, .. }) = snapshot.project_state_entry(&entry.id)
+            else {
+                panic!("edit must project a notice");
+            };
+            assert_eq!(text, expected);
+        }
+        let stream = serde_json::to_string(&events).unwrap();
+        assert!(!stream.contains("legacy-secret"));
+        assert!(!stream.contains("edit-secret"));
     }
 
     /// A settings entry recorded after a message on the same thread

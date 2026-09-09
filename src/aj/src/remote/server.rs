@@ -30,9 +30,9 @@ use aj_models::{speed_from_name, thinking_config_from_name};
 use aj_session::normalize_tag;
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, EmptyRequest,
-    ErrorResponse, Frame, HeadRequest, PromptRequest, QueueOperation, QueueOutcome, QueueRequest,
-    RequestBody, SessionCreated, SessionSettings, SettingsRequest, SteerRequest, TagRequest,
-    decode_request,
+    EnvRequest, ErrorResponse, Frame, HeadRequest, PromptRequest, QueueOperation, QueueOutcome,
+    QueueRequest, RequestBody, SessionCreated, SessionSettings, SettingsRequest, SteerRequest,
+    TagRequest, decode_request,
 };
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
@@ -193,9 +193,9 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/tasks", get(tasks))
         .route("/v1/sessions/{id}/tasks/{task_id}", get(task))
         .route("/v1/sessions/{id}/tasks/{task_id}/kill", post(kill_task))
-        // The one path that is both a read and a mutation.
         .route("/v1/sessions/{id}/queue", get(queue).post(queue_command))
         .route("/v1/sessions/{id}/tree", get(tree))
+        .route("/v1/sessions/{id}/env", get(environment).post(env_command))
         .route("/v1/sessions/{id}/prompt", post(prompt))
         .route("/v1/sessions/{id}/steer", post(steer))
         .route("/v1/sessions/{id}/cancel", post(cancel))
@@ -340,6 +340,32 @@ async fn queue_command(
         CommandOutcome::Withdrawn(text) => Ok(Json(QueueOutcome { text }).into_response()),
         CommandOutcome::Accepted => Ok(StatusCode::ACCEPTED.into_response()),
     }
+}
+
+async fn environment(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(state.host.environment(&session).await?).into_response())
+}
+
+async fn env_command(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(request): Body<EnvRequest>,
+) -> Result<Response, ApiError> {
+    accepted(
+        state
+            .host
+            .command(
+                &session,
+                Command::Env {
+                    key: request.key,
+                    value: request.value,
+                },
+            )
+            .await?,
+    )
 }
 
 async fn tree(

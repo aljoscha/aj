@@ -7232,3 +7232,35 @@ async fn a_command_is_refused_before_reaching_a_host_with_no_link() {
     fixture.shutdown().await;
     recorder.stop();
 }
+
+#[tokio::test]
+async fn environment_reads_and_edits_cross_the_gateway() {
+    let mut host = Upstream::start().await;
+    let session = host.create().await;
+    let fixture = Fixture::new(&[&host]).await;
+    let id = host.namespaced(&session);
+    fixture.row(&id).await;
+    let control =
+        crate::control::Control::remote(RemoteClient::new(&fixture.server.url()).unwrap());
+    assert!(control.environment(&id).await.unwrap().is_empty());
+    for value in [Some("full-secret".to_string()), Some(String::new()), None] {
+        control
+            .command(
+                &id,
+                Command::Env {
+                    key: "TOKEN".to_string(),
+                    value: value.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let expected: BTreeMap<_, _> = value
+            .into_iter()
+            .map(|value| ("TOKEN".to_string(), value))
+            .collect();
+        assert_eq!(control.environment(&id).await.unwrap(), expected);
+        assert_eq!(host.host.environment(&session).await.unwrap(), expected);
+    }
+    fixture.shutdown().await;
+    host.stop().await;
+}

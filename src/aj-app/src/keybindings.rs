@@ -427,7 +427,7 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
     (
         ACTION_SETTINGS_CLEAR,
         "ctrl+x",
-        "Clear the selected project override",
+        "Clear the selected project override or environment variable",
     ),
     (
         ACTION_USAGE_RESET,

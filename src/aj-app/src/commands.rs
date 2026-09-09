@@ -151,6 +151,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::OpenSessionTag,
     },
     Command {
+        name: "env",
+        title: "environment",
+        category: "session",
+        description: "Add, edit, or remove environment variables on this branch.",
+        action_id: None,
+        action: CommandAction::OpenSessionEnv,
+    },
+    Command {
         name: "archive",
         title: "archive",
         category: "session",
@@ -315,6 +323,8 @@ pub enum CommandAction {
     /// (an empty submission clears it), `Esc` cancels. A label the
     /// store would refuse is reported and changes nothing.
     OpenSessionTag,
+    /// Open the current branch's environment as editable settings rows.
+    OpenSessionEnv,
     /// Archive the focused session, or unarchive one that is archived.
     ///
     /// Display metadata only: the log, the lock and any turn in flight are

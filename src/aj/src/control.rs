@@ -28,10 +28,10 @@ use aj_app::session_setup::thinking_display_name;
 use aj_models::types::UserContent;
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{
-    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Frame, HeadRequest,
-    ModelSelection, PromptInput, PromptRequest, QueueOperation, QueueRequest, QueueState,
-    SessionList, SessionSettings, SessionTree, SettingsRequest, SteerRequest, TagRequest,
-    TaskDetails, TaskTable,
+    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, EnvRequest, Frame,
+    HeadRequest, ModelSelection, PromptInput, PromptRequest, QueueOperation, QueueRequest,
+    QueueState, SessionList, SessionSettings, SessionTree, SettingsRequest, SteerRequest,
+    TagRequest, TaskDetails, TaskTable,
 };
 use futures::FutureExt;
 use reqwest::StatusCode;
@@ -228,6 +228,17 @@ impl Control {
         }
     }
 
+    /// The full active-branch environment map, materializing the session if needed.
+    pub(crate) async fn environment(
+        &self,
+        session: &str,
+    ) -> Result<BTreeMap<String, String>, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.environment(session).await?),
+            Self::Remote(remote) => Ok(remote.client.environment(session).await?),
+        }
+    }
+
     pub(crate) async fn tasks(&self, session: &str) -> Result<TaskTable, ControlError> {
         match self {
             Self::Local(local) => Ok(local.host.tasks(session).await?),
@@ -380,6 +391,7 @@ fn wire_command(command: Command) -> RemoteCommand {
         Command::Compact { instructions } => {
             RemoteCommand::Compact(CompactRequest { instructions })
         }
+        Command::Env { key, value } => RemoteCommand::Env(EnvRequest { key, value }),
         Command::Settings(change) => RemoteCommand::Settings(settings_request(change)),
         // A cleared tag travels as the empty string, which is what the route
         // reads as "clear".

@@ -81,6 +81,7 @@ mod remote;
 mod scroll;
 mod selection_copied;
 mod serve;
+mod session_env;
 mod session_selector;
 mod session_tag;
 mod session_tree;

@@ -121,7 +121,7 @@ pub struct SessionStats {
     /// Model, thinking, speed, and verbosity currently recorded on the user
     /// thread.
     pub settings: SessionSettings,
-    /// Immutable log-level creation environment. `None` differs from a
+    /// Complete environment on the active user branch. `None` differs from a
     /// recorded empty map.
     pub session_env: Option<BTreeMap<String, String>>,
 }
@@ -379,18 +379,21 @@ mod tests {
     }
 
     #[test]
-    fn stats_reads_session_env_outside_branch_settings() {
+    fn stats_reads_session_env_from_active_branch() {
         let dir = tempfile::tempdir().unwrap();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).unwrap();
         let expected = BTreeMap::from([("BEADS_ACTOR".to_string(), "session-actor".to_string())]);
         let root = log.set_system_prompt("p".into()).expect("root");
-        log.append_env_change(expected.clone()).expect("env");
+        let env = log.append_env_change(expected.clone()).expect("env");
+        assert_eq!(log.stats().session_env, Some(expected.clone()));
         log.set_head(root.id).expect("root head");
 
         let stats = log.stats();
         assert_eq!(stats.settings, SessionSettings::default());
-        assert_eq!(stats.session_env, Some(expected));
+        assert_eq!(stats.session_env, None);
+        log.set_head(env.id).expect("env head");
+        assert_eq!(log.stats().session_env, Some(expected));
     }
 
     /// Build an assistant message carrying explicit token usage and a

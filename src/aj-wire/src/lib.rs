@@ -33,6 +33,9 @@ pub const ARCHIVE_CAPABILITY: &str = "archive";
 /// unknown event instead of folding it as assistant-turn context.
 pub const COMPACTION_USAGE_CAPABILITY: &str = "compaction_usage";
 
+/// The capability for reading and editing a session's active-branch environment.
+pub const SESSION_ENV_CAPABILITY: &str = "session_env";
+
 /// A creator-selected model, resolved against the receiving host's catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSelection {
@@ -212,6 +215,15 @@ impl HeadRequest {
     }
 }
 
+/// Sets one session environment value, or removes the key when `value` is null.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvRequest {
+    pub key: String,
+    /// Empty strings are values. Null or an absent field removes the key.
+    pub value: Option<String>,
+}
+
 /// Sets or clears a session's tag.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TagRequest {
@@ -274,8 +286,8 @@ impl std::error::Error for RequestDecodeError {
 /// rejection.
 ///
 /// An absent or ASCII-whitespace-only body reads as `{}`. Each request has a
-/// private strict representation, including request-only views of shared nested
-/// models, so decoding the same shared model as an observation remains tolerant.
+/// closed schema, with private request-only views of shared nested models, so
+/// decoding the same shared model as an observation remains tolerant.
 pub fn decode_request<T>(body: &[u8]) -> Result<T, RequestDecodeError>
 where
     T: RequestBody,
@@ -993,6 +1005,8 @@ mod request {
             before: request.before,
         }
     );
+
+    request_body!(EnvRequest, EnvRequest, |request| request);
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]

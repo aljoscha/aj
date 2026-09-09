@@ -1,444 +1,158 @@
-# Session-scoped environment
+# Session environment
 
-## Motivation
+## User experience
 
-A session's tool subshells inherit the host process environment, so
-anything identity-like (`BEADS_ACTOR` for the workshop's bench model)
-must live in the `aj serve` process, which dedicates the host to one
-identity and leaks it across every session the host serves. This spec
-gives each session its own environment map, stated at creation,
-persisted in the session log, restored on resume and materialize, and
-overlaid on tool subshells. Identity rides the session instead of the
-process.
+A session environment is an overlay on the environment inherited by its tool
+processes. It can be supplied at creation and deliberately edited afterwards.
+The overlay belongs to the current conversation branch, like recorded inference
+settings. It is not an installation-wide default or an immutable identity.
 
-Create-only in v1: no mutation surface and no settings-command axis.
-A session's env is fixed at birth and outlives host restarts.
+The `env` command in the command palette opens **Session environment**, using
+the settings window's filterable key/value rows:
 
-## 1. Semantics
+- Enter on a variable opens its value editor. Enter confirms the edit and
+  returns to the list. Escape cancels the field edit.
+- **Add variable** asks for a name and then a value. An existing name must be
+  edited through its row rather than accidentally replaced by an add.
+- The settings clear binding (Ctrl+X by default) removes the selected variable.
+  Saving an empty value keeps the variable with an empty value.
+- Confirmed edits apply individually. The list remains open and changes only
+  after the host accepts an edit. A refusal is shown without claiming success.
+- Escape closes the list. There is no whole-document save, configuration write,
+  or implicit environment change from opening the window.
 
-The session env is a map of environment variable names to values.
+The one-line field editors use JSON string escapes without enclosing quotes.
+Ordinary text and spaces are literal. A newline is `\n`, a tab is `\t`, a
+backslash is `\\`, and a quote is `\"`. Existing non-ASCII text is displayed
+as Unicode escapes. Encoding is lossless, including leading/trailing spaces,
+carriage returns, multiline values, and supplementary Unicode characters.
+Invalid escapes or invalid environment entries leave the field open to correct.
 
-**The identity invariant.** A session's env is exactly what its
-create was explicitly given, or what its own log records. It is never
-inherited from a host's process environment, base run config, or
-config file. This is enforced at one place: env is an explicit
-parameter of session creation, not a defaulting axis of
-`RunConfigSnapshot` / `base_run_config`. The invariant is what makes
-the feature safe on shared hosts: interactive runs embed a server
-under `--listen`, and a launch env that rode the host's base config
-would stamp the launcher's identity onto sessions remote peers
-create.
+Local and connected sessions use the same editor through `Control`. A host that
+does not serve the environment endpoint produces a notice rather than an empty
+editable map. The environment and its values are available over the trusted
+control connection. HTML export is a separate artifact boundary and redacts
+values.
 
-**Log scope.** Session env is immutable log-level creation metadata,
-not user-thread or branch state. Selecting, reconstructing, or
-switching a conversation head cannot select, replace, or clear it.
-Every branch of an env-bearing session executes with the same map,
-including one rooted directly at the system prompt before any
-inference-setting entry. In v1 only creation records the map.
+## Branch and execution semantics
 
-Consequences, each ruled below:
+Each `EnvChange` states the complete resulting map. The last record on the
+selected user-thread ancestry wins, without merging earlier maps. An empty map
+clears all session overrides. Absence of a record means no overlay.
 
-- A parked session re-materialized after the bench changed occupants
-  keeps *its* recorded env, never the new occupant's.
-- A resume of a session whose log records no env runs with no env,
-  even when the resuming invocation stated `--env`. Stamping the
-  resumer's identity onto an old session is the misattribution this
-  feature removes. Such a run says so instead of silently dropping
-  the flag (section 5).
-- `aj serve` and `aj gateway` refuse `--env` at startup: by the
-  invariant there is no path from a serve process to a session's env,
-  so accepting the flag would be a lie in the grammar.
-- Per-session env never appears in `config.toml` (brief non-goal): a
-  config default would stamp one identity onto every session, the
-  process-env failure mode with extra steps.
+A branch inherits the map at the point it forks. Changes made afterwards on one
+branch do not change its siblings. Selecting an earlier head, including the
+system-prompt root before the environment seed, restores the map at that point.
+Compaction does not remove state records from the ancestry used for extraction.
+Resuming or materializing the log restores the environment of the selected
+branch, not the launching process's `--env` values. Head selection follows the
+session log's existing persistence rules.
 
-**Layering.** In a tool subshell, the session env is applied above
-the inherited host process environment (which already includes the
-`~/.aj/.env` and project `.env` loads, `src/aj/src/main.rs:104-111`)
-and below the tool's fixed determinism overrides (`TERM=dumb`,
-`NO_COLOR=1`, `AGENT=aj`, ..., `bash.rs`). A session env entry
-shadows a host process variable of the same name. A session env entry
-named like a fixed override loses to it inside tool subshells, by
-design and without a refusal: the overrides exist so captured output
-stays parseable, and that is not the creator's to break. No key is
-reserved or rejected on collision grounds.
+Edits are refused while agents or background commands are running, using the
+same idle requirement as head switching. An accepted edit installs the map for
+subsequent tool invocations by the main agent and its sub-agents, including
+parked sub-agents used again. Separate sessions do not share the map. No edit
+can change the environment of a process that has already been spawned.
 
-**Extent.** The overlay applies to tool subshells: the bash tool's
-child, foreground and background alike (one build site serves both,
-`BashTool::execute` builds and spawns before the background branch),
-and the same subshells run by sub-agents. Host-side helper processes
-(the `rtk` formatter, `pgrep` liveness probes) are not tool subshells
-and keep plain process inheritance. The frozen system prompt's
-`<env>` block (`AgentEnv`, workspace context) is unrelated to this
-map and unchanged, and the name collision is noted here so nobody
-wires one into the other.
+Layering in a tool child is:
 
-**Validation.** Syntactic only, at the boundary that accepts the map
-(host create handler, CLI flag parse): a key must be non-empty and
-contain neither `=` nor NUL, a value must not contain NUL. A create
-carrying an invalid map is refused before a log exists with an error
-naming the offending key, per the existing rule that a refused create
-leaves nothing behind. Values are otherwise arbitrary, keys are
-case-sensitive, and an empty map is valid (applied trivially,
-recorded, echoed).
+1. Inherited host-process environment, including loaded `.env` files.
+2. The selected branch's session map.
+3. The tool's fixed determinism overrides, such as `TERM=dumb`, `NO_COLOR=1`,
+   and `AGENT=aj`.
 
-## 2. Wire
+Removing a session key exposes any inherited value. It is not an instruction to
+unset a host-process variable. Collisions with fixed overrides are allowed but
+those overrides win. Host-side helpers such as the `rtk` formatter keep their
+host-owned environment. The frozen system prompt's workspace `<env>` block is
+unrelated to this map.
 
-### 2.1 Create
+## Validation and persistence
 
-`CreateSessionRequest` gains a top-level field, sibling of `tag` and
-`prompt`:
+Keys are exact and case-sensitive on supported Unix execution hosts. A key must
+be non-empty and contain neither `=` nor NUL. Values may be empty and must not
+contain NUL. The same validation applies at create, edit, and log-resume
+boundaries. Invalid recorded maps are refused before tail repair can modify the
+file.
 
-```rust
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub env: Option<BTreeMap<String, String>>,
-```
+The log retains the `env_change` discriminator and full string-to-string map.
+New environment records are user-thread state entries parented at the current
+head. They are non-punctuation, like inference-setting records. A fresh session
+with only seeds leaves no conversation file. A confirmed edit to an established
+log flushes the state entry before reporting success. An unchanged value or
+removal of an absent key appends nothing.
 
-Env is a property of the creation, not an inference setting, so it
-deliberately does not join the wire `SessionSettings`: that struct is
-`#[serde(flatten)]`-embedded in `SettingsRequest`, the runtime
-mutation route, and placing env there would either open the mutation
-surface v1 excludes or force refusal logic into the settings path.
-Top-level placement makes create-only true by construction. A
-settings request that carries an `env` key anyway is an unknown field
-to the destination host. A protocol 2 host refuses it under the
-closed-schema rule in remote-control-spec.md before settings mutation;
-built-in clients send no command to a protocol 1 host and offer no such
-settings surface.
+First publication retains the log's existing transactional initial-write
+contract: the pending prefix and first punctuation are installed together at the
+canonical path without replacing an existing log. This feature does not change
+staging, error recovery, or power-loss durability.
 
-`BTreeMap` for deterministic serialization. The host applies the map
-in full or refuses the create (section 1 validation), never a partial
-apply.
+### Existing logs
 
-### 2.2 The answer says what happened
+An existing single root-parented Meta `EnvChange` creation record remains valid.
+It supplies that log's baseline when the selected ancestry has no user-thread
+environment record. A user-thread record overrides the entire baseline map,
+including when it is empty. Other branches without an override retain the
+baseline. No log rewrite or migration is required.
 
-Protocol 2 effect owners refuse unknown request fields before effects
-(the compatibility rules in remote-control-spec.md). The connection's
-exact protocol check excludes a protocol 1 host, while a protocol 2 host
-that predates this field refuses the create instead of minting a session
-without env. The create's answer
-still carries the applied fact: it is the positive result contract and
-makes the session identity legible to its creator.
+Logs with no environment records remain valid. Readers that only understand
+immutable Meta environment records cannot read the new user-thread records and
+must be upgraded before using edited sessions.
 
-`SessionCreated` gains:
+## Creation defaults
 
-```rust
-/// The env keys the create applied, present exactly when the request
-/// stated an env map (an empty stated map echoes as an empty list).
-/// Absent when the request stated none. A successful answer without
-/// this field after env was stated violates the protocol.
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub env_keys: Option<Vec<String>>,
-```
+`--env KEY=VALUE` remains a repeatable global launch flag. It splits at the
+first equals sign and refuses duplicate keys, missing equals signs, or invalid
+entries. It has no process-environment binding and no `config.toml` equivalent.
 
-Keys only: the creator already knows the values, and the echo's job
-is the fact of application, legible in operator output. Sorted (map
-order).
+For local interactive and print runs, the map applies to sessions the invocation
+creates, including later in-TUI new sessions. It is passed explicitly to each
+create, not installed in the host's base configuration. Other clients creating
+sessions on an embedded host therefore do not inherit the launcher's map.
 
-The decode table for a creator that stated env:
+On continue or attach, the existing session keeps its recorded branch map. The
+launch map stays available for later creates, and a notice explains that the
+flag did not edit the resumed session. Use the environment window for a
+conscious edit. `serve` and `gateway` refuse `--env` because those invocations do
+not create a session themselves.
 
-| Answer | Meaning |
-| --- | --- |
-| 200, `env_keys` exactly matches the stated keys | The host applied the map (all of it). |
-| 200, `env_keys` absent or not an exact match | Protocol violation. The session exists, but the creator cannot claim env was applied. |
-| 400 `invalid_request` | The destination host refused the create before minting, whether because it predates the field or the map is invalid. |
+Remote **creation** with `--env` is a separate extension. This build refuses
+that request before creating a session rather than silently dropping the map.
+Connected inspection and editing of existing sessions are supported regardless.
+The remote-control specification owns the create-wire extension and its strict
+request compatibility rules.
 
-Client rule: a built-in client that stated env and receives a
-successful answer without the exact `env_keys` reports a protocol
-violation loudly. The TUI renders a prominent notice that the host did
-not confirm session env. Unattended callers (the workshop's wake
-script) treat it as failure and name the session whose identity they
-cannot verify. A minted session is never deleted to make the error
-tidier, per the existing create contract.
+## Host and wire boundary
 
-This is still attempt-and-read within protocol 2: there is no
-`session_env` capability pre-gate or extra hello round-trip in the
-create path. The connection's existing version check supplies the
-protocol 1 boundary, and the receiver's strict command decoder supplies
-the within-generation boundary. It works identically through gateways,
-where the client sees the gateway's hello and the destination host owns
-create validation.
+`SessionHost::environment` reads the selected map, materializing the session as
+needed like the tree read. A field-edit command carries a key and either a
+string value or removal. The host edits its current map, rather than accepting a
+client's stale copy of unrelated keys, and records the full resulting map.
 
-### 2.3 Capability string
+GET `/v1/sessions/{id}/env` returns the string-to-string map, including values.
+POST to the same route accepts a `key` and a `value`. A string value sets the
+key, including an empty string. A null or omitted value removes it. Unknown
+request fields are refused before dispatch. Gateways forward both operations to
+the owning host. Hosts advertise the `session_env` capability, which is not a
+client-side precondition for trying the operation.
 
-Hosts advertise `session_env` in `GET /v1/hello` capabilities,
-extending the capability registry in remote-control-spec.md (new surface
-past the baseline). Gateways do not advertise it, a gateway cannot
-answer for its hosts. It
-is self-description, never a gate, and aj's own client code does not
-consult it: the request refusal or `env_keys` echo is the normative
-result. It exists so
-operator tooling can ask "is this bench binary new enough" without
-minting a session, which the workshop's cutover check wants.
+The read is requested when the editor opens, not during directory enumeration.
+Environment values do not enter directory rows or `state` frames. Live notices
+and replay name only the keys using terminal-safe quoting. Seeds before the
+first message and legacy Meta records project no environment notice.
 
-### 2.4 Gateway
+Session info reports the selected branch's map. Export redacts every
+`EnvChange` value in the embedded payload before JavaScript receives it, keeping
+keys and replacing values with `[redacted]`. Export never mutates the source
+log. Its state rows remain navigable and keys-only.
 
-Nothing to build. The gateway's create route already edits the body
-as a `RawObject`, reading `host` and carrying every other field
-unread upstream, and namespaces only `id` on the way back (the raw
-pass-through rule in remote-control-spec.md's compatibility section,
-`gateway/server.rs::create_session`). `env` rides through raw, and
-`env_keys` rides back inside the answer the gateway does not decode.
-This holds for protocol 2 gateways that predate the feature by the same
-contract; a protocol 1 gateway is excluded by the version check. The
-work is one pinning test: a create with env through the gateway reaches
-the host with the map intact and the echo intact on the way back.
+## Verification boundaries
 
-### 2.5 Spec doc amendments
-
-`docs/remote-control-spec.md` is amended with the range that lands
-the wire change: the create row of the commands table gains env among
-the optional creation properties with the echo contract, and the
-capability registry gains `session_env`.
-
-## 3. On-disk format (`aj-session`)
-
-One new variant on `ConversationEntryKind`, beside the four settings
-variants:
-
-```rust
-/// The complete environment fixed for this session at creation.
-/// V1 writes it once as log-level creation metadata when creation
-/// stated a map. An empty map is distinct from no record.
-EnvChange { env: BTreeMap<String, String> },
-```
-
-Serialized as `"type": "env_change"` under the existing tagged
-scheme. The creation record is `ThreadKind::Meta`, has no `agent_id`,
-and names the system-prompt root as its parent. It is never a legal
-conversation head. Non-punctuation, like the settings seeds: a
-created session that never receives a message leaves no file.
-
-**Transactional first publication.** A new log does not expose its
-target file one line at a time. On the first punctuation append,
-`ConversationLog` assembles the pending system prompt, optional
-`EnvChange`, inference-setting seeds, and punctuation into one complete
-initial image at a same-directory staging path outside the session-log
-namespace. After the complete image is written and flushed, it is
-atomically installed at the canonical session path without replacing
-an existing file.
-
-Pending records are not drained until installation succeeds. A
-surfaced write, flush, or install error leaves the canonical path absent
-or unchanged and keeps the fresh log's complete pending prefix for a
-same-object retry. A process failure before install may leave only an
-ignored staging artifact. After install the canonical image has a
-punctuation record after `EnvChange`. `flush_pending` remains a no-op
-before first punctuation. Later appends and the existing power-loss
-contract are unchanged.
-
-- **Seed**: `freeze_and_seed` appends one `EnvChange` immediately after
-  the system-prompt root and before the user-thread inference-setting
-  seeds, exactly when the create stated env. An absent map writes no
-  entry, so `None` stays distinct from `Some({})`.
-- **Extraction**: `LogSnapshot` and `ConversationLog` expose
-  `session_env()`, which reads the log-level creation record
-  independently of the active head. `None` means a legacy log or an
-  env-less create. `aj-session`'s `SessionSettings` remains
-  inference-only, and `Conversation::settings()` cannot state session
-  identity because a `Conversation` is head-filtered.
-- **Compaction**: cannot affect `session_env()`, because extraction
-  uses neither message projection nor a head-linearized conversation.
-- **Branching**: existing head targets remain valid, including the
-  system-prompt root and inference-setting entries before the first
-  message. `head_switch` restores branch-local inference settings but
-  neither reapplies nor clears the session env.
-- **Replay**: the log-level creation record always projects nothing.
-  V1 has no post-message env change to announce.
-- **Export**: the `/export` artifact embeds every log entry verbatim
-  today, and a self-contained HTML file is built to leave the
-  machine. The `ExportEntry` serializer (which already normalizes
-  tool-result details) redacts `EnvChange` values, keys kept, each
-  value replaced by a fixed `"[redacted]"` marker. The contract:
-  an export names the session's env keys and never carries a value.
-
-The log itself stores full values. Restore needs them, and the log
-lives on the host's disk in the same trust domain as the transcript,
-which already carries whatever secrets pass through tool output.
-
-## 4. Application
-
-- **Carrier**: session creation passes env explicitly
-  (`SessionSpec::Create` gains it, `SessionHost::create_with` /
-  `mint` take it through the same signatures that carry settings,
-  prompt, and tag). `RunConfigSnapshot` stays inference-only, per the
-  section 1 invariant.
-- **Agent state**: the `Agent`'s session state holds
-  `session_env: BTreeMap<String, String>` (empty when none), set at
-  `SessionCore::build`: from the create's map on Create, from
-  `PreparedLog::session_env` on Resume. Remote materialize goes through
-  the same log-level extraction, so parked sessions restore their env
-  across host restarts. Head switching restores only branch-local
-  inference settings and never mutates session env.
-- **Tool seam**: `ToolContext` gains a `session_env()` accessor,
-  backed by the session state through `SessionContextWrapper` like
-  `working_directory()`. `BashTool::execute` applies it at the single
-  child-build site, between process inheritance and the fixed
-  overrides. Foreground and background bash are the same spawned
-  child, so both are covered at that one site.
-- **Sub-agents**: `spawn_agent` copies the parent's session env onto
-  the child agent with one explicit setter, alongside the existing
-  thinking/speed/block-images inheritance lines. Sub-agent subshells
-  then see the same overlay through the same tool seam.
-
-## 5. CLI and local paths
-
-`--env KEY=VALUE`, repeatable, global (like `--tag`, so it reads the
-same on either side of a subcommand and reaches `connect`):
-
-- Parse splits at the first `=`. An argument without `=` is refused.
-  A key stated twice in one invocation is refused (stating one
-  identity twice is a bug, not a preference). Key/value validation
-  as in section 1. No environment-variable binding, deliberately
-  (the `--api-key` precedent): a session env stated by an exported
-  variable in the launching shell would be process-level identity
-  sneaking back in.
-- **Launch rule**: the launch env applies to every create the
-  invocation performs, and only to creates. This is one uniform
-  sentence across modes: the startup create of a local run, an
-  in-TUI new-session create (local or connected, host picker
-  included), a `connect --new` create, and a print-mode fresh run
-  all carry it. For the connected in-TUI create this deviates from
-  how launch *settings* behave (those are not re-sent, the host
-  defaults them): env is identity, and a `connect --new --env` run
-  whose user opens a second session must not silently mint an
-  identityless one. The deviation is deliberate and this line is its
-  record.
-- **Local TUI**: the parsed map is carried in the interactive state
-  and passed explicitly at each create call site
-  (`Control::create` gains an env parameter, the Local arm hands it
-  to `create_with`, the Remote arm puts it on the wire request).
-  It is not baked into the composed host's base config, per the
-  invariant.
-- **Resume**: on any resume or materialize the log-level creation
-  record wins independently of the selected conversation head. A log
-  that records env restores it, and a log that records none resumes
-  with none. No branch-local settings fold or launch env may substitute
-  for that record. The launch env stays armed for creates the run
-  performs later (an in-TUI new session), so a resume does not consume
-  or apply it. Where a run's primary gesture creates nothing
-  (`aj continue --env`, a bare `aj connect --env` that attached), the
-  run says the resumed or attached session keeps its own env and that
-  `--env` names creations, mirroring how a `--tag` that named nothing
-  is handled. No backfill entry is written.
-- **`aj serve` / `aj gateway`**: refuse `--env` at startup with an
-  error saying session env is stated per create.
-- **Print mode**: a fresh `aj -p` run seeds and applies env like the
-  interactive create path. `aj -p continue` follows the resume rule,
-  notices to stderr.
-
-## 6. Observability
-
-- **Create answer**: `env_keys` (section 2.2). The workshop wake
-  script prints them, which is the at-a-glance verification for the
-  unattended path.
-- **Session info** (`/info`): the digest gains an Env section under
-  Settings listing keys and values. The surface is local-only today
-  (connect mode refuses it, per the connect-mode action matrix in
-  remote-control-spec.md) and reads the same log the operator could
-  `cat`, so values are shown: verifying identity at a glance is the use
-  case, and `BEADS_ACTOR` redacted to a key name verifies nothing.
-  `SessionStats` carries the log-level `session_env` separately from
-  its branch-local inference settings.
-- **Export**: keys only, values redacted (section 3).
-- **Non-goals, v1**: no env in the sessions directory rows, `state`
-  frames, or any remote read. When session info learns to answer
-  over the wire, the Env section rides along and the redaction
-  question is decided there, where the trust domain changes.
-
-## 7. Back-compat
-
-- New binary, old log: no `EnvChange` entry, `session_env()` is `None`,
-  session runs with no env. No migration.
-- Old binary, new log: under the process-crash and surfaced-error
-  contract, transactional first publication leaves either no canonical
-  file or a complete initial image in which the unknown
-  `"type": "env_change"` entry is followed by the first punctuation.
-  The old reader therefore reports the interior unknown entry as corrupt
-  and leaves the file unchanged. Its general rule still treats an
-  unknown final entry as a torn tail and truncates it, but the v1 writer
-  does not expose `EnvChange` in that position.
-- New client, protocol 1 host or gateway: the exact hello check refuses
-  the connection before create. New client, older protocol 2 host: its
-  strict decoder refuses the unknown env field before minting (section
-  2.2).
-- Older protocol 2 client, new host: never states env, never sees
-  `env_keys` (skip-serialized), and ignores it if it ever did
-  (observation decoding is additive).
-- Older protocol 2 gateway between new ends: raw pass-through both
-  directions (section 2.4). A protocol 1 gateway is incompatible.
-
-## 8. Testing
-
-Mutation-anchored, per the workshop standard: each guarantee has a
-test that goes red when the wiring line is deleted, not only when a
-helper-built component is driven directly.
-
-- **Wire**: round-trip of `env` on the create request and `env_keys`
-  on the answer. The strict request codec accepts env as a known field
-  and refuses an unknown neighbor; the additive answer codec ignores
-  unknown fields and decodes an absent `env_keys` as `None`, which the
-  creating client treats like any non-exact echo: a protocol violation
-  when it stated env.
-- **Gateway**: an env-bearing create through the real gateway route
-  reaches the host with its env map and every non-routing field
-  structurally intact, and the echo returns intact.
-  Assert at the upstream-body boundary, not only on the client's
-  view.
-- **Host**: create with env, drive the real agent, the bash tool
-  observes the variables (assert in the child's output, the boundary
-  where the harm lands). Invalid map refuses with 400 and leaves no
-  session and no log file. Echo lists exactly the stated keys.
-  A create without env answers without `env_keys`.
-- **Layering**: a session env entry shadows a host process variable,
-  and a fixed override (`AGENT`) beats a session entry of the same
-  name.
-- **Sub-agents and background**: a sub-agent's bash child and a
-  background bash task observe the env. The sub-agent test must run
-  through the real `spawn_agent` path so deleting the inheritance
-  setter goes red.
-- **Persistence**: create with env, restart the host (rebuild
-  `SessionHost` over the same store), materialize, bash still
-  observes the env. Resume under a *different* launch `--env` keeps
-  the log's env (the occupant-change case, the reason persistence
-  exists). Legacy log resumed with `--env` runs env-less and
-  notices.
-- **First publication**: an owning subprocess drives the production
-  first-punctuation path through deterministic checkpoints after the
-  staged image is written and flushed and around no-clobber install.
-  Kill and wait at each checkpoint. The canonical path is always absent
-  or contains punctuation after `EnvChange`. Injected write, flush, and
-  install errors keep the complete pending prefix; retrying a
-  punctuation append on the same `ConversationLog` publishes the
-  original env once. A frozen pre-`EnvChange` codec fixture first proves
-  it truncates a manually constructed final unknown entry, then proves
-  it refuses the published interior unknown entry without changing
-  bytes. Direct target writes or draining pending records before install
-  must make these tests red.
-- **Head independence**: through a real `SessionHost`, create with env,
-  switch successfully to the system-prompt root, and send a prompt whose
-  user-thread ancestry omits every inference-setting seed. Before that
-  prompt the switch leaves the canonical path absent. `session_env()`
-  and the real bash child still observe the creation map, including
-  after host restart and materialization on that branch. Deriving env
-  from `Conversation::settings()`, clearing it on head switch, or
-  rejecting the root head must make this test red.
-- **Local paths**: launch `--env` reaches the startup create's seed
-  entry and an in-TUI new session's seed entry. `aj serve --env`
-  refuses to start. Duplicate-key and missing-`=` parses refuse.
-- **Export/replay**: export artifact contains the keys and the
-  redaction marker and not the values (assert on the decoded
-  embedded entries). Seed entry projects no replay notice.
-- **Client echo check**: scripted successful answers with absent and
-  non-exact `env_keys` make the connect path surface a protocol
-  violation and name the minted session.
-
-## 9. Acceptance (end to end)
-
-On a bench: a create carrying `{"BEADS_ACTOR":"judd"}` against a host
-whose process env says nothing (or says another seat) yields a
-session whose bash tool prints `BEADS_ACTOR=judd`, including from a
-sub-agent's subshell, and still prints it after the host process is
-restarted and the session is materialized by a new prompt. The wake
-script then carries the actor per create and the bench drop-ins are
-deleted (tracked separately, outside this repo).
+Coverage observes whole-map replacement, absent versus empty, sibling isolation,
+root-head selection, compaction, persisted resume, and the legacy Meta baseline
+at the log API. Runtime tests observe the actual bash child after edits and head
+switches, plus inheritance by sub-agents and session isolation. Host and wire
+tests cover set/remove, no-ops, invalid and busy refusals, and local/remote and
+gateway behavior. Editor tests drive the actual palette, settings widgets, and
+drive loop, including cancellation, invalid drafts, whitespace, and empty values.
+Export and replay retain value-nondisclosure coverage at their output boundaries.

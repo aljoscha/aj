@@ -507,6 +507,7 @@ impl Driver {
             Command::Queue(op) => Ok(self.queue_op(op)),
             Command::Compact { instructions } => self.compact(instructions),
             Command::Settings(change) => self.settings(change).await,
+            Command::Env { key, value } => self.environment(key, value).await,
             Command::Tag { tag } => self.tag(tag),
             Command::Archive { archived } => self.archive(archived),
             Command::Head { target } => self.head_switch(target).await,
@@ -846,46 +847,8 @@ impl Driver {
         }
 
         if let Some(entry) = &outcome.entry {
-            // Ask the projection what a backfill would render rather than
-            // restating the wording. The snapshot is taken under the log
-            // lock and projected outside it, because the projection walks
-            // the whole log.
-            let snapshot = self.session.core.log.lock().await.snapshot();
-            let notice = snapshot.project_state_entry(&entry.id);
-
-            // Splice the notice into the stream at its own append
-            // position. The confirm released the log lock before
-            // returning, so a background sub-agent's append can already
-            // sit in the channel carrying a higher position, and
-            // publishing the notice on either side of it unconditionally
-            // would break the monotone-per-stream guarantee. Holding the
-            // log lock for the splice is what stops a further append from
-            // arriving mid-way through it.
-            // Held through a clone, so the guard does not borrow `self`
-            // and the splice below can still publish.
-            let log = Arc::clone(&self.session.core.log);
-            let guard = log.lock().await;
-            let mut buffered = Vec::new();
-            while let Ok(tagged) = self.events.try_recv() {
-                buffered.push(tagged);
-            }
-            let mut spliced = false;
-            for tagged in buffered {
-                if !spliced
-                    && tagged
-                        .entry
-                        .as_ref()
-                        .is_some_and(|buffered| buffered.seq > entry.seq)
-                {
-                    self.publish_notice(agent, entry, notice.clone(), &outcome.notice);
-                    spliced = true;
-                }
-                self.on_event(tagged);
-            }
-            if !spliced {
-                self.publish_notice(agent, entry, notice, &outcome.notice);
-            }
-            drop(guard);
+            self.publish_state_entry(agent, entry, &outcome.notice)
+                .await;
         }
         for note in outcome.notes {
             // A failed config write or log record is a live-only
@@ -904,6 +867,91 @@ impl Driver {
             status.settings = settings;
             true
         });
+        Ok(CommandOutcome::Accepted)
+    }
+
+    async fn publish_state_entry(&mut self, agent: AgentId, entry: &EntryRef, confirmation: &str) {
+        // Ask the projection what a backfill would render rather than
+        // restating the wording. The snapshot is taken under the log
+        // lock and projected outside it, because the projection walks
+        // the whole log.
+        let snapshot = self.session.core.log.lock().await.snapshot();
+        let notice = snapshot.project_state_entry(&entry.id);
+
+        // Splice the notice into the stream at its own append
+        // position. The confirm released the log lock before
+        // returning, so a background sub-agent's append can already
+        // sit in the channel carrying a higher position, and
+        // publishing the notice on either side of it unconditionally
+        // would break the monotone-per-stream guarantee. Holding the
+        // log lock for the splice is what stops a further append from
+        // arriving mid-way through it.
+        // Held through a clone, so the guard does not borrow `self`
+        // and the splice below can still publish.
+        let log = Arc::clone(&self.session.core.log);
+        let guard = log.lock().await;
+        let mut buffered = Vec::new();
+        while let Ok(tagged) = self.events.try_recv() {
+            buffered.push(tagged);
+        }
+        let mut spliced = false;
+        for tagged in buffered {
+            if !spliced
+                && tagged
+                    .entry
+                    .as_ref()
+                    .is_some_and(|buffered| buffered.seq > entry.seq)
+            {
+                self.publish_notice(agent, entry, notice.clone(), confirmation);
+                spliced = true;
+            }
+            self.on_event(tagged);
+        }
+        if !spliced {
+            self.publish_notice(agent, entry, notice, confirmation);
+        }
+        drop(guard);
+    }
+
+    async fn environment(
+        &mut self,
+        key: String,
+        value: Option<String>,
+    ) -> Result<CommandOutcome, HostError> {
+        // Validate removals too, without ever putting a value into a notice.
+        aj_session::validate_session_env(&std::collections::BTreeMap::from([(
+            key.clone(),
+            value.clone().unwrap_or_default(),
+        )]))
+        .map_err(|err| HostError::Invalid(err.to_string()))?;
+        self.require_idle()?;
+        let (entry, env) = {
+            let mut log = self.session.core.log.lock().await;
+            let current = log.session_env().cloned().unwrap_or_default();
+            let mut env = current.clone();
+            match value {
+                Some(value) => {
+                    env.insert(key, value);
+                }
+                None => {
+                    env.remove(&key);
+                }
+            }
+            if env == current {
+                return Ok(CommandOutcome::Accepted);
+            }
+            let entry = log.append_env_change(env.clone()).map_err(internal)?;
+            // Established logs flush before runtime changes. Fresh seed-only
+            // logs remain buffered until their first message. Either failure
+            // invokes the log's existing session fence.
+            log.flush_pending().map_err(internal)?;
+            (entry, env)
+        };
+        self.session.core.agent.lock().await.set_session_env(env);
+        self.publish_state_entry(AgentId::Main, &entry, "Session environment changed")
+            .await;
+        self.publish_state();
+        self.shared.fanout.mark_list_dirty();
         Ok(CommandOutcome::Accepted)
     }
 
@@ -964,14 +1012,7 @@ impl Driver {
             .map(Arc::new)
     }
 
-    /// Switch the session's head to `target`, in place.
-    ///
-    /// Refused while any turn is driven or any background task is live: a
-    /// mid-turn switch would let the running turn persist onto the wrong
-    /// branch. On success the queues are cleared, the state that belonged to
-    /// the branch being left is reset, the agent is reseeded from the new
-    /// branch, a fresh epoch is minted and `reset` published.
-    async fn head_switch(&mut self, target: HeadTarget) -> Result<CommandOutcome, HostError> {
+    fn require_idle(&self) -> Result<(), HostError> {
         let snapshot = self.session.core.task_registry.snapshot();
         let (agents, bash) = running_work_counts(
             self.turns.driven(),
@@ -982,6 +1023,18 @@ impl Driver {
                 reason: format!("{agents} agents and {bash} background tasks are still running"),
             });
         }
+        Ok(())
+    }
+
+    /// Switch the session's head to `target`, in place.
+    ///
+    /// Refused while any turn is driven or any background task is live: a
+    /// mid-turn switch would let the running turn persist onto the wrong
+    /// branch. On success the queues are cleared, the state that belonged to
+    /// the branch being left is reset, the agent is reseeded from the new
+    /// branch, a fresh epoch is minted and `reset` published.
+    async fn head_switch(&mut self, target: HeadTarget) -> Result<CommandOutcome, HostError> {
+        self.require_idle()?;
         // Everything already on the event stream belongs to the epoch this
         // switch is about to replace. Published afterwards it would carry
         // the new epoch, which no client's epoch filter can reject, and it
@@ -996,7 +1049,7 @@ impl Driver {
         // Cloned so the guard does not borrow `self`: the queue updates
         // below are published while it is held.
         let log_handle = Arc::clone(&self.session.core.log);
-        let transcript = {
+        let (transcript, env) = {
             let mut log = log_handle.lock().await;
             // The abandoned branch's buffered non-punctuation entries
             // belong to it, so they must reach disk before the head moves
@@ -1072,7 +1125,10 @@ impl Driver {
             // abandoned branch are over by definition.
             status.finished_subs = log.sub_agent_ids();
             drop(status);
-            conversation.agent_messages()
+            (
+                conversation.agent_messages(),
+                log.session_env().cloned().unwrap_or_default(),
+            )
         };
         self.reset_branch_state();
         self.session.status().settings = settings_of(&self.session.core.run_config);
@@ -1080,6 +1136,7 @@ impl Driver {
         {
             let mut agent = self.session.core.agent.lock().await;
             agent.reseed_transcript(transcript);
+            agent.set_session_env(env);
             agent.clear_todo_list();
         }
 

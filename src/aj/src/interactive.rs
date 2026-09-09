@@ -91,6 +91,7 @@ use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt
 use crate::quit_hint::QuitHint;
 use crate::remote::RemoteError;
 use crate::selection_copied::SelectionCopied;
+use crate::session_env::open_session_env;
 use crate::session_selector::{
     SessionScan, extend_session_scan, open_connected_session_selector, open_session_selector,
 };
@@ -110,7 +111,7 @@ use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{Connection, STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::{TaskBacking, TaskOutputView, open_task_output};
 use crate::terminal::TerminalCaps;
-use crate::toasts::{ToastBody, ToastStack, Toasts, busy_refusal};
+use crate::toasts::{ToastBody, ToastStack, Toasts, busy_refusal, show_toast};
 use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
 use crate::usage_overlay::open_usage_overlay;
 
@@ -3354,6 +3355,7 @@ async fn apply_command_action(
         CommandAction::OpenThinkingSelector => Some("change thinking effort"),
         CommandAction::OpenModelSelector => Some("change the model"),
         CommandAction::OpenSessionTag => Some("change the session tag"),
+        CommandAction::OpenSessionEnv => Some("edit the session environment"),
         _ => None,
     };
     if gated.is_some_and(|verb| refuse_while_attaching(world, shell, verb)) {
@@ -3573,6 +3575,28 @@ async fn apply_command_action(
             open_session_tag(&handles, current.as_deref());
             ActionEffect::OpenedOverlay
         }
+        CommandAction::OpenSessionEnv => match world.control.environment(world.session()).await {
+            Ok(values) => {
+                open_session_env(
+                    shell.borrow().overlay_handles(),
+                    world.session().to_string(),
+                    values,
+                );
+                ActionEffect::OpenedOverlay
+            }
+            Err(err) => {
+                let message = if err.unknown_endpoint() {
+                    "This host does not serve the session environment editor.".to_string()
+                } else {
+                    format!(
+                        "Could not read the session environment: {}",
+                        peer_refusal(&err)
+                    )
+                };
+                fold_notice(world, &message);
+                ActionEffect::Redraw
+            }
+        },
         CommandAction::NewSession => {
             // Live work is no reason to refuse. The session we leave stays
             // attached and keeps folding, so its turn finishes whether or not
@@ -4119,7 +4143,8 @@ async fn apply_selector_activity(
         changed = true;
         let session_mutation = match &item {
             SelectorActivity::ThinkingConfirmed { .. }
-            | SelectorActivity::ModelConfirmed { .. } => true,
+            | SelectorActivity::ModelConfirmed { .. }
+            | SelectorActivity::EnvironmentEdit(_) => true,
             SelectorActivity::SettingChange { id, .. }
             | SelectorActivity::SettingClear { id, .. } => matches!(
                 id.as_str(),
@@ -4175,6 +4200,29 @@ async fn apply_selector_activity(
             SelectorActivity::SkillToggle { name, disable } => {
                 let notice = apply_skill_toggle(world, &name, disable);
                 fold_notice(world, &notice);
+            }
+            SelectorActivity::EnvironmentEdit(edit) => {
+                match world
+                    .control
+                    .command(
+                        &edit.session,
+                        Command::Env {
+                            key: edit.key.clone(),
+                            value: edit.value.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => edit.applied(),
+                    Err(err) => {
+                        let notice = if err.conflict() {
+                            session_busy_notice("change the environment")
+                        } else {
+                            format!("Environment not changed: {}", peer_refusal(&err))
+                        };
+                        show_toast(&shell.borrow().toasts, notice);
+                    }
+                }
             }
         }
     }
@@ -5090,6 +5138,7 @@ fn editor_theme_from_theme(theme: &Theme) -> EditorTheme {
 /// The shared handles the drive loop hands to an overlay's open function.
 /// Gathered from the shell in one borrow so the open call site never holds a
 /// shell borrow across it.
+#[derive(Clone)]
 pub(crate) struct OverlayHandles {
     pub(crate) stack: Rc<RefCell<OverlayStack>>,
     pub(crate) editor: WidgetRef,
@@ -21884,6 +21933,151 @@ mod tests {
         assert_eq!(
             shell.borrow().take_session_request(),
             Some(SessionRequest::New { host: None }),
+        );
+        shut_down(&world).await;
+    }
+
+    // ---- Session environment ----
+
+    #[tokio::test]
+    async fn the_env_overlay_edits_adds_and_removes_through_the_drive_loop_locally_and_remotely() {
+        for connected in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let remote = if connected {
+                Some(RemoteHost::start(&dir, "streaming-text").await)
+            } else {
+                None
+            };
+            let (mut world, shell) = match &remote {
+                Some(remote) => connect_world_and_shell(&dir, remote, &["--new"]).await,
+                None => world_and_shell(&dir, "streaming-text").await,
+            };
+            run_prompt(&mut world, "persist the session").await;
+            let unchanged = " \tkeep\r\n\\\"界 ";
+            for (key, value) in [("EDITED", "old"), ("REMOVE", "gone"), ("KEEP", unchanged)] {
+                world
+                    .control
+                    .command(
+                        world.session(),
+                        Command::Env {
+                            key: key.into(),
+                            value: Some(value.into()),
+                        },
+                    )
+                    .await
+                    .expect("seed env");
+            }
+            let (mut app, mut writer, root) = app_over(&shell).await;
+            let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+            // Confirm three distinct operations through the palette and existing
+            // settings widgets. Nothing drains their activity outside the loop.
+            writer
+                .write_all(b"\x0fenv\rEDITED\r\x15  new\\nvalue\\\\end  \r")
+                .expect("edit");
+            writer
+                .write_all(b"\x15Add variable\rEMPTY\r\r")
+                .expect("add empty value");
+            writer
+                .write_all(b"\x15REMOVE\x18\x03")
+                .expect("remove and close overlays");
+            writer
+                .write_all(&chord_bytes(AjAction::SessionNew))
+                .expect("exit the loop");
+            let exit = crate::remote::tests::bounded(
+                "env editor gesture",
+                drive(
+                    &mut app,
+                    &root,
+                    &shell,
+                    &mut world,
+                    &mut theme_watch,
+                    &mut prompt_history_rx,
+                    &mut autocomplete_rx,
+                ),
+            )
+            .await
+            .expect("drive");
+            assert!(matches!(exit, SessionExit::New { .. }));
+            assert_eq!(
+                world
+                    .control
+                    .environment(world.session())
+                    .await
+                    .expect("read env"),
+                BTreeMap::from([
+                    ("EDITED".into(), "  new\nvalue\\end  ".into()),
+                    ("EMPTY".into(), String::new()),
+                    ("KEEP".into(), unchanged.into()),
+                ]),
+                "connected={connected}"
+            );
+            if let Some(remote) = remote {
+                remote.shutdown().await;
+            } else {
+                shut_down(&world).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_env_overlay_prefills_values_and_keeps_invalid_or_cancelled_edits_unapplied() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        world
+            .control
+            .command(
+                world.session(),
+                Command::Env {
+                    key: "VALUE".into(),
+                    value: Some(" original\tvalue ".into()),
+                },
+            )
+            .await
+            .expect("seed env");
+        press(&mut app, &mut writer, &[0x0f]).await;
+        app.render(&root).expect("render palette");
+        type_text(&mut app, &mut writer, "env\r").await;
+        let command = shell.borrow().take_command().expect("palette command");
+        assert_eq!(command, CommandAction::OpenSessionEnv);
+        assert!(matches!(
+            apply_command(&mut world, &shell, command).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+        type_text(&mut app, &mut writer, "VALUE\r").await;
+        app.render(&root).expect("render field");
+        let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            painted.contains(r" original\tvalue "),
+            "the field reads the host's value: {painted}"
+        );
+        let depth = shell.borrow().overlays.borrow().depth();
+        press(&mut app, &mut writer, CTRL_U).await;
+        type_text(&mut app, &mut writer, r"invalid\q").await;
+        press(&mut app, &mut writer, b"\r").await;
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            depth,
+            "invalid input stays open"
+        );
+        assert!(shell.borrow().take_activity().is_empty());
+        let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            painted.contains(r"invalid\q"),
+            "the invalid draft stays available: {painted}"
+        );
+        press(&mut app, &mut writer, CTRL_U).await;
+        type_text(&mut app, &mut writer, "cancelled").await;
+        press(&mut app, &mut writer, b"\x1b").await;
+        assert!(shell.borrow().take_activity().is_empty());
+        assert_eq!(
+            world
+                .control
+                .environment(world.session())
+                .await
+                .expect("read env"),
+            BTreeMap::from([("VALUE".into(), " original\tvalue ".into())])
         );
         shut_down(&world).await;
     }

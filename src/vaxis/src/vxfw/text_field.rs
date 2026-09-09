@@ -12,7 +12,7 @@
 //! `Box<dyn FnMut(&mut EventContext, &str)>` that captures whatever state it
 //! needs directly. `on_change` fires only when an edit actually changes the
 //! text. `on_submit` fires on Enter/Ctrl-J and is handed the field's contents
-//! while the field clears itself.
+//! while the field clears itself unless [`TextField::clear_on_submit`] is false.
 //!
 //! # Word classification
 //!
@@ -64,6 +64,9 @@ pub struct TextField {
     pub on_change: Option<Box<dyn FnMut(&mut EventContext, &str)>>,
     /// Fires on Enter/Ctrl-J with the field contents. See the module docs.
     pub on_submit: Option<Box<dyn FnMut(&mut EventContext, &str)>>,
+    /// Clear the submitted text. Defaults to true. Editors that can reject a
+    /// submission can disable this to leave the draft and cursor available.
+    pub clear_on_submit: bool,
 }
 
 impl TextField {
@@ -80,6 +83,7 @@ impl TextField {
             previous_val: String::new(),
             on_change: None,
             on_submit: None,
+            clear_on_submit: true,
         }
     }
 
@@ -489,8 +493,11 @@ impl Widget for TextField {
                     || key.matches(u32::from('j'), Modifiers::CTRL)
                 {
                     if self.on_submit.is_some() {
-                        // toOwnedSlice clears the field, so grab the value first.
-                        let value = self.to_owned_slice();
+                        let value = if self.clear_on_submit {
+                            self.to_owned_slice()
+                        } else {
+                            self.buf.dupe()
+                        };
                         if let Some(cb) = self.on_submit.as_mut() {
                             cb(ctx, &value);
                         }

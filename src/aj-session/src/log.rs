@@ -250,12 +250,26 @@ fn validate_recorded_session_env(
     order: &[EntryId],
     entries: &HashMap<EntryId, ConversationEntry>,
 ) -> Result<(), ConversationError> {
+    // Validate every map before resume repairs framing, including branch edits.
+    for entry in entries.values() {
+        if let ConversationEntryKind::EnvChange { env } = &entry.entry {
+            validate_session_env(env)
+                .map_err(|err| ConversationError::Corrupt(format!("invalid env_change: {err}")))?;
+            if entry.agent_id.is_some() || entry.thread == ThreadKind::Subagent {
+                return Err(ConversationError::Corrupt(
+                    "env_change must be user state or legacy meta creation metadata".to_string(),
+                ));
+            }
+        }
+    }
     let env_entries: Vec<(usize, &ConversationEntry)> = order
         .iter()
         .enumerate()
         .filter_map(|(index, id)| {
             let entry = entries.get(id)?;
-            matches!(entry.entry, ConversationEntryKind::EnvChange { .. }).then_some((index, entry))
+            (entry.thread == ThreadKind::Meta
+                && matches!(entry.entry, ConversationEntryKind::EnvChange { .. }))
+            .then_some((index, entry))
         })
         .collect();
     let Some((index, entry)) = env_entries.first().copied() else {
@@ -290,11 +304,6 @@ fn validate_recorded_session_env(
                 .to_string(),
         ));
     }
-    let ConversationEntryKind::EnvChange { env } = &entry.entry else {
-        unreachable!("filtered to env_change above")
-    };
-    validate_session_env(env)
-        .map_err(|err| ConversationError::Corrupt(format!("invalid env_change: {err}")))?;
     let has_successor_punctuation = order[index + 1..]
         .iter()
         .filter_map(|id| entries.get(id))
@@ -422,12 +431,11 @@ pub enum ConversationEntryKind {
     /// speed. `thinking_display` also affects inference, but remains a
     /// live-only session setting and is deliberately not recorded.
     VerbosityChange { verbosity: String },
-    /// The complete environment fixed for this session at creation.
+    /// A complete environment replacement on the user branch.
     ///
-    /// Written at most once as root-parented [`ThreadKind::Meta`] metadata,
-    /// independently of every conversation head. An empty map is an explicit
-    /// recording, distinct from no entry. Values remain on disk for restore but
-    /// are redacted from export.
+    /// An empty map is explicit, distinct from no entry. Legacy root-parented
+    /// Meta records provide a session baseline. Values remain on disk for
+    /// restore but are never included in replay notices.
     EnvChange { env: BTreeMap<String, String> },
     /// The context the session was created with, as the user sees it: the base
     /// system prompt, the instruction files stitched into it, and the skills
@@ -779,8 +787,8 @@ impl Conversation {
     /// forward scan over [`Self::entries`], keeping the last value
     /// seen per axis. `ModelChange` entries and assistant-role
     /// messages both update the model; a `SubAgentSpawn` snapshot updates the
-    /// inference axes. Session environment is log-level creation metadata and
-    /// deliberately absent from this branch-filtered projection.
+    /// inference axes. The complete branch environment is read separately via
+    /// [`LogSnapshot::session_env`], without compaction filtering.
     pub fn settings(&self) -> SessionSettings {
         let mut settings = SessionSettings {
             model: None,
@@ -1092,17 +1100,28 @@ impl LogSnapshot {
         self.system_prompt_entry().map(|e| &e.id)
     }
 
-    /// The immutable environment recorded when this session was created.
+    /// The last complete environment on the active head's ancestry.
     ///
-    /// Read from log-level metadata rather than a linearized conversation, so
-    /// selecting a different user-thread head cannot select, replace, or clear
-    /// session identity. `None` is a legacy or explicitly env-less session and
-    /// differs from a recorded empty map.
+    /// An explicit empty map differs from absence. Compaction does not affect
+    /// this walk. A legacy Meta creation record supplies the baseline only when
+    /// the active path contains no User EnvChange.
     pub fn session_env(&self) -> Option<&BTreeMap<String, String>> {
+        let mut cursor = self.head.as_ref();
+        while let Some(id) = cursor {
+            let entry = self.entries.get(id)?;
+            if entry.thread == ThreadKind::User
+                && let ConversationEntryKind::EnvChange { env } = &entry.entry
+            {
+                return Some(env);
+            }
+            cursor = entry.parent_id.as_ref();
+        }
         self.order.iter().find_map(|id| {
             let entry = self.entries.get(id)?;
             match &entry.entry {
-                ConversationEntryKind::EnvChange { env } => Some(env),
+                ConversationEntryKind::EnvChange { env } if entry.thread == ThreadKind::Meta => {
+                    Some(env)
+                }
                 _ => None,
             }
         })
@@ -1265,7 +1284,7 @@ impl ConversationLog {
         // project its message twice. `append` rejects a duplicate id
         // loudly. On resume we keep the first ordinary occurrence and
         // carry on, since the rest of the file is still usable. Creation
-        // identity is stricter: coalescing a reused root or EnvChange id
+        // identity is stricter: coalescing a reused root or legacy Meta EnvChange id
         // could erase the physical identity record before its layout is
         // validated, so any duplicate involving either is corruption.
         let adopt = |order: &mut Vec<EntryId>,
@@ -1274,17 +1293,13 @@ impl ConversationLog {
                      line_number: u64|
          -> Result<(), ConversationError> {
             if let Some(existing) = entries.get(&entry.id) {
-                let is_creation_identity = order.first() == Some(&entry.id)
-                    || matches!(
-                        &existing.entry,
-                        ConversationEntryKind::SystemPrompt { .. }
-                            | ConversationEntryKind::EnvChange { .. }
-                    )
-                    || matches!(
-                        &entry.entry,
-                        ConversationEntryKind::SystemPrompt { .. }
-                            | ConversationEntryKind::EnvChange { .. }
-                    );
+                let protected = |entry: &ConversationEntry| {
+                    matches!(entry.entry, ConversationEntryKind::SystemPrompt { .. })
+                        || (entry.thread == ThreadKind::Meta
+                            && matches!(entry.entry, ConversationEntryKind::EnvChange { .. }))
+                };
+                let is_creation_identity =
+                    order.first() == Some(&entry.id) || protected(existing) || protected(&entry);
                 if is_creation_identity {
                     return Err(ConversationError::Corrupt(format!(
                         "{}:line {line_number}: duplicate creation identity entry id {}",
@@ -1415,9 +1430,8 @@ impl ConversationLog {
             }
         }
 
-        // Creation identity is validated before resume mutates any byte. A
-        // syntactically valid but malformed env record is corruption, and
-        // refusing it must leave the source bytes untouched.
+        // Validate creation layout and environment syntax before resume mutates
+        // any byte. Refusing a malformed env record must leave the source intact.
         validate_recorded_system_prompt(&order, &entries)?;
         validate_recorded_session_env(&order, &entries)?;
 
@@ -1571,13 +1585,13 @@ impl ConversationLog {
             validate_session_env(env)
                 .map_err(|err| ConversationError::InvalidAppend(err.to_string()))?;
             let root = self.core.system_prompt_id();
-            let valid = thread == ThreadKind::Meta
-                && agent_id.is_none()
-                && self.core.order.len() == 1
-                && parent_id.as_ref() == root;
+            let valid = thread == ThreadKind::User
+                || (thread == ThreadKind::Meta
+                    && self.core.order.len() == 1
+                    && parent_id.as_ref() == root);
             if !valid {
                 return Err(ConversationError::InvalidAppend(
-                    "env_change must be the single root-parented meta entry immediately after the system prompt"
+                    "env_change must be user state or the single root-parented meta creation record"
                         .to_string(),
                 ));
             }
@@ -2103,23 +2117,15 @@ impl ConversationLog {
         )
     }
 
-    /// Record the complete immutable session environment at creation.
+    /// Replace the complete environment on the active user branch.
     ///
-    /// Exactly one root-parented meta entry is legal, immediately after the
-    /// system prompt and before inference-setting seeds. It is non-punctuation,
-    /// so a brand-new session seeded with env but no message still leaves no
-    /// conversation file behind.
+    /// Repeated maps and empty maps are valid. Like other state entries this is
+    /// non-punctuation and becomes durable with a subsequent punctuation append.
     pub fn append_env_change(
         &mut self,
         env: BTreeMap<String, String>,
     ) -> Result<EntryRef, ConversationError> {
-        let parent = self.core.system_prompt_id().cloned();
-        self.append(
-            parent,
-            ThreadKind::Meta,
-            None,
-            ConversationEntryKind::EnvChange { env },
-        )
+        self.append_state_entry(ThreadFilter::USER, ConversationEntryKind::EnvChange { env })
     }
 
     /// Record what the session's system prompt was assembled from, beside the
@@ -4655,6 +4661,16 @@ mod tests {
         ] {
             let err = validate_session_env(&env).expect_err("invalid map is refused");
             assert!(err.to_string().contains(expected), "{err}");
+            let dir = fresh_sessions_dir();
+            let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+            let mut log = ConversationLog::create(&persistence).expect("create");
+            log.set_system_prompt("p".into()).expect("root");
+            log.append_env_change(BTreeMap::new()).expect("valid seed");
+            let before = log.len();
+            let err = log.append_env_change(env).expect_err("invalid edit");
+            assert!(matches!(err, ConversationError::InvalidAppend(_)));
+            assert_eq!(log.len(), before);
+            assert_eq!(log.session_env(), Some(&BTreeMap::new()));
         }
 
         let dir = fresh_sessions_dir();
@@ -4669,47 +4685,50 @@ mod tests {
             agent_id: None,
             entry: ConversationEntryKind::SystemPrompt { text: "p".into() },
         };
-        let invalid_env = ConversationEntry {
-            id: "env".to_string(),
-            parent_id: Some("root".to_string()),
-            timestamp: None,
-            thread: ThreadKind::Meta,
-            agent_id: None,
-            entry: ConversationEntryKind::EnvChange {
-                env: env_map(&[("", "value")]),
-            },
-        };
-        let message = ConversationEntry {
-            id: "message".to_string(),
-            parent_id: Some("root".to_string()),
-            timestamp: None,
-            thread: ThreadKind::User,
-            agent_id: None,
-            entry: ConversationEntryKind::Message {
-                message: user_text("hi"),
-            },
-        };
-        let bytes = format!(
-            "{}\n{}\n{}",
-            serde_json::to_string(&root).expect("root"),
-            serde_json::to_string(&invalid_env).expect("env"),
-            serde_json::to_string(&message).expect("message")
-        )
-        .into_bytes();
-        std::fs::write(&path, &bytes).expect("write invalid recorded env without final newline");
+        for thread in [ThreadKind::User, ThreadKind::Meta] {
+            let invalid_env = ConversationEntry {
+                id: "env".to_string(),
+                parent_id: Some("root".to_string()),
+                timestamp: None,
+                thread,
+                agent_id: None,
+                entry: ConversationEntryKind::EnvChange {
+                    env: env_map(&[("", "value")]),
+                },
+            };
+            let message = ConversationEntry {
+                id: "message".to_string(),
+                parent_id: Some("root".to_string()),
+                timestamp: None,
+                thread: ThreadKind::User,
+                agent_id: None,
+                entry: ConversationEntryKind::Message {
+                    message: user_text("hi"),
+                },
+            };
+            let bytes = format!(
+                "{}\n{}\n{}",
+                serde_json::to_string(&root).expect("root"),
+                serde_json::to_string(&invalid_env).expect("env"),
+                serde_json::to_string(&message).expect("message")
+            )
+            .into_bytes();
+            std::fs::write(&path, &bytes)
+                .expect("write invalid recorded env without final newline");
 
-        let err = ConversationLog::resume(&persistence, session_id)
-            .err()
-            .expect("invalid recorded identity is corruption");
-        assert!(
-            err.to_string().contains("environment key \"\" is empty"),
-            "{err}"
-        );
-        assert_eq!(
-            std::fs::read(&path).expect("source bytes"),
-            bytes,
-            "validation ran after resume normalized the source file"
-        );
+            let err = ConversationLog::resume(&persistence, session_id)
+                .err()
+                .expect("invalid recorded identity is corruption");
+            assert!(
+                err.to_string().contains("environment key \"\" is empty"),
+                "{err}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("source bytes"),
+                bytes,
+                "validation ran after resume normalized the source file"
+            );
+        }
     }
 
     #[test]
@@ -4838,6 +4857,15 @@ mod tests {
         };
         let cases = [
             (
+                "2000-01-01-00-00-00-000_9",
+                vec![
+                    root.clone(),
+                    env_entry("env", "root", ThreadKind::Meta),
+                    env_entry("env", "root", ThreadKind::Meta),
+                    message.clone(),
+                ],
+            ),
+            (
                 "2000-01-01-00-00-00-000_1",
                 vec![
                     root.clone(),
@@ -4849,7 +4877,7 @@ mod tests {
                 "2000-01-01-00-00-00-000_2",
                 vec![
                     root.clone(),
-                    env_entry("env", "root", ThreadKind::User),
+                    env_entry("env", "root", ThreadKind::Subagent),
                     message.clone(),
                 ],
             ),
@@ -4936,83 +4964,137 @@ mod tests {
             agent_id: None,
             entry: ConversationEntryKind::SystemPrompt { text: "p".into() },
         };
-        let invalid_env = ConversationEntry {
-            id: "env".to_string(),
-            parent_id: Some("root".to_string()),
-            timestamp: None,
-            thread: ThreadKind::Meta,
-            agent_id: None,
-            entry: ConversationEntryKind::EnvChange {
-                env: env_map(&[("", "value")]),
-            },
-        };
-        // A repairable torn tail: complete canonical envelope anchors, then
-        // parser EOF inside the payload. Only the earlier invalid env record
-        // must keep resume from mutating it.
-        let bytes = format!(
+        for thread in [ThreadKind::User, ThreadKind::Meta] {
+            let invalid_env = ConversationEntry {
+                id: "env".to_string(),
+                parent_id: Some("root".to_string()),
+                timestamp: None,
+                thread,
+                agent_id: None,
+                entry: ConversationEntryKind::EnvChange {
+                    env: env_map(&[("", "value")]),
+                },
+            };
+            // A repairable torn tail: complete canonical envelope anchors, then
+            // parser EOF inside the payload. Only the earlier invalid env record
+            // must keep resume from mutating it.
+            let bytes = format!(
             "{}\n{}\n{{\"id\":\"torn\",\"parent_id\":\"env\",\"timestamp\":null,\"thread\":\"user\",\"type\":\"message\",\"message\":{{\"ro",
             serde_json::to_string(&root).expect("root"),
             serde_json::to_string(&invalid_env).expect("env")
         )
         .into_bytes();
-        let path = persistence.session_path(session_id);
-        std::fs::write(&path, &bytes).expect("write invalid identity and torn tail");
+            let path = persistence.session_path(session_id);
+            std::fs::write(&path, &bytes).expect("write invalid identity and torn tail");
 
-        let err = ConversationLog::resume(&persistence, session_id)
-            .err()
-            .expect("invalid identity wins over tail repair");
-        assert!(
-            err.to_string().contains("environment key \"\" is empty"),
-            "{err}"
-        );
-        assert_eq!(
-            std::fs::read(&path).expect("source bytes"),
-            bytes,
-            "tail repair ran before identity validation"
-        );
+            let err = ConversationLog::resume(&persistence, session_id)
+                .err()
+                .expect("invalid identity wins over tail repair");
+            assert!(
+                err.to_string().contains("environment key \"\" is empty"),
+                "{err}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("source bytes"),
+                bytes,
+                "tail repair ran before identity validation"
+            );
+        }
     }
 
     #[test]
-    fn env_creation_record_is_meta_rooted_and_never_a_head() {
+    fn env_replacements_follow_branches_and_resume_without_successor_punctuation() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
+        let mut log = ConversationLog::create(&persistence).expect("create");
         let root = log.set_system_prompt("p".into()).expect("root");
-        let env = log
-            .append_env_change(env_map(&[("BEADS_ACTOR", "session-actor")]))
-            .expect("env creation record");
-        let entry = log.core().get(&env.id).expect("env entry");
-        assert_eq!(entry.thread, ThreadKind::Meta);
-        assert_eq!(entry.agent_id, None);
+        let original = env_map(&[("KEEP", "old"), ("DROP", "old")]);
+        let seed = log.append_env_change(original.clone()).expect("seed");
+        let entry = log.core().get(&seed.id).expect("seed entry");
+        assert_eq!(entry.thread, ThreadKind::User);
         assert_eq!(entry.parent_id.as_ref(), Some(&root.id));
-        assert_eq!(log.head(), None, "meta identity advanced the user head");
-        assert!(
-            matches!(log.set_head(env.id), Err(ConversationError::InvalidHead(_))),
-            "immutable creation metadata became a legal conversation head"
-        );
-        log.set_head(root.id)
-            .expect("system-prompt root remains a legal head");
+        assert_eq!(log.head(), Some(&seed.id));
+        let common = punctuation(&mut log, "common").expect("publish");
+        let replacement = env_map(&[("KEEP", "new")]);
+        log.append_env_change(replacement.clone()).expect("replace");
+        let edited = log.append_env_change(replacement.clone()).expect("repeat");
+        assert_eq!(log.session_env(), Some(&replacement));
+        assert!(!log.session_env().unwrap().contains_key("DROP"));
+        log.set_head(common.id.clone()).expect("fork");
+        assert_eq!(log.session_env(), Some(&original));
+        let empty = log.append_env_change(BTreeMap::new()).expect("clear");
+        assert_eq!(log.parent_of(&empty.id), Some(&common.id));
+        assert_eq!(log.session_env(), Some(&BTreeMap::new()));
+        log.flush_pending().expect("flush established log");
+        let mut resumed =
+            ConversationLog::resume(&persistence, log.session_id()).expect("resume trailing edit");
+        assert_eq!(resumed.head(), Some(&empty.id));
+        assert_eq!(resumed.session_env(), Some(&BTreeMap::new()));
+        resumed.set_head(edited.id).expect("edited branch");
+        assert_eq!(resumed.session_env(), Some(&replacement));
+        resumed.set_head(root.id).expect("before seed");
+        assert_eq!(resumed.session_env(), None);
     }
 
     #[test]
-    fn a_second_env_creation_record_is_refused_without_replacing_identity() {
+    fn legacy_meta_env_is_a_baseline_not_a_branch_override() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
-        log.set_system_prompt("p".into()).expect("set sp");
-        let original = env_map(&[("BEADS_ACTOR", "original-actor"), ("DROPPED_KEY", "old")]);
-        log.append_env_change(original.clone())
-            .expect("creation env");
-        let replacement = env_map(&[("BEADS_ACTOR", "replacement-actor")]);
-        let err = log
-            .append_env_change(replacement)
-            .expect_err("session identity is immutable");
-        assert_eq!(
-            log.session_env(),
-            Some(&original),
-            "the refused replacement changed the creation identity"
-        );
-        assert!(matches!(err, ConversationError::InvalidAppend(_)), "{err}");
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        let root = log.set_system_prompt("p".into()).expect("root");
+        let baseline = env_map(&[("BASE", "value")]);
+        log.append(
+            Some(root.id.clone()),
+            ThreadKind::Meta,
+            None,
+            ConversationEntryKind::EnvChange {
+                env: baseline.clone(),
+            },
+        )
+        .expect("legacy env");
+        let common = punctuation(&mut log, "common").expect("publish");
+        let original_bytes = std::fs::read(log.path()).expect("legacy bytes");
+        let mut resumed =
+            ConversationLog::resume(&persistence, log.session_id()).expect("legacy resume");
+        assert_eq!(std::fs::read(log.path()).unwrap(), original_bytes);
+        assert_eq!(resumed.session_env(), Some(&baseline));
+        let edited = resumed
+            .append_env_change(BTreeMap::new())
+            .expect("override");
+        assert_eq!(resumed.session_env(), Some(&BTreeMap::new()));
+        resumed.set_head(common.id).expect("sibling");
+        punctuation(&mut resumed, "sibling").expect("publish edit and sibling");
+        assert_eq!(resumed.session_env(), Some(&baseline));
+        let mut resumed =
+            ConversationLog::resume(&persistence, log.session_id()).expect("mixed resume");
+        assert_eq!(resumed.session_env(), Some(&baseline));
+        resumed.set_head(edited.id).expect("edited branch");
+        assert_eq!(resumed.session_env(), Some(&BTreeMap::new()));
+        resumed.set_head(root.id).expect("legacy root");
+        assert_eq!(resumed.session_env(), Some(&baseline));
+    }
+
+    #[test]
+    fn resumed_user_env_duplicates_keep_the_first_state_record() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        log.set_system_prompt("p".into()).expect("root");
+        punctuation(&mut log, "published").expect("publish");
+        let env = log
+            .append_env_change(env_map(&[("KEY", "first")]))
+            .expect("env");
+        log.flush_pending().expect("flush");
+        let mut duplicate = log.core().get(&env.id).unwrap().clone();
+        duplicate.entry = ConversationEntryKind::EnvChange {
+            env: BTreeMap::new(),
+        };
+        let mut file = OpenOptions::new().append(true).open(log.path()).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&duplicate).unwrap()).unwrap();
+        let resumed =
+            ConversationLog::resume(&persistence, log.session_id()).expect("ordinary duplicate");
+        assert_eq!(resumed.len(), log.len());
+        assert_eq!(resumed.session_env(), log.session_env());
     }
 
     #[test]
@@ -5060,8 +5142,11 @@ mod tests {
         assert_eq!(
             log.session_env(),
             Some(&expected),
-            "log-level identity changed across compaction"
+            "compaction hid the ancestral environment"
         );
+        let resumed =
+            ConversationLog::resume(&persistence, log.session_id()).expect("resume compaction");
+        assert_eq!(resumed.session_env(), Some(&expected));
     }
 
     #[test]
@@ -5116,7 +5201,7 @@ mod tests {
         assert_eq!(
             log.session_env(),
             Some(&expected),
-            "switching branches changed log-level identity"
+            "a branch lost its ancestral seed"
         );
     }
 

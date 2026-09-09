@@ -4,7 +4,7 @@ use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_models::types::{ImageContent, TextContent, UserContent};
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent,
-    DecodedFrame, DirectoryHost, EmptyRequest, EnrollHostRequest, ErrorResponse, Frame,
+    DecodedFrame, DirectoryHost, EmptyRequest, EnrollHostRequest, EnvRequest, ErrorResponse, Frame,
     HeadRequest, Hello, HostList, HostNameError, HostSource, HostSummary, MAX_HOST_NAME_BYTES,
     MergedDirectory, ModelSelection, PROTOCOL_VERSION, PromptInput, PromptRequest, QueueCounts,
     QueueOperation, QueueOutcome, QueueRequest, QueueState, RawObject, RequestBody, SessionCreated,
@@ -2652,4 +2652,41 @@ fn assert_reads_what_the_rewrite_writes(frame: &DecodedFrame) {
         expected,
         "{json}",
     );
+}
+
+#[test]
+fn environment_requests_distinguish_empty_values_from_removal() {
+    for value in [
+        Some("secret=value\nnext".to_string()),
+        Some(String::new()),
+        None,
+    ] {
+        let request = EnvRequest {
+            key: "TOKEN".to_string(),
+            value: value.clone(),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded, json!({"key": "TOKEN", "value": value}));
+        assert_eq!(
+            decode_request::<EnvRequest>(&serde_json::to_vec(&encoded).unwrap()).unwrap(),
+            request
+        );
+    }
+    assert_eq!(
+        decode_request::<EnvRequest>(br#"{"key":"TOKEN"}"#)
+            .unwrap()
+            .value,
+        None
+    );
+    for body in [
+        json!({"key": "TOKEN", "value": "new", "agent": "main"}),
+        json!({"key": "TOKEN", "vaule": "new"}),
+        json!({"key": "TOKEN", "value": 3}),
+        json!({"value": "new"}),
+    ] {
+        assert!(
+            decode_request::<EnvRequest>(&serde_json::to_vec(&body).unwrap()).is_err(),
+            "{body}"
+        );
+    }
 }
