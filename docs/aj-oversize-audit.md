@@ -10,7 +10,7 @@ abstractions, tests at the stable boundary). Reference case at audit time:
 `c4b977b` (retired below).
 
 Verdicts at audit time: 27 LOOK, 43 MAYBE, 31 FINE. Follow-up work has
-retired 25 LOOKs.
+retired 26 LOOKs.
 Prod/test splits are estimates. Verify a verdict against the diff before acting
 on it: the auditors read samples of the large diffs, not every line.
 
@@ -30,7 +30,7 @@ Recurring shapes worth naming, since they repeat across the list:
 - Empty bodies on large cross-crate changes. 26 of the 88 big commits have no
   body at all.
 
-## LOOK (27 total, 2 open)
+## LOOK (27 total, 1 open)
 
 Plausibly over-engineered or over-scoped relative to the user problem.
 
@@ -59,7 +59,7 @@ Plausibly over-engineered or over-scoped relative to the user problem.
 - ~~`e1139c6` 2026-08-30 aj-app: preserve committed compaction usage atomically~~ Retired: committed compaction publishes one durable event containing optional usage, with append handoff and exclusive accounting safeguards retained.
 - ~~`70e7ee6` 2026-08-31 aj-tools: bound direct command reap after sigkill~~ Retired without code changes: the existing process guard owns bounded reap and resource release, while capture joins distinguish intentional cancellation from real failure. No worthwhile simplification identified.
 - ~~`be726be` 2026-08-31 aj-wire: reject unknown command fields~~ Retired by `6073d92b`: simple requests and creation settings use their public schemas, while specialized views preserve flattened and shared-content behavior.
-- `5fc079e` 2026-08-31 agent: serialize live usage accounting
+- ~~`5fc079e` 2026-08-31 agent: serialize live usage accounting~~ Retired without further code changes: one exclusive accounting operation publishes one complete event, and subscription-only access shares the existing bus. No worthwhile simplification identified.
 - `fe5d661` 2026-09-01 aj-models: make auth hardening guarantees load-bearing
 
 ## MAYBE (43)
@@ -305,12 +305,13 @@ Large but plausibly proportionate, with one specific thing worth a second look.
 - Why flagged: A private schema for every command duplicated ordinary request fields. There were 22 `Strict*` types, not approximately 15. Shared content and flattened prompts do need specialized decoding, and settings edits deliberately exclude creation-only account selection. The five-commit range landed together after review, not as successive deployed redesigns.
 - Disposition: Keep the eleven specialized request types, the single codec entry point, generic errors, blank-body defaults, and gateway effect ownership. The empty-object visitor still rejects arrays. Public-serializer round trips, refusal-before-effects tests, and tolerant observation coverage remain intact.
 
-### 5fc079e 2026-08-31 agent: serialize live usage accounting
+### 5fc079e 2026-08-31 agent: serialize live usage accounting [RETIRED]
+- Status: Retired without further code changes. One Agent accounting operation brings live and shutdown totals into agreement with durable checkpoint spend. `b79559f1` removed paired-event delivery by carrying usage on the checkpoint completion event.
 - Stats: 9 files, +465 -182, ~190 prod / ~200 test lines (estimate: lib.rs event_protocol_tests hunk +200; docs excluded)
 - Body: empty
-- Verdict: LOOK. Open: the exclusive accounting API, event-emission guards, and subscription capability remain in place.
-- Why: Fourth reshape of `account_usage` in 27 hours (bf3a5eb -> bdaefe6 -> e1139c6 -> this). Introduces `UsageAccounting { AssistantTerminal, CommittedCompaction { checkpoint_id, reason, tokens_before, tokens_after, summary } }` so the agent constructs `CompactionEnd` itself, makes `account_usage` take `&mut self` for serialization, adds an `EventSubscriptions` capability type so hosts can subscribe without being able to emit, and adds a runtime rejection inside `emit_event` (`"accounting events must be emitted through Agent::account_usage"`) matching on event shape. A runtime guard against misuse of one's own API plus a capability split are parallel abstractions layered on top of the emit_sequence/guard machinery from e1139c6.
-- Simpler shape: One accounting method with one event per committed operation and a doc comment on `emit_event`; serialization comes from the caller already holding the agent lock.
+- Verdict: Retired after investigation. The exclusive receiver uses ordinary Rust borrowing, the two-case accounting input constructs the appropriate event, and the emission guard prevents bypassing the accumulator. The subscription-only handle shares bus storage and registration rather than adding a parallel bus.
+- Why flagged: Repeated accounting reshapes and apparent defensive layering. The twelve-commit range landed together, not as successive deployed redesigns. The concurrency finding concerned legal public API calls, reproduced with a scheduling yield, rather than an observed live-host race. Enforcing exclusive access adds no runtime serialization machinery.
+- Disposition: Keep production and tests. Replacing the emission guard with a caller convention or exposing the full bus would weaken ownership without a worthwhile simplification. All 12 targeted accounting, listener-failure, cancellation, live/replay, attach-release, and unsuccessful-compaction tests passed.
 
 ### fe5d661 2026-09-01 aj-models: make auth hardening guarantees load-bearing
 - Stats: 1 files, +501 -19, ~160 prod / ~350 test lines (estimate: `mod fault` ~90 and `PermissionSite` wrappers ~60 are production-file code behind cfg(test))
