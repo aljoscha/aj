@@ -1388,6 +1388,7 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
             }),
             tag: None,
             host: None,
+            env: None,
         })
         .await
         .expect("create with settings and a prompt")
@@ -1607,46 +1608,118 @@ async fn control_create_defaults_unstated_thinking_against_the_selected_model() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_never_drops_env_from_a_remote_create() {
-    let fixture = Fixture::new(Vec::new()).await;
-    let env = BTreeMap::from([("BEADS_ACTOR".to_string(), "session-actor".to_string())]);
+    let fixture = Fixture::new(vec![
+        calling(
+            "inspect the session environment",
+            "env-call",
+            "bash",
+            serde_json::json!({
+                "command": "printf '%s' \"$AJ_CREATE_ENV\"",
+                "description": "observe session env",
+            }),
+        ),
+        finalized_text_message("done"),
+    ])
+    .await;
+    let env = BTreeMap::from([(
+        "AJ_CREATE_ENV".to_string(),
+        "space = 'quote' \"double\" $literal\nnext".to_string(),
+    )]);
     let local = Control::local(fixture.host.clone())
         .create(None, None, None, None, Some(env.clone()))
         .await
         .expect("local control carries session env");
-    let handles = fixture
-        .host
-        .local_handles(&local)
+    let remote = Control::remote(fixture.client())
+        .create(None, None, None, None, Some(env.clone()))
         .await
-        .expect("local handles");
-    assert_eq!(handles.log.lock().await.session_env(), Some(&env));
-    drop(handles);
-
-    let before = fixture
-        .host
-        .sessions()
-        .await
-        .expect("sessions")
-        .sessions
-        .len();
-    let err = Control::remote(fixture.client())
-        .create(None, None, None, None, Some(env))
-        .await
-        .expect_err("the pre-wire remote arm refuses rather than dropping identity");
-    assert!(
-        err.to_string().contains("remote create is not served"),
-        "{err}"
-    );
+        .expect("remote control carries session env");
+    let mut attached = fixture.remote(&remote).await;
+    fixture.prompt(&remote, "inspect it").await;
+    let output = attached
+        .pump_until("the bash result", |frame| {
+            matches!(frame, Frame::Event { event, .. } if matches!(event.known(),
+            Some(AgentEvent::ToolExecutionEnd { call_id, .. }) if call_id == "env-call"))
+        })
+        .await;
+    let observed = output.iter().find_map(|frame| match frame {
+        Frame::Event { event, .. } => match event.known() {
+            Some(AgentEvent::ToolExecutionEnd {
+                call_id,
+                result:
+                    aj_agent::tool::ToolDetails::Bash {
+                        stdout, exit_code, ..
+                    },
+                is_error,
+                ..
+            }) if call_id == "env-call" => Some((stdout.as_str(), *exit_code, *is_error)),
+            _ => None,
+        },
+        _ => None,
+    });
     assert_eq!(
-        fixture
-            .host
-            .sessions()
-            .await
-            .expect("sessions")
-            .sessions
-            .len(),
-        before,
-        "an identityless remote session was minted behind the refusal"
+        observed,
+        Some((env["AJ_CREATE_ENV"].as_str(), Some(0), false)),
+        "the actual tool process receives the requested value"
     );
+    attached.settle().await;
+
+    let mut expected = vec![(local, Some(env.clone()))];
+    for env in [None, Some(BTreeMap::new())] {
+        let id = Control::remote(fixture.client())
+            .create(None, None, None, None, env.clone())
+            .await
+            .unwrap();
+        expected.push((id, env));
+    }
+    for (id, env) in expected {
+        let handles = fixture.host.local_handles(&id).await.unwrap();
+        assert_eq!(handles.log.lock().await.session_env(), env.as_ref());
+    }
+    fixture.host.shutdown().await;
+    let persistence = ConversationPersistence::new(fixture._dir.path().join("sessions"));
+    let log = aj_session::ConversationLog::resume(&persistence, &remote)
+        .expect("persisted log after the turn");
+    assert_eq!(log.session_env(), Some(&env));
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_create_environment_maps_mint_nothing() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let persistence = ConversationPersistence::new(fixture._dir.path().join("sessions"));
+    for env in [
+        serde_json::json!({"BAD=KEY": "private-value"}),
+        serde_json::json!({"": "private-value"}),
+        serde_json::json!({"TOKEN": "private-value\0"}),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/sessions", fixture.server.url()))
+            .json(&serde_json::json!({"env": env, "prompt": {"text": "must not run"}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorResponse = response.json().await.unwrap();
+        assert_eq!(error.code, "invalid_request");
+        assert!(!error.message.contains("private-value"));
+        assert!(fixture.host.sessions().await.unwrap().sessions.is_empty());
+        assert!(
+            persistence.list_sessions().unwrap().is_empty(),
+            "refusal left a log"
+        );
+    }
+    let env = BTreeMap::from([("EMPTY".to_string(), String::new())]);
+    let id = fixture
+        .client
+        .create_session(CreateSessionRequest {
+            env: Some(env.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("an empty value is valid")
+        .id;
+    let handles = fixture.host.local_handles(&id).await.unwrap();
+    assert_eq!(handles.log.lock().await.session_env(), Some(&env));
     fixture.shutdown().await;
 }
 

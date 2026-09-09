@@ -183,6 +183,10 @@ fn every_public_command_serializer_is_accepted_by_the_closed_codec() {
         settings: Some(session_settings()),
         prompt: Some(PromptInput::Content { content: content() }),
         tag: Some("strict requests".into()),
+        env: Some(BTreeMap::from([(
+            "IDENTITY".into(),
+            "session-actor".into(),
+        )])),
     });
     assert_public_request_round_trip(PromptRequest {
         agent: Some(AgentId::Sub(7)),
@@ -410,6 +414,7 @@ fn settings_use_the_cli_selection_triple_and_create_round_trips() {
         }),
         tag: None,
         host: None,
+        env: None,
     };
     let encoded = serde_json::to_value(&create).unwrap();
     assert_eq!(encoded["prompt"], json!({"text":"start here"}));
@@ -484,6 +489,34 @@ fn a_create_names_the_host_it_is_for_or_leaves_the_choice_to_the_server() {
             "{body}",
         );
     }
+}
+
+#[test]
+fn create_environment_is_optional_and_empty_is_not_absent() {
+    for env in [
+        None,
+        Some(BTreeMap::new()),
+        Some(BTreeMap::from([
+            ("NAME".to_string(), " value\nwith=equals ".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ])),
+    ] {
+        let request = CreateSessionRequest {
+            env: env.clone(),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            decode_request::<CreateSessionRequest>(&encoded)
+                .unwrap()
+                .env,
+            env
+        );
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json.get("env").is_some(), env.is_some());
+    }
+    assert!(decode_request::<CreateSessionRequest>(br#"{"env":{"KEY":42}}"#).is_err());
+    assert!(decode_request::<SettingsRequest>(br#"{"env":{"KEY":"value"}}"#).is_err());
 }
 
 #[test]

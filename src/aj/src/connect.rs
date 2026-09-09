@@ -592,42 +592,20 @@ mod tests {
             "AFTER=two",
         ]);
         let launch = parsed.connect_launch().expect("connect launch");
-        let remote_result = bounded(
-            "the current remote boundary to refuse before create",
+        let connected = bounded(
+            "connect to create with the complete environment",
             connect(&parsed, &Config::default(), &nothing_stated(), &launch),
         )
-        .await;
-        let remote_err = match remote_result {
-            Ok(_) => panic!("remote environment transport is a separate boundary"),
-            Err(err) => err,
-        };
-        let remote_message = format!("{remote_err:#}");
-        assert!(
-            remote_message.contains("session env on a remote create is not served"),
-            "unexpected remote refusal: {remote_err:#}"
-        );
+        .await
+        .expect("remote connect creates through Control");
+        let session = connected.session;
+        assert!(connected.created, "connect attached instead of creating");
+        assert_ne!(session, existing, "--new reused the existing session");
         assert_eq!(
             peer.rows().await.len(),
-            1,
-            "the unsupported remote create minted a partial identity"
+            2,
+            "connect minted exactly one session"
         );
-
-        let control = Control::local(peer.host.clone());
-        // The shared connect selection and Control create path cross into a
-        // real local host here, where this range owns the immutable log
-        // identity independently of remote transport.
-        let (session, created) = resolve_session(
-            &control,
-            launch.session(),
-            None,
-            None,
-            None,
-            parsed.launch_env().expect("valid split env"),
-        )
-        .await
-        .expect("connect selection creates through Control");
-        assert!(created, "connect attached instead of creating");
-        assert_ne!(session, existing, "--new reused the existing session");
 
         let handles = peer
             .host
@@ -647,7 +625,7 @@ mod tests {
                 })
                 .count(),
             1,
-            "connect did not publish exactly one immutable environment identity"
+            "connect did not record exactly one initial environment map"
         );
         drop(log);
         peer.shutdown().await;

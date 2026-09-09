@@ -28528,6 +28528,56 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connected_new_sessions_keep_the_launch_environment() {
+        let host_dir = TempDir::new().expect("host tempdir");
+        let client_dir = TempDir::new().expect("client tempdir");
+        let remote = RemoteHost::start(&host_dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(
+            &client_dir,
+            &remote,
+            &["--new", "--env", "SESSION_LABEL=remote-create"],
+        )
+        .await;
+        let expected = BTreeMap::from([("SESSION_LABEL".to_string(), "remote-create".to_string())]);
+        let initial = world.session().to_string();
+        assert_eq!(remote.host.environment(&initial).await.unwrap(), expected);
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNew))
+            .expect("new-session chord");
+        let exit = crate::remote::tests::bounded(
+            "connected new session gesture",
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await
+        .expect("drive");
+        let SessionExit::New { host } = exit else {
+            panic!("new-session gesture did not create")
+        };
+        assert!(matches!(
+            apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create { host }).await,
+            Focus::Moved
+        ));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert_ne!(world.session(), initial);
+        assert_eq!(
+            remote.host.environment(world.session()).await.unwrap(),
+            expected,
+            "the connected /new path must carry the launch environment, not host defaults"
+        );
+        remote.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn embedded_server_never_inherits_the_launchers_session_env() {
         let dir = TempDir::new().expect("tempdir");
         let args = Args::parse_from([

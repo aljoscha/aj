@@ -410,7 +410,7 @@ agent" locally take an optional `agent` field (default: the main agent).
 
 | Command | Body | Semantics |
 |---|---|---|
-| `POST /v1/sessions` | `{host?, settings?, prompt?, tag?}` | Create a session in the host's working directory. `settings` per section 7. `prompt` is `{text}` or `{content: [...]}`. Settings, prompt and tag are validated before a log exists, so a refusal leaves nothing behind. The tag and first prompt are applied afterwards under the session's own lock and are best-effort: one that does not land still answers 200 `{id}` plus an `incomplete` string carrying the host's words for what did not stick, so the client retags rather than creating a second session. A first prompt whose persistence fails does so on the stream, as `persistence_failed`, after the id was answered. A minted session is never deleted to make an error tidier. |
+| `POST /v1/sessions` | `{host?, settings?, prompt?, tag?, env?}` | Create a session in the host's working directory. `settings` and the initial string-to-string `env` overlay per section 7. `prompt` is `{text}` or `{content: [...]}`. Settings, prompt, tag and env are validated before a log exists, so a refusal leaves nothing behind. The tag and first prompt are applied afterwards under the session's own lock and are best-effort: one that does not land still answers 200 `{id}` plus an `incomplete` string carrying the host's words for what did not stick, so the client retags rather than creating a second session. A first prompt whose persistence fails does so on the stream, as `persistence_failed`, after the id was answered. A minted session is never deleted to make an error tidier. |
 | `.../{id}/prompt` | `{text}` or `{content}`, optional `agent` | Run a turn if the agent is idle, queue a follow-up if busy. |
 | `.../{id}/steer` | `{text, agent?}` | Queue steering, or promote the pending follow-up when `text` is empty. |
 | `.../{id}/cancel` | `{agent?}` | Cancel the targeted agent through the mechanism that owns its run: its driven turn, a detached sub-agent's background task, or the foreground-sub-agent-cancels-main cascade. A running mark with no owning turn or task is 409 `conflict`. An idle or completed target is accepted. |
@@ -738,10 +738,18 @@ request fields are refused before mutation. Removal exposes any inherited
 process value rather than masking it. The environment read reports only
 entries remaining in the overlay.
 
-Remote launch/create environment input is not part of the creation wire
-contract. `CreateSessionRequest` and `SessionSettings` carry no environment
-map, and a client asked to send one on a remote create refuses rather than
-dropping it. Creation-wire support is separate scope.
+The optional top-level `env` on `CreateSessionRequest` supplies the initial
+branch environment. It is separate from inference `SessionSettings` and is
+validated before minting. Absence records no overlay, and an explicit empty
+map records an empty overlay. `--env KEY=VALUE` supplies this map to every
+create the invocation performs, including connected in-TUI new sessions.
+Attaching or resuming does not apply the launch map to an existing session.
+
+A protocol-2 receiver that predates the field refuses it before minting under
+the closed-schema rule (section 5.10). The client surfaces the refusal and
+never retries with env removed. Protocol-1 peers are refused at hello. The
+ordinary successful create response needs no env echo or proof exchange.
+Gateways forward the map to the owning host without interpreting it.
 
 ## 8. Client TUI
 

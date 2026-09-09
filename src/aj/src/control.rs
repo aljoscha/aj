@@ -307,12 +307,6 @@ impl Control {
                     .await?)
             }
             Self::Remote(remote) => {
-                if session_env.is_some() {
-                    return Err(HostError::Unsupported(
-                        "session env on a remote create is not served by this build".to_string(),
-                    )
-                    .into());
-                }
                 let created = remote
                     .client
                     .create_session(CreateSessionRequest {
@@ -320,6 +314,7 @@ impl Control {
                         settings,
                         prompt: prompt.map(|content| PromptInput::Content { content }),
                         tag,
+                        env: session_env,
                     })
                     .await?;
                 match created.incomplete {

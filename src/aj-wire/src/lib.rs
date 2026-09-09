@@ -4,6 +4,7 @@
 //! has to satisfy ([`normalize_host_name`]). Transport and session behavior
 //! live in their respective frontend and application crates.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -99,6 +100,10 @@ pub struct CreateSessionRequest {
     /// rules as [`TagRequest`], so a blank one leaves the session untagged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// The initial environment overlay for this session, independent of host
+    /// defaults. An explicitly empty map remains distinct from absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
 }
 
 /// Identifies a newly created session, and says what the create could not
@@ -839,6 +844,8 @@ mod request {
         prompt: Option<StrictPromptInput>,
         #[serde(default)]
         tag: Option<String>,
+        #[serde(default)]
+        env: Option<BTreeMap<String, String>>,
     }
 
     request_body!(
@@ -849,6 +856,7 @@ mod request {
             settings: request.settings.map(Into::into),
             prompt: request.prompt.map(Into::into),
             tag: request.tag,
+            env: request.env,
         }
     );
 

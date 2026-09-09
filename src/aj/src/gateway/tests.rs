@@ -3591,6 +3591,106 @@ async fn a_create_body_that_repeats_a_key_is_the_hosts_to_refuse() {
     host.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_create_environment_reaches_the_owning_host_log() {
+    let mut host = Upstream::start().await;
+    let fixture = Fixture::new(&[&host]).await;
+    fixture.until_connected(&host.host_id()).await;
+    let env = BTreeMap::from([("TOKEN".to_string(), "literal=value\n'quoted'".to_string())]);
+    let id = crate::control::Control::remote(RemoteClient::new(&fixture.server.url()).unwrap())
+        .create(Some(host.host_id()), None, None, None, Some(env.clone()))
+        .await
+        .expect("create through gateway");
+    let local = host.session_ids().await;
+    assert_eq!(local.len(), 1);
+    assert_eq!(id, host.namespaced(&local[0]));
+    let handles = host.host.local_handles(&local[0]).await.unwrap();
+    assert_eq!(handles.log.lock().await.session_env(), Some(&env));
+    fixture.shutdown().await;
+    host.stop().await;
+}
+
+/// The protocol-2 create envelope from 4dee971. The host, not a capability
+/// gate in either intermediary, owns rejection of unknown top-level fields.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvlessCreateRequest {
+    #[serde(default, rename = "host")]
+    _host: Option<String>,
+    #[serde(default, rename = "settings")]
+    _settings: Option<aj_wire::SessionSettings>,
+    #[serde(default, rename = "prompt")]
+    _prompt: Option<PromptInput>,
+    #[serde(default, rename = "tag")]
+    _tag: Option<String>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_envless_protocol_two_host_refuses_create_directly_and_through_gateway() {
+    let recorder = Recorder::serve_with_schema("envless", true, true).await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![recorder.address.clone()],
+    )
+    .await;
+    fixture.until_connected("envless").await;
+    for (index, url) in [recorder.address.url().to_string(), fixture.server.url()]
+        .into_iter()
+        .enumerate()
+    {
+        let client = RemoteClient::new(&url).unwrap();
+        assert_eq!(client.hello().await.unwrap().protocol, 2);
+        let control = crate::control::Control::remote(client);
+        control
+            .create(Some("envless".to_string()), None, None, None, None)
+            .await
+            .expect("the frozen host can mint without env");
+        assert_eq!(recorder.minted.load(Ordering::SeqCst), index + 1);
+        let env = BTreeMap::from([("TOKEN".to_string(), "private=value\n'quoted'".to_string())]);
+        let assignment = format!("TOKEN={}", env["TOKEN"]);
+        let args = Args::try_parse_from([
+            "aj",
+            "connect",
+            &url,
+            "--new",
+            "--env",
+            &assignment,
+            "must not run",
+        ])
+        .unwrap();
+        let launch = args.connect_launch().unwrap();
+        let stated = crate::connect::Stated::new(Default::default(), Default::default());
+        let error =
+            match crate::connect::connect(&args, &Default::default(), &stated, &launch).await {
+                Ok(_) => panic!("strict host accepted unknown env"),
+                Err(error) => error,
+            };
+        let Some(crate::control::ControlError::Remote(error)) =
+            error.downcast_ref::<crate::control::ControlError>()
+        else {
+            panic!("not a host HTTP refusal")
+        };
+        assert_eq!(error.status(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(error.code(), Some("invalid_request"));
+        assert!(!error.to_string().contains("private=value"));
+        assert_eq!(recorder.minted.load(Ordering::SeqCst), index + 1);
+        let sent = recorder.creates();
+        assert_eq!(sent.len(), (index + 1) * 2, "no client or gateway pre-gate");
+        let expected = CreateSessionRequest {
+            host: (index == 1).then(|| "envless".to_string()),
+            env: Some(env),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(sent.last().unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(recorder.proxied().is_empty(), "no follow-up prompt");
+    }
+    fixture.shutdown().await;
+    recorder.stop();
+}
+
 /// The one route a [`Recorder`] refuses, so a test can watch an error body cross
 /// the proxy.
 const REFUSED_ROUTE: &str = "refuse";
@@ -3614,6 +3714,7 @@ struct Recorder {
     /// none.
     create_queries: Arc<StdMutex<Vec<Option<String>>>>,
     proxied: Arc<StdMutex<Vec<ProxiedRequest>>>,
+    minted: Arc<AtomicUsize>,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -3632,6 +3733,10 @@ impl Recorder {
     }
 
     async fn serve(host_id: &str, stream: bool) -> Self {
+        Self::serve_with_schema(host_id, stream, false).await
+    }
+
+    async fn serve_with_schema(host_id: &str, stream: bool, envless: bool) -> Self {
         use axum::response::sse::{Event, Sse};
         use axum::routing::{get, post};
 
@@ -3639,8 +3744,9 @@ impl Recorder {
         let create_queries: Arc<StdMutex<Vec<Option<String>>>> =
             Arc::new(StdMutex::new(Vec::new()));
         let proxied: Arc<StdMutex<Vec<ProxiedRequest>>> = Arc::new(StdMutex::new(Vec::new()));
+        let minted = Arc::new(AtomicUsize::new(0));
         let hello = serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
+            "protocol": if envless { 2 } else { PROTOCOL_VERSION },
             "capabilities": [],
             "app_version": "0",
             "host_id": host_id,
@@ -3675,9 +3781,11 @@ impl Recorder {
             .route(
                 "/v1/sessions",
                 post({
+                    let minted = Arc::clone(&minted);
                     let creates = Arc::clone(&creates);
                     let create_queries = Arc::clone(&create_queries);
                     move |uri: axum::http::Uri, body: String| {
+                        let minted = Arc::clone(&minted);
                         let creates = Arc::clone(&creates);
                         let create_queries = Arc::clone(&create_queries);
                         async move {
@@ -3688,9 +3796,18 @@ impl Recorder {
                                 .expect("the queries mutex is poisoned")
                                 .push(uri.query().map(str::to_string));
                             let mut held = creates.lock().expect("the creates mutex is poisoned");
-                            let refuse = body.contains(REFUSED_CREATE_FIELD);
+                            let refuse = if envless {
+                                serde_json::from_str::<EnvlessCreateRequest>(&body).is_err()
+                            } else {
+                                body.contains(REFUSED_CREATE_FIELD)
+                            };
                             held.push(body);
                             if refuse {
+                                if envless {
+                                    return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
+                                        "code": "invalid_request", "message": "malformed request body"
+                                    }))).into_response();
+                                }
                                 return (
                                     StatusCode::BAD_REQUEST,
                                     [(reqwest::header::CONTENT_TYPE, "application/json")],
@@ -3698,8 +3815,9 @@ impl Recorder {
                                 )
                                     .into_response();
                             }
+                            let count = minted.fetch_add(1, Ordering::SeqCst) + 1;
                             axum::Json(serde_json::json!({
-                                "id": format!("recorded-{}", held.len())
+                                "id": format!("recorded-{}", if envless { count } else { held.len() })
                             }))
                             .into_response()
                         }
@@ -3765,6 +3883,7 @@ impl Recorder {
             creates,
             create_queries,
             proxied,
+            minted,
             serving,
         }
     }

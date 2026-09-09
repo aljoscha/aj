@@ -105,10 +105,11 @@ must be upgraded before using edited sessions.
 first equals sign and refuses duplicate keys, missing equals signs, or invalid
 entries. It has no process-environment binding and no `config.toml` equivalent.
 
-For local interactive and print runs, the map applies to sessions the invocation
-creates, including later in-TUI new sessions. It is passed explicitly to each
-create, not installed in the host's base configuration. Other clients creating
-sessions on an embedded host therefore do not inherit the launcher's map.
+For local interactive, connected, and print runs, the map applies to sessions
+the invocation creates, including later in-TUI new sessions. It is passed
+explicitly to each create, not installed in the host's base configuration.
+Other clients creating sessions on an embedded host therefore do not inherit
+the launcher's map.
 
 On continue or attach, the existing session keeps its recorded branch map. The
 launch map stays available for later creates, and a notice explains that the
@@ -116,11 +117,16 @@ flag did not edit the resumed session. Use the environment window for a
 conscious edit. `serve` and `gateway` refuse `--env` because those invocations do
 not create a session themselves.
 
-Remote **creation** with `--env` is a separate extension. This build refuses
-that request before creating a session rather than silently dropping the map.
-Connected inspection and editing of existing sessions are supported regardless.
-The remote-control specification owns the create-wire extension and its strict
-request compatibility rules.
+Remote creates carry an optional top-level `env` map in `CreateSessionRequest`.
+The host validates the map before minting and records it as the initial branch
+environment. An explicitly empty map is recorded as empty, while an absent map
+records no environment. Gateways forward it without interpreting its contents.
+
+A protocol-2 host predating this field refuses it under strict request decoding,
+before minting a session. Protocol-1 peers are refused at hello. Clients do not
+retry after stripping the map, and no environment echo, proof exchange, or
+capability pre-gate is needed. Successful creation keeps the ordinary
+`SessionCreated` response and existing partial-create behavior.
 
 ## Host and wire boundary
 

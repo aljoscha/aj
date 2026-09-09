@@ -252,6 +252,7 @@ async fn create_session(
         settings,
         prompt,
         tag,
+        env,
     } = request;
     // Refuse a create meant for another host: a plain host accepts only an
     // absent `host` or its own id, it cannot create elsewhere. The rule is the
@@ -264,7 +265,7 @@ async fn create_session(
             settings,
             prompt.map(|prompt| prompt.into_content()),
             tag,
-            None,
+            env,
         )
         .await;
     let created = match created {
