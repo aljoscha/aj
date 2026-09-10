@@ -73,6 +73,8 @@ pub struct UserEntry {
     pub message_id: Option<String>,
     /// The authoritative wire content blocks.
     pub content: Vec<UserContent>,
+    /// Recorded branch context carried by this message, absent on older hosts.
+    pub branch_settings: Option<aj_wire::BranchSettings>,
 }
 
 impl UserEntry {
@@ -1303,6 +1305,7 @@ mod tests {
             .append(EntryKind::User(UserEntry {
                 message_id: None,
                 content: Vec::new(),
+                branch_settings: None,
             }));
         assert!(
             chat.has_conversation(),

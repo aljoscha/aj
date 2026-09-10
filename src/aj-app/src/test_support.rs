@@ -323,6 +323,7 @@ pub enum CanonicalEntry {
     User {
         message_id: Option<String>,
         content: Value,
+        branch_settings: Option<aj_wire::BranchSettings>,
     },
     Assistant {
         message_id: Option<String>,
@@ -712,6 +713,7 @@ fn canonical_entry(entry: &Entry) -> CanonicalEntry {
         EntryKind::User(u) => CanonicalEntry::User {
             message_id: u.message_id.clone(),
             content: json(&u.content),
+            branch_settings: u.branch_settings.clone(),
         },
         EntryKind::Assistant(a) => CanonicalEntry::Assistant {
             message_id: a.message_id.clone(),
@@ -1144,7 +1146,11 @@ mod tests {
                 agent_id: AgentId::Main,
                 text: "Thinking level set to high.".to_string(),
             },
-            Some(&"entry-7".to_string()),
+            Some(&aj_wire::DurableEvent {
+                seq: 7,
+                entry_id: "entry-7".to_string(),
+                branch_settings: None,
+            }),
         );
         let projected = CanonicalState::of_reduced(&chat, &lifecycle);
         let empty = CanonicalState::of_reduced(

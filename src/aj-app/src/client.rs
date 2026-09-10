@@ -333,12 +333,7 @@ impl SessionClient {
                         follow_up: follow_up.clone(),
                     });
                 }
-                reduce(
-                    chat,
-                    &mut self.lifecycle,
-                    event,
-                    durability.as_ref().map(|durability| &durability.entry_id),
-                )
+                reduce(chat, &mut self.lifecycle, event, durability.as_ref())
             }
             Frame::State {
                 session,
@@ -920,6 +915,7 @@ mod tests {
             durability: Some(aj_wire::DurableEvent {
                 seq,
                 entry_id: entry_id.to_string(),
+                branch_settings: None,
             }),
             event: event.into(),
         }

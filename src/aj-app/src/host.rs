@@ -34,6 +34,7 @@
 
 pub(crate) mod driver;
 mod fanout;
+mod head;
 mod live;
 mod store;
 
@@ -382,7 +383,7 @@ fn keep_tail(path: &str) -> &str {
     }
 }
 
-/// A mutation of one session.
+/// An operation on one session.
 ///
 /// Commands that act on "the viewed agent" locally carry the target
 /// explicitly, so a client resolves its own view to a parameter.
@@ -438,6 +439,7 @@ pub enum Command {
     /// Switch the session's head. Refused while work is live.
     Head {
         target: HeadTarget,
+        changes: aj_wire::BranchChanges,
     },
     KillTask {
         task: TaskId,
@@ -450,6 +452,7 @@ pub enum Command {
 /// replace that message rather than continue after it, so the head goes to
 /// its parent. The host resolves the parent, which keeps the gesture one
 /// command and keeps every client from repeating the same walk.
+#[derive(Clone)]
 pub enum HeadTarget {
     Entry(EntryId),
     Before(EntryId),
@@ -762,6 +765,8 @@ impl SessionHost {
                 COMPACTION_USAGE_CAPABILITY.to_string(),
                 aj_wire::SESSION_ENV_CAPABILITY.to_string(),
                 aj_wire::SESSION_ACCOUNTS_CAPABILITY.to_string(),
+                aj_wire::BRANCH_SETTINGS_CAPABILITY.to_string(),
+                aj_wire::TRANSCRIPT_SETTINGS_CAPABILITY.to_string(),
             ],
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.host_id.clone(),
@@ -875,29 +880,11 @@ impl SessionHost {
         &self,
         selection: &ModelSelection,
     ) -> Result<ModelInfo, HostError> {
-        validate_model_selection(selection)?;
-        let mut info = self
-            .inner
-            .shared
-            .catalog
-            .iter()
-            .find(|info| info.provider == selection.api && info.id == selection.name)
-            .cloned()
-            .or_else(|| {
-                (self.inner.run_config_defaults.startup().model_key
-                    == (selection.api.clone(), selection.name.clone()))
-                    .then(|| (*self.inner.run_config_defaults.startup().model_info).clone())
-            })
-            .ok_or_else(|| {
-                HostError::Unsupported(format!(
-                    "model {}/{} is not in the host catalog",
-                    selection.api, selection.name
-                ))
-            })?;
-        if let Some(url) = &selection.url {
-            info.base_url.clone_from(url);
-        }
-        Ok(info)
+        resolve_model_selection(
+            &self.inner.shared.catalog,
+            self.inner.run_config_defaults.startup(),
+            selection,
+        )
     }
 
     /// Open a stream and serve an attach block for every session it can
@@ -1344,6 +1331,23 @@ impl SessionHost {
         Ok(env)
     }
 
+    /// The environment overlay before exactly `message`, with the same target
+    /// validation as a head switch. This read is allowed during live work and
+    /// changes neither the head nor the runtime.
+    pub async fn environment_before(
+        &self,
+        session: &str,
+        message: &str,
+    ) -> Result<BTreeMap<String, String>, HostError> {
+        let live = self.live(session).await?;
+        let log = live.core.log.lock().await;
+        let entry = driver::resolve_head_target(&log, &HeadTarget::Before(message.to_string()))?;
+        Ok(log
+            .session_env_at(Some(&entry))
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Account names and selection policy on the host, never bearer material.
     pub async fn accounts(
         &self,
@@ -1693,103 +1697,18 @@ impl SessionHost {
         settings: Option<&SessionSettings>,
         config: &Config,
     ) -> Result<RunConfigSnapshot, HostError> {
-        let mut run = self
+        let run = self
             .inner
             .run_config_defaults
             .resolve(config, &self.inner.shared.auth)
             .map_err(|err| HostError::Unsupported(err.to_string()))?;
-        let default_settings = SessionSettings::default();
-        let settings = settings.unwrap_or(&default_settings);
-
-        let speed = match settings.speed.as_deref() {
-            Some(name) => speed_from_name(name).ok_or_else(|| {
-                HostError::Invalid(format!("unknown speed {name:?}. Expected standard or fast"))
-            })?,
-            None => run.speed,
-        };
-
-        if let Some(selection) = &settings.model {
-            let info = self.resolve_model_selection(selection)?;
-            let base_bundle = run.model_key == (selection.api.clone(), selection.name.clone())
-                && self.inner.shared.catalog.iter().all(|catalog| {
-                    catalog.provider != selection.api || catalog.id != selection.name
-                });
-            if base_bundle {
-                if selection
-                    .url
-                    .as_deref()
-                    .is_some_and(|url| url != run.model_info.base_url)
-                {
-                    return Err(HostError::Unsupported(format!(
-                        "the host's injected model {}/{} cannot change its URL",
-                        selection.api, selection.name
-                    )));
-                }
-            } else {
-                let resolved = crate::model::from_model_info(&self.inner.shared.auth, info, speed)
-                    .map_err(|err| HostError::Unsupported(err.to_string()))?;
-                run.provider = resolved.provider;
-                run.model_info = resolved.model_info;
-                run.stream_options = resolved.stream_options;
-            }
-            run.model_key = (selection.api.clone(), selection.name.clone());
-        }
-
-        run.speed = speed;
-        run.stream_options.speed = speed;
-
-        if let Some(name) = settings.thinking_display.as_deref() {
-            run.thinking_display = thinking_display_from_name(name).ok_or_else(|| {
-                HostError::Invalid(format!(
-                    "unknown thinking display {name:?}. Expected default, summarized, detailed, or omitted"
-                ))
-            })?;
-        }
-        crate::model::apply_thinking_display(&mut run.stream_options, run.thinking_display);
-
-        if let Some(name) = settings.verbosity.as_deref() {
-            run.stream_options.verbosity = verbosity_from_name(name).ok_or_else(|| {
-                HostError::Invalid(format!(
-                    "unknown verbosity {name:?}. Expected default, low, medium, or high"
-                ))
-            })?;
-        }
-
-        if let Some(name) = settings.thinking.as_deref() {
-            run.thinking = thinking_config_from_name(name).ok_or_else(|| {
-                HostError::Invalid(format!(
-                    "unknown thinking level {name:?}. Expected off, minimal, low, medium, high, xhigh, or max"
-                ))
-            })?;
-            let level = run
-                .thinking
-                .as_ref()
-                .map(thinking_level_for)
-                .unwrap_or(aj_models::types::ThinkingLevel::Off);
-            validate_thinking_level(&run.model_info, &level).map_err(HostError::Unsupported)?;
-        } else {
-            // Unstated, so this axis is ours to default and we default it
-            // against the model actually chosen. Our own
-            // configured level was resolved for our own default model, and a
-            // creator who names a model without naming a level would otherwise
-            // inherit a level that model may have no word for.
-            let configured = run
-                .thinking
-                .as_ref()
-                .map(thinking_level_for)
-                .unwrap_or(aj_models::types::ThinkingLevel::Off);
-            let level = default_thinking_level(&run.model_info, &configured);
-            if level != configured {
-                run.thinking = thinking_config_from_name(level.as_str())
-                    .expect("a canonical level name parses");
-            }
-        }
-
-        if let Some(selection) = &settings.account {
-            run.accounts.set(&run.model_key.0, selection.name.clone());
-        }
-        run.bind_accounts(&self.inner.shared.auth);
-        Ok(run)
+        apply_settings(
+            run,
+            settings,
+            &self.inner.shared.catalog,
+            &self.inner.shared.auth,
+            false,
+        )
     }
 
     /// Return the live session for `id`, creating it (when `id` is `None`)
@@ -2103,10 +2022,9 @@ impl SessionHost {
                 Frame::Event {
                     session: session.id().to_string(),
                     epoch: epoch.clone(),
-                    durability: tagged.entry.map(|entry| DurableEvent {
-                        seq: entry.seq,
-                        entry_id: entry.id,
-                    }),
+                    durability: tagged
+                        .entry
+                        .map(|entry| durable_event(entry, tagged.branch_settings)),
                     event: tagged.event.into(),
                 },
             )
@@ -2263,6 +2181,159 @@ fn validate_prompt(content: &[UserContent]) -> Result<(), HostError> {
         return Err(HostError::Invalid("the prompt is empty".to_string()));
     }
     Ok(())
+}
+
+fn resolve_model_selection(
+    catalog: &[ModelInfo],
+    fallback: &RunConfigSnapshot,
+    selection: &ModelSelection,
+) -> Result<ModelInfo, HostError> {
+    validate_model_selection(selection)?;
+    let mut info = catalog
+        .iter()
+        .find(|info| info.provider == selection.api && info.id == selection.name)
+        .cloned()
+        .or_else(|| {
+            (fallback.model_key == (selection.api.clone(), selection.name.clone()))
+                .then(|| (*fallback.model_info).clone())
+        })
+        .ok_or_else(|| {
+            HostError::Unsupported(format!(
+                "model {}/{} is not in the host catalog",
+                selection.api, selection.name
+            ))
+        })?;
+    if let Some(url) = &selection.url {
+        info.base_url.clone_from(url);
+    }
+    Ok(info)
+}
+
+/// Apply explicit axes to a resolved baseline. A branch inherits untouched
+/// axes verbatim and validates their combination. A creator may default effort
+/// for its chosen model instead.
+fn apply_settings(
+    mut run: RunConfigSnapshot,
+    settings: Option<&SessionSettings>,
+    catalog: &[ModelInfo],
+    auth: &AuthStorage,
+    inherit_unstated: bool,
+) -> Result<RunConfigSnapshot, HostError> {
+    let default_settings = SessionSettings::default();
+    let settings = settings.unwrap_or(&default_settings);
+
+    let speed = match settings.speed.as_deref() {
+        Some(name) => speed_from_name(name).ok_or_else(|| {
+            HostError::Invalid(format!("unknown speed {name:?}. Expected standard or fast"))
+        })?,
+        None => run.speed,
+    };
+
+    let verbosity = run.stream_options.verbosity;
+    let mut bundle_model = None;
+    if let Some(selection) = &settings.model {
+        let info = resolve_model_selection(catalog, &run, selection)?;
+        let base_bundle = run.model_key == (selection.api.clone(), selection.name.clone())
+            && catalog
+                .iter()
+                .all(|catalog| catalog.provider != selection.api || catalog.id != selection.name);
+        if base_bundle {
+            if selection
+                .url
+                .as_deref()
+                .is_some_and(|url| url != run.model_info.base_url)
+            {
+                return Err(HostError::Unsupported(format!(
+                    "the host's injected model {}/{} cannot change its URL",
+                    selection.api, selection.name
+                )));
+            }
+        } else {
+            bundle_model = Some(info);
+        }
+        run.model_key = (selection.api.clone(), selection.name.clone());
+    }
+
+    if inherit_unstated
+        && bundle_model.is_none()
+        && aj_models::speed_name(speed) != aj_models::speed_name(run.speed)
+    {
+        bundle_model = Some((*run.model_info).clone());
+    }
+    if let Some(info) = bundle_model {
+        let resolved = crate::model::from_model_info(auth, info, speed)
+            .map_err(|err| HostError::Unsupported(err.to_string()))?;
+        run.provider = resolved.provider;
+        run.model_info = resolved.model_info;
+        run.stream_options = resolved.stream_options;
+    }
+    if inherit_unstated {
+        run.stream_options.verbosity = verbosity;
+    }
+    run.speed = speed;
+    run.stream_options.speed = speed;
+
+    if let Some(name) = settings.thinking_display.as_deref() {
+        run.thinking_display = thinking_display_from_name(name).ok_or_else(|| {
+                HostError::Invalid(format!(
+                    "unknown thinking display {name:?}. Expected default, summarized, detailed, or omitted"
+                ))
+            })?;
+    }
+    crate::model::apply_thinking_display(&mut run.stream_options, run.thinking_display);
+
+    if let Some(name) = settings.verbosity.as_deref() {
+        run.stream_options.verbosity = verbosity_from_name(name).ok_or_else(|| {
+            HostError::Invalid(format!(
+                "unknown verbosity {name:?}. Expected default, low, medium, or high"
+            ))
+        })?;
+    }
+
+    if let Some(name) = settings.thinking.as_deref() {
+        run.thinking = thinking_config_from_name(name).ok_or_else(|| {
+                HostError::Invalid(format!(
+                    "unknown thinking level {name:?}. Expected off, minimal, low, medium, high, xhigh, or max"
+                ))
+            })?;
+        let level = run
+            .thinking
+            .as_ref()
+            .map(thinking_level_for)
+            .unwrap_or(aj_models::types::ThinkingLevel::Off);
+        validate_thinking_level(&run.model_info, &level).map_err(HostError::Unsupported)?;
+    } else if !inherit_unstated {
+        // Unstated, so this axis is ours to default and we default it
+        // against the model actually chosen. Our own
+        // configured level was resolved for our own default model, and a
+        // creator who names a model without naming a level would otherwise
+        // inherit a level that model may have no word for.
+        let configured = run
+            .thinking
+            .as_ref()
+            .map(thinking_level_for)
+            .unwrap_or(aj_models::types::ThinkingLevel::Off);
+        let level = default_thinking_level(&run.model_info, &configured);
+        if level != configured {
+            run.thinking =
+                thinking_config_from_name(level.as_str()).expect("a canonical level name parses");
+        }
+    }
+
+    if inherit_unstated && settings.thinking.is_none() {
+        let level = run
+            .thinking
+            .as_ref()
+            .map(thinking_level_for)
+            .unwrap_or(aj_models::types::ThinkingLevel::Off);
+        validate_thinking_level(&run.model_info, &level).map_err(HostError::Unsupported)?;
+    }
+
+    if let Some(selection) = &settings.account {
+        run.accounts.set(&run.model_key.0, selection.name.clone());
+    }
+    run.bind_accounts(auth);
+    Ok(run)
 }
 
 fn validate_model_selection(selection: &ModelSelection) -> Result<(), HostError> {
@@ -2549,6 +2620,26 @@ fn spawn_list_publisher(inner: &Arc<HostInner>) {
             fanout.publish_list(host.directory().await.sessions);
         }
     });
+}
+
+/// Convert only the recorded path state, never the currently selected runtime.
+fn durable_event(
+    entry: aj_session::EntryRef,
+    settings: Option<aj_session::SessionSettings>,
+) -> DurableEvent {
+    DurableEvent {
+        seq: entry.seq,
+        entry_id: entry.id,
+        branch_settings: settings.map(|settings| aj_wire::BranchSettings {
+            model: settings
+                .model
+                .map(|(api, name)| aj_wire::RecordedModel { api, name }),
+            thinking: settings.thinking,
+            speed: settings.speed,
+            verbosity: settings.verbosity,
+            accounts: settings.accounts,
+        }),
+    }
 }
 
 #[cfg(test)]

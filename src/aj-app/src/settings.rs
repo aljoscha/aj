@@ -69,8 +69,7 @@ pub enum ConfigTarget {
     Project,
 }
 
-/// How a confirmed setting change persists, beyond the effect it
-/// always has on the running session.
+/// How a setting change persists, independently of applying it to a session.
 ///
 /// The `/thinking` and `/model` overlays are session-scoped
 /// ([`PersistAction::None`]); the settings windows persist to a config
@@ -217,6 +216,96 @@ pub fn persist_setting(
         PersistAction::User => persist_user(layers, effective, user_mutate),
         PersistAction::ProjectSet => persist_project(layers, effective, &[(key, value)]),
         PersistAction::ProjectClear => persist_project(layers, effective, &[(key, None)]),
+    }
+}
+
+/// Save an axis choice as a config default, refreshing `config` from the layers.
+///
+/// Does not change runtime settings or append to the session log, so a frontend
+/// can save defaults while keeping a branch choice pending. Returns a save
+/// failure notice, or `None` on success (including [`PersistAction::None`]).
+pub fn persist_axis(
+    layers: &Arc<Mutex<ConfigLayers>>,
+    config: &Arc<Mutex<Config>>,
+    persist: PersistAction,
+    axis: &crate::host::SettingsAxis,
+) -> Option<String> {
+    use crate::host::SettingsAxis;
+
+    match axis {
+        SettingsAxis::Thinking(level) => persist_setting(
+            layers,
+            config,
+            persist,
+            "thinking",
+            Some(thinking_level_name(level)),
+            |c| c.thinking = Some(config_thinking_level(level.as_ref())),
+        ),
+        SettingsAxis::Model(info) => {
+            // `model_url` is a user-supplied endpoint override, not part of
+            // the model choice. Saving the catalog URL would freeze out
+            // updates to models.json.
+            match persist {
+                PersistAction::None => None,
+                PersistAction::User => persist_user(layers, config, |c| {
+                    c.model_api = Some(info.provider.clone());
+                    c.model_name = Some(info.id.clone());
+                }),
+                PersistAction::ProjectSet => persist_project(
+                    layers,
+                    config,
+                    &[
+                        ("model_api", Some(info.provider.as_str())),
+                        ("model_name", Some(info.id.as_str())),
+                    ],
+                ),
+                PersistAction::ProjectClear => {
+                    persist_project(layers, config, &[("model_api", None), ("model_name", None)])
+                }
+            }
+        }
+        SettingsAxis::Speed(speed) => {
+            // Standard removes the user key but is an explicit project
+            // override, so a project can override a user default of fast.
+            persist_setting(
+                layers,
+                config,
+                persist,
+                "speed",
+                Some(speed_name(*speed)),
+                |c| {
+                    c.speed = match speed {
+                        None | Some(Speed::Standard) => None,
+                        Some(Speed::Fast) => Some(ConfigSpeed::Fast),
+                    };
+                },
+            )
+        }
+        SettingsAxis::Verbosity(verbosity) => {
+            // The default choice removes the key in either layer.
+            let value = verbosity.map(|value| value.to_string());
+            persist_setting(
+                layers,
+                config,
+                persist,
+                "verbosity",
+                value.as_deref(),
+                |c| {
+                    c.verbosity = *verbosity;
+                },
+            )
+        }
+        SettingsAxis::ThinkingDisplay(display) => {
+            let value = display.map(|value| value.to_string());
+            persist_setting(
+                layers,
+                config,
+                persist,
+                "thinking_display",
+                value.as_deref(),
+                |c| c.thinking_display = *display,
+            )
+        }
     }
 }
 
@@ -444,13 +533,11 @@ pub async fn confirm_thinking_for_main(
     // this session (the settings windows). The `/thinking` overlay
     // command is session-scoped: it relies on the session-log record
     // above to survive a resume and leaves the default untouched.
-    let save_note = persist_setting(
+    let save_note = persist_axis(
         layers,
         config,
         persist,
-        "thinking",
-        Some(thinking_level_name(&level)),
-        |c| c.thinking = Some(config_thinking_level(level.as_ref())),
+        &crate::host::SettingsAxis::Thinking(level),
     );
     MainConfirm {
         footer: Some(FooterUpdate {
@@ -620,28 +707,12 @@ pub async fn confirm_model_for_main(
             // (the settings windows). The `/model` overlay command is
             // session-scoped: it relies on the session-log record above
             // to survive a resume and leaves the default untouched.
-            // `model_url` is intentionally left untouched: it's a
-            // user-supplied endpoint override, not part of "which
-            // model", and pinning the catalog's base URL into it would
-            // freeze out future `models.json` updates.
-            let save_note = match persist {
-                PersistAction::None => None,
-                PersistAction::User => persist_user(layers, config, |c| {
-                    c.model_api = Some(info.provider.clone());
-                    c.model_name = Some(info.id.clone());
-                }),
-                PersistAction::ProjectSet => persist_project(
-                    layers,
-                    config,
-                    &[
-                        ("model_api", Some(info.provider.as_str())),
-                        ("model_name", Some(info.id.as_str())),
-                    ],
-                ),
-                PersistAction::ProjectClear => {
-                    persist_project(layers, config, &[("model_api", None), ("model_name", None)])
-                }
-            };
+            let save_note = persist_axis(
+                layers,
+                config,
+                persist,
+                &crate::host::SettingsAxis::Model(info.clone()),
+            );
             MainConfirm {
                 footer: Some(FooterUpdate {
                     settings,
@@ -773,16 +844,11 @@ pub async fn confirm_verbosity_for_main(
         let mut log = core.log.lock().await;
         record(log.append_verbosity_change(ThreadFilter::USER, name))
     };
-    // The verbosity name (`low`/`medium`/`high`) is the canonical
-    // config value; `None` means "unset" and removes the key.
-    let verbosity_str = verbosity.map(|v| v.to_string());
-    let save_note = persist_setting(
+    let save_note = persist_axis(
         layers,
         config,
         persist,
-        "verbosity",
-        verbosity_str.as_deref(),
-        |c| c.verbosity = verbosity,
+        &crate::host::SettingsAxis::Verbosity(verbosity),
     );
     VerbosityConfirm {
         notice: format!("Output verbosity set to {name}. Takes effect next turn."),
@@ -809,14 +875,11 @@ pub fn confirm_thinking_display_for_main(
         apply_thinking_display(&mut cfg.stream_options, display);
     }
     let name = thinking_display_name(display);
-    let value = display.map(|value| value.to_string());
-    let save_note = persist_setting(
+    let save_note = persist_axis(
         layers,
         config,
         persist,
-        "thinking_display",
-        value.as_deref(),
-        |config| config.thinking_display = display,
+        &crate::host::SettingsAxis::ThinkingDisplay(display),
     );
     ConfirmOutcome {
         applied: true,
@@ -878,16 +941,12 @@ pub async fn confirm_speed_for_main(
                 let mut log = core.log.lock().await;
                 record(log.append_speed_change(ThreadFilter::USER, name))
             };
-            // "standard" persists to the user layer as key removal:
-            // it's the default, and `speed_from_name` maps it to `None`
-            // on the wire. The project layer stores it explicitly so it
-            // can override a user `fast`.
-            let save_note = persist_setting(layers, config, persist, "speed", Some(name), |c| {
-                c.speed = match speed {
-                    None | Some(Speed::Standard) => None,
-                    Some(Speed::Fast) => Some(ConfigSpeed::Fast),
-                };
-            });
+            let save_note = persist_axis(
+                layers,
+                config,
+                persist,
+                &crate::host::SettingsAxis::Speed(speed),
+            );
             SpeedConfirm::Applied {
                 footer: FooterUpdate {
                     settings,

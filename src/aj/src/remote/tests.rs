@@ -4838,7 +4838,7 @@ async fn environment_reads_and_edits_are_equal_through_both_control_arms() {
                 }
             }
             for reader in &controls {
-                assert_eq!(reader.environment(&session).await.unwrap(), expected);
+                assert_eq!(reader.environment(&session, None).await.unwrap(), expected);
             }
         }
     }
@@ -4860,7 +4860,7 @@ async fn invalid_environment_requests_leave_the_map_unchanged() {
         )
         .await
         .unwrap();
-    let expected = control.environment(&session).await.unwrap();
+    let expected = control.environment(&session, None).await.unwrap();
     for body in [
         serde_json::json!({"key": "TOKEN", "vaule": "replace"}),
         serde_json::json!({"key": "TOKEN", "value": "replace", "agent": "main"}),
@@ -4884,7 +4884,7 @@ async fn invalid_environment_requests_leave_the_map_unchanged() {
             "invalid_request"
         );
         assert_eq!(
-            control.environment(&session).await.unwrap(),
+            control.environment(&session, None).await.unwrap(),
             expected,
             "{body}"
         );
@@ -4909,7 +4909,7 @@ async fn a_busy_environment_edit_forwards_the_host_refusal() {
         })
         .await;
     let control = Control::remote(fixture.client());
-    let before = control.environment(&session).await.unwrap();
+    let before = control.environment(&session, None).await.unwrap();
     let err = control
         .command(
             &session,
@@ -4921,21 +4921,28 @@ async fn a_busy_environment_edit_forwards_the_host_refusal() {
         .await
         .expect_err("busy edit refused");
     assert!(err.conflict(), "{err}");
-    assert_eq!(control.environment(&session).await.unwrap(), before);
+    assert_eq!(control.environment(&session, None).await.unwrap(), before);
     remote.settle().await;
     fixture.shutdown().await;
 }
 
 #[tokio::test]
-async fn a_stale_environment_endpoint_surfaces_the_usual_unsupported_error() {
-    let app = axum::Router::new().fallback(|| async {
-        (
-            StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({
-                "code": "unknown_endpoint", "message": "no such endpoint"
-            })),
+async fn a_host_without_historical_environment_reads_never_returns_the_live_map() {
+    let app = axum::Router::new()
+        .route(
+            "/v1/sessions/session/env",
+            axum::routing::get(|| async {
+                axum::Json(BTreeMap::from([("CURRENT", "not historical")]))
+            }),
         )
-    });
+        .fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "code": "unknown_endpoint", "message": "no such endpoint"
+                })),
+            )
+        });
     let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
         .await
         .unwrap();
@@ -4944,25 +4951,195 @@ async fn a_stale_environment_endpoint_surfaces_the_usual_unsupported_error() {
         axum::serve(listener, app).await.unwrap();
     });
     let control = Control::remote(RemoteClient::new(&url).unwrap());
-    assert!(
-        control
-            .environment("session")
-            .await
-            .unwrap_err()
-            .unknown_endpoint()
+    assert_eq!(
+        control.environment("session", None).await.unwrap()["CURRENT"],
+        "not historical"
     );
     assert!(
         control
-            .command(
-                "session",
-                Command::Env {
-                    key: "TOKEN".to_string(),
-                    value: None,
-                }
-            )
+            .environment("session", Some("message"))
             .await
             .unwrap_err()
             .unknown_endpoint()
     );
     serving.abort();
+}
+
+#[tokio::test]
+async fn branch_context_and_environment_cross_both_control_adapters() {
+    let fixture = Fixture::new(vec![finalized_text_message("original answer")]).await;
+    let session = fixture.create().await;
+    let controls = [
+        Control::local(fixture.host.clone()),
+        Control::remote(fixture.client()),
+    ];
+    controls[0]
+        .command(
+            &session,
+            Command::Env {
+                key: "BASE".into(),
+                value: Some("inherited-secret".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let mut live = fixture.oracle(&session).await;
+    fixture.prompt(&session, "original prompt").await;
+    live.settle().await;
+    let user_context = |chat: &ChatState| {
+        chat.transcript(AgentId::Main)
+            .unwrap()
+            .entries()
+            .iter()
+            .find_map(|entry| {
+                if let aj_app::chat::EntryKind::User(user) = &entry.kind {
+                    Some((
+                        user.message_id.clone().unwrap(),
+                        user.branch_settings.clone().unwrap(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+    };
+    let (message, recorded) = user_context(&live.chat);
+    assert!(
+        recorded.model.is_some(),
+        "the live message carries recorded state"
+    );
+    assert!(
+        !serde_json::to_string(&recorded)
+            .unwrap()
+            .contains("inherited-secret")
+    );
+    let replay = fixture.remote(&session).await;
+    assert_eq!(user_context(&replay.chat), (message.clone(), recorded));
+    controls[0]
+        .command(
+            &session,
+            Command::Env {
+                key: "BASE".into(),
+                value: Some("current".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let before = serde_json::to_value(controls[0].tree(&session).await.unwrap()).unwrap();
+    for control in &controls {
+        assert_eq!(
+            control.environment(&session, Some(&message)).await.unwrap(),
+            BTreeMap::from([("BASE".into(), "inherited-secret".into())])
+        );
+        assert_eq!(
+            control.environment(&session, None).await.unwrap()["BASE"],
+            "current"
+        );
+        assert_eq!(
+            serde_json::to_value(control.tree(&session).await.unwrap()).unwrap(),
+            before
+        );
+        assert!(
+            control
+                .environment(&session, Some("missing/id"))
+                .await
+                .unwrap_err()
+                .unknown_entry()
+        );
+    }
+    for (control, verbosity) in controls.iter().zip(["high", "low"]) {
+        control
+            .command(
+                &session,
+                Command::Head {
+                    target: aj_app::host::HeadTarget::Before(message.clone()),
+                    changes: aj_wire::BranchChanges {
+                        settings: SessionSettings {
+                            verbosity: Some(verbosity.into()),
+                            ..Default::default()
+                        },
+                        env: BTreeMap::from([
+                            ("BASE".into(), None),
+                            ("EMPTY".into(), Some(String::new())),
+                        ]),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            control.environment(&session, None).await.unwrap(),
+            BTreeMap::from([("EMPTY".into(), String::new())])
+        );
+        assert_eq!(
+            fixture
+                .host
+                .local_handles(&session)
+                .await
+                .unwrap()
+                .run_config
+                .lock()
+                .unwrap()
+                .settings()
+                .verbosity,
+            verbosity
+        );
+        assert_eq!(
+            control.environment(&session, Some(&message)).await.unwrap()["BASE"],
+            "inherited-secret"
+        );
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn head_overrides_reject_non_branch_settings_without_switching() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+    let control = Control::remote(fixture.client());
+    control
+        .command(
+            &session,
+            Command::Env {
+                key: "KEEP".into(),
+                value: Some("value".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let target = control.tree(&session).await.unwrap().head.unwrap();
+    control
+        .command(
+            &session,
+            Command::Env {
+                key: "CURRENT".into(),
+                value: Some("value".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let before = serde_json::to_value(control.tree(&session).await.unwrap()).unwrap();
+    let env = control.environment(&session, None).await.unwrap();
+    for settings in [
+        serde_json::json!({"account":{"name":"pin"}}),
+        serde_json::json!({"thinking_display":"full"}),
+        serde_json::json!({"speed":"not-a-speed"}),
+        serde_json::json!({"future":true}),
+    ] {
+        let response = reqwest::Client::new().post(format!("{}/v1/sessions/{session}/head", fixture.server.url()))
+            .json(&serde_json::json!({"entry":target, "changes":{"settings":settings,"env":{"KEEP":null}}}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{settings}");
+        assert_eq!(
+            response.json::<ErrorResponse>().await.unwrap().code,
+            "invalid_request"
+        );
+        assert_eq!(
+            serde_json::to_value(control.tree(&session).await.unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(control.environment(&session, None).await.unwrap(), env);
+    }
+    fixture.shutdown().await;
 }

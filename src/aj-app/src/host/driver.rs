@@ -23,7 +23,7 @@
 //! gestures (a settings change and then the prompt that should run under it)
 //! without a barrier of its own. The cost is that a slow command (a head
 //! switch) delays every other client's, which is why refusals are cheap and
-//! reads bypass this task entirely.
+//! independent reads bypass this task entirely.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,11 +56,11 @@ use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 /// entry the log does not hold is a 404, and one with no parent is refused:
 /// branching before a root would leave the session with no history at all,
 /// and no transcript gesture can legitimately ask for it.
-fn resolve_head_target(
+pub(super) fn resolve_head_target(
     log: &aj_session::ConversationLog,
     target: &HeadTarget,
 ) -> Result<String, HostError> {
-    match target {
+    let entry = match target {
         HeadTarget::Entry(entry) => Ok(entry.clone()),
         HeadTarget::Before(entry) => match log.parent_of(entry) {
             Some(parent) if log.contains(parent) => Ok(parent.clone()),
@@ -74,7 +74,25 @@ fn resolve_head_target(
             ))),
             None => Err(HostError::UnknownEntry(entry.clone())),
         },
-    }
+    }?;
+    log.validate_head(&entry).map_err(|err| match err {
+        aj_session::ConversationError::InvalidHead(_) if log.contains(&entry) => {
+            // A before request names the child, not the rejected parent.
+            HostError::Invalid(match target {
+                HeadTarget::Entry(entry) => {
+                    format!("entry {entry} is not on the user thread and cannot be a head")
+                }
+                HeadTarget::Before(entry) => format!(
+                    "cannot branch before entry {entry}: its parent is not on the user thread"
+                ),
+            })
+        }
+        aj_session::ConversationError::InvalidHead(_) => {
+            HostError::UnknownEntry(target.named().to_string())
+        }
+        other => internal(other),
+    })?;
+    Ok(entry)
 }
 
 /// How long a shutdown waits for cancelled turns to wind themselves down
@@ -218,7 +236,11 @@ impl Driver {
     /// lifecycle, advance the durable high-water mark, publish the frame,
     /// and start a wake if the event earned one.
     fn on_event(&mut self, tagged: TaggedEvent) {
-        let TaggedEvent { entry, event } = tagged;
+        let TaggedEvent {
+            entry,
+            event,
+            branch_settings,
+        } = tagged;
         // Captured off a borrow, because `publish_event` below takes the
         // event by value. The wake it decides on has to wait until after
         // `apply_lifecycle`: `Turns::spawn_wake` refuses a busy owner, and
@@ -234,7 +256,10 @@ impl Driver {
             _ => None,
         };
         self.apply_lifecycle(&event);
-        self.publish_event(entry, event);
+        self.publish_event(
+            entry.map(|entry| super::durable_event(entry, branch_settings)),
+            event,
+        );
         self.refresh_state();
         self.shared.fanout.mark_list_dirty();
         if !self.session.is_draining()
@@ -395,7 +420,7 @@ impl Driver {
 
     // -- publishing ------------------------------------------------------
 
-    fn publish_event(&self, entry: Option<EntryRef>, event: AgentEvent) {
+    fn publish_event(&self, entry: Option<DurableEvent>, event: AgentEvent) {
         // A `MessageEnd` rides the entry whose id is the message's own id: the
         // wire codec pins the two together and refuses any other pairing
         // (`Frame`'s serializer validates as it writes). Nothing validates on
@@ -404,7 +429,7 @@ impl Driver {
         // loop. The assert puts that where the frame is built.
         if let AgentEvent::MessageEnd { message, .. } = &event {
             debug_assert_eq!(
-                entry.as_ref().map(|entry| entry.id.as_str()),
+                entry.as_ref().map(|entry| entry.entry_id.as_str()),
                 Some(message.id()),
                 "a MessageEnd must be published with its own log entry",
             );
@@ -430,13 +455,7 @@ impl Driver {
                 status.last_seq = status.last_seq.max(entry.seq);
                 status.note_activity();
             }
-            (
-                status.epoch.clone(),
-                entry.map(|entry| DurableEvent {
-                    seq: entry.seq,
-                    entry_id: entry.id,
-                }),
-            )
+            (status.epoch.clone(), entry)
         };
         self.shared.fanout.publish(Frame::Event {
             session: self.session.id().to_string(),
@@ -511,7 +530,7 @@ impl Driver {
             Command::Env { key, value } => self.environment(key, value).await,
             Command::Tag { tag } => self.tag(tag),
             Command::Archive { archived } => self.archive(archived),
-            Command::Head { target } => self.head_switch(target).await,
+            Command::Head { target, changes } => self.head_switch(target, changes).await,
             Command::KillTask { task } => self.kill_task(task),
         }
     }
@@ -1017,7 +1036,9 @@ impl Driver {
         confirmation: &str,
     ) {
         match projected {
-            Some(event) => self.publish_event(Some(entry.clone()), event),
+            Some(event) => {
+                self.publish_event(Some(super::durable_event(entry.clone(), None)), event)
+            }
             None => {
                 {
                     let mut status = self.session.status();
@@ -1070,6 +1091,43 @@ impl Driver {
         Ok(())
     }
 
+    async fn prepare_head(
+        &self,
+        log: &aj_session::ConversationLog,
+        entry: &String,
+        changes: &aj_wire::BranchChanges,
+    ) -> Result<
+        (
+            crate::session_setup::RunConfigSnapshot,
+            std::collections::BTreeMap<String, String>,
+        ),
+        HostError,
+    > {
+        let env = log.session_env_at(Some(entry)).cloned().unwrap_or_default();
+        let run = self
+            .session
+            .core
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned")
+            .clone();
+        let config = self
+            .shared
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .clone();
+        super::head::prepare(
+            run,
+            &config,
+            &log.linearize(entry, ThreadFilter::USER).settings(),
+            &self.shared,
+            env,
+            changes,
+        )
+        .await
+    }
+
     /// Switch the session's head to `target`, in place.
     ///
     /// Refused while any turn is driven or any background task is live: a
@@ -1077,7 +1135,11 @@ impl Driver {
     /// branch. On success the queues are cleared, the state that belonged to
     /// the branch being left is reset, the agent is reseeded from the new
     /// branch, a fresh epoch is minted and `reset` published.
-    async fn head_switch(&mut self, target: HeadTarget) -> Result<CommandOutcome, HostError> {
+    async fn head_switch(
+        &mut self,
+        target: HeadTarget,
+        changes: aj_wire::BranchChanges,
+    ) -> Result<CommandOutcome, HostError> {
         self.require_idle()?;
         // Everything already on the event stream belongs to the epoch this
         // switch is about to replace. Published afterwards it would carry
@@ -1093,7 +1155,7 @@ impl Driver {
         // Cloned so the guard does not borrow `self`: the queue updates
         // below are published while it is held.
         let log_handle = Arc::clone(&self.session.core.log);
-        let (transcript, env) = {
+        {
             let mut log = log_handle.lock().await;
             // The abandoned branch's buffered non-punctuation entries
             // belong to it, so they must reach disk before the head moves
@@ -1103,35 +1165,8 @@ impl Driver {
             // that moves the head: a parent read outside it could be
             // superseded by an append before the switch lands.
             let entry = resolve_head_target(&log, &target)?;
-            let known = log.contains(&entry);
-            log.set_head(entry).map_err(|err| match err {
-                // `set_head` refuses an id it does not know and one whose
-                // role cannot be a head (a sub-agent entry) with the same
-                // error. The first is a 404 and the second a malformed
-                // request, so the two are told apart here.
-                //
-                // Both quote the entry the request named. For a `before`
-                // target that is not the entry `set_head` rejected, and
-                // naming the parent would report an id the client never sent.
-                aj_session::ConversationError::InvalidHead(_) if known => {
-                    HostError::Invalid(match &target {
-                        HeadTarget::Entry(entry) => {
-                            format!("entry {entry} is not on the user thread and cannot be a head")
-                        }
-                        HeadTarget::Before(entry) => format!(
-                            "cannot branch before entry {entry}: its parent is not on the \
-                             user thread"
-                        ),
-                    })
-                }
-                // Only a direct target reaches this: `resolve_head_target`
-                // has already established that a `before` target's parent is
-                // in the log.
-                aj_session::ConversationError::InvalidHead(_) => {
-                    HostError::UnknownEntry(target.named().to_string())
-                }
-                other => internal(other),
-            })?;
+            let (prepared, env) = self.prepare_head(&log, &entry, &changes).await?;
+            log.set_head(entry).map_err(internal)?;
             for agent in self.session.core.message_queues.queued_agents() {
                 self.session.core.message_queues.clear(agent);
                 self.publish_queue(agent);
@@ -1141,33 +1176,27 @@ impl Driver {
             repair_interrupted_tool_uses(&mut log, &conversation).map_err(internal)?;
             let head = log.head().cloned().expect("repair keeps a head");
             let conversation = log.linearize(&head, ThreadFilter::USER);
-            // The branch records its own settings, so restoring them
-            // mirrors what resuming onto this head would do.
-            self.session
+            super::head::append_changes(&mut log, &changes, &prepared, &env)?;
+            log.flush_pending().map_err(internal)?;
+            *self
+                .session
                 .core
                 .run_config
                 .lock()
-                .expect("run config mutex poisoned")
-                .accounts
-                .replace(conversation.settings().accounts);
-            if let Some(restore) = &self.shared.restore {
-                let config = self
-                    .shared
-                    .config
-                    .lock()
-                    .expect("config mutex poisoned")
-                    .clone();
-                crate::session_setup::restore_session_settings(
-                    &config,
-                    &self.session.core.run_config,
-                    &conversation.settings(),
-                    restore,
-                );
+                .expect("run config mutex poisoned") = prepared;
+            self.reset_branch_state();
+            // Nothing is driven, so reseeding cannot race an inference request.
+            {
+                let mut agent = self.session.core.agent.lock().await;
+                agent.reseed_transcript(conversation.agent_messages());
+                agent.set_session_env(env);
+                agent.clear_todo_list();
             }
             // The epoch and the high-water mark move under the log lock, so
             // an attach that snapshots the log cannot pair the new
             // projection with the old epoch.
             let mut status = self.session.status();
+            status.settings = settings_of(&self.session.core.run_config);
             status.epoch = mint_epoch();
             status.last_seq = log.last_seq();
             status.note_activity();
@@ -1175,20 +1204,6 @@ impl Driver {
             // established that nothing is live, and the runs of the
             // abandoned branch are over by definition.
             status.finished_subs = log.sub_agent_ids();
-            drop(status);
-            (
-                conversation.agent_messages(),
-                log.session_env().cloned().unwrap_or_default(),
-            )
-        };
-        self.reset_branch_state();
-        self.session.status().settings = settings_of(&self.session.core.run_config);
-        // Uncontended: nothing is driven, which the refusal above ensured.
-        {
-            let mut agent = self.session.core.agent.lock().await;
-            agent.reseed_transcript(transcript);
-            agent.set_session_env(env);
-            agent.clear_todo_list();
         }
 
         // The backfill boundaries live streams filter against are left

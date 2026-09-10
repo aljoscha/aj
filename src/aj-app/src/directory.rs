@@ -754,6 +754,7 @@ mod tests {
             durability: Some(aj_wire::DurableEvent {
                 seq,
                 entry_id: format!("entry-{seq}"),
+                branch_settings: None,
             }),
             event: AgentEvent::Notice {
                 agent_id: AgentId::Main,

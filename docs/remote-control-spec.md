@@ -178,11 +178,18 @@ reaches any path or URL construction or store lookup, on both roles.
 `GET /v1/events` opens the SSE stream. Each frame is one JSON object,
 internally tagged with `kind`:
 
-- `event`: `{kind, session, epoch, seq?, entry_id?, event}` where
+- `event`: `{kind, session, epoch, seq?, entry_id?, branch_settings?, event}` where
   `event` is a serialized `AgentEvent`. `seq` and `entry_id` are present
   if and only if the event is durable (section 5.4). The envelope's
   semantics apply whether or not the nested event type is known to the
-  receiver.
+  receiver. Durable main-thread user-message ends carry `branch_settings`:
+  the recorded model (`{api, name}`), thinking, speed, verbosity, and provider
+  account pins at that message's parent. Unrecorded inference axes are omitted,
+  distinct from explicit `off` or `default`. An absent provider pin follows the
+  provider's current default. This is historical context, not a prediction of
+  the host's runtime fallback or validation. It contains no environment values,
+  credentials, or live-only thinking display. Live delivery and backfill supply
+  the same context, including across compaction. Older hosts may omit the field.
 - `state`: `{kind, session, epoch, working, settings, last_seq}`.
   `working` says whether the session's **main agent** has a turn in
   flight, `settings` is the active `AgentSettings` (`provider`,
@@ -423,8 +430,30 @@ agent" locally take an optional `agent` field (default: the main agent).
 | `.../{id}/env` | `{key, value}` | Set one session environment value, including the empty string. Null or an absent `value` removes the key from the map, not from the inherited process environment. Idle-only: 409 `conflict` while a turn or background task is live. Validates before mutation and persists the full resulting active-branch map. Capability `session_env` (section 5.10). |
 | `.../{id}/tag` | `{tag}`, empty or absent clears | Set the session's tag (section 5.8): one trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
 | `.../{id}/archive` | `{archived: bool}`, absent reads false | Set or clear the archived bit (section 5.8). Materializes like any command, so a rival's lock refuses it. Nothing else refuses it: a session working through a turn takes it and goes on working. Capability `archive` (section 5.10). |
-| `.../{id}/head` | `{entry}` or `{before: <entry_id>}` | Switch the session head. 409 `conflict` while working or tasks live. Clears queues, new epoch, `reset` frame. `before` resolves the named entry to its parent server-side, atomically with the switch. An unknown entry is 404 `unknown_entry`, an entry with no parent is refused. Exactly one of the two fields. |
+| `.../{id}/head` | `{entry, changes?}` or `{before: <entry_id>, changes?}` | Switch the session head. 409 `conflict` while working or tasks live. Clears queues, new epoch, `reset` frame. `before` resolves the named entry to its parent server-side, atomically with the switch. An unknown entry is 404 `unknown_entry`, an entry with no parent is refused. Exactly one target. Optional `changes` applies session-scoped overrides to its inherited baseline (see below). |
 | `.../{id}/tasks/{task_id}/kill` | `{}` (absent or blank is equivalent) | Kill a background task. Any field or non-object value is refused before the task is touched. |
+
+Head `changes` is a closed object with optional `settings`, `accounts`, and
+`env` objects. Settings may override model, thinking, speed, and verbosity
+together. The host rejects `settings.account` (the accounts map owns pins) and
+`thinking_display` (live-only). Accounts maps provider names to exact labels,
+with null removing a pin and `""` pinning the unnamed account. Env maps keys to
+values, with null removing a session overlay key and `""` retaining an empty
+value. Omitted fields inherit the target baseline. The host validates and
+prepares the changes before switching. These changes never update config files
+or auth defaults.
+
+Branch preparation is client-owned. The editor combines the selected message's
+recorded `branch_settings` with explicit choices, leaving unrecorded axes
+unspecified rather than borrowing the live branch's values. No host request is
+needed to arm a branch or edit inference settings. The environment editor reads
+the selected branch point only when opened (section 5.7). Submission resolves
+inheritance and validates the requested combination on the host.
+
+Capability `branch_settings` covers head overrides. Empty
+`changes` is omitted on the wire so ordinary head requests remain compatible.
+Nonempty changes must travel to the server: an older server's closed head schema
+rejects them rather than silently switching without the requested overrides.
 
 The create body's `host` field names an enrolled host in the vocabulary
 the directory rows' `host` field uses (section 5.8). On a gateway it is
@@ -477,6 +506,14 @@ code.
   unredacted on the trusted control port. Export-only redaction does not
   apply. This reads the session overlay, not the host process environment.
   Capability `session_env` (section 5.10).
+- `GET /v1/sessions/{id}/env/before/{entry}`: the same map at the named entry's
+  parent, with the same target validation as `head.before`. An unknown entry is
+  404 `unknown_entry`, and a parentless entry or invalid parent head is refused.
+  This read can materialize a session and is available while work is live. It
+  changes neither the head nor runtime state. The entry is one URL-encoded path
+  segment. A host without this resource returns `unknown_endpoint`, rather than
+  ignoring a target query and returning the live map. Capability
+  `transcript_settings` (section 5.10).
 - `GET /v1/sessions/{id}/accounts?provider=...`: `{provider, selected,
   default, accounts, override_active, source}` from the host-local auth store.
   `provider` is URL-encoded by clients. Omitting it selects the session's
@@ -615,6 +652,8 @@ Both ends of every connection are aj, but versions skew. Rules:
   | Capability | Covers | Advertised by |
   |---|---|---|
   | `archive` | `POST /v1/sessions/{id}/archive` | hosts |
+  | `branch_settings` | `head.changes` | hosts |
+  | `transcript_settings` | user-message `branch_settings` and `GET /v1/sessions/{id}/env/before/{entry}` | hosts |
   | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
   | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
   | `compaction_usage` | optional cumulative `usage` on durable `compaction_end`, identified by the frame's `entry_id` | hosts |

@@ -650,10 +650,9 @@ impl ThreadFilter {
 /// [`Conversation::settings`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSettings {
-    /// Last (provider, model_id) recorded on this path: the most
-    /// recent [`ConversationEntryKind::ModelChange`] entry, falling
-    /// back to the most recent assistant message's (provider, model)
-    /// for logs that carry no settings entries.
+    /// Last (provider, model_id) recorded on this path. Model changes,
+    /// assistant messages, and sub-agent spawn snapshots each replace it
+    /// in path order.
     pub model: Option<(String, String)>,
     /// Session-wide provider account pins folded on the user path. An absent
     /// provider uses its default, an empty label pins its unnamed account, and
@@ -673,6 +672,52 @@ pub struct SessionSettings {
     /// "nothing recorded" (inherit the current default) — distinct
     /// from `Some("default")`, which pins the server default.
     pub verbosity: Option<String>,
+}
+
+impl SessionSettings {
+    /// Fold one recorded entry in path order, without resolving runtime defaults.
+    /// The caller selects the thread and ancestry before applying entries.
+    pub(crate) fn apply(&mut self, entry: &ConversationEntryKind) {
+        match entry {
+            ConversationEntryKind::ModelChange { provider, model_id } => {
+                self.model = Some((provider.clone(), model_id.clone()));
+            }
+            ConversationEntryKind::AccountChange { provider, account } => match account {
+                Some(label) => {
+                    self.accounts.insert(provider.clone(), label.clone());
+                }
+                None => {
+                    self.accounts.remove(provider);
+                }
+            },
+            ConversationEntryKind::ThinkingChange { level } => {
+                self.thinking = Some(level.clone());
+            }
+            ConversationEntryKind::SpeedChange { speed } => {
+                self.speed = Some(speed.clone());
+            }
+            ConversationEntryKind::VerbosityChange { verbosity } => {
+                self.verbosity = Some(verbosity.clone());
+            }
+            ConversationEntryKind::EnvChange { .. } | ConversationEntryKind::Context { .. } => {}
+            ConversationEntryKind::SubAgentSpawn { settings: snap, .. } => {
+                self.model = Some((snap.provider.clone(), snap.model_id.clone()));
+                self.thinking = Some(snap.thinking.clone());
+                self.speed = Some(snap.speed.clone());
+                self.verbosity = Some(snap.verbosity.clone());
+            }
+            ConversationEntryKind::Message { message } => {
+                if let Some(Message::Assistant(a)) = message.as_stored_wire() {
+                    self.model = Some((a.provider.clone(), a.model.clone()));
+                }
+            }
+            ConversationEntryKind::SystemPrompt { .. } => {}
+            // Compaction does not change settings: it keeps the
+            // retained tail's last assistant model plus any
+            // pre-boundary state entries.
+            ConversationEntryKind::Compaction { .. } => {}
+        }
+    }
 }
 
 /// A linearized, read-only view of (a slice of) a conversation log. Produced
@@ -804,46 +849,7 @@ impl Conversation {
     pub fn settings(&self) -> SessionSettings {
         let mut settings = SessionSettings::default();
         for entry in &self.entries {
-            match &entry.entry {
-                ConversationEntryKind::ModelChange { provider, model_id } => {
-                    settings.model = Some((provider.clone(), model_id.clone()));
-                }
-                ConversationEntryKind::AccountChange { provider, account } => match account {
-                    Some(label) => {
-                        settings.accounts.insert(provider.clone(), label.clone());
-                    }
-                    None => {
-                        settings.accounts.remove(provider);
-                    }
-                },
-                ConversationEntryKind::ThinkingChange { level } => {
-                    settings.thinking = Some(level.clone());
-                }
-                ConversationEntryKind::SpeedChange { speed } => {
-                    settings.speed = Some(speed.clone());
-                }
-                ConversationEntryKind::VerbosityChange { verbosity } => {
-                    settings.verbosity = Some(verbosity.clone());
-                }
-                ConversationEntryKind::EnvChange { .. } | ConversationEntryKind::Context { .. } => {
-                }
-                ConversationEntryKind::SubAgentSpawn { settings: snap, .. } => {
-                    settings.model = Some((snap.provider.clone(), snap.model_id.clone()));
-                    settings.thinking = Some(snap.thinking.clone());
-                    settings.speed = Some(snap.speed.clone());
-                    settings.verbosity = Some(snap.verbosity.clone());
-                }
-                ConversationEntryKind::Message { message } => {
-                    if let Some(Message::Assistant(a)) = message.as_stored_wire() {
-                        settings.model = Some((a.provider.clone(), a.model.clone()));
-                    }
-                }
-                ConversationEntryKind::SystemPrompt { .. } => {}
-                // Compaction does not change settings: it keeps the
-                // retained tail's last assistant model plus any
-                // pre-boundary state entries.
-                ConversationEntryKind::Compaction { .. } => {}
-            }
+            settings.apply(&entry.entry);
         }
         settings
     }
@@ -1002,6 +1008,33 @@ impl LogSnapshot {
         Conversation::from_entries(self.session_id.clone(), out)
     }
 
+    /// Recorded user-thread settings on the ancestry ending at `head`, inclusive.
+    /// Equivalent to `linearize(head, ThreadFilter::USER).settings()` without
+    /// cloning message history. Meta and sub-agent entries do not contribute.
+    /// An unknown head yields defaults, and a broken ancestry yields the known
+    /// suffix, as in [`Self::linearize`]. This does not select the head.
+    pub fn settings_at(&self, head: &EntryId) -> SessionSettings {
+        let mut path = Vec::new();
+        let mut cursor = Some(head);
+        while let Some(id) = cursor {
+            let Some(entry) = self.entries.get(id) else {
+                tracing::warn!(
+                    "settings_at: entry {id} missing from log, returning a partial chain"
+                );
+                break;
+            };
+            if ThreadFilter::USER.matches(entry) {
+                path.push(&entry.entry);
+            }
+            cursor = entry.parent_id.as_ref();
+        }
+        let mut settings = SessionSettings::default();
+        for entry in path.into_iter().rev() {
+            settings.apply(entry);
+        }
+        settings
+    }
+
     /// Most-recently-appended entry matching `filter`, or `None` if none
     /// exist. Used to pick the default "current" head when resuming.
     pub fn latest_leaf(&self, filter: ThreadFilter) -> Option<EntryId> {
@@ -1121,7 +1154,15 @@ impl LogSnapshot {
     /// this walk. A legacy Meta creation record supplies the baseline only when
     /// the active path contains no User EnvChange.
     pub fn session_env(&self) -> Option<&BTreeMap<String, String>> {
-        let mut cursor = self.head.as_ref();
+        self.session_env_at(self.head.as_ref())
+    }
+
+    /// The complete environment inherited at `head`, without selecting it.
+    /// `None` reads only the legacy Meta baseline. This follows ancestry even
+    /// across compaction, with the same absence/empty distinction as
+    /// [`Self::session_env`]. An unknown head returns `None`.
+    pub fn session_env_at(&self, head: Option<&EntryId>) -> Option<&BTreeMap<String, String>> {
+        let mut cursor = head;
         while let Some(id) = cursor {
             let entry = self.entries.get(id)?;
             if entry.thread == ThreadKind::User
@@ -1853,7 +1894,16 @@ impl ConversationLog {
     /// surface to the user.
     pub fn set_head(&mut self, id: EntryId) -> Result<(), ConversationError> {
         self.ensure_writable()?;
-        let entry = self.core.entries.get(&id).ok_or_else(|| {
+        self.validate_head(&id)?;
+        self.core.head = Some(id);
+        Ok(())
+    }
+
+    /// Validate the target of [`Self::set_head`] without selecting it or
+    /// requiring a writable log. Preview and mutation share the same rules
+    /// for which entries can anchor the user thread.
+    pub fn validate_head(&self, id: &EntryId) -> Result<(), ConversationError> {
+        let entry = self.core.entries.get(id).ok_or_else(|| {
             ConversationError::InvalidHead(format!("entry {id} is not in this session's log"))
         })?;
         let valid = match entry.thread {
@@ -1866,7 +1916,6 @@ impl ConversationLog {
                 "entry {id} is not a user-thread or system-prompt entry"
             )));
         }
-        self.core.head = Some(id);
         Ok(())
     }
 
@@ -1946,6 +1995,12 @@ impl ConversationLog {
         self.core.clone()
     }
 
+    /// Recorded user-thread settings at `head`, without selecting it or cloning
+    /// message history. See [`LogSnapshot::settings_at`].
+    pub fn settings_at(&self, head: &EntryId) -> SessionSettings {
+        self.core.settings_at(head)
+    }
+
     /// The entry tree behind this log, for in-crate readers that already
     /// hold the log.
     pub(crate) fn core(&self) -> &LogSnapshot {
@@ -1991,6 +2046,11 @@ impl ConversationLog {
     /// See [`LogSnapshot::session_env`].
     pub fn session_env(&self) -> Option<&BTreeMap<String, String>> {
         self.core.session_env()
+    }
+
+    /// See [`LogSnapshot::session_env_at`].
+    pub fn session_env_at(&self, head: Option<&EntryId>) -> Option<&BTreeMap<String, String>> {
+        self.core.session_env_at(head)
     }
 
     /// See [`LogSnapshot::len`].

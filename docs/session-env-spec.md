@@ -137,7 +137,14 @@ string value or removal. The host edits its current map, rather than accepting a
 client's stale copy of unrelated keys, and records the full resulting map.
 
 GET `/v1/sessions/{id}/env` returns the string-to-string map, including values.
-POST to the same route accepts a `key` and a `value`. A string value sets the
+GET `/v1/sessions/{id}/env/before/{entry}` reads the map at the named entry's
+parent, using the same target validation as branching before a message. It is
+an independent read, available during live work and without moving the head.
+The branch environment editor uses this resource and applies its pending key
+edits locally. Opening it again reads the same historical baseline and reapplies
+those edits. Arming a branch does not read environment values.
+
+POST `/v1/sessions/{id}/env` accepts a `key` and a `value`. A string value sets the
 key, including an empty string. A null or omitted value removes it. Unknown
 request fields are refused before dispatch. Gateways forward both operations to
 the owning host. Hosts advertise the `session_env` capability, which is not a
@@ -145,7 +152,8 @@ client-side precondition for trying the operation.
 
 The read is requested when the editor opens, not during directory enumeration.
 Environment values do not enter directory rows or `state` frames. Live notices
-and replay name only the keys using terminal-safe quoting. Seeds before the
+and replay name only the keys using terminal-safe quoting. User-message branch
+metadata also excludes environment values. Seeds before the
 first message and legacy Meta records project no environment notice.
 
 Session info reports the selected branch's map. Export redacts every

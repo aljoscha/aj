@@ -2018,6 +2018,7 @@ fn locally_constructed_message_end_requires_and_backfills_durability() {
         durability: Some(aj_wire::DurableEvent {
             seq: 1,
             entry_id: "entry-1".into(),
+            branch_settings: None,
         }),
         event: DecodedAgentEvent::from(event),
     };
@@ -2853,4 +2854,119 @@ fn environment_requests_distinguish_empty_values_from_removal() {
             "{body}"
         );
     }
+}
+
+#[test]
+fn head_changes_round_trip_and_preserve_removals() {
+    let body = br#"{"before":"message","changes":{"settings":{"speed":"fast"},"accounts":{"anthropic":"","openai":null},"env":{"EMPTY":"","REMOVE":null}}}"#;
+    let request = decode_request::<HeadRequest>(body).unwrap();
+    assert!(!request.changes.is_empty());
+    assert_eq!(request.changes.accounts["openai"], None);
+    assert_eq!(request.changes.env["EMPTY"], Some(String::new()));
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        serde_json::from_slice::<Value>(body).unwrap()
+    );
+    assert_public_request_round_trip(request);
+    let empty = decode_request::<HeadRequest>(
+        br#"{"entry":"e","changes":{"settings":{},"accounts":{},"env":{}}}"#,
+    )
+    .unwrap();
+    assert!(empty.changes.is_empty());
+    assert_eq!(serde_json::to_value(empty).unwrap(), json!({"entry":"e"}));
+}
+
+#[test]
+fn head_changes_schema_is_closed_at_each_settings_boundary() {
+    for body in [
+        json!({"entry":"e", "changes":{"future":true}}),
+        json!({"entry":"e", "changes":{"settings":{"future":true}}}),
+        json!({"entry":"e", "changes":{"settings":{"model":{"api":"test","name":"model","future":true}}}}),
+        json!({"entry":"e", "changes":{"env":{"KEY":42}}}),
+        json!({"entry":"e", "changes":{"accounts":{"provider":false}}}),
+    ] {
+        assert!(
+            decode_request::<HeadRequest>(&serde_json::to_vec(&body).unwrap()).is_err(),
+            "{body}"
+        );
+        assert!(serde_json::from_value::<HeadRequest>(body).is_err());
+    }
+}
+
+#[test]
+fn durable_branch_settings_are_optional_additive_and_losslessly_forwarded() {
+    let old = r#"{"kind":"event","session":"s","epoch":"e","seq":1,"entry_id":"m","event":{"type":"message_end","agent_id":"main","message":{"role":"user","content":[{"type":"text","text":"hello"}],"timestamp":10}}}"#;
+    let Frame::Event {
+        durability: Some(old_metadata),
+        ..
+    } = serde_json::from_str::<Frame>(old).unwrap()
+    else {
+        panic!("durable message")
+    };
+    assert_eq!(old_metadata.branch_settings, None);
+    assert_eq!(
+        serde_json::to_value(old_metadata).unwrap(),
+        serde_json::json!({"seq":1,"entry_id":"m"})
+    );
+
+    let mut frame: Frame = serde_json::from_str(old).unwrap();
+    let settings = aj_wire::BranchSettings {
+        model: Some(aj_wire::RecordedModel {
+            api: "missing-provider".into(),
+            name: "missing-model".into(),
+        }),
+        thinking: Some("off".into()),
+        accounts: BTreeMap::from([("openai".into(), String::new())]),
+        ..Default::default()
+    };
+    if let Frame::Event {
+        durability: Some(metadata),
+        ..
+    } = &mut frame
+    {
+        metadata.branch_settings = Some(settings.clone());
+    }
+    let encoded = serde_json::to_value(&frame).unwrap();
+    assert_eq!(
+        encoded["branch_settings"],
+        serde_json::to_value(&settings).unwrap()
+    );
+    assert!(encoded["event"].get("branch_settings").is_none());
+    let Frame::Event {
+        durability: Some(metadata),
+        ..
+    } = serde_json::from_value(encoded).unwrap()
+    else {
+        panic!("durable message")
+    };
+    assert_eq!(metadata.branch_settings, Some(settings));
+
+    let added = old.replace("\"seq\":1", r#""branch_settings":{"model":{"api":"p","name":"m","future":1e400},"future":18446744073709551616},"seq":1"#);
+    let mut decoded: DecodedFrame = serde_json::from_str(&added).unwrap();
+    let DecodedFrame::Known(known) = &decoded else {
+        panic!("known frame")
+    };
+    let Frame::Event {
+        durability: Some(metadata),
+        ..
+    } = known.value()
+    else {
+        panic!("durable message")
+    };
+    let settings = metadata.branch_settings.as_ref().unwrap();
+    assert_eq!(settings.model.as_ref().unwrap().name, "m");
+    assert_eq!(settings.thinking, None);
+    assert_eq!(settings.speed, None);
+    assert_eq!(settings.verbosity, None);
+    assert!(settings.accounts.is_empty());
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), added);
+    decoded.rewrite_session("gateway:s").unwrap();
+    let forwarded = serde_json::to_string(&decoded).unwrap();
+    assert!(forwarded.contains("1e400"));
+    assert!(forwarded.contains("18446744073709551616"));
+    assert!(forwarded.contains("gateway:s"));
+    assert_eq!(
+        serde_json::from_str::<aj_wire::BranchSettings>("{}").unwrap(),
+        aj_wire::BranchSettings::default()
+    );
 }

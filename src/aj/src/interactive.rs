@@ -1889,9 +1889,22 @@ async fn branch_focused_session(
     }
     let session = world.session().to_string();
     let branching = matches!(target, HeadTarget::Before(_));
+    let changes = {
+        let shell = shell.borrow();
+        let draft = shell.branch_anchor.borrow();
+        draft
+            .as_ref()
+            .filter(|draft| {
+                prompt.is_some()
+                    && matches!(&target, HeadTarget::Before(message) if message == &draft.message)
+            })
+            .map(|draft| draft.changes.clone())
+            .unwrap_or_default()
+    };
+    let has_changes = !changes.is_empty();
     if let Err(err) = world
         .control
-        .command(&session, Command::Head { target })
+        .command(&session, Command::Head { target, changes })
         .await
     {
         // One toast for one failed gesture. The refusal names the action, so
@@ -1899,7 +1912,11 @@ async fn branch_focused_session(
         // names the same failure again. It stays a separate sentence because
         // the fallback arm of `head_refusal` ends in opaque peer refusal text
         // whose punctuation we do not control.
-        let mut refusal = head_refusal(branching, &err);
+        let mut refusal = if has_changes && err.invalid() {
+            format!("Can't branch: {}", peer_refusal(&err))
+        } else {
+            head_refusal(branching, &err)
+        };
         // The head did not move, so the prompt would run against the branch
         // the user meant to leave. Restore it verbatim instead; it is
         // already in prompt history (recorded at the submit site), so it is
@@ -1912,6 +1929,7 @@ async fn branch_focused_session(
         app.request_redraw();
         return;
     }
+    shell.borrow().disarm_branch();
     // Head is authoritative once accepted. Close the old epoch's stream and
     // recover forward in the drive loop. The prompt remains client-owned until
     // that committed epoch reaches Caught, so a failed follow cannot submit it
@@ -2488,6 +2506,16 @@ async fn apply_auth_request(
             provider,
             account,
         } => {
+            if session == world.session() && shell.borrow().branch_anchor.borrow().is_some() {
+                if let Some(draft) = shell.borrow().branch_anchor.borrow_mut().as_mut() {
+                    draft.changes.accounts.insert(provider, account);
+                }
+                shell
+                    .borrow()
+                    .show_toast("Account applies when you submit the branch.".to_string());
+                app.request_redraw();
+                return;
+            }
             if let Err(err) = world
                 .control
                 .command(&session, Command::Account { provider, account })
@@ -2863,12 +2891,72 @@ fn park_session_request(
     ctx.redraw = true;
 }
 
-/// Arm a branch anchor: record the branched-from user message's stable id.
-/// A submit resolves it against the log to find the branch point (the
-/// message's parent), and the transcript reads it to keep the highlight box on
-/// that message while the editor holds focus. `Some` iff a branch is armed.
-fn arm_branch(anchor: &Rc<RefCell<Option<String>>>, message_id: String) {
-    *anchor.borrow_mut() = Some(message_id);
+fn branch_settings(shell: &Rc<RefCell<Shell>>) -> Option<aj_wire::BranchSettings> {
+    shell
+        .borrow()
+        .branch_anchor
+        .borrow()
+        .as_ref()
+        .map(crate::branch::BranchDraft::settings)
+}
+
+fn editing_target(world: &World, shell: &Rc<RefCell<Shell>>) -> AgentId {
+    if shell.borrow().branch_anchor.borrow().is_some() {
+        AgentId::Main
+    } else {
+        world.chat.borrow().active_view()
+    }
+}
+
+fn editing_model(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    target: AgentId,
+) -> Option<(String, String)> {
+    if target == AgentId::Main
+        && let Some(state) = branch_settings(shell)
+    {
+        return state.model.map(|model| (model.api, model.name));
+    }
+    Some(viewed_model(world, target))
+}
+
+fn editing_thinking(world: &World, shell: &Rc<RefCell<Shell>>, target: AgentId) -> Option<String> {
+    if target == AgentId::Main
+        && let Some(state) = branch_settings(shell)
+    {
+        return state.thinking;
+    }
+    Some(aj_models::thinking_config_name(viewed_thinking(world, target).as_ref()).to_string())
+}
+
+/// Defaults windows still save defaults. Their session effect, like an explicit
+/// model or thinking pick, belongs to the pending branch rather than the live
+/// one. Cancellation discards that session effect, not an intentional default.
+fn stage_branch_setting(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    persist: PersistAction,
+    axis: SettingsAxis,
+) {
+    let note = if world.control.is_remote() {
+        unpersisted_note(world, persist != PersistAction::None)
+    } else {
+        aj_app::settings::persist_axis(&world.config_layers, &world.config, persist, &axis)
+    };
+    let saved_default =
+        persist != PersistAction::None && !world.control.is_remote() && note.is_none();
+    if let Some(draft) = shell.borrow().branch_anchor.borrow_mut().as_mut() {
+        draft.set(axis);
+    }
+    let notice = if saved_default {
+        "Default saved, even if you cancel. Session change applies when you submit the branch."
+    } else {
+        "Setting applies when you submit the branch."
+    };
+    shell
+        .borrow()
+        .show_toast(join_notice(notice.to_string(), note));
 }
 
 /// Replace the editor text while preserving any displaced draft in recall
@@ -3273,7 +3361,8 @@ enum ArmedSubmit {
 /// history by the caller, so it survives a failed branch).
 ///
 /// Refusals keep the anchor and restore the editor text (submit clears the
-/// editor). Arming is always allowed; only the submit is gated here.
+/// editor). The draft stays client-owned until the host accepts the head
+/// change. Arming is always allowed. Only submission is gated here.
 async fn submit_with_armed_anchor(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
@@ -3298,7 +3387,12 @@ async fn submit_with_armed_anchor(
         shell.borrow().show_toast(busy_refusal("branch"));
         return ArmedSubmit::Stay;
     }
-    let message_id = shell.borrow().branch_anchor.borrow().clone();
+    let message_id = shell
+        .borrow()
+        .branch_anchor
+        .borrow()
+        .as_ref()
+        .map(|draft| draft.message.clone());
     let Some(message_id) = message_id else {
         // No anchor: the caller gates on `is_some`, so this is unreachable in
         // practice. Treat it as a plain submit rather than panicking.
@@ -3309,7 +3403,6 @@ async fn submit_with_armed_anchor(
     // parent: a branch replaces the message rather than continuing after it.
     // Resolving it here would need the log, which a connection
     // does not have, and would race an append besides.
-    shell.borrow().disarm_branch();
     ArmedSubmit::Branch {
         target: HeadTarget::Before(message_id),
         prompt: text,
@@ -3468,7 +3561,12 @@ async fn apply_command_action(
         CommandAction::OpenSessionEnv => Some("edit the session environment"),
         _ => None,
     };
-    if gated.is_some_and(|verb| refuse_while_attaching(world, shell, verb)) {
+    let local_choice = shell.borrow().branch_anchor.borrow().is_some()
+        && matches!(
+            action,
+            CommandAction::OpenThinkingSelector | CommandAction::OpenModelSelector
+        );
+    if !local_choice && gated.is_some_and(|verb| refuse_while_attaching(world, shell, verb)) {
         return ActionEffect::Redraw;
     }
     match action {
@@ -3515,13 +3613,15 @@ async fn apply_command_action(
             ActionEffect::None
         }
         CommandAction::OpenThinkingSelector => {
-            let target = world.chat.borrow().active_view();
-            let current = viewed_thinking(world, target);
-            let (provider, model_id) = viewed_model(world, target);
-            let supported = world
-                .catalog
-                .iter()
-                .find(|m| m.provider == provider && m.id == model_id)
+            let target = editing_target(world, shell);
+            let current = editing_thinking(world, shell, target);
+            let supported = editing_model(world, shell, target)
+                .and_then(|(provider, model_id)| {
+                    world
+                        .catalog
+                        .iter()
+                        .find(|m| m.provider == provider && m.id == model_id)
+                })
                 .map(aj_app::commands::thinking_levels_for)
                 .unwrap_or_else(|| aj_app::commands::THINKING_LEVELS.iter().collect());
             let handles = shell.borrow().overlay_handles();
@@ -3531,14 +3631,14 @@ async fn apply_command_action(
                 &handles.chrome,
                 &handles.activity,
                 target,
-                current,
+                current.as_deref(),
                 supported,
             );
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenModelSelector => {
-            let target = world.chat.borrow().active_view();
-            let current = viewed_model(world, target);
+            let target = editing_target(world, shell);
+            let current = editing_model(world, shell, target);
             let handles = shell.borrow().overlay_handles();
             open_model(
                 &handles.stack,
@@ -3547,7 +3647,7 @@ async fn apply_command_action(
                 &handles.activity,
                 Arc::clone(&world.catalog),
                 target,
-                Some(current),
+                current,
             );
             ActionEffect::OpenedOverlay
         }
@@ -3685,28 +3785,50 @@ async fn apply_command_action(
             open_session_tag(&handles, current.as_deref());
             ActionEffect::OpenedOverlay
         }
-        CommandAction::OpenSessionEnv => match world.control.environment(world.session()).await {
-            Ok(values) => {
-                open_session_env(
-                    shell.borrow().overlay_handles(),
-                    world.session().to_string(),
-                    values,
-                );
-                ActionEffect::OpenedOverlay
+        CommandAction::OpenSessionEnv => {
+            let draft = shell.borrow().branch_anchor.borrow().clone();
+            match world
+                .control
+                .environment(
+                    world.session(),
+                    draft.as_ref().map(|draft| draft.message.as_str()),
+                )
+                .await
+            {
+                Ok(mut values) => {
+                    if let Some(draft) = draft {
+                        for (key, value) in draft.changes.env {
+                            match value {
+                                Some(value) => {
+                                    values.insert(key, value);
+                                }
+                                None => {
+                                    values.remove(&key);
+                                }
+                            }
+                        }
+                    }
+                    open_session_env(
+                        shell.borrow().overlay_handles(),
+                        world.session().to_string(),
+                        values,
+                    );
+                    ActionEffect::OpenedOverlay
+                }
+                Err(err) => {
+                    let message = if err.unknown_endpoint() {
+                        "This host does not serve the session environment editor.".to_string()
+                    } else {
+                        format!(
+                            "Could not read the session environment: {}",
+                            peer_refusal(&err)
+                        )
+                    };
+                    fold_notice(world, &message);
+                    ActionEffect::Redraw
+                }
             }
-            Err(err) => {
-                let message = if err.unknown_endpoint() {
-                    "This host does not serve the session environment editor.".to_string()
-                } else {
-                    format!(
-                        "Could not read the session environment: {}",
-                        peer_refusal(&err)
-                    )
-                };
-                fold_notice(world, &message);
-                ActionEffect::Redraw
-            }
-        },
+        }
         CommandAction::NewSession => {
             // Live work is no reason to refuse. The session we leave stays
             // attached and keeps folding, so its turn finishes whether or not
@@ -3761,8 +3883,25 @@ async fn apply_command_action(
         }
         CommandAction::OpenAccountSelector => {
             let session = world.session().to_string();
-            let target = world.chat.borrow().active_view();
-            let (provider, _) = viewed_model(world, target);
+            let target = editing_target(world, shell);
+            let Some((provider, _)) = editing_model(world, shell, target) else {
+                shell.borrow().show_toast(
+                    "Choose a model before selecting a branch account: no model was recorded here.",
+                );
+                return ActionEffect::Redraw;
+            };
+            if shell
+                .borrow()
+                .branch_anchor
+                .borrow()
+                .as_ref()
+                .is_some_and(|draft| draft.inherited.is_none())
+            {
+                shell
+                    .borrow()
+                    .show_toast("This host does not provide recorded branch account choices.");
+                return ActionEffect::Redraw;
+            }
             match world.control.accounts(&session, Some(&provider)).await {
                 Ok(list) if list.override_active => {
                     fold_notice(
@@ -3771,7 +3910,10 @@ async fn apply_command_action(
                     );
                     ActionEffect::Redraw
                 }
-                Ok(list) => {
+                Ok(mut list) => {
+                    if let Some(state) = branch_settings(shell) {
+                        list.selected = state.accounts.get(&provider).cloned();
+                    }
                     let rows = session_account_rows(&session, &provider, list);
                     let handles = shell.borrow().overlay_handles();
                     crate::login::open_auth_picker(
@@ -4308,7 +4450,22 @@ async fn apply_selector_activity(
             ),
             SelectorActivity::SkillToggle { .. } => false,
         };
-        if session_mutation && refuse_while_attaching(world, shell, "change session settings") {
+        let draft_choice = shell.borrow().branch_anchor.borrow().is_some()
+            && match &item {
+                SelectorActivity::ThinkingConfirmed { target, .. }
+                | SelectorActivity::ModelConfirmed { target, .. } => *target == AgentId::Main,
+                SelectorActivity::SettingChange { id, .. }
+                | SelectorActivity::SettingClear { id, .. } => matches!(
+                    id.as_str(),
+                    MODEL_SETTING_ID | "thinking" | "speed" | "verbosity"
+                ),
+                SelectorActivity::EnvironmentEdit(edit) => edit.session == world.session(),
+                _ => false,
+            };
+        if session_mutation
+            && !draft_choice
+            && refuse_while_attaching(world, shell, "change session settings")
+        {
             // The settings widgets update their rows optimistically. Closing the
             // window makes the refusal atomic from the user's perspective; a
             // later open reads the still-active values again.
@@ -4317,6 +4474,15 @@ async fn apply_selector_activity(
         }
         match item {
             SelectorActivity::ThinkingConfirmed { target, level } => {
+                if target == AgentId::Main && shell.borrow().branch_anchor.borrow().is_some() {
+                    stage_branch_setting(
+                        world,
+                        shell,
+                        PersistAction::None,
+                        SettingsAxis::Thinking(level),
+                    );
+                    continue;
+                }
                 // Session-scoped: the selectors leave `config.toml` alone and
                 // rely on the session log's record to survive a resume.
                 if let Some(notice) =
@@ -4326,6 +4492,15 @@ async fn apply_selector_activity(
                 }
             }
             SelectorActivity::ModelConfirmed { target, info } => {
+                if target == AgentId::Main && shell.borrow().branch_anchor.borrow().is_some() {
+                    stage_branch_setting(
+                        world,
+                        shell,
+                        PersistAction::None,
+                        SettingsAxis::Model(*info),
+                    );
+                    continue;
+                }
                 if let Some(notice) = confirm_model(world, target, PersistAction::None, *info).await
                 {
                     fold_notice(world, &notice);
@@ -4358,6 +4533,21 @@ async fn apply_selector_activity(
                 fold_notice(world, &notice);
             }
             SelectorActivity::EnvironmentEdit(edit) => {
+                if edit.session == world.session()
+                    && shell.borrow().branch_anchor.borrow().is_some()
+                {
+                    if let Some(draft) = shell.borrow().branch_anchor.borrow_mut().as_mut() {
+                        draft
+                            .changes
+                            .env
+                            .insert(edit.key.clone(), edit.value.clone());
+                    }
+                    edit.applied();
+                    shell.borrow().show_toast(
+                        "Environment change applies when you submit the branch.".to_string(),
+                    );
+                    continue;
+                }
                 match world
                     .control
                     .command(
@@ -4600,6 +4790,8 @@ async fn apply_setting_change(
     id: &str,
     value: &str,
 ) -> Option<String> {
+    let drafting = shell.borrow().branch_anchor.borrow().is_some()
+        && matches!(id, MODEL_SETTING_ID | "thinking" | "speed" | "verbosity");
     match id {
         MODEL_SETTING_ID => {
             let Some(info) = value.split_once('/').and_then(|(provider, model_id)| {
@@ -4612,6 +4804,10 @@ async fn apply_setting_change(
                 revert_setting_row(shell, MODEL_SETTING_ID, &active_model(world));
                 return Some(format!("Unknown model {value}."));
             };
+            if drafting {
+                stage_branch_setting(world, shell, persist, SettingsAxis::Model(info));
+                return None;
+            }
             let refused = confirm_model(world, AgentId::Main, persist, info).await;
             // A refusal stages nothing, so the row is reverted to the model
             // that is actually active. Compared rather than assumed, because
@@ -4623,6 +4819,10 @@ async fn apply_setting_change(
             refused
         }
         "thinking" => match thinking_config_from_name(value) {
+            Some(level) if drafting => {
+                stage_branch_setting(world, shell, persist, SettingsAxis::Thinking(level));
+                None
+            }
             Some(level) => confirm_thinking(world, AgentId::Main, persist, level).await,
             None => Some(format!("Unknown thinking level {value:?}.")),
         },
@@ -4649,6 +4849,10 @@ async fn apply_setting_change(
             .unwrap_or_else(Some)
         }
         "speed" => match speed_from_name(value) {
+            Some(speed) if drafting => {
+                stage_branch_setting(world, shell, persist, SettingsAxis::Speed(speed));
+                None
+            }
             Some(speed) => {
                 match command_settings(world, AgentId::Main, persist, SettingsAxis::Speed(speed))
                     .await
@@ -4682,6 +4886,10 @@ async fn apply_setting_change(
                     Err(err) => return Some(format!("Can't set verbosity: {err}")),
                 }
             };
+            if drafting {
+                stage_branch_setting(world, shell, persist, SettingsAxis::Verbosity(verbosity));
+                return None;
+            }
             command_settings(
                 world,
                 AgentId::Main,
@@ -5583,7 +5791,7 @@ struct Shell {
     /// transcript reads it to keep the highlight box on that message, and any
     /// session install clears it so a stale anchor can't resolve against a
     /// different session's log.
-    branch_anchor: Rc<RefCell<Option<String>>>,
+    branch_anchor: Rc<RefCell<Option<crate::branch::BranchDraft>>>,
     /// The per-session image store, shared with the [`TranscriptView`]'s entry
     /// builder (which records pending images and reads transmitted ids) and
     /// the host loop (which transmits after each frame and frees on a session
@@ -5665,7 +5873,8 @@ impl Shell {
         // reads it to keep the highlight box on the branched-from message, and
         // the Esc handler clears it on a cancel. Created here so the closures
         // and the transcript all share the same cell.
-        let branch_anchor: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let branch_anchor: Rc<RefCell<Option<crate::branch::BranchDraft>>> =
+            Rc::new(RefCell::new(None));
         // The per-session image store, shared between the transcript builder
         // (which records pending images and reads transmitted ids) and the
         // host loop (which transmits and frees). Created here so both share
@@ -5960,17 +6169,15 @@ impl Shell {
                     }
                 }
                 AjAction::BranchMessage => {
-                    // `focused_message_id` already gates on focus mode, the
+                    // `focused_branch` already gates on focus mode, the
                     // cursor sitting on a user message, and the active view
                     // being Main (a sub-agent user message is not a branch
                     // point), so a `Some` here means the gesture is valid.
                     // Inert otherwise.
                     let transcript = transcript_for_actions.borrow();
-                    let anchor = transcript
-                        .focused_message_id()
-                        .zip(transcript.focused_message_text());
+                    let anchor = transcript.focused_branch();
                     drop(transcript);
-                    if let Some((message_id, text)) = anchor {
+                    if let Some((draft, text)) = anchor {
                         // Prefill the editor with the message (preserving the
                         // user's draft on the recall history), arm the anchor,
                         // and move focus to the editor so the user edits the
@@ -5979,7 +6186,7 @@ impl Shell {
                         // highlight box on the branched-from message by reading
                         // the armed anchor.
                         replace_editor_preserving_draft(&editor_for_actions, &text);
-                        arm_branch(&branch_anchor_for_actions, message_id);
+                        *branch_anchor_for_actions.borrow_mut() = Some(draft);
                         ctx.request_focus(Rc::clone(&editor_widget));
                         ctx.redraw = true;
                     }
@@ -6675,13 +6882,37 @@ fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
 /// thinking-change path has to remember to retint.
 fn sync_editor_chrome(world: &World, shell: &Rc<RefCell<Shell>>) {
     let active = world.chat.borrow().active_view();
-    let level = viewed_thinking(world, active);
+    let branch = branch_settings(shell);
+    let level = if let Some(state) = &branch {
+        state
+            .thinking
+            .as_deref()
+            .and_then(thinking_config_from_name)
+            .flatten()
+    } else {
+        viewed_thinking(world, active)
+    };
     let shell = shell.borrow();
     let color = editor_border_color(&shell.theme.read(), level.as_ref());
     // A pending branch overrides the agent marker: while composing the branch
     // prompt the mode matters more than which view is behind it.
-    let label = if shell.branch_anchor.borrow().is_some() {
-        Some(branch_armed_hint())
+    let label = if let Some(state) = branch {
+        Some(if state == aj_wire::BranchSettings::default() {
+            branch_armed_hint()
+        } else {
+            format!(
+                "{} · {} · thinking {} · {} · verbosity {}",
+                branch_armed_hint(),
+                state
+                    .model
+                    .as_ref()
+                    .map(|model| model.name.as_str())
+                    .unwrap_or("model unrecorded"),
+                state.thinking.as_deref().unwrap_or("unrecorded"),
+                state.speed.as_deref().unwrap_or("speed unrecorded"),
+                state.verbosity.as_deref().unwrap_or("unrecorded"),
+            )
+        })
     } else {
         match active {
             AgentId::Main => None,
@@ -8480,6 +8711,37 @@ mod tests {
     use vaxis::vxfw::{MaxSize, Size};
 
     use super::*;
+
+    fn arm_branch(anchor: &Rc<RefCell<Option<crate::branch::BranchDraft>>>, message_id: String) {
+        *anchor.borrow_mut() = Some(crate::branch::BranchDraft::new(message_id, None));
+    }
+
+    fn arm_recorded_branch(world: &World, shell: &Rc<RefCell<Shell>>, message: &str) {
+        let chat = world.chat.borrow();
+        let user = chat
+            .transcript(AgentId::Main)
+            .unwrap()
+            .entries()
+            .iter()
+            .find_map(|entry| {
+                if let aj_app::chat::EntryKind::User(user) = &entry.kind
+                    && user.message_id.as_deref() == Some(message)
+                {
+                    Some(user)
+                } else {
+                    None
+                }
+            })
+            .expect("message is in the client transcript");
+        assert!(
+            user.branch_settings.is_some(),
+            "host supplied recorded settings"
+        );
+        *shell.borrow().branch_anchor.borrow_mut() = Some(crate::branch::BranchDraft::new(
+            message.to_string(),
+            user.branch_settings.clone(),
+        ));
+    }
 
     /// Restores a path's permissions when it goes out of scope.
     ///
@@ -12379,6 +12641,7 @@ mod tests {
                 world.session(),
                 Command::Head {
                     target: HeadTarget::Entry(head),
+                    changes: Default::default(),
                 },
             )
             .await
@@ -18812,6 +19075,104 @@ mod tests {
 
     // --- Branch flow (Phase 3) ---
 
+    #[tokio::test]
+    async fn branch_arming_editing_and_cancel_do_not_wait_for_the_host() {
+        for connected in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let remote = if connected {
+                Some(RemoteHost::start(&dir, "streaming-text").await)
+            } else {
+                None
+            };
+            let (mut world, shell) = match &remote {
+                Some(remote) => connect_world_and_shell(&dir, remote, &["--new"]).await,
+                None => world_and_shell(&dir, "streaming-text").await,
+            };
+            run_prompt(&mut world, "original prompt").await;
+            assert_eq!(reattach(&mut world, &shell).await.unwrap(), CatchUp::Caught);
+            let host = remote
+                .as_ref()
+                .map(|remote| remote.host.clone())
+                .unwrap_or_else(|| world.host().clone());
+            let handles = host.local_handles(world.session()).await.unwrap();
+            let log = Arc::clone(&handles.log);
+            let held = log.lock().await;
+            let old_head = held.head().cloned();
+            let old_count = held.len();
+            let observed = Rc::clone(&shell);
+            let (exit, (armed, edited, cancelled)) = crate::remote::tests::bounded(
+                "branch preparation without host access",
+                drive_until(&mut world, &shell, move |mut writer| async move {
+                    writer.write_all(b"\tb").unwrap();
+                    let armed = settled(Duration::from_secs(3), || {
+                        observed
+                            .borrow()
+                            .branch_anchor
+                            .borrow()
+                            .as_ref()
+                            .and_then(|draft| draft.inherited.as_ref())
+                            .map(|_| ())
+                    })
+                    .await
+                    .is_some();
+                    let edited = if armed {
+                        writer.write_all(b"\x0fthinking\rhigh\r").unwrap();
+                        settled(Duration::from_secs(3), || {
+                            branch_settings(&observed)
+                                .is_some_and(|settings| {
+                                    settings.thinking.as_deref() == Some("high")
+                                })
+                                .then_some(())
+                        })
+                        .await
+                        .is_some()
+                    } else {
+                        false
+                    };
+                    let cancelled = if edited {
+                        writer.write_all(b"\x15local draft").unwrap();
+                        let typed = settled(Duration::from_secs(3), || {
+                            (observed.borrow().editor.borrow().text() == "local draft")
+                                .then_some(())
+                        })
+                        .await
+                        .is_some();
+                        writer.write_all(b"\x1b").unwrap();
+                        typed
+                            && settled(Duration::from_secs(3), || {
+                                observed
+                                    .borrow()
+                                    .branch_anchor
+                                    .borrow()
+                                    .is_none()
+                                    .then_some(())
+                            })
+                            .await
+                            .is_some()
+                    } else {
+                        false
+                    };
+                    assert_eq!(held.head().cloned(), old_head);
+                    assert_eq!(held.len(), old_count, "preparation never enters the log");
+                    drop(held);
+                    (armed, edited, cancelled)
+                }),
+            )
+            .await;
+            if let Some(remote) = remote {
+                remote.shutdown().await;
+            } else {
+                shut_down(&world).await;
+            }
+            exit.unwrap();
+            assert!(
+                armed && edited && cancelled,
+                "connected={connected}: armed={armed}, edited={edited}, cancelled={cancelled}"
+            );
+            assert_eq!(shell.borrow().editor.borrow().text(), "local draft");
+        }
+    }
+
     /// The clean-rebuild branch confirmation distinguishes the `b`-submit
     /// flow (a prompt is handed off) from a tree-view switch (a bare head
     /// move).
@@ -18827,30 +19188,111 @@ mod tests {
         );
     }
 
-    /// Arming records the branched-from message id; re-arming replaces it;
-    /// disarming clears it. The transcript reads this cell to keep the
-    /// highlight box on the branched-from message (that rendering is covered
-    /// in the transcript tests).
     #[tokio::test]
-    async fn arming_sets_anchor_and_rearm_replaces_and_disarm_clears() {
+    async fn branch_refusal_retains_edits_and_cancel_or_rearm_discards_only_the_draft() {
         let dir = TempDir::new().expect("tempdir");
-        let (_world, shell) = world_and_shell(&dir, "streaming-text").await;
-        arm_branch(&shell.borrow().branch_anchor, "m1".to_string());
+        let project_path = dir.path().join(".aj/config.toml");
+        let mut layers = default_layers();
+        layers.project_path = Some(project_path.clone());
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", layers).await;
+        run_prompt(&mut world, "original").await;
+        let original = local_settings_seed(world.handles()).0;
+        let (message, old_head) = {
+            let log = world.handles().log.lock().await;
+            let message = log.entries_in_order().into_iter().find(|entry| matches!(&entry.entry,
+                aj_session::ConversationEntryKind::Message { message }
+                if matches!(message.as_stored_wire(), Some(aj_models::types::Message::User(_)))
+            )).unwrap().id.clone();
+            (message, log.head().unwrap().clone())
+        };
+        arm_recorded_branch(&world, &shell, &message);
+        let mut watch = inert_theme_watch();
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::SettingChange {
+                target: ConfigTarget::Project,
+                id: "thinking".into(),
+                value: "high".into(),
+            }],
+        )
+        .await;
         assert_eq!(
-            shell.borrow().branch_anchor.borrow().clone(),
-            Some("m1".to_string())
+            branch_settings(&shell).unwrap().thinking.as_deref(),
+            Some("high")
         );
-
-        // Re-arming replaces the anchor.
-        arm_branch(&shell.borrow().branch_anchor, "m2".to_string());
+        assert_eq!(local_settings_seed(world.handles()).0, original);
+        assert!(
+            std::fs::read_to_string(&project_path)
+                .unwrap()
+                .contains("high"),
+            "the defaults window still saves defaults"
+        );
+        assert!(matches!(
+            submit_with_armed_anchor(&mut world, &shell, String::new()).await,
+            ArmedSubmit::Stay
+        ));
         assert_eq!(
-            shell.borrow().branch_anchor.borrow().clone(),
-            Some("m2".to_string())
+            branch_settings(&shell).unwrap().thinking.as_deref(),
+            Some("high")
         );
-
-        // Disarming clears it.
-        shell.borrow().disarm_branch();
-        assert!(shell.borrow().branch_anchor.borrow().is_none());
+        let ArmedSubmit::Branch { target, prompt } =
+            submit_with_armed_anchor(&mut world, &shell, "keep my prompt".into()).await
+        else {
+            panic!("submit")
+        };
+        // Work can begin after the client's idle check but before the host
+        // accepts the head change. A refused command must retain both edits.
+        let task = register_bash_task(&mut world, "sleep 100").await;
+        branch_focused_session(&mut app, &shell, &mut world, target, Some(prompt)).await;
+        assert_eq!(world.handles().log.lock().await.head(), Some(&old_head));
+        assert_eq!(shell.borrow().editor.borrow().text(), "keep my prompt");
+        assert_eq!(
+            branch_settings(&shell).unwrap().thinking.as_deref(),
+            Some("high")
+        );
+        world
+            .handles()
+            .task_registry
+            .set_status(task, aj_agent::tool::TaskStatus::Killed);
+        arm_recorded_branch(&world, &shell, &message);
+        assert_eq!(
+            branch_settings(&shell).unwrap().thinking.as_deref(),
+            Some(original.thinking.as_str()),
+            "rearm inherits rather than carrying the discarded edit"
+        );
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::ThinkingConfirmed {
+                target: AgentId::Main,
+                level: Some(ThinkingConfig::Low),
+            }],
+        )
+        .await;
+        let mut ctx = EventContext::new();
+        shell.borrow_mut().handle_event(
+            &mut ctx,
+            &Event::KeyPress(Key {
+                codepoint: Key::ESCAPE,
+                mods: Modifiers::empty(),
+                ..Key::default()
+            }),
+        );
+        assert!(ctx.consume_event);
+        assert!(branch_settings(&shell).is_none());
+        assert_eq!(local_settings_seed(world.handles()).0, original);
+        assert_eq!(shell.borrow().editor.borrow().text(), "keep my prompt");
+        assert!(
+            std::fs::read_to_string(&project_path)
+                .unwrap()
+                .contains("high"),
+            "cancelling a branch does not undo an intentional default"
+        );
+        shut_down(&world).await;
     }
 
     /// While a branch is armed the editor chrome carries the standing hint:
@@ -19134,14 +19576,15 @@ mod tests {
     /// Submitting with an anchor armed on a persisted user message resolves to
     /// a branch exit naming that message as the one to branch before, so the
     /// host moves the head to its parent, carrying the edited prompt. The
-    /// anchor is disarmed on resolution.
+    /// anchor remains client-owned until the host accepts the switch.
     #[tokio::test]
     async fn armed_submit_branches_before_the_anchored_message() {
         use aj_models::types::Message;
         use aj_session::ConversationEntryKind;
 
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
         persist_session(&mut world).await;
 
         // The first user message on disk, plus its parent (a settings entry),
@@ -19179,17 +19622,19 @@ mod tests {
                 };
                 assert_eq!(named, anchored, "the anchor's own message travels");
                 assert_eq!(prompt, "edited prompt");
+                assert!(
+                    shell.borrow().branch_anchor.borrow().is_some(),
+                    "submission alone does not consume the draft"
+                );
                 // And the host resolves that to the message's parent.
-                world
-                    .host()
-                    .command(
-                        world.session(),
-                        Command::Head {
-                            target: HeadTarget::Before(named),
-                        },
-                    )
-                    .await
-                    .expect("the branch switch is accepted");
+                branch_focused_session(
+                    &mut app,
+                    &shell,
+                    &mut world,
+                    HeadTarget::Before(named),
+                    Some(prompt),
+                )
+                .await;
                 assert_eq!(
                     world
                         .handles()
@@ -19206,8 +19651,308 @@ mod tests {
         }
         assert!(
             shell.borrow().branch_anchor.borrow().is_none(),
-            "the anchor is disarmed on resolution"
+            "acceptance consumes the draft"
         );
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn branch_edits_use_recorded_context_and_commit_without_changing_the_original() {
+        for connected in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let argv = [
+                "aj",
+                "--model-api",
+                "openai-codex",
+                "--model-name",
+                "gpt-5.2",
+            ];
+            let remote = if connected {
+                Some(RemoteHost::with_args(&dir, Args::parse_from(argv)).await)
+            } else {
+                None
+            };
+            let (mut world, shell) = match &remote {
+                Some(remote) => connect_world_and_shell(&dir, remote, &["--new"]).await,
+                None => {
+                    let world = world_from_argv(&dir, &argv).await.unwrap();
+                    let shell = shell_for(&world);
+                    (world, shell)
+                }
+            };
+            let host = remote
+                .as_ref()
+                .map(|remote| remote.host.clone())
+                .unwrap_or_else(|| world.host().clone());
+            let session = world.session().to_string();
+            let handles = host.local_handles(&session).await.unwrap();
+            // Keep catalog-backed restoration while making the seed inference
+            // deterministic and entirely local. Scripted CLI mode deliberately
+            // has no restoration context, so it cannot test this contract.
+            handles.run_config.lock().unwrap().provider =
+                Arc::new(aj_models::scripted::ScriptedProvider::from_messages(
+                    vec![aj_app::test_support::finalized_text_message(
+                        "original answer",
+                    )],
+                    0,
+                    Duration::ZERO,
+                ));
+            world
+                .control
+                .command(
+                    &session,
+                    Command::Env {
+                        key: "REMOVE".into(),
+                        value: Some("old".into()),
+                    },
+                )
+                .await
+                .unwrap();
+            confirm_thinking(
+                &world,
+                AgentId::Main,
+                PersistAction::None,
+                Some(ThinkingConfig::Low),
+            )
+            .await;
+            run_prompt(&mut world, "original prompt").await;
+            // The branch gesture selects a delivered message, not a log entry
+            // whose remote frames might still be in flight.
+            assert_eq!(reattach(&mut world, &shell).await.unwrap(), CatchUp::Caught);
+            let handles = host.local_handles(&session).await.unwrap();
+            let message = {
+                let log = handles.log.lock().await;
+                log.entries_in_order().into_iter().find(|entry| matches!(&entry.entry,
+                    aj_session::ConversationEntryKind::Message { message }
+                    if matches!(message.as_stored_wire(), Some(aj_models::types::Message::User(_)))
+                )).unwrap().id.clone()
+            };
+            let info = world
+                .catalog
+                .iter()
+                .find(|info| {
+                    info.provider == "openai-codex"
+                        && info.id != "gpt-5.2"
+                        && aj_models::registry::validate_thinking_level(
+                            info,
+                            &aj_models::types::ThinkingLevel::High,
+                        )
+                        .is_ok()
+                })
+                .unwrap()
+                .clone();
+            confirm_thinking(
+                &world,
+                AgentId::Main,
+                PersistAction::None,
+                Some(ThinkingConfig::High),
+            )
+            .await;
+            let original = handles.run_config.lock().unwrap().settings();
+            let (old_head, old_count, original_recorded) = {
+                let mut log = handles.log.lock().await;
+                log.flush_pending().unwrap();
+                (
+                    log.head().unwrap().clone(),
+                    log.entries_in_order().len(),
+                    log.linearize(log.head().unwrap(), ThreadFilter::USER)
+                        .settings(),
+                )
+            };
+            arm_recorded_branch(&world, &shell, &message);
+            let inherited = branch_settings(&shell).unwrap();
+            assert_ne!(
+                inherited.model.as_ref().unwrap().name,
+                info.id,
+                "the branch point must differ from today's model"
+            );
+            assert_ne!(
+                inherited.thinking.as_deref(),
+                Some(original.thinking.as_str()),
+                "an explicit choice equal to the live value must override historical inheritance"
+            );
+            let (mut app, mut writer, root) = app_over(&shell).await;
+            let mut watch = inert_theme_watch();
+            apply_selector_activity(
+                &mut world,
+                &shell,
+                &mut watch,
+                vec![
+                    SelectorActivity::ModelConfirmed {
+                        target: AgentId::Main,
+                        info: Box::new(info.clone()),
+                    },
+                    SelectorActivity::ThinkingConfirmed {
+                        target: AgentId::Main,
+                        level: Some(ThinkingConfig::High),
+                    },
+                ],
+            )
+            .await;
+            apply_setting_change(
+                &world,
+                &shell,
+                &mut watch,
+                PersistAction::None,
+                "speed",
+                "fast",
+            )
+            .await;
+            apply_setting_change(
+                &world,
+                &shell,
+                &mut watch,
+                PersistAction::None,
+                "verbosity",
+                "high",
+            )
+            .await;
+            let (redraw, _rx) = unbounded_channel();
+            apply_auth_request(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut None,
+                &redraw,
+                AuthPickerRequest::SelectAccount {
+                    session: session.clone(),
+                    provider: info.provider.clone(),
+                    account: None,
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                apply_command(&mut world, &shell, CommandAction::OpenSessionEnv).await,
+                ActionEffect::OpenedOverlay
+            ));
+            focus_overlay(&mut app, &root);
+            type_text(&mut app, &mut writer, "REMOVE").await;
+            press(&mut app, &mut writer, b"\x18").await;
+            let activity = shell.borrow().take_activity();
+            apply_selector_activity(&mut world, &shell, &mut watch, activity).await;
+            press(&mut app, &mut writer, CTRL_U).await;
+            type_text(&mut app, &mut writer, "Add variable\rEMPTY\r\r").await;
+            let activity = shell.borrow().take_activity();
+            apply_selector_activity(&mut world, &shell, &mut watch, activity).await;
+            press(&mut app, &mut writer, b"\x03").await;
+
+            assert!(matches!(
+                apply_command(&mut world, &shell, CommandAction::OpenSessionEnv).await,
+                ActionEffect::OpenedOverlay
+            ));
+            focus_overlay(&mut app, &root);
+            let reopened = top_overlay_rows(&shell).join("\n");
+            assert!(
+                reopened.contains("EMPTY") && !reopened.contains("REMOVE"),
+                "reopening retains the staged empty value and deletion: {reopened}"
+            );
+            press(&mut app, &mut writer, b"\x03").await;
+
+            let preview = branch_settings(&shell).unwrap();
+            assert_eq!(preview.model.as_ref().unwrap().name, info.id);
+            assert_eq!(preview.thinking.as_deref(), Some("high"));
+            assert_eq!(preview.speed.as_deref(), Some("fast"));
+            assert_eq!(preview.verbosity.as_deref(), Some("high"));
+            let expected_env = BTreeMap::from([("EMPTY".into(), String::new())]);
+            assert_eq!(
+                shell
+                    .borrow()
+                    .branch_anchor
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .changes
+                    .env,
+                BTreeMap::from([
+                    ("REMOVE".into(), None),
+                    ("EMPTY".into(), Some(String::new()))
+                ])
+            );
+            sync_editor_chrome(&world, &shell);
+            let chrome = editor_top_bar_text(&shell);
+            assert!(
+                chrome.contains(&info.id) && chrome.contains("thinking high"),
+                "{chrome}"
+            );
+            let narrow = painted_rows(&shell, 60, 24).join("\n");
+            assert!(
+                narrow.contains("Esc cancels"),
+                "branch cancellation stays visible before optional settings detail: {narrow}"
+            );
+            assert_eq!(
+                editing_model(&world, &shell, AgentId::Main),
+                Some((info.provider.clone(), info.id.clone()))
+            );
+            assert_eq!(handles.run_config.lock().unwrap().settings(), original);
+            {
+                let log = handles.log.lock().await;
+                assert_eq!(log.head(), Some(&old_head));
+                assert_eq!(
+                    log.entries_in_order().len(),
+                    old_count,
+                    "draft choices must not enter the original log"
+                );
+                assert_eq!(
+                    log.session_env().unwrap().get("REMOVE").map(String::as_str),
+                    Some("old")
+                );
+            }
+            let ArmedSubmit::Branch { target, prompt } =
+                submit_with_armed_anchor(&mut world, &shell, "edited prompt".into()).await
+            else {
+                panic!("branch submit")
+            };
+            branch_focused_session(&mut app, &shell, &mut world, target, Some(prompt)).await;
+            assert!(
+                shell.borrow().branch_anchor.borrow().is_none(),
+                "accepted branch consumes its draft"
+            );
+            let applied = handles.run_config.lock().unwrap().settings();
+            assert_eq!(applied.model_id, preview.model.unwrap().name);
+            assert_eq!(Some(applied.thinking), preview.thinking);
+            assert_eq!(Some(applied.speed), preview.speed);
+            assert_eq!(Some(applied.verbosity), preview.verbosity);
+            assert_eq!(host.environment(&session).await.unwrap(), expected_env);
+            {
+                let log = handles.log.lock().await;
+                let new = log.linearize(log.head().unwrap(), ThreadFilter::USER);
+                assert!(
+                    !new.entries().iter().any(|entry| entry.id == message),
+                    "the branch replaces the anchored message"
+                );
+            }
+            // The old branch retains its own choices, rather than inheriting
+            // either the draft or the new branch's explicit state records.
+            host.command(
+                &session,
+                Command::Head {
+                    target: HeadTarget::Entry(old_head),
+                    changes: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+            {
+                let log = handles.log.lock().await;
+                let recorded = log
+                    .linearize(log.head().unwrap(), ThreadFilter::USER)
+                    .settings();
+                assert_eq!(
+                    recorded, original_recorded,
+                    "every recorded setting on the original path is unchanged"
+                );
+            }
+            assert_eq!(
+                host.environment(&session).await.unwrap(),
+                BTreeMap::from([("REMOVE".into(), "old".into())])
+            );
+            if let Some(remote) = remote {
+                remote.shutdown().await;
+            } else {
+                shut_down(&world).await;
+            }
+        }
     }
 
     /// A branch switch is refused while a turn or a background task is live,
@@ -19562,6 +20307,7 @@ mod tests {
                 &first,
                 Command::Head {
                     target: HeadTarget::Entry(head),
+                    changes: Default::default(),
                 },
             )
             .await
@@ -19644,6 +20390,7 @@ mod tests {
                 &first,
                 Command::Head {
                     target: HeadTarget::Entry(head),
+                    changes: Default::default(),
                 },
             )
             .await
@@ -20092,7 +20839,7 @@ mod tests {
     }
 
     /// Submitting with an anchor armed on the file root (a user message with no
-    /// parent, as in an ancient file) is refused, and the anchor is disarmed.
+    /// parent) is refused without consuming the draft.
     /// Like the other refusals, it restores the edited text the submit cleared
     /// so the user's prompt is not silently dropped.
     #[tokio::test]
@@ -20132,13 +20879,13 @@ mod tests {
             panic!("the submit hands the anchor to the host");
         };
         assert!(
-            shell.borrow().branch_anchor.borrow().is_none(),
-            "the anchor is disarmed once it is handed off"
+            shell.borrow().branch_anchor.borrow().is_some(),
+            "the host has not accepted the draft"
         );
         sync_editor_chrome(&world, &shell);
         assert!(
-            !editor_top_bar_text(&shell).contains("branching"),
-            "and the mode's standing hint goes with it: {}",
+            editor_top_bar_text(&shell).contains("branching"),
+            "the pending draft retains its standing hint: {}",
             editor_top_bar_text(&shell),
         );
 
@@ -20166,6 +20913,10 @@ mod tests {
             shell.borrow().editor.borrow().text(),
             "edited root prompt",
             "the edited prompt is restored into the editor on a root refusal"
+        );
+        assert!(
+            shell.borrow().branch_anchor.borrow().is_some(),
+            "a refusal retains the draft until the user cancels or rearms"
         );
         shut_down(&world).await;
     }
@@ -20270,6 +21021,10 @@ mod tests {
     impl RemoteHost {
         async fn start(dir: &TempDir, demo: &str) -> RemoteHost {
             let args = Args::parse_from(["aj", "--scripted", demo]);
+            Self::with_args(dir, args).await
+        }
+
+        async fn with_args(dir: &TempDir, args: Args) -> RemoteHost {
             let auth = AuthStorage::new(dir.path().join("auth.json"));
             let persistence = ConversationPersistence::new(dir.path().join("sessions"));
             let ComposedHost { host, .. } =
@@ -21599,7 +22354,12 @@ mod tests {
             toast_lines(&shell),
         );
         assert_eq!(
-            shell.borrow().branch_anchor.borrow().clone(),
+            shell
+                .borrow()
+                .branch_anchor
+                .borrow()
+                .as_ref()
+                .map(|draft| draft.message.clone()),
             Some(head),
             "an armed branch survives a switch that did not happen",
         );
@@ -22503,7 +23263,7 @@ mod tests {
             assert_eq!(
                 world
                     .control
-                    .environment(world.session())
+                    .environment(world.session(), None)
                     .await
                     .expect("read env"),
                 BTreeMap::from([
@@ -22576,7 +23336,7 @@ mod tests {
         assert_eq!(
             world
                 .control
-                .environment(world.session())
+                .environment(world.session(), None)
                 .await
                 .expect("read env"),
             BTreeMap::from([("VALUE".into(), " original\tvalue ".into())])
@@ -24319,6 +25079,7 @@ mod tests {
             session: session.to_string(),
             epoch: epoch.to_string(),
             durability: Some(aj_wire::DurableEvent {
+                branch_settings: None,
                 seq,
                 entry_id: format!("entry-{seq}"),
             }),
@@ -24341,6 +25102,7 @@ mod tests {
             session: session.to_string(),
             epoch: epoch.to_string(),
             durability: Some(aj_wire::DurableEvent {
+                branch_settings: None,
                 seq,
                 entry_id: message.id().to_string(),
             }),

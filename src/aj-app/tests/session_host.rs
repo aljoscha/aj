@@ -1048,6 +1048,7 @@ async fn session_env_edits_follow_branches_in_real_bash_and_after_restart() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry(root),
             },
         )
@@ -1073,6 +1074,7 @@ async fn session_env_edits_follow_branches_in_real_bash_and_after_restart() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry(edited_head),
             },
         )
@@ -2534,6 +2536,7 @@ async fn a_head_switch_replaces_the_epoch_and_resets_the_stream() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry(head.clone()),
             },
         )
@@ -2618,6 +2621,7 @@ async fn a_head_switch_is_refused_while_work_is_live() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry("whatever".to_string()),
             },
         )
@@ -2661,6 +2665,7 @@ async fn a_head_switch_is_refused_while_work_is_live() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry("whatever".to_string()),
             },
         )
@@ -2687,6 +2692,7 @@ async fn a_head_switch_to_an_unknown_entry_is_refused() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry("no-such-entry".to_string()),
             },
         )
@@ -2716,6 +2722,7 @@ async fn a_head_switch_to_an_unknown_entry_is_refused() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry(sub_entry),
             },
         )
@@ -2776,11 +2783,24 @@ async fn a_head_switch_before_an_entry_lands_on_its_parent() {
         )
     };
 
+    assert!(matches!(
+        harness
+            .host
+            .environment_before(&session, "no-such-entry")
+            .await,
+        Err(HostError::UnknownEntry(_))
+    ));
+    assert!(matches!(
+        harness.host.environment_before(&session, &root).await,
+        Err(HostError::Invalid(_))
+    ));
+
     harness
         .host
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Before(second_user.clone()),
             },
         )
@@ -2803,6 +2823,7 @@ async fn a_head_switch_before_an_entry_lands_on_its_parent() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Before("no-such-entry".to_string()),
             },
         )
@@ -2815,6 +2836,7 @@ async fn a_head_switch_before_an_entry_lands_on_its_parent() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Before(root),
             },
         )
@@ -2868,17 +2890,24 @@ async fn a_head_refusal_names_the_entry_the_request_sent() {
         )
     };
     assert_ne!(sub_entry, its_parent);
+    let read_error = harness
+        .host
+        .environment_before(&session, &sub_entry)
+        .await
+        .unwrap_err();
 
     let err = harness
         .host
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Before(sub_entry.clone()),
             },
         )
         .await
         .expect_err("a sub-agent entry's parent is not a legal head");
+    assert_eq!(read_error.to_string(), err.to_string());
     let HostError::Invalid(message) = &err else {
         panic!("got {err:?}");
     };
@@ -2960,6 +2989,7 @@ async fn a_head_switch_forgets_the_abandoned_branch() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry(head),
             },
         )
@@ -9803,6 +9833,7 @@ async fn a_head_switch_does_not_move_the_tag() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry(head),
             },
         )
@@ -10145,6 +10176,7 @@ async fn a_head_switch_does_not_move_the_archived_bit() {
         .command(
             &session,
             Command::Head {
+                changes: Default::default(),
                 target: HeadTarget::Entry(head),
             },
         )
@@ -10233,6 +10265,8 @@ async fn the_host_declares_its_additive_capabilities() {
     for expected in [
         aj_wire::ARCHIVE_CAPABILITY,
         aj_wire::COMPACTION_USAGE_CAPABILITY,
+        aj_wire::BRANCH_SETTINGS_CAPABILITY,
+        aj_wire::TRANSCRIPT_SETTINGS_CAPABILITY,
     ] {
         assert!(
             capabilities.iter().any(|capability| capability == expected),
@@ -12481,5 +12515,749 @@ async fn every_published_frame_round_trips_through_the_wire_codec() {
             "the sample covers the {wanted} frame kind",
         );
     }
+    harness.host.shutdown().await;
+}
+
+/// A real registry-backed restore path, with different recorded axes on the
+/// historical and active branches. No inference request is needed to restore it.
+async fn branch_restore_harness() -> (Harness, String, String, String) {
+    use aj_models::registry::{Catalog, ModelRegistry, OverridesFile, ReasoningOption};
+    use aj_models::types::ThinkingLevel;
+    let dir = TempDir::new().unwrap();
+    let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+    let auth = AuthStorage::new(dir.path().join("auth.json"));
+    for name in ["historical", "active"] {
+        auth.insert_account(
+            "openai",
+            name,
+            aj_models::auth::AuthCredential::ApiKey {
+                key: format!("synthetic-{name}"),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let mut model = scripted_model_info();
+    model.provider = "openai".into();
+    model.api = "openai-responses".into();
+    model.base_url = "http://127.0.0.1:1".into();
+    model.reasoning = true;
+    model.reasoning_options = vec![ReasoningOption::Effort {
+        values: vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High],
+    }];
+    model.supports_verbosity = true;
+    model.id = "historical".into();
+    let mut active = model.clone();
+    active.id = "active".into();
+    active.context_window += 1;
+    let mut limited = model.clone();
+    limited.id = "limited".into();
+    limited.reasoning_options = vec![ReasoningOption::Effort {
+        values: vec![ThinkingLevel::Low],
+    }];
+    let catalog = vec![model.clone(), active, limited];
+    let registry = Arc::new(ModelRegistry::from_catalog_with_overrides(
+        Catalog {
+            schema_version: aj_models::registry::CATALOG_SCHEMA_VERSION,
+            updated_at: 0,
+            source: "fixture".into(),
+            models: catalog.clone(),
+        },
+        OverridesFile { overrides: vec![] },
+        "fixture",
+    ));
+    let mut log = ConversationLog::create(&persistence).unwrap();
+    log.set_system_prompt("fixture".into()).unwrap();
+    let mut heads = Vec::new();
+    for (id, thinking, speed, verbosity) in [
+        ("historical", "high", "fast", "high"),
+        ("active", "low", "standard", "low"),
+    ] {
+        log.append_model_change(ThreadFilter::USER, "openai", id)
+            .unwrap();
+        log.append_thinking_change(ThreadFilter::USER, thinking)
+            .unwrap();
+        log.append_speed_change(ThreadFilter::USER, speed).unwrap();
+        log.append_verbosity_change(ThreadFilter::USER, verbosity)
+            .unwrap();
+        log.append_account_change("openai", Some(id)).unwrap();
+        log.append_env_change(BTreeMap::from([
+            ("KEEP".into(), id.into()),
+            ("REMOVE".into(), id.into()),
+        ]))
+        .unwrap();
+        let parent = log.head().cloned();
+        log.append(
+            parent,
+            aj_session::ThreadKind::User,
+            None,
+            aj_session::ConversationEntryKind::Message {
+                message: aj_agent::message::AgentMessage::wire(aj_models::types::Message::User(
+                    aj_models::types::UserMessage::text(id),
+                )),
+            },
+        )
+        .unwrap();
+        let mut message = finalized_text_message(id);
+        message.provider = "openai".into();
+        message.model = id.into();
+        message.api = "openai-responses".into();
+        let parent = log.head().cloned();
+        log.append(
+            parent,
+            aj_session::ThreadKind::User,
+            None,
+            aj_session::ConversationEntryKind::Message {
+                message: aj_agent::message::AgentMessage::wire(
+                    aj_models::types::Message::Assistant(message),
+                ),
+            },
+        )
+        .unwrap();
+        heads.push(log.head().unwrap().clone());
+    }
+    let session = log.session_id().to_string();
+    drop(log);
+    let bundle = aj_app::model::from_model_info(&auth, model, None).unwrap();
+    let config = Arc::new(StdMutex::new(harness_config(&dir)));
+    let host = SessionHost::new(HostSetup {
+        config: Arc::clone(&config),
+        layers: Arc::new(StdMutex::new(ConfigLayers {
+            user: Config::default(),
+            project: ConfigLayer::default(),
+            project_path: None,
+        })),
+        catalog: Arc::new(catalog),
+        defaults: RunConfigDefaults::fixed(RunConfigSnapshot {
+            provider: bundle.provider,
+            model_info: bundle.model_info,
+            stream_options: bundle.stream_options,
+            accounts: Default::default(),
+            thinking: None,
+            thinking_display: Some(ConfigThinkingDisplay::Detailed),
+            speed: None,
+            model_key: ("openai".into(), "historical".into()),
+            session_id: None,
+        }),
+        restore: Some(aj_app::session_setup::RestoreContext {
+            registry,
+            auth: auth.clone(),
+        }),
+        persistence: persistence.clone(),
+        auth,
+        working_directory: dir.path().to_path_buf(),
+        name: None,
+        idle_grace: None,
+        live_capacity: None,
+    })
+    .unwrap();
+    host.local_handles(&session).await.unwrap();
+    (
+        Harness {
+            _dir: dir,
+            persistence,
+            config,
+            host,
+        },
+        session,
+        heads.remove(0),
+        heads.remove(0),
+    )
+}
+
+#[tokio::test]
+async fn branch_draft_restores_then_overrides_and_replays_only_on_the_new_path() {
+    let (harness, session, historical, original) = branch_restore_harness().await;
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    assert_eq!(
+        handles.run_config.lock().unwrap().settings().model_id,
+        "active"
+    );
+    let before = handles
+        .log
+        .lock()
+        .await
+        .entries_in_order()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let changes = aj_wire::BranchChanges {
+        settings: SessionSettings {
+            model: Some(ModelSelection {
+                api: "openai".into(),
+                name: "active".into(),
+                url: None,
+            }),
+            verbosity: Some("medium".into()),
+            ..Default::default()
+        },
+        accounts: BTreeMap::from([("openai".into(), None)]),
+        env: BTreeMap::from([
+            ("REMOVE".into(), None),
+            ("EMPTY".into(), Some(String::new())),
+        ]),
+    };
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(historical.clone()),
+                changes,
+            },
+        )
+        .await
+        .unwrap();
+    let settings = handles.run_config.lock().unwrap().settings();
+    assert_eq!(settings.model_id, "active");
+    assert_eq!(
+        settings.thinking, "high",
+        "model changes preserve untouched thinking"
+    );
+    assert_eq!(settings.speed, "fast");
+    assert_eq!(settings.verbosity, "medium");
+    assert_eq!(settings.thinking_display, "detailed");
+    assert!(
+        handles
+            .run_config
+            .lock()
+            .unwrap()
+            .accounts
+            .snapshot()
+            .is_empty()
+    );
+    let new_head = handles.log.lock().await.head().unwrap().clone();
+    let expected_env = BTreeMap::from([
+        ("KEEP".into(), "historical".into()),
+        ("EMPTY".into(), String::new()),
+    ]);
+    assert_eq!(
+        harness.host.environment(&session).await.unwrap(),
+        expected_env
+    );
+    {
+        let log = handles.log.lock().await;
+        assert_eq!(
+            serde_json::to_value(&log.entries_in_order()[..before.len()]).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        let old = log.linearize(&original, ThreadFilter::USER).settings();
+        assert_eq!(old.thinking.as_deref(), Some("low"));
+        assert_eq!(old.accounts["openai"], "active");
+        assert_eq!(
+            log.len() - before.len(),
+            4,
+            "only explicit model, verbosity, account and env records"
+        );
+    }
+    harness.host.shutdown().await;
+    let reopened = ConversationLog::resume(&harness.persistence, &session).unwrap();
+    assert_eq!(reopened.head(), Some(&new_head));
+    let replayed = reopened.linearize(&new_head, ThreadFilter::USER).settings();
+    assert_eq!(replayed.model, Some(("openai".into(), "active".into())));
+    assert_eq!(replayed.thinking.as_deref(), Some("high"));
+    assert_eq!(replayed.speed.as_deref(), Some("fast"));
+    assert_eq!(replayed.verbosity.as_deref(), Some("medium"));
+    assert!(replayed.accounts.is_empty());
+    assert_eq!(reopened.session_env(), Some(&expected_env));
+}
+
+async fn attached_epoch(host: &SessionHost, session: &str) -> String {
+    let mut stream = host
+        .attach(&[AttachRequest {
+            session: session.into(),
+            cursor: None,
+        }])
+        .await
+        .unwrap();
+    epoch_of(
+        &frames_until(&mut stream, "caught_up", |f| {
+            matches!(f, Frame::CaughtUp { .. })
+        })
+        .await,
+    )
+}
+
+#[tokio::test]
+async fn branch_draft_refusals_leave_live_and_durable_state_unchanged() {
+    let (harness, session, historical, original) = branch_restore_harness().await;
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    handles
+        .queues
+        .append_follow_up(AgentId::Main, "keep queued draft");
+    let queue = serde_json::to_value(harness.host.queue(&session).await.unwrap()).unwrap();
+    let epoch = attached_epoch(&harness.host, &session).await;
+    let live = handles.run_config.lock().unwrap().clone();
+    let before = serde_json::to_value(handles.log.lock().await.entries_in_order()).unwrap();
+    let env = harness.host.environment(&session).await.unwrap();
+    let bad_settings = [
+        SessionSettings {
+            model: Some(ModelSelection {
+                api: "openai".into(),
+                name: "limited".into(),
+                url: None,
+            }),
+            ..Default::default()
+        },
+        SessionSettings {
+            model: Some(ModelSelection {
+                api: "openai".into(),
+                name: "missing".into(),
+                url: None,
+            }),
+            ..Default::default()
+        },
+        SessionSettings {
+            thinking: Some("unknown".into()),
+            ..Default::default()
+        },
+        SessionSettings {
+            speed: Some("unknown".into()),
+            ..Default::default()
+        },
+        SessionSettings {
+            verbosity: Some("unknown".into()),
+            ..Default::default()
+        },
+        SessionSettings {
+            thinking_display: Some("omitted".into()),
+            ..Default::default()
+        },
+        SessionSettings {
+            account: Some(aj_wire::AccountSelection { name: None }),
+            ..Default::default()
+        },
+    ];
+    let mut changes: Vec<_> = bad_settings
+        .into_iter()
+        .map(|settings| aj_wire::BranchChanges {
+            settings,
+            accounts: BTreeMap::from([("openai".into(), None)]),
+            ..Default::default()
+        })
+        .collect();
+    changes.push(aj_wire::BranchChanges {
+        accounts: BTreeMap::from([("openai".into(), Some("missing".into()))]),
+        ..Default::default()
+    });
+    changes.push(aj_wire::BranchChanges {
+        accounts: BTreeMap::from([("openai".into(), None)]),
+        env: BTreeMap::from([("INVALID=KEY".into(), None)]),
+        ..Default::default()
+    });
+    for changes in changes {
+        assert!(
+            harness
+                .host
+                .command(
+                    &session,
+                    Command::Head {
+                        target: HeadTarget::Entry(historical.clone()),
+                        changes
+                    }
+                )
+                .await
+                .is_err()
+        );
+        let run = handles.run_config.lock().unwrap().clone();
+        assert_eq!(run.settings(), live.settings());
+        assert_eq!(
+            run.accounts.snapshot(),
+            BTreeMap::from([("openai".into(), "active".into())])
+        );
+        assert_eq!(
+            run.stream_options.resolve_api_key().await.unwrap().key,
+            "synthetic-active",
+            "installed resolver still follows the live branch"
+        );
+        assert_eq!(
+            live.stream_options.resolve_api_key().await.unwrap().key,
+            "synthetic-active",
+            "previously handed-out resolvers are untouched"
+        );
+        assert_eq!(handles.log.lock().await.head(), Some(&original));
+        assert_eq!(
+            serde_json::to_value(handles.log.lock().await.entries_in_order()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(harness.host.queue(&session).await.unwrap()).unwrap(),
+            queue
+        );
+        assert_eq!(harness.host.environment(&session).await.unwrap(), env);
+        assert_eq!(attached_epoch(&harness.host, &session).await, epoch);
+    }
+    harness.host.shutdown().await;
+    let reopened = ConversationLog::resume(&harness.persistence, &session).unwrap();
+    assert_eq!(reopened.head(), Some(&original));
+    assert_eq!(
+        serde_json::to_value(reopened.entries_in_order()).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn environment_before_runs_during_a_turn_without_mutating_branch_state() {
+    let (harness, session, historical, _) = branch_restore_harness().await;
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    handles.run_config.lock().unwrap().provider = scripted(
+        vec![finalized_text_message("a fairly long answer to stream")],
+        1,
+        Duration::from_millis(20),
+    );
+    let mut stream = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    assert!(matches!(
+        harness
+            .host
+            .command(
+                &session,
+                Command::Head {
+                    target: HeadTarget::Entry(historical.clone()),
+                    changes: Default::default()
+                }
+            )
+            .await,
+        Err(HostError::Conflict { .. })
+    ));
+    frames_until(&mut stream.stream, "first streamed output", |frame| {
+        matches!(frame, Frame::Event { event, .. } if matches!(event.known(), Some(AgentEvent::MessageUpdate { .. })))
+    }).await;
+    let before = handles.log.lock().await.head().cloned();
+    let epoch = attached_epoch(&harness.host, &session).await;
+    let env = harness
+        .host
+        .environment_before(&session, &historical)
+        .await
+        .unwrap();
+    assert_eq!(
+        env,
+        BTreeMap::from([
+            ("KEEP".into(), "historical".into()),
+            ("REMOVE".into(), "historical".into()),
+        ])
+    );
+    assert_eq!(handles.log.lock().await.head().cloned(), before);
+    assert_eq!(attached_epoch(&harness.host, &session).await, epoch);
+    assert_eq!(
+        harness.host.environment(&session).await.unwrap()["KEEP"],
+        "active"
+    );
+    let run = handles.run_config.lock().unwrap().clone();
+    assert_eq!(run.settings().model_id, "active");
+    assert_eq!(
+        run.stream_options.resolve_api_key().await.unwrap().key,
+        "synthetic-active"
+    );
+    stream.pump_until_idle().await;
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn branch_draft_can_override_effort_speed_and_account_without_changing_other_axes() {
+    let (harness, session, historical, _) = branch_restore_harness().await;
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    let baseline_env = harness
+        .host
+        .environment_before(&session, &historical)
+        .await
+        .unwrap();
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(historical.clone()),
+                changes: aj_wire::BranchChanges {
+                    settings: SessionSettings {
+                        thinking: Some("low".into()),
+                        speed: Some("standard".into()),
+                        ..Default::default()
+                    },
+                    accounts: BTreeMap::from([("openai".into(), Some("active".into()))]),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let run = handles.run_config.lock().unwrap().clone();
+    let settings = run.settings();
+    assert_eq!(settings.model_id, "historical");
+    assert_eq!(settings.verbosity, "high");
+    assert_eq!(settings.thinking_display, "detailed");
+    assert_eq!(settings.thinking, "low");
+    assert_eq!(settings.speed, "standard");
+    assert_eq!(aj_models::speed_name(run.stream_options.speed), "standard");
+    assert_eq!(
+        run.stream_options.resolve_api_key().await.unwrap().key,
+        "synthetic-active"
+    );
+    assert_eq!(
+        harness.host.environment(&session).await.unwrap(),
+        baseline_env
+    );
+    let count = handles.log.lock().await.len();
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(historical),
+                changes: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let run = handles.run_config.lock().unwrap().clone();
+    assert_eq!(run.settings().model_id, "historical");
+    assert_eq!(run.settings().thinking, "high");
+    assert_eq!(run.settings().speed, "fast");
+    assert_eq!(run.settings().verbosity, "high");
+    assert_eq!(run.settings().thinking_display, "detailed");
+    assert_eq!(run.accounts.get("openai").as_deref(), Some("historical"));
+    assert_eq!(
+        run.stream_options.resolve_api_key().await.unwrap().key,
+        "synthetic-historical"
+    );
+    assert_eq!(
+        handles.log.lock().await.len(),
+        count,
+        "an empty draft appends no overrides"
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn branch_empty_commit_keeps_unavailable_model_fallback() {
+    let (harness, session, historical, original) = branch_restore_harness().await;
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    let unavailable = {
+        let mut log = handles.log.lock().await;
+        log.set_head(historical).unwrap();
+        log.append_model_change(ThreadFilter::USER, "openai", "unavailable")
+            .unwrap();
+        let parent = log.head().cloned();
+        let head = log
+            .append(
+                parent,
+                aj_session::ThreadKind::User,
+                None,
+                aj_session::ConversationEntryKind::Message {
+                    message: aj_agent::message::AgentMessage::wire(
+                        aj_models::types::Message::User(aj_models::types::UserMessage::text(
+                            "unavailable",
+                        )),
+                    ),
+                },
+            )
+            .unwrap()
+            .id;
+        log.set_head(original).unwrap();
+        head
+    };
+    let count = handles.log.lock().await.len();
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(unavailable),
+                changes: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let run = handles.run_config.lock().unwrap().clone();
+    assert_eq!(
+        run.settings().model_id,
+        "active",
+        "unavailable recorded model keeps the live bundle"
+    );
+    assert_eq!(run.settings().thinking, "high");
+    assert_eq!(run.accounts.get("openai").as_deref(), Some("historical"));
+    assert_eq!(handles.log.lock().await.len(), count);
+    let client = Client::attach(&harness.host, &session).await;
+    let users = user_branch_settings(&client.chat);
+    let recorded = users["unavailable"].as_ref().unwrap();
+    assert_eq!(recorded.model.as_ref().unwrap().name, "unavailable");
+    assert_eq!(recorded.thinking.as_deref(), Some("high"));
+    harness.host.shutdown().await;
+}
+
+fn user_branch_settings(chat: &ChatState) -> BTreeMap<String, Option<aj_wire::BranchSettings>> {
+    chat.transcript(AgentId::Main)
+        .unwrap()
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            aj_app::chat::EntryKind::User(user) => {
+                Some((user.joined_text(), user.branch_settings.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn transcript_settings_follow_recorded_messages_live_backfill_and_across_branches() {
+    let (harness, session, historical, _) = branch_restore_harness().await;
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    let mut client = Client::attach(&harness.host, &session).await;
+    let users = user_branch_settings(&client.chat);
+    assert_eq!(users.len(), 2);
+    for (name, thinking, speed) in [
+        ("historical", "high", "fast"),
+        ("active", "low", "standard"),
+    ] {
+        let settings = users[name].as_ref().unwrap();
+        assert_eq!(settings.model.as_ref().unwrap().name, name);
+        assert_eq!(settings.model.as_ref().unwrap().api, "openai");
+        assert_eq!(settings.thinking.as_deref(), Some(thinking));
+        assert_eq!(settings.speed.as_deref(), Some(speed));
+        assert_eq!(settings.accounts["openai"], name);
+    }
+    let mut scripts = sub_agent_turn();
+    scripts[1].provider = "sub-provider".into();
+    scripts[1].model = "sub-model".into();
+    handles.run_config.lock().unwrap().provider = scripted(scripts, 1, Duration::ZERO);
+    harness.prompt(&session, "delegate").await;
+    let frames = client.pump_until_idle().await;
+    assert!(events(&frames).iter().any(|event| matches!(
+        event,
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(_),
+            ..
+        }
+    )));
+    let mut observed = 0;
+    for frame in &frames {
+        if let Frame::Event {
+            durability: Some(metadata),
+            event,
+            ..
+        } = frame
+        {
+            if let Some(settings) = &metadata.branch_settings {
+                observed += 1;
+                assert!(
+                    matches!(event.known(), Some(AgentEvent::MessageEnd { agent_id: AgentId::Main, message }) if matches!(message.as_stored_wire(), Some(aj_models::types::Message::User(_))))
+                );
+                let value = serde_json::to_value(settings).unwrap();
+                assert!(value.get("env").is_none());
+                assert!(value.get("thinking_display").is_none());
+                assert!(value.get("context_window").is_none());
+                assert!(!value.to_string().contains("KEEP"));
+            }
+        }
+    }
+    assert_eq!(observed, 1);
+    let live = user_branch_settings(&client.chat);
+    assert_eq!(live["delegate"], users["active"]);
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+            }),
+        )
+        .await
+        .unwrap();
+    let replay = Client::attach(&harness.host, &session).await;
+    assert_eq!(
+        user_branch_settings(&replay.chat),
+        live,
+        "later runtime and sub-agent settings cannot rewrite message context"
+    );
+
+    let cursor = client.client.cursor().unwrap();
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(historical),
+                changes: aj_wire::BranchChanges {
+                    settings: SessionSettings {
+                        thinking: Some("low".into()),
+                        ..Default::default()
+                    },
+                    accounts: BTreeMap::from([("openai".into(), None)]),
+                    env: BTreeMap::from([("KEEP".into(), Some("branch-secret".into()))]),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    client.reattach(&harness.host, cursor).await;
+    handles.run_config.lock().unwrap().provider =
+        scripted(vec![finalized_text_message("replaced")], 1, Duration::ZERO);
+    harness.prompt(&session, "replacement").await;
+    client.pump_until_idle().await;
+    let branched = user_branch_settings(&client.chat);
+    assert_eq!(
+        branched.len(),
+        2,
+        "epoch reset drops abandoned messages and their metadata"
+    );
+    assert_eq!(branched["historical"], users["historical"]);
+    let settings = branched["replacement"].as_ref().unwrap();
+    assert_eq!(settings.model.as_ref().unwrap().name, "historical");
+    assert_eq!(settings.thinking.as_deref(), Some("low"));
+    assert_eq!(settings.speed.as_deref(), Some("fast"));
+    assert_eq!(settings.verbosity.as_deref(), Some("high"));
+    assert!(settings.accounts.is_empty());
+    assert!(
+        !serde_json::to_string(settings)
+            .unwrap()
+            .contains("branch-secret")
+    );
+    let replay = Client::attach(&harness.host, &session).await;
+    assert_eq!(user_branch_settings(&replay.chat), branched);
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn transcript_settings_keep_unrecorded_axes_unknown_after_materialization() {
+    let harness = Harness::new(Vec::new());
+    let mut log = ConversationLog::create(&harness.persistence).unwrap();
+    let root = log.set_system_prompt("old session".into()).unwrap();
+    let parent = Some(root.id);
+    let message = log
+        .append(
+            parent,
+            aj_session::ThreadKind::User,
+            None,
+            aj_session::ConversationEntryKind::Message {
+                message: aj_agent::message::AgentMessage::wire(aj_models::types::Message::User(
+                    aj_models::types::UserMessage::text("old prompt"),
+                )),
+            },
+        )
+        .unwrap();
+    let session = log.session_id().to_string();
+    drop(log);
+    let client = Client::attach(&harness.host, &session).await;
+    assert_eq!(
+        user_branch_settings(&client.chat)["old prompt"],
+        Some(aj_wire::BranchSettings::default())
+    );
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    assert_eq!(
+        handles.run_config.lock().unwrap().settings().model_id,
+        "scripted",
+        "a usable runtime does not fill missing historical axes"
+    );
+    assert!(
+        harness
+            .host
+            .environment_before(&session, &message.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     harness.host.shutdown().await;
 }

@@ -228,14 +228,19 @@ impl Control {
         }
     }
 
-    /// The full active-branch environment map, materializing the session if needed.
+    /// The session overlay at the current head or before a named message.
+    /// Reads only when requested and never moves the head.
     pub(crate) async fn environment(
         &self,
         session: &str,
+        before: Option<&str>,
     ) -> Result<BTreeMap<String, String>, ControlError> {
         match self {
-            Self::Local(local) => Ok(local.host.environment(session).await?),
-            Self::Remote(remote) => Ok(remote.client.environment(session).await?),
+            Self::Local(local) => Ok(match before {
+                Some(message) => local.host.environment_before(session, message).await?,
+                None => local.host.environment(session).await?,
+            }),
+            Self::Remote(remote) => Ok(remote.client.environment(session, before).await?),
         }
     }
 
@@ -409,11 +414,19 @@ fn wire_command(command: Command) -> RemoteCommand {
             tag: tag.unwrap_or_default(),
         }),
         Command::Archive { archived } => RemoteCommand::Archive(ArchiveRequest { archived }),
-        Command::Head { target } => RemoteCommand::Head(match target {
-            HeadTarget::Entry(entry) => HeadRequest::entry(entry),
-            HeadTarget::Before(entry) => HeadRequest::before(entry),
-        }),
+        Command::Head { target, changes } => {
+            let mut request = head_request(target);
+            request.changes = changes;
+            RemoteCommand::Head(request)
+        }
         Command::KillTask { task } => RemoteCommand::KillTask(task),
+    }
+}
+
+fn head_request(target: HeadTarget) -> HeadRequest {
+    match target {
+        HeadTarget::Entry(entry) => HeadRequest::entry(entry),
+        HeadTarget::Before(entry) => HeadRequest::before(entry),
     }
 }
 
@@ -422,7 +435,7 @@ fn wire_command(command: Command) -> RemoteCommand {
 /// Persistence is deliberately dropped: the wire has no persist axis, since
 /// the config files a host would write are the host's own. The caller says
 /// so in its notice rather than silently pretending the default moved.
-fn settings_request(change: SettingsChange) -> SettingsRequest {
+pub(crate) fn settings_request(change: SettingsChange) -> SettingsRequest {
     let SettingsChange { agent, axis, .. } = change;
     let mut wire = SessionSettings::default();
     match axis {

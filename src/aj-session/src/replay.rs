@@ -120,7 +120,7 @@ use serde_json::Value;
 use crate::compaction::estimate_conversation_context;
 use crate::log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, EntryRef,
-    LogSnapshot, ThreadFilter, ThreadKind,
+    LogSnapshot, SessionSettings, ThreadFilter, ThreadKind,
 };
 use crate::tool_details::resolve_tool_details;
 
@@ -142,6 +142,11 @@ use crate::tool_details::resolve_tool_details;
 pub struct TaggedEvent {
     pub entry: Option<EntryRef>,
     pub event: AgentEvent,
+    /// Raw recorded settings on the message's parent path. Present exactly for
+    /// durable main-thread `MessageEnd` events carrying a genuine `Message::User`,
+    /// including defaults when nothing was recorded. No runtime defaults,
+    /// environment, credentials, or display preferences are resolved here.
+    pub branch_settings: Option<SessionSettings>,
 }
 
 /// The projected durable suffix of a live log.
@@ -557,6 +562,9 @@ struct OpenRun {
 /// Per-walk projection state.
 #[derive(Default)]
 struct ReplayState {
+    /// Recorded settings on the selected main path, including silent seeds and
+    /// the prefix before a suffix cursor. Sub-agent entries never contribute.
+    branch_settings: SessionSettings,
     /// Map of `tool_call_id` ↦ (`tool_name`, `arguments`) populated
     /// from each `ToolCall` we see on assistant messages. Used to
     /// synthesize a matching [`AgentEvent::ToolExecutionStart`]
@@ -660,13 +668,21 @@ fn sub_start_event(
 /// `None` when the entry has no known position (single-thread
 /// projection) or sits at or below a suffix cursor.
 fn durable(at: Option<EntryRef>, event: AgentEvent) -> TaggedEvent {
-    TaggedEvent { entry: at, event }
+    TaggedEvent {
+        entry: at,
+        event,
+        branch_settings: None,
+    }
 }
 
 /// One projected event that stands for no log entry of its own:
 /// bracketing frames and everything a live run emits without persisting.
 fn transient(event: AgentEvent) -> TaggedEvent {
-    TaggedEvent { entry: None, event }
+    TaggedEvent {
+        entry: None,
+        event,
+        branch_settings: None,
+    }
 }
 
 impl ReplayState {
@@ -877,6 +893,12 @@ impl ReplayState {
         log: Option<&LogSnapshot>,
         out: &mut VecDeque<TaggedEvent>,
     ) {
+        if entry.thread == ThreadKind::User {
+            // User messages do not change settings, so their snapshot is also
+            // the parent-path baseline. Fold before the notice gate so silent
+            // seed entries contribute just like visible settings changes.
+            self.branch_settings.apply(&entry.entry);
+        }
         // The one meta entry with a face: the session's opening notice, on the
         // main agent and ahead of every message, which is where it stood live.
         if let ConversationEntryKind::Context { context } = &entry.entry {
@@ -1004,13 +1026,20 @@ impl ReplayState {
                             agent_id,
                             message: agent_msg.clone(),
                         }));
-                        out.push_back(durable(
+                        let mut end = durable(
                             at,
                             AgentEvent::MessageEnd {
                                 agent_id,
                                 message: agent_msg.clone(),
                             },
-                        ));
+                        );
+                        if end.entry.is_some()
+                            && agent_id == AgentId::Main
+                            && matches!(agent_msg.as_stored_wire(), Some(Message::User(_)))
+                        {
+                            end.branch_settings = Some(self.branch_settings.clone());
+                        }
+                        out.push_back(end);
                     }
                     AgentMessageKind::Wire(Message::Assistant(a)) => {
                         self.project_assistant(agent_id, at, agent_msg, a, out);
@@ -1355,6 +1384,122 @@ mod tests {
 
     fn user_msg(text: &str) -> AgentMessage {
         AgentMessage::wire(Message::User(UserMessage::text(text)))
+    }
+
+    #[test]
+    fn branch_settings_follow_selected_ancestry_and_the_suffix_prefix() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).unwrap();
+        let root = log.set_system_prompt("p".into()).unwrap();
+        log.append_model_change(ThreadFilter::USER, "provider", "seed")
+            .unwrap();
+        log.append_thinking_change(ThreadFilter::USER, "high")
+            .unwrap();
+        let first = ConversationView::user(&mut log)
+            .add_message(user_msg("first"))
+            .unwrap();
+        let expected = SessionSettings {
+            model: Some(("provider".into(), "seed".into())),
+            thinking: Some("high".into()),
+            ..SessionSettings::default()
+        };
+        log.append_model_change(ThreadFilter::USER, "abandoned", "model")
+            .unwrap();
+        log.append_thinking_change(ThreadFilter::USER, "off")
+            .unwrap();
+        log.append_account_change("abandoned", Some("account"))
+            .unwrap();
+        let abandoned = ConversationView::user(&mut log)
+            .add_message(user_msg("abandoned"))
+            .unwrap();
+
+        log.set_head(first.id.clone()).unwrap();
+        let selected = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+        let settings: Vec<_> = selected
+            .events
+            .iter()
+            .filter_map(|tagged| tagged.branch_settings.as_ref())
+            .collect();
+        assert_eq!(
+            settings,
+            vec![&expected],
+            "selecting an ancestor excludes later settings"
+        );
+
+        let checkpoint = log
+            .append_compaction(
+                ThreadFilter::USER,
+                "summary".into(),
+                first.id.clone(),
+                100,
+                None,
+                None,
+            )
+            .unwrap();
+        let sibling = ConversationView::user(&mut log)
+            .add_message(user_msg("sibling"))
+            .unwrap();
+        for cursor in [
+            None,
+            Some(first.seq),
+            Some(abandoned.seq),
+            Some(checkpoint.seq),
+        ] {
+            let projected = project_suffix(&log.snapshot(), cursor, &BTreeSet::new());
+            let baselines: Vec<_> = projected
+                .events
+                .iter()
+                .filter_map(|tagged| {
+                    tagged.branch_settings.as_ref().map(|settings| {
+                        (
+                            tagged.entry.as_ref().expect("durable").id.clone(),
+                            settings.clone(),
+                        )
+                    })
+                })
+                .collect();
+            let expected_baselines = if cursor.is_none() {
+                vec![
+                    (first.id.clone(), expected.clone()),
+                    (sibling.id.clone(), expected.clone()),
+                ]
+            } else {
+                vec![(sibling.id.clone(), expected.clone())]
+            };
+            assert_eq!(baselines, expected_baselines, "cursor {cursor:?}");
+            assert!(projected.events.iter().all(|tagged| {
+                tagged
+                    .entry
+                    .as_ref()
+                    .is_none_or(|entry| entry.id != abandoned.id)
+                    && (matches!(tagged.event, AgentEvent::MessageEnd { .. })
+                        || tagged.branch_settings.is_none())
+            }));
+        }
+        assert_eq!(log.settings_at(&first.id), expected);
+        assert_eq!(log.settings_at(&sibling.id), expected);
+        assert_eq!(
+            log.head(),
+            Some(&sibling.id),
+            "historical reads do not select a head"
+        );
+
+        log.set_head(root.id).unwrap();
+        let fresh = ConversationView::user(&mut log)
+            .add_message(user_msg("from root"))
+            .unwrap();
+        let projected = project_suffix(&log.snapshot(), Some(sibling.seq), &BTreeSet::new());
+        let end = projected
+            .events
+            .iter()
+            .find(|tagged| tagged.entry.as_ref() == Some(&fresh))
+            .unwrap();
+        assert_eq!(
+            end.branch_settings,
+            Some(SessionSettings::default()),
+            "sibling seeds are not inherited"
+        );
     }
 
     fn assistant_msg(content: Vec<AssistantContent>) -> AgentMessage {

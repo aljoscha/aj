@@ -40,7 +40,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use aj_agent::events::AgentId;
-use aj_app::commands::{THINKING_LEVELS, ThinkingLevel, thinking_level_name, thinking_levels_for};
+use aj_app::commands::{THINKING_LEVELS, ThinkingLevel, thinking_levels_for};
 use aj_app::footer::format_tokens;
 use aj_app::keybindings::{ACTION_SETTINGS_CLEAR, action_shortcut};
 use aj_app::settings::ConfigTarget;
@@ -180,19 +180,19 @@ fn thinking_items(current_name: &str, levels: &[&ThinkingLevel]) -> Vec<SelectIt
         .collect()
 }
 
-/// Open the thinking selector for `target`, pre-selecting `current`.
+/// Open the thinking selector for `target`, marking `current` when known.
 pub(crate) fn open_thinking(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
     chrome: &OverlayChrome,
     activity: &Rc<RefCell<Vec<SelectorActivity>>>,
     target: AgentId,
-    current: Option<ThinkingConfig>,
+    current: Option<&str>,
     supported: Vec<&'static ThinkingLevel>,
 ) {
-    let current_name = thinking_level_name(&current).to_string();
+    let current_name = current.unwrap_or("");
     let select = Rc::new(RefCell::new(FilterableSelect::new(
-        thinking_items(&current_name, &supported),
+        thinking_items(current_name, &supported),
         chrome.select.clone(),
     )));
     select

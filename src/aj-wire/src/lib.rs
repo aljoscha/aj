@@ -39,6 +39,12 @@ pub const SESSION_ENV_CAPABILITY: &str = "session_env";
 /// The capability for reading and selecting provider-local session accounts.
 pub const SESSION_ACCOUNTS_CAPABILITY: &str = "session_accounts";
 
+/// The capability for session-scoped head overrides.
+pub const BRANCH_SETTINGS_CAPABILITY: &str = "branch_settings";
+
+/// The capability for recorded message settings and targeted environment reads.
+pub const TRANSCRIPT_SETTINGS_CAPABILITY: &str = "transcript_settings";
+
 /// A creator-selected model, resolved against the receiving host's catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -228,16 +234,59 @@ pub struct AccountList {
     pub source: String,
 }
 
-/// Switches a session's active branch head.
+/// Session-scoped changes applied to the inherited state of a head target.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchChanges {
+    #[serde(default, skip_serializing_if = "session_settings_empty")]
+    pub settings: SessionSettings,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub accounts: BTreeMap<String, Option<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, Option<String>>,
+}
+
+impl BranchChanges {
+    pub fn is_empty(&self) -> bool {
+        session_settings_empty(&self.settings) && self.accounts.is_empty() && self.env.is_empty()
+    }
+}
+
+fn session_settings_empty(settings: &SessionSettings) -> bool {
+    settings == &SessionSettings::default()
+}
+
+/// A model identity recorded in session history, not a runtime selection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedModel {
+    pub api: String,
+    pub name: String,
+}
+
+/// Recorded settings before a main user message. Missing axes are unknown,
+/// not defaults. Environment values and live display preferences are excluded.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<RecordedModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub accounts: BTreeMap<String, String>,
+}
+
+/// Selects a session head target for switching.
 ///
 /// Exactly one target: [`Self::entry`] names the head directly, and
 /// [`Self::before`] names an entry whose *parent* becomes the head, which is
 /// the branch-from-a-message gesture (a branch replaces the message rather
 /// than continuing after it).
 ///
-/// The host resolves the parent, so the gesture is one command rather than a
-/// parent read plus a switch. A read would be an endpoint with a single
-/// consumer, and every client would have to repeat the same resolution.
+/// The host resolves the parent under the session lock.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeadRequest {
@@ -245,6 +294,8 @@ pub struct HeadRequest {
     pub entry: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "BranchChanges::is_empty")]
+    pub changes: BranchChanges,
 }
 
 impl HeadRequest {
@@ -253,6 +304,7 @@ impl HeadRequest {
         Self {
             entry: Some(entry.into()),
             before: None,
+            changes: BranchChanges::default(),
         }
     }
 
@@ -261,6 +313,7 @@ impl HeadRequest {
         Self {
             entry: None,
             before: Some(entry.into()),
+            changes: BranchChanges::default(),
         }
     }
 }
@@ -1048,11 +1101,13 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
-/// Log identity carried by a durable event frame.
+/// Log identity and recorded context carried by a durable event frame.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableEvent {
     pub seq: u64,
     pub entry_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_settings: Option<BranchSettings>,
 }
 
 /// Where a client's view of one session stands: the epoch it applied
@@ -1555,6 +1610,7 @@ impl<'de> Deserialize<'de> for Frame {
                     epoch,
                     seq,
                     entry_id,
+                    branch_settings,
                     mut event,
                 } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
                 let durability = match (seq, entry_id) {
@@ -1565,7 +1621,11 @@ impl<'de> Deserialize<'de> for Frame {
                                 "durable event frame entry_id must not be empty",
                             ));
                         }
-                        Some(DurableEvent { seq, entry_id })
+                        Some(DurableEvent {
+                            seq,
+                            entry_id,
+                            branch_settings,
+                        })
                     }
                     (MetadataField::Null, _) | (_, MetadataField::Null) => {
                         return Err(D::Error::custom(
@@ -1668,6 +1728,8 @@ struct EventFrameFields {
     seq: MetadataField<u64>,
     #[serde(default)]
     entry_id: MetadataField<String>,
+    #[serde(default)]
+    branch_settings: Option<BranchSettings>,
     event: DecodedAgentEvent,
 }
 

@@ -112,6 +112,17 @@ fn event_frame(epoch: &str, tagged: &TaggedEvent) -> Frame {
         durability: tagged.entry.as_ref().map(|entry| DurableEvent {
             seq: entry.seq,
             entry_id: entry.id.clone(),
+            branch_settings: tagged.branch_settings.clone().map(|settings| {
+                aj_wire::BranchSettings {
+                    model: settings
+                        .model
+                        .map(|(api, name)| aj_wire::RecordedModel { api, name }),
+                    thinking: settings.thinking,
+                    speed: settings.speed,
+                    verbosity: settings.verbosity,
+                    accounts: settings.accounts,
+                }
+            }),
         }),
         event: tagged.event.clone().into(),
     }
@@ -566,12 +577,10 @@ async fn reapplying_the_whole_projected_suffix_changes_nothing() {
 /// Fold one tagged event straight into the reducer, handing it the log
 /// entry a durable frame's envelope would carry.
 fn fold(chat: &mut ChatState, life: &mut AgentLifecycle, tagged: &TaggedEvent) {
-    let _ = reduce(
-        chat,
-        life,
-        tagged.event.clone(),
-        tagged.entry.as_ref().map(|entry| &entry.id),
-    );
+    let Frame::Event { durability, .. } = event_frame(EPOCH, tagged) else {
+        unreachable!()
+    };
+    let _ = reduce(chat, life, tagged.event.clone(), durability.as_ref());
 }
 
 /// A guard on the harness itself: durable identity is what absorbs the

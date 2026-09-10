@@ -93,6 +93,7 @@ fn durable(seq: u64) -> Frame {
         *durability = Some(DurableEvent {
             seq,
             entry_id: format!("entry-{seq}"),
+            branch_settings: None,
         });
     }
     frame

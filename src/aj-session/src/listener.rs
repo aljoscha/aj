@@ -41,6 +41,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use aj_agent::bus::Listener;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::message::AgentMessage;
+use aj_models::types::Message;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -299,7 +300,31 @@ fn persisting_forwarder_inner(
                 // the seqs a consumer sees would stop being monotone.
                 let mut guard = log.lock().await;
                 let entry = persist(&mut guard, &event)?;
-                let _ = sink.send(TaggedEvent { entry, event });
+                let branch_settings = match (&entry, &event) {
+                    (
+                        Some(entry),
+                        AgentEvent::MessageEnd {
+                            agent_id: AgentId::Main,
+                            message,
+                        },
+                    ) if matches!(message.as_stored_wire(), Some(Message::User(_))) => {
+                        // Read the appended message's parent under the append
+                        // lock, never the runtime or a later head's settings.
+                        Some(
+                            guard
+                                .core()
+                                .parent_of(&entry.id)
+                                .map(|parent| guard.settings_at(parent))
+                                .unwrap_or_default(),
+                        )
+                    }
+                    _ => None,
+                };
+                let _ = sink.send(TaggedEvent {
+                    entry,
+                    event,
+                    branch_settings,
+                });
             } else {
                 // NOTE: this branch must not take the log lock. The
                 // compaction run emits `CompactionEnd`
@@ -311,7 +336,11 @@ fn persisting_forwarder_inner(
                     AgentEvent::CompactionEnd { .. } => handoff.take(),
                     _ => None,
                 };
-                let _ = sink.send(TaggedEvent { entry, event });
+                let _ = sink.send(TaggedEvent {
+                    entry,
+                    event,
+                    branch_settings: None,
+                });
             }
             Ok(())
         })
@@ -404,6 +433,7 @@ fn persist_message(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
     use aj_agent::bus::{EventBus, listener_from_sync};
@@ -422,11 +452,11 @@ mod tests {
     };
     use crate::log::{
         ConversationEntry, ConversationEntryKind, ConversationLog, ConversationView, EntryRef,
-        ThreadFilter,
+        SessionSettings, ThreadFilter,
         test_support::{AppendFault, AppendFaultFixture},
     };
     use crate::persistence::ConversationPersistence;
-    use crate::replay::TaggedEvent;
+    use crate::replay::{TaggedEvent, project_suffix};
 
     /// Set up a temp sessions dir + a fresh log with a frozen system
     /// prompt root.
@@ -1120,6 +1150,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_settings_agree_live_and_replayed_without_resolving_missing_axes() {
+        use aj_agent::message::{TaskNotification, TaskNotificationKind, TaskOutcome};
+
+        for seeded in [false, true] {
+            let (_dir, log) = fresh_log();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let bus = EventBus::new();
+            let _h = bus.subscribe(persisting_forwarder(
+                Arc::clone(&log),
+                AppendHandoff::default(),
+                tx,
+            ));
+            let mut initial = SessionSettings::default();
+            if seeded {
+                let mut guard = log.lock().await;
+                guard
+                    .append_model_change(ThreadFilter::USER, "provider", "seed")
+                    .unwrap();
+                guard
+                    .append_account_change("provider", Some("work"))
+                    .unwrap();
+                guard.append_account_change("other", Some("")).unwrap();
+                guard
+                    .append_thinking_change(ThreadFilter::USER, "high")
+                    .unwrap();
+                initial.model = Some(("provider".into(), "seed".into()));
+                initial.accounts = [
+                    ("provider".into(), "work".into()),
+                    ("other".into(), "".into()),
+                ]
+                .into();
+                initial.thinking = Some("high".into());
+            }
+            let first = user_msg("first");
+            bus.emit(AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: first.clone(),
+            })
+            .await
+            .unwrap();
+            bus.emit(AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: AgentMessage::wire(Message::Assistant(AssistantMessage {
+                    provider: "provider".into(),
+                    model: "actually-used".into(),
+                    account: Some("not-a-session-pin".into()),
+                    ..AssistantMessage::empty()
+                })),
+            })
+            .await
+            .unwrap();
+            {
+                let mut guard = log.lock().await;
+                guard.append_account_change("provider", None).unwrap();
+                guard
+                    .append_thinking_change(ThreadFilter::USER, "off")
+                    .unwrap();
+                guard
+                    .append_speed_change(ThreadFilter::USER, "standard")
+                    .unwrap();
+                guard
+                    .append_verbosity_change(ThreadFilter::USER, "default")
+                    .unwrap();
+                guard
+                    .append_env_change([("TOKEN".into(), "secret-env-value".into())].into())
+                    .unwrap();
+            }
+            bus.emit(sub_start(1, "child")).await.unwrap();
+            for (agent_id, message) in [
+                (AgentId::Sub(1), user_msg("child prompt")),
+                (AgentId::Sub(1), assistant_text("child answer")),
+                (
+                    AgentId::Main,
+                    AgentMessage::task_notification(TaskNotification::new(
+                        "job".into(),
+                        TaskNotificationKind::Bash,
+                        TaskOutcome::Succeeded,
+                        "done".into(),
+                    )),
+                ),
+                (AgentId::Main, tool_result("call", "read_file", "body")),
+            ] {
+                bus.emit(AgentEvent::MessageEnd { agent_id, message })
+                    .await
+                    .unwrap();
+            }
+            let second = user_msg("second");
+            bus.emit(AgentEvent::MessageStart {
+                agent_id: AgentId::Main,
+                message: second.clone(),
+            })
+            .await
+            .unwrap();
+            bus.emit(AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: second.clone(),
+            })
+            .await
+            .unwrap();
+            let mut expected_second = initial.clone();
+            expected_second.model = Some(("provider".into(), "actually-used".into()));
+            expected_second.accounts.remove("provider");
+            expected_second.thinking = Some("off".into());
+            expected_second.speed = Some("standard".into());
+            expected_second.verbosity = Some("default".into());
+
+            // Consume only after later settings exist. Delivery-time state must
+            // not replace either message's historical parent-path baseline.
+            let mut guard = log.lock().await;
+            guard
+                .append_model_change(ThreadFilter::USER, "later", "later")
+                .unwrap();
+            guard
+                .append_thinking_change(ThreadFilter::USER, "max")
+                .unwrap();
+            guard.flush_pending().unwrap();
+            let resumed = ConversationLog::resume(
+                &ConversationPersistence::new(guard.path().parent().unwrap().to_path_buf()),
+                guard.session_id(),
+            )
+            .unwrap();
+            let live = drained(&mut rx);
+            let replayed = project_suffix(&resumed.snapshot(), None, &BTreeSet::new()).events;
+            for events in [&live, &replayed] {
+                let mut baselines = Vec::new();
+                for tagged in events {
+                    if let AgentEvent::MessageEnd {
+                        agent_id: AgentId::Main,
+                        message,
+                    } = &tagged.event
+                        && matches!(message.as_stored_wire(), Some(Message::User(_)))
+                    {
+                        let entry = tagged.entry.as_ref().expect("durable user message");
+                        let settings = tagged.branch_settings.as_ref().expect("branch baseline");
+                        let parent = resumed.core().parent_of(&entry.id).unwrap();
+                        assert_eq!(*settings, resumed.settings_at(parent));
+                        assert_eq!(
+                            *settings,
+                            resumed.linearize(parent, ThreadFilter::USER).settings()
+                        );
+                        baselines.push((message.id(), settings.clone()));
+                    } else {
+                        assert_eq!(tagged.branch_settings, None, "{tagged:?}");
+                    }
+                }
+                assert_eq!(
+                    baselines,
+                    vec![
+                        (first.id(), initial.clone()),
+                        (second.id(), expected_second.clone())
+                    ]
+                );
+                assert!(!format!("{events:?}").contains("secret-env-value"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn forwarder_tags_the_durable_events_and_forwards_the_rest() {
         let (_dir, log) = fresh_log();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1211,6 +1399,17 @@ mod tests {
         );
 
         for tagged in &forwarded {
+            assert_eq!(
+                tagged.branch_settings,
+                matches!(
+                    &tagged.event,
+                    AgentEvent::MessageEnd {
+                        agent_id: AgentId::Main,
+                        ..
+                    }
+                )
+                .then(SessionSettings::default),
+            );
             let Some(entry) = &tagged.entry else {
                 continue;
             };

@@ -506,7 +506,7 @@ struct EntryBuilder {
     /// Read live so the branch border stays on the branched-from message while
     /// the editor, not the transcript, holds focus. `Some` iff a branch is
     /// armed.
-    branch_armed: Rc<RefCell<Option<String>>>,
+    branch_armed: Rc<RefCell<Option<crate::branch::BranchDraft>>>,
     /// The pre-styled focus hint (`y to copy \u{b7} b to branch`) and the
     /// branch hint (`branching \u{b7} Esc to cancel`), resolved once through the
     /// keybinding data. Shared by `Rc` so each `CachingEntry` clones a handle
@@ -528,7 +528,12 @@ impl EntryBuilder {
         let EntryKind::User(user) = &entry.kind else {
             return EntryBorder::None;
         };
-        if user.message_id.is_some() && *self.branch_armed.borrow() == user.message_id {
+        if self
+            .branch_armed
+            .borrow()
+            .as_ref()
+            .is_some_and(|draft| user.message_id.as_ref() == Some(&draft.message))
+        {
             EntryBorder::Branch
         } else if self.focus_mode.get() && idx == cursor {
             EntryBorder::Focus
@@ -1751,7 +1756,7 @@ pub struct TranscriptView {
     /// (so the branch border tracks the armed message) and the Shell (its
     /// single writer). Kept so [`set_styles`](Self::set_styles) can rebuild the
     /// builder on a theme swap without losing the handle.
-    branch_armed: Rc<RefCell<Option<String>>>,
+    branch_armed: Rc<RefCell<Option<crate::branch::BranchDraft>>>,
     /// Called from the Esc branch of transcript-focus mode to hand focus
     /// back to the editor. `None` until the host wires it in `Shell::new`.
     /// The resulting `FocusOut` clears the focus flag, exiting the mode.
@@ -1958,7 +1963,7 @@ impl TranscriptView {
         chat: Rc<RefCell<ChatState>>,
         theme: &Theme,
         focused: Rc<std::cell::Cell<bool>>,
-        branch_armed: Rc<RefCell<Option<String>>>,
+        branch_armed: Rc<RefCell<Option<crate::branch::BranchDraft>>>,
         selection_copied: Rc<std::cell::Cell<Option<SelectionCopied>>>,
         image_store: Rc<RefCell<ImageStore>>,
     ) -> TranscriptView {
@@ -2513,8 +2518,7 @@ impl TranscriptView {
         }
     }
 
-    /// The stable message id of the focused user message, the branch anchor
-    /// for the `b` shortcut. Sibling of [`focused_message_text`].
+    /// The focused user message's branch draft and editor text for the `b` shortcut.
     ///
     /// `Some` only when in focus mode, the cursor sits on an `EntryKind::User`
     /// entry, and the active view is Main. A sub-agent user message is not a
@@ -2522,7 +2526,7 @@ impl TranscriptView {
     /// user-thread head there would splice the main conversation onto a
     /// sub-agent thread. We gate the Main-view check here (rather than in the
     /// caller) because `chat.active_view()` is already in hand.
-    pub(crate) fn focused_message_id(&self) -> Option<String> {
+    pub(crate) fn focused_branch(&self) -> Option<(crate::branch::BranchDraft, String)> {
         if !self.in_focus_mode() {
             return None;
         }
@@ -2536,7 +2540,13 @@ impl TranscriptView {
             // A user row with no durable id (nothing in the TUI produces
             // one, but the type allows it) is not a branch anchor: there
             // is no log entry to branch from.
-            EntryKind::User(user) => user.message_id.clone(),
+            EntryKind::User(user) => Some((
+                crate::branch::BranchDraft::new(
+                    user.message_id.clone()?,
+                    user.branch_settings.clone(),
+                ),
+                user.joined_text(),
+            )),
             _ => None,
         }
     }
@@ -3807,6 +3817,7 @@ mod tests {
         // User entries render through `build_user_bubble`, so the
         // span path only carries the spacer.
         let t = transcript_with(EntryKind::User(UserEntry {
+            branch_settings: None,
             content: vec![UserContent::text("hello")],
             message_id: None,
         }));
@@ -3846,6 +3857,7 @@ mod tests {
     #[test]
     fn user_bubble_paints_the_tint_and_drops_the_prefix() {
         let user = UserEntry {
+            branch_settings: None,
             content: vec![UserContent::text("hello world")],
             message_id: None,
         };
@@ -3936,6 +3948,7 @@ mod tests {
     #[test]
     fn focus_border_reuses_the_padding_and_keeps_the_bubble_size() {
         let user = UserEntry {
+            branch_settings: None,
             content: vec![UserContent::text("ciao?")],
             message_id: None,
         };
@@ -3984,6 +3997,7 @@ mod tests {
     #[test]
     fn focus_hint_renders_both_copy_and_branch_shortcuts_from_binding_data() {
         let user = UserEntry {
+            branch_settings: None,
             content: vec![UserContent::text("ciao?")],
             message_id: None,
         };
@@ -4011,6 +4025,7 @@ mod tests {
     fn long_user_message_is_never_folded() {
         let lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
         let user = UserEntry {
+            branch_settings: None,
             content: vec![UserContent::text(lines.join("\n"))],
             message_id: None,
         };
@@ -4861,7 +4876,7 @@ mod tests {
         assert!(!view.in_focus_mode(), "FocusOut leaves focus mode");
     }
 
-    /// `b` is inert in a sub-agent view: `focused_message_id` returns `None`
+    /// `b` is inert in a sub-agent view: `focused_branch` returns `None`
     /// even with the cursor on a sub-agent user row, so no branch anchor can be
     /// armed there. Anchoring the user-thread head at a sub-agent user message
     /// would splice the main conversation onto a sub thread, the data-
@@ -4869,7 +4884,7 @@ mod tests {
     /// resolves, proving the `None` comes from the view gate and not from an
     /// empty or non-user cursor.
     #[test]
-    fn focused_message_id_is_none_in_a_sub_agent_view() {
+    fn focused_branch_is_none_in_a_sub_agent_view() {
         let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         // A real Main branch point, so the None below is the sub-view gate, not
@@ -4910,7 +4925,7 @@ mod tests {
             "the cursor sits on the sub-agent user row"
         );
         assert!(
-            view.focused_message_id().is_none(),
+            view.focused_branch().is_none(),
             "the branch anchor is inert in a sub-agent view"
         );
     }
@@ -5867,7 +5882,9 @@ mod tests {
                 _ => panic!("entry 2 is a user message"),
             }
         };
-        let branch_armed = Rc::new(RefCell::new(armed_id));
+        let branch_armed = Rc::new(RefCell::new(
+            armed_id.map(|id| crate::branch::BranchDraft::new(id, None)),
+        ));
         let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
         // Tall viewport so the whole transcript fits and the assertions are
         // exact.
@@ -6687,10 +6704,12 @@ mod tests {
     #[test]
     fn user_entry_fingerprint_tracks_content() {
         let hello = transcript_with(EntryKind::User(UserEntry {
+            branch_settings: None,
             content: vec![UserContent::text("hello")],
             message_id: None,
         }));
         let longer = transcript_with(EntryKind::User(UserEntry {
+            branch_settings: None,
             content: vec![UserContent::text("hello, world")],
             message_id: None,
         }));

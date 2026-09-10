@@ -20,7 +20,6 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, ErrorCategory, Message, StopReason, UserContent,
     UserMessage,
 };
-use aj_session::EntryId as LogEntryId;
 use serde_json::Value;
 
 use crate::chat::model::{
@@ -39,10 +38,10 @@ pub struct Redraw(pub bool);
 /// Fold `event` into the model, updating the shared lifecycle sets
 /// alongside it.
 ///
-/// `entry` is the log entry the event derives from: `Some` for a durable
-/// frame (the wire envelope's `entry_id`), `None` for a
-/// locally emitted event, for a live non-durable one, and for every
-/// event of a dead-log replay.
+/// `durability` is the log metadata the event derives from: `Some` for a durable
+/// frame, `None` for events without a durable envelope. Its branch settings
+/// land atomically with the user message rather than being reconstructed from
+/// the runtime settings this view happens to have observed.
 ///
 /// It is the durable identity of the effects whose event carries none of
 /// its own: a compaction checkpoint's summary row and a projected state
@@ -58,8 +57,9 @@ pub fn reduce(
     state: &mut ChatState,
     lifecycle: &mut AgentLifecycle,
     event: AgentEvent,
-    entry: Option<&LogEntryId>,
+    durability: Option<&aj_wire::DurableEvent>,
 ) -> Redraw {
+    let entry = durability.map(|durability| &durability.entry_id);
     match event {
         // ---- Lifecycle ----------------------------------------------------
         //
@@ -140,9 +140,13 @@ pub fn reduce(
                 AgentMessageKind::Wire(Message::ToolResult(_)) => None,
             };
             match message.kind {
-                AgentMessageKind::Wire(Message::User(user)) => {
-                    reduce_user_end(state, agent_id, user, message_id)
-                }
+                AgentMessageKind::Wire(Message::User(user)) => reduce_user_end(
+                    state,
+                    agent_id,
+                    user,
+                    message_id,
+                    durability.and_then(|d| d.branch_settings.as_ref()),
+                ),
                 AgentMessageKind::Wire(Message::Assistant(assistant)) => {
                     reduce_assistant_end(state, agent_id, assistant, message_id)
                 }
@@ -684,6 +688,7 @@ fn reduce_user_end(
     agent_id: AgentId,
     user: UserMessage,
     message_id: Option<String>,
+    branch_settings: Option<&aj_wire::BranchSettings>,
 ) -> Redraw {
     let text = joined_user_text(&user.content);
     if text.is_empty() {
@@ -693,6 +698,9 @@ fn reduce_user_end(
         && let Some(EntryKind::User(entry)) = entry_kind_mut(state, agent_id, id)
     {
         entry.content = user.content;
+        if let Some(settings) = branch_settings {
+            entry.branch_settings = Some(settings.clone());
+        }
         return Redraw(true);
     }
     let id = state
@@ -702,6 +710,7 @@ fn reduce_user_end(
         .append(EntryKind::User(UserEntry {
             message_id: message_id.clone(),
             content: user.content,
+            branch_settings: branch_settings.cloned(),
         }));
     remember_message(state, agent_id, message_id.as_deref(), id);
     Redraw(true)
@@ -1215,6 +1224,59 @@ mod tests {
 
     fn state() -> ChatState {
         state_with_catalog(Vec::new())
+    }
+
+    #[test]
+    fn user_context_updates_with_duplicate_payloads_without_losing_known_metadata() {
+        let mut state = state();
+        let mut life = AgentLifecycle::default();
+        let mut message = AgentMessage::wire(Message::User(UserMessage::text("original")));
+        message.set_id("message-1".into());
+        let event = |message| AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message,
+        };
+        let _ = reduce(&mut state, &mut life, event(message.clone()), None);
+        let row_id = entries(&state, AgentId::Main)[0].id;
+        let EntryKind::User(user) = &entries(&state, AgentId::Main)[0].kind else {
+            panic!("user row")
+        };
+        assert_eq!(user.branch_settings, None);
+        let mut metadata = aj_wire::DurableEvent {
+            seq: 1,
+            entry_id: "message-1".into(),
+            branch_settings: Some(aj_wire::BranchSettings {
+                thinking: Some("high".into()),
+                ..Default::default()
+            }),
+        };
+        let _ = reduce(
+            &mut state,
+            &mut life,
+            event(message.clone()),
+            Some(&metadata),
+        );
+        let EntryKind::User(user) = &entries(&state, AgentId::Main)[0].kind else {
+            panic!("user row")
+        };
+        assert_eq!(user.branch_settings, metadata.branch_settings);
+
+        metadata.branch_settings = Some(aj_wire::BranchSettings {
+            speed: Some("fast".into()),
+            ..Default::default()
+        });
+        let _ = reduce(&mut state, &mut life, event(message), Some(&metadata));
+        let mut message = AgentMessage::wire(Message::User(UserMessage::text("refreshed")));
+        message.set_id("message-1".into());
+        let _ = reduce(&mut state, &mut life, event(message), None);
+        let rows = entries(&state, AgentId::Main);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, row_id);
+        let EntryKind::User(user) = &rows[0].kind else {
+            panic!("user row")
+        };
+        assert_eq!(user.joined_text(), "refreshed");
+        assert_eq!(user.branch_settings, metadata.branch_settings);
     }
 
     /// Dispatch `event`, discarding the redraw signal.
@@ -2368,7 +2430,11 @@ mod tests {
             &mut s,
             &mut life,
             sub_agent_start(1, "scripted", "scripted"),
-            Some(&root),
+            Some(&aj_wire::DurableEvent {
+                seq: 1,
+                entry_id: root.clone(),
+                branch_settings: None,
+            }),
         );
         let b = s.sub_box_mut(1).expect("box");
         assert_eq!(
@@ -3054,7 +3120,11 @@ mod tests {
                 summary: Some("did stuff".into()),
                 error: None,
             },
-            Some(&checkpoint),
+            Some(&aj_wire::DurableEvent {
+                seq: 1,
+                entry_id: checkpoint.clone(),
+                branch_settings: None,
+            }),
         );
         assert!(!life.is_compacting(AgentId::Main));
         assert_eq!(s.compaction_phase(AgentId::Main), None);
@@ -4294,13 +4364,21 @@ mod tests {
             &mut s,
             &mut life,
             compaction_end("the summary", 400),
-            Some(&entry),
+            Some(&aj_wire::DurableEvent {
+                seq: 1,
+                entry_id: entry.clone(),
+                branch_settings: None,
+            }),
         );
         let _ = reduce(
             &mut s,
             &mut life,
             compaction_end("the summary, reprojected", 400),
-            Some(&entry),
+            Some(&aj_wire::DurableEvent {
+                seq: 1,
+                entry_id: entry.clone(),
+                branch_settings: None,
+            }),
         );
 
         let rows: Vec<&CompactionEntry> = entries(&s, AgentId::Main)
@@ -4351,7 +4429,11 @@ mod tests {
                 error: None,
                 usage: Some(checkpoint_usage),
             },
-            Some(&entry),
+            Some(&aj_wire::DurableEvent {
+                seq: 1,
+                entry_id: entry.clone(),
+                branch_settings: None,
+            }),
         );
         assert_eq!(
             s.footers().context_usage(AgentId::Main),
@@ -4390,7 +4472,11 @@ mod tests {
             &mut s,
             &mut life,
             notice("Model set to openai/gpt-5."),
-            Some(&entry),
+            Some(&aj_wire::DurableEvent {
+                seq: 1,
+                entry_id: entry.clone(),
+                branch_settings: None,
+            }),
         );
         // The re-served text stands in for a projection that renders the
         // same entry differently: the row is rewritten, not just left
@@ -4399,7 +4485,11 @@ mod tests {
             &mut s,
             &mut life,
             notice("Model set to openai/gpt-5 (reprojected)."),
-            Some(&entry),
+            Some(&aj_wire::DurableEvent {
+                seq: 1,
+                entry_id: entry.clone(),
+                branch_settings: None,
+            }),
         );
         assert_eq!(
             notices(&s, AgentId::Main),

@@ -196,6 +196,10 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/queue", get(queue).post(queue_command))
         .route("/v1/sessions/{id}/tree", get(tree))
         .route("/v1/sessions/{id}/env", get(environment).post(env_command))
+        .route(
+            "/v1/sessions/{id}/env/before/{entry}",
+            get(environment_before),
+        )
         .route("/v1/sessions/{id}/accounts", get(accounts))
         .route("/v1/sessions/{id}/account", post(account))
         .route("/v1/sessions/{id}/prompt", post(prompt))
@@ -341,7 +345,7 @@ async fn queue_command(
     let outcome = state.host.command(&session, Command::Queue(op)).await?;
     match outcome {
         CommandOutcome::Withdrawn(text) => Ok(Json(QueueOutcome { text }).into_response()),
-        CommandOutcome::Accepted => Ok(StatusCode::ACCEPTED.into_response()),
+        outcome => accepted(outcome),
     }
 }
 
@@ -350,6 +354,13 @@ async fn environment(
     Path(session): Path<String>,
 ) -> Result<Response, ApiError> {
     Ok(Json(state.host.environment(&session).await?).into_response())
+}
+
+async fn environment_before(
+    State(state): State<Arc<ServerState>>,
+    Path((session, entry)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    Ok(Json(state.host.environment_before(&session, &entry).await?).into_response())
 }
 
 async fn env_command(
@@ -510,13 +521,14 @@ async fn settings(
 async fn head(
     State(state): State<Arc<ServerState>>,
     Path(session): Path<String>,
-    Body(request): Body<HeadRequest>,
+    Body(mut request): Body<HeadRequest>,
 ) -> Result<Response, ApiError> {
+    let changes = std::mem::take(&mut request.changes);
     let target = head_target(request)?;
     accepted(
         state
             .host
-            .command(&session, Command::Head { target })
+            .command(&session, Command::Head { target, changes })
             .await?,
     )
 }
@@ -613,11 +625,10 @@ fn task_id(raw: &str) -> Result<TaskId, ApiError> {
 fn accepted(outcome: CommandOutcome) -> Result<Response, ApiError> {
     match outcome {
         CommandOutcome::Accepted => Ok(StatusCode::ACCEPTED.into_response()),
-        // Only the queue withdrawal returns one, and it has its own handler.
         CommandOutcome::Withdrawn(_) => Err(ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal",
-            message: "the host withdrew a message for a command that takes none".to_string(),
+            message: "the host returned data for a command that takes none".to_string(),
         }),
     }
 }

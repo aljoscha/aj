@@ -58,6 +58,7 @@ fn is_interactive(args: &Args) -> bool {
 
 mod agent_picker;
 mod autocomplete;
+mod branch;
 mod bubble;
 mod connect;
 mod content_overlay;

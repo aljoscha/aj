@@ -7364,7 +7364,7 @@ async fn environment_reads_and_edits_cross_the_gateway() {
     fixture.row(&id).await;
     let control =
         crate::control::Control::remote(RemoteClient::new(&fixture.server.url()).unwrap());
-    assert!(control.environment(&id).await.unwrap().is_empty());
+    assert!(control.environment(&id, None).await.unwrap().is_empty());
     for value in [Some("full-secret".to_string()), Some(String::new()), None] {
         control
             .command(
@@ -7380,9 +7380,42 @@ async fn environment_reads_and_edits_cross_the_gateway() {
             .into_iter()
             .map(|value| ("TOKEN".to_string(), value))
             .collect();
-        assert_eq!(control.environment(&id).await.unwrap(), expected);
+        assert_eq!(control.environment(&id, None).await.unwrap(), expected);
         assert_eq!(host.host.environment(&session).await.unwrap(), expected);
     }
+    let handles = host.host.local_handles(&session).await.unwrap();
+    let message = {
+        let mut log = handles.log.lock().await;
+        log.append_env_change(BTreeMap::from([("TOKEN".into(), "historical".into())]))
+            .unwrap();
+        let parent = log.head().cloned();
+        let message = log
+            .append(
+                parent,
+                aj_session::ThreadKind::User,
+                None,
+                aj_session::ConversationEntryKind::Message {
+                    message: aj_agent::message::AgentMessage::wire(
+                        aj_models::types::Message::User(aj_models::types::UserMessage::text(
+                            "branch point",
+                        )),
+                    ),
+                },
+            )
+            .unwrap();
+        log.append_env_change(BTreeMap::from([("TOKEN".into(), "current".into())]))
+            .unwrap();
+        log.flush_pending().unwrap();
+        message.id
+    };
+    assert_eq!(
+        control.environment(&id, Some(&message)).await.unwrap()["TOKEN"],
+        "historical"
+    );
+    assert_eq!(
+        control.environment(&id, None).await.unwrap()["TOKEN"],
+        "current"
+    );
     fixture.shutdown().await;
     host.stop().await;
 }

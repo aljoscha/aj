@@ -530,6 +530,7 @@ mod tests {
                     .expect("append the interleaved message");
                 let _ = sink.send(TaggedEvent {
                     entry: Some(entry),
+                    branch_settings: None,
                     event: AgentEvent::MessageEnd {
                         agent_id: AgentId::Main,
                         message,

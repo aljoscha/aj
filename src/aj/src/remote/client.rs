@@ -280,8 +280,21 @@ impl RemoteClient {
     pub(crate) async fn environment(
         &self,
         session: &str,
+        before: Option<&str>,
     ) -> Result<BTreeMap<String, String>, RemoteError> {
-        self.get(&format!("/v1/sessions/{session}/env")).await
+        let mut url = reqwest::Url::parse(&self.base).expect("validated base URL");
+        {
+            let mut path = url.path_segments_mut().expect("HTTP URL has path segments");
+            path.pop_if_empty()
+                .extend(["v1", "sessions", session, "env"]);
+            if let Some(message) = before {
+                // A distinct resource path fails closed on a host that cannot
+                // select history. An older handler may silently ignore a query.
+                path.extend(["before", message]);
+            }
+        }
+        let response = self.http.get(url).timeout(REQUEST_TIMEOUT).send().await?;
+        decode(refusal(response).await?).await
     }
 
     pub(crate) async fn tree(&self, session: &str) -> Result<SessionTree, RemoteError> {
@@ -308,8 +321,7 @@ impl RemoteClient {
         decode(refusal(response).await?).await
     }
 
-    /// Apply one mutation. Every command but the queue withdrawal answers
-    /// [`CommandOutcome::Accepted`].
+    /// Execute a command, decoding withdrawn text for a queue removal.
     pub(crate) async fn command(
         &self,
         session: &str,
