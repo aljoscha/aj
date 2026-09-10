@@ -1738,6 +1738,8 @@ pub struct TranscriptView {
     /// whole cache is cleared, since they are not part of any per-entry
     /// fingerprint.
     last_globals: GlobalRenderInputs,
+    /// The model incarnation the reading state belongs to.
+    generation: u64,
     /// While true, every draw pins the viewport to the bottom so a
     /// streaming turn stays in view. Wheel-up and thumb drags
     /// disengage, a scroll that lands back at the bottom re-engages.
@@ -1997,6 +1999,7 @@ impl TranscriptView {
         apply_scrollbar_thumbs(&mut bars.borrow_mut(), &styles);
         let list = Rc::clone(&bars.borrow().view);
         let last_globals = GlobalRenderInputs::read(&chat.borrow());
+        let generation = chat.borrow().generation();
         TranscriptView {
             chat,
             list,
@@ -2013,6 +2016,7 @@ impl TranscriptView {
             },
             width_method: gwidth::Method::Unicode,
             last_globals,
+            generation,
             follow_tail: true,
             focused,
             branch_armed,
@@ -2036,59 +2040,59 @@ impl TranscriptView {
         }
     }
 
-    /// Re-engage follow-tail so the next draw pins the viewport to the bottom,
-    /// and drop the view state a swap or a switch invalidates.
-    ///
-    /// Not what keeps a new model off the old one's cached surfaces: the caches
-    /// retire an incarnation's slots on their own (see
-    /// [`EntryRenderCache::retire`]). What a caller that forgets this loses is
-    /// view state, and not only the scroll position: the selection stays
-    /// anchored in entries that are gone, and the list's geometry is keyed by
-    /// index, so a swap to content of the same length keeps the outgoing
-    /// entries' measured heights and self-heals only as rows redraw.
-    ///
-    /// Two callers use it. On a session rebuild the view's `chat` cell keeps
-    /// its identity across the swap (the outer loop overwrites its contents
-    /// in place), so the fresh session's transcript must open at the tail
-    /// rather than wherever the previous session was scrolled. On an
-    /// `active_view` switch each view opens at its bottom (scroll position is
-    /// per view). The draw path refreshes `item_count` before
-    /// scrolling, so we needn't touch the list's scroll offset here.
+    /// Stop motion and gestures and release reconstructible caches while keeping
+    /// this session's reading position, follow-tail mode, and selection. Drawing
+    /// the same model again restores layout without a presentation swap.
+    pub(crate) fn suspend(&mut self) {
+        self.cancel_scroll_anim();
+        self.cancel_selection_gesture();
+        // Only the vertical bar is enabled. MouseLeave cancels its thumb drag
+        // without synthesizing a release that might copy the selection.
+        self.bars
+            .borrow_mut()
+            .handle_event(&mut EventContext::new(), &Event::MouseLeave);
+        *self.cache.borrow_mut() = EntryRenderCache::new();
+        self.entry_text = EntryTextCache::new();
+        self.agent_hit_rows = Vec::new();
+        self.agent_hit_width = 0;
+        self.last_view = Size {
+            width: 0,
+            height: 0,
+        };
+        self.list.borrow_mut().suspend();
+    }
+
+    /// Re-engage follow-tail and discard reading state invalidated by a model
+    /// rebuild or an active-agent view switch. Cache retirement independently
+    /// prevents reuse of surfaces from another model generation.
     pub(crate) fn reset_to_tail(&mut self) {
-        // A different session in the reused `chat` cell is a different
-        // incarnation of the model, and the caches retire an incarnation's
-        // slots themselves now (see `EntryRenderCache::retire`), so this clear
-        // is not what keeps a fresh session off the previous one's surface.
-        // What it is still for is the other caller: a view switch, which is the
-        // same incarnation and so passes the retirement untouched. The render
-        // cache keys views apart (`AgentId` is in the key) and the draw's
-        // global-input clear catches the switch anyway, so this one is
-        // belt-and-braces.
         self.cache.borrow_mut().clear();
-        // The text cache is the one that needs it. Its key is an `EntryId`
-        // alone, so two views collide outright, and select-to-copy reaches it
-        // without drawing, so the draw's global-input clear cannot be what
-        // covers the switch. Keying it by `(AgentId, EntryId)` would retire
-        // this clear the way the retirement retired the one above.
+        // Selection text is keyed by EntryId alone. Active-agent views reuse
+        // those ids, and select-to-copy can run before the next draw.
         self.entry_text.clear();
-        self.agent_click = None;
+        self.cancel_selection_gesture();
         self.agent_hit_rows.clear();
         self.agent_hit_width = 0;
-        // The reused list holds a different session whose entries reuse indices,
-        // so a geometry carried over from the previous session would missize the
-        // new session's thumb. Drop it so the next draw rebuilds it.
-        self.list.borrow_mut().reset_geometry();
+        let mut list = self.list.borrow_mut();
+        list.suspend();
+        list.cursor = 0;
+        drop(list);
         self.follow_tail = true;
-        // A fresh session's entries are unrelated to the old selection's anchor
-        // entry, so drop it rather than highlight stale content.
         self.selection = None;
-        self.selection_origin = None;
-        self.last_click = None;
-        // An in-flight glide targets a position in the outgoing content, which
-        // the swap invalidates (a focus glide by entry index, a page glide by
-        // line delta). Cancel it so its remaining scroll does not land on the
-        // new session's transcript.
-        self.scroll_anim = None;
+        self.cancel_scroll_anim();
+    }
+
+    /// Discard reading and focus state from a replaced model. Returns whether
+    /// the shell must return keyboard focus to the editor before dispatch.
+    pub(crate) fn reconcile_model(&mut self) -> bool {
+        let generation = self.chat.borrow().generation();
+        if self.generation != generation {
+            self.reset_to_tail();
+            self.focused.set(false);
+            self.generation = generation;
+            return true;
+        }
+        false
     }
 
     /// Install the callback invoked when Esc leaves transcript-focus mode.
@@ -3175,6 +3179,13 @@ impl TranscriptView {
     /// only after the bars declined the event, so a scrollbar-thumb drag
     /// scrolls rather than selects.
     fn handle_selection_mouse(&mut self, ctx: &mut EventContext, m: &mouse::Mouse) {
+        // A release or drag after cancellation does not belong to this widget's
+        // selection, even if a highlight remains from the completed gesture.
+        if matches!(m.kind, mouse::Type::Drag | mouse::Type::Release)
+            && self.selection_origin.is_none()
+        {
+            return;
+        }
         match m.kind {
             mouse::Type::Press => {
                 let Some(pos) = self.point_to_sel(m.row, m.col) else {
@@ -3224,16 +3235,8 @@ impl TranscriptView {
                     return;
                 };
                 let target = self.selection_for_unit(caret, self.selection_unit);
-                match self.selection_origin {
-                    Some(origin) => {
-                        self.selection = Some(Self::extend_unit_selection(origin, target));
-                    }
-                    // A drag with no prior press is not expected, but start a
-                    // selection at the caret rather than drop the interaction.
-                    None => {
-                        self.selection = Some(target);
-                        self.selection_origin = Some(target);
-                    }
+                if let Some(origin) = self.selection_origin {
+                    self.selection = Some(Self::extend_unit_selection(origin, target));
                 }
                 ctx.redraw = true;
             }
@@ -3500,6 +3503,7 @@ fn apply_scrollbar_thumbs(bars: &mut ScrollBars<ListView>, styles: &TranscriptSt
 
 impl Widget for TranscriptView {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        self.reconcile_model();
         // Stash the presentation state the per-entry text layout reuses, so
         // `entry_rows` wraps under the same cell size and width method the
         // visible render just used. A measuring pass carries the same values,
@@ -3581,6 +3585,7 @@ impl Widget for TranscriptView {
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        self.reconcile_model();
         // Content-area mouse events target the inner list, so they
         // pass through here on the way down.
         if let Event::Mouse(m) = event {
@@ -3592,6 +3597,7 @@ impl Widget for TranscriptView {
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        self.reconcile_model();
         match event {
             Event::Mouse(m) => {
                 if !matches!(m.button, mouse::Button::Left | mouse::Button::None) {
@@ -8404,5 +8410,120 @@ mod tests {
             view.selection.is_none(),
             "a plain click cleared the selection"
         );
+    }
+
+    #[test]
+    fn suspend_frees_caches_and_preserves_reading_position_and_selection() {
+        use vaxis::vxfw::ScrollableView;
+
+        let chat = chat_with_notices(50);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 9);
+        view.draw(&ctx);
+        view.page_up(&mut EventContext::new());
+        view.draw(&ctx);
+        view.handle_event(&mut EventContext::new(), &mouse(1, 1, mouse::Type::Press));
+        view.handle_event(&mut EventContext::new(), &mouse(5, 1, mouse::Type::Drag));
+        let before = crate::test_support::rows(&view.draw(&ctx));
+        let selection = view.selection.expect("a range is selected");
+        assert!(selection.anchor != selection.caret);
+        let text = view.extract_selection(view.content_width(), selection.anchor, selection.caret);
+        assert!(!text.is_empty());
+        assert!(!view.cache.borrow().slots.is_empty());
+        assert!(!view.entry_text.slots.is_empty());
+        assert!(view.list.borrow().content_extent().is_some());
+        let top = view.list.borrow().scroll_top();
+        let offset = view.list.borrow().scroll_offset();
+        assert!(top > 0);
+        assert!(offset > 0, "fixture exercises an intra-entry line offset");
+        assert!(!view.follow_tail);
+
+        view.suspend();
+        assert_eq!(view.cache.borrow().slots.capacity(), 0);
+        assert_eq!(view.entry_text.slots.capacity(), 0);
+        assert_eq!(view.agent_hit_rows.capacity(), 0);
+        assert!(view.list.borrow().content_extent().is_none());
+        assert_eq!(view.list.borrow().scroll_top(), top);
+        assert_eq!(view.list.borrow().scroll_offset(), offset);
+        assert!(view.selection == Some(selection));
+        assert!(!view.follow_tail);
+        assert!(view.selection_origin.is_none());
+        assert_eq!(crate::test_support::rows(&view.draw(&ctx)), before);
+        assert_eq!(
+            view.extract_selection(view.content_width(), selection.anchor, selection.caret),
+            text
+        );
+
+        // The abandoned press must neither extend the retained highlight nor
+        // copy it when its orphan drag and release reach the resumed tree.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(9, 3, mouse::Type::Drag));
+        view.handle_event(&mut ec, &mouse(9, 3, mouse::Type::Release));
+        assert!(view.selection == Some(selection));
+        assert!(ec.cmds.is_empty());
+    }
+
+    #[test]
+    fn suspend_preserves_follow_tail() {
+        let chat = chat_with_notices(50);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 11);
+        view.draw(&ctx);
+        assert!(view.follow_tail);
+        view.suspend();
+        assert!(view.follow_tail);
+        apply(
+            &chat,
+            &mut AgentLifecycle::default(),
+            user_end("arrived while hidden"),
+        );
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        assert!(view.follow_tail);
+        assert!(view.list.borrow().is_at_bottom());
+        assert!(rows.iter().any(|row| row.contains("arrived while hidden")));
+    }
+
+    #[test]
+    fn suspend_stops_scroll_tick_without_moving_the_viewport() {
+        let chat = chat_with_notices(50);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let ctx = draw_ctx(40, 11);
+        view.borrow_mut().draw(&ctx);
+        let mut ec = EventContext::new();
+        view.borrow_mut().page_up(&mut ec);
+        assert!(view.borrow().scroll_anim.is_some());
+        assert!(view.borrow().scroll_tick_scheduled);
+        let before = crate::test_support::rows(&view.borrow_mut().draw(&ctx));
+        view.borrow_mut().suspend();
+        assert!(view.borrow().scroll_tick_scheduled);
+        let mut ec = EventContext::new();
+        view.borrow_mut().handle_event(&mut ec, &Event::Tick);
+        assert!(ec.cmds.is_empty());
+        assert!(!ec.redraw);
+        assert!(!view.borrow().scroll_tick_scheduled);
+        assert!(view.borrow().scroll_anim.is_none());
+        assert_eq!(
+            crate::test_support::rows(&view.borrow_mut().draw(&ctx)),
+            before
+        );
+    }
+
+    #[test]
+    fn suspend_cancels_the_scrollbar_thumb_drag() {
+        let chat = chat_with_notices(50);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 11);
+        view.draw(&ctx);
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(39, 10, mouse::Type::Press));
+        assert!(ec.consume_event, "the thumb grabbed the press");
+        view.suspend();
+        view.draw(&ctx);
+        let mut ec = EventContext::new();
+        view.capture_event(&mut ec, &mouse(20, 0, mouse::Type::Drag));
+        assert!(!ec.consume_event, "the thumb no longer owns this drag");
+        view.draw(&ctx);
+        assert!(view.list.borrow().is_at_bottom());
     }
 }

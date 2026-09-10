@@ -196,9 +196,9 @@ struct World {
     /// Separate from action feedback so a failed action followed by passive
     /// recovery still receives its session's context and restore notices.
     startup: HashMap<String, PendingStartup>,
-    /// The chat model, shared with the [`TranscriptView`]. Only the
-    /// loop mutates it (via the client fold and the arm helpers). The view
-    /// reads it at draw time. Never borrowed across an await.
+    /// Handle to the selected session's model, also held by its directory entry
+    /// and widget tree. Selection changes this handle, never the cell's session.
+    /// Only the loop mutates models. Never borrowed across an await.
     chat: Rc<RefCell<ChatState>>,
     /// Mirror of the lifecycle bits the status chrome (loader,
     /// footer) reads at draw time, shared with those widgets and
@@ -342,7 +342,13 @@ async fn build_world(
         StartupSession::Resume(id) => id,
     };
     let control = Control::local(host);
-    let mut directory = SessionDirectory::new(session.clone());
+    let chat = Rc::new(RefCell::new(seeded_chat(
+        &config,
+        unknown_settings(),
+        0,
+        &catalog,
+    )));
+    let mut directory = SessionDirectory::new(session.clone(), Rc::clone(&chat));
     // The stream before the handles: its attachment is what stops the host from
     // releasing the session in between (attachment is the retention signal an
     // idle session is released without), which would leave the
@@ -361,7 +367,7 @@ async fn build_world(
             .expect("run config mutex poisoned");
         (cfg.settings(), cfg.model_info.context_window)
     };
-    let chat = seeded_chat(&config, settings, context_window, &catalog);
+    *chat.borrow_mut() = seeded_chat(&config, settings, context_window, &catalog);
     let mut world = World {
         control,
         directory,
@@ -374,7 +380,7 @@ async fn build_world(
         resume: None,
         transition: None,
         startup: HashMap::new(),
-        chat: Rc::new(RefCell::new(chat)),
+        chat,
         status: Rc::new(RefCell::new(StatusState::default())),
         process_notices: ProcessNotices::at_launch(diagnostics, &keybinding_problems),
         config,
@@ -528,10 +534,15 @@ async fn build_connect_world(
         created,
     } = connected;
     let working_directory_follows_focus = working_directory.is_none();
-    let mut directory = SessionDirectory::new(session.clone());
+    let chat = Rc::new(RefCell::new(seeded_chat(
+        &config,
+        unknown_settings(),
+        0,
+        &catalog,
+    )));
+    let mut directory = SessionDirectory::new(session.clone(), Rc::clone(&chat));
     // No run config to seed from: the block's opening `state` frame carries
     // the host's own settings and lands before the first paint.
-    let chat = seeded_chat(&config, unknown_settings(), 0, &catalog);
     let stream = open_stream(&control, &mut directory).await?;
     let mut world = World {
         control,
@@ -547,7 +558,7 @@ async fn build_connect_world(
         resume: None,
         transition: None,
         startup: HashMap::new(),
-        chat: Rc::new(RefCell::new(chat)),
+        chat,
         status: Rc::new(RefCell::new(StatusState::default())),
         process_notices: ProcessNotices::at_launch(diagnostics, &keybinding_problems),
         config,
@@ -812,7 +823,7 @@ async fn open_tree_overlay(
 fn fold_ready_frames(world: &mut World) -> bool {
     let mut redraw = false;
     while let Some(frame) = world.stream_mut().try_recv() {
-        redraw |= world.directory.apply(&mut world.chat.borrow_mut(), frame).0;
+        redraw |= world.directory.apply(frame).0;
     }
     redraw
 }
@@ -1061,7 +1072,7 @@ impl Block {
             "a block folded against another session's client",
         );
         if self.settled.is_some() {
-            return world.directory.apply(&mut world.chat.borrow_mut(), frame).0;
+            return world.directory.apply(frame).0;
         }
         let mine = frame.session() == Some(self.session.as_str());
         let refusal = match &frame {
@@ -1077,7 +1088,7 @@ impl Block {
         if mine {
             self.deadline = Instant::now() + self.silence;
         }
-        let redraw = world.directory.apply(&mut world.chat.borrow_mut(), frame).0;
+        let redraw = world.directory.apply(frame).0;
         let phase = world.client().attach_phase();
         if let Some((reason, refusal)) = refusal {
             self.settle(CatchUp::Refused { reason, refusal });
@@ -1478,12 +1489,9 @@ fn settle_create_host(
 /// Select `session`, close the prior stream, and try to follow the selected
 /// session through its own attach block.
 ///
-/// Rebind by replace-contents: the `chat` and `status` cells keep their
-/// identity across the swap (every chrome widget and the keymap's dispatch
-/// closure hold clones of these Rcs, captured once at [`Shell::new`]), so
-/// overwriting their contents repoints the whole UI at the new session
-/// without rebuilding a widget or re-initializing the app. Only the handles
-/// a content swap cannot reach are repointed in [`Shell::rebind`].
+/// Models and widget trees belong to their sessions. Selecting a session
+/// changes the world's active handles and the shell's displayed tree, without
+/// moving model contents or editing state between sessions.
 ///
 /// Selection is committed before IO. A refused, stalled, or unopened target
 /// therefore keeps its cached transcript on screen under explicit connection
@@ -1514,7 +1522,7 @@ async fn focus_session(
         ..
     }) = world.transition.take()
     {
-        replace_editor_preserving_draft(&shell.borrow().editor, &prompt);
+        replace_editor_preserving_draft(&shell.borrow().view().editor, &prompt);
     }
     let attaching = !world.directory.is_attached(&session);
     let reopening = attaching
@@ -1542,18 +1550,25 @@ async fn focus_session(
     if let Some(startup) = startup {
         world.startup.entry(session.clone()).or_insert(startup);
     }
-    // A new local session has no direct handles until its stream retains the
-    // materialization. Start with the same explicit unknown seed connect mode
-    // uses; the opening State frame supplies its real settings before Caught.
-    let minted =
-        attaching.then(|| seeded_chat(&world.config, unknown_settings(), 0, &world.catalog));
-    // Parks the outgoing session's transcript and brings the incoming one into
-    // the cell the widgets read, which is what makes a switch back instant.
-    world
-        .directory
-        .focus(&mut world.chat.borrow_mut(), &session, || {
-            minted.expect("a session focused for the first time was minted a transcript")
-        });
+    free_session_images(app, shell);
+    let remembered = shell
+        .borrow()
+        .views
+        .borrow()
+        .parked
+        .get(&session)
+        .map(|view| Rc::clone(&view.chat));
+    world.directory.focus(&session, || {
+        remembered.unwrap_or_else(|| {
+            Rc::new(RefCell::new(seeded_chat(
+                &world.config,
+                unknown_settings(),
+                0,
+                &world.catalog,
+            )))
+        })
+    });
+    world.chat = world.directory.chat();
     world.sync_working_directory();
     // A swap reads the session's handles now; a reopen reads them once the
     // target proves usable. A swap whose handles cannot be read has lost its
@@ -1577,30 +1592,14 @@ async fn focus_session(
         world.connection = Connection::Connected;
     }
     world.transition = Some(transition);
-    // This selection is painted before the new drive loop's first bottom-of-
-    // iteration sync, so publish its state now.
-    sync_status(world);
-    // Clear any armed branch anchor: the shell and its slots survive session
-    // changes, so without this a stale anchor could resolve against the new
-    // session's log (and with legacy 8-hex ids even hit a wrong entry).
     shell.borrow().disarm_branch();
-    // Start the switched-to session's splash box at the top: a prior session's
-    // wheel scroll must not carry over.
-    shell.borrow().splash.borrow_mut().reset_scroll();
-    shell.borrow_mut().rebind(world);
-    // Reconcile the editor chrome onto the freshly focused session. The
-    // per-iteration reconcile runs at the bottom of `drive`, but `drive`
-    // re-enters here with no prior render and paints its first frame at the top
-    // of the loop, one iteration before that reconcile. The editor widget
-    // persists across the chat swap, so without this the first frame would show
-    // the outgoing session's baked border tint and stale `agent N` marker. This
-    // mirrors the `world.status` reset above, which resets chrome for the same
-    // install-to-first-draw window.
+    shell.borrow_mut().select_session(world);
+    world.status = Rc::clone(&shell.borrow().view().status);
+    sync_status(world);
     sync_editor_chrome(world, shell);
-    free_session_images(app, shell);
     app.request_redraw();
     // Retitle the terminal for the switched-to session, and hand focus back
-    // to the editor: `rebind` closed the overlay stack, so the widget that
+    // to the editor: `select_session` closed the overlay stack, so the widget that
     // held focus may be gone. Both run off the loop with no event context,
     // so they ride app events (see `REFOCUS_OVERLAY_EVENT`).
     app.post_app_event(UserEvent {
@@ -1684,8 +1683,8 @@ fn fold_selected_startup(world: &mut World, startup: PendingStartup) {
 }
 
 /// Complete the pending user transition after the selected target's Caught.
-/// With no action pending this is passive recovery, which stays in scrollback
-/// and never becomes delayed action success.
+/// With no action pending this is passive recovery, never delayed action success.
+/// A retained model keeps its reading position. A rebuilt one opens at the tail.
 async fn complete_pending_transition(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
@@ -1743,6 +1742,12 @@ async fn complete_pending_transition(
                 .show_toast(branch_switch_notice(prompt.is_some()));
             if let Some(prompt) = prompt {
                 auto_submit_launch(world, vec![UserContent::text(prompt)]).await;
+                shell
+                    .borrow()
+                    .view()
+                    .transcript
+                    .borrow_mut()
+                    .resume_follow_tail();
             }
         }
     }
@@ -1820,7 +1825,7 @@ fn fail_pending_transition(
         PendingTransition::Head { branching, prompt } => {
             let restored_prompt = prompt.is_some();
             if let Some(prompt) = &prompt {
-                replace_editor_preserving_draft(&shell.borrow().editor, prompt);
+                replace_editor_preserving_draft(&shell.borrow().view().editor, prompt);
             }
             let action = if branching {
                 "The branch changed"
@@ -1882,7 +1887,7 @@ async fn branch_focused_session(
 ) {
     if refuse_while_attaching(world, shell, "change branches") {
         if let Some(prompt) = &prompt {
-            shell.borrow().editor.borrow_mut().set_text(prompt);
+            shell.borrow().view().editor.borrow_mut().set_text(prompt);
         }
         app.request_redraw();
         return;
@@ -1891,7 +1896,8 @@ async fn branch_focused_session(
     let branching = matches!(target, HeadTarget::Before(_));
     let changes = {
         let shell = shell.borrow();
-        let draft = shell.branch_anchor.borrow();
+        let view = shell.view();
+        let draft = view.branch_anchor.borrow();
         draft
             .as_ref()
             .filter(|draft| {
@@ -1922,7 +1928,7 @@ async fn branch_focused_session(
         // already in prompt history (recorded at the submit site), so it is
         // never lost either way.
         if let Some(prompt) = prompt {
-            shell.borrow().editor.borrow_mut().set_text(&prompt);
+            shell.borrow().view().editor.borrow_mut().set_text(&prompt);
             refusal.push_str(" Your message is back in the editor.");
         }
         shell.borrow().show_toast(refusal);
@@ -1989,7 +1995,12 @@ async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<Catch
     // in-flight glide. Not the caches keyed by entry id, which retire the
     // incarnation they were filled for without being told (see
     // `EntryRenderCache::retire`).
-    shell.borrow().transcript.borrow_mut().reset_to_tail();
+    shell
+        .borrow()
+        .view()
+        .transcript
+        .borrow_mut()
+        .reset_to_tail();
     Ok(caught)
 }
 
@@ -2044,7 +2055,12 @@ fn branch_switch_notice(prompt_present: bool) -> &'static str {
 /// requested whenever the store changed, so the frame that places the image or
 /// shows the fallback runs.
 fn drain_pending_images(app: &mut AsyncApp, world: &World, shell: &Rc<RefCell<Shell>>) {
-    let pending = shell.borrow().image_store.borrow_mut().take_pending();
+    let pending = shell
+        .borrow()
+        .view()
+        .image_store
+        .borrow_mut()
+        .take_pending();
     if pending.is_empty() {
         return;
     }
@@ -2066,6 +2082,7 @@ fn drain_pending_images(app: &mut AsyncApp, world: &World, shell: &Rc<RefCell<Sh
                 // back to text and is not re-attempted every frame.
                 shell
                     .borrow()
+                    .view()
                     .image_store
                     .borrow_mut()
                     .mark_failed(agent, entry_id);
@@ -2077,11 +2094,11 @@ fn drain_pending_images(app: &mut AsyncApp, world: &World, shell: &Rc<RefCell<Sh
             // base64 string.
             match app.load_image(vaxis::image::Source::Mem(bytes)) {
                 Ok(img) => {
-                    shell
-                        .borrow()
-                        .image_store
-                        .borrow_mut()
-                        .insert(agent, entry_id, img.id());
+                    shell.borrow().view().image_store.borrow_mut().insert(
+                        agent,
+                        entry_id,
+                        img.id(),
+                    );
                     dirtied = true;
                 }
                 Err(_) => {
@@ -2090,6 +2107,7 @@ fn drain_pending_images(app: &mut AsyncApp, world: &World, shell: &Rc<RefCell<Sh
                     // re-attempted every frame.
                     shell
                         .borrow()
+                        .view()
                         .image_store
                         .borrow_mut()
                         .mark_failed(agent, entry_id);
@@ -2121,7 +2139,7 @@ fn image_entry_bytes(entry: &aj_app::chat::Entry) -> Option<Vec<u8>> {
 /// The ids belong to the outgoing session's terminal graphics memory, so
 /// releasing them here bounds it to the live session.
 fn free_session_images(app: &mut AsyncApp, shell: &Rc<RefCell<Shell>>) {
-    let ids = shell.borrow().image_store.borrow_mut().drain_ids();
+    let ids = shell.borrow().view().image_store.borrow_mut().drain_ids();
     for id in ids {
         app.free_image(id);
     }
@@ -2506,8 +2524,9 @@ async fn apply_auth_request(
             provider,
             account,
         } => {
-            if session == world.session() && shell.borrow().branch_anchor.borrow().is_some() {
-                if let Some(draft) = shell.borrow().branch_anchor.borrow_mut().as_mut() {
+            if session == world.session() && shell.borrow().view().branch_anchor.borrow().is_some()
+            {
+                if let Some(draft) = shell.borrow().view().branch_anchor.borrow_mut().as_mut() {
                     draft.changes.accounts.insert(provider, account);
                 }
                 shell
@@ -2894,6 +2913,7 @@ fn park_session_request(
 fn branch_settings(shell: &Rc<RefCell<Shell>>) -> Option<aj_wire::BranchSettings> {
     shell
         .borrow()
+        .view()
         .branch_anchor
         .borrow()
         .as_ref()
@@ -2901,7 +2921,7 @@ fn branch_settings(shell: &Rc<RefCell<Shell>>) -> Option<aj_wire::BranchSettings
 }
 
 fn editing_target(world: &World, shell: &Rc<RefCell<Shell>>) -> AgentId {
-    if shell.borrow().branch_anchor.borrow().is_some() {
+    if shell.borrow().view().branch_anchor.borrow().is_some() {
         AgentId::Main
     } else {
         world.chat.borrow().active_view()
@@ -2946,7 +2966,7 @@ fn stage_branch_setting(
     };
     let saved_default =
         persist != PersistAction::None && !world.control.is_remote() && note.is_none();
-    if let Some(draft) = shell.borrow().branch_anchor.borrow_mut().as_mut() {
+    if let Some(draft) = shell.borrow().view().branch_anchor.borrow_mut().as_mut() {
         draft.set(axis);
     }
     let notice = if saved_default {
@@ -2960,11 +2980,12 @@ fn stage_branch_setting(
 }
 
 /// Replace the editor text while preserving any displaced draft in recall
-/// history (up / Ctrl+P). A blank draft is skipped by `add_to_history`.
+/// history (up / Ctrl+P), private to this editor. Paste markers are expanded
+/// because submitting the replacement releases their backing payloads.
 fn replace_editor_preserving_draft(editor: &Rc<RefCell<TextArea>>, message: &str) {
     let mut editor = editor.borrow_mut();
-    let draft = editor.text();
-    editor.add_to_history(&draft);
+    let draft = editor.expanded_text();
+    editor.remember_draft(&draft);
     editor.set_text(message);
 }
 
@@ -3042,7 +3063,12 @@ async fn prompt_host(world: &mut World, command: Command) -> bool {
 /// Submit editor text and return the transcript to its live tail when accepted.
 async fn handle_editor_submit(world: &mut World, shell: &Rc<RefCell<Shell>>, text: String) {
     if handle_submit(world, text).await {
-        shell.borrow().transcript.borrow_mut().resume_follow_tail();
+        shell
+            .borrow()
+            .view()
+            .transcript
+            .borrow_mut()
+            .resume_follow_tail();
     }
 }
 
@@ -3154,7 +3180,8 @@ async fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> 
         }
     };
     let shell = shell.borrow();
-    let mut editor = shell.editor.borrow_mut();
+    let view = shell.view();
+    let mut editor = view.editor.borrow_mut();
     let current = editor.text();
     let combined = if current.trim().is_empty() {
         text
@@ -3178,7 +3205,7 @@ fn paste_clipboard_image(shell: &Rc<RefCell<Shell>>) -> bool {
         tracing::debug!("clipboard: no image to paste");
         return false;
     };
-    insert_pasted_image_path(&shell.borrow().editor, &path)
+    insert_pasted_image_path(&shell.borrow().view().editor, &path)
 }
 
 /// Insert a pasted clipboard-image path at the editor cursor as plain text
@@ -3209,7 +3236,8 @@ async fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
     // run when it was already empty, so clearing is right on every branch.
     let text = {
         let shell = shell.borrow();
-        let mut editor = shell.editor.borrow_mut();
+        let view = shell.view();
+        let mut editor = view.editor.borrow_mut();
         let text = editor.text().trim().to_string();
         editor.clear();
         text
@@ -3226,8 +3254,18 @@ async fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
         .await;
     match steered {
         Ok(_) if !text.is_empty() => {
-            shell.borrow().editor.borrow_mut().add_to_history(&text);
-            shell.borrow().transcript.borrow_mut().resume_follow_tail();
+            shell
+                .borrow()
+                .view()
+                .editor
+                .borrow_mut()
+                .add_to_history(&text);
+            shell
+                .borrow()
+                .view()
+                .transcript
+                .borrow_mut()
+                .resume_follow_tail();
         }
         Ok(_) => {}
         Err(err) => fold_notice(world, &err.to_string()),
@@ -3271,7 +3309,7 @@ async fn handle_host_action(
             // Steering is incoherent with an armed branch anchor: it would
             // consume the branch prompt as steering for the branch being
             // abandoned. Refuse and keep the anchor and editor text intact.
-            if shell.borrow().branch_anchor.borrow().is_some() {
+            if shell.borrow().view().branch_anchor.borrow().is_some() {
                 shell.borrow().show_toast(branch_armed_refusal("steer"));
                 return true;
             }
@@ -3282,7 +3320,7 @@ async fn handle_host_action(
             // Dequeueing is incoherent with an armed branch anchor: it would
             // splice queued text into the prefilled branch prompt. Refuse and
             // keep the anchor and editor text intact.
-            if shell.borrow().branch_anchor.borrow().is_some() {
+            if shell.borrow().view().branch_anchor.borrow().is_some() {
                 shell
                     .borrow()
                     .show_toast(branch_armed_refusal("dequeue a message"));
@@ -3383,12 +3421,13 @@ async fn submit_with_armed_anchor(
     // kept rather than handed to a refusal one layer down.
     let (agents, bash) = running_work(world);
     if agents + bash > 0 {
-        shell.borrow().editor.borrow_mut().set_text(&text);
+        shell.borrow().view().editor.borrow_mut().set_text(&text);
         shell.borrow().show_toast(busy_refusal("branch"));
         return ArmedSubmit::Stay;
     }
     let message_id = shell
         .borrow()
+        .view()
         .branch_anchor
         .borrow()
         .as_ref()
@@ -3561,7 +3600,7 @@ async fn apply_command_action(
         CommandAction::OpenSessionEnv => Some("edit the session environment"),
         _ => None,
     };
-    let local_choice = shell.borrow().branch_anchor.borrow().is_some()
+    let local_choice = shell.borrow().view().branch_anchor.borrow().is_some()
         && matches!(
             action,
             CommandAction::OpenThinkingSelector | CommandAction::OpenModelSelector
@@ -3786,7 +3825,7 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionEnv => {
-            let draft = shell.borrow().branch_anchor.borrow().clone();
+            let draft = shell.borrow().view().branch_anchor.borrow().clone();
             match world
                 .control
                 .environment(
@@ -3892,6 +3931,7 @@ async fn apply_command_action(
             };
             if shell
                 .borrow()
+                .view()
                 .branch_anchor
                 .borrow()
                 .as_ref()
@@ -4251,7 +4291,12 @@ async fn apply_picker_outcome(
             // per view). `reset_to_tail` also clears the
             // render cache, which the draw's active-view clear would do
             // anyway, so the two don't fight.
-            shell.borrow().transcript.borrow_mut().reset_to_tail();
+            shell
+                .borrow()
+                .view()
+                .transcript
+                .borrow_mut()
+                .reset_to_tail();
             ActionEffect::Redraw
         }
         AgentPickerOutcome::OpenTask(id) => {
@@ -4373,7 +4418,7 @@ fn recall_into_editor(shell: &Rc<RefCell<Shell>>, text: &str) {
     let shell = shell.borrow();
     // `set_text` replaces the whole document and leaves the cursor at the end,
     // so the recalled prompt is ready to edit before sending.
-    shell.editor.borrow_mut().set_text(text);
+    shell.view().editor.borrow_mut().set_text(text);
 }
 
 /// The viewed agent's current thinking level, from its footer entry, falling
@@ -4450,7 +4495,7 @@ async fn apply_selector_activity(
             ),
             SelectorActivity::SkillToggle { .. } => false,
         };
-        let draft_choice = shell.borrow().branch_anchor.borrow().is_some()
+        let draft_choice = shell.borrow().view().branch_anchor.borrow().is_some()
             && match &item {
                 SelectorActivity::ThinkingConfirmed { target, .. }
                 | SelectorActivity::ModelConfirmed { target, .. } => *target == AgentId::Main,
@@ -4474,7 +4519,8 @@ async fn apply_selector_activity(
         }
         match item {
             SelectorActivity::ThinkingConfirmed { target, level } => {
-                if target == AgentId::Main && shell.borrow().branch_anchor.borrow().is_some() {
+                if target == AgentId::Main && shell.borrow().view().branch_anchor.borrow().is_some()
+                {
                     stage_branch_setting(
                         world,
                         shell,
@@ -4492,7 +4538,8 @@ async fn apply_selector_activity(
                 }
             }
             SelectorActivity::ModelConfirmed { target, info } => {
-                if target == AgentId::Main && shell.borrow().branch_anchor.borrow().is_some() {
+                if target == AgentId::Main && shell.borrow().view().branch_anchor.borrow().is_some()
+                {
                     stage_branch_setting(
                         world,
                         shell,
@@ -4534,9 +4581,9 @@ async fn apply_selector_activity(
             }
             SelectorActivity::EnvironmentEdit(edit) => {
                 if edit.session == world.session()
-                    && shell.borrow().branch_anchor.borrow().is_some()
+                    && shell.borrow().view().branch_anchor.borrow().is_some()
                 {
-                    if let Some(draft) = shell.borrow().branch_anchor.borrow_mut().as_mut() {
+                    if let Some(draft) = shell.borrow().view().branch_anchor.borrow_mut().as_mut() {
                         draft
                             .changes
                             .env
@@ -4790,7 +4837,7 @@ async fn apply_setting_change(
     id: &str,
     value: &str,
 ) -> Option<String> {
-    let drafting = shell.borrow().branch_anchor.borrow().is_some()
+    let drafting = shell.borrow().view().branch_anchor.borrow().is_some()
         && matches!(id, MODEL_SETTING_ID | "thinking" | "speed" | "verbosity");
     match id {
         MODEL_SETTING_ID => {
@@ -5629,10 +5676,155 @@ impl Widget for ChatSlot {
     }
 }
 
-/// The root widget: the keymap controller wrapping the base layout, the
-/// editor submit plumbing, and the overlay stack drawn above everything
-/// while it is open.
+/// A session's persistent widget tree. Its model cell never names another
+/// session, even while the directory drops and rebuilds its attachment.
+struct SessionView {
+    id: String,
+    chat: Rc<RefCell<ChatState>>,
+    status: Rc<RefCell<StatusState>>,
+    layout: WidgetRef,
+    editor: Rc<RefCell<TextArea>>,
+    transcript: Rc<RefCell<TranscriptView>>,
+    splash: Rc<RefCell<Splash>>,
+    status_line: Rc<RefCell<StatusLine>>,
+    pending: Rc<RefCell<PendingBox>>,
+    footer: Rc<RefCell<FooterLine>>,
+    focus_mode: Rc<Cell<bool>>,
+    branch_anchor: Rc<RefCell<Option<crate::branch::BranchDraft>>>,
+    selection_copied: Rc<Cell<Option<SelectionCopied>>>,
+    submitted: Rc<RefCell<Option<String>>>,
+    image_store: Rc<RefCell<ImageStore>>,
+    autocomplete_rx: RefCell<UnboundedReceiver<AutocompleteDelivery>>,
+}
+
+impl SessionView {
+    fn new(
+        chat: Rc<RefCell<ChatState>>,
+        status: Rc<RefCell<StatusState>>,
+        theme: &ThemeHandle,
+        header: String,
+        id: &str,
+        cwd: PathBuf,
+    ) -> Self {
+        let submitted = Rc::new(RefCell::new(None));
+        let editor = TextArea::new();
+        let autocomplete_rx = editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("a session view owns its editor's receiver");
+        let slot = Rc::clone(&submitted);
+        editor.borrow_mut().on_submit = Some(Box::new(move |_ctx, text| {
+            *slot.borrow_mut() = Some(text.to_string());
+        }));
+        editor.borrow_mut().set_autocomplete_provider(Arc::new(
+            crate::autocomplete::CombinedAutocompleteProvider::new(cwd.clone()),
+        ));
+        editor.borrow_mut().set_autocomplete_max_visible(20);
+        let focus_mode = Rc::new(Cell::new(false));
+        let branch_anchor = Rc::new(RefCell::new(None));
+        let selection_copied = Rc::new(Cell::new(None));
+        let image_store = Rc::new(RefCell::new(ImageStore::default()));
+        let t = theme.read();
+        let styles = Rc::new(TranscriptStyles::from_theme(&t, TerminalCaps::default()));
+        let transcript = Rc::new(RefCell::new(TranscriptView::new(
+            Rc::clone(&chat),
+            &t,
+            Rc::clone(&focus_mode),
+            Rc::clone(&branch_anchor),
+            Rc::clone(&selection_copied),
+            Rc::clone(&image_store),
+        )));
+        transcript
+            .borrow_mut()
+            .set_widget_ref(Rc::downgrade(&transcript));
+        let editor_widget = to_widget_ref(Rc::clone(&editor));
+        transcript
+            .borrow_mut()
+            .set_on_exit_focus(Box::new(move |ctx| {
+                ctx.request_focus(Rc::clone(&editor_widget));
+                ctx.redraw = true;
+            }));
+        editor.borrow_mut().set_theme(editor_theme_from_theme(&t));
+        let status_line = StatusLine::new(Rc::clone(&chat), Rc::clone(&status), Rc::clone(&styles));
+        let pending = Rc::new(RefCell::new(PendingBox::new(
+            Rc::clone(&chat),
+            Rc::clone(&styles),
+        )));
+        let footer = Rc::new(RefCell::new(FooterLine::new(
+            Rc::clone(&chat),
+            Rc::clone(&status),
+            Rc::clone(&styles),
+            cwd.display().to_string(),
+            None,
+        )));
+        let splash = Splash::new(Rc::clone(&chat), Rc::clone(&styles), theme.color_mode());
+        let chat_slot = Rc::new(RefCell::new(ChatSlot {
+            chat: Rc::clone(&chat),
+            status: Rc::clone(&status),
+            splash: Rc::clone(&splash),
+            transcript: Rc::clone(&transcript),
+        }));
+        let header = Rc::new(RefCell::new(Text::new(&header)));
+        let layout: WidgetRef = Rc::new(RefCell::new(FlexColumn {
+            children: vec![
+                FlexItem::init(to_widget_ref(Rc::clone(&header)), 0),
+                FlexItem::init(to_widget_ref(chat_slot), 1),
+                FlexItem::init(to_widget_ref(Rc::clone(&status_line)), 0),
+                FlexItem::init(to_widget_ref(Rc::clone(&pending)), 0),
+                FlexItem::init(to_widget_ref(Rc::clone(&editor)), 0),
+                FlexItem::init(to_widget_ref(Rc::clone(&footer)), 0),
+            ],
+        }));
+        Self {
+            id: id.to_string(),
+            chat,
+            status,
+            layout,
+            editor,
+            transcript,
+            splash,
+            status_line,
+            pending,
+            footer,
+            focus_mode,
+            branch_anchor,
+            selection_copied,
+            submitted,
+            image_store,
+            autocomplete_rx: RefCell::new(autocomplete_rx),
+        }
+    }
+
+    fn suspend(&self) {
+        self.editor.borrow_mut().suspend();
+        self.transcript.borrow_mut().suspend();
+        self.status_line.borrow_mut().set_visible(false);
+        self.splash.borrow_mut().set_visible(false);
+        self.footer.borrow_mut().set_task_registry(None);
+    }
+
+    fn activate(&self) {
+        self.status_line.borrow_mut().set_visible(true);
+        self.splash.borrow_mut().set_visible(true);
+    }
+}
+
+/// A stable layout slot selecting a whole session tree, not its contents.
+struct SessionViews {
+    active: Rc<SessionView>,
+    parked: HashMap<String, Rc<SessionView>>,
+}
+
+impl Widget for SessionViews {
+    fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        draw_widget(&self.active.layout, ctx)
+    }
+}
+
+/// Stable application root, widget callbacks and shared chrome.
 struct Shell {
+    views: Rc<RefCell<SessionViews>>,
+    history: vaxis::vxfw::EditorHistory,
     /// The keymap controller wrapping the base layout. Drawn (and thereby
     /// placed on the focus path) by [`Shell::draw`], which also appends
     /// the overlay children to its surface so an open overlay is a
@@ -5642,12 +5834,6 @@ struct Shell {
     /// through the shared stack, `turn_running` is refreshed by the drive
     /// loop's per-iteration sync (see [`sync_keymap_ctx`]).
     keymap_ctx: Rc<RefCell<HostCtx>>,
-    /// Typed handle to the editor so `Init` can focus it.
-    editor: Rc<RefCell<TextArea>>,
-    /// Typed handle to the loader line so host-posted app events (the
-    /// busy-edge wake, see [`drive`]) reach it. The loader is not on
-    /// the focus path, so the Shell forwards from its capturing phase.
-    status_line: Rc<RefCell<StatusLine>>,
     /// The Ctrl+C quit-arm hint, floated above the editor while the quit
     /// sequence is armed. Drawn straight from the live keymap state. Plain
     /// `RefCell` (no `Rc`): never shared, the cell exists for the `&self`
@@ -5676,11 +5862,6 @@ struct Shell {
     /// and the `toast_box` that draws them. The drive loop prunes it and
     /// wakes at the earliest live deadline.
     toasts: ToastStack,
-    /// The last select-to-copy record, written by the transcript (which the
-    /// unified toast stack deliberately leaves untouched). The drive loop
-    /// edge-detects fresh records by their timestamp and folds each into
-    /// `toasts`. Copy payload, so a `Cell` not a `RefCell`.
-    selection_copied: Rc<Cell<Option<SelectionCopied>>>,
     /// Whether any work is in flight (an in-flight turn OR background
     /// sub-agents / bash tasks). Refreshed every drive-loop iteration by
     /// [`sync_keymap_ctx`] from `running_work_counts`. The session-overlay
@@ -5695,10 +5876,6 @@ struct Shell {
     /// each paint so the box shows the previous frame's numbers. `None` before
     /// the first frame. Copy payload, so a `Cell` rather than a `RefCell`.
     frame_stats: Rc<Cell<Option<FrameStats>>>,
-    /// Latest submitted editor text, parked by the `on_submit`
-    /// callback for the host loop to collect after dispatch. The
-    /// callback can't spawn turns itself (it has no session access).
-    submitted: Rc<RefCell<Option<String>>>,
     /// The keymap action awaiting the host loop, parked by the
     /// controller's handler (the same slot pattern as `submitted`) for
     /// the actions that need the session world.
@@ -5723,16 +5900,6 @@ struct Shell {
     /// theme swap re-tints overlays opened afterward. Rebuilt by
     /// [`Shell::restyle`].
     chrome: Rc<RefCell<OverlayChrome>>,
-    /// Typed handles to the palette-consuming widgets, kept so
-    /// [`Shell::restyle`] can push rebuilt styles into them.
-    transcript: Rc<RefCell<TranscriptView>>,
-    /// The empty-state splash, kept so [`Shell::restyle`] can re-tint it and
-    /// [`Shell::capture_event`] can forward the wake that starts its animation.
-    /// Not on the focus path (it is non-interactive), so the Shell forwards to
-    /// it the same way it does the loader.
-    splash: Rc<RefCell<Splash>>,
-    pending: Rc<RefCell<PendingBox>>,
-    footer: Rc<RefCell<FooterLine>>,
     /// Confirmed config edits parked by the selector and settings overlays
     /// for the drive loop to apply through the shared settings core (the
     /// overlays can't reach the async cores or the session world). Drained
@@ -5764,11 +5931,8 @@ struct Shell {
     /// A recalled prompt parked by the prompt-history overlay, collected
     /// by the drive loop and dropped into the editor.
     recall_slot: Rc<RefCell<Option<String>>>,
-    /// Typed handle to the header line, so a session rebuild can refresh
-    /// the shown session id in place.
-    header: Rc<RefCell<Text>>,
     /// The terminal window title (`"AJ - <session id> - <cwd basename>"`).
-    /// Recomputed in [`Shell::rebind`] on a session switch and pushed to the
+    /// Recomputed in [`Shell::select_session`] on a session switch and pushed to the
     /// terminal via [`SET_TITLE_EVENT`] (switch) and the `Init` handler
     /// (startup), never per draw.
     window_title: String,
@@ -5785,18 +5949,6 @@ struct Shell {
     /// Where the session-tag editor parks a confirmed label, read by the drive
     /// loop, which owns the control surface the tag command travels over.
     tag_edit: Rc<RefCell<Option<TagEdit>>>,
-    /// The armed branch anchor: the branched-from user message's stable id,
-    /// `Some` while the user is composing a branch (after `b`). The
-    /// `on_action` handler arms it, the drive loop resolves it on submit, the
-    /// transcript reads it to keep the highlight box on that message, and any
-    /// session install clears it so a stale anchor can't resolve against a
-    /// different session's log.
-    branch_anchor: Rc<RefCell<Option<crate::branch::BranchDraft>>>,
-    /// The per-session image store, shared with the [`TranscriptView`]'s entry
-    /// builder (which records pending images and reads transmitted ids) and
-    /// the host loop (which transmits after each frame and frees on a session
-    /// switch).
-    image_store: Rc<RefCell<ImageStore>>,
     /// The probed terminal capabilities, unknown at construction (the probe
     /// runs after `app.init`). Set once by [`Shell::set_terminal_caps`] and
     /// read via [`Shell::terminal_caps`] and [`Shell::restyle`] so a rebuild
@@ -5819,92 +5971,29 @@ impl Shell {
         session_id: &str,
         cwd: PathBuf,
     ) -> Shell {
-        let submitted: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let editor = TextArea::new();
-        {
-            let slot = Rc::clone(&submitted);
-            // The editor clears itself on submit. A busy-agent
-            // submit is queued (not restored), so the clear is right
-            // either way.
-            editor.borrow_mut().on_submit = Some(Box::new(move |_ctx, text| {
-                *slot.borrow_mut() = Some(text.to_string());
-            }));
-        }
-        // Install the `@`-file autocomplete provider on the editor, rooted at
-        // the working directory known when this shell is constructed. The
-        // provider owns the path itself.
-        // Typing `/` at the empty prompt still opens the command palette (see
-        // `on_palette_trigger` below). There is no `/`- or `#`-completion
-        // provider, only `@`-file completion.
-        editor.borrow_mut().set_autocomplete_provider(Arc::new(
-            crate::autocomplete::CombinedAutocompleteProvider::new(cwd.clone()),
-        ));
-        // Cap the popup at 20 rows, its fixed ceiling. The session already caps
-        // matches at 20, and `Shell::draw` clamps per frame to the space above
-        // the editor, so this only bounds a tall terminal. Set once here: the
-        // editor persists across session rebinds, so it never needs resetting.
-        editor.borrow_mut().set_autocomplete_max_visible(20);
-        // The footer shows the working directory as text. The provider owns the
-        // path itself.
-        let cwd_display = cwd.display().to_string();
-        // The terminal window title, matching aj's format. Recomputed on a
-        // session switch in `rebind`, so we only need the initial world's id
-        // and cwd here.
         let window_title = aj_app::session::window_title(APP_TITLE, session_id, &cwd);
-        // The transcript-focus flag, shared between the transcript (its single
-        // writer, via focus in/out) and the keymap host context (which reads it
-        // to gate the copy chord). Created here so both get the same cell.
-        let focus_mode = Rc::new(std::cell::Cell::new(false));
-        // The select-to-copy record, shared between the transcript (its single
-        // writer, on a copy) and the drive loop, which edge-detects fresh
-        // records and folds each into the toast stack. Created here so both
-        // see the same cell.
-        let selection_copied: Rc<Cell<Option<SelectionCopied>>> = Rc::new(Cell::new(None));
-        // The toast stack, shared between its writers (the drive loop's copy
-        // fold, the overlay confirm closures, `Shell::show_toast`) and the
-        // `Toasts` box that draws it. The drive loop prunes it and wakes at
-        // the earliest live deadline.
-        let toasts: ToastStack = Rc::new(RefCell::new(Vec::new()));
-        // The global busy flag, refreshed each drive-loop iteration. Read by
-        // the session-overlay confirm closures to refuse a switch mid-work.
-        let busy: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        // Branch-anchor slot, following the parked-slot pattern: `on_action`
-        // arms it on `b`, the drive loop resolves it on submit, the transcript
-        // reads it to keep the highlight box on the branched-from message, and
-        // the Esc handler clears it on a cancel. Created here so the closures
-        // and the transcript all share the same cell.
-        let branch_anchor: Rc<RefCell<Option<crate::branch::BranchDraft>>> =
-            Rc::new(RefCell::new(None));
-        // The per-session image store, shared between the transcript builder
-        // (which records pending images and reads transmitted ids) and the
-        // host loop (which transmits and frees). Created here so both share
-        // the same handle.
-        let image_store: Rc<RefCell<ImageStore>> = Rc::new(RefCell::new(ImageStore::default()));
-        // Resolve the initial styles and chrome from a single snapshot of
-        // the theme, then keep the handle for the runtime re-style path.
-        // Caps are unknown here (the probe runs after `app.init`), so styles
-        // start with the default caps and `restyle` refreshes them.
-        let (styles, transcript, chrome) = {
+        let view = Rc::new(SessionView::new(
+            Rc::clone(&chat),
+            status,
+            &theme,
+            header,
+            session_id,
+            cwd,
+        ));
+        view.footer.borrow_mut().set_task_registry(task_registry);
+        let views = Rc::new(RefCell::new(SessionViews {
+            active: Rc::clone(&view),
+            parked: HashMap::new(),
+        }));
+        let (styles, chrome) = {
             let t = theme.read();
-            let styles = Rc::new(TranscriptStyles::from_theme(&t, TerminalCaps::default()));
-            let transcript = Rc::new(RefCell::new(TranscriptView::new(
-                Rc::clone(&chat),
-                &t,
-                Rc::clone(&focus_mode),
-                Rc::clone(&branch_anchor),
-                Rc::clone(&selection_copied),
-                Rc::clone(&image_store),
-            )));
-            editor.borrow_mut().set_theme(editor_theme_from_theme(&t));
-            (styles, transcript, OverlayChrome::from_theme(&t))
+            (
+                Rc::new(TranscriptStyles::from_theme(&t, TerminalCaps::default())),
+                Rc::new(RefCell::new(OverlayChrome::from_theme(&t))),
+            )
         };
-        let chrome = Rc::new(RefCell::new(chrome));
-        // Give the transcript its own `WidgetRef` (weak) so focus navigation
-        // can schedule ticks targeting it to drive the smooth focus scroll.
-        transcript
-            .borrow_mut()
-            .set_widget_ref(Rc::downgrade(&transcript));
-        let status_line = StatusLine::new(Rc::clone(&chat), Rc::clone(&status), Rc::clone(&styles));
+        let toasts: ToastStack = Rc::new(RefCell::new(Vec::new()));
+        let busy = Rc::new(Cell::new(false));
         let quit_hint_warning: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let quit_hint = RefCell::new(QuitHint::new(
             Rc::clone(&styles),
@@ -5925,42 +6014,6 @@ impl Shell {
             Rc::clone(&chrome),
             Rc::clone(&toasts),
         ));
-        let pending = Rc::new(RefCell::new(PendingBox::new(
-            Rc::clone(&chat),
-            Rc::clone(&styles),
-        )));
-        let footer = Rc::new(RefCell::new(FooterLine::new(
-            Rc::clone(&chat),
-            Rc::clone(&status),
-            Rc::clone(&styles),
-            cwd_display,
-            task_registry,
-        )));
-        // The empty-state splash and the transcript share the chat slot. The
-        // `ChatSlot` wrapper draws whichever fits the current state, so the
-        // transcript's focus and scroll wiring is untouched while it is shown.
-        let splash = Splash::new(Rc::clone(&chat), Rc::clone(&styles), theme.color_mode());
-        let chat_slot = Rc::new(RefCell::new(ChatSlot {
-            chat: Rc::clone(&chat),
-            status,
-            splash: Rc::clone(&splash),
-            transcript: Rc::clone(&transcript),
-        }));
-        // Slot order mirrors `aj`'s layout: header, chat (flex), status,
-        // pending, editor, footer. The status and pending slots collapse to
-        // zero height while idle/empty, so the editor sits flush under the chat
-        // between turns.
-        let header_line = Rc::new(RefCell::new(Text::new(&header)));
-        let column: WidgetRef = Rc::new(RefCell::new(FlexColumn {
-            children: vec![
-                FlexItem::init(to_widget_ref(Rc::clone(&header_line)), 0),
-                FlexItem::init(to_widget_ref(Rc::clone(&chat_slot)), 1),
-                FlexItem::init(to_widget_ref(Rc::clone(&status_line)), 0),
-                FlexItem::init(to_widget_ref(Rc::clone(&pending)), 0),
-                FlexItem::init(to_widget_ref(Rc::clone(&editor)), 0),
-                FlexItem::init(to_widget_ref(Rc::clone(&footer)), 0),
-            ],
-        }));
         // The strip runs the full height beside the column, not beside the chat
         // alone: it is about the connection rather than the transcript, and a
         // strip that stopped at the editor would leave the session list looking
@@ -5979,7 +6032,7 @@ impl Shell {
         let layout: WidgetRef = Rc::new(RefCell::new(FlexRow {
             children: vec![
                 FlexItem::init(to_widget_ref(Rc::clone(&sidebar_strip)), 0),
-                FlexItem::init(column, 1),
+                FlexItem::init(to_widget_ref(Rc::clone(&views)), 1),
             ],
         }));
 
@@ -6003,8 +6056,8 @@ impl Shell {
         let tag_edit: Rc<RefCell<Option<TagEdit>>> = Rc::new(RefCell::new(None));
         let keymap_ctx = Rc::new(RefCell::new(HostCtx {
             overlays: Rc::clone(&overlays),
-            editor: Rc::clone(&editor),
-            focus_mode: Rc::clone(&focus_mode),
+            editor: Rc::clone(&view.editor),
+            focus_mode: Rc::clone(&view.focus_mode),
             turn_running: false,
             login_active: false,
             chat: Rc::clone(&chat),
@@ -6017,240 +6070,197 @@ impl Shell {
         // the live `EventContext` can move focus. The rest park in the
         // `host_action` slot for the drive loop, which owns the world.
         let on_action: Box<dyn FnMut(&mut EventContext, &AjAction)> = {
-            let chat = Rc::clone(&chat);
             let overlays_for_actions = Rc::clone(&overlays);
-            let editor_widget: WidgetRef = to_widget_ref(Rc::clone(&editor));
             let chrome_for_actions = Rc::clone(&chrome);
             let command_slot_for_actions = Rc::clone(&command_slot);
             let fetch_slot_for_actions = Rc::clone(&fetch_slot);
             let settings_ui_for_actions = Rc::clone(&settings_ui);
             let task_view_for_actions = Rc::clone(&task_view);
-            let transcript_for_actions = Rc::clone(&transcript);
-            let transcript_widget: WidgetRef = to_widget_ref(Rc::clone(&transcript));
-            let editor_for_actions = Rc::clone(&editor);
-            let branch_anchor_for_actions = Rc::clone(&branch_anchor);
             let action_slot = Rc::clone(&host_action);
             let theme_for_actions = theme.clone();
             let sidebar_for_actions = Rc::clone(&sidebar);
             let session_request_for_actions = Rc::clone(&session_request);
-            Box::new(move |ctx, action| match action {
-                AjAction::SidebarToggle => {
-                    let mut state = sidebar_for_actions.borrow_mut();
-                    state.visible = !state.visible;
-                    // An explicit ask outranks the row-count default for the
-                    // rest of the process, in both directions: a user who hid
-                    // the strip does not want it back when a session appears.
-                    state.toggled = true;
-                    ctx.redraw = true;
-                }
-                // Which sessions the strip shows is client state too, so the
-                // reveal never reaches the loop that owns the world either.
-                // The rows themselves are rebuilt by the next `sync_sidebar`,
-                // which is where the filter lives.
-                AjAction::SidebarArchived => {
-                    let mut state = sidebar_for_actions.borrow_mut();
-                    state.reveal_archived = !state.reveal_archived;
-                    ctx.redraw = true;
-                }
-                // The fold gesture's keyboard half: the group the focused row
-                // sits in opens past the cap or closes back to it. Client
-                // state, so it never reaches the loop that owns the world.
-                AjAction::SidebarFold => {
-                    if sidebar_for_actions.borrow_mut().toggle_focused_fold() {
+            let views = Rc::clone(&views);
+            Box::new(move |ctx, action| {
+                let view = Rc::clone(&views.borrow().active);
+                let chat = &view.chat;
+                let editor_widget = to_widget_ref(Rc::clone(&view.editor));
+                let transcript_widget = to_widget_ref(Rc::clone(&view.transcript));
+                let editor_for_actions = &view.editor;
+                let transcript_for_actions = &view.transcript;
+                let branch_anchor_for_actions = &view.branch_anchor;
+                match action {
+                    AjAction::SidebarToggle => {
+                        let mut state = sidebar_for_actions.borrow_mut();
+                        state.visible = !state.visible;
+                        // An explicit ask outranks the row-count default for the
+                        // rest of the process, in both directions: a user who hid
+                        // the strip does not want it back when a session appears.
+                        state.toggled = true;
                         ctx.redraw = true;
                     }
-                }
-                // Stepping the sidebar's order rather than the working set's:
-                // the strip is what the user is reading, so next means the row
-                // below the one highlighted, whether or not that session has
-                // ever been attached. Parked as a session request, which is how
-                // every session change reaches the loop that owns the world.
-                AjAction::SessionNext | AjAction::SessionPrev => {
-                    let forward = matches!(action, AjAction::SessionNext);
-                    if let Some(session) = step_session(&sidebar_for_actions.borrow(), forward) {
+                    // Which sessions the strip shows is client state too, so the
+                    // reveal never reaches the loop that owns the world either.
+                    // The rows themselves are rebuilt by the next `sync_sidebar`,
+                    // which is where the filter lives.
+                    AjAction::SidebarArchived => {
+                        let mut state = sidebar_for_actions.borrow_mut();
+                        state.reveal_archived = !state.reveal_archived;
+                        ctx.redraw = true;
+                    }
+                    // The fold gesture's keyboard half: the group the focused row
+                    // sits in opens past the cap or closes back to it. Client
+                    // state, so it never reaches the loop that owns the world.
+                    AjAction::SidebarFold => {
+                        if sidebar_for_actions.borrow_mut().toggle_focused_fold() {
+                            ctx.redraw = true;
+                        }
+                    }
+                    // Stepping the sidebar's order rather than the working set's:
+                    // the strip is what the user is reading, so next means the row
+                    // below the one highlighted, whether or not that session has
+                    // ever been attached. Parked as a session request, which is how
+                    // every session change reaches the loop that owns the world.
+                    AjAction::SessionNext | AjAction::SessionPrev => {
+                        let forward = matches!(action, AjAction::SessionNext);
+                        if let Some(session) = step_session(&sidebar_for_actions.borrow(), forward)
+                        {
+                            park_session_request(
+                                &session_request_for_actions,
+                                ctx,
+                                SessionRequest::Resume(session),
+                            );
+                        }
+                    }
+                    AjAction::SessionNew => {
+                        // No host named: the loop asks when the peer leaves the
+                        // answer open (see `settle_create_host`).
                         park_session_request(
                             &session_request_for_actions,
                             ctx,
-                            SessionRequest::Resume(session),
+                            SessionRequest::New { host: None },
                         );
                     }
-                }
-                AjAction::SessionNew => {
-                    // No host named: the loop asks when the peer leaves the
-                    // answer open (see `settle_create_host`).
-                    park_session_request(
-                        &session_request_for_actions,
-                        ctx,
-                        SessionRequest::New { host: None },
-                    );
-                }
-                AjAction::ThinkingToggle => {
-                    // Matches aj's `aj.thinking.toggle` handler: flip the
-                    // visibility flag, no notice (the transcript shows the new
-                    // state).
-                    let mut chat = chat.borrow_mut();
-                    chat.show_thinking_block = !chat.show_thinking_block;
-                    ctx.redraw = true;
-                }
-                AjAction::ToolsExpand => {
-                    let mut chat = chat.borrow_mut();
-                    chat.tools_expanded = !chat.tools_expanded;
-                    ctx.redraw = true;
-                }
-                AjAction::PaletteOpen => {
-                    // The binding's predicate already gates on "no overlay
-                    // open", matching aj's inert-while-modal behavior.
-                    let content_styles = ContentStyles::from_theme(&theme_for_actions.read());
-                    open_palette(
-                        &overlays_for_actions,
-                        &editor_widget,
-                        &chrome_for_actions,
-                        &command_slot_for_actions,
-                        &fetch_slot_for_actions,
-                        content_styles,
-                        ctx,
-                    );
-                }
-                AjAction::CloseAllOverlays => {
-                    overlays_for_actions.borrow_mut().close_all();
-                    // Release any settings-window handles so a closed window is
-                    // never re-tinted or reverted by the host, and the same for
-                    // a task viewer, so nothing is polled for a closed overlay.
-                    *settings_ui_for_actions.borrow_mut() = None;
-                    *task_view_for_actions.borrow_mut() = None;
-                    ctx.request_focus(Rc::clone(&editor_widget));
-                    ctx.redraw = true;
-                }
-                AjAction::Quit => ctx.quit = true,
-                AjAction::ChatPageUp => {
-                    // Chat scroll is reachable from widget land (the transcript
-                    // owns its scroll state), so it runs here in dispatch rather
-                    // than parking for the host loop.
-                    transcript_for_actions.borrow_mut().page_up(ctx);
-                    ctx.redraw = true;
-                }
-                AjAction::ChatPageDown => {
-                    transcript_for_actions.borrow_mut().page_down(ctx);
-                    ctx.redraw = true;
-                }
-                AjAction::ChatScrollToTop => {
-                    transcript_for_actions.borrow_mut().scroll_to_top(ctx);
-                    ctx.redraw = true;
-                }
-                AjAction::ChatScrollToBottom => {
-                    transcript_for_actions.borrow_mut().scroll_to_bottom(ctx);
-                    ctx.redraw = true;
-                }
-                AjAction::TranscriptFocus => {
-                    // Tab has two meanings while the autocomplete popup is
-                    // closed (its gate), split by whether the transcript is
-                    // already focused. When focused, Tab
-                    // steps to the next-older user message. Otherwise it engages
-                    // focus mode, but only if there is a user message to land
-                    // on: its `FocusIn` lands on the newest one. No user
-                    // messages means Tab is a no-op and stays in the editor.
-                    let mut transcript = transcript_for_actions.borrow_mut();
-                    if transcript.in_focus_mode() {
-                        transcript.focus_prev_user_message(ctx);
-                        ctx.redraw = true;
-                    } else if transcript.has_user_message() {
-                        drop(transcript);
-                        ctx.request_focus(Rc::clone(&transcript_widget));
+                    AjAction::ThinkingToggle => {
+                        // Matches aj's `aj.thinking.toggle` handler: flip the
+                        // visibility flag, no notice (the transcript shows the new
+                        // state).
+                        let mut chat = chat.borrow_mut();
+                        chat.show_thinking_block = !chat.show_thinking_block;
                         ctx.redraw = true;
                     }
-                }
-                AjAction::CopyMessage => {
-                    // The keymap gate guarantees the transcript is focused, but
-                    // resolve the message defensively rather than assume it: a
-                    // miss is a no-op. Copy goes through the same OSC 52 path
-                    // the mouse select-to-copy uses.
-                    if let Some(text) = transcript_for_actions.borrow().focused_message_text() {
-                        ctx.copy_to_clipboard(text);
+                    AjAction::ToolsExpand => {
+                        let mut chat = chat.borrow_mut();
+                        chat.tools_expanded = !chat.tools_expanded;
+                        ctx.redraw = true;
                     }
-                }
-                AjAction::BranchMessage => {
-                    // `focused_branch` already gates on focus mode, the
-                    // cursor sitting on a user message, and the active view
-                    // being Main (a sub-agent user message is not a branch
-                    // point), so a `Some` here means the gesture is valid.
-                    // Inert otherwise.
-                    let transcript = transcript_for_actions.borrow();
-                    let anchor = transcript.focused_branch();
-                    drop(transcript);
-                    if let Some((draft, text)) = anchor {
-                        // Prefill the editor with the message (preserving the
-                        // user's draft on the recall history), arm the anchor,
-                        // and move focus to the editor so the user edits the
-                        // branch prompt. The focus move's `FocusOut` exits
-                        // transcript focus, but the transcript keeps the
-                        // highlight box on the branched-from message by reading
-                        // the armed anchor.
-                        replace_editor_preserving_draft(&editor_for_actions, &text);
-                        *branch_anchor_for_actions.borrow_mut() = Some(draft);
+                    AjAction::PaletteOpen => {
+                        // The binding's predicate already gates on "no overlay
+                        // open", matching aj's inert-while-modal behavior.
+                        let content_styles = ContentStyles::from_theme(&theme_for_actions.read());
+                        open_palette(
+                            &overlays_for_actions,
+                            &editor_widget,
+                            &chrome_for_actions,
+                            &command_slot_for_actions,
+                            &fetch_slot_for_actions,
+                            content_styles,
+                            ctx,
+                        );
+                    }
+                    AjAction::CloseAllOverlays => {
+                        overlays_for_actions.borrow_mut().close_all();
+                        // Release any settings-window handles so a closed window is
+                        // never re-tinted or reverted by the host, and the same for
+                        // a task viewer, so nothing is polled for a closed overlay.
+                        *settings_ui_for_actions.borrow_mut() = None;
+                        *task_view_for_actions.borrow_mut() = None;
                         ctx.request_focus(Rc::clone(&editor_widget));
                         ctx.redraw = true;
                     }
-                }
-                AjAction::CancelTurn
-                | AjAction::Steer
-                | AjAction::Dequeue
-                | AjAction::PasteImage
-                | AjAction::HistoryOpen
-                | AjAction::AgentPickerOpen
-                | AjAction::SessionTag
-                | AjAction::SessionArchive => {
-                    *action_slot.borrow_mut() = Some(*action);
+                    AjAction::Quit => ctx.quit = true,
+                    AjAction::ChatPageUp => {
+                        // Chat scroll is reachable from widget land (the transcript
+                        // owns its scroll state), so it runs here in dispatch rather
+                        // than parking for the host loop.
+                        transcript_for_actions.borrow_mut().page_up(ctx);
+                        ctx.redraw = true;
+                    }
+                    AjAction::ChatPageDown => {
+                        transcript_for_actions.borrow_mut().page_down(ctx);
+                        ctx.redraw = true;
+                    }
+                    AjAction::ChatScrollToTop => {
+                        transcript_for_actions.borrow_mut().scroll_to_top(ctx);
+                        ctx.redraw = true;
+                    }
+                    AjAction::ChatScrollToBottom => {
+                        transcript_for_actions.borrow_mut().scroll_to_bottom(ctx);
+                        ctx.redraw = true;
+                    }
+                    AjAction::TranscriptFocus => {
+                        // Tab has two meanings while the autocomplete popup is
+                        // closed (its gate), split by whether the transcript is
+                        // already focused. When focused, Tab
+                        // steps to the next-older user message. Otherwise it engages
+                        // focus mode, but only if there is a user message to land
+                        // on: its `FocusIn` lands on the newest one. No user
+                        // messages means Tab is a no-op and stays in the editor.
+                        let mut transcript = transcript_for_actions.borrow_mut();
+                        if transcript.in_focus_mode() {
+                            transcript.focus_prev_user_message(ctx);
+                            ctx.redraw = true;
+                        } else if transcript.has_user_message() {
+                            drop(transcript);
+                            ctx.request_focus(Rc::clone(&transcript_widget));
+                            ctx.redraw = true;
+                        }
+                    }
+                    AjAction::CopyMessage => {
+                        // The keymap gate guarantees the transcript is focused, but
+                        // resolve the message defensively rather than assume it: a
+                        // miss is a no-op. Copy goes through the same OSC 52 path
+                        // the mouse select-to-copy uses.
+                        if let Some(text) = transcript_for_actions.borrow().focused_message_text() {
+                            ctx.copy_to_clipboard(text);
+                        }
+                    }
+                    AjAction::BranchMessage => {
+                        // `focused_branch` already gates on focus mode, the
+                        // cursor sitting on a user message, and the active view
+                        // being Main (a sub-agent user message is not a branch
+                        // point), so a `Some` here means the gesture is valid.
+                        // Inert otherwise.
+                        let transcript = transcript_for_actions.borrow();
+                        let anchor = transcript.focused_branch();
+                        drop(transcript);
+                        if let Some((draft, text)) = anchor {
+                            // Prefill the editor with the message (preserving the
+                            // user's draft on the recall history), arm the anchor,
+                            // and move focus to the editor so the user edits the
+                            // branch prompt. The focus move's `FocusOut` exits
+                            // transcript focus, but the transcript keeps the
+                            // highlight box on the branched-from message by reading
+                            // the armed anchor.
+                            replace_editor_preserving_draft(editor_for_actions, &text);
+                            *branch_anchor_for_actions.borrow_mut() = Some(draft);
+                            ctx.request_focus(Rc::clone(&editor_widget));
+                            ctx.redraw = true;
+                        }
+                    }
+                    AjAction::CancelTurn
+                    | AjAction::Steer
+                    | AjAction::Dequeue
+                    | AjAction::PasteImage
+                    | AjAction::HistoryOpen
+                    | AjAction::AgentPickerOpen
+                    | AjAction::SessionTag
+                    | AjAction::SessionArchive => {
+                        *action_slot.borrow_mut() = Some(*action);
+                    }
                 }
             })
         };
-        // The `/`-at-empty-prompt palette trigger. The editor swallows the
-        // `/` and fires this instead of inserting it, opening the same
-        // palette the global `PaletteOpen` chord (Ctrl+O) opens. The two
-        // never double-fire: `/` reaches the editor at target/bubble while
-        // the chord matches in the controller's capture phase, and the
-        // editor only fires the trigger for a lone `/`.
-        {
-            let overlays_c = Rc::clone(&overlays);
-            let editor_widget: WidgetRef = to_widget_ref(Rc::clone(&editor));
-            let chrome_c = Rc::clone(&chrome);
-            let command_slot_c = Rc::clone(&command_slot);
-            let fetch_slot_c = Rc::clone(&fetch_slot);
-            let theme_c = theme.clone();
-            editor.borrow_mut().on_palette_trigger = Some(Box::new(move |ctx| {
-                let content_styles = ContentStyles::from_theme(&theme_c.read());
-                open_palette(
-                    &overlays_c,
-                    &editor_widget,
-                    &chrome_c,
-                    &command_slot_c,
-                    &fetch_slot_c,
-                    content_styles,
-                    ctx,
-                );
-            }));
-        }
-        // Wire the transcript's Esc-to-exit callback to move focus back to the
-        // editor. The resulting `FocusOut` clears the item cursor, exiting
-        // transcript-focus mode.
-        {
-            let editor_widget: WidgetRef = to_widget_ref(Rc::clone(&editor));
-            transcript
-                .borrow_mut()
-                .set_on_exit_focus(Box::new(move |ctx| {
-                    ctx.request_focus(Rc::clone(&editor_widget));
-                    ctx.redraw = true;
-                }));
-        }
-        // Route transcript box clicks through the picker outcome slot, so the
-        // drive loop applies the normal observe behavior.
-        {
-            let picker_outcome = Rc::clone(&picker_outcome);
-            transcript
-                .borrow_mut()
-                .set_on_observe_agent(Box::new(move |id| {
-                    *picker_outcome.borrow_mut() = Some(AgentPickerOutcome::Observe(id));
-                }));
-        }
         // A pointer gesture on the strip parks the request the stepping and
         // create chords park, through the function they both call, so a click
         // triggers the action rather than reimplementing it. The
@@ -6281,22 +6291,20 @@ impl Shell {
         let keymap =
             KeymapController::new(build_keymap(), Rc::clone(&keymap_ctx), layout, on_action);
 
-        Shell {
+        let shell = Shell {
+            views,
+            history: vaxis::vxfw::EditorHistory::default(),
             keymap,
             keymap_ctx,
-            editor,
-            status_line,
             sidebar,
             quit_hint,
             quit_hint_warning,
             frame_stats_box,
             toast_box,
             toasts,
-            selection_copied,
             busy,
             show_frame_stats,
             frame_stats,
-            submitted,
             host_action,
             overlays,
             scrim: Rc::new(RefCell::new(Scrim)),
@@ -6304,10 +6312,6 @@ impl Shell {
             fetch_slot,
             theme,
             chrome,
-            transcript,
-            splash,
-            pending,
-            footer,
             selector_activity,
             settings_ui,
             picker_outcome,
@@ -6316,27 +6320,26 @@ impl Shell {
             history_fetch,
             skills_fill,
             recall_slot,
-            header: header_line,
             window_title,
             session_scan,
             session_request,
             auth_request,
             tag_edit,
-            branch_anchor,
-            image_store,
             terminal_caps: Cell::new(TerminalCaps::default()),
             width_method: Cell::new(vaxis::gwidth::Method::Unicode),
-        }
+        };
+        shell.wire_view(&view);
+        shell
     }
 
     /// Collect a submit parked by the editor callback, if any.
     fn take_submitted(&self) -> Option<String> {
-        self.submitted.borrow_mut().take()
+        self.view().submitted.borrow_mut().take()
     }
 
     /// Clear the armed branch anchor.
     fn disarm_branch(&self) {
-        *self.branch_anchor.borrow_mut() = None;
+        *self.view().branch_anchor.borrow_mut() = None;
     }
 
     /// Raise a transient bottom-right toast with `body`. Live toasts
@@ -6437,7 +6440,7 @@ impl Shell {
     fn overlay_handles(&self) -> OverlayHandles {
         OverlayHandles {
             stack: Rc::clone(&self.overlays),
-            editor: to_widget_ref(Rc::clone(&self.editor)),
+            editor: to_widget_ref(Rc::clone(&self.view().editor)),
             chrome: self.chrome.borrow().clone(),
             activity: Rc::clone(&self.selector_activity),
             settings_ui: Rc::clone(&self.settings_ui),
@@ -6481,19 +6484,30 @@ impl Shell {
     fn restyle(&self) {
         let t = self.theme.read();
         let styles = Rc::new(TranscriptStyles::from_theme(&t, self.terminal_caps()));
-        self.transcript.borrow_mut().set_styles(Rc::clone(&styles));
-        self.status_line.borrow_mut().set_styles(Rc::clone(&styles));
+        self.view()
+            .transcript
+            .borrow_mut()
+            .set_styles(Rc::clone(&styles));
+        self.view()
+            .status_line
+            .borrow_mut()
+            .set_styles(Rc::clone(&styles));
         self.quit_hint.borrow_mut().set_styles(Rc::clone(&styles));
         self.frame_stats_box
             .borrow_mut()
             .set_styles(Rc::clone(&styles));
         self.toast_box.borrow_mut().set_styles(Rc::clone(&styles));
-        self.splash
+        self.view()
+            .splash
             .borrow_mut()
             .set_styles(Rc::clone(&styles), t.color_mode());
-        self.pending.borrow_mut().set_styles(Rc::clone(&styles));
-        self.footer.borrow_mut().set_styles(styles);
-        self.editor
+        self.view()
+            .pending
+            .borrow_mut()
+            .set_styles(Rc::clone(&styles));
+        self.view().footer.borrow_mut().set_styles(styles);
+        self.view()
+            .editor
             .borrow_mut()
             .set_theme(editor_theme_from_theme(&t));
         let chrome = OverlayChrome::from_theme(&t);
@@ -6508,46 +6522,88 @@ impl Shell {
     /// Called from [`Shell::draw`] each frame so the editor's growth ceiling
     /// tracks the live terminal height.
     fn set_editor_row_cap(&self, terminal_rows: usize) {
-        self.editor
+        self.view()
+            .editor
             .borrow_mut()
             .set_max_visible_rows(Some(editor_row_cap(terminal_rows)));
     }
 
-    /// Repoint the session-scoped handles a replace-contents swap can't
-    /// reach onto the freshly built `world`, and reset the transcript to a
-    /// fresh-session view.
-    ///
-    /// The `chat` and `status` cells are shared by identity across sessions
-    /// (the outer loop overwrites their contents in place), so the chrome
-    /// widgets and the keymap's dispatch closure keep pointing at the live
-    /// model with nothing to do here. What does need repointing is every
-    /// handle into the session itself: the pending box's message queues and
-    /// the footer's task registry belong to the session that owns them, and
-    /// the old clones would observe a session nobody is looking at. Plus the
-    /// header id and the window title. We also drop the transcript back to
-    /// follow-tail so the next session opens pinned to the bottom.
-    ///
-    /// NOTE: the root `Shell` instance and the `AsyncApp` are deliberately
-    /// left untouched: the app's mouse/focus handlers hold the root Shell Rc
-    /// captured at `init`, so rebuilding the root or re-initializing the app
-    /// would strand them. We swap the Shell's innards, never the Shell.
-    fn rebind(&mut self, world: &World) {
-        // Every open overlay is scoped to the session it was opened over: a
-        // task viewer holds that session's task registry, a settings window a
-        // handle this swap cannot reach. Closing the stack is what keeps one
-        // from surviving a session change pointed at the previous session.
+    fn view(&self) -> Rc<SessionView> {
+        Rc::clone(&self.views.borrow().active)
+    }
+
+    fn wire_view(&self, view: &SessionView) {
+        view.editor.borrow_mut().set_history(self.history.clone());
+        let overlays = Rc::clone(&self.overlays);
+        // Weak because the callback belongs to the editor it returns focus to.
+        let editor = Rc::downgrade(&view.editor);
+        let chrome = Rc::clone(&self.chrome);
+        let command_slot = Rc::clone(&self.command_slot);
+        let fetch_slot = Rc::clone(&self.fetch_slot);
+        let theme = self.theme.clone();
+        view.editor.borrow_mut().on_palette_trigger = Some(Box::new(move |ctx| {
+            if let Some(editor) = editor.upgrade() {
+                open_palette(
+                    &overlays,
+                    &to_widget_ref(editor),
+                    &chrome,
+                    &command_slot,
+                    &fetch_slot,
+                    ContentStyles::from_theme(&theme.read()),
+                    ctx,
+                );
+            }
+        }));
+        let picker_outcome = Rc::clone(&self.picker_outcome);
+        view.transcript
+            .borrow_mut()
+            .set_on_observe_agent(Box::new(move |id| {
+                *picker_outcome.borrow_mut() = Some(AgentPickerOutcome::Observe(id));
+            }));
+    }
+
+    /// Select an existing session tree, or construct it on the first visit.
+    /// The shell, sidebar, keymap and overlay stack keep their identity.
+    fn select_session(&mut self, world: &World) {
+        let current = self.view();
+        if current.id != world.session() {
+            current.suspend();
+            let incoming = self.views.borrow_mut().parked.remove(world.session());
+            let incoming = incoming.unwrap_or_else(|| {
+                let view = Rc::new(SessionView::new(
+                    Rc::clone(&world.chat),
+                    Rc::new(RefCell::new(StatusState::default())),
+                    &self.theme,
+                    format!("{APP_TITLE} - session {}", world.session()),
+                    world.session(),
+                    world.working_directory.clone(),
+                ));
+                self.wire_view(&view);
+                view
+            });
+            let mut views = self.views.borrow_mut();
+            views.parked.insert(current.id.clone(), current);
+            views.active = incoming;
+        }
+        let view = self.view();
+        view.activate();
+        let mut ctx = self.keymap_ctx.borrow_mut();
+        ctx.editor = Rc::clone(&view.editor);
+        ctx.chat = Rc::clone(&view.chat);
+        ctx.focus_mode = Rc::clone(&view.focus_mode);
+        drop(ctx);
         self.overlays.borrow_mut().close_all();
         *self.settings_ui.borrow_mut() = None;
         *self.task_view.borrow_mut() = None;
         self.rebind_handles(world);
         self.rebind_working_directory(world);
-        self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.session());
-        self.transcript.borrow_mut().reset_to_tail();
+        self.restyle();
     }
 
     /// Repoint the chrome that names the focused session's host directory.
     fn rebind_working_directory(&mut self, world: &World) {
-        self.footer
+        self.view()
+            .footer
             .borrow_mut()
             .set_working_directory(world.working_directory.display().to_string());
         self.window_title =
@@ -6557,12 +6613,12 @@ impl Shell {
     /// Point the chrome that reads a session's own handles at the ones the
     /// world now holds.
     ///
-    /// Split out of [`Self::rebind`] because a re-attach can land on a fresh
+    /// Split out of [`Self::select_session`] because a re-attach can land on a fresh
     /// materialization of the same session, which needs this and nothing else
-    /// rebind does: closing the overlay stack and dropping the view to the tail
+    /// selection does: closing the overlay stack and choosing the widget tree
     /// belong to a session change.
     fn rebind_handles(&self, world: &World) {
-        self.footer.borrow_mut().set_task_registry(
+        self.view().footer.borrow_mut().set_task_registry(
             world
                 .local
                 .as_ref()
@@ -6608,7 +6664,8 @@ impl Widget for Shell {
         // below, which run only when a modal IS open.
         if self.overlays.borrow().top().is_none() {
             let term = ctx.max.size();
-            let editor = self.editor.borrow();
+            let view = self.view();
+            let editor = view.editor.borrow();
             // The editor sits directly above the footer in the `FlexColumn`,
             // and only the footer is below it, so the editor's top row is the
             // terminal height minus the footer and the editor's own block.
@@ -6625,7 +6682,7 @@ impl Widget for Shell {
             let indent = self.sidebar_cols();
             let popup_width = term.width.saturating_sub(indent);
             if let Some(popup) = editor.draw_autocomplete_popup_surface(popup_width, max_rows) {
-                let popup = block_mouse(popup, &self.transcript);
+                let popup = block_mouse(popup, &self.view().transcript);
                 // Anchor so the popup's bottom edge abuts the editor's top.
                 let anchor = editor_top.saturating_sub(popup.size.height);
                 inner.children.push(SubSurface {
@@ -6656,7 +6713,7 @@ impl Widget for Shell {
             let editor_top = term
                 .height
                 .saturating_sub(FOOTER_ROWS)
-                .saturating_sub(self.editor.borrow().drawn_height());
+                .saturating_sub(self.view().editor.borrow().drawn_height());
             // The next box's bottom row, moved up as boxes stack. Each box is
             // bounded by the room left above it, keeping the header on screen,
             // and its `draw` returns `None` when it can't fit.
@@ -6669,7 +6726,7 @@ impl Widget for Shell {
                     height: stack_bottom.saturating_sub(HEADER_ROWS),
                 };
                 if let Some(hint) = self.quit_hint.borrow().draw(ctx, avail) {
-                    let hint = block_mouse(hint, &self.transcript);
+                    let hint = block_mouse(hint, &self.view().transcript);
                     stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, hint, 1);
                 }
             }
@@ -6679,7 +6736,7 @@ impl Widget for Shell {
                 height: stack_bottom.saturating_sub(HEADER_ROWS),
             };
             for toast in self.toast_box.borrow().draw_stack(ctx, avail) {
-                let toast = block_mouse(toast, &self.transcript);
+                let toast = block_mouse(toast, &self.view().transcript);
                 stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, toast, 1);
             }
         }
@@ -6698,7 +6755,7 @@ impl Widget for Shell {
                 height: term.height.saturating_sub(HEADER_ROWS),
             };
             if let Some(surf) = self.frame_stats_box.borrow().draw(ctx, avail) {
-                let surf = block_mouse(surf, &self.transcript);
+                let surf = block_mouse(surf, &self.view().transcript);
                 let anchor_col = term.width.saturating_sub(surf.size.width);
                 inner.children.push(SubSurface {
                     origin: RelativePoint {
@@ -6751,14 +6808,14 @@ impl Widget for Shell {
             let editor_top = term
                 .height
                 .saturating_sub(FOOTER_ROWS)
-                .saturating_sub(self.editor.borrow().drawn_height());
+                .saturating_sub(self.view().editor.borrow().drawn_height());
             let mut stack_bottom = editor_top;
             let avail = Size {
                 width: term.width,
                 height: editor_top.saturating_sub(HEADER_ROWS),
             };
             for toast in self.toast_box.borrow().draw_stack(ctx, avail) {
-                let toast = block_mouse(toast, &self.transcript);
+                let toast = block_mouse(toast, &self.view().transcript);
                 stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, toast, 3);
             }
         }
@@ -6780,10 +6837,22 @@ impl Widget for Shell {
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        let view = self.view();
+        if view.transcript.borrow_mut().reconcile_model() {
+            ctx.request_focus(to_widget_ref(Rc::clone(&view.editor)));
+            ctx.redraw = true;
+            // A capture chord belongs to the frame the user saw, not to an
+            // unrelated message at the same index in a replacement model.
+            if matches!(event, Event::KeyPress(_) | Event::Mouse(_)) {
+                ctx.consume_event();
+                return;
+            }
+        }
+
         if matches!(event, Event::KeyPress(_))
             || matches!(event, Event::Mouse(_)) && self.overlays.borrow().top().is_some()
         {
-            self.transcript.borrow_mut().cancel_agent_click();
+            self.view().transcript.borrow_mut().cancel_agent_click();
         }
         // Host-posted app events target the focused widget, but they're
         // meant for the Shell chrome. The Shell is the root of every focus
@@ -6799,7 +6868,7 @@ impl Widget for Shell {
                     .borrow()
                     .top()
                     .map(|o| Rc::clone(&o.focus))
-                    .unwrap_or_else(|| to_widget_ref(Rc::clone(&self.editor)));
+                    .unwrap_or_else(|| to_widget_ref(Rc::clone(&self.view().editor)));
                 ctx.request_focus(target);
                 ctx.redraw = true;
             } else if user.name == SET_TITLE_EVENT {
@@ -6811,15 +6880,18 @@ impl Widget for Shell {
                 // wakes and neither sits on the focus path, so the Shell (the
                 // focus-path root) forwards App events to both. Each ignores
                 // the wake meant for the other.
-                self.status_line.borrow_mut().handle_event(ctx, event);
-                self.splash.borrow_mut().handle_event(ctx, event);
+                self.view()
+                    .status_line
+                    .borrow_mut()
+                    .handle_event(ctx, event);
+                self.view().splash.borrow_mut().handle_event(ctx, event);
             }
         }
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
         if let Event::Init = event {
-            ctx.request_focus(to_widget_ref(Rc::clone(&self.editor)));
+            ctx.request_focus(to_widget_ref(Rc::clone(&self.view().editor)));
             // `Init` dispatch drains the ctx command queue before the first
             // frame, so the title applies ahead of the initial paint.
             ctx.set_title(self.window_title.clone());
@@ -6832,9 +6904,9 @@ impl Widget for Shell {
         if let Event::KeyPress(key) = event
             && key.matches(Key::ESCAPE, Modifiers::empty())
             && !self.overlays.borrow().is_open()
-            && !self.transcript.borrow().in_focus_mode()
+            && !self.view().transcript.borrow().in_focus_mode()
         {
-            if self.branch_anchor.borrow().is_some() {
+            if self.view().branch_anchor.borrow().is_some() {
                 self.disarm_branch();
                 // A cancel is a client action that has completed: the mode is
                 // gone, nothing is pending, and the conversation was never
@@ -6843,7 +6915,12 @@ impl Widget for Shell {
                 ctx.consume_and_redraw();
                 return;
             }
-            if self.transcript.borrow_mut().handle_unfocused_escape() {
+            if self
+                .view()
+                .transcript
+                .borrow_mut()
+                .handle_unfocused_escape()
+            {
                 ctx.consume_and_redraw();
             }
         }
@@ -6919,7 +6996,8 @@ fn sync_editor_chrome(world: &World, shell: &Rc<RefCell<Shell>>) {
             AgentId::Sub(n) => Some(format!("agent {n}")),
         }
     };
-    let mut editor = shell.editor.borrow_mut();
+    let view = shell.view();
+    let mut editor = view.editor.borrow_mut();
     editor.set_border_color(color);
     editor.set_top_bar_label(label);
 }
@@ -7088,25 +7166,11 @@ pub async fn run(args: Args) -> Result<()> {
     // Bootstrap the editor's prompt-history ring from the workspace's session
     // logs. The scan runs off the loop (blocking IO) and `drive`'s seed arm
     // installs the result once it lands, so a large backlog never delays first
-    // paint. Spawned once here, not per session: the editor persists across
-    // session switches, so re-seeding would duplicate entries. `drive` clears
+    // paint. Every editor shares this workspace history, so the scan runs only
+    // once for the application. `drive` clears
     // the receiver after the one delivery, making its arm a no-op thereafter,
     // and pends forever on the `None` a connection answers with.
     let mut prompt_history_rx = spawn_prompt_history_bootstrap(&world);
-
-    // Take the editor's autocomplete delivery receiver once, before the
-    // session loop. The widget owns the async pipeline (it spawns the query
-    // task, staleness-guards deliveries by request id and buffer snapshot, and
-    // cancels on new input or dismiss). The host just drains this receiver in
-    // `drive` and redraws. The editor, and thus its delivery sender, persists
-    // across session rebinds, so the receiver is taken once here and threaded
-    // through every `drive` call.
-    let mut autocomplete_rx = shell
-        .borrow()
-        .editor
-        .borrow_mut()
-        .take_autocomplete_rx()
-        .expect("editor hands out its autocomplete receiver exactly once");
 
     // Outer session loop. Each iteration drives one focused session; a
     // new-session, resume or branch request exits `drive` with the matching
@@ -7118,6 +7182,7 @@ pub async fn run(args: Args) -> Result<()> {
     let run_result: Result<()> = loop {
         // Restore the terminal even when the loop exits with a render error,
         // otherwise the user is left stuck on the alt screen.
+
         let exit = drive(
             &mut app,
             &root,
@@ -7125,7 +7190,6 @@ pub async fn run(args: Args) -> Result<()> {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         )
         .await;
 
@@ -7285,7 +7349,7 @@ fn block_mouse(mut surface: Surface, transcript: &Rc<RefCell<TranscriptView>>) -
 /// with the copy-toast look and its own timer. Returns whether a toast was
 /// pushed, so the caller requests the showing repaint.
 fn fold_selection_copied_record(shell: &Shell, seen: &mut Option<Instant>) -> bool {
-    let Some(copied) = shell.selection_copied.get() else {
+    let Some(copied) = shell.view().selection_copied.get() else {
         return false;
     };
     if *seen == Some(copied.at) {
@@ -7560,11 +7624,7 @@ async fn poll_task_output(world: &World, shell: &Rc<RefCell<Shell>>, retry: &mut
 ///
 /// The drive loop owns the response to failures, including retry pacing and
 /// whether a failed local open ends the shell.
-async fn advance_resume(
-    world: &mut World,
-    shell: &Rc<RefCell<Shell>>,
-    state: Resume,
-) -> ResumeAdvance {
+async fn advance_resume(world: &mut World, state: Resume) -> ResumeAdvance {
     let mut state = state;
     match state.step {
         ResumeStep::Waiting => {
@@ -7603,11 +7663,6 @@ async fn advance_resume(
                 None => world.abandon_attach_block(),
             };
             refresh_client_reads(world).await;
-            // The block may have been served under a fresh epoch (a host
-            // restart mints one), which restarts the transcript under the view.
-            // Opening it at the new tail is what this is for: the caches keyed
-            // by entry id need no telling (see `EntryRenderCache::retire`).
-            shell.borrow().transcript.borrow_mut().reset_to_tail();
             ResumeAdvance::Settled { state, caught }
         }
     }
@@ -7630,8 +7685,9 @@ async fn drive(
     world: &mut World,
     theme_watch: &mut ThemeWatch,
     prompt_history_rx: &mut Option<UnboundedReceiver<Vec<String>>>,
-    autocomplete_rx: &mut UnboundedReceiver<AutocompleteDelivery>,
 ) -> Result<SessionExit> {
+    // The receiver stays with its editor across switches and early exits.
+    let view = shell.borrow().view();
     // Rising-edge tracker for the loader's animation: the tick chain
     // is armed once per idle-to-busy transition, not per iteration.
     let mut was_animating = false;
@@ -7646,7 +7702,7 @@ async fn drive(
     // Seeded from the current record so a copy already reported by a previous
     // session's drive loop isn't re-toasted.
     let mut selection_copied_seen: Option<Instant> =
-        shell.borrow().selection_copied.get().map(|c| c.at);
+        shell.borrow().view().selection_copied.get().map(|c| c.at);
     // Async read-only overlay fills. The list handle is `!Send`, so it
     // stays here (paired with its `FetchKind`) while the detached fetch
     // sends only the rendered rows back over the channel.
@@ -7725,6 +7781,19 @@ async fn drive(
         data: None,
     });
     let exit = loop {
+        // Reconcile before paint as well as input, so a model replaced while
+        // keyboard-focused opens at the tail with focus back in its editor.
+        let rebuilt = view.transcript.borrow_mut().reconcile_model();
+        if rebuilt {
+            app.post_app_event(UserEvent {
+                name: REFOCUS_OVERLAY_EVENT.to_string(),
+                data: None,
+            });
+            app.request_redraw();
+        }
+        // Input predicates must describe the selected session even for a key
+        // already buffered when this drive invocation starts.
+        sync_keymap_ctx(world, shell);
         // The sidebar mirror leads the iteration, ahead of both the paint and
         // the input read. A session request breaks out of the input arm below,
         // so a mirror refreshed at the foot of the iteration would leave a key
@@ -7846,7 +7915,7 @@ async fn drive(
             // this arm pends forever afterward (the seed happens once).
             maybe_seed = recv_prompt_history(prompt_history_rx.as_mut()) => {
                 if let Some(entries) = maybe_seed {
-                    shell.borrow().editor.borrow_mut().seed_history(&entries);
+                    shell.borrow().view().editor.borrow_mut().seed_history(&entries);
                     app.request_redraw();
                 }
                 *prompt_history_rx = None;
@@ -7931,7 +8000,7 @@ async fn drive(
                         let submitted = shell.borrow().take_submitted();
                         if let Some(text) = submitted {
                             if refuse_while_attaching(world, shell, "send") {
-                                shell.borrow().editor.borrow_mut().set_text(&text);
+                                shell.borrow().view().editor.borrow_mut().set_text(&text);
                                 app.request_redraw();
                                 continue;
                             }
@@ -7945,12 +8014,12 @@ async fn drive(
                             // `spawn_prompt_history_bootstrap`). Recording it
                             // before the branch resolution below means the
                             // prompt survives a failed branch.
-                            shell.borrow().editor.borrow_mut().add_to_history(&text);
+                            shell.borrow().view().editor.borrow_mut().add_to_history(&text);
                             // With a branch anchor armed, submit resolves the
                             // branch instead of starting a turn: a refusal
                             // stays in the session, a resolution breaks out
                             // with `SessionExit::Branch`.
-                            let armed = shell.borrow().branch_anchor.borrow().is_some();
+                            let armed = shell.borrow().view().branch_anchor.borrow().is_some();
                             if armed {
                                 match submit_with_armed_anchor(world, shell, text).await {
                                     ArmedSubmit::Stay => app.request_redraw(),
@@ -8193,7 +8262,7 @@ async fn drive(
                             None => {
                                 world
                                     .directory
-                                    .apply(&mut world.chat.borrow_mut(), frame)
+                                    .apply(frame)
                                     .0
                             }
                         };
@@ -8252,7 +8321,8 @@ async fn drive(
             // quiesced, so keystrokes would render late. Below input, typed input
             // always wins. The popup still catches up via the coalescing drain
             // here and the per-iteration `pump_autocomplete` at the loop bottom.
-            Some(delivery) = autocomplete_rx.recv() => {
+            // Borrow only while polling, never across an await or event dispatch.
+            Some(delivery) = std::future::poll_fn(|cx| view.autocomplete_rx.borrow_mut().poll_recv(cx)) => {
                 {
                     // Coalesce the wake flood: apply the first delivery, then
                     // drain everything else already queued so a burst collapses
@@ -8265,9 +8335,10 @@ async fn drive(
                     // borrow across the drain (no await inside) and drop it
                     // before the single redraw below.
                     let shell = shell.borrow();
-                    let mut editor = shell.editor.borrow_mut();
+                    let view = shell.view();
+                    let mut editor = view.editor.borrow_mut();
                     editor.apply_autocomplete_delivery(delivery);
-                    while let Ok(delivery) = autocomplete_rx.try_recv() {
+                    while let Ok(delivery) = view.autocomplete_rx.borrow_mut().try_recv() {
                         editor.apply_autocomplete_delivery(delivery);
                     }
                 }
@@ -8404,7 +8475,7 @@ async fn drive(
         // the top of the loop shows each connection state.
         if resume.as_ref().is_some_and(Resume::ready) {
             let state = resume.take().expect("checked just above");
-            match advance_resume(world, shell, state).await {
+            match advance_resume(world, state).await {
                 ResumeAdvance::Pending(next) => {
                     world.connection = Connection::CatchingUp;
                     resume = Some(next);
@@ -8516,8 +8587,12 @@ async fn drive(
         // active session and rebuilds the popup from its latest snapshot. It is
         // a no-op when no session is open. The widget still owns the pipeline,
         // the host just drives the tick from its own loop.
-        shell.borrow().editor.borrow_mut().pump_autocomplete();
-        sync_keymap_ctx(world, shell);
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .pump_autocomplete();
         sync_editor_chrome(world, shell);
         // The close-all chord must not pre-empt the login dialog's own
         // Esc/Ctrl+C teardown, so mirror the login liveness into the
@@ -8737,7 +8812,7 @@ mod tests {
             user.branch_settings.is_some(),
             "host supplied recorded settings"
         );
-        *shell.borrow().branch_anchor.borrow_mut() = Some(crate::branch::BranchDraft::new(
+        *shell.borrow().view().branch_anchor.borrow_mut() = Some(crate::branch::BranchDraft::new(
             message.to_string(),
             user.branch_settings.clone(),
         ));
@@ -8891,7 +8966,7 @@ mod tests {
         assert_eq!(shell.window_title, "aj - sess-1 - myproj");
     }
 
-    /// A session switch reruns [`Shell::rebind`], which recomputes the title
+    /// A session switch reruns [`Shell::select_session`], which recomputes the title
     /// off the new world's id and cwd.
     #[tokio::test]
     async fn rebind_updates_window_title_on_session_switch() {
@@ -8901,7 +8976,7 @@ mod tests {
         let mut shell = titled_shell("old-session", "/home/me/oldproj");
         assert_eq!(shell.window_title, "aj - old-session - oldproj");
 
-        shell.rebind(&world);
+        shell.select_session(&world);
         let expected = aj_app::session::window_title(
             APP_TITLE,
             world.session(),
@@ -8938,14 +9013,14 @@ mod tests {
 
         let mut shell = titled_shell("old-session", "/home/me/oldproj");
         assert_eq!(
-            shell.footer.borrow().pending_notices(AgentId::Main),
+            shell.view().footer.borrow().pending_notices(AgentId::Main),
             0,
             "a fresh shell holds its own empty registry"
         );
 
-        shell.rebind(&world);
+        shell.select_session(&world);
         assert_eq!(
-            shell.footer.borrow().pending_notices(AgentId::Main),
+            shell.view().footer.borrow().pending_notices(AgentId::Main),
             1,
             "rebind must repoint the footer at the switched-to session's registry"
         );
@@ -9057,7 +9132,12 @@ mod tests {
         app.handle_input(event);
         for _ in 0..80 {
             tokio::task::yield_now().await;
-            shell.borrow().editor.borrow_mut().pump_autocomplete();
+            shell
+                .borrow()
+                .view()
+                .editor
+                .borrow_mut()
+                .pump_autocomplete();
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
@@ -9110,8 +9190,15 @@ mod tests {
         // Baseline: popup closed. Record the editor block height.
         let ctx = draw_ctx(100, 30);
         let closed = shell.borrow_mut().draw(&ctx);
-        let editor_h_closed = shell.borrow().editor.borrow().drawn_height();
-        assert!(!shell.borrow().editor.borrow().is_showing_autocomplete());
+        let editor_h_closed = shell.borrow().view().editor.borrow().drawn_height();
+        assert!(
+            !shell
+                .borrow()
+                .view()
+                .editor
+                .borrow()
+                .is_showing_autocomplete()
+        );
         assert!(
             popup_overlay(&closed).is_none(),
             "no popup overlay while the popup is closed",
@@ -9122,7 +9209,12 @@ mod tests {
             type_and_settle_autocomplete(&mut app, &mut writer, &shell, *byte).await;
         }
         assert!(
-            shell.borrow().editor.borrow().is_showing_autocomplete(),
+            shell
+                .borrow()
+                .view()
+                .editor
+                .borrow()
+                .is_showing_autocomplete(),
             "typing `@file` opens the file-completion popup",
         );
 
@@ -9130,7 +9222,7 @@ mod tests {
         // the transcript (the only flex child) keeps its size and the input
         // line and footer do not move.
         let composed = shell.borrow_mut().draw(&ctx);
-        let editor_h_open = shell.borrow().editor.borrow().drawn_height();
+        let editor_h_open = shell.borrow().view().editor.borrow().drawn_height();
         assert_eq!(
             editor_h_open, editor_h_closed,
             "opening the popup must not change the editor block height",
@@ -9183,7 +9275,7 @@ mod tests {
         // panics. Fifteen items would overflow, so the window is clamped.
         let short = draw_ctx(100, 16);
         let composed = shell.borrow_mut().draw(&short);
-        let editor_h_short = shell.borrow().editor.borrow().drawn_height();
+        let editor_h_short = shell.borrow().view().editor.borrow().drawn_height();
         let editor_top_short = 16 - FOOTER_ROWS - editor_h_short;
         let popup = popup_overlay(&composed).expect("a popup overlay on the short terminal");
         assert!(
@@ -9227,6 +9319,7 @@ mod tests {
         let shell = test_shell_with_chat(chat);
         let surface = shell
             .borrow()
+            .view()
             .transcript
             .borrow_mut()
             .draw(&draw_ctx(40, 20));
@@ -9249,11 +9342,13 @@ mod tests {
         let mut ctx = EventContext::new();
         shell
             .borrow()
+            .view()
             .transcript
             .borrow_mut()
             .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Press));
         shell
             .borrow()
+            .view()
             .transcript
             .borrow_mut()
             .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Release));
@@ -9265,6 +9360,7 @@ mod tests {
 
         shell
             .borrow()
+            .view()
             .transcript
             .borrow_mut()
             .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Press));
@@ -9277,6 +9373,7 @@ mod tests {
         );
         shell
             .borrow()
+            .view()
             .transcript
             .borrow_mut()
             .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Release));
@@ -9300,13 +9397,25 @@ mod tests {
         std::fs::write(tmp.path().join("notes.txt"), "n").expect("write file");
 
         let (mut app, mut writer, shell, _root) = init_app_in_dir(tmp.path().to_path_buf()).await;
-        assert!(!shell.borrow().editor.borrow().is_showing_autocomplete());
+        assert!(
+            !shell
+                .borrow()
+                .view()
+                .editor
+                .borrow()
+                .is_showing_autocomplete()
+        );
 
         for byte in b"@hel" {
             type_and_settle_autocomplete(&mut app, &mut writer, &shell, *byte).await;
         }
         assert!(
-            shell.borrow().editor.borrow().is_showing_autocomplete(),
+            shell
+                .borrow()
+                .view()
+                .editor
+                .borrow()
+                .is_showing_autocomplete(),
             "typing `@hel` opens the file-completion popup",
         );
         // `@` opens the file popup, not the `/`-command palette.
@@ -9316,8 +9425,15 @@ mod tests {
         );
 
         type_and_settle_autocomplete(&mut app, &mut writer, &shell, b'\t').await;
-        assert_eq!(shell.borrow().editor.borrow().text(), "@hello.md ");
-        assert!(!shell.borrow().editor.borrow().is_showing_autocomplete());
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "@hello.md ");
+        assert!(
+            !shell
+                .borrow()
+                .view()
+                .editor
+                .borrow()
+                .is_showing_autocomplete()
+        );
     }
 
     /// setup path (`build_initial_run_config` + `SessionCore::build`),
@@ -9572,7 +9688,7 @@ mod tests {
             Some(world.handles().task_registry.clone()),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
-            "",
+            world.session(),
             PathBuf::from("/tmp"),
         )))
     }
@@ -11133,13 +11249,10 @@ mod tests {
                 .iter()
                 .any(|row| row.id == held && !row.locked)
         );
-        let _ = world.directory.apply(
-            &mut world.chat.borrow_mut(),
-            aj_wire::Frame::List {
-                sessions: released.sessions,
-                hosts: released.hosts,
-            },
-        );
+        let _ = world.directory.apply(aj_wire::Frame::List {
+            sessions: released.sessions,
+            hosts: released.hosts,
+        });
         assert_eq!(world.client().withheld(), Some(Refusal::Locked));
         assert!(
             !world.directory.needs_reattach(),
@@ -11214,8 +11327,8 @@ mod tests {
         let left_before = main_entries(&world.chat.borrow());
         let arrived_before = world
             .directory
-            .parked_chat(&first)
-            .map(main_entries)
+            .chat_for(&first)
+            .map(|chat| main_entries(&chat.borrow()))
             .expect("the session we are about to arrive at is parked");
 
         let moved = apply_focus_request(
@@ -11249,8 +11362,8 @@ mod tests {
         assert_eq!(
             world
                 .directory
-                .parked_chat(&second)
-                .map(main_entries)
+                .chat_for(&second)
+                .map(|chat| main_entries(&chat.borrow()))
                 .expect("the session we just left is parked"),
             left_before,
             "the transcript left behind gained a row",
@@ -11298,8 +11411,8 @@ mod tests {
         assert_eq!(
             world
                 .directory
-                .parked_chat(&first)
-                .map(main_entries)
+                .chat_for(&first)
+                .map(|chat| main_entries(&chat.borrow()))
                 .expect("the session we just left is parked"),
             left_before,
             "the transcript left behind gained a row",
@@ -11358,7 +11471,7 @@ mod tests {
         assert!(!frame.quit);
         assert!(app.needs_redraw());
         // Init focused the editor, so the typed grapheme landed there.
-        assert_eq!(shell.borrow().editor.borrow().cursor(), (0, 1));
+        assert_eq!(shell.borrow().view().editor.borrow().cursor(), (0, 1));
     }
 
     #[tokio::test]
@@ -11373,8 +11486,8 @@ mod tests {
 
         assert_eq!(shell.borrow().take_submitted().as_deref(), Some("hi"));
         // The editor cleared itself on submit.
-        assert_eq!(shell.borrow().editor.borrow().cursor(), (0, 0));
-        assert_eq!(shell.borrow().editor.borrow().text(), "");
+        assert_eq!(shell.borrow().view().editor.borrow().cursor(), (0, 0));
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "");
     }
 
     /// Shift+Enter inserts a newline into the multi-line editor rather than
@@ -11385,7 +11498,8 @@ mod tests {
         let mut ctx = EventContext::new();
         {
             let shell = shell.borrow();
-            let mut editor = shell.editor.borrow_mut();
+            let view = shell.view();
+            let mut editor = view.editor.borrow_mut();
             editor.insert_at_cursor("line1");
             editor.handle_event(
                 &mut ctx,
@@ -11397,9 +11511,9 @@ mod tests {
             );
             editor.insert_at_cursor("line2");
         }
-        let editor = shell.borrow().editor.borrow().text();
+        let editor = shell.borrow().view().editor.borrow().text();
         assert_eq!(editor, "line1\nline2");
-        assert_eq!(shell.borrow().editor.borrow().cursor(), (1, 5));
+        assert_eq!(shell.borrow().view().editor.borrow().cursor(), (1, 5));
     }
 
     /// History up recalls a seeded entry, newest first, without submitting.
@@ -11408,13 +11522,14 @@ mod tests {
         let (_app, _writer, shell, _root) = init_app().await;
         shell
             .borrow()
+            .view()
             .editor
             .borrow_mut()
             .seed_history(&["older".to_string(), "newer".to_string()]);
 
         let up = || {
             let mut ctx = EventContext::new();
-            shell.borrow().editor.borrow_mut().handle_event(
+            shell.borrow().view().editor.borrow_mut().handle_event(
                 &mut ctx,
                 &Event::KeyPress(Key {
                     codepoint: Key::UP,
@@ -11424,9 +11539,9 @@ mod tests {
             );
         };
         up();
-        assert_eq!(shell.borrow().editor.borrow().text(), "newer");
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "newer");
         up();
-        assert_eq!(shell.borrow().editor.borrow().text(), "older");
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "older");
     }
 
     /// A submitted prompt is recorded into the editor's history ring by the
@@ -11450,16 +11565,21 @@ mod tests {
             // submit awaits on the host.
             let submitted = shell.borrow().take_submitted();
             if let Some(text) = submitted {
-                shell.borrow().editor.borrow_mut().add_to_history(&text);
+                shell
+                    .borrow()
+                    .view()
+                    .editor
+                    .borrow_mut()
+                    .add_to_history(&text);
                 handle_submit(&mut world, text).await;
                 break;
             }
         }
-        assert_eq!(shell.borrow().editor.borrow().text(), "");
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "");
 
         // Up recalls the just-submitted prompt.
         let mut ctx = EventContext::new();
-        shell.borrow().editor.borrow_mut().handle_event(
+        shell.borrow().view().editor.borrow_mut().handle_event(
             &mut ctx,
             &Event::KeyPress(Key {
                 codepoint: Key::UP,
@@ -11467,7 +11587,7 @@ mod tests {
                 ..Key::default()
             }),
         );
-        assert_eq!(shell.borrow().editor.borrow().text(), "recall me");
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "recall me");
 
         // Settle the turn so the teardown below is clean.
         cancel_viewed_turn(&mut world).await;
@@ -11484,7 +11604,8 @@ mod tests {
         let cap = 3;
         {
             let shell = shell.borrow();
-            let mut editor = shell.editor.borrow_mut();
+            let view = shell.view();
+            let mut editor = view.editor.borrow_mut();
             editor.set_max_visible_rows(Some(cap));
             editor.insert_at_cursor(
                 &(1..=20)
@@ -11508,7 +11629,7 @@ mod tests {
             },
             width_method: gwidth::Method::Unicode,
         };
-        let surface = shell.borrow().editor.borrow_mut().draw(&ctx);
+        let surface = shell.borrow().view().editor.borrow_mut().draw(&ctx);
         assert_eq!(
             surface.size.height,
             u16::try_from(cap + 2).unwrap(),
@@ -11527,7 +11648,7 @@ mod tests {
         let shell = test_shell_with_chat(empty_chat());
         // Forty lines exceed both caps under test (7 at height 24, 15 at height
         // 50), so the editor is cap-limited, not content-limited, at both.
-        shell.borrow().editor.borrow_mut().insert_at_cursor(
+        shell.borrow().view().editor.borrow_mut().insert_at_cursor(
             &(1..=40)
                 .map(|n| format!("line {n}"))
                 .collect::<Vec<_>>()
@@ -11536,11 +11657,11 @@ mod tests {
 
         let short = draw_ctx(80, 24);
         shell.borrow_mut().draw(&short);
-        let drawn_short = shell.borrow().editor.borrow().drawn_height();
+        let drawn_short = shell.borrow().view().editor.borrow().drawn_height();
 
         let tall = draw_ctx(80, 50);
         shell.borrow_mut().draw(&tall);
-        let drawn_tall = shell.borrow().editor.borrow().drawn_height();
+        let drawn_tall = shell.borrow().view().editor.borrow().drawn_height();
 
         let expected = u16::try_from(editor_row_cap(50) - editor_row_cap(24)).unwrap();
         assert_eq!(
@@ -11624,7 +11745,12 @@ mod tests {
     /// top rule is row 0 and `draw_rule` paints every cell with the border
     /// style, so the corner cell carries the current border color.
     fn editor_border_fg(shell: &Rc<RefCell<Shell>>) -> Color {
-        let surf = shell.borrow().editor.borrow_mut().draw(&draw_ctx(100, 30));
+        let surf = shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .draw(&draw_ctx(100, 30));
         surf.read_cell(0, 0).style.fg
     }
 
@@ -11704,7 +11830,7 @@ mod tests {
         app.handle_input(event);
         assert!(chat.borrow().tools_expanded);
         assert_eq!(
-            shell.borrow().editor.borrow().cursor(),
+            shell.borrow().view().editor.borrow().cursor(),
             (0, 0),
             "the chord never reached the editor"
         );
@@ -11714,7 +11840,7 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert!(chat.borrow().tools_expanded, "unchanged by plain typing");
-        assert_eq!(shell.borrow().editor.borrow().cursor(), (0, 1));
+        assert_eq!(shell.borrow().view().editor.borrow().cursor(), (0, 1));
     }
 
     /// The thinking toggle (alt+t) flips thinking-block visibility, per
@@ -11768,7 +11894,7 @@ mod tests {
             Some(AjAction::AgentPickerOpen)
         );
         assert_eq!(
-            shell.borrow().editor.borrow().cursor(),
+            shell.borrow().view().editor.borrow().cursor(),
             (0, 0),
             "none of the chords leaked into the editor"
         );
@@ -11798,21 +11924,21 @@ mod tests {
         press(b"\x1b[A").await;
         assert_eq!(shell.borrow().take_host_action(), Some(AjAction::Dequeue));
         assert_eq!(
-            shell.borrow().editor.borrow().cursor(),
+            shell.borrow().view().editor.borrow().cursor(),
             (0, 0),
             "the recall chord never reached the editor",
         );
         assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
-        assert_eq!(shell.borrow().editor.borrow().text(), "queued");
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "queued");
         assert!(!world.handles().queues.has_pending(AgentId::Main));
 
         // Ctrl+P (0x10) does the same. Re-queue and clear the editor first.
         stage_pending(&mut world, AgentId::Main, "again").await;
-        shell.borrow().editor.borrow_mut().clear();
+        shell.borrow().view().editor.borrow_mut().clear();
         press(&[0x10]).await;
         assert_eq!(shell.borrow().take_host_action(), Some(AjAction::Dequeue));
         assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
-        assert_eq!(shell.borrow().editor.borrow().text(), "again");
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "again");
         shut_down(&world).await;
     }
 
@@ -11826,7 +11952,12 @@ mod tests {
             init_app_with_world(&dir, "streaming-text").await;
 
         stage_pending(&mut world, AgentId::Main, "queued").await;
-        shell.borrow().editor.borrow_mut().insert_at_cursor("draft");
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .insert_at_cursor("draft");
 
         writer.write_all(b"\x1b[A").expect("write up");
         let event = app.next_input().await.expect("input event");
@@ -11854,6 +11985,7 @@ mod tests {
             init_app_with_world(&dir, "streaming-text").await;
         shell
             .borrow()
+            .view()
             .editor
             .borrow_mut()
             .seed_history(&["older".to_string(), "newer".to_string()]);
@@ -11868,7 +12000,7 @@ mod tests {
             "no recall fired, the key descended to the editor",
         );
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "newer",
             "the editor handled Up as history navigation",
         );
@@ -12118,10 +12250,14 @@ mod tests {
             "no toast without a copy",
         );
 
-        shell.borrow().selection_copied.set(Some(SelectionCopied {
-            chars: 7,
-            at: Instant::now(),
-        }));
+        shell
+            .borrow()
+            .view()
+            .selection_copied
+            .set(Some(SelectionCopied {
+                chars: 7,
+                at: Instant::now(),
+            }));
         let mut seen = None;
         assert!(
             fold_selection_copied_record(&shell.borrow(), &mut seen),
@@ -12151,6 +12287,7 @@ mod tests {
         let at = Instant::now();
         shell
             .borrow()
+            .view()
             .selection_copied
             .set(Some(SelectionCopied { chars: 7, at }));
 
@@ -12165,10 +12302,14 @@ mod tests {
             "no toast for a previous session's copy"
         );
 
-        shell.borrow().selection_copied.set(Some(SelectionCopied {
-            chars: 9,
-            at: at + std::time::Duration::from_millis(1),
-        }));
+        shell
+            .borrow()
+            .view()
+            .selection_copied
+            .set(Some(SelectionCopied {
+                chars: 9,
+                at: at + std::time::Duration::from_millis(1),
+            }));
         assert!(
             fold_selection_copied_record(&shell.borrow(), &mut seen),
             "a fresh record still toasts"
@@ -12268,7 +12409,7 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().cursor(),
+            shell.borrow().view().editor.borrow().cursor(),
             (0, 1),
             "focus is back in the editor"
         );
@@ -12716,7 +12857,7 @@ mod tests {
         while let Some(mut state) = pending.take() {
             assert!(Instant::now() < deadline, "the re-attach never settled");
             if state.ready() {
-                match advance_resume(world, shell, state).await {
+                match advance_resume(world, state).await {
                     ResumeAdvance::Pending(state) => {
                         world.connection = Connection::CatchingUp;
                         pending = Some(state);
@@ -12808,7 +12949,7 @@ mod tests {
     #[tokio::test]
     async fn a_local_re_attach_after_the_host_is_gone_is_fatal() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, _) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
         shut_down(&world).await;
 
@@ -12818,7 +12959,7 @@ mod tests {
         );
         assert!(
             matches!(
-                advance_resume(&mut world, &shell, Resume::new()).await,
+                advance_resume(&mut world, Resume::new()).await,
                 ResumeAdvance::OpenFailed { .. }
             ),
             "a local host that cannot serve its own session is gone"
@@ -12974,12 +13115,7 @@ mod tests {
             rx: None,
         };
         let mut prompt_history_rx = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver exactly once");
+
         tokio::join!(
             drive(
                 &mut app,
@@ -12988,7 +13124,6 @@ mod tests {
                 world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
             stop(writer),
         )
@@ -13349,7 +13484,7 @@ mod tests {
             let ControlFrame::Frame(frame) = received else {
                 panic!("the stream is open");
             };
-            let _ = world.directory.apply(&mut world.chat.borrow_mut(), frame);
+            let _ = world.directory.apply(frame);
         }
 
         handle_submit(&mut world, "second".to_string()).await;
@@ -13442,7 +13577,7 @@ mod tests {
                 aj_app::theme::ColorMode::Truecolor,
             )),
             "aj".to_string(),
-            "",
+            world.session(),
             PathBuf::from("/tmp"),
         )));
         (world, shell)
@@ -13475,7 +13610,7 @@ mod tests {
             Some(world.handles().task_registry.clone()),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
-            "",
+            world.session(),
             dir.path().to_path_buf(),
         )));
         (world, shell)
@@ -13512,7 +13647,7 @@ mod tests {
                 aj_app::theme::ColorMode::Truecolor,
             )),
             "aj".to_string(),
-            "",
+            world.session(),
             PathBuf::from("/tmp"),
         )));
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
@@ -13542,6 +13677,7 @@ mod tests {
         // Busy + editor text: queue as steering, clear the editor.
         shell
             .borrow()
+            .view()
             .editor
             .borrow_mut()
             .insert_at_cursor("steer this");
@@ -13550,7 +13686,7 @@ mod tests {
         assert_eq!(snapshot.kind, Some(aj_agent::queue::PendingKind::Steering));
         assert_eq!(snapshot.text, "steer this");
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "",
             "the steered text left the editor"
         );
@@ -13587,6 +13723,7 @@ mod tests {
 
         shell
             .borrow()
+            .view()
             .editor
             .borrow_mut()
             .insert_at_cursor("hi there");
@@ -13626,12 +13763,16 @@ mod tests {
         world.connection = Connection::CatchingUp;
         shell
             .borrow()
+            .view()
             .editor
             .borrow_mut()
             .set_text("keep this steer");
 
         assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
-        assert_eq!(shell.borrow().editor.borrow().text(), "keep this steer");
+        assert_eq!(
+            shell.borrow().view().editor.borrow().text(),
+            "keep this steer"
+        );
         assert!(
             !world.client().working(),
             "the uncaught target started a turn"
@@ -13682,7 +13823,7 @@ mod tests {
         fold_ready_frames(&mut world);
         assert!(world.client().working(), "the session is busy");
 
-        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
         let transcript_ctx = draw_ctx(40, 8);
         transcript
             .borrow_mut()
@@ -13690,7 +13831,12 @@ mod tests {
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
         assert!(!transcript.borrow().is_at_bottom(), "starts in history");
         assert!(!transcript.borrow().in_focus_mode(), "editor owns focus");
-        shell.borrow().editor.borrow_mut().set_text("steer draft");
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .set_text("steer draft");
 
         writer.write_all(b"\x1b\r").expect("write Alt+Enter");
         let event = app.next_input().await.expect("Alt+Enter event");
@@ -13733,14 +13879,19 @@ mod tests {
         app.request_redraw();
         app.render(&root).expect("render populated transcript");
 
-        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
         let transcript_ctx = draw_ctx(40, 8);
         transcript
             .borrow_mut()
             .scroll_to_top(&mut EventContext::new());
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
         assert!(!transcript.borrow().is_at_bottom(), "starts in history");
-        shell.borrow().editor.borrow_mut().set_text("new prompt");
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .set_text("new prompt");
 
         writer.write_all(b"\t").expect("write Tab");
         let event = app.next_input().await.expect("Tab event");
@@ -13752,7 +13903,7 @@ mod tests {
         app.handle_input(event);
 
         assert_eq!(shell.borrow().take_host_action(), None);
-        assert_eq!(shell.borrow().editor.borrow().text(), "new prompt");
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "new prompt");
         assert!(!world.client().working(), "no turn was spawned");
         assert!(transcript.borrow().in_focus_mode(), "focus is preserved");
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
@@ -13781,13 +13932,18 @@ mod tests {
         fold_ready_frames(&mut world);
         assert!(world.client().working(), "the session is busy");
 
-        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
         let transcript_ctx = draw_ctx(40, 8);
         transcript
             .borrow_mut()
             .scroll_to_top(&mut EventContext::new());
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
-        shell.borrow().editor.borrow_mut().set_text("steer draft");
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .set_text("steer draft");
 
         writer.write_all(b"\t").expect("write Tab");
         let event = app.next_input().await.expect("Tab event");
@@ -13797,7 +13953,7 @@ mod tests {
         app.handle_input(event);
 
         assert_eq!(shell.borrow().take_host_action(), None);
-        assert_eq!(shell.borrow().editor.borrow().text(), "steer draft");
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "steer draft");
         assert!(!world.handles().queues.has_pending(AgentId::Main));
         assert!(transcript.borrow().in_focus_mode(), "focus is preserved");
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
@@ -13824,10 +13980,15 @@ mod tests {
             "queued line"
         );
 
-        shell.borrow().editor.borrow_mut().insert_at_cursor("draft");
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .insert_at_cursor("draft");
         assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "queued line\n\ndraft"
         );
         assert!(!world.handles().queues.has_pending(AgentId::Main));
@@ -13853,7 +14014,7 @@ mod tests {
 
         assert!(handle_host_action(&mut world, &shell, AjAction::CancelTurn).await);
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "second",
             "the queued follow-up came back to the editor"
         );
@@ -14066,7 +14227,7 @@ mod tests {
         let mut ev_ctx = EventContext::new();
         {
             let shell = shell.borrow();
-            let editor: WidgetRef = to_widget_ref(Rc::clone(&shell.editor));
+            let editor: WidgetRef = to_widget_ref(Rc::clone(&shell.view().editor));
             let content_styles = ContentStyles::from_theme(&shell.theme.read());
             open_palette(
                 &shell.overlays,
@@ -14170,7 +14331,7 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().cursor(),
+            shell.borrow().view().editor.borrow().cursor(),
             (0, 0),
             "typed key went to the palette filter, not the editor"
         );
@@ -14186,7 +14347,7 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().cursor(),
+            shell.borrow().view().editor.borrow().cursor(),
             (0, 1),
             "focus is back in the editor"
         );
@@ -14237,7 +14398,7 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().cursor(),
+            shell.borrow().view().editor.borrow().cursor(),
             (0, 1),
             "focus is back in the editor"
         );
@@ -14295,7 +14456,7 @@ mod tests {
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
         assert_eq!(
-            shell.borrow().editor.borrow().cursor(),
+            shell.borrow().view().editor.borrow().cursor(),
             (0, 1),
             "focus is back in the editor"
         );
@@ -14406,7 +14567,7 @@ mod tests {
         writer.write_all(b"x").expect("write key");
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
-        assert_eq!(shell.borrow().editor.borrow().cursor(), (0, 1));
+        assert_eq!(shell.borrow().view().editor.borrow().cursor(), (0, 1));
     }
 
     /// The agent picker chains under the palette like the other selectors:
@@ -15000,12 +15161,7 @@ mod tests {
 
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out autocomplete once");
+
         let observed_shell = Rc::clone(&shell);
         let (exit, refused) = tokio::join!(
             drive(
@@ -15015,7 +15171,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
             async move {
                 writer.write_all(b"x").expect("wake drive loop");
@@ -15936,7 +16091,7 @@ mod tests {
             writer.write_all(b"\x1b").expect("cancel login");
             drop(writer);
         });
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         let exit = tokio::time::timeout(
             Duration::from_secs(2),
             drive(
@@ -15946,7 +16101,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await
@@ -16042,7 +16196,7 @@ mod tests {
         let auth = world.auth.clone();
         let chat = Rc::clone(&world.chat);
         let overlays = Rc::clone(&shell.borrow().overlays);
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         writer.write_all(b"x").expect("trigger auth request drain");
         let mut drive = Box::pin(drive(
             &mut app,
@@ -16051,7 +16205,6 @@ mod tests {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         ));
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -16209,12 +16362,7 @@ mod tests {
         sync_status(&world);
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out autocomplete once");
+
         let observed_shell = Rc::clone(&shell);
         let (exit, typed) = tokio::join!(
             drive(
@@ -16224,7 +16372,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
             async move {
                 writer.write_all(b"x").expect("wake the drive loop");
@@ -16239,6 +16386,7 @@ mod tests {
                 let typed = settled(Duration::from_secs(3), || {
                     observed_shell
                         .borrow()
+                        .view()
                         .editor
                         .borrow()
                         .text()
@@ -16501,7 +16649,7 @@ mod tests {
     /// The set of foreground colors the footer widget draws, for the
     /// re-style assertion above.
     fn footer_fg_colors(shell: &Rc<RefCell<Shell>>) -> Vec<vaxis::cell::Color> {
-        let footer = Rc::clone(&shell.borrow().footer);
+        let footer = Rc::clone(&shell.borrow().view().footer);
         let surface = footer
             .borrow_mut()
             .draw(&crate::test_support::draw_ctx(80, None));
@@ -16540,7 +16688,7 @@ mod tests {
         let chat = empty_chat();
         fold_lines(&chat, 80);
         let (mut app, mut writer, shell, _root) = init_app_with_chat(chat).await;
-        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
 
         for _ in 0..2 {
             app.handle_input(wheel_up_at(3, 3));
@@ -16576,7 +16724,7 @@ mod tests {
         let chat = empty_chat();
         fold_lines(&chat, 80);
         let (mut app, mut writer, shell, _root) = init_app_with_chat(chat).await;
-        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
 
         for _ in 0..2 {
             app.handle_input(wheel_up_at(3, 3));
@@ -16584,14 +16732,14 @@ mod tests {
         let _ = shell.borrow_mut().draw(&full_draw_ctx());
         {
             let shell = shell.borrow();
-            arm_branch(&shell.branch_anchor, "m1".to_string());
+            arm_branch(&shell.view().branch_anchor, "m1".to_string());
         }
 
         writer.write_all(b"\x1b").expect("write first esc");
         let event = app.next_input().await.expect("first input event");
         app.handle_input(event);
         let _ = shell.borrow_mut().draw(&full_draw_ctx());
-        assert!(shell.borrow().branch_anchor.borrow().is_none());
+        assert!(shell.borrow().view().branch_anchor.borrow().is_none());
         assert_eq!(toast_lines(&shell), vec!["Branch cancelled."]);
         assert!(
             !transcript.borrow().is_following_tail(),
@@ -16618,7 +16766,7 @@ mod tests {
         let chat = empty_chat();
         fold_lines(&chat, 80);
         let (mut app, mut writer, shell, _root) = init_app_with_chat(chat).await;
-        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
 
         for _ in 0..2 {
             app.handle_input(wheel_up_at(3, 3));
@@ -16664,7 +16812,14 @@ mod tests {
     #[test]
     fn already_following_escape_is_not_consumed_or_redrawn() {
         let shell = test_shell_with_chat(empty_chat());
-        assert!(shell.borrow().transcript.borrow().is_following_tail());
+        assert!(
+            shell
+                .borrow()
+                .view()
+                .transcript
+                .borrow()
+                .is_following_tail()
+        );
         let mut ctx = EventContext::new();
         shell.borrow_mut().handle_event(
             &mut ctx,
@@ -16751,7 +16906,7 @@ mod tests {
             Some(world.handles().task_registry.clone()),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
-            "",
+            world.session(),
             PathBuf::from("/tmp"),
         )));
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
@@ -16800,7 +16955,7 @@ mod tests {
                 }
                 continue;
             }
-            match advance_resume(world, shell, state).await {
+            match advance_resume(world, state).await {
                 ResumeAdvance::Pending(next) => state = next,
                 ResumeAdvance::OpenFailed { error, .. } => {
                     panic!("the selected transition could not open: {error}")
@@ -16964,6 +17119,7 @@ mod tests {
         assert!(
             shell
                 .borrow()
+                .view()
                 .image_store
                 .borrow()
                 .get(AgentId::Main, entry_id)
@@ -16980,6 +17136,7 @@ mod tests {
         assert!(
             shell
                 .borrow()
+                .view()
                 .image_store
                 .borrow()
                 .get(AgentId::Main, entry_id)
@@ -17014,6 +17171,7 @@ mod tests {
         assert!(
             shell
                 .borrow()
+                .view()
                 .image_store
                 .borrow()
                 .is_failed(AgentId::Main, entry_id),
@@ -17022,6 +17180,7 @@ mod tests {
         assert!(
             shell
                 .borrow()
+                .view()
                 .image_store
                 .borrow()
                 .get(AgentId::Main, entry_id)
@@ -17050,7 +17209,7 @@ mod tests {
             Some(world.handles().task_registry.clone()),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
-            "",
+            world.session(),
             PathBuf::from("/tmp"),
         )));
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
@@ -17082,12 +17241,6 @@ mod tests {
 
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
 
         // One benign key forces a full loop iteration (whose top-of-iteration
         // render draws the image entry and drains the pending set), then EOF
@@ -17101,7 +17254,6 @@ mod tests {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         )
         .await
         .expect("drive exits without a fatal error");
@@ -17110,6 +17262,7 @@ mod tests {
         assert!(
             shell
                 .borrow()
+                .view()
                 .image_store
                 .borrow()
                 .get(AgentId::Main, entry_id)
@@ -17979,7 +18132,12 @@ mod tests {
     /// Reads the editor's top-border row as a single string. The top rule is
     /// row 0, so the inlaid agent marker (if any) lands there.
     fn editor_top_bar_text(shell: &Rc<RefCell<Shell>>) -> String {
-        let surf = shell.borrow().editor.borrow_mut().draw(&draw_ctx(100, 30));
+        let surf = shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .draw(&draw_ctx(100, 30));
         (0..surf.size.width)
             .map(|c| surf.read_cell(c, 0).char.grapheme().to_string())
             .collect()
@@ -18095,13 +18253,8 @@ mod tests {
         );
     }
 
-    /// A session install reconciles the editor chrome onto the new session, so
-    /// its first paint is correct without waiting for the drive loop's
-    /// bottom-of-iteration reconcile. Observing a sub-agent bakes an `agent N`
-    /// marker and the sub's tint into the editor, and the editor persists across
-    /// the chat swap, so after the install the marker must be gone and the
-    /// border must match the fresh main view's tint. Asserted without a manual
-    /// reconcile: the install is the single writer for this window.
+    /// Selecting a session paints its editor's own agent marker and border tint
+    /// immediately, without waiting for the drive loop's first reconciliation.
     #[tokio::test]
     async fn install_reconciles_the_editor_chrome_onto_the_new_session() {
         let dir = TempDir::new().expect("tempdir");
@@ -18216,12 +18369,6 @@ mod tests {
 
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
 
         // One benign key forces a full loop iteration, whose
         // bottom-of-iteration reconcile runs, then EOF (the dropped writer)
@@ -18235,7 +18382,6 @@ mod tests {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         )
         .await
         .expect("drive exits without a fatal error");
@@ -18262,16 +18408,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
-        arm_branch(&shell.borrow().branch_anchor, "m1".to_string());
+        arm_branch(&shell.borrow().view().branch_anchor, "m1".to_string());
 
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
 
         // One benign key forces a full loop iteration, whose reconcile lays
         // the hint into the editor's chrome, then EOF quits.
@@ -18284,7 +18424,6 @@ mod tests {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         )
         .await
         .expect("drive exits without a fatal error");
@@ -18309,16 +18448,10 @@ mod tests {
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         let folded = main_notices(&world);
-        arm_branch(&shell.borrow().branch_anchor, "m1".to_string());
+        arm_branch(&shell.borrow().view().branch_anchor, "m1".to_string());
 
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
 
         writer.write_all(b"\x1b").expect("write an escape");
         drop(writer);
@@ -18329,14 +18462,13 @@ mod tests {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         )
         .await
         .expect("drive exits without a fatal error");
         assert!(matches!(exit, SessionExit::Quit), "EOF quit the loop");
 
         assert!(
-            shell.borrow().branch_anchor.borrow().is_none(),
+            shell.borrow().view().branch_anchor.borrow().is_none(),
             "the typed Esc disarmed the branch",
         );
         let painted = painted_rows(&shell, 100, 40).join("\n");
@@ -18542,7 +18674,7 @@ mod tests {
         // does with the parked recall).
         recall_into_editor(&shell, &text);
         assert_eq!(
-            shell.borrow().editor.borrow().cursor(),
+            shell.borrow().view().editor.borrow().cursor(),
             (0, "add a test".chars().count()),
             "the recalled prompt is in the editor"
         );
@@ -18958,7 +19090,7 @@ mod tests {
     }
 
     /// The switch path: focusing another session re-attaches over the same
-    /// Shell, rebinding by content-swap so the transcript renders the new
+    /// Shell, selecting a session-owned tree so the transcript renders the new
     /// session's model and the pending box reads the new session's queues. The
     /// session left behind accumulates its usage for the shutdown banner.
     #[tokio::test]
@@ -18996,8 +19128,7 @@ mod tests {
         settle_pending_transition(&mut app, &shell, &mut world).await;
 
         assert_eq!(world.session(), beta, "the frontend re-attached onto beta");
-        // The transcript renders beta's replayed content, not alpha's, which
-        // proves every chrome widget follows the content-swapped chat cell.
+        // The selected tree renders beta's replayed content, not alpha's.
         let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
             rows.contains("beta session prompt"),
@@ -19007,16 +19138,10 @@ mod tests {
             !rows.contains("alpha session prompt"),
             "alpha content gone after the swap: {rows}"
         );
-        // The header id followed the swap.
-        assert_eq!(
-            shell.borrow().header.borrow().text,
-            format!("aj - session {beta}")
-        );
-        // The pending box reads the focused session's queue out of the chat
-        // model, which the swap replaced, so a message queued on the new
-        // session previews.
+        assert!(rows.contains(&format!("aj - session {beta}")));
+        // The pending box reads the selected session's queue from its model.
         stage_pending(&mut world, AgentId::Main, "queued after switch").await;
-        let pending = Rc::clone(&shell.borrow().pending);
+        let pending = Rc::clone(&shell.borrow().view().pending);
         let pending_rows = crate::test_support::rows(
             &pending
                 .borrow_mut()
@@ -19107,6 +19232,7 @@ mod tests {
                     let armed = settled(Duration::from_secs(3), || {
                         observed
                             .borrow()
+                            .view()
                             .branch_anchor
                             .borrow()
                             .as_ref()
@@ -19132,7 +19258,7 @@ mod tests {
                     let cancelled = if edited {
                         writer.write_all(b"\x15local draft").unwrap();
                         let typed = settled(Duration::from_secs(3), || {
-                            (observed.borrow().editor.borrow().text() == "local draft")
+                            (observed.borrow().view().editor.borrow().text() == "local draft")
                                 .then_some(())
                         })
                         .await
@@ -19142,6 +19268,7 @@ mod tests {
                             && settled(Duration::from_secs(3), || {
                                 observed
                                     .borrow()
+                                    .view()
                                     .branch_anchor
                                     .borrow()
                                     .is_none()
@@ -19169,7 +19296,7 @@ mod tests {
                 armed && edited && cancelled,
                 "connected={connected}: armed={armed}, edited={edited}, cancelled={cancelled}"
             );
-            assert_eq!(shell.borrow().editor.borrow().text(), "local draft");
+            assert_eq!(shell.borrow().view().editor.borrow().text(), "local draft");
         }
     }
 
@@ -19248,7 +19375,10 @@ mod tests {
         let task = register_bash_task(&mut world, "sleep 100").await;
         branch_focused_session(&mut app, &shell, &mut world, target, Some(prompt)).await;
         assert_eq!(world.handles().log.lock().await.head(), Some(&old_head));
-        assert_eq!(shell.borrow().editor.borrow().text(), "keep my prompt");
+        assert_eq!(
+            shell.borrow().view().editor.borrow().text(),
+            "keep my prompt"
+        );
         assert_eq!(
             branch_settings(&shell).unwrap().thinking.as_deref(),
             Some("high")
@@ -19285,7 +19415,10 @@ mod tests {
         assert!(ctx.consume_event);
         assert!(branch_settings(&shell).is_none());
         assert_eq!(local_settings_seed(world.handles()).0, original);
-        assert_eq!(shell.borrow().editor.borrow().text(), "keep my prompt");
+        assert_eq!(
+            shell.borrow().view().editor.borrow().text(),
+            "keep my prompt"
+        );
         assert!(
             std::fs::read_to_string(&project_path)
                 .unwrap()
@@ -19312,7 +19445,7 @@ mod tests {
             "no hint before arming"
         );
 
-        arm_branch(&shell.borrow().branch_anchor, "m1".to_string());
+        arm_branch(&shell.borrow().view().branch_anchor, "m1".to_string());
         sync_editor_chrome(&world, &shell);
         let armed = editor_top_bar_text(&shell);
         for part in ["branching", "type a message", "cancels"] {
@@ -19342,7 +19475,7 @@ mod tests {
     async fn branch_prefill_preserves_the_draft_for_recall() {
         let dir = TempDir::new().expect("tempdir");
         let (_world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let editor = Rc::clone(&shell.borrow().editor);
+        let editor = Rc::clone(&shell.borrow().view().editor);
         editor.borrow_mut().set_text("my unsent draft");
 
         // The arm handler's prefill: the draft goes onto history, the message
@@ -19378,10 +19511,15 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (world, shell) = world_and_shell(&dir, "streaming-text").await;
         let folded = main_notices(&world);
-        shell.borrow().editor.borrow_mut().set_text("kept draft");
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .set_text("kept draft");
         {
             let sh = shell.borrow();
-            arm_branch(&sh.branch_anchor, "m1".to_string());
+            arm_branch(&sh.view().branch_anchor, "m1".to_string());
         }
         let mut ctx = EventContext::new();
         shell.borrow_mut().handle_event(
@@ -19394,7 +19532,7 @@ mod tests {
         );
         assert!(ctx.consume_event, "Esc is consumed");
         assert!(
-            shell.borrow().branch_anchor.borrow().is_none(),
+            shell.borrow().view().branch_anchor.borrow().is_none(),
             "anchor cleared"
         );
         assert_eq!(
@@ -19408,7 +19546,7 @@ mod tests {
             "and folds nothing into the conversation",
         );
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "kept draft",
             "the editor text stays after cancel"
         );
@@ -19423,19 +19561,24 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let folded = main_notices(&world);
-        shell.borrow().editor.borrow_mut().set_text("branch draft");
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .set_text("branch draft");
         {
             let sh = shell.borrow();
-            arm_branch(&sh.branch_anchor, "m1".to_string());
+            arm_branch(&sh.view().branch_anchor, "m1".to_string());
         }
         // Steer is refused: the editor keeps its draft and the anchor stays.
         assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
-        assert_eq!(shell.borrow().editor.borrow().text(), "branch draft");
-        assert!(shell.borrow().branch_anchor.borrow().is_some());
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "branch draft");
+        assert!(shell.borrow().view().branch_anchor.borrow().is_some());
         // Dequeue is refused the same way.
         assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
-        assert_eq!(shell.borrow().editor.borrow().text(), "branch draft");
-        assert!(shell.borrow().branch_anchor.borrow().is_some());
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "branch draft");
+        assert!(shell.borrow().view().branch_anchor.borrow().is_some());
 
         let toasts = toast_lines(&shell);
         for what in ["steer", "dequeue a message"] {
@@ -19461,12 +19604,12 @@ mod tests {
         let folded = main_notices(&world);
         {
             let sh = shell.borrow();
-            arm_branch(&sh.branch_anchor, "m1".to_string());
+            arm_branch(&sh.view().branch_anchor, "m1".to_string());
         }
         let outcome = submit_with_armed_anchor(&mut world, &shell, "   ".to_string()).await;
         assert!(matches!(outcome, ArmedSubmit::Stay));
         assert!(
-            shell.borrow().branch_anchor.borrow().is_some(),
+            shell.borrow().view().branch_anchor.borrow().is_some(),
             "the anchor is kept on an empty submit"
         );
         assert_eq!(
@@ -19496,16 +19639,16 @@ mod tests {
         assert!(world.client().working(), "a turn is in flight");
         {
             let sh = shell.borrow();
-            arm_branch(&sh.branch_anchor, "m1".to_string());
+            arm_branch(&sh.view().branch_anchor, "m1".to_string());
         }
         let outcome = submit_with_armed_anchor(&mut world, &shell, "edited".to_string()).await;
         assert!(matches!(outcome, ArmedSubmit::Stay));
         assert!(
-            shell.borrow().branch_anchor.borrow().is_some(),
+            shell.borrow().view().branch_anchor.borrow().is_some(),
             "the anchor is kept on a busy submit"
         );
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "edited",
             "the text is restored into the editor"
         );
@@ -19552,15 +19695,15 @@ mod tests {
         let task = register_bash_task(&mut world, "sleep 100").await;
         {
             let sh = shell.borrow();
-            arm_branch(&sh.branch_anchor, "m1".to_string());
+            arm_branch(&sh.view().branch_anchor, "m1".to_string());
         }
         let outcome = submit_with_armed_anchor(&mut world, &shell, "edited".to_string()).await;
         assert!(matches!(outcome, ArmedSubmit::Stay));
         assert!(
-            shell.borrow().branch_anchor.borrow().is_some(),
+            shell.borrow().view().branch_anchor.borrow().is_some(),
             "the anchor is kept on a background-task submit"
         );
-        assert_eq!(shell.borrow().editor.borrow().text(), "edited");
+        assert_eq!(shell.borrow().view().editor.borrow().text(), "edited");
         assert!(
             crate::toasts::toast_texts(&shell.borrow().toasts)
                 .iter()
@@ -19613,7 +19756,7 @@ mod tests {
         let anchored = message_id.clone();
         {
             let sh = shell.borrow();
-            arm_branch(&sh.branch_anchor, message_id);
+            arm_branch(&sh.view().branch_anchor, message_id);
         }
         match submit_with_armed_anchor(&mut world, &shell, "edited prompt".to_string()).await {
             ArmedSubmit::Branch { target, prompt } => {
@@ -19623,7 +19766,7 @@ mod tests {
                 assert_eq!(named, anchored, "the anchor's own message travels");
                 assert_eq!(prompt, "edited prompt");
                 assert!(
-                    shell.borrow().branch_anchor.borrow().is_some(),
+                    shell.borrow().view().branch_anchor.borrow().is_some(),
                     "submission alone does not consume the draft"
                 );
                 // And the host resolves that to the message's parent.
@@ -19650,7 +19793,7 @@ mod tests {
             ArmedSubmit::Stay => panic!("expected a branch exit"),
         }
         assert!(
-            shell.borrow().branch_anchor.borrow().is_none(),
+            shell.borrow().view().branch_anchor.borrow().is_none(),
             "acceptance consumes the draft"
         );
         shut_down(&world).await;
@@ -19858,6 +20001,7 @@ mod tests {
             assert_eq!(
                 shell
                     .borrow()
+                    .view()
                     .branch_anchor
                     .borrow()
                     .as_ref()
@@ -19905,7 +20049,7 @@ mod tests {
             };
             branch_focused_session(&mut app, &shell, &mut world, target, Some(prompt)).await;
             assert!(
-                shell.borrow().branch_anchor.borrow().is_none(),
+                shell.borrow().view().branch_anchor.borrow().is_none(),
                 "accepted branch consumes its draft"
             );
             let applied = handles.run_config.lock().unwrap().settings();
@@ -20132,16 +20276,16 @@ mod tests {
         // prompt below was ever folded. The transcript content can only come
         // from the background fold.
         let folded_prompt = |world: &World| {
-            world
-                .directory
-                .parked_chat(&first)
-                .and_then(|chat| chat.transcript(AgentId::Main))
-                .is_some_and(|transcript| {
-                    transcript.entries().iter().any(|entry| {
-                        matches!(&entry.kind, EntryKind::User(user)
-                            if user.joined_text() == "while in the background")
+            world.directory.chat_for(&first).is_some_and(|chat| {
+                chat.borrow()
+                    .transcript(AgentId::Main)
+                    .is_some_and(|transcript| {
+                        transcript.entries().iter().any(|entry| {
+                            matches!(&entry.kind, EntryKind::User(user)
+                                if user.joined_text() == "while in the background")
+                        })
                     })
-                })
+            })
         };
         let deadline = Instant::now() + SETTLE_DEADLINE;
         while !folded_prompt(&world) {
@@ -20204,7 +20348,7 @@ mod tests {
             let ControlFrame::Frame(frame) = received else {
                 return;
             };
-            let _ = world.directory.apply(&mut world.chat.borrow_mut(), frame);
+            let _ = world.directory.apply(frame);
         }
         panic!("the stream never went quiet");
     }
@@ -20833,7 +20977,10 @@ mod tests {
             !toasts.iter().any(|t| t.contains("does-not-exist")),
             "in the gesture's words, not by quoting the host's entry id: {toasts:?}",
         );
-        assert_eq!(shell.borrow().editor.borrow().text(), "edited prompt");
+        assert_eq!(
+            shell.borrow().view().editor.borrow().text(),
+            "edited prompt"
+        );
         assert!(!world.client().working(), "no turn spawned");
         shut_down(&world).await;
     }
@@ -20871,7 +21018,7 @@ mod tests {
         let shell = shell_for(&world);
         {
             let sh = shell.borrow();
-            arm_branch(&sh.branch_anchor, root_id);
+            arm_branch(&sh.view().branch_anchor, root_id);
         }
         let outcome =
             submit_with_armed_anchor(&mut world, &shell, "edited root prompt".to_string()).await;
@@ -20879,7 +21026,7 @@ mod tests {
             panic!("the submit hands the anchor to the host");
         };
         assert!(
-            shell.borrow().branch_anchor.borrow().is_some(),
+            shell.borrow().view().branch_anchor.borrow().is_some(),
             "the host has not accepted the draft"
         );
         sync_editor_chrome(&world, &shell);
@@ -20910,12 +21057,12 @@ mod tests {
             toast_lines(&shell),
         );
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "edited root prompt",
             "the edited prompt is restored into the editor on a root refusal"
         );
         assert!(
-            shell.borrow().branch_anchor.borrow().is_some(),
+            shell.borrow().view().branch_anchor.borrow().is_some(),
             "a refusal retains the draft until the user cancels or rearms"
         );
         shut_down(&world).await;
@@ -20932,10 +21079,10 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         {
             let sh = shell.borrow();
-            arm_branch(&sh.branch_anchor, "m1".to_string());
+            arm_branch(&sh.view().branch_anchor, "m1".to_string());
         }
         assert!(
-            shell.borrow().branch_anchor.borrow().is_some(),
+            shell.borrow().view().branch_anchor.borrow().is_some(),
             "armed before the change"
         );
 
@@ -20949,7 +21096,7 @@ mod tests {
         assert!(matches!(moved, Focus::Moved));
 
         assert!(
-            shell.borrow().branch_anchor.borrow().is_none(),
+            shell.borrow().view().branch_anchor.borrow().is_none(),
             "the change clears the armed anchor"
         );
         shut_down(&world).await;
@@ -20999,7 +21146,7 @@ mod tests {
             toast_lines(&shell),
         );
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "",
             "the prompt was submitted, not restored",
         );
@@ -21276,7 +21423,7 @@ mod tests {
     /// The footer row of a shell, which is where the host's settings surface
     /// for a remote client.
     fn footer_row(shell: &Rc<RefCell<Shell>>) -> String {
-        let footer = Rc::clone(&shell.borrow().footer);
+        let footer = Rc::clone(&shell.borrow().view().footer);
         crate::test_support::rows(
             &footer
                 .borrow_mut()
@@ -22176,9 +22323,7 @@ mod tests {
             sessions: sessions.clone(),
             hosts,
         };
-        let redraw = world
-            .directory
-            .apply(&mut world.chat.borrow_mut(), list(hosts.clone()));
+        let redraw = world.directory.apply(list(hosts.clone()));
         assert!(redraw.0, "the directory took the frame as news");
         sync_sidebar(&world, &shell);
 
@@ -22214,9 +22359,7 @@ mod tests {
                 unreachable: false,
             },
         ];
-        let redraw = world
-            .directory
-            .apply(&mut world.chat.borrow_mut(), list(back));
+        let redraw = world.directory.apply(list(back));
         assert!(redraw.0, "first contact is news");
         sync_sidebar(&world, &shell);
         let painted = sidebar_rows(&shell);
@@ -22280,17 +22423,14 @@ mod tests {
             working_directory: None,
             unreachable: false,
         };
-        let redraw = world.directory.apply(
-            &mut world.chat.borrow_mut(),
-            aj_wire::Frame::List {
-                sessions: sessions.clone(),
-                hosts: vec![
-                    named("aaa-laptop", "~/workshop"),
-                    named("builder-1", "~/work/umber/aj"),
-                    named("zzz-deep", "~/work/umber/materialize/src"),
-                ],
-            },
-        );
+        let redraw = world.directory.apply(aj_wire::Frame::List {
+            sessions: sessions.clone(),
+            hosts: vec![
+                named("aaa-laptop", "~/workshop"),
+                named("builder-1", "~/work/umber/aj"),
+                named("zzz-deep", "~/work/umber/materialize/src"),
+            ],
+        });
         assert!(redraw.0, "the directory took the frame as news");
         sync_sidebar(&world, &shell);
 
@@ -22329,7 +22469,7 @@ mod tests {
             .await
             .latest_leaf(ThreadFilter::USER)
             .expect("a persisted user message");
-        arm_branch(&shell.borrow().branch_anchor, head.clone());
+        arm_branch(&shell.borrow().view().branch_anchor, head.clone());
         let before = main_notices(&world).len();
 
         let moved = apply_focus_request(
@@ -22356,6 +22496,7 @@ mod tests {
         assert_eq!(
             shell
                 .borrow()
+                .view()
                 .branch_anchor
                 .borrow()
                 .as_ref()
@@ -22364,6 +22505,814 @@ mod tests {
             "an armed branch survives a switch that did not happen",
         );
         shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn session_views_restore_drafts_and_submit_only_to_the_focused_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        persist_session(&mut world).await;
+        let a = world.session().to_string();
+        let editor = Rc::clone(&shell.borrow().view().editor);
+        editor
+            .borrow_mut()
+            .seed_history(&["workspace recall".to_string()]);
+        let paste = "literal payload αβγ\n".repeat(100);
+        editor
+            .borrow_mut()
+            .handle_event(&mut EventContext::new(), &Event::Paste(paste.clone()));
+        assert_ne!(
+            editor.borrow().text(),
+            paste,
+            "fixture uses a collapsed paste"
+        );
+        editor.borrow_mut().insert_at_cursor(" suffix");
+        let key = |codepoint, mods| {
+            Event::KeyPress(Key {
+                codepoint,
+                mods,
+                ..Key::default()
+            })
+        };
+        editor.borrow_mut().handle_event(
+            &mut EventContext::new(),
+            &key(Key::LEFT, Modifiers::empty()),
+        );
+        let cursor = editor.borrow().cursor();
+        let draft = editor.borrow().expanded_text();
+
+        assert!(matches!(
+            apply_focus_request(
+                &mut app,
+                &shell,
+                &mut world,
+                FocusRequest::Create { host: None }
+            )
+            .await,
+            Focus::Moved
+        ));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        let b = world.session().to_string();
+        let editor_b = Rc::clone(&shell.borrow().view().editor);
+        assert!(!Rc::ptr_eq(&editor, &editor_b));
+        assert_eq!(
+            editor.borrow().expanded_text(),
+            draft,
+            "A's editor remains intact offscreen"
+        );
+        assert_eq!(editor_b.borrow().text(), "");
+        editor_b
+            .borrow_mut()
+            .handle_event(&mut EventContext::new(), &key(Key::UP, Modifiers::empty()));
+        assert_eq!(
+            editor_b.borrow().text(),
+            "workspace recall",
+            "recall remains workspace-wide"
+        );
+        editor_b.borrow_mut().set_text("B draft");
+
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(a.clone()),
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert_eq!(editor.borrow().expanded_text(), draft);
+        assert_eq!(editor.borrow().cursor(), cursor);
+        editor.borrow_mut().handle_event(
+            &mut EventContext::new(),
+            &key(u32::from('_'), Modifiers::CTRL),
+        );
+        assert_eq!(
+            editor.borrow().expanded_text(),
+            paste,
+            "undo keeps the literal paste payload"
+        );
+
+        apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(b)).await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert!(Rc::ptr_eq(&editor_b, &shell.borrow().view().editor));
+        assert_eq!(editor_b.borrow().text(), "B draft");
+        app.handle_input(key(Key::ENTER, Modifiers::empty()));
+        let submitted = shell.borrow().take_submitted().expect("submit callback");
+        handle_submit(&mut world, submitted).await;
+        settle(&mut world).await;
+        assert!(user_messages(&world).iter().any(|text| text == "B draft"));
+        sync_status(&world);
+        sync_keymap_ctx(&world, &shell);
+        app.request_redraw();
+        app.render(&root).expect("render B's conversation");
+        app.handle_input(key(Key::TAB, Modifiers::empty()));
+        assert!(shell.borrow().view().transcript.borrow().in_focus_mode());
+        app.handle_input(key(Key::ESCAPE, Modifiers::empty()));
+        writer
+            .write_all(b"x")
+            .expect("type in B after leaving transcript focus");
+        let input = app.next_input().await.expect("typed input");
+        app.handle_input(input);
+        assert_eq!(
+            editor_b.borrow().text(),
+            "x",
+            "transcript Escape returns to B's editor"
+        );
+        apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(a)).await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert!(!user_messages(&world).iter().any(|text| text == "B draft"));
+        assert_eq!(editor.borrow().expanded_text(), paste);
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn session_views_route_completions_through_the_selected_editor() {
+        use vaxis::vxfw::{
+            AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions, CompletionApplied,
+            SuggestOpts,
+        };
+        struct Provider(&'static str);
+        #[async_trait]
+        impl AutocompleteProvider for Provider {
+            async fn get_suggestions(
+                &self,
+                lines: &[String],
+                _line: usize,
+                _col: usize,
+                _opts: SuggestOpts,
+            ) -> Option<AutocompleteSuggestions> {
+                Some(AutocompleteSuggestions {
+                    items: vec![AutocompleteItem::new(
+                        self.0.to_string(),
+                        self.0.to_string(),
+                    )],
+                    prefix: lines[0].clone(),
+                })
+            }
+            fn apply_completion(
+                &self,
+                _lines: &[String],
+                _line: usize,
+                _col: usize,
+                item: &AutocompleteItem,
+                _prefix: &str,
+            ) -> CompletionApplied {
+                CompletionApplied {
+                    lines: vec![item.value.clone()],
+                    cursor_line: 0,
+                    cursor_col: item.value.len(),
+                }
+            }
+        }
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        persist_session(&mut world).await;
+        let a = world.session().to_string();
+        let view_a = shell.borrow().view();
+        view_a
+            .editor
+            .borrow_mut()
+            .set_autocomplete_provider(Arc::new(Provider("completed A")));
+        view_a.editor.borrow_mut().set_text("unfinished ");
+        press(&mut app, &mut writer, b"@").await;
+        // Keep A's completed delivery queued until after the switch. Neither
+        // the test nor the new session may take over A's receiver.
+        assert_eq!(
+            view_a.editor.borrow().text(),
+            "unfinished @",
+            "typed input reaches A"
+        );
+        assert!(
+            poll_for(|| (!view_a.autocomplete_rx.borrow().is_empty()).then_some(()))
+                .await
+                .is_some()
+        );
+        assert_eq!(view_a.editor.borrow().text(), "unfinished @");
+
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        persist_session(&mut world).await;
+        let view_b = shell.borrow().view();
+        view_b
+            .editor
+            .borrow_mut()
+            .set_autocomplete_provider(Arc::new(Provider("completed B")));
+        view_b.editor.borrow_mut().set_text("unfinished ");
+        let (mut theme_watch, mut history_rx) = drive_parts();
+
+        // The same app drives B and then A, just as the outer session loop does.
+        // Both editors started with the same buffer and a first completion
+        // request, so choosing the wrong receiver can mutate the wrong draft.
+        for (view, expected, input) in [
+            (&view_b, "completed B", b'@'),
+            (&view_a, "completed A", b'x'),
+        ] {
+            writer.write_all(&[input]).expect("request completion");
+            let (exit, ()) = tokio::join!(
+                tokio::time::timeout(
+                    SETTLE_DEADLINE,
+                    drive(
+                        &mut app,
+                        &root,
+                        &shell,
+                        &mut world,
+                        &mut theme_watch,
+                        &mut history_rx
+                    )
+                ),
+                async {
+                    assert!(
+                        poll_for(|| view.editor.borrow().is_showing_autocomplete().then_some(()))
+                            .await
+                            .is_some(),
+                        "the selected editor opens its completion popup"
+                    );
+                    writer.write_all(b"\t").expect("accept completion");
+                    assert!(
+                        poll_for(|| (view.editor.borrow().text() == expected).then_some(()))
+                            .await
+                            .is_some(),
+                        "completion did not reach the selected editor"
+                    );
+                    assert!(poll_for(|| (shell.borrow().sidebar.borrow().rows.len() >= 2).then_some(())).await.is_some(),
+                        "both sessions are available for the switch chord");
+                    writer
+                        .write_all(&chord_bytes(AjAction::SessionNext))
+                        .expect("switch session");
+                }
+            );
+            let SessionExit::Switch(target) = exit
+                .expect("completion and switch finish")
+                .expect("drive exits")
+            else {
+                panic!("the session chord exits the drive loop");
+            };
+            if expected == "completed B" {
+                assert_eq!(target, a);
+                assert_eq!(view_a.editor.borrow().text(), "unfinished @");
+                apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target))
+                    .await;
+                settle_pending_transition(&mut app, &shell, &mut world).await;
+            }
+        }
+        assert_eq!(view_b.editor.borrow().text(), "completed B");
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn session_views_keep_reading_position_until_the_model_is_evicted() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let prompt = (0..80)
+            .map(|i| format!("reading row {i:03}\n"))
+            .collect::<String>();
+        run_prompt(&mut world, &prompt).await;
+        let a = world.session().to_string();
+        world.chat.borrow_mut().tools_expanded = true;
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .insert_at_cursor("retained beyond eviction");
+        painted_rows(&shell, 100, 30);
+        shell
+            .borrow()
+            .view()
+            .transcript
+            .borrow_mut()
+            .scroll_to_top(&mut EventContext::new());
+        painted_rows(&shell, 100, 30);
+        for _ in 0..prompt.lines().count() {
+            let rows = painted_rows(&shell, 100, 30);
+            if rows.iter().any(|row| row.contains("reading row 020"))
+                && !rows.iter().any(|row| row.contains("reading row 000"))
+            {
+                break;
+            }
+            shell
+                .borrow()
+                .view()
+                .transcript
+                .borrow_mut()
+                .handle_event(&mut EventContext::new(), &wheel_down_at(1, 1));
+            painted_rows(&shell, 100, 30);
+        }
+        let before = painted_rows(&shell, 100, 30);
+        assert!(
+            !shell
+                .borrow()
+                .view()
+                .transcript
+                .borrow()
+                .is_following_tail()
+        );
+        assert!(
+            !before.iter().any(|row| row.contains("reading row 000")),
+            "fixture is scrolled past the top: {before:?}"
+        );
+        assert!(
+            !before.iter().any(|row| row.contains("reading row 079")),
+            "tail is off-screen"
+        );
+        let reading_rows = |rows: Vec<String>| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    row.split_once("reading row ").map(|(_, rest)| {
+                        rest.split_whitespace()
+                            .next()
+                            .expect("row number")
+                            .to_string()
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let resized = reading_rows(painted_rows(&shell, 70, 24));
+        assert!(!resized.is_empty());
+        painted_rows(&shell, 100, 30);
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        painted_rows(&shell, 70, 24);
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(a.clone()),
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        // Switch toasts temporarily cover transcript rows, independently of scrolling.
+        shell.borrow().toasts.borrow_mut().clear();
+        sync_status(&world);
+        assert_eq!(
+            reading_rows(painted_rows(&shell, 70, 24)),
+            resized,
+            "an attached session keeps its reading position at the resized dimensions"
+        );
+
+        for _ in 0..8 {
+            apply_focus_request(
+                &mut app,
+                &shell,
+                &mut world,
+                FocusRequest::Create { host: None },
+            )
+            .await;
+            settle_pending_transition(&mut app, &shell, &mut world).await;
+            assert_eq!(shell.borrow().view().editor.borrow().text(), "");
+            assert!(
+                !world.chat.borrow().tools_expanded,
+                "new views have their own presentation defaults"
+            );
+        }
+        assert!(
+            !world.directory.is_attached(&a),
+            "fixture crosses the attached working-set limit"
+        );
+        // Inactive views must not carry stale layout into a resized terminal.
+        painted_rows(&shell, 70, 24);
+        apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(a)).await;
+        painted_rows(&shell, 70, 24); // The attach has not supplied the transcript yet.
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert_eq!(
+            shell.borrow().view().editor.borrow().text(),
+            "retained beyond eviction"
+        );
+        assert!(
+            world.chat.borrow().tools_expanded,
+            "local presentation survives model eviction"
+        );
+        sync_status(&world);
+        shell.borrow().toasts.borrow_mut().clear();
+        let after = painted_rows(&shell, 70, 24);
+        assert!(
+            after.iter().any(|row| row.contains("reading row 079")),
+            "a replayed session opens at the tail in the resized terminal: {after:?}"
+        );
+        assert!(!after.iter().any(|row| row.contains("reading row 000")));
+        assert!(
+            shell
+                .borrow()
+                .view()
+                .transcript
+                .borrow()
+                .is_following_tail()
+        );
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn replacing_a_focused_model_returns_to_the_editor_before_paint_or_capture() {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{Message, UserMessage};
+
+        for key_before_paint in [true, false] {
+            let dir = TempDir::new().expect("tempdir");
+            let (mut world, shell, mut app, mut writer, root) =
+                world_shell_app(&dir, "streaming-text", default_layers()).await;
+            run_prompt(&mut world, "original prompt").await;
+            sync_status(&world);
+            let view = shell.borrow().view();
+            view.editor.borrow_mut().set_text("private draft");
+            app.request_redraw();
+            app.render(&root).expect("render original model");
+            press(&mut app, &mut writer, b"\t").await;
+            assert!(view.transcript.borrow().in_focus_mode());
+            assert!(view.transcript.borrow().focused_branch().is_some());
+            let user_index = world
+                .chat
+                .borrow()
+                .transcript(AgentId::Main)
+                .expect("main")
+                .entries()
+                .iter()
+                .position(|entry| matches!(entry.kind, EntryKind::User(_)))
+                .expect("user index");
+            let generation = world.chat.borrow().generation();
+            let mut lifecycle = AgentLifecycle::default();
+            let mut replacement = seeded_chat(&world.config, unknown_settings(), 0, &world.catalog);
+            // Replace the message at the focused index, not just the length of
+            // the transcript. A stale branch chord could otherwise be inert.
+            for _ in 0..user_index {
+                let _ = reduce(
+                    &mut replacement,
+                    &mut lifecycle,
+                    notice_event("replacement context"),
+                    None,
+                );
+            }
+            let _ = reduce(
+                &mut replacement,
+                &mut lifecycle,
+                AgentEvent::MessageEnd {
+                    agent_id: AgentId::Main,
+                    message: AgentMessage::wire(Message::User(UserMessage::text(
+                        "replacement prompt",
+                    ))),
+                },
+                Some(&aj_wire::DurableEvent {
+                    seq: 1,
+                    entry_id: "replacement-message".to_string(),
+                    branch_settings: None,
+                }),
+            );
+            for i in 0..80 {
+                let _ = reduce(
+                    &mut replacement,
+                    &mut lifecycle,
+                    notice_event(&format!("replacement row {i:03}")),
+                    None,
+                );
+            }
+            assert_ne!(replacement.generation(), generation);
+            if key_before_paint {
+                *world.chat.borrow_mut() = replacement;
+                press(&mut app, &mut writer, &chord_bytes(AjAction::BranchMessage)).await;
+                assert!(
+                    view.branch_anchor.borrow().is_none(),
+                    "an unseen replacement cannot become a branch anchor"
+                );
+                assert_eq!(view.editor.borrow().text(), "private draft");
+                press(&mut app, &mut writer, b"x").await;
+            } else {
+                let (mut theme, mut history) = drive_parts();
+                let chat = Rc::clone(&world.chat);
+                let control = Control::local(world.host().clone());
+                let session = world.session().to_string();
+                let (exit, ()) = tokio::join!(
+                    tokio::time::timeout(
+                        SETTLE_DEADLINE,
+                        drive(
+                            &mut app,
+                            &root,
+                            &shell,
+                            &mut world,
+                            &mut theme,
+                            &mut history
+                        )
+                    ),
+                    async {
+                        // The driver has reached its input/frame wait. Replace
+                        // the model now, then wake it with a host list update,
+                        // not a key that could reconcile through Shell capture.
+                        *chat.borrow_mut() = replacement;
+                        control
+                            .command(
+                                &session,
+                                Command::Tag {
+                                    tag: Some("wake replacement".to_string()),
+                                },
+                            )
+                            .await
+                            .expect("wake the running driver");
+                        assert!(
+                            poll_for(|| (!view.transcript.borrow().in_focus_mode()
+                                && view.transcript.borrow().is_following_tail())
+                            .then_some(()))
+                            .await
+                            .is_some()
+                        );
+                        writer.write_all(b"x").expect("type after replacement");
+                        assert!(
+                            poll_for(
+                                || (view.editor.borrow().text() == "private draftx").then_some(())
+                            )
+                            .await
+                            .is_some()
+                        );
+                        drop(writer);
+                    }
+                );
+                assert!(matches!(
+                    exit.expect("drive finishes").expect("drive succeeds"),
+                    SessionExit::Quit
+                ));
+            }
+            assert_eq!(view.editor.borrow().text(), "private draftx");
+            assert!(!view.transcript.borrow().in_focus_mode());
+            assert!(
+                painted_rows(&shell, 100, 40)
+                    .iter()
+                    .any(|row| row.contains("replacement row 079"))
+            );
+            shut_down(&world).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_submission_leaves_scroll_back_for_the_new_response() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let context = (0..80)
+            .map(|i| format!("context row {i:03}\n"))
+            .collect::<String>();
+        run_prompt(&mut world, &context).await;
+        run_prompt(&mut world, "branch here").await;
+        let message = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main")
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::User(user) if user.joined_text() == "branch here" => {
+                    user.message_id.clone()
+                }
+                _ => None,
+            })
+            .expect("persisted branch point");
+        arm_branch(&shell.borrow().view().branch_anchor, message);
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
+        painted_rows(&shell, 100, 30);
+        transcript
+            .borrow_mut()
+            .scroll_to_top(&mut EventContext::new());
+        let before = painted_rows(&shell, 100, 30);
+        assert!(before.iter().any(|row| row.contains("context row 000")));
+        assert!(!transcript.borrow().is_following_tail());
+        world.handles().run_config.lock().unwrap().provider =
+            Arc::new(aj_models::scripted::ScriptedProvider::from_messages(
+                vec![aj_app::test_support::finalized_text_message(
+                    "branch response complete",
+                )],
+                0,
+                Duration::ZERO,
+            ));
+        let ArmedSubmit::Branch { target, prompt } =
+            submit_with_armed_anchor(&mut world, &shell, "edited branch prompt".to_string()).await
+        else {
+            panic!("armed submit requests a branch")
+        };
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                target,
+                prompt: Some(prompt),
+            },
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        settle(&mut world).await;
+        let after = painted_rows(&shell, 100, 30);
+        assert!(
+            user_messages(&world)
+                .iter()
+                .any(|text| text == "edited branch prompt")
+        );
+        assert!(
+            after
+                .iter()
+                .any(|row| row.contains("branch response complete")),
+            "{after:?}"
+        );
+        assert!(transcript.borrow().is_following_tail());
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn replay_falls_back_to_main_when_the_observed_agent_is_not_on_the_selected_branch() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "parallel-agents", default_layers()).await;
+        drive_demo_to_completion(&mut world).await;
+        let observed = AgentId::Sub(first_sub(&world.chat.borrow()));
+        let before_spawn = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::User(user) => user.message_id.clone(),
+                _ => None,
+            })
+            .expect("the persisted prompt precedes every sub-agent spawn");
+        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Observe(observed)).await;
+        painted_rows(&shell, 100, 30);
+        assert_eq!(world.chat.borrow().active_view(), observed);
+        assert!(world.chat.borrow().transcript(observed).is_some());
+
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                target: HeadTarget::Entry(before_spawn),
+                prompt: None,
+            },
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert!(
+            world.chat.borrow().transcript(observed).is_none(),
+            "the selected branch excludes the real sub-agent thread"
+        );
+        assert_eq!(world.chat.borrow().active_view(), AgentId::Main);
+        sync_status(&world);
+        assert!(
+            painted_rows(&shell, 100, 30)
+                .iter()
+                .any(|row| row.contains("run the demo")),
+            "the selected branch is visible rather than an absent agent's view"
+        );
+        handle_submit(&mut world, "continue on selected branch".to_string()).await;
+        settle(&mut world).await;
+        assert!(
+            user_messages(&world)
+                .iter()
+                .any(|text| text == "continue on selected branch"),
+            "the next prompt is submitted to Main"
+        );
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn passive_reattachment_keeps_live_reading_state_but_rebuilt_models_open_at_tail() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let prompt = (0..80)
+            .map(|i| format!("reading row {i:03}\n"))
+            .collect::<String>();
+        run_prompt(&mut world, &prompt).await;
+        let session = world.session().to_string();
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
+        world.chat.borrow_mut().tools_expanded = true;
+        painted_rows(&shell, 100, 30);
+        transcript
+            .borrow_mut()
+            .scroll_to_top(&mut EventContext::new());
+        painted_rows(&shell, 100, 30);
+        for _ in 0..prompt.lines().count() {
+            let rows = painted_rows(&shell, 100, 30);
+            if rows.iter().any(|row| row.contains("reading row 020"))
+                && !rows.iter().any(|row| row.contains("reading row 000"))
+            {
+                break;
+            }
+            transcript
+                .borrow_mut()
+                .handle_event(&mut EventContext::new(), &wheel_down_at(1, 1));
+            painted_rows(&shell, 100, 30);
+        }
+        for (col, kind) in [
+            (3, vaxis::mouse::Type::Press),
+            (9, vaxis::mouse::Type::Drag),
+            (9, vaxis::mouse::Type::Release),
+        ] {
+            transcript
+                .borrow_mut()
+                .handle_event(&mut EventContext::new(), &left_mouse_at(3, col, kind));
+        }
+        let reading_rows = |rows: Vec<String>| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    row.split_once("reading row ").map(|(_, text)| {
+                        text.split_whitespace()
+                            .next()
+                            .expect("row number")
+                            .to_string()
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = reading_rows(painted_rows(&shell, 100, 30));
+        assert!(!before.is_empty());
+        assert!(!before.iter().any(|row| row == "000" || row == "079"));
+        assert!(!transcript.borrow().is_following_tail());
+        assert!(
+            transcript.borrow().has_selection(),
+            "fixture has selected text"
+        );
+
+        // A suffix rejoin keeps the model and its selection valid. A restarted
+        // host replays the same persisted messages into a new generation.
+        for restart in [false, true] {
+            let generation = world.chat.borrow().generation();
+            if restart {
+                world.stream.take();
+                remote.shutdown().await;
+                remote = RemoteHost::start(&dir, "streaming-text").await;
+                world.control = Control::remote(
+                    crate::remote::RemoteClient::new(&remote.url()).expect("restarted host client"),
+                );
+            }
+            let ResumeAdvance::Pending(mut state) = advance_resume(&mut world, Resume::new()).await
+            else {
+                panic!("passive reattachment opened");
+            };
+            let mut saw_empty = false;
+            let mut saw_partial = false;
+            while !state.ready() {
+                let frame = tokio::time::timeout(SETTLE_DEADLINE, world.stream_mut().recv())
+                    .await
+                    .expect("replay frame arrives");
+                let ControlFrame::Frame(frame) = frame else {
+                    panic!("replay stream stays live");
+                };
+                state
+                    .block_mut()
+                    .expect("arriving block")
+                    .fold(&mut world, frame);
+                if restart && world.client().rebuilding() {
+                    saw_empty |= user_rows(&world).is_empty();
+                    saw_partial |= !user_rows(&world).is_empty();
+                }
+                painted_rows(&shell, 100, 30);
+            }
+            assert!(matches!(
+                advance_resume(&mut world, state).await,
+                ResumeAdvance::Settled {
+                    caught: CatchUp::Caught,
+                    ..
+                }
+            ));
+            assert_eq!(world.session(), session);
+            let after = reading_rows(painted_rows(&shell, 100, 30));
+            if restart {
+                assert!(
+                    after.iter().any(|row| row == "079"),
+                    "rebuilt transcript opens at tail: {after:?}"
+                );
+            } else {
+                assert_eq!(
+                    after, before,
+                    "a suffix rejoin preserves the live reading position"
+                );
+            }
+            assert_eq!(transcript.borrow().is_following_tail(), restart);
+            assert!(world.chat.borrow().tools_expanded);
+            assert_eq!(transcript.borrow().has_selection(), !restart);
+            if restart {
+                assert_ne!(world.chat.borrow().generation(), generation);
+                assert!(
+                    saw_empty && saw_partial,
+                    "draws covered empty and partial replacement"
+                );
+            } else {
+                assert_eq!(world.chat.borrow().generation(), generation);
+            }
+        }
+        remote.shutdown().await;
     }
 
     /// Two stepping chords in a row walk two sessions.
@@ -22403,12 +23352,6 @@ mod tests {
 
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
 
         // Both chords are in the buffer before the loop reads either, which is
         // what a held key does.
@@ -22425,10 +23368,10 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             )
             .await
             .expect("drive exits without a fatal error");
+
             let SessionExit::Switch(target) = exit else {
                 panic!("step {step} did not break out for a switch");
             };
@@ -22481,12 +23424,6 @@ mod tests {
 
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
 
         writer
             .write_all(&chord_bytes(AjAction::SessionNext))
@@ -22498,7 +23435,6 @@ mod tests {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         )
         .await
         .expect("drive exits without a fatal error");
@@ -22815,7 +23751,12 @@ mod tests {
             type_and_settle_autocomplete(&mut app, &mut writer, &shell, *byte).await;
         }
         assert!(
-            shell.borrow().editor.borrow().is_showing_autocomplete(),
+            shell
+                .borrow()
+                .view()
+                .editor
+                .borrow()
+                .is_showing_autocomplete(),
             "the completion popup is open",
         );
         let composed = shell.borrow_mut().draw(&draw_ctx(100, 30));
@@ -23230,7 +24171,7 @@ mod tests {
                     .expect("seed env");
             }
             let (mut app, mut writer, root) = app_over(&shell).await;
-            let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+            let (mut theme_watch, mut prompt_history_rx) = drive_parts();
             // Confirm three distinct operations through the palette and existing
             // settings widgets. Nothing drains their activity outside the loop.
             writer
@@ -23254,7 +24195,6 @@ mod tests {
                     &mut world,
                     &mut theme_watch,
                     &mut prompt_history_rx,
-                    &mut autocomplete_rx,
                 ),
             )
             .await
@@ -23486,7 +24426,7 @@ mod tests {
 
         // A client holding no row for its own session, which is what an attach
         // whose first list frame has not landed yet looks like.
-        world.directory = SessionDirectory::new(session.clone());
+        world.directory = SessionDirectory::new(session.clone(), Rc::clone(&world.chat));
 
         press(&mut app, &mut writer, &chord_bytes(AjAction::SessionTag)).await;
         drain_parked_action(&mut world, &shell)
@@ -23605,12 +24545,6 @@ mod tests {
 
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
 
         writer
             .write_all(&chord_bytes(AjAction::SessionTag))
@@ -23627,7 +24561,6 @@ mod tests {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         )
         .await
         .expect("drive exits without a fatal error");
@@ -25162,7 +26095,7 @@ mod tests {
 
         let status = Rc::clone(&world.status);
         let observed_shell = Rc::clone(&shell);
-        let editor = Rc::clone(&shell.borrow().editor);
+        let editor = Rc::clone(&shell.borrow().view().editor);
         let chat = Rc::clone(&world.chat);
         let (exit, observed) = drive_until(&mut world, &shell, move |mut writer| async move {
             let catching = settled(Duration::from_secs(3), || {
@@ -25200,7 +26133,8 @@ mod tests {
                 .write_all(b"after state\r")
                 .expect("submit after State but before Caught");
             let gated_in_block = settled(Duration::from_secs(3), || {
-                (observed_shell.borrow().editor.borrow().text() == "after state").then_some(())
+                (observed_shell.borrow().view().editor.borrow().text() == "after state")
+                    .then_some(())
             })
             .await;
             writer
@@ -25210,7 +26144,8 @@ mod tests {
                 .write_all(b"steer while catching\x1b\r")
                 .expect("Alt+Enter during Applying");
             let steer_gated = settled(Duration::from_secs(3), || {
-                let kept = observed_shell.borrow().editor.borrow().text() == "steer while catching";
+                let kept =
+                    observed_shell.borrow().view().editor.borrow().text() == "steer while catching";
                 let refused = toast_lines(&observed_shell)
                     .iter()
                     .any(|toast| toast.contains("Can't steer") && toast.contains("attaching"));
@@ -25280,7 +26215,7 @@ mod tests {
         );
         assert_eq!(peer.steers(), 0, "a steer was sent before target Caught");
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "steer while catching"
         );
         assert_eq!(world.connection, Connection::Connected);
@@ -25782,7 +26717,7 @@ mod tests {
         assert!(world.startup.contains_key(&target));
 
         let status = Rc::clone(&world.status);
-        let editor = Rc::clone(&shell.borrow().editor);
+        let editor = Rc::clone(&shell.borrow().view().editor);
         let (exit, observed) = drive_until(&mut world, &shell, move |mut writer| async move {
             let rejoining = settled(Duration::from_secs(4), || {
                 (status.borrow().connection == Connection::CatchingUp && peer.opens() >= 2)
@@ -26096,6 +27031,7 @@ mod tests {
             .id;
         shell
             .borrow()
+            .view()
             .image_store
             .borrow_mut()
             .insert(AgentId::Main, stale_image_entry, 42);
@@ -26158,7 +27094,12 @@ mod tests {
 
         // A newer draft must survive restoring the held branch prompt when
         // the attach refusal settles. Recovery waits for explicit selection.
-        shell.borrow().editor.borrow_mut().set_text("newer draft");
+        shell
+            .borrow()
+            .view()
+            .editor
+            .borrow_mut()
+            .set_text("newer draft");
         assert!(matches!(
             settle_pending_transition(&mut app, &shell, &mut world).await,
             CatchUp::Refused {
@@ -26207,13 +27148,14 @@ mod tests {
         assert_eq!(
             shell
                 .borrow()
+                .view()
                 .image_store
                 .borrow()
                 .get(AgentId::Main, stale_image_entry),
             None,
             "the forced Head replacement retained the abandoned projection's image id",
         );
-        assert_eq!(shell.borrow().editor.borrow().text(), prompt);
+        assert_eq!(shell.borrow().view().editor.borrow().text(), prompt);
         assert!(
             toast_lines(&shell)
                 .iter()
@@ -26221,8 +27163,8 @@ mod tests {
             "the accepted-Head failure was not visible: {:?}",
             toast_lines(&shell),
         );
-        shell.borrow().editor.borrow_mut().set_text("");
-        shell.borrow().editor.borrow_mut().handle_event(
+        shell.borrow().view().editor.borrow_mut().set_text("");
+        shell.borrow().view().editor.borrow_mut().handle_event(
             &mut EventContext::new(),
             &Event::KeyPress(Key {
                 codepoint: Key::UP,
@@ -26231,7 +27173,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "newer draft",
             "restoring the held branch prompt discarded the newer draft",
         );
@@ -26403,7 +27345,7 @@ mod tests {
         let peer = WarmPeer::start(Vec::new(), silence / 10).await;
         redirect_to(&mut world, &peer, silence);
 
-        let editor = Rc::clone(&shell.borrow().editor);
+        let editor = Rc::clone(&shell.borrow().view().editor);
         let typed = "the loop is still mine";
         let asked = Arc::clone(&peer.opens);
         let (exit, observed) = crate::remote::tests::bounded(
@@ -26505,7 +27447,7 @@ mod tests {
         redirect_to(&mut world, &peer, silence);
 
         let chat = Rc::clone(&world.chat);
-        let editor = Rc::clone(&shell.borrow().editor);
+        let editor = Rc::clone(&shell.borrow().view().editor);
         let typed = "the loop is still mine";
         let landed = "Reconnected to the host.";
         let (exit, observed) = crate::remote::tests::bounded(
@@ -26673,7 +27615,7 @@ mod tests {
         redirect_to(&mut world, &peer, crate::remote::SILENCE);
 
         let chat = Rc::clone(&world.chat);
-        let editor = Rc::clone(&shell.borrow().editor);
+        let editor = Rc::clone(&shell.borrow().view().editor);
         let typed = "the loop is still mine";
         let (exit, observed) = crate::remote::tests::bounded(
             "the drive loop to come back for its input",
@@ -26814,13 +27756,12 @@ mod tests {
     async fn a_block_in_hand_survives_a_deadline_the_driver_slept_through() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, _) = connect_world_and_shell(&dir, &remote, &[]).await;
         let session = world.session().to_string();
         let epoch = "epoch-in-hand";
         let silence = Duration::from_millis(300);
 
-        let ResumeAdvance::Pending(mut state) =
-            advance_resume(&mut world, &shell, Resume::new()).await
+        let ResumeAdvance::Pending(mut state) = advance_resume(&mut world, Resume::new()).await
         else {
             panic!("the peer answered the open, so a block is arriving");
         };
@@ -26860,7 +27801,7 @@ mod tests {
              one that gives up and this test measures nothing",
         );
 
-        let left = advance_resume(&mut world, &shell, state).await;
+        let left = advance_resume(&mut world, state).await;
         assert!(
             matches!(
                 left,
@@ -26893,7 +27834,7 @@ mod tests {
     async fn a_composed_catch_up_past_its_deadline_loses_nothing() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut world, _) = connect_world_and_shell(&dir, &remote, &[]).await;
         let session = world.session().to_string();
         let epoch = "epoch-composed";
 
@@ -26909,8 +27850,7 @@ mod tests {
         .await;
         redirect_to(&mut world, &peer, silence);
 
-        let ResumeAdvance::Pending(state) = advance_resume(&mut world, &shell, Resume::new()).await
-        else {
+        let ResumeAdvance::Pending(state) = advance_resume(&mut world, Resume::new()).await else {
             panic!("the peer answered the open, so a block is arriving");
         };
 
@@ -26922,7 +27862,7 @@ mod tests {
              one that gives up and this test measures nothing",
         );
 
-        let left = advance_resume(&mut world, &shell, state).await;
+        let left = advance_resume(&mut world, state).await;
         let landed = matches!(
             left,
             ResumeAdvance::Settled {
@@ -27062,8 +28002,7 @@ mod tests {
         let silence = Duration::from_secs(120);
         let peer = WarmPeer::start(Vec::new(), Duration::from_millis(20)).await;
         redirect_to(&mut world, &peer, silence);
-        let ResumeAdvance::Pending(resuming) =
-            advance_resume(&mut world, &shell, Resume::new()).await
+        let ResumeAdvance::Pending(resuming) = advance_resume(&mut world, Resume::new()).await
         else {
             panic!("the peer answered the open, so a block is now awaited");
         };
@@ -27722,7 +28661,7 @@ mod tests {
         assert!(handle_submit(&mut world, "over the wire".to_string()).await);
         settle(&mut world).await;
         press(&mut app, &mut writer, b"\t").await;
-        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
         assert!(
             transcript.borrow().in_focus_mode(),
             "the fixture never reached transcript focus, so the mode assertion \
@@ -27737,12 +28676,7 @@ mod tests {
         drop(writer);
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
+
         let exit = drive(
             &mut app,
             &root,
@@ -27750,7 +28684,6 @@ mod tests {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         )
         .await
         .expect("drive exits without a fatal error");
@@ -27798,12 +28731,7 @@ mod tests {
         drop(writer);
         let mut theme_watch = inert_theme_watch();
         let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-        let mut autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
+
         let exit = drive(
             &mut app,
             &root,
@@ -27811,7 +28739,6 @@ mod tests {
             &mut world,
             &mut theme_watch,
             &mut prompt_history_rx,
-            &mut autocomplete_rx,
         )
         .await
         .expect("drive exits without a fatal error");
@@ -27930,7 +28857,7 @@ mod tests {
         tx.send(vec!["older prompt".to_string(), "newer prompt".to_string()])
             .expect("the seed is queued before the loop starts");
         let mut prompt_history_rx = Some(rx);
-        let (mut theme_watch, _, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, _) = drive_parts();
 
         // Up, then EOF so the loop returns. Both are buffered before the loop
         // reads either.
@@ -27945,7 +28872,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await
@@ -27953,7 +28879,7 @@ mod tests {
         assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
 
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "newer prompt",
             "Up produced the newest seeded entry",
         );
@@ -27981,7 +28907,7 @@ mod tests {
         let before = durable_seq(&remote, &session).await;
         let (mut app, mut writer, root) = app_over(&shell).await;
         let mut prompt_history_rx = spawn_prompt_history_bootstrap(&world);
-        let (mut theme_watch, _, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, _) = drive_parts();
 
         // Typed, submitted, recalled twice, then EOF. All buffered before the
         // loop reads any of it.
@@ -27997,7 +28923,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await
@@ -28013,7 +28938,7 @@ mod tests {
              the draft and this test measures nothing",
         );
         assert_eq!(
-            shell.borrow().editor.borrow().text(),
+            shell.borrow().view().editor.borrow().text(),
             "remote work",
             "a second Up walked past this run's own prompts into the client's \
              store",
@@ -29067,7 +29992,7 @@ mod tests {
         // which is the seam a connect-mode refusal would sit at.
         {
             let sh = shell.borrow();
-            arm_branch(&sh.branch_anchor, message.clone());
+            arm_branch(&sh.view().branch_anchor, message.clone());
         }
         let outcome =
             submit_with_armed_anchor(&mut world, &shell, "edited prompt".to_string()).await;
@@ -29464,7 +30389,7 @@ mod tests {
         );
         writer.write_all(b"\r").expect("confirm the filtered row");
 
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         let exit = crate::remote::tests::bounded(
             "the selector confirmation to end the drive loop",
             drive(
@@ -29474,7 +30399,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await
@@ -29631,13 +30555,10 @@ mod tests {
             .find(|host| host.id.as_deref() == Some(&focused_host))
             .expect("the focused host has a directory row")
             .working_directory = Some(refreshed_directory.clone());
-        let redraw = world.directory.apply(
-            &mut world.chat.borrow_mut(),
-            aj_wire::Frame::List {
-                sessions: world.directory.rows().to_vec(),
-                hosts,
-            },
-        );
+        let redraw = world.directory.apply(aj_wire::Frame::List {
+            sessions: world.directory.rows().to_vec(),
+            hosts,
+        });
         assert!(redraw.0, "the changed host metadata is news");
         let stale = footer_row(&shell);
         assert!(
@@ -29677,20 +30598,8 @@ mod tests {
     }
 
     /// The loop's own parts, so a test can call `drive` the way `run` does.
-    fn drive_parts(
-        shell: &Rc<RefCell<Shell>>,
-    ) -> (
-        ThemeWatch,
-        Option<UnboundedReceiver<Vec<String>>>,
-        UnboundedReceiver<AutocompleteDelivery>,
-    ) {
-        let autocomplete_rx = shell
-            .borrow()
-            .editor
-            .borrow_mut()
-            .take_autocomplete_rx()
-            .expect("editor hands out its autocomplete receiver once");
-        (inert_theme_watch(), None, autocomplete_rx)
+    fn drive_parts() -> (ThemeWatch, Option<UnboundedReceiver<Vec<String>>>) {
+        (inert_theme_watch(), None)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -29738,11 +30647,11 @@ mod tests {
             Some(world.handles().task_registry.clone()),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
-            "",
+            world.session(),
             dir.path().to_path_buf(),
         )));
         let (mut app, mut writer, root) = app_over(&shell).await;
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         writer
             .write_all(&chord_bytes(AjAction::SessionNew))
             .expect("new-session chord");
@@ -29756,7 +30665,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await
@@ -29798,7 +30706,7 @@ mod tests {
         let initial = world.session().to_string();
         assert_eq!(remote.host.environment(&initial).await.unwrap(), expected);
         let (mut app, mut writer, root) = app_over(&shell).await;
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         writer
             .write_all(&chord_bytes(AjAction::SessionNew))
             .expect("new-session chord");
@@ -29811,7 +30719,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await
@@ -29911,7 +30818,7 @@ mod tests {
         let right = RemoteHost::start(&right_dir, "streaming-text").await;
         let (gateway, ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
         let (mut app, mut writer, root) = app_over(&shell).await;
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         let before = (session_count(&left).await, session_count(&right).await);
 
         writer
@@ -29930,7 +30837,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await
@@ -30003,7 +30909,7 @@ mod tests {
         let right = RemoteHost::start(&right_dir, "streaming-text").await;
         let (gateway, ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
         let (mut app, mut writer, root) = app_over(&shell).await;
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
 
         // Ctrl+O opens the palette, `new` filters to the create command, and the
         // Enter after it confirms the row the picker then opens over.
@@ -30020,7 +30926,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await
@@ -30057,7 +30962,7 @@ mod tests {
         let right = RemoteHost::start(&right_dir, "streaming-text").await;
         let (gateway, ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
         let (mut app, mut writer, root) = app_over(&shell).await;
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         let before = (session_count(&left).await, session_count(&right).await);
 
         // The second host, named in full. The filter matches a subsequence, and
@@ -30089,7 +30994,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await
@@ -30157,7 +31061,7 @@ mod tests {
         let right = RemoteHost::start(&right_dir, "streaming-text").await;
         let (gateway, _ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
         let (mut app, mut writer, root) = app_over(&shell).await;
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         let before = (session_count(&left).await, session_count(&right).await);
 
         writer
@@ -30176,7 +31080,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await;
@@ -30218,7 +31121,7 @@ mod tests {
         let right = RemoteHost::start(&right_dir, "streaming-text").await;
         let (gateway, _ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
         let (mut app, mut writer, root) = app_over(&shell).await;
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         let before = (session_count(&left).await, session_count(&right).await);
         let focused = world.session().to_string();
 
@@ -30238,7 +31141,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await;
@@ -30274,7 +31176,7 @@ mod tests {
         gateway.until_sessions(1).await;
         let (mut world, shell) = connect_world_and_shell_at(&client_dir, &gateway.url(), &[]).await;
         let (mut app, mut writer, root) = app_over(&shell).await;
-        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
         let before = session_count(&host).await;
 
         writer
@@ -30290,7 +31192,6 @@ mod tests {
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-                &mut autocomplete_rx,
             ),
         )
         .await

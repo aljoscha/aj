@@ -142,7 +142,7 @@ pub(crate) struct Splash {
     styles: Rc<TranscriptStyles>,
     /// Top wrapped-line offset of the notices box, advanced by the mouse wheel
     /// while the cursor is over the box. Clamped to the box's content every
-    /// draw. Reset to 0 by [`Splash::reset_scroll`] on a session switch.
+    /// draw and retained while this session's widget tree is hidden.
     notices_scroll: usize,
     /// Splash-local rect and scroll bound of the drawn notices box, recorded
     /// each [`draw`](Widget::draw) so [`handle_event`](Widget::handle_event)
@@ -158,6 +158,7 @@ pub(crate) struct Splash {
     /// Whether a tick targeting this widget is in flight, guarding against
     /// stacking multiple tick chains when a wake and a pending tick interleave.
     tick_armed: bool,
+    visible: bool,
     /// Set by [`draw`](Widget::draw) whenever the splash actually renders, and
     /// cleared when a tick consumes it. A tick that finds it clear means the
     /// transcript has replaced the splash, so the animation pump stops there.
@@ -180,6 +181,7 @@ impl Splash {
                 ramp: build_ramp(mode),
                 started: Instant::now(),
                 tick_armed: false,
+                visible: true,
                 drawn: false,
             })
         })
@@ -192,15 +194,23 @@ impl Splash {
         self.ramp = build_ramp(mode);
     }
 
-    /// Return the notices box to the top, for a session switch.
-    pub(crate) fn reset_scroll(&mut self) {
-        self.notices_scroll = 0;
+    /// Gate animation while this session's widget tree is hidden. Showing it
+    /// allows the normal wake event to restart the pump.
+    pub(crate) fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+        if !visible {
+            self.notices_hit = None;
+        }
+        // Keep ownership of an in-flight tick until delivery so a rapid
+        // hide/show followed by a wake cannot stack another chain.
     }
 
     /// Schedule the next animation tick if none is pending, and latch a redraw
-    /// so the new frame paints. The visibility guard lives in the tick handler,
-    /// not here, so the startup wake can kick the chain before the first draw.
+    /// so the new frame paints. A visible tree can wake before its first draw.
     fn arm_tick(&mut self, ctx: &mut EventContext) {
+        if !self.visible {
+            return;
+        }
         ctx.redraw = true;
         if self.tick_armed {
             return;
@@ -621,6 +631,10 @@ impl Widget for Splash {
             Event::Mouse(m) => self.handle_wheel(ctx, m),
             Event::Tick => {
                 self.tick_armed = false;
+                if !self.visible {
+                    self.drawn = false;
+                    return;
+                }
                 ctx.redraw = true;
                 // Re-arm only while the splash is still the drawn child. `drawn`
                 // is set by `draw` and cleared here: a tick that finds it clear
@@ -1132,16 +1146,6 @@ mod tests {
         );
     }
 
-    /// A session switch starts the box at the top: `reset_scroll` zeroes the
-    /// offset, so a prior session's scroll does not carry over.
-    #[test]
-    fn reset_scroll_zeroes_the_offset() {
-        let splash = splash(chat());
-        splash.borrow_mut().notices_scroll = 7;
-        splash.borrow_mut().reset_scroll();
-        assert_eq!(splash.borrow().notices_scroll, 0, "notices offset reset");
-    }
-
     /// A synthetic wheel `Event::Mouse` at splash-local `(col, row)`.
     fn wheel(col: u16, row: u16, button: mouse::Button) -> Event {
         Event::Mouse(mouse::Mouse {
@@ -1354,5 +1358,67 @@ mod tests {
             first, second,
             "the composited frame must change as the animation advances"
         );
+    }
+
+    #[test]
+    fn hidden_wakes_and_pending_ticks_do_not_rearm() {
+        let widget = splash(chat());
+        let wake = Event::App(vaxis::vxfw::UserEvent {
+            name: SPLASH_WAKE_EVENT.to_string(),
+            data: None,
+        });
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &wake);
+        assert_eq!(ctx.cmds.len(), 1);
+        widget
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(60, Some(24)));
+        widget.borrow_mut().set_visible(false);
+        assert!(
+            widget.borrow().tick_armed,
+            "the orphan still owns the chain"
+        );
+
+        for event in [&wake, &Event::Tick, &wake] {
+            let mut ctx = EventContext::new();
+            widget.borrow_mut().handle_event(&mut ctx, event);
+            assert!(ctx.cmds.is_empty(), "hidden widgets schedule nothing");
+            assert!(!ctx.redraw, "hidden widgets do not request frames");
+        }
+        assert!(!widget.borrow().tick_armed);
+
+        widget.borrow_mut().set_visible(true);
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &wake);
+        assert_eq!(ctx.cmds.len(), 1, "a visible wake restarts the chain");
+        assert!(matches!(ctx.cmds[0], Command::Tick(_)));
+    }
+
+    #[test]
+    fn rapid_hide_show_reuses_the_pending_tick() {
+        let widget = splash(chat());
+        widget
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(60, Some(24)));
+        let wake = Event::App(vaxis::vxfw::UserEvent {
+            name: SPLASH_WAKE_EVENT.to_string(),
+            data: None,
+        });
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &wake);
+        assert_eq!(ctx.cmds.len(), 1);
+        widget.borrow_mut().set_visible(false);
+        widget.borrow_mut().set_visible(true);
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &wake);
+        assert!(
+            ctx.cmds.is_empty(),
+            "the pending tick owns the resumed chain"
+        );
+        // Wake and orphan can share a batch, before the resumed frame draws.
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &Event::Tick);
+        assert_eq!(ctx.cmds.len(), 1);
+        assert!(matches!(ctx.cmds[0], Command::Tick(_)));
     }
 }

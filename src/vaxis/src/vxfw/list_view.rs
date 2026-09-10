@@ -647,6 +647,16 @@ impl ListView {
         self.geometry.reset();
     }
 
+    /// Release reconstructible layout memory and cancel pending motion while
+    /// preserving the last drawn reading position and item cursor.
+    pub fn suspend(&mut self) {
+        self.geometry = ListGeometry::new();
+        self.last_viewport_height = None;
+        self.top_pad = 0;
+        self.scroll.pending_lines = 0;
+        self.scroll.wants_cursor = false;
+    }
+
     /// Inserts children at the front of `child_list` until `add_height` lines
     /// are filled above the current top, walking upward from `top - 1`.
     fn insert_children(
@@ -1699,5 +1709,39 @@ mod tests {
         // Items 0..=3 are now measured (3 + 1 + 2 + 1 = 7), item 4 estimates at
         // 7 / 4 = 1, so the extent is 7 + 1 = 8.
         assert_eq!(list_view.content_extent(), Some(8));
+    }
+
+    #[test]
+    fn suspend_releases_geometry_and_cancels_motion_but_keeps_position() {
+        let mut list = ListView::new(Source::Slice(
+            (0..50).map(|_| text("first\nsecond\nthird")).collect(),
+        ));
+        let ctx = draw_ctx(20, 7);
+        list.jump_to_item(20);
+        list.scroll_lines(1);
+        list.draw(&ctx);
+        let top = list.scroll_top();
+        let offset = list.scroll_offset();
+        assert_eq!(top, 20);
+        assert_eq!(offset, 1);
+        assert!(list.geometry.heights.capacity() > 0);
+        assert!(list.content_extent().is_some());
+        list.scroll_lines(8);
+        // Item 23 is below the viewport, so bringing it into view would scroll.
+        let mut event_ctx = EventContext::new();
+        for _ in 0..3 {
+            list.next_item(&mut event_ctx);
+        }
+        let cursor = list.cursor;
+        assert_eq!(cursor, 23);
+        list.suspend();
+        assert_eq!(list.geometry.heights.capacity(), 0);
+        assert!(list.content_extent().is_none());
+        assert_eq!(list.viewport_height(), None);
+        list.draw(&ctx);
+        assert_eq!(list.scroll_top(), top);
+        assert_eq!(list.scroll_offset(), offset);
+        assert_eq!(list.cursor, cursor);
+        assert!(list.content_extent().is_some());
     }
 }

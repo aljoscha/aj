@@ -108,7 +108,7 @@ pub use crate::vxfw::spinner::Spinner;
 pub use crate::vxfw::split_view::{Constrain, SplitView};
 pub use crate::vxfw::text::{Overflow, Text, TextAlign, WidthBasis};
 pub use crate::vxfw::text_area::{
-    AutocompleteDelivery, ChordDoc, EditorTheme, PopupStyle, TextArea,
+    AutocompleteDelivery, ChordDoc, EditorHistory, EditorTheme, PopupStyle, TextArea,
 };
 pub use crate::vxfw::text_field::TextField;
 

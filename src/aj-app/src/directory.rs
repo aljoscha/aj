@@ -21,19 +21,19 @@
 //! focus, so the rule is applied at both (see
 //! [`SessionDirectory::retire_archived`]).
 //!
-//! The focused session's transcript is **not** stored here. A frontend holds
-//! it behind widgets that cannot be repointed, so it lives in the frontend's
-//! own cell and the directory borrows it for the duration of a call. Focusing
-//! another session swaps the two. Every entry point that can touch the focused
-//! session therefore takes `focused_chat`, and the invariant is that exactly
-//! the focused session's stored transcript is `None`.
+//! Every attached session holds a stable model cell shared with its frontend.
+//! Focus selects a session without moving its data, and background frames fold
+//! into the same cell its view reads. Detachment clears reconstructible data
+//! even when a frontend retains that cell for a later visit.
 //!
 //! Attaching is not this type's job: it owns no stream and does no IO. The
 //! caller attaches the set [`SessionDirectory::attach_requests`] names and arms
 //! the folds the peer served, and a session dropped from the working set is
 //! detached by that same reopen leaving it unnamed.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_wire::{DirectoryHost, Frame, SessionSummary};
@@ -86,9 +86,8 @@ const WORKING_SET: usize = 8;
 struct Attached {
     session: String,
     client: SessionClient,
-    /// The transcript while this session sits in the background. `None` for
-    /// the focused session, whose transcript the frontend holds.
-    chat: Option<ChatState>,
+    /// The session-bound model, shared with its view regardless of focus.
+    chat: Rc<RefCell<ChatState>>,
     /// The durable position the stream has carried this session to: the seq
     /// of the last durable frame routed into its transcript, `None` until one
     /// arrives.
@@ -105,6 +104,10 @@ struct Attached {
 }
 
 /// Every session a peer offers, plus the fold state for the working set.
+///
+/// Each supplied model cell belongs to one session. Callers must release model
+/// borrows before mutating the directory, which may fold frames or reset cells
+/// on detachment.
 pub struct SessionDirectory {
     /// The working set, most recently focused first, so the focused session is
     /// the first entry and the eviction candidate is the last. Never longer
@@ -146,16 +149,16 @@ pub struct SessionDirectory {
 }
 
 impl SessionDirectory {
-    /// A directory focused on `session`, whose transcript the caller holds.
+    /// A directory focused on `session`, sharing its model with the caller.
     ///
     /// The session counts as attached from the start: a frontend reaches this
     /// type having already opened its first stream.
-    pub fn new(session: String) -> Self {
+    pub fn new(session: String, chat: Rc<RefCell<ChatState>>) -> Self {
         Self {
             attached: vec![Attached {
                 client: SessionClient::new(session.clone()),
                 session,
-                chat: None,
+                chat,
                 delivered: None,
             }],
             rows: Vec::new(),
@@ -168,6 +171,21 @@ impl SessionDirectory {
     /// The session the frontend is rendering.
     pub fn focused(&self) -> &str {
         &self.focused_entry().session
+    }
+
+    /// The focused session's stable model cell.
+    pub fn chat(&self) -> Rc<RefCell<ChatState>> {
+        Rc::clone(&self.focused_entry().chat)
+    }
+
+    /// One session's model, `None` for a session outside the working set.
+    /// Retaining the cell does not retain its attachment or prevent its reset
+    /// on eviction or archive retirement.
+    pub fn chat_for(&self, session: &str) -> Option<Rc<RefCell<ChatState>>> {
+        self.attached
+            .iter()
+            .find(|attached| attached.session == session)
+            .map(|attached| Rc::clone(&attached.chat))
     }
 
     /// The focused session's fold, and the owner of its agent lifecycle,
@@ -242,13 +260,12 @@ impl SessionDirectory {
     /// Fold one frame.
     ///
     /// A session-scoped frame goes to its own session's fold, writing into that
-    /// session's transcript, or into `focused_chat` when the frame belongs to
-    /// the focused session. A frame for a session outside the working set is
+    /// session's model, regardless of focus. A frame outside the working set is
     /// dropped: the host only sends those for sessions the stream named, so one
     /// arriving here is either a peer bug or the tail of a stream this client
     /// has already replaced, and folding it would need a transcript no gesture
     /// has asked for.
-    pub fn apply(&mut self, focused_chat: &mut ChatState, frame: Frame) -> Redraw {
+    pub fn apply(&mut self, frame: Frame) -> Redraw {
         let Some(session) = frame.session() else {
             return self.apply_host_frame(frame);
         };
@@ -269,10 +286,8 @@ impl SessionDirectory {
         // reconnect arms the session, a `reset` sends it back, and a refusal
         // after either of those would find the flag still set and say nothing.
         let asked_before = attached.client.withheld();
-        let mut redraw = match &mut attached.chat {
-            Some(chat) => attached.client.apply(chat, frame),
-            None => attached.client.apply(focused_chat, frame),
-        };
+        let mut chat = attached.chat.borrow_mut();
+        let mut redraw = attached.client.apply(&mut chat, frame);
         // The client raises this when it drops an attachment, so this asks the
         // one place that decides what a refusal is rather than matching the
         // frame kind a second time.
@@ -280,12 +295,8 @@ impl SessionDirectory {
         if let Some(refusal) = asked_now
             && asked_now != asked_before
         {
-            let chat = match &mut attached.chat {
-                Some(chat) => chat,
-                None => focused_chat,
-            };
             let noticed = attached.client.apply_local(
-                chat,
+                &mut chat,
                 AgentEvent::Warning {
                     agent_id: AgentId::Main,
                     text: withheld_notice(refusal).to_string(),
@@ -293,6 +304,7 @@ impl SessionDirectory {
             );
             redraw = Redraw(redraw.0 || noticed.0);
         }
+        drop(chat);
         if let Some(seq) = delivered {
             // Last write wins rather than a maximum. A block re-delivers
             // entries at or below the position already reached and commits the
@@ -354,45 +366,30 @@ impl SessionDirectory {
         }
     }
 
-    /// Move focus to `session`, swapping its transcript into `focused_chat`.
+    /// Move focus to `session` without moving data between models.
     ///
-    /// `mint` builds the transcript for a session focused for the first time,
-    /// which is also what attaches it. It runs only in that case, so
-    /// a caller can put whatever a fresh transcript costs behind it.
+    /// `mint` supplies a model only when the session is outside the working set.
+    /// It may return a cell retained by the session's view after detachment.
+    /// Models that remain attached are not reset.
     ///
     /// If the admission fills the working set, its least recently focused
     /// session is dropped. Reopening the stream over [`Self::attach_requests`]
     /// then detaches it from the peer. Its row and attention state remain, and
     /// re-attach reconciliation absorbs rebuilding its transcript.
     ///
-    /// Focusing the already-focused session leaves everything alone rather than
-    /// cycling its transcript out and back.
-    pub fn focus(
-        &mut self,
-        focused_chat: &mut ChatState,
-        session: &str,
-        mint: impl FnOnce() -> ChatState,
-    ) {
+    /// Focusing the already-focused session leaves everything alone.
+    pub fn focus(&mut self, session: &str, mint: impl FnOnce() -> Rc<RefCell<ChatState>>) {
         if session == self.focused() {
             return;
         }
-        // The incoming entry goes to the front, which pushes the session being
-        // left to index 1 either way. Taking the incoming transcript before
-        // parking the outgoing one means a `mint` that panicked would leave the
-        // frontend's cell holding a live transcript rather than none.
-        let incoming = match self
+        match self
             .attached
             .iter()
             .position(|attached| attached.session == session)
         {
             Some(index) => {
-                let chat = self.attached[index]
-                    .chat
-                    .take()
-                    .expect("only the focused session's transcript is on loan");
                 let entry = self.attached.remove(index);
                 self.attached.insert(0, entry);
-                chat
             }
             None => {
                 let chat = mint();
@@ -401,30 +398,33 @@ impl SessionDirectory {
                     Attached {
                         client: SessionClient::new(session.to_string()),
                         session: session.to_string(),
-                        chat: None,
+                        chat,
                         delivered: None,
                     },
                 );
-                chat
             }
-        };
-        let outgoing = std::mem::replace(focused_chat, incoming);
-        let previous = &mut self.attached[1];
-        previous.chat = Some(outgoing);
-        let previous = previous.session.clone();
+        }
+        let previous = self.attached[1].session.clone();
         // Everything the session did while it was the focused one was on
         // screen, so leaving is the moment its output counts as seen.
         self.mark_viewed(&previous);
         // Leaving an archived session is leaving it for good: the user said
         // they were done there, so it goes rather than sitting in the set
-        // holding a lock the host could release. Only here, once the incoming
-        // transcript is in the frontend's cell and the outgoing one is parked,
-        // because dropping an entry before that would take the transcript with
-        // it.
+        // holding a lock the host could release.
         self.retire_archived(session);
-        // The vector is in recency order, so truncation drops only the least
+        // The vector is in recency order, so eviction drops only the least
         // recently focused sessions. Rows and attention state live outside it.
-        self.attached.truncate(WORKING_SET);
+        while self.attached.len() > WORKING_SET {
+            let evicted = self.attached.pop().expect("working set exceeds its bound");
+            Self::clear_detached(&evicted);
+        }
+    }
+
+    /// Views may retain a detached cell, but not its reconstructible history.
+    fn clear_detached(attached: &Attached) {
+        // The client's lifecycle is being discarded. Reset only needs an empty
+        // lifecycle here to clear the model without retaining that client.
+        attached.chat.borrow_mut().reset(&mut Default::default());
     }
 
     /// Whether the working set may hold `session` while `keep` is the one the
@@ -466,8 +466,14 @@ impl SessionDirectory {
             .map(|attached| attached.session.clone())
             .filter(|session| !self.held(session, keep))
             .collect();
-        self.attached
-            .retain(|attached| !retiring.contains(&attached.session));
+        self.attached.retain(|attached| {
+            if retiring.contains(&attached.session) {
+                Self::clear_detached(attached);
+                false
+            } else {
+                true
+            }
+        });
         retiring
     }
 
@@ -637,20 +643,6 @@ impl SessionDirectory {
             .collect()
     }
 
-    /// A background session's parked transcript, `None` for the focused session
-    /// (whose transcript the frontend holds) or one outside the working set.
-    ///
-    /// For tests that need to watch a session fold while nothing renders it.
-    /// Production readers go through the focused transcript, which is the only
-    /// one on screen.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn parked_chat(&self, session: &str) -> Option<&ChatState> {
-        self.attached
-            .iter()
-            .find(|attached| attached.session == session)
-            .and_then(|attached| attached.chat.as_ref())
-    }
-
     /// Point the focused entry at `session`, keeping its fold, its transcript,
     /// and whatever it owes.
     ///
@@ -686,6 +678,9 @@ mod tests {
     use std::sync::Arc;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+    use aj_agent::message::AgentMessage;
+    use aj_agent::tool::TaskKind;
+    use aj_models::types::{Message, UserMessage};
     use aj_wire::QueueCounts;
     use chrono::DateTime;
 
@@ -707,8 +702,12 @@ mod tests {
         }
     }
 
-    fn chat() -> ChatState {
-        ChatState::new(settings(), 200_000, Arc::new(Vec::new()))
+    fn chat() -> Rc<RefCell<ChatState>> {
+        Rc::new(RefCell::new(ChatState::new(
+            settings(),
+            200_000,
+            Arc::new(Vec::new()),
+        )))
     }
 
     /// The notices in a transcript, which is what these tests read a fold
@@ -860,23 +859,22 @@ mod tests {
     }
 
     /// A directory focused on `FOCUSED` with `OTHER` attached in the
-    /// background, both caught up, plus the frontend's transcript.
+    /// background, both caught up.
     ///
     /// `OTHER` gets there the way a real client does: a first focus attaches it,
     /// then the user switches back.
-    fn two_sessions() -> (SessionDirectory, ChatState) {
-        let mut directory = SessionDirectory::new(FOCUSED.to_string());
-        let mut focused_chat = chat();
+    fn two_sessions() -> SessionDirectory {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string(), chat());
 
-        directory.focus(&mut focused_chat, OTHER, chat);
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+        directory.focus(OTHER, chat);
+        directory.focus(FOCUSED, || panic!("already attached"));
         directory.expect_attach(|_| true);
 
         for session in [FOCUSED, OTHER] {
-            let _ = directory.apply(&mut focused_chat, state(session));
-            let _ = directory.apply(&mut focused_chat, caught_up(session, 0));
+            let _ = directory.apply(state(session));
+            let _ = directory.apply(caught_up(session, 0));
         }
-        (directory, focused_chat)
+        directory
     }
 
     /// A background session's frames fold into its own transcript, never into
@@ -885,59 +883,99 @@ mod tests {
     /// whole reason the sidebar can keep sessions attached at all.
     #[test]
     fn a_background_session_folds_into_its_own_transcript() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
+        let background = directory.chat_for(OTHER).expect("attached");
 
-        let redraw = directory.apply(&mut focused_chat, durable(OTHER, 1, "from the background"));
+        let redraw = directory.apply(durable(OTHER, 1, "from the background"));
         assert!(
             !redraw.0,
             "a transcript nobody is looking at does not ask for a repaint",
         );
         assert!(
-            notices(&focused_chat).is_empty(),
+            notices(&directory.chat().borrow()).is_empty(),
             "the focused transcript is untouched: {:?}",
-            notices(&focused_chat),
+            notices(&directory.chat().borrow()),
+        );
+        assert_eq!(notices(&background.borrow()), vec!["from the background"]);
+
+        let redraw = directory.apply(durable(FOCUSED, 1, "in the foreground"));
+        assert!(redraw.0, "the focused session's fold does ask for one");
+        assert_eq!(
+            notices(&directory.chat().borrow()),
+            vec!["in the foreground"]
         );
 
-        let redraw = directory.apply(&mut focused_chat, durable(FOCUSED, 1, "in the foreground"));
-        assert!(redraw.0, "the focused session's fold does ask for one");
-        assert_eq!(notices(&focused_chat), vec!["in the foreground"]);
-
         // The background fold really happened, it just landed elsewhere.
-        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
-        assert_eq!(notices(&focused_chat), vec!["from the background"]);
+        directory.focus(OTHER, || panic!("already attached"));
+        assert!(Rc::ptr_eq(&directory.chat(), &background));
+        assert_eq!(
+            notices(&directory.chat().borrow()),
+            vec!["from the background"]
+        );
     }
 
-    /// Focusing a background session swaps the two transcripts, so what it
-    /// folded while out of view is on screen immediately and the session
-    /// being left keeps everything it had. This is the "view swap, not a
-    /// rebuild" the sidebar rests on.
+    /// Views keep the same model and its contents while focus selects which
+    /// session is on screen. Neither model is moved or rebuilt.
     #[test]
-    fn focusing_swaps_the_transcripts_both_ways() {
-        let (mut directory, mut focused_chat) = two_sessions();
-        let _ = directory.apply(&mut focused_chat, durable(FOCUSED, 1, "in the foreground"));
-        let _ = directory.apply(&mut focused_chat, durable(OTHER, 1, "from the background"));
+    fn focusing_preserves_session_bound_models_both_ways() {
+        let mut directory = two_sessions();
+        let foreground = directory.chat();
+        let background = directory.chat_for(OTHER).expect("attached");
+        assert!(Rc::ptr_eq(
+            &foreground,
+            &directory.chat_for(FOCUSED).expect("focused is attached"),
+        ));
+        assert!(!Rc::ptr_eq(&foreground, &background));
+        let _ = directory.apply(durable(FOCUSED, 1, "in the foreground"));
+        let _ = directory.apply(durable(OTHER, 1, "from the background"));
+        let foreground_generation = foreground.borrow().generation();
+        let background_generation = background.borrow().generation();
+        let requests: Vec<_> = directory
+            .attach_requests()
+            .into_iter()
+            .map(|request| (request.session, request.cursor))
+            .collect();
 
-        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        directory.focus(OTHER, || panic!("already attached"));
         assert_eq!(directory.focused(), OTHER);
+        assert!(Rc::ptr_eq(&directory.chat(), &background));
+        assert_eq!(notices(&foreground.borrow()), vec!["in the foreground"]);
         assert_eq!(
-            notices(&focused_chat),
+            notices(&directory.chat().borrow()),
             vec!["from the background"],
             "the background session's own history is what comes on screen",
         );
 
-        // And back, onto state that was parked rather than rebuilt.
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+        // Returning selects the original cell, with its original content.
+        directory.focus(FOCUSED, || panic!("already attached"));
+        assert!(Rc::ptr_eq(&directory.chat(), &foreground));
+        assert_eq!(foreground.borrow().generation(), foreground_generation);
+        assert_eq!(background.borrow().generation(), background_generation);
         assert_eq!(
-            notices(&focused_chat),
+            directory
+                .attach_requests()
+                .into_iter()
+                .map(|request| (request.session, request.cursor))
+                .collect::<Vec<_>>(),
+            requests
+        );
+        assert_eq!(
+            notices(&directory.chat().borrow()),
             vec!["in the foreground"],
             "the session left behind kept its transcript",
         );
 
-        // Routing follows the swap: what is now the background session folds
-        // out of view.
-        let redraw = directory.apply(&mut focused_chat, durable(OTHER, 2, "later"));
+        // Background output still reaches the handle the view retained.
+        let redraw = directory.apply(durable(OTHER, 2, "later"));
         assert!(!redraw.0);
-        assert_eq!(notices(&focused_chat), vec!["in the foreground"]);
+        assert_eq!(
+            notices(&directory.chat().borrow()),
+            vec!["in the foreground"]
+        );
+        assert_eq!(
+            notices(&background.borrow()),
+            vec!["from the background", "later"]
+        );
     }
 
     /// A first focus mints the transcript and attaches, which is how a
@@ -945,45 +983,50 @@ mod tests {
     /// read.
     #[test]
     fn a_first_focus_mints_and_attaches() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
         assert!(!directory.is_attached("session-fresh"));
+        assert!(directory.chat_for("session-fresh").is_none());
 
+        let model = chat();
         let mut minted = false;
-        directory.focus(&mut focused_chat, "session-fresh", || {
+        directory.focus("session-fresh", || {
             minted = true;
-            chat()
+            Rc::clone(&model)
         });
         assert!(minted, "a session with no transcript gets one");
         assert!(directory.is_attached("session-fresh"));
         assert_eq!(directory.focused(), "session-fresh");
-        assert!(notices(&focused_chat).is_empty());
+        assert!(Rc::ptr_eq(&directory.chat(), &model));
+        assert!(notices(&directory.chat().borrow()).is_empty());
 
-        // The session left behind is parked, not lost.
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+        // The session left behind remains attached.
+        directory.focus(FOCUSED, || panic!("already attached"));
         assert_eq!(directory.focused(), FOCUSED);
     }
 
-    /// Focusing the session already focused changes nothing. Its transcript
-    /// is the one on loan, so a swap would have to park and un-park the same
-    /// cell, and `mint` must not run.
+    /// Focusing the session already focused changes nothing, and `mint` must
+    /// not run.
     #[test]
     fn refocusing_the_focused_session_is_inert() {
-        let (mut directory, mut focused_chat) = two_sessions();
-        let _ = directory.apply(&mut focused_chat, durable(FOCUSED, 1, "in the foreground"));
+        let mut directory = two_sessions();
+        let _ = directory.apply(durable(FOCUSED, 1, "in the foreground"));
 
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("no mint, no swap"));
+        directory.focus(FOCUSED, || panic!("already attached"));
         assert_eq!(directory.focused(), FOCUSED);
-        assert_eq!(notices(&focused_chat), vec!["in the foreground"]);
+        assert_eq!(
+            notices(&directory.chat().borrow()),
+            vec!["in the foreground"]
+        );
     }
 
     /// A frame for a session this client never attached is dropped rather
     /// than folded into whatever transcript happens to be on screen.
     #[test]
     fn a_frame_for_an_unattached_session_is_dropped() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
 
         let before = directory.client().cursor();
-        let redraw = directory.apply(&mut focused_chat, durable("session-stranger", 1, "stray"));
+        let redraw = directory.apply(durable("session-stranger", 1, "stray"));
         assert!(!redraw.0);
         assert!(
             !directory.is_attached("session-stranger"),
@@ -995,9 +1038,9 @@ mod tests {
         // nothing was folded on the way to being dropped.
         assert_eq!(directory.client().cursor(), before);
         assert!(
-            notices(&focused_chat).is_empty(),
+            notices(&directory.chat().borrow()).is_empty(),
             "and nothing reached the focused transcript: {:?}",
-            notices(&focused_chat),
+            notices(&directory.chat().borrow()),
         );
     }
 
@@ -1005,20 +1048,20 @@ mod tests {
     /// repaint: `list` is cumulative, so a resend carries no news.
     #[test]
     fn list_frames_own_the_rows_and_only_changes_repaint() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
         assert!(directory.rows().is_empty());
 
         let sessions = vec![row(FOCUSED, false, 10), row(OTHER, true, 20)];
-        let redraw = directory.apply(&mut focused_chat, list(sessions.clone()));
+        let redraw = directory.apply(list(sessions.clone()));
         assert!(redraw.0, "the first rows are news");
         assert_eq!(directory.rows().len(), 2);
 
-        let redraw = directory.apply(&mut focused_chat, list(sessions));
+        let redraw = directory.apply(list(sessions));
         assert!(!redraw.0, "the same rows again are not");
 
         // The other host-level kinds are nobody's business here.
         for frame in [Frame::Heartbeat, Frame::Vms { vms: Vec::new() }] {
-            assert!(!directory.apply(&mut focused_chat, frame).0);
+            assert!(!directory.apply(frame).0);
         }
         assert_eq!(directory.rows().len(), 2, "and they leave the rows alone");
     }
@@ -1032,29 +1075,23 @@ mod tests {
     /// strip would keep the first label and mark it was given.
     #[test]
     fn a_change_confined_to_the_hosts_is_still_news() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
         assert!(directory.hosts().is_empty(), "a plain host names none");
 
         // One host answering, one configured host that never has, and a row on
         // neither of them: the rows stay untouched throughout.
         let sessions = vec![row(FOCUSED, false, 10)];
         let enrolled = vec![learned("builder-1", false), configured("10.0.0.7:7777")];
-        let redraw = directory.apply(
-            &mut focused_chat,
-            list_of(sessions.clone(), enrolled.clone()),
-        );
+        let redraw = directory.apply(list_of(sessions.clone(), enrolled.clone()));
         assert!(redraw.0, "the first hosts are news");
         assert_eq!(directory.hosts(), enrolled.as_slice());
 
-        let redraw = directory.apply(
-            &mut focused_chat,
-            list_of(sessions.clone(), enrolled.clone()),
-        );
+        let redraw = directory.apply(list_of(sessions.clone(), enrolled.clone()));
         assert!(!redraw.0, "the same directory again is not");
 
         // The host goes out. Nothing about the rows says so.
         let gone = vec![learned("builder-1", true), configured("10.0.0.7:7777")];
-        let redraw = directory.apply(&mut focused_chat, list_of(sessions.clone(), gone.clone()));
+        let redraw = directory.apply(list_of(sessions.clone(), gone.clone()));
         assert!(
             redraw.0,
             "a host going out is news the rows cannot carry: {:?}",
@@ -1065,7 +1102,7 @@ mod tests {
         // And the configured host answers for the first time, which is where
         // its id comes from and what the strip relabels its group by.
         let met = vec![learned("builder-1", true), learned("builder-2", false)];
-        let redraw = directory.apply(&mut focused_chat, list_of(sessions.clone(), met.clone()));
+        let redraw = directory.apply(list_of(sessions.clone(), met.clone()));
         assert!(redraw.0, "a host learning its id is news too");
         assert_eq!(directory.hosts(), met.as_slice());
         assert_eq!(
@@ -1084,36 +1121,27 @@ mod tests {
     /// fold position, which is exactly what was on screen.
     #[test]
     fn what_the_user_watched_while_focused_is_not_unseen_afterwards() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
 
         // Away and back, so `FOCUSED` has a recorded position and the
         // never-viewed rule cannot answer for it.
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![row(FOCUSED, false, 10), row(OTHER, false, 10)]),
-        );
-        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+        let _ = directory.apply(list(vec![row(FOCUSED, false, 10), row(OTHER, false, 10)]));
+        directory.focus(OTHER, || panic!("already attached"));
+        directory.focus(FOCUSED, || panic!("already attached"));
 
         // A turn runs in `FOCUSED`, on screen the whole time. No `list` frame
         // reports it yet: the coalescing tick has not fired.
-        let _ = directory.apply(&mut focused_chat, durable(FOCUSED, 50, "watched"));
+        let _ = directory.apply(durable(FOCUSED, 50, "watched"));
 
-        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![row(FOCUSED, false, 50), row(OTHER, false, 10)]),
-        );
+        directory.focus(OTHER, || panic!("already attached"));
+        let _ = directory.apply(list(vec![row(FOCUSED, false, 50), row(OTHER, false, 10)]));
         assert!(
             !unseen(&directory, FOCUSED),
             "the user watched that turn happen, so leaving cannot mark it unseen",
         );
 
         // What does count is what happens after they left.
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![row(FOCUSED, false, 90), row(OTHER, false, 10)]),
-        );
+        let _ = directory.apply(list(vec![row(FOCUSED, false, 90), row(OTHER, false, 10)]));
         assert!(
             unseen(&directory, FOCUSED),
             "output after the switch is unseen",
@@ -1126,17 +1154,13 @@ mod tests {
     /// the user did view.
     #[test]
     fn a_session_left_before_its_first_row_still_reports_later_output() {
-        let mut directory = SessionDirectory::new(FOCUSED.to_string());
-        let mut focused_chat = chat();
+        let mut directory = SessionDirectory::new(FOCUSED.to_string(), chat());
 
         // Left inside the window before any `list` frame, which is where every
         // freshly created session and every connect starts.
-        directory.focus(&mut focused_chat, OTHER, chat);
+        directory.focus(OTHER, chat);
 
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![row(FOCUSED, false, 5), row(OTHER, false, 0)]),
-        );
+        let _ = directory.apply(list(vec![row(FOCUSED, false, 5), row(OTHER, false, 0)]));
         assert!(
             unseen(&directory, FOCUSED),
             "the user did view it, so a row past what they saw is unseen",
@@ -1148,30 +1172,24 @@ mod tests {
     /// row was only ever evidence, the attention is this client's own state.
     #[test]
     fn the_unseen_mark_outlives_the_row_that_proved_it() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
         // Leave FOCUSED, which records what the user had seen of it.
-        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        directory.focus(OTHER, || panic!("already attached"));
 
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![row(FOCUSED, false, 5), row(OTHER, false, 0)]),
-        );
+        let _ = directory.apply(list(vec![row(FOCUSED, false, 5), row(OTHER, false, 0)]));
         assert!(unseen(&directory, FOCUSED), "the live row proves it moved");
 
         // The session is released and its row goes cold, taking the evidence
         // with it. The mark must not go with it.
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![cold_row(FOCUSED), row(OTHER, false, 0)]),
-        );
+        let _ = directory.apply(list(vec![cold_row(FOCUSED), row(OTHER, false, 0)]));
         assert!(
             unseen(&directory, FOCUSED),
             "a cold row does not un-see what the user never looked at",
         );
 
         // Looking at it is what discharges the mark.
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
-        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        directory.focus(FOCUSED, || panic!("already attached"));
+        directory.focus(OTHER, || panic!("already attached"));
         assert!(
             !unseen(&directory, FOCUSED),
             "viewing it clears the mark, cold row or not",
@@ -1182,17 +1200,14 @@ mod tests {
     /// so the mark does not wait on a `list` frame to follow it.
     #[test]
     fn a_background_fold_is_evidence_enough() {
-        let (mut directory, mut focused_chat) = two_sessions();
-        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        let mut directory = two_sessions();
+        directory.focus(OTHER, || panic!("already attached"));
         // A row exists, but a stale one: it says FOCUSED has moved nowhere.
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![cold_row(FOCUSED), row(OTHER, false, 0)]),
-        );
+        let _ = directory.apply(list(vec![cold_row(FOCUSED), row(OTHER, false, 0)]));
         assert!(!unseen(&directory, FOCUSED), "nothing has moved yet");
 
         // A durable frame folds into it while the user is elsewhere.
-        let _ = directory.apply(&mut focused_chat, durable(FOCUSED, 9, "while away"));
+        let _ = directory.apply(durable(FOCUSED, 9, "while away"));
         assert!(
             unseen(&directory, FOCUSED),
             "the fold is first-hand evidence, no row needed",
@@ -1204,13 +1219,13 @@ mod tests {
     /// the user moves between them.
     #[test]
     fn the_rows_survive_a_focus_change() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
         let sessions = vec![row(FOCUSED, false, 10), row(OTHER, true, 20)];
-        let _ = directory.apply(&mut focused_chat, list(sessions.clone()));
+        let _ = directory.apply(list(sessions.clone()));
 
-        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        directory.focus(OTHER, || panic!("already attached"));
         assert_eq!(directory.rows(), sessions.as_slice());
-        directory.focus(&mut focused_chat, "session-fresh", chat);
+        directory.focus("session-fresh", chat);
         assert_eq!(
             directory.rows(),
             sessions.as_slice(),
@@ -1224,32 +1239,26 @@ mod tests {
     /// stale stamp can invent or hide the glyph.
     #[test]
     fn unseen_output_compares_durable_positions() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
 
         // `OTHER` folds up to the position its row reports, which is what the
         // user watching it would have had on screen.
-        let _ = directory.apply(&mut focused_chat, durable(OTHER, 10, "watched"));
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![row(FOCUSED, false, 10), row(OTHER, false, 10)]),
-        );
+        let _ = directory.apply(durable(OTHER, 10, "watched"));
+        let _ = directory.apply(list(vec![row(FOCUSED, false, 10), row(OTHER, false, 10)]));
         directory.mark_viewed(OTHER);
         assert!(
             !unseen(&directory, OTHER),
             "nothing has happened since the user looked",
         );
 
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![row(FOCUSED, false, 10), row(OTHER, false, 20)]),
-        );
+        let _ = directory.apply(list(vec![row(FOCUSED, false, 10), row(OTHER, false, 20)]));
         assert!(
             unseen(&directory, OTHER),
             "the session moved on after the user looked away",
         );
 
         // Folding that output and looking again clears it.
-        let _ = directory.apply(&mut focused_chat, durable(OTHER, 20, "caught up on"));
+        let _ = directory.apply(durable(OTHER, 20, "caught up on"));
         directory.mark_viewed(OTHER);
         assert!(!unseen(&directory, OTHER));
     }
@@ -1260,24 +1269,21 @@ mod tests {
     /// would light up every row in the store.
     #[test]
     fn working_focused_and_never_viewed_sessions_are_not_unseen() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
 
         // Away and back, which records a position for both. Without one, the
         // never-viewed arm would answer for them and the two rules below would
         // never be reached.
-        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
-        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![
-                row(FOCUSED, false, 99),
-                row(OTHER, true, 99),
-                // Idle, moved on, and never viewed: it reaches the
-                // never-viewed arm rather than being turned away for working
-                // or for being the focused one.
-                row("session-never-opened", false, 99),
-            ]),
-        );
+        directory.focus(OTHER, || panic!("already attached"));
+        directory.focus(FOCUSED, || panic!("already attached"));
+        let _ = directory.apply(list(vec![
+            row(FOCUSED, false, 99),
+            row(OTHER, true, 99),
+            // Idle, moved on, and never viewed: it reaches the
+            // never-viewed arm rather than being turned away for working
+            // or for being the focused one.
+            row("session-never-opened", false, 99),
+        ]));
         assert!(
             !unseen(&directory, OTHER),
             "a working session reports working, not unseen",
@@ -1297,7 +1303,7 @@ mod tests {
     /// never comes and stops advancing its cursor.
     #[test]
     fn arming_covers_the_set_the_peer_served_and_no_more() {
-        let (mut directory, mut focused_chat) = two_sessions();
+        let mut directory = two_sessions();
         let cursor = |directory: &SessionDirectory, session: &str| {
             directory
                 .client_for(session)
@@ -1306,16 +1312,16 @@ mod tests {
                 .map(|cursor| cursor.seq)
         };
         // Both sessions are past their first block and folding live frames.
-        let _ = directory.apply(&mut focused_chat, durable(FOCUSED, 1, "foreground"));
-        let _ = directory.apply(&mut focused_chat, durable(OTHER, 1, "background"));
+        let _ = directory.apply(durable(FOCUSED, 1, "foreground"));
+        let _ = directory.apply(durable(OTHER, 1, "background"));
 
         // A reopened stream that served only the focused session.
         directory.expect_attach(|session| session == FOCUSED);
 
         // The armed fold is in the block phase, so it honours the block's
         // `caught_up` and takes its high-water mark.
-        let _ = directory.apply(&mut focused_chat, state(FOCUSED));
-        let _ = directory.apply(&mut focused_chat, caught_up(FOCUSED, 9));
+        let _ = directory.apply(state(FOCUSED));
+        let _ = directory.apply(caught_up(FOCUSED, 9));
         assert_eq!(
             cursor(&directory, FOCUSED),
             Some(9),
@@ -1327,8 +1333,8 @@ mod tests {
         // covered the whole set regardless of what the peer served would move
         // this cursor.
         let before = cursor(&directory, OTHER);
-        let _ = directory.apply(&mut focused_chat, state(OTHER));
-        let _ = directory.apply(&mut focused_chat, caught_up(OTHER, 5));
+        let _ = directory.apply(state(OTHER));
+        let _ = directory.apply(caught_up(OTHER, 5));
         assert_eq!(
             cursor(&directory, OTHER),
             before,
@@ -1337,8 +1343,8 @@ mod tests {
 
         // Arming the rest of the set then covers the one left out.
         directory.expect_attach(|_| true);
-        let _ = directory.apply(&mut focused_chat, state(OTHER));
-        let _ = directory.apply(&mut focused_chat, caught_up(OTHER, 5));
+        let _ = directory.apply(state(OTHER));
+        let _ = directory.apply(caught_up(OTHER, 5));
         assert_eq!(cursor(&directory, OTHER), Some(5));
     }
 
@@ -1347,16 +1353,15 @@ mod tests {
     /// leave a live driver and a held lock behind per session visited.
     #[test]
     fn visiting_past_the_bound_drops_the_least_recently_focused() {
-        let mut directory = SessionDirectory::new("session-0".to_string());
-        let mut focused_chat = chat();
+        let mut directory = SessionDirectory::new("session-0".to_string(), chat());
         let rows = (0..=WORKING_SET)
             .map(|n| row(&format!("session-{n}"), false, 0))
             .collect();
-        let _ = directory.apply(&mut focused_chat, list(rows));
+        let _ = directory.apply(list(rows));
 
         // Fill the set exactly. Nothing is displaced on the way.
         for n in 1..WORKING_SET {
-            directory.focus(&mut focused_chat, &format!("session-{n}"), chat);
+            directory.focus(&format!("session-{n}"), chat);
         }
         for n in 0..WORKING_SET {
             assert!(directory.is_attached(&format!("session-{n}")));
@@ -1364,7 +1369,7 @@ mod tests {
 
         // One more, so the oldest focus goes. `session-0` was focused first and
         // never again, so it is the one.
-        directory.focus(&mut focused_chat, "session-8", chat);
+        directory.focus("session-8", chat);
         assert!(!directory.is_attached("session-0"));
         assert!(directory.is_attached("session-8"));
         assert!(
@@ -1383,18 +1388,135 @@ mod tests {
 
         // Re-focusing a session in the set renews it, so the next admission
         // takes the one that has now gone longest without focus.
-        directory.focus(&mut focused_chat, "session-1", || {
-            panic!("still in the set")
-        });
-        directory.focus(&mut focused_chat, "session-8", || {
-            panic!("still in the set")
-        });
-        directory.focus(&mut focused_chat, "session-9", chat);
+        directory.focus("session-1", || panic!("still in the set"));
+        directory.focus("session-8", || panic!("still in the set"));
+        directory.focus("session-9", chat);
         assert!(
             !directory.is_attached("session-2"),
             "renewing session-1 moved the eviction candidate onto session-2",
         );
         assert!(directory.is_attached("session-1"));
+    }
+
+    /// A retained view cannot keep detached history or pending work alive, nor
+    /// keep the session in the stream's working set. Its cell can be reused
+    /// when the user opens that session again.
+    #[test]
+    fn detachment_clears_retained_models_and_remint_reuses_the_cell() {
+        for detach in ["lru", "archive-focus", "archive-list", "archive-mark"] {
+            let retained = chat();
+            retained.borrow_mut().show_token_usage = false;
+            let mut directory = SessionDirectory::new(FOCUSED.into(), Rc::clone(&retained));
+            assert!(Rc::ptr_eq(&directory.chat(), &retained));
+            directory.expect_attach(|_| true);
+            let _ = directory.apply(state(FOCUSED));
+            let _ = directory.apply(caught_up(FOCUSED, 0));
+            let _ = directory.apply(durable(FOCUSED, 1, "retained history"));
+            for event in [
+                AgentEvent::TaskStart {
+                    agent_id: AgentId::Main,
+                    task_id: 1,
+                    call_id: "call-1".into(),
+                    kind: TaskKind::Bash {
+                        command: "echo task".into(),
+                    },
+                    label: "retained task".into(),
+                },
+                AgentEvent::QueueUpdate {
+                    agent_id: AgentId::Main,
+                    steering: vec![AgentMessage::wire(Message::User(UserMessage::text(
+                        "queued",
+                    )))],
+                    follow_up: vec![],
+                },
+            ] {
+                let _ = directory.apply(Frame::Event {
+                    session: FOCUSED.into(),
+                    epoch: EPOCH.into(),
+                    durability: None,
+                    event: event.into(),
+                });
+            }
+            let generation = retained.borrow().generation();
+            let archived = SessionSummary {
+                archived: true,
+                ..row(FOCUSED, false, 1)
+            };
+            if detach == "archive-focus" {
+                let _ = directory.apply(list(vec![archived.clone()]));
+            } else {
+                directory.focus(OTHER, chat);
+            }
+
+            // Neither background focus nor the focused archive exemption clears data.
+            assert_eq!(notices(&retained.borrow()), vec!["retained history"]);
+            assert_eq!(retained.borrow().tasks().len(), 1);
+            assert_eq!(retained.borrow().queue().queues[0].steering.len(), 1);
+            assert_eq!(retained.borrow().generation(), generation);
+
+            match detach {
+                "lru" => {
+                    for n in 2..=WORKING_SET {
+                        directory.focus(&format!("session-{n}"), chat);
+                    }
+                }
+                "archive-focus" => directory.focus(OTHER, chat),
+                "archive-list" => {
+                    let _ = directory.apply(list(vec![archived]));
+                }
+                "archive-mark" => {
+                    let _ = directory.apply(list(vec![row(FOCUSED, false, 1)]));
+                    directory.mark_archived(FOCUSED, true);
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(!directory.is_attached(FOCUSED), "{detach}");
+            assert!(directory.chat_for(FOCUSED).is_none(), "{detach}");
+            assert!(directory.client_for(FOCUSED).is_none(), "{detach}");
+            let requests = directory.attach_requests();
+            assert_eq!(
+                requests.len(),
+                if detach == "lru" { WORKING_SET } else { 1 }
+            );
+            assert!(requests.iter().all(|request| request.session != FOCUSED));
+            assert!(
+                retained
+                    .borrow()
+                    .transcript(AgentId::Main)
+                    .unwrap()
+                    .entries()
+                    .is_empty(),
+                "{detach}"
+            );
+            assert!(retained.borrow().tasks().is_empty(), "{detach}");
+            assert!(retained.borrow().queue().queues.is_empty(), "{detach}");
+            assert_ne!(retained.borrow().generation(), generation);
+            assert!(
+                !retained.borrow().show_token_usage,
+                "view configuration survives"
+            );
+            assert!(!directory.apply(durable(FOCUSED, 2, "detached tail")).0);
+            assert!(notices(&retained.borrow()).is_empty());
+
+            directory.focus(FOCUSED, || Rc::clone(&retained));
+            assert!(Rc::ptr_eq(&directory.chat(), &retained));
+            let requests = directory.attach_requests();
+            assert_eq!(
+                requests.len(),
+                if detach == "lru" { WORKING_SET } else { 2 }
+            );
+            assert_eq!(requests[0].session, FOCUSED);
+            assert!(
+                requests[0].cursor.is_none(),
+                "detached data needs a full backfill"
+            );
+            directory.expect_attach(|session| session == FOCUSED);
+            let _ = directory.apply(state(FOCUSED));
+            let _ = directory.apply(durable(FOCUSED, 1, "reconstructed history"));
+            let _ = directory.apply(caught_up(FOCUSED, 1));
+            assert_eq!(notices(&retained.borrow()), vec!["reconstructed history"]);
+        }
     }
 
     /// An archived row for a session the user has just left takes it out of
@@ -1405,27 +1527,21 @@ mod tests {
     /// are asserted here.
     #[test]
     fn leaving_an_archived_session_drops_it_from_the_working_set() {
-        let mut directory = SessionDirectory::new("session-0".to_string());
-        let mut focused_chat = chat();
-        directory.focus(&mut focused_chat, "session-1", chat);
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![
-                SessionSummary {
-                    archived: true,
-                    ..row("session-1", false, 1)
-                },
-                row("session-0", false, 1),
-            ]),
-        );
+        let mut directory = SessionDirectory::new("session-0".to_string(), chat());
+        directory.focus("session-1", chat);
+        let _ = directory.apply(list(vec![
+            SessionSummary {
+                archived: true,
+                ..row("session-1", false, 1)
+            },
+            row("session-0", false, 1),
+        ]));
         assert!(
             directory.is_attached("session-1"),
             "archiving the session on screen detached it, so the user lost what they were reading",
         );
 
-        directory.focus(&mut focused_chat, "session-0", || {
-            panic!("still in the set")
-        });
+        directory.focus("session-0", || panic!("still in the set"));
         assert!(
             !directory.is_attached("session-1"),
             "the archived session is still in the working set, holding a lock the host could release",
@@ -1448,20 +1564,16 @@ mod tests {
     /// stream feeds.
     #[test]
     fn focusing_an_archived_session_attaches_it() {
-        let mut directory = SessionDirectory::new("session-0".to_string());
-        let mut focused_chat = chat();
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![
-                SessionSummary {
-                    archived: true,
-                    ..row("session-1", false, 1)
-                },
-                row("session-0", false, 1),
-            ]),
-        );
+        let mut directory = SessionDirectory::new("session-0".to_string(), chat());
+        let _ = directory.apply(list(vec![
+            SessionSummary {
+                archived: true,
+                ..row("session-1", false, 1)
+            },
+            row("session-0", false, 1),
+        ]));
 
-        directory.focus(&mut focused_chat, "session-1", chat);
+        directory.focus("session-1", chat);
         let requests = directory.attach_requests();
         let named: Vec<&str> = requests
             .iter()
@@ -1486,16 +1598,13 @@ mod tests {
     /// would reach: the set the peer is told to serve, and the set this keeps.
     #[test]
     fn a_session_with_no_row_is_not_treated_as_archived() {
-        let mut directory = SessionDirectory::new("session-0".to_string());
-        let mut focused_chat = chat();
-        directory.focus(&mut focused_chat, "session-1", chat);
+        let mut directory = SessionDirectory::new("session-0".to_string(), chat());
+        directory.focus("session-1", chat);
         // One session has a row, the other has never been published. Neither is
         // archived, so the two must be treated alike.
-        let _ = directory.apply(&mut focused_chat, list(vec![row("session-1", false, 1)]));
+        let _ = directory.apply(list(vec![row("session-1", false, 1)]));
 
-        directory.focus(&mut focused_chat, "session-0", || {
-            panic!("still in the set")
-        });
+        directory.focus("session-0", || panic!("still in the set"));
         let requests = directory.attach_requests();
         let named: Vec<&str> = requests
             .iter()
@@ -1522,24 +1631,20 @@ mod tests {
     /// left in the set is one the host cannot release.
     #[test]
     fn a_background_session_archived_elsewhere_leaves_the_set() {
-        let mut directory = SessionDirectory::new("session-0".to_string());
-        let mut focused_chat = chat();
-        directory.focus(&mut focused_chat, "session-1", chat);
+        let mut directory = SessionDirectory::new("session-0".to_string(), chat());
+        directory.focus("session-1", chat);
         assert!(
             directory.is_attached("session-0"),
             "the background session is not in the set, so this measures nothing",
         );
 
-        let redraw = directory.apply(
-            &mut focused_chat,
-            list(vec![
-                SessionSummary {
-                    archived: true,
-                    ..row("session-0", false, 1)
-                },
-                row("session-1", false, 1),
-            ]),
-        );
+        let redraw = directory.apply(list(vec![
+            SessionSummary {
+                archived: true,
+                ..row("session-0", false, 1)
+            },
+            row("session-1", false, 1),
+        ]));
         assert!(
             !directory.is_attached("session-0"),
             "the archived background session is still in the working set",
@@ -1556,15 +1661,11 @@ mod tests {
     /// else, and losing it here would detach the very session on screen.
     #[test]
     fn a_reattach_keeps_the_archived_session_the_user_is_on() {
-        let mut directory = SessionDirectory::new("session-0".to_string());
-        let mut focused_chat = chat();
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![SessionSummary {
-                archived: true,
-                ..row("session-0", false, 1)
-            }]),
-        );
+        let mut directory = SessionDirectory::new("session-0".to_string(), chat());
+        let _ = directory.apply(list(vec![SessionSummary {
+            archived: true,
+            ..row("session-0", false, 1)
+        }]));
 
         let requests = directory.attach_requests();
         let named: Vec<&str> = requests
@@ -1586,13 +1687,12 @@ mod tests {
     /// reads exactly like a quiet one.
     #[test]
     fn a_returning_row_re_owes_every_withheld_session() {
-        let mut directory = SessionDirectory::new("session-0".to_string());
-        let mut focused_chat = chat();
-        directory.focus(&mut focused_chat, "session-1", chat);
+        let mut directory = SessionDirectory::new("session-0".to_string(), chat());
+        directory.focus("session-1", chat);
         let both = || vec![row("session-0", false, 0), row("session-1", false, 0)];
-        let _ = directory.apply(&mut focused_chat, list(both()));
+        let _ = directory.apply(list(both()));
         for session in ["session-0", "session-1"] {
-            let _ = directory.apply(&mut focused_chat, refusal(session, "unknown_session"));
+            let _ = directory.apply(refusal(session, "unknown_session"));
         }
         // The premise: both sessions are withheld and neither owes a re-attach,
         // without which the return below re-owes nothing this test can see.
@@ -1602,8 +1702,8 @@ mod tests {
             assert!(!client.needs_reattach(), "{session} still owes a re-attach");
         }
 
-        let _ = directory.apply(&mut focused_chat, list(Vec::new()));
-        let _ = directory.apply(&mut focused_chat, list(both()));
+        let _ = directory.apply(list(Vec::new()));
+        let _ = directory.apply(list(both()));
 
         // The background session first, so a rule that only re-owes the focused
         // one fails on the session it strands.
@@ -1626,10 +1726,9 @@ mod tests {
             ("locked", WITHHELD_LOCKED_NOTICE, WITHHELD_NOTICE),
             ("unknown_session", WITHHELD_NOTICE, WITHHELD_LOCKED_NOTICE),
         ] {
-            let mut directory = SessionDirectory::new(FOCUSED.to_string());
-            let mut focused_chat = chat();
-            let _ = directory.apply(&mut focused_chat, refusal(FOCUSED, code));
-            let folded = notices(&focused_chat);
+            let mut directory = SessionDirectory::new(FOCUSED.to_string(), chat());
+            let _ = directory.apply(refusal(FOCUSED, code));
+            let folded = notices(&directory.chat().borrow());
             assert!(
                 folded.iter().any(|text| text == expected),
                 "the {code} refusal told the user to watch for the wrong \
@@ -1648,11 +1747,10 @@ mod tests {
     /// refusal, whether it is focused or in the background.
     #[test]
     fn locked_refusals_stay_out_of_automatic_attachments() {
-        let mut directory = SessionDirectory::new(FOCUSED.to_string());
-        let mut focused_chat = chat();
-        directory.focus(&mut focused_chat, OTHER, chat);
+        let mut directory = SessionDirectory::new(FOCUSED.to_string(), chat());
+        directory.focus(OTHER, chat);
         for session in [FOCUSED, OTHER] {
-            let _ = directory.apply(&mut focused_chat, refusal(session, "locked"));
+            let _ = directory.apply(refusal(session, "locked"));
         }
         for rows in [
             vec![held_row(FOCUSED), held_row(OTHER)],
@@ -1660,14 +1758,11 @@ mod tests {
             vec![],
             vec![row(FOCUSED, false, 0), row(OTHER, false, 0)],
         ] {
-            let _ = directory.apply(&mut focused_chat, list(rows));
+            let _ = directory.apply(list(rows));
             for session in [FOCUSED, OTHER] {
-                let _ = directory.apply(
-                    &mut focused_chat,
-                    Frame::Reset {
-                        session: session.into(),
-                    },
-                );
+                let _ = directory.apply(Frame::Reset {
+                    session: session.into(),
+                });
             }
             assert!(!directory.needs_reattach());
             assert!(directory.attach_requests().is_empty());

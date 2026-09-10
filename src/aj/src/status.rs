@@ -1,8 +1,8 @@
 //! The status chrome's loader line: a braille spinner plus a message,
 //! shown while the viewed agent works.
 //!
-//! The widget renders from two shared cells at draw time: the
-//! [`ChatState`] (for the active view and compaction phase) and a
+//! The widget renders from two session-owned cells at draw time: the
+//! [`ChatState`] (for the active agent view and compaction phase) and a
 //! [`StatusState`] mirror of the lifecycle bits the widgets can't
 //! reach directly. The host's select loop owns the `AgentLifecycle`
 //! (the reducer and the turn-join arm both mutate it), so instead of
@@ -117,9 +117,18 @@ pub(crate) struct StatusLine {
     /// against stacking multiple tick chains when wake events and
     /// pending ticks interleave.
     tick_armed: bool,
+    visible: bool,
 }
 
 impl StatusLine {
+    /// Gate animation while this session's widget tree is hidden. Showing it
+    /// allows the normal wake event to restart the pump.
+    pub(crate) fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+        // A pending tick still owns the chain until delivery, including across
+        // a hide/show pair. Clearing tick_armed here would allow a duplicate.
+    }
+
     pub(crate) fn new(
         chat: Rc<RefCell<ChatState>>,
         status: Rc<RefCell<StatusState>>,
@@ -133,6 +142,7 @@ impl StatusLine {
                 styles,
                 started: None,
                 tick_armed: false,
+                visible: true,
             })
         })
     }
@@ -189,7 +199,7 @@ impl StatusLine {
     /// Schedule the next animation tick if the animation should run and none
     /// is pending, and latch a redraw so the new frame paints.
     fn arm_tick(&mut self, ctx: &mut EventContext) {
-        if !self.status.borrow().animating() {
+        if !self.visible || !self.status.borrow().animating() {
             return;
         }
         ctx.redraw = true;
@@ -247,6 +257,9 @@ impl Widget for StatusLine {
             Event::App(user) if user.name == STATUS_WAKE_EVENT => self.arm_tick(ctx),
             Event::Tick => {
                 self.tick_armed = false;
+                if !self.visible {
+                    return;
+                }
                 // Repaint even when the agent just went idle so the
                 // final frame clears, then re-arm only while animating.
                 ctx.redraw = true;
@@ -525,5 +538,74 @@ mod tests {
         let mut ctx = EventContext::new();
         line.borrow_mut().handle_event(&mut ctx, &Event::Tick);
         assert!(ctx.cmds.is_empty(), "chain ends when no sub is running");
+    }
+
+    #[test]
+    fn hidden_wakes_and_pending_ticks_do_not_rearm() {
+        let widget = loader(StatusState {
+            running: true,
+            ..StatusState::default()
+        })
+        .0;
+        let wake = Event::App(vaxis::vxfw::UserEvent {
+            name: STATUS_WAKE_EVENT.to_string(),
+            data: None,
+        });
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &wake);
+        assert_eq!(ctx.cmds.len(), 1);
+        widget
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(60, Some(24)));
+        widget.borrow_mut().set_visible(false);
+        assert!(
+            widget.borrow().tick_armed,
+            "the orphan still owns the chain"
+        );
+
+        for event in [&wake, &Event::Tick, &wake] {
+            let mut ctx = EventContext::new();
+            widget.borrow_mut().handle_event(&mut ctx, event);
+            assert!(ctx.cmds.is_empty(), "hidden widgets schedule nothing");
+            assert!(!ctx.redraw, "hidden widgets do not request frames");
+        }
+        assert!(!widget.borrow().tick_armed);
+
+        widget.borrow_mut().set_visible(true);
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &wake);
+        assert_eq!(ctx.cmds.len(), 1, "a visible wake restarts the chain");
+        assert!(matches!(ctx.cmds[0], Command::Tick(_)));
+    }
+
+    #[test]
+    fn rapid_hide_show_reuses_the_pending_tick() {
+        let widget = loader(StatusState {
+            running: true,
+            ..StatusState::default()
+        })
+        .0;
+        let wake = Event::App(vaxis::vxfw::UserEvent {
+            name: STATUS_WAKE_EVENT.to_string(),
+            data: None,
+        });
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &wake);
+        assert_eq!(ctx.cmds.len(), 1);
+        widget.borrow_mut().set_visible(false);
+        widget.borrow_mut().set_visible(true);
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &wake);
+        assert!(
+            ctx.cmds.is_empty(),
+            "the pending tick owns the resumed chain"
+        );
+        widget
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(60, Some(24)));
+        let mut ctx = EventContext::new();
+        widget.borrow_mut().handle_event(&mut ctx, &Event::Tick);
+        assert_eq!(ctx.cmds.len(), 1);
+        assert!(matches!(ctx.cmds[0], Command::Tick(_)));
     }
 }

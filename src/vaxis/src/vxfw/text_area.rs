@@ -33,7 +33,7 @@
 //! so a flex-0 host slot grows with content up to the cap and scrolls beyond.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -500,6 +500,35 @@ struct AtomicSegment<'a> {
     start_index: usize,
 }
 
+/// Shared submitted/workspace prompts for [`TextArea`] recall. Cloning this
+/// handle shares entries, not editing state or unsent drafts. A default handle
+/// starts empty. Each standalone editor creates its own handle.
+#[derive(Clone, Default)]
+pub struct EditorHistory(Rc<RefCell<HistoryEntries>>);
+
+#[derive(Default)]
+struct HistoryEntries {
+    // Stable chronological positions let editors browse independently while
+    // entries are prepended or evicted. Private drafts reserve positions here,
+    // but their text is held only by the editor that remembers them.
+    entries: BTreeMap<i64, String>,
+    next_position: i64,
+}
+
+impl HistoryEntries {
+    fn reserve_position(&mut self) -> i64 {
+        let position = self.next_position;
+        self.next_position += 1;
+        position
+    }
+}
+
+fn trim_history<T>(entries: &mut BTreeMap<i64, T>) {
+    while entries.len() > TextArea::HISTORY_LIMIT {
+        entries.pop_first();
+    }
+}
+
 /// A multi-line text editor widget. See the module docs for the model.
 pub struct TextArea {
     // -- Document --
@@ -553,8 +582,11 @@ pub struct TextArea {
     jump_mode: Option<JumpDirection>,
 
     // -- History --
-    history: Vec<String>,
-    history_index: Option<usize>,
+    history: EditorHistory,
+    remembered_drafts: BTreeMap<i64, String>,
+    history_index: Option<i64>,
+    /// Pre-recall display text. Its paste payloads remain owned by this editor.
+    history_draft: String,
 
     // -- Autocomplete --
     //
@@ -674,8 +706,10 @@ impl TextArea {
             pastes: HashMap::new(),
             paste_counter: 0,
             jump_mode: None,
-            history: Vec::new(),
+            history: EditorHistory::default(),
+            remembered_drafts: BTreeMap::new(),
             history_index: None,
+            history_draft: String::new(),
             autocomplete_provider: None,
             autocomplete_state: None,
             autocomplete_items: Vec::new(),
@@ -709,6 +743,13 @@ impl TextArea {
     /// handler and the help screen.
     pub fn bindings() -> &'static [ChordDoc] {
         &BINDINGS
+    }
+
+    /// Closes autocomplete and cancels its work, invalidating queued deliveries.
+    /// Editing state, recall navigation, callbacks and the delivery channel stay
+    /// intact. The host calls this when parking an editor.
+    pub fn suspend(&mut self) {
+        self.cancel_autocomplete();
     }
 
     // -- Content --
@@ -784,12 +825,8 @@ impl TextArea {
         // A wholesale replacement is a hard break: no kill accumulation, yank
         // cycle, or word-repeat coalescing should carry across it.
         self.last_action = LastAction::None;
-        // Exit history browsing, dropping the draft `history_up` parked at the
-        // tail if we were mid-browse.
-        if self.history_index.is_some() {
-            self.history.pop();
-            self.history_index = None;
-        }
+        // A replacement ends browsing without publishing the pre-recall draft.
+        self.exit_history();
     }
 
     /// Inserts `text` at the cursor as one undo unit.
@@ -800,7 +837,7 @@ impl TextArea {
         self.invalidate_visual_line_cache();
         self.save_undo();
         self.cancel_autocomplete();
-        self.history_index = None;
+        self.exit_history();
         let normalized = Self::normalize_text(text);
         for ch in normalized.chars() {
             if ch == '\n' {
@@ -906,7 +943,7 @@ impl TextArea {
         self.reset_sticky_state();
         self.undo_stack.clear();
         self.last_action = LastAction::None;
-        self.history_index = None;
+        self.exit_history();
     }
 
     /// Takes the submitted text, if any, clearing it. Returns `Some` at most
@@ -924,55 +961,97 @@ impl TextArea {
 
     // -- History --
 
-    /// Adds `text` to the history for up/down navigation.
-    ///
-    /// Whitespace-only strings and a duplicate of the most recent entry are
-    /// ignored. The ring is capped at [`TextArea::HISTORY_LIMIT`]; once full,
-    /// the oldest entry is dropped.
-    pub fn add_to_history(&mut self, text: &str) {
-        if text.trim().is_empty() {
-            self.history_index = None;
+    /// Uses `history` for submitted/workspace prompt recall. Reattaching the
+    /// same handle is a no-op. Changing handles ends recall browsing without
+    /// changing the document or undo state. Remembered drafts remain private
+    /// and are placed after the new history's existing entries.
+    pub fn set_history(&mut self, history: EditorHistory) {
+        if Rc::ptr_eq(&self.history.0, &history.0) {
             return;
         }
-        if self.history.last().is_some_and(|prev| prev == text) {
-            self.history_index = None;
-            return;
+        self.exit_history();
+        let drafts = std::mem::take(&mut self.remembered_drafts);
+        self.history = history;
+        let mut history = self.history.0.borrow_mut();
+        for text in drafts.into_values() {
+            let position = history.reserve_position();
+            self.remembered_drafts.insert(position, text);
         }
-        self.history.push(text.to_string());
-        if self.history.len() > Self::HISTORY_LIMIT {
-            let overflow = self.history.len() - Self::HISTORY_LIMIT;
-            self.history.drain(..overflow);
-        }
-        self.history_index = None;
     }
 
-    /// Splices older entries in beneath whatever the ring already holds.
+    /// Adds `text` to shared history for up/down navigation and ends this
+    /// editor's browse. Other editors' navigation is unchanged.
     ///
-    /// `entries` are oldest-first. They land before any prompts already in the
-    /// ring, so submissions made this session stay the most-recent ones an Up
-    /// press reaches first. Safe to call mid-browse: a browse cursor (and the
-    /// draft parked at the tail) index into the ring, so we shift
-    /// `history_index` by the net change at the front and only ever drop from
-    /// the front to keep the draft at the tail.
-    pub fn seed_history(&mut self, entries: &[String]) {
-        if entries.is_empty() {
+    /// Whitespace-only strings and a duplicate of the most recent shared entry
+    /// are ignored. Text is stored verbatim. The ring is capped at
+    /// [`TextArea::HISTORY_LIMIT`], dropping the oldest entries first.
+    pub fn add_to_history(&mut self, text: &str) {
+        self.exit_history();
+        let mut history = self.history.0.borrow_mut();
+        if text.trim().is_empty()
+            || history
+                .entries
+                .last_key_value()
+                .is_some_and(|(_, prev)| prev == text)
+        {
             return;
         }
-        let added = entries.len();
-        let mut seeded = Vec::with_capacity(added + self.history.len());
-        seeded.extend(entries.iter().cloned());
-        seeded.append(&mut self.history);
-        self.history = seeded;
-        if let Some(idx) = self.history_index.as_mut() {
-            *idx += added;
+        let position = history.reserve_position();
+        history.entries.insert(position, text.to_string());
+        trim_history(&mut history.entries);
+    }
+
+    /// Remembers displaced unsent text in this editor's recall only, without
+    /// changing its document, undo state or current browse. Pass expanded text
+    /// so large-paste payloads survive submission clearing the paste map.
+    ///
+    /// Text is normalized like [`Self::set_text`]. Whitespace-only text and a
+    /// duplicate of the most recently remembered draft are ignored. Drafts and
+    /// shared prompts are recalled in insertion order, newest first, with at
+    /// most [`Self::HISTORY_LIMIT`] entries available in either store and in
+    /// the combined recall view. Only an explicit [`Self::add_to_history`]
+    /// publishes text to other editors.
+    pub fn remember_draft(&mut self, text: &str) {
+        let text = Self::normalize_text(text);
+        if text.trim().is_empty()
+            || self
+                .remembered_drafts
+                .last_key_value()
+                .is_some_and(|(_, prev)| prev == &text)
+        {
+            return;
         }
-        if self.history.len() > Self::HISTORY_LIMIT {
-            let overflow = self.history.len() - Self::HISTORY_LIMIT;
-            self.history.drain(..overflow);
-            if let Some(idx) = self.history_index.as_mut() {
-                *idx = idx.saturating_sub(overflow);
-            }
-        }
+        let position = self.history.0.borrow_mut().reserve_position();
+        self.remembered_drafts.insert(position, text);
+        trim_history(&mut self.remembered_drafts);
+    }
+
+    /// Retires the browse cursor and its private pre-recall draft together.
+    fn exit_history(&mut self) {
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    /// Prepends older shared entries, oldest-first and verbatim. Existing
+    /// prompts remain newest, with no duplicate or whitespace filtering.
+    /// Browsing editors retain their position and private pre-recall draft,
+    /// and can navigate into seeded entries. Only the oldest shared entries
+    /// are dropped to enforce [`Self::HISTORY_LIMIT`].
+    pub fn seed_history(&mut self, entries: &[String]) {
+        let mut history = self.history.0.borrow_mut();
+        // Bootstrap precedes even private drafts reserved before any submission.
+        let end = history
+            .entries
+            .first_key_value()
+            .map_or(0, |(&pos, _)| pos.min(0));
+        let start = end - i64::try_from(entries.len()).expect("history count fits i64");
+        history.entries.extend(
+            entries
+                .iter()
+                .zip(start..end)
+                .map(|(text, position)| (position, text.clone())),
+        );
+        trim_history(&mut history.entries);
     }
 
     // -- Presentation --
@@ -1156,12 +1235,8 @@ impl TextArea {
 
     fn restore_undo(&mut self) {
         if let Some(snapshot) = self.undo_stack.pop() {
-            // Exit history browsing, dropping the draft parked at the tail if we
-            // were mid-browse so the ring returns to its pre-browse shape.
-            if self.history_index.is_some() {
-                self.history.pop();
-                self.history_index = None;
-            }
+            // Undo restores local editing state, never shared history.
+            self.exit_history();
             self.lines = snapshot.lines;
             self.invalidate_visual_line_cache();
             self.cursor_line = snapshot.cursor_line;
@@ -2177,59 +2252,63 @@ impl TextArea {
 
     // -- History navigation --
 
-    /// Navigates history upward.
-    ///
-    /// The first call (not yet browsing) saves an undo snapshot and parks the
-    /// current text as a draft at the tail of the ring. That draft is what
-    /// [`TextArea::history_down`] returns to when walking past the newest real
-    /// entry. Later calls do not push further snapshots, so one undo returns to
-    /// the pre-browse state no matter how far the user walked.
-    fn history_up(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
-        let idx = match self.history_index {
-            None => {
-                self.save_undo();
-                self.history.push(self.text());
-                self.history.len() - 2
-            }
-            Some(i) if i > 0 => i - 1,
-            _ => return,
-        };
-        self.history_index = Some(idx);
-        self.load_history_entry(idx);
-    }
-
-    /// Navigates history downward, restoring and dropping the draft when it
-    /// walks back past the newest real entry.
-    fn history_down(&mut self) {
-        let idx = match self.history_index {
-            Some(i) => i + 1,
-            None => return,
-        };
-        if idx >= self.history.len() {
-            return;
-        }
-        self.history_index = if idx == self.history.len() - 1 {
-            None
+    /// Finds a neighbour in the current bounded recall view. Positions do not
+    /// shift when another editor submits or bootstrap prepends prompts, even if
+    /// the selected entry is evicted. The displayed document stays untouched
+    /// until the user navigates, then moves relative to that stable position.
+    fn history_entry(&self, backwards: bool) -> Option<(i64, String)> {
+        let history = self.history.0.borrow();
+        let mut entries: BTreeMap<i64, &String> = history
+            .entries
+            .iter()
+            .chain(self.remembered_drafts.iter())
+            .map(|(&position, text)| (position, text))
+            .collect();
+        trim_history(&mut entries);
+        let entry = if backwards {
+            entries
+                .iter()
+                .rev()
+                .find(|(position, _)| self.history_index.is_none_or(|index| **position < index))
         } else {
-            Some(idx)
+            entries
+                .iter()
+                .find(|(position, _)| self.history_index.is_some_and(|index| **position > index))
         };
-        let text = self.history[idx].clone();
+        entry.map(|(&position, text)| (position, (*text).clone()))
+    }
+
+    /// The first Up saves one undo step and a private pre-recall draft.
+    /// Later steps do not add undo snapshots, so one undo restores that draft.
+    fn history_up(&mut self) {
+        let Some((position, text)) = self.history_entry(true) else {
+            return;
+        };
         if self.history_index.is_none() {
-            self.history.pop();
+            self.save_undo();
+            self.history_draft = self.text();
         }
+        self.history_index = Some(position);
         self.set_document(&text);
     }
 
-    fn load_history_entry(&mut self, idx: usize) {
-        let text = self.history[idx].clone();
-        self.set_document(&text);
+    /// Walking past the newest entry restores the private pre-recall draft.
+    fn history_down(&mut self) {
+        if self.history_index.is_none() {
+            return;
+        }
+        if let Some((position, text)) = self.history_entry(false) {
+            self.history_index = Some(position);
+            self.set_document(&text);
+        } else {
+            let text = std::mem::take(&mut self.history_draft);
+            self.exit_history();
+            self.set_document(&text);
+        }
     }
 
     /// Replaces the document with `text` (already normalized), cursor to end.
-    /// Used by history navigation, which owns the ring shape itself.
+    /// Used by history navigation without changing its browse position.
     fn set_document(&mut self, text: &str) {
         self.invalidate_visual_line_cache();
         self.lines = if text.is_empty() {
@@ -2284,7 +2363,7 @@ impl TextArea {
         self.pastes.clear();
         self.paste_counter = 0;
         self.last_action = LastAction::None;
-        self.history_index = None;
+        self.exit_history();
     }
 
     /// Consumes the event with a redraw, then fires `on_change` if the text
@@ -2326,8 +2405,7 @@ impl TextArea {
             self.move_up();
         } else if self.history_index.is_some() || self.cursor_col == 0 {
             // Top row, and either already browsing or sitting at the start:
-            // step back in history. `history_up` parks a live draft at the
-            // tail and no-ops when there's nothing to recall.
+            // step back in history, keeping the live draft private.
             self.history_up();
         } else {
             // First Up from a non-empty top row snaps to the start; the next
@@ -4272,22 +4350,293 @@ mod tests {
     // -- History --
 
     #[test]
-    fn history_draft_preserved_and_restored() {
-        // The history_up method parks the in-progress buffer as a draft and
-        // history_down restores it.
-        let mut ed = editor();
-        ed.add_to_history("first");
-        ed.add_to_history("second");
-        ed.set_document("draft");
+    fn standalone_history_is_private_until_a_handle_is_shared() {
+        let a = TextArea::new();
+        let b = TextArea::new();
+        a.borrow_mut().add_to_history("standalone");
+        send(&mut b.borrow_mut(), &key(Key::UP, Modifiers::empty()));
+        assert_eq!(b.borrow().text(), "");
+        send(&mut a.borrow_mut(), &key(Key::UP, Modifiers::empty()));
+        assert_eq!(a.borrow().text(), "standalone");
+    }
 
-        ed.history_up();
-        assert_eq!(ed.text(), "second");
-        ed.history_up();
-        assert_eq!(ed.text(), "first");
-        ed.history_down();
-        assert_eq!(ed.text(), "second");
-        ed.history_down();
-        assert_eq!(ed.text(), "draft");
+    #[test]
+    fn bootstrap_precedes_private_recall_even_without_shared_submissions() {
+        let history = EditorHistory::default();
+        let a = TextArea::new();
+        let b = TextArea::new();
+        let mut a = a.borrow_mut();
+        let mut b = b.borrow_mut();
+        a.set_history(history.clone());
+        b.set_history(history);
+        a.remember_draft("private\tdraft");
+        a.set_text("current draft");
+        send(&mut a, &ctrl('a'));
+        send(&mut a, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(a.text(), "private    draft");
+        b.seed_history(&["bootstrapped".into()]);
+        assert_eq!(a.text(), "private    draft");
+        send(&mut a, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(a.text(), "bootstrapped");
+        for expected in ["private    draft", "current draft"] {
+            send(&mut a, &key(Key::DOWN, Modifiers::empty()));
+            assert_eq!(a.text(), expected);
+        }
+        send(&mut b, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(b.text(), "bootstrapped");
+        send(&mut b, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(b.text(), "");
+    }
+
+    #[test]
+    fn shared_history_preserves_each_editors_navigation_pastes_and_undo() {
+        let history = crate::vxfw::EditorHistory::default();
+        let a = TextArea::new();
+        let b = TextArea::new();
+        let mut a = a.borrow_mut();
+        let mut b = b.borrow_mut();
+        a.set_history(history.clone());
+        b.set_history(history);
+        a.seed_history(&["oldest".into(), "newest".into()]);
+
+        let payload = "a".repeat(1001);
+        send(&mut a, &Event::Paste(payload.clone()));
+        let marker = a.text();
+        assert_ne!(marker, payload);
+        send(&mut a, &ctrl('a'));
+        send(&mut a, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(a.text(), "newest");
+        send(&mut a, &left());
+        let cursor = a.cursor();
+        a.suspend();
+
+        b.set_text("private b");
+        send(&mut b, &ctrl('a'));
+        send(&mut b, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(b.text(), "newest");
+        send(&mut b, &key(Key::ENTER, Modifiers::empty()));
+        let submitted = b.take_submitted().unwrap();
+        b.add_to_history(&submitted);
+        send(&mut b, &ctrl('-'));
+        assert_eq!(b.text(), "", "submit clears only this editor's undo");
+        b.set_text("submitted b");
+        send(&mut b, &key(Key::ENTER, Modifiers::empty()));
+        let submitted = b.take_submitted().unwrap();
+        b.add_to_history(&submitted);
+
+        assert_eq!(a.text(), "newest");
+        assert_eq!(a.cursor(), cursor);
+        send(&mut a, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(a.text(), "oldest");
+        for expected in ["newest", "submitted b", &marker] {
+            send(&mut a, &key(Key::DOWN, Modifiers::empty()));
+            assert_eq!(a.text(), expected);
+        }
+        assert_eq!(a.expanded_text(), payload);
+        send(&mut a, &ctrl('-'));
+        assert_eq!(a.text(), marker);
+        assert_eq!(a.cursor(), (0, 0), "undo restores the pre-recall cursor");
+        send(&mut a, &ctrl('-'));
+        assert_eq!(a.text(), "", "the paste is still its own undo unit");
+
+        send(&mut a, &key(Key::UP, Modifiers::empty()));
+        a.insert_at_cursor(" edited");
+        send(&mut a, &ctrl('-'));
+        assert_eq!(a.text(), "submitted b");
+        for expected in ["submitted b", "newest", "oldest", "oldest"] {
+            send(&mut b, &key(Key::UP, Modifiers::empty()));
+            assert_eq!(
+                b.text(),
+                expected,
+                "recall excludes edits and both private drafts"
+            );
+        }
+    }
+
+    #[test]
+    fn remembered_drafts_stay_local_and_ordered_after_submissions() {
+        let history = EditorHistory::default();
+        let a = TextArea::new();
+        let b = TextArea::new();
+        let mut a = a.borrow_mut();
+        let mut b = b.borrow_mut();
+        a.set_history(history.clone());
+        b.set_history(history);
+        b.add_to_history("oldest");
+        let payload = "p".repeat(1001);
+        send(&mut a, &Event::Paste(payload.clone()));
+        let expanded = a.expanded_text();
+        a.remember_draft(&expanded);
+        a.remember_draft(&expanded);
+        a.remember_draft(" \t\r\n");
+        a.set_text("branch prefill");
+        send(&mut a, &key(Key::ENTER, Modifiers::empty()));
+        let submitted = a.take_submitted().unwrap();
+        a.add_to_history(&submitted);
+        b.set_text("submitted b");
+        send(&mut b, &key(Key::ENTER, Modifiers::empty()));
+        let submitted = b.take_submitted().unwrap();
+        b.add_to_history(&submitted);
+
+        for expected in [
+            "submitted b",
+            "branch prefill",
+            &payload,
+            "oldest",
+            "oldest",
+        ] {
+            send(&mut a, &ctrl('a'));
+            send(&mut a, &key(Key::UP, Modifiers::empty()));
+            assert_eq!(a.expanded_text(), expected);
+        }
+        for expected in ["submitted b", "branch prefill", "oldest", "oldest"] {
+            send(&mut b, &key(Key::UP, Modifiers::empty()));
+            assert_eq!(b.text(), expected);
+        }
+    }
+
+    #[test]
+    fn bootstrap_preserves_all_browse_positions_and_private_return_drafts() {
+        let history = EditorHistory::default();
+        let a = TextArea::new();
+        let b = TextArea::new();
+        let mut a = a.borrow_mut();
+        let mut b = b.borrow_mut();
+        a.set_history(history.clone());
+        b.set_history(history);
+        a.add_to_history("first live");
+        a.add_to_history("second live");
+        for (ed, draft) in [(&mut *a, "private a"), (&mut *b, "private b")] {
+            ed.set_text(draft);
+            send(ed, &ctrl('a'));
+            send(ed, &key(Key::UP, Modifiers::empty()));
+        }
+        send(&mut a, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(a.text(), "first live");
+        assert_eq!(b.text(), "second live");
+        let seeds: Vec<_> = (0..TextArea::HISTORY_LIMIT)
+            .map(|i| format!("seed {i}"))
+            .collect();
+        b.seed_history(&seeds);
+        assert_eq!(a.text(), "first live");
+        assert_eq!(b.text(), "second live");
+        send(&mut a, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(a.text(), seeds[99]);
+        for expected in ["first live", "second live", "private a"] {
+            send(&mut a, &key(Key::DOWN, Modifiers::empty()));
+            assert_eq!(a.text(), expected);
+        }
+        send(&mut b, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(b.text(), "private b");
+
+        b.clear();
+        for expected in ["second live", "first live"]
+            .into_iter()
+            .chain(seeds[2..].iter().rev().map(String::as_str))
+        {
+            send(&mut b, &key(Key::UP, Modifiers::empty()));
+            assert_eq!(b.text(), expected);
+        }
+        send(&mut b, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(
+            b.text(),
+            "seed 2",
+            "private drafts do not consume shared capacity"
+        );
+    }
+
+    #[test]
+    fn eviction_keeps_browse_position_and_return_draft() {
+        let history = EditorHistory::default();
+        let a = TextArea::new();
+        let b = TextArea::new();
+        let mut a = a.borrow_mut();
+        let mut b = b.borrow_mut();
+        a.set_history(history.clone());
+        b.set_history(history);
+        a.add_to_history("evicted");
+        a.set_text("private a");
+        send(&mut a, &ctrl('a'));
+        send(&mut a, &key(Key::UP, Modifiers::empty()));
+        for i in 0..TextArea::HISTORY_LIMIT {
+            b.add_to_history(&format!("entry {i}"));
+        }
+        assert_eq!(a.text(), "evicted");
+        send(&mut a, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(a.text(), "evicted");
+        for i in 0..TextArea::HISTORY_LIMIT {
+            send(&mut a, &key(Key::DOWN, Modifiers::empty()));
+            assert_eq!(a.text(), format!("entry {i}"));
+        }
+        send(&mut a, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(a.text(), "private a");
+    }
+
+    #[test]
+    fn browse_exits_never_publish_a_private_draft() {
+        for exit in [
+            "submit",
+            "insert",
+            "clear",
+            "replace",
+            "undo",
+            "down",
+            "add",
+            "duplicate",
+            "empty",
+        ] {
+            let ed = TextArea::new();
+            let mut ed = ed.borrow_mut();
+            let history = EditorHistory::default();
+            ed.set_history(history.clone());
+            let observer = TextArea::new();
+            observer.borrow_mut().set_history(history);
+            ed.seed_history(&["older prompt".to_string(), "workspace prompt".to_string()]);
+            type_str(&mut ed, "PRIVATE A DRAFT");
+            send(&mut ed, &ctrl('a'));
+            send(&mut ed, &key(Key::UP, Modifiers::empty()));
+            assert_eq!(ed.text(), "workspace prompt");
+            match exit {
+                "submit" => {
+                    send(&mut ed, &key(Key::ENTER, Modifiers::empty()));
+                    let submitted = ed.take_submitted().expect("recalled prompt submitted");
+                    assert_eq!(submitted, "workspace prompt");
+                    ed.add_to_history(&submitted);
+                }
+                "insert" => ed.insert_at_cursor(" edited"),
+                "clear" => ed.clear(),
+                "replace" => ed.set_text("replacement"),
+                "undo" => {
+                    send(&mut ed, &ctrl('-'));
+                    assert_eq!(ed.text(), "PRIVATE A DRAFT");
+                }
+                "down" => {
+                    send(&mut ed, &key(Key::DOWN, Modifiers::empty()));
+                    assert_eq!(ed.text(), "PRIVATE A DRAFT");
+                }
+                "add" => ed.add_to_history("new submission"),
+                "duplicate" => ed.add_to_history("workspace prompt"),
+                "empty" => ed.add_to_history(" "),
+                _ => unreachable!(),
+            }
+            let mut ed = observer.borrow_mut();
+            if exit == "add" {
+                send(&mut ed, &key(Key::UP, Modifiers::empty()));
+                assert_eq!(ed.text(), "new submission");
+            }
+            for expected in ["workspace prompt", "older prompt", "older prompt"] {
+                send(&mut ed, &key(Key::UP, Modifiers::empty()));
+                assert_eq!(ed.text(), expected, "browse exit: {exit}");
+            }
+            for expected in ["workspace prompt", ""] {
+                if expected.is_empty() && exit == "add" {
+                    send(&mut ed, &key(Key::DOWN, Modifiers::empty()));
+                    assert_eq!(ed.text(), "new submission");
+                }
+                send(&mut ed, &key(Key::DOWN, Modifiers::empty()));
+                assert_eq!(ed.text(), expected, "browse exit: {exit}");
+            }
+        }
     }
 
     #[test]
@@ -5337,6 +5686,45 @@ mod tests {
             send(ed, &char_key(c));
             wait_autocomplete(ed).await;
         }
+    }
+
+    #[tokio::test]
+    async fn suspend_rejects_queued_completions_and_keeps_the_original_channel() {
+        let ed = TextArea::new();
+        ed.borrow_mut()
+            .set_autocomplete_provider(Arc::new(MockProvider {
+                get: |_lines, _l, _col, _force| Some((vec![item("completed")], "draft".into())),
+            }));
+        let mut rx = ed.borrow_mut().take_autocomplete_rx().unwrap();
+        ed.borrow_mut().set_text("draft");
+        send(&mut ed.borrow_mut(), &tab());
+        let delivery = rx.recv().await.unwrap();
+        ed.borrow_mut().suspend();
+        ed.borrow_mut().apply_autocomplete_delivery(delivery);
+        assert_eq!(ed.borrow().text(), "draft");
+        assert!(!ed.borrow().is_showing_autocomplete());
+
+        send(&mut ed.borrow_mut(), &tab());
+        let delivery = rx.recv().await.unwrap();
+        ed.borrow_mut().apply_autocomplete_delivery(delivery);
+        assert_eq!(ed.borrow().text(), "completed");
+        send(&mut ed.borrow_mut(), &ctrl('-'));
+        assert_eq!(ed.borrow().text(), "draft");
+        assert!(ed.borrow_mut().take_autocomplete_rx().is_none());
+
+        ed.borrow_mut()
+            .set_autocomplete_provider(Arc::new(MockProvider {
+                get: |_lines, _l, _col, _force| {
+                    Some((vec![item("first"), item("second")], "draft".into()))
+                },
+            }));
+        send(&mut ed.borrow_mut(), &tab());
+        let delivery = rx.recv().await.unwrap();
+        ed.borrow_mut().apply_autocomplete_delivery(delivery);
+        assert!(ed.borrow().is_showing_autocomplete());
+        ed.borrow_mut().suspend();
+        assert!(!ed.borrow().is_showing_autocomplete());
+        assert_eq!(ed.borrow().text(), "draft");
     }
 
     #[tokio::test]
