@@ -256,7 +256,7 @@ impl UsageOverlay {
             }
             Phase::SelectProvider | Phase::Confirm { .. } | Phase::Failed { .. } => {
                 format!(
-                    "\u{2191}\u{2193} select \u{00b7} {} confirm \u{00b7} {} back",
+                    "\u{2191}\u{2193} select  \u{2022}  {} confirm  \u{2022}  {} back",
                     confirm_key_label(),
                     close_key_label()
                 )
@@ -1302,7 +1302,7 @@ mod tests {
         assert!(out.contains("other"), "{out}");
         assert_eq!(
             overlay.footer_hint(),
-            "\u{2191}\u{2193} select \u{00b7} Enter confirm \u{00b7} Esc back"
+            "\u{2191}\u{2193} select  \u{2022}  Enter confirm  \u{2022}  Esc back"
         );
 
         // Choosing a provider advances to its confirm step.

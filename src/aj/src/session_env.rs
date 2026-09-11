@@ -21,7 +21,8 @@ use crate::toasts::show_toast;
 
 // NUL cannot occur in an environment key.
 const ADD_ROW: &str = "\0add";
-const FIELD_HINT: &str = r#"Enter to set · Esc to cancel · escapes: \n \t \\ \" (no outer quotes)"#;
+const FIELD_HINT: &str =
+    r#"Enter to set  •  Esc to cancel  •  escapes: \n \t \\ \" (no outer quotes)"#;
 
 #[derive(Clone)]
 struct EnvUi {
@@ -98,7 +99,7 @@ pub(crate) fn open_session_env(
     }
     let mut subtitle = subtitle_edit_close("edit");
     if let Some(clear) = action_shortcut(ACTION_SETTINGS_CLEAR) {
-        subtitle.push_str(&format!("  ·  {clear} to remove"));
+        subtitle.push_str(&format!("  •  {clear} to remove"));
     }
     push_window(
         &ui.handles.stack,
