@@ -217,6 +217,7 @@ fn every_public_command_serializer_is_accepted_by_the_closed_codec() {
         instructions: Some("keep the protocol decisions".into()),
     });
     assert_public_request_round_trip(SettingsRequest {
+        persist: Default::default(),
         agent: Some(AgentId::Sub(10)),
         change: session_settings(),
     });
@@ -502,6 +503,7 @@ fn account_list_preserves_labels_nulls_and_additive_observations() {
 #[test]
 fn settings_use_the_cli_selection_triple_and_create_round_trips() {
     let request = SettingsRequest {
+        persist: Default::default(),
         agent: None,
         change: session_settings(),
     };

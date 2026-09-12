@@ -482,6 +482,7 @@ pub enum QueueOp {
 }
 
 /// Which settings axis a change moves, and to what.
+#[derive(Clone)]
 pub enum SettingsAxis {
     Model(ModelInfo),
     Thinking(Option<ThinkingConfig>),
@@ -503,6 +504,9 @@ pub struct SettingsChange {
 pub enum CommandOutcome {
     /// Accepted, with nothing to return.
     Accepted,
+    /// The session changed, but a requested save or log record failed.
+    /// The caller must not present this as either a complete success or a refusal.
+    Incomplete(String),
     /// The withdrawn queued message, so a client can restore it to its
     /// editor the way the local dequeue gesture does. `None` when nothing
     /// was pending.
@@ -760,6 +764,127 @@ impl SessionHost {
         Ok(Self { inner })
     }
 
+    /// Model choices from the host catalog, without config or skill discovery.
+    /// The session supplies routing only and is not materialized.
+    pub async fn models(&self, session: &str) -> Result<Vec<ModelInfo>, HostError> {
+        let _ = self.live_or_cold(session).await?;
+        Ok(self.inner.shared.catalog.as_ref().clone())
+    }
+
+    /// The host's config and editor catalogs. The session id supplies gateway
+    /// routing and must name a session in this store. Reading does not
+    /// materialize it.
+    pub async fn config(&self, session: &str) -> Result<aj_wire::HostConfig, HostError> {
+        let _ = self.live_or_cold(session).await?;
+        let skills = self
+            .skills(session)
+            .await?
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        let shared = &self.inner.shared;
+        let layers = shared.layers.lock().expect("config layers mutex poisoned");
+        Ok(aj_wire::HostConfig {
+            user: crate::settings::host_values(&layers.user),
+            effective: crate::settings::host_values(&layers.effective()),
+            project_keys: layers
+                .project
+                .set_keys()
+                .filter(|key| !crate::settings::is_presentation(key))
+                .map(String::from)
+                .collect(),
+            has_project: layers.project_path.is_some(),
+            models: shared.catalog.as_ref().clone(),
+            tools: aj_tools::get_builtin_tools(&aj_tools::BuiltinToolOptions::default())
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect(),
+            skills,
+        })
+    }
+
+    /// Write one value into a host config layer. The session only routes.
+    pub async fn edit_config(
+        &self,
+        session: &str,
+        edit: aj_wire::ConfigEdit,
+    ) -> Result<(), HostError> {
+        let _ = self.live_or_cold(session).await?;
+        let shared = Arc::clone(&self.inner.shared);
+        tokio::task::spawn_blocking(move || {
+            crate::settings::edit_config(&shared.layers, &shared.config, &shared.catalog, edit)
+        })
+        .await
+        .map_err(|err| HostError::Internal(err.into()))?
+    }
+
+    /// Discover in the host's directory using USER disabled-skills defaults.
+    /// A running session keeps the skill listing frozen in its environment.
+    pub async fn skills(&self, session: &str) -> Result<Vec<aj_wire::SkillInfo>, HostError> {
+        let _ = self.live_or_cold(session).await?;
+        let disabled = self
+            .inner
+            .shared
+            .layers
+            .lock()
+            .expect("config layers mutex poisoned")
+            .user
+            .disabled_skills
+            .clone();
+        let cwd = self.inner.working_directory.clone();
+        tokio::task::spawn_blocking(move || {
+            aj_conf::skills::discover_skills_in(&cwd, &disabled)
+                .0
+                .into_iter()
+                .map(|skill| aj_wire::SkillInfo {
+                    name: skill.name,
+                    description: skill.description,
+                    path: skill.path.display().to_string(),
+                    enabled: skill.enabled,
+                    disable_model_invocation: skill.disable_model_invocation,
+                })
+                .collect()
+        })
+        .await
+        .map_err(|err| HostError::Internal(err.into()))
+    }
+
+    pub async fn toggle_skill(
+        &self,
+        session: &str,
+        toggle: aj_wire::SkillToggle,
+    ) -> Result<(), HostError> {
+        if !self
+            .skills(session)
+            .await?
+            .iter()
+            .any(|skill| skill.name == toggle.name)
+        {
+            return Err(HostError::Invalid(format!(
+                "Unknown skill {:?}.",
+                toggle.name
+            )));
+        }
+        let shared = Arc::clone(&self.inner.shared);
+        let note = tokio::task::spawn_blocking(move || {
+            crate::settings::persist_user(&shared.layers, &shared.config, |config| {
+                if toggle.disable {
+                    if !config.disabled_skills.contains(&toggle.name) {
+                        config.disabled_skills.push(toggle.name.clone());
+                    }
+                } else {
+                    config.disabled_skills.retain(|name| name != &toggle.name);
+                }
+            })
+        })
+        .await
+        .map_err(|err| HostError::Internal(err.into()))?;
+        match note {
+            Some(note) => Err(HostError::Internal(note.into())),
+            None => Ok(()),
+        }
+    }
+
     /// Protocol identity and capabilities, the reachability and identity probe.
     ///
     /// The list names the routes this host serves past the protocol-1
@@ -771,6 +896,8 @@ impl SessionHost {
         Hello {
             protocol: PROTOCOL_VERSION,
             capabilities: vec![
+                aj_wire::HOST_CONFIG_CAPABILITY.to_string(),
+                aj_wire::HOST_SKILLS_CAPABILITY.to_string(),
                 ARCHIVE_CAPABILITY.to_string(),
                 COMPACTION_USAGE_CAPABILITY.to_string(),
                 aj_wire::SESSION_INFO_CAPABILITY.to_string(),

@@ -268,6 +268,44 @@ impl RemoteClient {
         decode(response).await
     }
 
+    pub(crate) async fn models(
+        &self,
+        session: &str,
+    ) -> Result<Vec<aj_models::registry::ModelInfo>, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/models")).await
+    }
+
+    pub(crate) async fn config(&self, session: &str) -> Result<aj_wire::HostConfig, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/config")).await
+    }
+
+    pub(crate) async fn edit_config(
+        &self,
+        session: &str,
+        edit: aj_wire::ConfigEdit,
+    ) -> Result<(), RemoteError> {
+        self.post(&format!("/v1/sessions/{session}/config"), encode(&edit)?)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn skills(
+        &self,
+        session: &str,
+    ) -> Result<Vec<aj_wire::SkillInfo>, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/skills")).await
+    }
+
+    pub(crate) async fn toggle_skill(
+        &self,
+        session: &str,
+        toggle: aj_wire::SkillToggle,
+    ) -> Result<(), RemoteError> {
+        self.post(&format!("/v1/sessions/{session}/skills"), encode(&toggle)?)
+            .await
+            .map(|_| ())
+    }
+
     pub(crate) async fn tasks(&self, session: &str) -> Result<TaskTable, RemoteError> {
         self.get(&format!("/v1/sessions/{session}/tasks")).await
     }
@@ -433,7 +471,16 @@ impl RemoteClient {
         let path = format!("/v1/sessions/{session}/{}", command.route());
         let response = self.post(&path, command.body()?).await?;
         if !command.withdraws() {
-            return Ok(CommandOutcome::Accepted);
+            let body = response.bytes().await?;
+            let acceptance = if body.is_empty() {
+                aj_wire::CommandAcceptance::default()
+            } else {
+                serde_json::from_slice::<aj_wire::CommandAcceptance>(&body)
+                    .map_err(RemoteError::Decode)?
+            };
+            return Ok(acceptance
+                .incomplete
+                .map_or(CommandOutcome::Accepted, CommandOutcome::Incomplete));
         }
         let outcome: QueueOutcome = decode(response).await?;
         Ok(CommandOutcome::Withdrawn(outcome.text))

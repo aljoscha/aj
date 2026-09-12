@@ -7,11 +7,9 @@
 //! correctness (seqs, epochs, attach atomicity, flow control) already lives
 //! in the host, which is why this layer stays this thin.
 //!
-//! The one rule that is this layer's alone: a request arriving over the
-//! network is not the local user. A settings change therefore always carries
-//! [`PersistAction::None`], so no peer can rewrite the host's config files,
-//! and a model change travels as the (api, url, name) triple the host
-//! resolves against its own catalog rather than as a catalog object.
+//! A model change travels as the (api, url, name) triple the host resolves
+//! against its own catalog. Settings persistence targets the host's files,
+//! while client presentation preferences never cross this transport.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,7 +22,6 @@ use aj_app::host::{
     QueueOp, SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::thinking_display_from_name;
-use aj_app::settings::PersistAction;
 use aj_conf::ConfigVerbosity;
 use aj_models::{speed_from_name, thinking_config_from_name};
 use aj_session::normalize_tag;
@@ -218,6 +215,9 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/sessions/{id}/compact", post(compact))
         .route("/v1/sessions/{id}/settings", post(settings))
+        .route("/v1/sessions/{id}/models", get(models))
+        .route("/v1/sessions/{id}/config", get(config).post(edit_config))
+        .route("/v1/sessions/{id}/skills", get(skills).post(toggle_skill))
         .route("/v1/sessions/{id}/tag", post(tag))
         .route("/v1/sessions/{id}/archive", post(archive))
         .route("/v1/sessions/{id}/head", post(head))
@@ -593,6 +593,45 @@ async fn compact(
     )
 }
 
+async fn models(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(state.host.models(&session).await?).into_response())
+}
+
+async fn config(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(state.host.config(&session).await?).into_response())
+}
+
+async fn edit_config(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(edit): Body<aj_wire::ConfigEdit>,
+) -> Result<Response, ApiError> {
+    state.host.edit_config(&session, edit).await?;
+    accepted(CommandOutcome::Accepted)
+}
+
+async fn skills(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(state.host.skills(&session).await?).into_response())
+}
+
+async fn toggle_skill(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(toggle): Body<aj_wire::SkillToggle>,
+) -> Result<Response, ApiError> {
+    state.host.toggle_skill(&session, toggle).await?;
+    accepted(CommandOutcome::Accepted)
+}
+
 async fn settings(
     State(state): State<Arc<ServerState>>,
     Path(session): Path<String>,
@@ -714,6 +753,13 @@ fn task_id(raw: &str) -> Result<TaskId, ApiError> {
 fn accepted(outcome: CommandOutcome) -> Result<Response, ApiError> {
     match outcome {
         CommandOutcome::Accepted => Ok(StatusCode::ACCEPTED.into_response()),
+        CommandOutcome::Incomplete(message) => Ok((
+            StatusCode::ACCEPTED,
+            Json(aj_wire::CommandAcceptance {
+                incomplete: Some(message),
+            }),
+        )
+            .into_response()),
         CommandOutcome::Withdrawn(_) => Err(ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal",
@@ -795,7 +841,12 @@ fn settings_change(
     host: &SessionHost,
     request: SettingsRequest,
 ) -> Result<SettingsChange, ApiError> {
-    let SettingsRequest { agent, change } = request;
+    let SettingsRequest {
+        agent,
+        change,
+        persist,
+        ..
+    } = request;
     let SessionSettings {
         model,
         thinking,
@@ -874,10 +925,7 @@ fn settings_change(
 
     Ok(SettingsChange {
         agent: agent.unwrap_or(AgentId::Main),
-        // Forced: a network peer must not be able to rewrite this host's
-        // config files, so a remote change is session-only however it was
-        // asked for.
-        persist: PersistAction::None,
+        persist,
         axis,
     })
 }

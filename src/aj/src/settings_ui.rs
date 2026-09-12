@@ -62,13 +62,7 @@ use crate::overlay::{
     subtitle_confirm_close, subtitle_edit_close,
 };
 
-/// The synthetic settings row folding `model_api` + `model_name` into one
-/// picker-backed entry. Its change value is a `provider/id` string.
-pub(crate) const MODEL_SETTING_ID: &str = "model";
-
-/// The "leave unset" sentinel for options whose absence has its own meaning
-/// (`thinking_display`, `verbosity`). The host maps it back to key removal.
-pub(crate) const UNSET_VALUE: &str = "default";
+pub(crate) use aj_app::settings::{MODEL_SETTING_ID, UNSET_VALUE};
 
 /// A confirmed edit parked by an overlay for the drive loop to apply through
 /// the shared settings core. The overlays cannot reach the async cores or the
@@ -76,45 +70,51 @@ pub(crate) const UNSET_VALUE: &str = "default";
 pub(crate) enum SelectorActivity {
     /// A thinking level was confirmed for `target` (session-scoped).
     ThinkingConfirmed {
+        owner: crate::interactive::SettingsOwner,
         target: AgentId,
         level: Option<ThinkingConfig>,
     },
     /// A model was confirmed for `target` (session-scoped).
     ModelConfirmed {
+        owner: crate::interactive::SettingsOwner,
         target: AgentId,
         info: Box<ModelInfo>,
     },
     /// A settings-window value change to persist to `target`'s layer.
     SettingChange {
+        owner: crate::interactive::SettingsOwner,
         target: ConfigTarget,
         id: String,
         value: String,
     },
     /// A project override cleared; `inherited` is the value the live effect
     /// reverts to.
-    SettingClear { id: String, inherited: String },
+    SettingClear {
+        owner: crate::interactive::SettingsOwner,
+        id: String,
+        inherited: String,
+    },
     /// A skills-window toggle: enable or disable `name` for new sessions.
-    SkillToggle { name: String, disable: bool },
+    SkillToggle {
+        owner: crate::interactive::SettingsOwner,
+        name: String,
+        disable: bool,
+    },
     /// A confirmed field edit in the session environment window.
     EnvironmentEdit(crate::session_env::EnvEdit),
 }
 
 /// Handles the drive loop keeps for a live settings window: the row list
-/// (so an apply failure can revert a row and a theme swap can re-tint it) and
-/// the window chrome (so a theme swap re-tints its border). Cleared when the
-/// window closes.
+/// (so an apply failure can revert a row and a theme swap can re-tint it),
+/// the window chrome (so a theme swap re-tints its border), and the host
+/// read the window opened with, taken by the drive loop once. Cleared when
+/// the window closes.
 pub(crate) struct SettingsUi {
-    list: Rc<RefCell<SettingList>>,
+    pub(crate) list: Rc<RefCell<SettingList>>,
     window: Rc<RefCell<OverlayWindow>>,
 }
 
 impl SettingsUi {
-    /// Set a row's displayed value (an optimistic edit, or a host correction
-    /// after a failed apply). No-op for an unknown id.
-    pub(crate) fn set_value(&self, id: &str, value: &str) {
-        self.list.borrow().set_value(id, value);
-    }
-
     /// The displayed value of the row with `id`, or `None` for an unknown id.
     #[cfg(test)]
     pub(crate) fn value_of(&self, id: &str) -> Option<String> {
@@ -161,6 +161,39 @@ pub(crate) fn push_window(
     window
 }
 
+/// An inert, cancellable list until the opening host supplies its choices.
+pub(crate) fn open_selector_loading(
+    stack: &Rc<RefCell<OverlayStack>>,
+    editor: &WidgetRef,
+    chrome: &OverlayChrome,
+    thinking: bool,
+) -> Rc<RefCell<FilterableSelect>> {
+    let select = Rc::new(RefCell::new(FilterableSelect::new(
+        vec![SelectItem::new("Loading host models…", "")],
+        chrome.select.clone(),
+    )));
+    let stack_cancel = Rc::clone(stack);
+    let editor_cancel = Rc::clone(editor);
+    select.borrow_mut().on_cancel = Some(Box::new(move |ctx| {
+        close_top(&stack_cancel, ctx, &editor_cancel)
+    }));
+    let focus = select.borrow().focus_target();
+    push_window(
+        stack,
+        chrome,
+        if thinking {
+            "Thinking effort"
+        } else {
+            "Select model"
+        },
+        subtitle_confirm_close(),
+        to_widget_ref(Rc::clone(&select)),
+        focus,
+        OverlayPlacement::Small,
+    );
+    select
+}
+
 // ============================================================================
 // Thinking selector
 // ============================================================================
@@ -180,56 +213,43 @@ fn thinking_items(current_name: &str, levels: &[&ThinkingLevel]) -> Vec<SelectIt
         .collect()
 }
 
-/// Open the thinking selector for `target`, marking `current` when known.
-pub(crate) fn open_thinking(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    activity: &Rc<RefCell<Vec<SelectorActivity>>>,
+/// Fill the opening selector with the host model's supported thinking levels.
+pub(crate) fn fill_thinking(
+    handles: &crate::interactive::OverlayHandles,
+    select: &Rc<RefCell<FilterableSelect>>,
+    owner: crate::interactive::SettingsOwner,
     target: AgentId,
     current: Option<&str>,
     supported: Vec<&'static ThinkingLevel>,
 ) {
     let current_name = current.unwrap_or("");
-    let select = Rc::new(RefCell::new(FilterableSelect::new(
-        thinking_items(current_name, &supported),
-        chrome.select.clone(),
-    )));
+    select
+        .borrow()
+        .set_items(thinking_items(current_name, &supported));
     select
         .borrow()
         .select_matching(|item| item.filter_key == current_name);
-    let focus = select.borrow().focus_target();
     {
         let mut sel = select.borrow_mut();
-        let activity = Rc::clone(activity);
-        let stack_c = Rc::clone(stack);
-        let editor_c = Rc::clone(editor);
+        let activity = Rc::clone(&handles.activity);
+        let stack_c = Rc::clone(&handles.stack);
+        let editor_c = Rc::clone(&handles.editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
             if let Some(level) = aj_app::commands::parse_thinking_level(&item.filter_key) {
                 activity
                     .borrow_mut()
-                    .push(SelectorActivity::ThinkingConfirmed { target, level });
+                    .push(SelectorActivity::ThinkingConfirmed {
+                        owner: owner.clone(),
+                        target,
+                        level,
+                    });
             }
             // A confirmed pick is terminal: tear the whole stack down
-            // (palette included) back to the transcript. Cancel below uses
+            // (palette included) back to the transcript. Cancel uses
             // `close_top`, which returns to the palette underneath.
             close_all(&stack_c, ctx, &editor_c);
         }));
-        let stack_cancel = Rc::clone(stack);
-        let editor_cancel = Rc::clone(editor);
-        sel.on_cancel = Some(Box::new(move |ctx| {
-            close_top(&stack_cancel, ctx, &editor_cancel)
-        }));
     }
-    push_window(
-        stack,
-        chrome,
-        "Thinking effort",
-        subtitle_confirm_close(),
-        to_widget_ref(select),
-        focus,
-        OverlayPlacement::Small,
-    );
 }
 
 // ============================================================================
@@ -289,20 +309,18 @@ fn trim_price(v: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-/// Open the model selector for `target`, pre-selecting the current model.
-pub(crate) fn open_model(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    activity: &Rc<RefCell<Vec<SelectorActivity>>>,
+/// Fill the opening selector with the host catalog and preselect its current model.
+pub(crate) fn fill_model(
+    handles: &crate::interactive::OverlayHandles,
+    select: &Rc<RefCell<FilterableSelect>>,
+    owner: crate::interactive::SettingsOwner,
     catalog: Arc<Vec<ModelInfo>>,
     target: AgentId,
     current: Option<(String, String)>,
 ) {
-    let select = Rc::new(RefCell::new(FilterableSelect::new(
-        model_items(&catalog, current.as_ref()),
-        chrome.select.clone(),
-    )));
+    select
+        .borrow()
+        .set_items(model_items(&catalog, current.as_ref()));
     if let Some(info) = current
         .as_ref()
         .and_then(|(p, id)| catalog.iter().find(|m| m.provider == *p && m.id == *id))
@@ -312,12 +330,11 @@ pub(crate) fn open_model(
             .borrow()
             .select_matching(|item| item.filter_key == key);
     }
-    let focus = select.borrow().focus_target();
     {
         let mut sel = select.borrow_mut();
-        let activity = Rc::clone(activity);
-        let stack_c = Rc::clone(stack);
-        let editor_c = Rc::clone(editor);
+        let activity = Rc::clone(&handles.activity);
+        let stack_c = Rc::clone(&handles.stack);
+        let editor_c = Rc::clone(&handles.editor);
         let catalog_c = Arc::clone(&catalog);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
             if let Some(info) = catalog_c
@@ -327,30 +344,17 @@ pub(crate) fn open_model(
                 activity
                     .borrow_mut()
                     .push(SelectorActivity::ModelConfirmed {
+                        owner: owner.clone(),
                         target,
                         info: Box::new(info.clone()),
                     });
             }
             // A confirmed pick is terminal: tear the whole stack down
-            // (palette included) back to the transcript. Cancel below uses
+            // (palette included) back to the transcript. Cancel uses
             // `close_top`, which returns to the palette underneath.
             close_all(&stack_c, ctx, &editor_c);
         }));
-        let stack_cancel = Rc::clone(stack);
-        let editor_cancel = Rc::clone(editor);
-        sel.on_cancel = Some(Box::new(move |ctx| {
-            close_top(&stack_cancel, ctx, &editor_cancel)
-        }));
     }
-    push_window(
-        stack,
-        chrome,
-        "Select model",
-        subtitle_confirm_close(),
-        to_widget_ref(select),
-        focus,
-        OverlayPlacement::Small,
-    );
 }
 
 // ============================================================================
@@ -502,7 +506,7 @@ fn build_setting_row(
     widget
 }
 
-/// Recompute the filtered view and reset the cursor to the top.
+/// Recompute the filtered view without changing its selection or scroll.
 fn apply_setting_filter(state: &mut SettingListState, list: &mut ListView) {
     let SettingListState {
         rows,
@@ -519,7 +523,6 @@ fn apply_setting_filter(state: &mut SettingListState, list: &mut ListView) {
         .map(|(i, _)| i)
         .collect();
     list.item_count = Some(u32::try_from(visible.len()).expect("row count fits u32"));
-    list.jump_to_item(0);
 }
 
 /// Selected-row info cloned out so callbacks can run without holding a state
@@ -549,6 +552,13 @@ pub(crate) struct SettingList {
     state: Rc<RefCell<SettingListState>>,
     styles: Rc<RefCell<SelectStyles>>,
     project_mode: bool,
+    /// A pending or unconfirmed save pauses edits until it finishes or the
+    /// window is reopened. Navigation and closing remain available.
+    edit_notice: RefCell<Option<String>>,
+    // One optimistic edit per window, restored only on a definite refusal.
+    edit_before: RefCell<Option<(String, String, bool)>>,
+    host_hint: RefCell<Option<String>>,
+    load_notice: RefCell<Option<String>>,
     /// Fires on Enter over a [`RowKind::Cycle`] row with `(id, next_value)`.
     pub(crate) on_change: Option<Box<dyn FnMut(&mut EventContext, &str, &str)>>,
     /// Fires on Enter over a [`RowKind::Submenu`] row with `(id, value)`.
@@ -599,7 +609,9 @@ impl SettingList {
             prompt.set_on_change(move |ctx, text| {
                 let mut state = state.borrow_mut();
                 state.query = text.to_string();
-                apply_setting_filter(&mut state, &mut list.borrow_mut());
+                let mut list = list.borrow_mut();
+                apply_setting_filter(&mut state, &mut list);
+                list.jump_to_item(0);
                 ctx.redraw = true;
             });
         }
@@ -610,6 +622,10 @@ impl SettingList {
             state,
             styles,
             project_mode,
+            edit_notice: RefCell::new(None),
+            edit_before: RefCell::new(None),
+            host_hint: RefCell::new(None),
+            load_notice: RefCell::new(None),
             on_change: None,
             on_open: None,
             on_clear: None,
@@ -631,6 +647,9 @@ impl SettingList {
     pub(crate) fn set_value(&self, id: &str, value: &str) {
         let mut state = self.state.borrow_mut();
         if let Some(row) = state.rows.iter_mut().find(|r| r.id == id) {
+            self.edit_before
+                .borrow_mut()
+                .get_or_insert_with(|| (row.id.clone(), row.value.clone(), row.inherited));
             row.value = value.to_string();
         }
     }
@@ -659,10 +678,64 @@ impl SettingList {
             .max()
             .unwrap_or(0);
         state.rows = rows;
-        apply_setting_filter(&mut state, &mut self.list.borrow_mut());
+        let mut list = self.list.borrow_mut();
+        apply_setting_filter(&mut state, &mut list);
+        list.jump_to_item(0);
     }
 
-    /// A row's current displayed value, for tests.
+    /// Add independently loaded rows without replacing an edit or moving the
+    /// selection in the rows already on screen.
+    pub(crate) fn merge_rows(&self, rows: Vec<SettingRow>) {
+        let selected = self.selected().map(|row| row.id);
+        let mut state = self.state.borrow_mut();
+        for row in rows {
+            if let Some(existing) = state.rows.iter_mut().find(|existing| existing.id == row.id) {
+                *existing = row;
+            } else {
+                state.rows.push(row);
+            }
+        }
+        state.label_width = state
+            .rows
+            .iter()
+            .map(|row| row.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let mut list = self.list.borrow_mut();
+        apply_setting_filter(&mut state, &mut list);
+        if let Some(position) =
+            selected.and_then(|id| state.visible.iter().position(|&i| state.rows[i].id == id))
+        {
+            list.cursor = u32::try_from(position).expect("row count fits u32");
+        } else {
+            list.cursor = list.cursor.min(
+                u32::try_from(state.visible.len())
+                    .unwrap()
+                    .saturating_sub(1),
+            );
+        }
+        list.ensure_scroll();
+    }
+
+    pub(crate) fn host_hint(&self, hint: String) {
+        *self.host_hint.borrow_mut() = Some(hint);
+    }
+
+    pub(crate) fn load_notice(&self, notice: Option<String>) {
+        *self.load_notice.borrow_mut() = notice;
+    }
+
+    fn footer_text(&self) -> String {
+        let mut lines = Vec::new();
+        if self.project_mode {
+            lines.push(SETTINGS_OVERRIDE_LEGEND.to_string());
+        }
+        lines.extend(self.host_hint.borrow().iter().cloned());
+        lines.extend(self.load_notice.borrow().iter().cloned());
+        lines.join("\n")
+    }
+
+    /// A row's current displayed value.
     #[cfg(test)]
     pub(crate) fn value_of(&self, id: &str) -> Option<String> {
         self.state
@@ -671,6 +744,39 @@ impl SettingList {
             .iter()
             .find(|r| r.id == id)
             .map(|r| r.value.clone())
+    }
+
+    pub(crate) fn begin_save(&self) -> bool {
+        let mut notice = self.edit_notice.borrow_mut();
+        if notice.is_some() {
+            return false;
+        }
+        *notice = Some("Saving… You can close this window.".into());
+        true
+    }
+
+    pub(crate) fn finish_save(&self, confirmed: bool) {
+        if confirmed {
+            self.edit_before.borrow_mut().take();
+        }
+        *self.edit_notice.borrow_mut() = (!confirmed)
+            .then(|| "Could not confirm the change. Reopen this window to refresh.".into());
+    }
+
+    /// A refusal before mutation leaves the previous value known and editable.
+    pub(crate) fn reject_save(&self) {
+        if let Some((id, value, inherited)) = self.edit_before.borrow_mut().take()
+            && let Some(row) = self
+                .state
+                .borrow_mut()
+                .rows
+                .iter_mut()
+                .find(|row| row.id == id)
+        {
+            row.value = value;
+            row.inherited = inherited;
+        }
+        *self.edit_notice.borrow_mut() = None;
     }
 
     /// The cursored row's id, value, and (for a cycle row) its value cycle.
@@ -693,6 +799,9 @@ impl SettingList {
     /// The cursored row's description, for the below-list panel. Empty when
     /// the row carries no description (or there is no cursored row).
     fn selected_description(&self) -> String {
+        if let Some(notice) = &*self.edit_notice.borrow() {
+            return notice.clone();
+        }
         let cursor = usize::try_from(self.list.borrow().cursor).expect("cursor fits usize");
         let state = self.state.borrow();
         state
@@ -721,7 +830,9 @@ impl SettingList {
             return 0;
         }
         let state = self.state.borrow();
-        let mut max = 0;
+        let mut max = self.edit_notice.borrow().as_ref().map_or(0, |notice| {
+            wrapped_height(ctx, notice, width, MAX_DESC_PANEL_HEIGHT)
+        });
         for &row_idx in &state.visible {
             let desc = &state.rows[row_idx].description;
             max = max.max(wrapped_height(ctx, desc, width, MAX_DESC_PANEL_HEIGHT));
@@ -780,15 +891,16 @@ impl Widget for SettingList {
         // Keep at least a couple of list rows. On a cramped overlay we drop
         // the panel rather than starve the list.
         //
-        // In project mode reserve one more row at the very bottom for the
-        // override legend. It shares the panel's height guard: a cramped
-        // overlay drops both rather than starve the list.
-        let legend_height: u16 = u16::from(self.project_mode);
+        // Ownership and loading feedback stay visible independently of the
+        // filter. Leave room for navigating even when the footer wraps.
+        let footer = self.footer_text();
+        let footer_cap = size.height.saturating_sub(2 + reserved + MIN_LIST_ROWS);
+        let legend_height = wrapped_height(ctx, &footer, desc_width, footer_cap);
         let below_list = reserved + legend_height;
         let (list_height, show_panel, show_legend) = {
             let with_below = size.height.saturating_sub(2 + below_list);
             if below_list > 0 && with_below >= MIN_LIST_ROWS {
-                (with_below, reserved > 0, self.project_mode)
+                (with_below, reserved > 0, legend_height > 0)
             } else {
                 (size.height.saturating_sub(2), false, false)
             }
@@ -858,8 +970,7 @@ impl Widget for SettingList {
             }
         }
         if show_legend {
-            // The legend sits directly below the reserved panel block, at the
-            // very bottom of the body (col 2, matching the panel's indent).
+            // The footer follows the description panel and shares its indent.
             let legend_ctx = ctx.with_constraints(
                 Size {
                     width: 0,
@@ -867,15 +978,15 @@ impl Widget for SettingList {
                 },
                 MaxSize {
                     width: Some(desc_width),
-                    height: Some(1),
+                    height: Some(legend_height),
                 },
             );
             let mut rich = RichText::new(vec![TextSpan {
-                text: SETTINGS_OVERRIDE_LEGEND.to_string(),
+                text: footer,
                 style: self.styles.borrow().secondary,
                 ..TextSpan::default()
             }]);
-            rich.softwrap = false;
+            rich.softwrap = true;
             let widget: WidgetRef = Rc::new(RefCell::new(rich));
             surface.children.push(SubSurface {
                 origin: RelativePoint {
@@ -897,6 +1008,14 @@ impl Widget for SettingList {
             if let Some(cb) = self.on_close.as_mut() {
                 cb(ctx);
             }
+            ctx.consume_and_redraw();
+            return;
+        }
+        if self.edit_notice.borrow().is_some()
+            && (action_matches(key, ACTION_SETTINGS_CLEAR)
+                || key.matches(Key::ENTER, Modifiers::empty())
+                || key.matches(u32::from('j'), Modifiers::CTRL))
+        {
             ctx.consume_and_redraw();
             return;
         }
@@ -1056,90 +1175,37 @@ impl Widget for TextEditOverlay {
 /// canonical vocabulary the host's apply path parses.
 pub(crate) struct SettingsValues {
     pub(crate) model_key: (String, String),
-    pub(crate) model_url: Option<String>,
-    pub(crate) thinking: String,
-    pub(crate) thinking_display: Option<String>,
-    pub(crate) speed: String,
-    pub(crate) verbosity: Option<String>,
-    pub(crate) theme: String,
-    pub(crate) disabled_tools: Vec<String>,
-    pub(crate) disabled_skills: Vec<String>,
-    pub(crate) show_thinking_block: bool,
-    pub(crate) show_token_usage: bool,
-    pub(crate) compact_transcript: bool,
-    pub(crate) show_frame_stats: bool,
-    pub(crate) sidebar_cols: String,
-    pub(crate) image_auto_resize: bool,
-    pub(crate) show_image_in_terminal: bool,
-    pub(crate) image_block: bool,
-    pub(crate) bash_rtk: bool,
-    pub(crate) spill_dir: Option<String>,
-    pub(crate) syntax_highlighting: bool,
-    pub(crate) auto_compact: bool,
-    pub(crate) compact_threshold: String,
-    pub(crate) compact_keep_recent: String,
-}
-
-/// The configured theme name for display, defaulting to `light` (the
-/// interactive default) when unset.
-fn config_theme_name(config: &Config) -> String {
-    config.theme.clone().unwrap_or_else(|| "light".to_string())
-}
-
-/// The `(provider, id)` a bare config layer resolves to, applying the default
-/// provider and picking that provider's first catalog model when the id is
-/// unset. Mirrors the run-config resolution so a project row shows what the
-/// file pins.
-fn config_model_key(config: &Config, catalog: &[ModelInfo]) -> (String, String) {
-    let provider = config
-        .model_api
-        .clone()
-        .unwrap_or_else(|| aj_app::model::DEFAULT_PROVIDER_ID.to_string());
-    let id = config.model_name.clone().unwrap_or_else(|| {
-        catalog
-            .iter()
-            .find(|m| m.provider == provider)
-            .map(|m| m.id.clone())
-            .unwrap_or_default()
-    });
-    (provider, id)
+    values: std::collections::BTreeMap<String, String>,
 }
 
 impl SettingsValues {
-    /// The config-layer view of `config` (project-settings windows): every
-    /// value read from the layer, so a project-set row shows exactly what the
-    /// file pins and an unset row shows the inherited value.
-    pub(crate) fn from_config(config: &Config, catalog: &[ModelInfo]) -> SettingsValues {
-        SettingsValues {
-            model_key: config_model_key(config, catalog),
-            model_url: config.model_url.clone(),
-            thinking: config
-                .thinking
-                .map(|l| l.to_string())
-                .unwrap_or_else(|| "off".to_string()),
-            thinking_display: config.thinking_display.map(|d| d.to_string()),
-            speed: config
-                .speed
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "standard".to_string()),
-            verbosity: config.verbosity.map(|v| v.to_string()),
-            theme: config_theme_name(config),
-            disabled_tools: config.disabled_tools.clone(),
-            disabled_skills: config.disabled_skills.clone(),
-            show_thinking_block: config.show_thinking_block,
-            show_token_usage: config.show_token_usage,
-            compact_transcript: config.compact_transcript,
-            show_frame_stats: config.show_frame_stats,
-            sidebar_cols: config.sidebar_cols.to_string(),
-            image_auto_resize: config.image_auto_resize,
-            show_image_in_terminal: config.show_image_in_terminal,
-            image_block: config.image_block,
-            bash_rtk: config.bash_rtk,
-            spill_dir: config.spill_dir.clone(),
-            syntax_highlighting: config.syntax_highlighting,
-            auto_compact: config.auto_compact,
-            compact_threshold: config.compact_threshold.to_string(),
-            compact_keep_recent: config.compact_keep_recent.to_string(),
+    #[cfg(test)]
+    pub(crate) fn from_config(config: &Config, catalog: &[ModelInfo]) -> Self {
+        Self::from_values(aj_app::settings::schema_values(config), catalog)
+    }
+
+    pub(crate) fn from_values(
+        values: std::collections::BTreeMap<String, String>,
+        catalog: &[ModelInfo],
+    ) -> Self {
+        let set = |key: &str| {
+            values
+                .get(key)
+                .filter(|value| value.as_str() != "<unset>")
+                .cloned()
+        };
+        let provider =
+            set("model_api").unwrap_or_else(|| aj_app::model::DEFAULT_PROVIDER_ID.to_string());
+        let model = set("model_name").unwrap_or_else(|| {
+            catalog
+                .iter()
+                .find(|model| model.provider == provider)
+                .map(|model| model.id.clone())
+                .unwrap_or_default()
+        });
+        Self {
+            model_key: (provider, model),
+            values,
         }
     }
 }
@@ -1163,12 +1229,6 @@ fn row_is_project_set(row_id: &str, set_keys: &BTreeSet<String>) -> bool {
     }
 }
 
-/// Canonical `", "`-joined display form of a name set.
-fn join_names(names: &[String]) -> String {
-    let set: BTreeSet<String> = names.iter().cloned().collect();
-    set.into_iter().collect::<Vec<_>>().join(", ")
-}
-
 /// Parse a `", "`-joined name list back into a set.
 fn split_names(joined: &str) -> BTreeSet<String> {
     joined
@@ -1187,53 +1247,39 @@ fn row_value_kind(
     values: &SettingsValues,
     option: &aj_conf::ConfigOption,
 ) -> Option<(String, RowKind)> {
-    let value_or_unset = |v: &Option<String>| v.clone().unwrap_or_else(|| UNSET_VALUE.to_string());
+    let raw = values.values.get(name)?;
+    let value = if raw == "<unset>" {
+        match name {
+            "thinking" => "off",
+            "speed" => "standard",
+            "thinking_display" | "verbosity" => UNSET_VALUE,
+            "theme" => "light",
+            _ => "",
+        }
+        .to_string()
+    } else {
+        raw.clone()
+    };
     Some(match name {
         "model_api" => (
             format!("{}/{}", values.model_key.0, values.model_key.1),
             RowKind::Submenu,
         ),
         "model_name" => return None,
-        "model_url" => (
-            values.model_url.clone().unwrap_or_default(),
-            RowKind::Submenu,
-        ),
-        "thinking" => (values.thinking.clone(), RowKind::Submenu),
-        "thinking_display" => {
-            let mut vals = vec![UNSET_VALUE.to_string()];
-            vals.extend(enum_values(option));
-            (
-                value_or_unset(&values.thinking_display),
-                RowKind::Cycle(vals),
-            )
+        "thinking" => (value, RowKind::Submenu),
+        "thinking_display" | "verbosity" => {
+            let mut choices = vec![UNSET_VALUE.to_string()];
+            choices.extend(enum_values(option));
+            (value, RowKind::Cycle(choices))
         }
-        "speed" => (values.speed.clone(), RowKind::Cycle(enum_values(option))),
-        "verbosity" => {
-            let mut vals = vec![UNSET_VALUE.to_string()];
-            vals.extend(enum_values(option));
-            (value_or_unset(&values.verbosity), RowKind::Cycle(vals))
-        }
-        "theme" => (values.theme.clone(), RowKind::Submenu),
-        "disabled_tools" => (join_names(&values.disabled_tools), RowKind::Submenu),
-        "disabled_skills" => (join_names(&values.disabled_skills), RowKind::Submenu),
-        "show_thinking_block" => (values.show_thinking_block.to_string(), bool_cycle()),
-        "show_token_usage" => (values.show_token_usage.to_string(), bool_cycle()),
-        "compact_transcript" => (values.compact_transcript.to_string(), bool_cycle()),
-        "show_frame_stats" => (values.show_frame_stats.to_string(), bool_cycle()),
-        "sidebar_cols" => (values.sidebar_cols.clone(), RowKind::Submenu),
-        "image_auto_resize" => (values.image_auto_resize.to_string(), bool_cycle()),
-        "show_image_in_terminal" => (values.show_image_in_terminal.to_string(), bool_cycle()),
-        "image_block" => (values.image_block.to_string(), bool_cycle()),
-        "bash_rtk" => (values.bash_rtk.to_string(), bool_cycle()),
-        "spill_dir" => (
-            values.spill_dir.clone().unwrap_or_default(),
-            RowKind::Submenu,
+        _ => (
+            value,
+            match option.kind {
+                ValueKind::Bool => bool_cycle(),
+                ValueKind::Enum(_) => RowKind::Cycle(enum_values(option)),
+                _ => RowKind::Submenu,
+            },
         ),
-        "syntax_highlighting" => (values.syntax_highlighting.to_string(), bool_cycle()),
-        "auto_compact" => (values.auto_compact.to_string(), bool_cycle()),
-        "compact_threshold" => (values.compact_threshold.clone(), RowKind::Submenu),
-        "compact_keep_recent" => (values.compact_keep_recent.clone(), RowKind::Submenu),
-        _ => return None,
     })
 }
 
@@ -1261,14 +1307,6 @@ fn build_setting_rows(
     let mut rows = Vec::new();
     for option in Config::OPTIONS {
         let Some((value, kind)) = row_value_kind(option.name, values, option) else {
-            // `model_name` folds into the model row; an unmapped option is a
-            // schema/window drift we skip rather than crash on.
-            if option.name != "model_name" {
-                tracing::warn!(
-                    option = option.name,
-                    "config option has no settings-window row"
-                );
-            }
             continue;
         };
         let id = row_id_for(option.name).to_string();
@@ -1306,28 +1344,29 @@ fn theme_items(names: &[String], current: &str) -> Vec<SelectItem> {
 /// The catalog snapshot, theme names, and toggle-name sets a settings window's
 /// submenus need. Held together so the on-open handler carries one bundle.
 pub(crate) struct SettingsCatalogs {
+    pub(crate) owner: crate::interactive::SettingsOwner,
     pub(crate) models: Arc<Vec<ModelInfo>>,
     pub(crate) themes: Vec<String>,
     pub(crate) tools: Vec<String>,
     pub(crate) skills: Vec<String>,
 }
 
-/// Open a settings window (user or project) targeting `target`. See the
-/// module docs for the edit flow. `values` are the current displayed values,
+/// Fill an existing settings window targeting `target`, preserving its filter
+/// and focus. `values` are the current displayed values,
 /// `inherited` the user-layer values a project clear reverts to, and
 /// `set_keys` the option names the project layer sets (empty for user).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn open_settings(
+pub(crate) fn fill_settings(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
     chrome: &OverlayChrome,
     activity: &Rc<RefCell<Vec<SelectorActivity>>>,
-    settings_ui: &Rc<RefCell<Option<SettingsUi>>>,
     target: ConfigTarget,
     values: SettingsValues,
     inherited: SettingsValues,
     set_keys: BTreeSet<String>,
-    catalogs: SettingsCatalogs,
+    mut catalogs: SettingsCatalogs,
+    list: &SkillsFill,
 ) {
     let project_mode = target == ConfigTarget::Project;
     // The thinking submenu is filtered to what the current model offers.
@@ -1340,13 +1379,18 @@ pub(crate) fn open_settings(
         .find(|m| m.provider == values.model_key.0 && m.id == values.model_key.1)
         .map(thinking_levels_for)
         .unwrap_or_else(|| THINKING_LEVELS.iter().collect());
-    let rows = build_setting_rows(&values, &inherited, project_mode, &set_keys);
-    let list = Rc::new(RefCell::new(SettingList::new(
-        rows,
-        chrome.select.clone(),
-        project_mode,
-    )));
-    let focus = list.borrow().focus_target();
+    let mut rows = build_setting_rows(&values, &inherited, project_mode, &set_keys);
+    if catalogs.owner.is_remote() {
+        for row in &mut rows {
+            if !aj_app::settings::is_presentation(&row.id) {
+                row.label.push_str(" *");
+            }
+        }
+    }
+    list.borrow().merge_rows(rows);
+    catalogs.owner.bind_rows(list);
+    let owner = catalogs.owner.clone();
+    let clear_owner = owner.clone();
     {
         let mut l = list.borrow_mut();
         // Cycle edits: stage the change for the host to persist.
@@ -1355,6 +1399,7 @@ pub(crate) fn open_settings(
             activity_change
                 .borrow_mut()
                 .push(SelectorActivity::SettingChange {
+                    owner: owner.clone(),
                     target,
                     id: id.to_string(),
                     value: value.to_string(),
@@ -1365,8 +1410,11 @@ pub(crate) fn open_settings(
         let editor_open = Rc::clone(editor);
         let chrome_open = chrome.clone();
         let activity_open = Rc::clone(activity);
-        let list_open = Rc::clone(&list);
+        let list_open = Rc::downgrade(list);
         l.on_open = Some(Box::new(move |ctx, id, value| {
+            let Some(list_open) = list_open.upgrade() else {
+                return;
+            };
             open_setting_submenu(
                 ctx,
                 &stack_open,
@@ -1388,20 +1436,38 @@ pub(crate) fn open_settings(
                 activity_clear
                     .borrow_mut()
                     .push(SelectorActivity::SettingClear {
+                        owner: clear_owner.clone(),
                         id: id.to_string(),
                         inherited: inherited_value.to_string(),
                     });
             }));
         }
-        // Esc closes and releases the host's live handles.
-        let stack_close = Rc::clone(stack);
-        let editor_close = Rc::clone(editor);
-        let settings_ui_close = Rc::clone(settings_ui);
-        l.on_close = Some(Box::new(move |ctx| {
-            *settings_ui_close.borrow_mut() = None;
-            close_top(&stack_close, ctx, &editor_close);
-        }));
     }
+}
+
+/// Open an empty settings window. The caller installs client rows immediately
+/// and adds host rows when their background read finishes.
+pub(crate) fn open_settings_loading(
+    stack: &Rc<RefCell<OverlayStack>>,
+    editor: &WidgetRef,
+    chrome: &OverlayChrome,
+    settings_ui: &Rc<RefCell<Option<SettingsUi>>>,
+    target: ConfigTarget,
+) -> SkillsFill {
+    let project_mode = target == ConfigTarget::Project;
+    let list = Rc::new(RefCell::new(SettingList::new(
+        Vec::new(),
+        chrome.select.clone(),
+        project_mode,
+    )));
+    let focus = list.borrow().focus_target();
+    let stack_close = Rc::clone(stack);
+    let editor_close = Rc::clone(editor);
+    let ui_close = Rc::clone(settings_ui);
+    list.borrow_mut().on_close = Some(Box::new(move |ctx| {
+        *ui_close.borrow_mut() = None;
+        close_top(&stack_close, ctx, &editor_close);
+    }));
     let title = if project_mode {
         "Project settings"
     } else {
@@ -1416,7 +1482,31 @@ pub(crate) fn open_settings(
         focus,
         OverlayPlacement::Large,
     );
-    *settings_ui.borrow_mut() = Some(SettingsUi { list, window });
+    *settings_ui.borrow_mut() = Some(SettingsUi {
+        list: Rc::clone(&list),
+        window,
+    });
+    list
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_settings(
+    stack: &Rc<RefCell<OverlayStack>>,
+    editor: &WidgetRef,
+    chrome: &OverlayChrome,
+    activity: &Rc<RefCell<Vec<SelectorActivity>>>,
+    settings_ui: &Rc<RefCell<Option<SettingsUi>>>,
+    target: ConfigTarget,
+    values: SettingsValues,
+    inherited: SettingsValues,
+    set_keys: BTreeSet<String>,
+    catalogs: SettingsCatalogs,
+) {
+    let list = open_settings_loading(stack, editor, chrome, settings_ui, target);
+    fill_settings(
+        stack, editor, chrome, activity, target, values, inherited, set_keys, catalogs, &list,
+    );
 }
 
 /// The settings window's key-hint subtitle. The project window advertises the
@@ -1470,6 +1560,7 @@ fn open_setting_submenu(
                 parent,
                 activity,
                 target,
+                catalogs.owner.clone(),
                 "Select model",
                 id.to_string(),
                 items,
@@ -1492,6 +1583,7 @@ fn open_setting_submenu(
                 parent,
                 activity,
                 target,
+                catalogs.owner.clone(),
                 "Thinking effort",
                 id.to_string(),
                 items,
@@ -1509,6 +1601,7 @@ fn open_setting_submenu(
                 parent,
                 activity,
                 target,
+                catalogs.owner.clone(),
                 "Theme",
                 id.to_string(),
                 items,
@@ -1524,6 +1617,7 @@ fn open_setting_submenu(
             parent,
             activity,
             target,
+            catalogs.owner.clone(),
             "Disabled tools",
             id.to_string(),
             &catalogs.tools,
@@ -1537,6 +1631,7 @@ fn open_setting_submenu(
             parent,
             activity,
             target,
+            catalogs.owner.clone(),
             "Disabled skills",
             id.to_string(),
             &catalogs.skills,
@@ -1552,6 +1647,7 @@ fn open_setting_submenu(
             parent,
             activity,
             target,
+            catalogs.owner.clone(),
             id.to_string(),
             value,
         ),
@@ -1569,6 +1665,7 @@ fn open_picker_submenu(
     parent: &Rc<RefCell<SettingList>>,
     activity: &Rc<RefCell<Vec<SelectorActivity>>>,
     target: ConfigTarget,
+    owner: crate::interactive::SettingsOwner,
     title: &str,
     id: String,
     items: Vec<SelectItem>,
@@ -1598,6 +1695,7 @@ fn open_picker_submenu(
                 activity_c
                     .borrow_mut()
                     .push(SelectorActivity::SettingChange {
+                        owner: owner.clone(),
                         target,
                         id: id.clone(),
                         value,
@@ -1624,6 +1722,7 @@ fn open_text_submenu(
     parent: &Rc<RefCell<SettingList>>,
     activity: &Rc<RefCell<Vec<SelectorActivity>>>,
     target: ConfigTarget,
+    owner: crate::interactive::SettingsOwner,
     id: String,
     value: &str,
 ) {
@@ -1641,6 +1740,7 @@ fn open_text_submenu(
             activity_c
                 .borrow_mut()
                 .push(SelectorActivity::SettingChange {
+                    owner: owner.clone(),
                     target,
                     id: id_submit.clone(),
                     value: text.to_string(),
@@ -1675,6 +1775,7 @@ fn open_toggles_submenu(
     parent: &Rc<RefCell<SettingList>>,
     activity: &Rc<RefCell<Vec<SelectorActivity>>>,
     target: ConfigTarget,
+    owner: crate::interactive::SettingsOwner,
     title: &str,
     id: String,
     names: &[String],
@@ -1732,6 +1833,7 @@ fn open_toggles_submenu(
                 activity_close
                     .borrow_mut()
                     .push(SelectorActivity::SettingChange {
+                        owner: owner.clone(),
                         target,
                         id: id.clone(),
                         value: joined,
@@ -1784,15 +1886,20 @@ pub(crate) struct SkillRow {
     pub(crate) disable_model_invocation: bool,
 }
 
-/// The skills window's fill handle: the drive loop replaces the loading
-/// placeholder with the discovered rows through it once the off-loop
-/// discovery walk lands. Parked on open so the fill targets this captured
-/// list, never the stack's `top()`.
+/// A list opened on a loading placeholder, which its fill replaces with the
+/// discovered rows once they land. The fill targets this captured list, never
+/// the stack's `top()`.
 pub(crate) type SkillsFill = Rc<RefCell<SettingList>>;
+
+/// What the skills fill needs: the list to fill and the host it reads from.
+pub(crate) struct SkillsFetch {
+    pub(crate) list: SkillsFill,
+    pub(crate) owner: crate::interactive::SettingsOwner,
+}
 
 /// Build one skills-window row per discovered skill. Each Enter toggles the
 /// highlighted skill (see [`open_skills`]'s `on_change`), so every row is a
-/// bool cycle. Shared by the drive loop's skills fill arm.
+/// bool cycle.
 pub(crate) fn build_skill_rows(skills: Vec<SkillRow>) -> Vec<SettingRow> {
     skills
         .into_iter()
@@ -1837,28 +1944,28 @@ pub(crate) fn skills_placeholder_row(label: &str) -> SettingRow {
     }
 }
 
-/// Open the skills window with a loading placeholder and park its fill handle
-/// for the drive loop.
+/// Open the skills window with a loading placeholder and hand back the list
+/// its fill replaces once discovery has answered.
 ///
 /// The window opens immediately (on top of whatever is on the stack, e.g. the
-/// palette) so the user sees it right away. Discovery walks the skill tree off
-/// the loop, and the drive loop replaces the placeholder with the discovered
-/// rows through the parked fill handle once the walk lands. The `on_change`
-/// (toggle) and `on_close` wiring operates by row id/name, so it works
-/// unchanged once real rows replace the placeholder. Does not move focus: the
-/// caller (host) posts the refocus event.
+/// palette) so the user sees it right away. The `on_change` (toggle) and
+/// `on_close` wiring operates by row id/name, so it works unchanged once real
+/// rows replace the placeholder. Does not move focus: the caller (host) posts
+/// the refocus event.
 pub(crate) fn open_skills(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
     chrome: &OverlayChrome,
     activity: &Rc<RefCell<Vec<SelectorActivity>>>,
-    fill_slot: &Rc<RefCell<Option<SkillsFill>>>,
-) {
+    mut owner: crate::interactive::SettingsOwner,
+) -> SkillsFetch {
     let list = Rc::new(RefCell::new(SettingList::new(
         vec![skills_placeholder_row("Loading skills\u{2026}")],
         chrome.select.clone(),
         false,
     )));
+    owner.bind_rows(&list);
+    let change_owner = owner.clone();
     let focus = list.borrow().focus_target();
     {
         let mut l = list.borrow_mut();
@@ -1867,6 +1974,7 @@ pub(crate) fn open_skills(
             activity_change
                 .borrow_mut()
                 .push(SelectorActivity::SkillToggle {
+                    owner: change_owner.clone(),
                     name: name.to_string(),
                     disable: value == "disabled",
                 });
@@ -1886,11 +1994,9 @@ pub(crate) fn open_skills(
         focus,
         OverlayPlacement::Large,
     );
-    // Park the fill handle so the drive loop can replace the placeholder with
-    // the discovered rows. The fill targets this captured list, never the
-    // stack's `top()`, so a confirm of another opener from the still-open
-    // palette can't misdirect it.
-    *fill_slot.borrow_mut() = Some(list);
+    // The fill targets this captured list, never the stack's `top()`, so a
+    // confirm of another opener from the still-open palette can't misdirect it.
+    SkillsFetch { list, owner }
 }
 
 #[cfg(test)]
@@ -2041,6 +2147,13 @@ mod tests {
             SettingsValues::from_config(&config, &[]),
             BTreeSet::new(),
             SettingsCatalogs {
+                owner: crate::interactive::SettingsOwner::new(
+                    crate::control::Control::remote(
+                        crate::remote::RemoteClient::new("http://127.0.0.1:1").unwrap(),
+                    ),
+                    "unconnected-widget-test".to_string(),
+                    Arc::new(Vec::new()),
+                ),
                 models: Arc::new(Vec::new()),
                 themes: Vec::new(),
                 tools: Vec::new(),
@@ -2334,7 +2447,10 @@ mod tests {
         let mut config = Config::default();
         config.show_frame_stats = true;
         let values = SettingsValues::from_config(&config, &[]);
-        assert!(values.show_frame_stats, "from_config seeds the flag");
+        assert_eq!(
+            values.values["show_frame_stats"], "true",
+            "from_config seeds the flag"
+        );
 
         let inherited = SettingsValues::from_config(&Config::default(), &[]);
         let rows = build_setting_rows(&values, &inherited, false, &BTreeSet::new());

@@ -833,6 +833,7 @@ mod tests {
             user: Config::default(),
             project: ConfigLayer::default(),
             project_path: None,
+            writes: Default::default(),
         }
     }
 
@@ -900,6 +901,7 @@ mod tests {
             user: Config::default(),
             project: ConfigLayer::default(),
             project_path: Some(dir.path().join("project-config.toml")),
+            writes: Default::default(),
         };
         let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
         let composed = compose_host(&args, layers, &empty_auth(&dir), &persistence, None)

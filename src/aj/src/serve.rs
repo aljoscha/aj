@@ -124,6 +124,7 @@ pub(crate) async fn run(mut args: Args) -> Result<()> {
         user: user_config,
         project: project_layer,
         project_path: Config::project_config_file_path(),
+        writes: Default::default(),
     };
     let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
     let sessions_dir = Config::get_sessions_dir_path()?;

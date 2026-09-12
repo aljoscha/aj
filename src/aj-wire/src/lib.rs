@@ -92,6 +92,13 @@ pub const BRANCH_SETTINGS_CAPABILITY: &str = "branch_settings";
 /// The capability for recorded message settings and targeted environment reads.
 pub const TRANSCRIPT_SETTINGS_CAPABILITY: &str = "transcript_settings";
 
+/// The capability for host config reads and edits, and for `persist` on the
+/// settings command.
+pub const HOST_CONFIG_CAPABILITY: &str = "host_config";
+
+/// The capability for host skill discovery and user-default toggles.
+pub const HOST_SKILLS_CAPABILITY: &str = "host_skills";
+
 /// A creator-selected model, resolved against the receiving host's catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -240,6 +247,14 @@ pub struct QueueOutcome {
     pub text: Option<String>,
 }
 
+/// An accepted mutation's optional partial-success diagnostic. An empty HTTP
+/// body also means complete acceptance. Effects still arrive on the event stream.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CommandAcceptance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
+}
+
 /// Starts a manual compaction with optional instructions.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -248,9 +263,73 @@ pub struct CompactRequest {
     pub instructions: Option<String>,
 }
 
+/// The host's config as the settings editor shows it: schema-keyed values of
+/// the user layer and the effective merge, which project keys are set, and
+/// the catalogs the editor offers. Never credentials.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostConfig {
+    pub user: BTreeMap<String, String>,
+    pub effective: BTreeMap<String, String>,
+    pub project_keys: Vec<String>,
+    pub has_project: bool,
+    pub models: Vec<aj_models::registry::ModelInfo>,
+    pub tools: Vec<String>,
+    pub skills: Vec<String>,
+}
+
+/// One host config value to write into the layer `persist` names. `value` is
+/// absent only for a project clear.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigEdit {
+    pub key: String,
+    pub value: Option<String>,
+    pub persist: PersistAction,
+}
+
+/// Discovered metadata only, never a skill's body.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub enabled: bool,
+    pub disable_model_invocation: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillToggle {
+    pub name: String,
+    pub disable: bool,
+}
+
+/// Which host config layer a change is also written to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistAction {
+    /// The session only, no config file changes.
+    #[default]
+    None,
+    /// The host's user config.
+    User,
+    /// An override in the host's project config.
+    ProjectSet,
+    /// Remove the override from the host's project config.
+    ProjectClear,
+}
+
+impl PersistAction {
+    fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+}
+
 /// Applies an inference setting change. Account mutations use [`AccountRequest`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsRequest {
+    #[serde(default, skip_serializing_if = "PersistAction::is_none")]
+    pub persist: PersistAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentId>,
     #[serde(flatten)]
@@ -1014,6 +1093,8 @@ mod request {
     #[serde(deny_unknown_fields)]
     struct StrictSettingsRequest {
         #[serde(default)]
+        persist: PersistAction,
+        #[serde(default)]
         agent: Option<AgentId>,
         #[serde(default)]
         model: Option<ModelSelection>,
@@ -1031,6 +1112,7 @@ mod request {
         SettingsRequest,
         StrictSettingsRequest,
         |request: StrictSettingsRequest| SettingsRequest {
+            persist: request.persist,
             agent: request.agent,
             change: SessionSettings {
                 model: request.model,
@@ -1048,6 +1130,8 @@ mod request {
     request_body!(EnvRequest, EnvRequest, |request| request);
     request_body!(AccountRequest, AccountRequest, |request| request);
     request_body!(UsageResetRequest, UsageResetRequest, |request| request);
+    request_body!(ConfigEdit, ConfigEdit, |request| request);
+    request_body!(SkillToggle, SkillToggle, |request| request);
 
     request_body!(TagRequest, TagRequest, |request| request);
 

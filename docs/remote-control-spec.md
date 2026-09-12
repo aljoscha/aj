@@ -414,7 +414,11 @@ Client application rules:
 
 Commands are JSON POSTs. Effects are observable on the stream or the
 corresponding read. Mutations against a specific session return 202 on
-acceptance. `POST /v1/sessions`
+acceptance. An optional JSON body `{incomplete: <message>}` reports a change
+that applied but whose requested save or log record failed. An empty body or
+absent `incomplete` means complete acceptance. The caller can report partial
+success without correlating an event-stream warning with its request.
+`POST /v1/sessions`
 returns 200 with the new session's id. Commands that act on "the viewed
 agent" locally take an optional `agent` field (default: the main agent).
 
@@ -426,7 +430,7 @@ agent" locally take an optional `agent` field (default: the main agent).
 | `.../{id}/cancel` | `{agent?}` | Cancel the targeted agent through the mechanism that owns its run: its driven turn, a detached sub-agent's background task, or the foreground-sub-agent-cancels-main cascade. A running mark with no owning turn or task is 409 `conflict`. An idle or completed target is accepted. |
 | `.../{id}/queue` | `{op: "remove", agent?}` or `{op: "clear"}` | Withdraw one agent's pending message, or clear the session's queues. A withdrawal answers 200 `{text?}` with the text it took, which is what makes the dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index. A clear answers 202. |
 | `.../{id}/compact` | `{instructions?}` | Manual compaction. |
-| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, optional `agent` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. A remote change never persists to the host's config files. |
+| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, optional `agent`, `persist` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. `persist` defaults to `none`, or is `user`, `project_set`, or `project_clear`, and also writes the value into that host config layer. Persistence is main-agent only. Capability `host_config`. |
 | `.../{id}/account` | `{provider, account?}` | Select an account for this session and provider from the host-local auth store. Missing or null `account` resets to Provider default, `""` pins the unnamed account, any other string pins that exact label. Does not change the provider's auth-store default. Read the result through `accounts`. Capability `session_accounts` (section 5.10). |
 | `.../{id}/env` | `{key, value}` | Set one session environment value, including the empty string. Null or an absent `value` removes the key from the map, not from the inherited process environment. Idle-only: 409 `conflict` while a turn or background task is live. Validates before mutation and persists the full resulting active-branch map. Capability `session_env` (section 5.10). |
 | `.../{id}/tag` | `{tag}`, empty or absent clears | Set the session's tag (section 5.8): one trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
@@ -447,8 +451,10 @@ or auth defaults.
 Branch preparation is client-owned. The editor combines the selected message's
 recorded `branch_settings` with explicit choices, leaving unrecorded axes
 unspecified rather than borrowing the live branch's values. No host request is
-needed to arm a branch or edit inference settings. The environment editor reads
-the selected branch point only when opened (section 5.7). Submission resolves
+needed to arm a branch or stage session-only inference settings. Saving a
+staged axis into the host's config is an ordinary config edit (section 5.6).
+The environment editor reads the selected branch point only when opened
+(section 5.7). Submission resolves
 inheritance and validates the requested combination on the host.
 
 Capability `branch_settings` covers head overrides. Empty
@@ -478,6 +484,70 @@ Errors cross the wire as a small envelope: `{code, message, ...fields}`.
 error that references a session carries it in a top-level `session`
 field, so a gateway rewrites error bodies without understanding the
 code.
+
+#### Host config and skills
+
+Two things can hold a setting: the running session, which the settings
+command changes, and the host's config files, which seed every new session.
+Capability `host_config` covers the second: `GET` and `POST
+/v1/sessions/{id}/config`, plus `persist` on the settings command for the
+common "apply and save" gesture. The session id routes to the owning host
+and must name a session in its store. Reading does not materialize it.
+
+A read returns `HostConfig`: the `user` layer and the `effective` merge as
+schema-keyed string maps in the editor's vocabulary (`<unset>` for absent
+optionals, comma-separated name lists), `project_keys`, `has_project`, and
+the host's `models`, `tools`, and `skills` catalogs. Nothing from the auth
+store, environment, or arbitrary config-file keys. Connections are trusted,
+so complete model and catalog URLs round-trip without masking. The
+standalone model and thinking selectors read the same model catalog through
+`GET /v1/sessions/{id}/models`, a model array under `host_config`. This read
+does not discover skills or read config layers. Selectors show a notice if
+it fails, never the client's catalog.
+
+A write is one `ConfigEdit`, `{key, value, persist}`, into the layer
+`persist` names: `user` or `project_set` with a string value, `project_clear`
+with none. Unknown keys, malformed values and presentation keys are refused
+before anything changes, as is a project edit on a host without a
+repository. The inference axes (`model` as `provider/id`, `thinking`,
+`thinking_display`, `speed`, `verbosity`) are accepted in the editor's
+vocabulary and land exactly as a persisted settings command would land them,
+without touching any session. That is how an editor saves an axis while a
+branch draft is open: the config is written at once and the session effect
+waits for the branch. A save succeeds or fails as a whole and the host's
+effective config only ever reflects what reached disk, so a same-value retry
+after a failed save writes again.
+
+Capability `host_skills` adds `GET /v1/sessions/{id}/skills`, returning
+discovered `{name, description, path, enabled, disable_model_invocation}`
+metadata, and `POST /v1/sessions/{id}/skills` with `{name, disable}`.
+Discovery uses the host's working directory and user skill roots. A toggle
+needs a discovered name and edits `disabled_skills` in the host's user config
+for new sessions. Running sessions keep their prompt's skill listing.
+
+The settings and skills editors capture the session and host they opened on
+and stay responsive while host reads run in the background. Settings starts
+with editable client presentation rows and a host-loading notice. Host rows
+arrive below them without replacing client edits or moving the selection.
+Skills starts with a loading placeholder. A reply fills only the window that
+asked for it. Saves also run off the input loop, with one outstanding edit per
+window. The chosen value stays visible and the user can navigate or close
+while saving. A definite validation or endpoint refusal restores the previous
+value and leaves the window editable. An unconfirmed save pauses further edits
+and asks the user to reopen the window to refresh. A save that failed after
+the session applied the change is reported in the notice.
+Branch choices are staged immediately, independently of saving their defaults.
+An unsupported endpoint shows a notice and never falls back to reading or
+writing the client's config.
+
+Theme, transcript rendering, image rendering, frame statistics, sidebar width,
+and keybindings belong to the client. Their settings remain available when
+host discovery fails. The editor reads and writes them in the client's own
+layers and applies their live rendering effect locally. Over a connection,
+host-side rows carry `*`, with a footer naming the opening host and explaining
+that unmarked settings belong to the client. Local runs need no ownership
+marker. A project edit without a repository on its owning side reports that
+side's limitation. Neither side's values fall back to the other's.
 
 ### 5.7 Reads
 
@@ -748,6 +818,8 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `prompt_history` | Workspace and All prompt-history reads | hosts and gateways |
   | `credentials` | `GET` and `POST /v1/sessions/{id}/credentials` (section 5.12) | hosts |
   | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
+  | `host_config` | `GET` and `POST /v1/sessions/{id}/config`, `GET /v1/sessions/{id}/models`, and `settings.persist` | hosts |
+  | `host_skills` | `GET` and `POST /v1/sessions/{id}/skills` | hosts |
   | `compaction_usage` | optional cumulative `usage` on durable `compaction_end`, identified by the frame's `entry_id` | hosts |
 
   A capability is self-description, never a gate: probing an endpoint

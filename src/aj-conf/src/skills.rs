@@ -97,11 +97,19 @@ struct SkillFrontmatter {
 /// are still returned but marked [`Skill::enabled`]` = false`.
 pub fn discover_skills(disabled: &[String]) -> (Vec<Skill>, Vec<SkillDiagnostic>) {
     let working_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let git_root = crate::paths::find_git_root(&working_directory);
+    discover_skills_in(&working_directory, disabled)
+}
+
+/// Discover skills for a host directory and the process's user skill roots.
+pub fn discover_skills_in(
+    working_directory: &Path,
+    disabled: &[String],
+) -> (Vec<Skill>, Vec<SkillDiagnostic>) {
+    let git_root = crate::paths::find_git_root(working_directory);
     let home = crate::paths::home_dir();
     discover_skills_at(
         home.as_deref(),
-        &working_directory,
+        working_directory,
         git_root.as_deref(),
         disabled,
     )

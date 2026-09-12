@@ -114,6 +114,7 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
             user: Config::default(),
             project: ConfigLayer::default(),
             project_path: None,
+            writes: Default::default(),
         })),
         catalog: Arc::new(Vec::new()),
         defaults: RunConfigDefaults::fixed(RunConfigSnapshot {

@@ -46,7 +46,7 @@ use crate::host::{
     SettingsAxis, SettingsChange, mint_epoch, persistence_failure_message,
 };
 use crate::session::AgentLifecycle;
-use crate::settings::ConfirmOutcome;
+use crate::settings::{ConfirmOutcome, PersistAction};
 use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 
 /// Resolve a head target against `log` to the entry the head moves to.
@@ -752,6 +752,30 @@ impl Driver {
         Ok(CommandOutcome::Accepted)
     }
 
+    fn validate_settings_persistence(&self, change: &SettingsChange) -> Result<(), HostError> {
+        if change.persist != PersistAction::None && change.agent != AgentId::Main {
+            return Err(HostError::Invalid(
+                "sub-agent settings cannot persist defaults".into(),
+            ));
+        }
+        if matches!(
+            change.persist,
+            PersistAction::ProjectSet | PersistAction::ProjectClear
+        ) && self
+            .shared
+            .layers
+            .lock()
+            .expect("config layers mutex poisoned")
+            .project_path
+            .is_none()
+        {
+            return Err(HostError::Invalid(
+                "Project settings need a git repository on the host.".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Apply a settings change and synthesize its frames: the notice tagged
     /// with the entry the change appended, then a refreshed `state`.
     ///
@@ -759,6 +783,7 @@ impl Driver {
     /// host staged nothing and has nothing to publish, and a client told
     /// "accepted" would show settings this host never adopted.
     async fn settings(&mut self, change: SettingsChange) -> Result<CommandOutcome, HostError> {
+        self.validate_settings_persistence(&change)?;
         let SettingsChange {
             agent,
             persist,
@@ -870,6 +895,12 @@ impl Driver {
             self.publish_state_entry(agent, entry, &outcome.notice)
                 .await;
         }
+        let incomplete = (!outcome.notes.is_empty()).then(|| {
+            format!(
+                "Current-session setting applied. {}",
+                outcome.notes.join(" ")
+            )
+        });
         for note in outcome.notes {
             // A failed config write or log record is a live-only
             // diagnostic: no entry exists for a backfill to regenerate it
@@ -878,7 +909,7 @@ impl Driver {
                 None,
                 AgentEvent::Warning {
                     agent_id: agent,
-                    text: note,
+                    text: format!("Current-session setting applied. {note}"),
                 },
             );
         }
@@ -887,7 +918,7 @@ impl Driver {
             status.settings = settings;
             true
         });
-        Ok(CommandOutcome::Accepted)
+        Ok(incomplete.map_or(CommandOutcome::Accepted, CommandOutcome::Incomplete))
     }
 
     async fn publish_state_entry(&mut self, agent: AgentId, entry: &EntryRef, confirmation: &str) {

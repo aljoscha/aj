@@ -79,6 +79,25 @@ impl From<CreateError> for ControlError {
 }
 
 impl ControlError {
+    /// A refusal before mutation, unlike an internal, gateway, or transport
+    /// failure whose outcome a caller must refresh before retrying.
+    pub(crate) fn mutation_refused(&self) -> bool {
+        match self {
+            Self::Host(error) => !matches!(error, HostError::Internal(_)),
+            Self::Remote(error) => matches!(
+                error.status(),
+                Some(
+                    StatusCode::BAD_REQUEST
+                        | StatusCode::NOT_FOUND
+                        | StatusCode::CONFLICT
+                        | StatusCode::UNAUTHORIZED
+                        | StatusCode::FORBIDDEN
+                )
+            ),
+            Self::PartialCreate { .. } | Self::Preview(_) => false,
+        }
+    }
+
     /// Whether the peer refused because its current state conflicts with the
     /// request: a turn in flight, background work live, a head switch that
     /// would strand it (the wire's 409).
@@ -249,7 +268,21 @@ impl Control {
         command: Command,
     ) -> Result<CommandOutcome, ControlError> {
         match self {
-            Self::Local(local) => Ok(local.host.command(session, command).await?),
+            Self::Local(local) => {
+                let mut command = command;
+                if let Command::Settings(change) = &mut command
+                    && let SettingsAxis::Model(info) = &change.axis
+                {
+                    change.axis = SettingsAxis::Model(local.host.resolve_model_selection(
+                        &ModelSelection {
+                            api: info.provider.clone(),
+                            name: info.id.clone(),
+                            url: None,
+                        },
+                    )?);
+                }
+                Ok(local.host.command(session, command).await?)
+            }
             Self::Remote(remote) => Ok(remote
                 .client
                 .command(session, &wire_command(command))
@@ -341,6 +374,59 @@ impl Control {
                 None => local.host.environment(session).await?,
             }),
             Self::Remote(remote) => Ok(remote.client.environment(session, before).await?),
+        }
+    }
+
+    /// Model choices from the addressed host, independent of its config editor.
+    pub(crate) async fn models(
+        &self,
+        session: &str,
+    ) -> Result<Vec<aj_models::registry::ModelInfo>, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.models(session).await?),
+            Self::Remote(remote) => Ok(remote.client.models(session).await?),
+        }
+    }
+
+    /// The host's config layers and editor catalogs, as the settings editor
+    /// shows them.
+    pub(crate) async fn config(&self, session: &str) -> Result<aj_wire::HostConfig, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.config(session).await?),
+            Self::Remote(remote) => Ok(remote.client.config(session).await?),
+        }
+    }
+
+    /// Write one value into a host config layer, without touching any session.
+    pub(crate) async fn edit_config(
+        &self,
+        session: &str,
+        edit: aj_wire::ConfigEdit,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.edit_config(session, edit).await?),
+            Self::Remote(remote) => Ok(remote.client.edit_config(session, edit).await?),
+        }
+    }
+
+    pub(crate) async fn skills(
+        &self,
+        session: &str,
+    ) -> Result<Vec<aj_wire::SkillInfo>, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.skills(session).await?),
+            Self::Remote(remote) => Ok(remote.client.skills(session).await?),
+        }
+    }
+
+    pub(crate) async fn toggle_skill(
+        &self,
+        session: &str,
+        toggle: aj_wire::SkillToggle,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.toggle_skill(session, toggle).await?),
+            Self::Remote(remote) => Ok(remote.client.toggle_skill(session, toggle).await?),
         }
     }
 
@@ -619,13 +705,13 @@ fn head_request(target: HeadTarget) -> HeadRequest {
     }
 }
 
-/// The wire form of a settings change.
-///
-/// Persistence is deliberately dropped: the wire has no persist axis, since
-/// the config files a host would write are the host's own. The caller says
-/// so in its notice rather than silently pretending the default moved.
+/// The wire form of a host settings change, including its persistence intent.
 pub(crate) fn settings_request(change: SettingsChange) -> SettingsRequest {
-    let SettingsChange { agent, axis, .. } = change;
+    let SettingsChange {
+        agent,
+        axis,
+        persist,
+    } = change;
     let mut wire = SessionSettings::default();
     match axis {
         SettingsAxis::Model(info) => {
@@ -658,6 +744,7 @@ pub(crate) fn settings_request(change: SettingsChange) -> SettingsRequest {
         }
     }
     SettingsRequest {
+        persist,
         agent: agent_target(agent),
         change: wire,
     }

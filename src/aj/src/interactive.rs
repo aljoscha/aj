@@ -45,14 +45,12 @@ use aj_app::theme::{
 };
 use aj_app::turn::running_work_counts;
 use aj_conf::skills::Skill;
-use aj_conf::{
-    AgentEnv, Config, ConfigDiagnostic, ConfigThinkingDisplay, ConfigVerbosity, Severity,
-};
+use aj_conf::{AgentEnv, Config, ConfigDiagnostic, Severity};
 use aj_models::auth::AuthStorage;
 use aj_models::oauth::OAuthError;
 use aj_models::registry::ModelInfo;
 use aj_models::types::UserContent;
-use aj_models::{ThinkingConfig, speed_from_name, thinking_config_from_name};
+use aj_models::{ThinkingConfig, thinking_config_from_name};
 use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter};
 use aj_wire::{
     CredentialMutation, CredentialOutcome, CredentialOverview, StoredCredentialMetadata,
@@ -101,8 +99,8 @@ use crate::session_tag::{TagEdit, open_session_tag};
 use crate::session_tree::{build_tree_rows, open_session_tree};
 use crate::settings_ui::{
     MODEL_SETTING_ID, SelectorActivity, SettingsCatalogs, SettingsUi, SettingsValues, SkillRow,
-    SkillsFill, UNSET_VALUE, build_skill_rows, open_model, open_settings, open_skills,
-    open_thinking, skills_placeholder_row,
+    SkillsFetch, SkillsFill, build_skill_rows, fill_model, fill_settings, fill_thinking,
+    open_selector_loading, open_settings_loading, open_skills, skills_placeholder_row,
 };
 #[cfg(test)]
 use crate::sidebar::{RowStatus, SIDEBAR_COLS, SidebarRow};
@@ -214,9 +212,8 @@ struct World {
     /// settings windows mutate one layer, recompute the effective config, and
     /// persist that layer's file (see [`aj_app::settings`]).
     config_layers: Arc<StdMutex<ConfigLayers>>,
-    /// The model catalog, shared with the model selector and the settings
-    /// window's model submenu. Also seeds [`ChatState`]'s context-window
-    /// resolver.
+    /// The client model catalog, used to seed [`ChatState`]'s context-window
+    /// resolver. Host-facing selectors fetch their catalog through Control.
     catalog: Arc<Vec<ModelInfo>>,
     /// This process's credential store. Login uses only its OAuth provider
     /// registry: the flow runs here, where the browser is, and the result is
@@ -2350,19 +2347,16 @@ fn open_credential_picker(world: &World, shell: &Rc<RefCell<Shell>>, action: Com
     tokio::spawn(async move {
         let _ = tx.send(control.credential_overview(&session).await);
     });
-    shell
-        .borrow_mut()
-        .credential_fills
-        .push(Box::pin(async move {
-            match rx.await {
-                Ok(Ok(overview)) => {
-                    let (rows, empty) = credential_picker_rows(action, overview);
-                    fill.fill(rows, empty);
-                }
-                Ok(Err(err)) => fill.fill(Vec::new(), &credential_error(&err, false)),
-                Err(_) => fill.fill(Vec::new(), "Credential read task stopped."),
+    shell.borrow_mut().fills.push(Box::pin(async move {
+        match rx.await {
+            Ok(Ok(overview)) => {
+                let (rows, empty) = credential_picker_rows(action, overview);
+                fill.fill(rows, empty);
             }
-        }));
+            Ok(Err(err)) => fill.fill(Vec::new(), &credential_error(&err, false)),
+            Err(_) => fill.fill(Vec::new(), "Credential read task stopped."),
+        }
+    }));
 }
 
 fn credential_picker_rows(
@@ -2711,19 +2705,16 @@ fn open_default_logout_resolution(
     tokio::spawn(async move {
         let _ = tx.send(control.credential_overview(&session).await);
     });
-    shell
-        .borrow_mut()
-        .credential_fills
-        .push(Box::pin(async move {
-            match rx.await {
-                Ok(Ok(overview)) => {
-                    let rows = default_logout_rows(overview, provider_id, account_label);
-                    fill.fill(rows, "The account set changed. Reopen the logout picker.");
-                }
-                Ok(Err(err)) => fill.fill(Vec::new(), &credential_error(&err, false)),
-                Err(_) => fill.fill(Vec::new(), "Credential read task stopped."),
+    shell.borrow_mut().fills.push(Box::pin(async move {
+        match rx.await {
+            Ok(Ok(overview)) => {
+                let rows = default_logout_rows(overview, provider_id, account_label);
+                fill.fill(rows, "The account set changed. Reopen the logout picker.");
             }
-        }));
+            Ok(Err(err)) => fill.fill(Vec::new(), &credential_error(&err, false)),
+            Err(_) => fill.fill(Vec::new(), "Credential read task stopped."),
+        }
+    }));
     app.post_app_event(UserEvent {
         name: REFOCUS_OVERLAY_EVENT.to_string(),
         data: None,
@@ -3287,33 +3278,47 @@ fn editing_thinking(world: &World, shell: &Rc<RefCell<Shell>>, target: AgentId) 
     Some(aj_models::thinking_config_name(viewed_thinking(world, target).as_ref()).to_string())
 }
 
-/// Defaults windows still save defaults. Their session effect, like an explicit
-/// model or thinking pick, belongs to the pending branch rather than the live
-/// one. Cancellation discards that session effect, not an intentional default.
-fn stage_branch_setting(
-    world: &World,
-    shell: &Rc<RefCell<Shell>>,
-    persist: PersistAction,
+/// Stage an axis choice on the pending branch draft. With a branch open the
+/// running session must not change, so the session effect waits for the
+/// branch's submission while `save`, an editor row's config edit, is written
+/// to the host right away. Cancelling the branch discards the staged effect,
+/// not the saved config.
+async fn stage_branch_setting(
+    owner: &SettingsOwner,
+    save: Option<aj_wire::ConfigEdit>,
     axis: SettingsAxis,
-) {
-    let note = if world.control.is_remote() {
-        unpersisted_note(world, persist != PersistAction::None)
-    } else {
-        aj_app::settings::persist_axis(&world.config_layers, &world.config, persist, &axis)
-    };
-    let saved_default =
-        persist != PersistAction::None && !world.control.is_remote() && note.is_none();
-    if let Some(draft) = shell.borrow().view().branch_anchor.borrow_mut().as_mut() {
+) -> String {
+    let staged = if let Some(branch) = &owner.branch
+        && let Some(draft) = branch.borrow_mut().as_mut()
+        && owner.branch_message.as_ref() == Some(&draft.message)
+    {
         draft.set(axis);
-    }
-    let notice = if saved_default {
-        "Default saved, even if you cancel. Session change applies when you submit the branch."
+        true
     } else {
-        "Setting applies when you submit the branch."
+        false
     };
-    shell
-        .borrow()
-        .show_toast(join_notice(notice.to_string(), note));
+    let (saved, note) = match save {
+        None => (false, None),
+        Some(edit) => match owner.control.edit_config(&owner.session, edit).await {
+            Ok(()) => {
+                owner.finish_save(true);
+                (true, None)
+            }
+            Err(err) => {
+                owner.fail_save(&err);
+                (false, Some(settings_read_notice("settings editor", &err)))
+            }
+        },
+    };
+    let notice = match (saved, staged) {
+        (true, true) => {
+            "Default saved, even if you cancel. Session change applies when you submit the branch."
+        }
+        (true, false) => "Default saved. The branch draft is no longer active.",
+        (false, true) => "Setting applies when you submit the branch.",
+        (false, false) => "The branch draft is no longer active.",
+    };
+    join_notice(notice.to_string(), note)
 }
 
 /// Replace the editor text while preserving any displaced draft in recall
@@ -3914,11 +3919,10 @@ async fn apply_tag_edit(world: &mut World, edit: TagEdit) {
 /// here and rely on the [`REFOCUS_OVERLAY_EVENT`] the caller posts to move
 /// focus onto them.
 ///
-/// Skills discovery and HTML export do blocking work, so they don't run here.
-/// Skills opens its window up front (with a loading placeholder) and parks a
-/// fill handle the drive loop streams the discovered rows into once the
-/// off-loop walk lands. HTML export spawns off the loop via `export_tx` and
-/// its result notice comes back to the drive loop's fill arm.
+/// Host reads and HTML export do not run here. The host-backed editors open
+/// their window up front on a loading placeholder and park the read in
+/// [`Shell::fills`] for the drive loop. HTML export spawns off the loop via
+/// `export_tx` and its result notice comes back to the drive loop.
 async fn apply_command_action(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
@@ -3973,139 +3977,54 @@ async fn apply_command_action(
             spawn_session_export(&world.control, world.session(), export_tx);
             ActionEffect::None
         }
-        CommandAction::OpenThinkingSelector => {
-            let target = editing_target(world, shell);
-            let current = editing_thinking(world, shell, target);
-            let supported = editing_model(world, shell, target)
-                .and_then(|(provider, model_id)| {
-                    world
-                        .catalog
-                        .iter()
-                        .find(|m| m.provider == provider && m.id == model_id)
-                })
-                .map(aj_app::commands::thinking_levels_for)
-                .unwrap_or_else(|| aj_app::commands::THINKING_LEVELS.iter().collect());
-            let handles = shell.borrow().overlay_handles();
-            open_thinking(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.activity,
-                target,
-                current.as_deref(),
-                supported,
-            );
+        // The host-backed editors open on a placeholder at once and park
+        // their read in `Shell::fills` for the drive loop, so the window is
+        // there and cancellable before the host has answered.
+        CommandAction::OpenThinkingSelector | CommandAction::OpenModelSelector => {
+            let thinking = matches!(action, CommandAction::OpenThinkingSelector);
+            let fetch = open_host_selector(world, shell, thinking);
+            shell
+                .borrow_mut()
+                .fills
+                .push(Box::pin(fill_host_selector(fetch)));
             ActionEffect::OpenedOverlay
         }
-        CommandAction::OpenModelSelector => {
-            let target = editing_target(world, shell);
-            let current = editing_model(world, shell, target);
-            let handles = shell.borrow().overlay_handles();
-            open_model(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.activity,
-                Arc::clone(&world.catalog),
-                target,
-                current,
-            );
-            ActionEffect::OpenedOverlay
-        }
-        CommandAction::OpenSettings => {
-            // NOTE: the global window shows the PERSISTED user-layer config,
-            // the config a fresh session loads as its user layer. That can
-            // differ from an unpersisted runtime toggle, which is intended:
-            // this window edits `~/.aj/config.toml`, it is not a view of the
-            // live session.
-            let user = world
-                .config_layers
-                .lock()
-                .expect("config layers mutex poisoned")
-                .user
-                .clone();
-            let values = SettingsValues::from_config(&user, &world.catalog);
-            // The user window has no inherited layer and no project keys; the
-            // clear path is inert there, so a second view of the same layer is
-            // a valid (unused) `inherited` set.
-            let inherited = SettingsValues::from_config(&user, &world.catalog);
-            let handles = shell.borrow().overlay_handles();
-            open_settings(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.activity,
-                &handles.settings_ui,
-                ConfigTarget::User,
-                values,
-                inherited,
-                std::collections::BTreeSet::new(),
-                settings_catalogs(world),
-            );
-            ActionEffect::OpenedOverlay
-        }
-        CommandAction::OpenProjectSettings => {
-            // Per-project settings need a git repository. The effective
-            // config-layer view shows what the project pins; the user layer is
-            // what a clear reverts to.
-            let has_project = world
-                .config_layers
-                .lock()
-                .expect("config layers mutex poisoned")
-                .project_path
-                .is_some();
-            if !has_project {
-                fold_notice(
-                    world,
-                    "Project settings need a git repository (no .git found above the \
-                     working directory).",
-                );
-                return ActionEffect::Redraw;
-            }
-            let (effective, user, set_keys) = {
-                let l = world
-                    .config_layers
-                    .lock()
-                    .expect("config layers mutex poisoned");
-                let effective = world.config.lock().expect("config mutex poisoned").clone();
-                let set_keys: std::collections::BTreeSet<String> =
-                    l.project.set_keys().map(String::from).collect();
-                (effective, l.user.clone(), set_keys)
+        CommandAction::OpenSettings | CommandAction::OpenProjectSettings => {
+            let project = matches!(action, CommandAction::OpenProjectSettings);
+            let target = if project {
+                ConfigTarget::Project
+            } else {
+                ConfigTarget::User
             };
-            let values = SettingsValues::from_config(&effective, &world.catalog);
-            let inherited = SettingsValues::from_config(&user, &world.catalog);
             let handles = shell.borrow().overlay_handles();
-            open_settings(
+            let owner = SettingsOwner::capture(world, shell, Arc::clone(&world.catalog));
+            let list = open_settings_loading(
                 &handles.stack,
                 &handles.editor,
                 &handles.chrome,
-                &handles.activity,
                 &handles.settings_ui,
-                ConfigTarget::Project,
-                values,
-                inherited,
-                set_keys,
-                settings_catalogs(world),
+                target,
             );
+            let client_has_project =
+                fill_client_settings(&handles, &world.config_layers, &list, owner.clone(), target);
+            if world.control.is_remote() {
+                list.borrow().host_hint(format!(
+                    "* Host-side settings on {}. Unmarked settings belong to this client.",
+                    credential_host(world)
+                ));
+            }
+            list.borrow()
+                .load_notice(Some("Loading host settings…".into()));
+            let fill = fill_host_settings(handles, list, owner, target, client_has_project);
+            shell.borrow_mut().fills.push(Box::pin(fill));
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSkills => {
-            // Open the skills window NOW, on top of the kept palette, showing a
-            // loading placeholder, and park its fill handle. Discovery walks
-            // the `SKILL.md` files up to the git root (blocking IO), so it runs
-            // off the loop: the drive loop's drain spawns the walk and streams
-            // the discovered rows into the parked handle once it lands. The
-            // window shows up immediately and the UI stays responsive
-            // meanwhile. Uniform with every other opener. Esc (`close_top`)
-            // returns to the palette underneath.
-            let handles = shell.borrow().overlay_handles();
-            open_skills(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.activity,
-                &handles.skills_fill,
-            );
+            let fetch = open_host_skills(world, shell);
+            shell
+                .borrow_mut()
+                .fills
+                .push(Box::pin(fill_host_skills(fetch)));
             ActionEffect::OpenedOverlay
         }
         // The session-selector and session-tree overlays open READ-ONLY at any
@@ -4344,7 +4263,7 @@ fn fill_skills_window(list: &SkillsFill, skills: Vec<Skill>) {
             .map(|s| SkillRow {
                 name: s.name,
                 description: s.description,
-                path: aj_conf::display_path(&s.path),
+                path: s.path.display().to_string(),
                 enabled: s.enabled,
                 disable_model_invocation: s.disable_model_invocation,
             })
@@ -4531,37 +4450,81 @@ fn viewed_model(world: &World, target: AgentId) -> (String, String) {
         .unwrap_or_default()
 }
 
-/// The `provider/id` of the session's active model, as the settings window
-/// spells it in its model row.
-fn active_model(world: &World) -> String {
-    let (provider, model_id) = viewed_model(world, AgentId::Main);
-    format!("{provider}/{model_id}")
+/// An editor's opening host, session, catalog and optional branch draft.
+/// Focus changes cannot turn a queued edit into a command for another session.
+#[derive(Clone)]
+pub(crate) struct SettingsOwner {
+    control: Control,
+    session: String,
+    models: Arc<Vec<ModelInfo>>,
+    branch: Option<Rc<RefCell<Option<crate::branch::BranchDraft>>>>,
+    // A rearmed anchor must not redirect a queued choice to another branch.
+    branch_message: Option<String>,
+    // Callbacks own this context, so the return link must not keep the list alive.
+    rows: std::rc::Weak<RefCell<crate::settings_ui::SettingList>>,
 }
 
-/// The catalog and name sets the settings window's submenus need. Rediscovered
-/// per open so newly added skills are togglable without a restart.
-fn settings_catalogs(world: &World) -> SettingsCatalogs {
-    let tools: Vec<String> = aj_tools::get_builtin_tools(&aj_tools::BuiltinToolOptions::default())
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect();
-    let skills: Vec<String> = aj_conf::skills::discover_skills(&[])
-        .0
-        .into_iter()
-        .map(|skill| skill.name)
-        .collect();
-    SettingsCatalogs {
-        models: Arc::clone(&world.catalog),
-        themes: Theme::available(),
-        tools,
-        skills,
+impl SettingsOwner {
+    pub(crate) fn new(control: Control, session: String, models: Arc<Vec<ModelInfo>>) -> Self {
+        Self {
+            control,
+            session,
+            models,
+            branch: None,
+            branch_message: None,
+            rows: std::rc::Weak::new(),
+        }
+    }
+
+    fn capture(world: &World, shell: &Rc<RefCell<Shell>>, models: Arc<Vec<ModelInfo>>) -> Self {
+        let mut owner = Self::new(world.control.clone(), world.session().to_string(), models);
+        let branch = Rc::clone(&shell.borrow().view().branch_anchor);
+        if branch.borrow().is_some() {
+            owner.branch_message = branch.borrow().as_ref().map(|draft| draft.message.clone());
+            owner.branch = Some(Rc::clone(&branch));
+        }
+        owner
+    }
+
+    pub(crate) fn bind_rows(&mut self, list: &SkillsFill) {
+        self.rows = Rc::downgrade(list);
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        self.control.is_remote()
+    }
+
+    fn reject_save(&self) {
+        if let Some(list) = self.rows.upgrade() {
+            list.borrow().reject_save();
+        }
+    }
+
+    fn fail_save(&self, error: &ControlError) {
+        if error.mutation_refused() {
+            self.reject_save();
+        } else {
+            self.finish_save(false);
+        }
+    }
+
+    fn begin_save(&self) -> bool {
+        self.rows
+            .upgrade()
+            .is_none_or(|list| list.borrow().begin_save())
+    }
+
+    fn finish_save(&self, confirmed: bool) {
+        if let Some(list) = self.rows.upgrade() {
+            list.borrow().finish_save(confirmed);
+        }
     }
 }
 
 /// Apply one batch of confirmed config edits parked by the overlays through
 /// the shared settings core, reconciling the chat model and folding a notice
 /// for each. Returns whether anything changed renderable state.
-async fn apply_selector_activity(
+async fn dispatch_selector_activity(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     theme_watch: &mut ThemeWatch,
@@ -4575,10 +4538,7 @@ async fn apply_selector_activity(
             | SelectorActivity::ModelConfirmed { .. }
             | SelectorActivity::EnvironmentEdit(_) => true,
             SelectorActivity::SettingChange { id, .. }
-            | SelectorActivity::SettingClear { id, .. } => matches!(
-                id.as_str(),
-                MODEL_SETTING_ID | "thinking" | "thinking_display" | "speed" | "verbosity"
-            ),
+            | SelectorActivity::SettingClear { id, .. } => aj_app::settings::is_axis(id),
             SelectorActivity::SkillToggle { .. } => false,
         };
         let draft_choice = shell.borrow().view().branch_anchor.borrow().is_some()
@@ -4593,7 +4553,18 @@ async fn apply_selector_activity(
                 SelectorActivity::EnvironmentEdit(edit) => edit.session == world.session(),
                 _ => false,
             };
+        let opening_owner = match &item {
+            SelectorActivity::ThinkingConfirmed { owner, .. }
+            | SelectorActivity::ModelConfirmed { owner, .. }
+            | SelectorActivity::SettingChange { owner, .. }
+            | SelectorActivity::SettingClear { owner, .. }
+            | SelectorActivity::SkillToggle { owner, .. } => Some(owner),
+            _ => None,
+        };
+        let focused_operation = opening_owner.is_none_or(|owner| owner.session == world.session());
+        let draft_choice = opening_owner.map_or(draft_choice, |owner| owner.branch.is_some());
         if session_mutation
+            && focused_operation
             && !draft_choice
             && refuse_while_attaching(world, shell, "change session settings")
         {
@@ -4604,66 +4575,86 @@ async fn apply_selector_activity(
             continue;
         }
         match item {
-            SelectorActivity::ThinkingConfirmed { target, level } => {
-                if target == AgentId::Main && shell.borrow().view().branch_anchor.borrow().is_some()
-                {
-                    stage_branch_setting(
-                        world,
-                        shell,
-                        PersistAction::None,
-                        SettingsAxis::Thinking(level),
-                    );
+            SelectorActivity::ThinkingConfirmed {
+                owner,
+                target,
+                level,
+            } => {
+                if owner.branch.is_some() {
+                    let notice =
+                        stage_branch_setting(&owner, None, SettingsAxis::Thinking(level)).await;
+                    shell.borrow().show_toast(notice);
                     continue;
                 }
                 // Session-scoped: the selectors leave `config.toml` alone and
                 // rely on the session log's record to survive a resume.
                 if let Some(notice) =
-                    confirm_thinking(world, target, PersistAction::None, level).await
+                    confirm_thinking(world, &owner, target, PersistAction::None, level).await
                 {
                     fold_notice(world, &notice);
                 }
             }
-            SelectorActivity::ModelConfirmed { target, info } => {
-                if target == AgentId::Main && shell.borrow().view().branch_anchor.borrow().is_some()
-                {
-                    stage_branch_setting(
-                        world,
-                        shell,
-                        PersistAction::None,
-                        SettingsAxis::Model(*info),
-                    );
+            SelectorActivity::ModelConfirmed {
+                owner,
+                target,
+                info,
+            } => {
+                if owner.branch.is_some() {
+                    let notice =
+                        stage_branch_setting(&owner, None, SettingsAxis::Model(*info)).await;
+                    shell.borrow().show_toast(notice);
                     continue;
                 }
-                if let Some(notice) = confirm_model(world, target, PersistAction::None, *info).await
-                {
-                    fold_notice(world, &notice);
-                }
-            }
-            SelectorActivity::SettingChange { target, id, value } => {
-                let persist = PersistAction::set_for(target);
                 if let Some(notice) =
-                    apply_setting_change(world, shell, theme_watch, persist, &id, &value).await
+                    confirm_model(world, &owner, target, PersistAction::None, *info).await
                 {
                     fold_notice(world, &notice);
                 }
             }
-            SelectorActivity::SettingClear { id, inherited } => {
-                if let Some(notice) = apply_setting_change(
+            SelectorActivity::SettingChange {
+                owner,
+                target,
+                id,
+                value,
+            } => {
+                start_setting_change(
                     world,
                     shell,
                     theme_watch,
-                    PersistAction::ProjectClear,
-                    &id,
-                    &inherited,
-                )
-                .await
-                {
-                    fold_notice(world, &notice);
-                }
+                    owner,
+                    target.persist_action(),
+                    id,
+                    value,
+                );
             }
-            SelectorActivity::SkillToggle { name, disable } => {
-                let notice = apply_skill_toggle(world, &name, disable);
-                fold_notice(world, &notice);
+            SelectorActivity::SettingClear {
+                owner,
+                id,
+                inherited,
+            } => {
+                start_setting_change(
+                    world,
+                    shell,
+                    theme_watch,
+                    owner,
+                    PersistAction::ProjectClear,
+                    id,
+                    inherited,
+                );
+            }
+            SelectorActivity::SkillToggle {
+                owner,
+                name,
+                disable,
+            } => {
+                if owner.begin_save() {
+                    park_setting_save(
+                        shell,
+                        Box::pin(
+                            async move { Some(apply_skill_toggle(&owner, &name, disable).await) },
+                        ),
+                    );
+                }
             }
             SelectorActivity::EnvironmentEdit(edit) => {
                 if edit.session == world.session()
@@ -4708,6 +4699,33 @@ async fn apply_selector_activity(
     changed
 }
 
+/// A window permits one save at a time. Its reply only updates that window,
+/// even when the user closes it or selects another session while waiting.
+fn park_setting_save(
+    shell: &Rc<RefCell<Shell>>,
+    save: futures::future::LocalBoxFuture<'static, Option<String>>,
+) {
+    let toasts = Rc::clone(&shell.borrow().toasts);
+    shell.borrow_mut().fills.push(Box::pin(async move {
+        if let Some(notice) = save.await {
+            show_toast(&toasts, notice);
+        }
+    }));
+}
+
+#[cfg(test)]
+async fn apply_selector_activity(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    theme_watch: &mut ThemeWatch,
+    activity: Vec<SelectorActivity>,
+) -> bool {
+    let changed = dispatch_selector_activity(world, shell, theme_watch, activity).await;
+    let fills = std::mem::take(&mut shell.borrow_mut().fills);
+    futures::future::join_all(fills).await;
+    changed
+}
+
 /// Record the main agent's settings identity into the chat model so the
 /// footer's model line and context gauge reflect a change without waiting for
 /// the next turn.
@@ -4735,57 +4753,46 @@ fn note_main_footer(world: &World) {
 /// Send a settings change to the host, returning the note to fold when it
 /// applied and the refusal to fold when it did not.
 ///
-/// An accepted change folds nothing of substance here: the host stages it,
-/// records it on the session log, and publishes the notice that record
-/// projects plus a refreshed `state` frame, so the transcript row arrives on
-/// the stream like any other. The one thing the host cannot report is that a
-/// change meant to outlive the session did not persist, which is what the
-/// `Ok` note carries.
+/// An accepted change folds nothing here: the host applies and persists it,
+/// records the session change, and publishes its confirmation and state.
 async fn command_settings(
-    world: &World,
+    owner: &SettingsOwner,
     agent: AgentId,
     persist: PersistAction,
     axis: SettingsAxis,
 ) -> Result<Option<String>, String> {
-    let persisting = persist != PersistAction::None;
     let change = SettingsChange {
         agent,
         persist,
         axis,
     };
-    match world
+    match owner
         .control
-        .command(world.session(), Command::Settings(change))
+        .command(&owner.session, Command::Settings(change))
         .await
     {
-        Ok(_) => Ok(unpersisted_note(world, persisting)),
+        Ok(CommandOutcome::Incomplete(message)) => Ok(Some(message)),
+        Ok(_) => Ok(None),
         Err(err) => Err(err.to_string()),
     }
-}
-
-/// The note a persisting settings change earns over a connection: the wire
-/// carries no persist axis, because the config files a default
-/// would be written to are the host's own, not this client's.
-fn unpersisted_note(world: &World, persisting: bool) -> Option<String> {
-    (persisting && world.control.is_remote()).then(|| {
-        "Applied to this session only: a settings default can't be saved over a \
-         connection."
-            .to_string()
-    })
 }
 
 /// Apply a confirmed thinking pick and reconcile the footer entry it moved.
 async fn confirm_thinking(
     world: &World,
+    owner: &SettingsOwner,
     target: AgentId,
     persist: PersistAction,
     level: Option<ThinkingConfig>,
 ) -> Option<String> {
     let name = aj_app::commands::thinking_level_name(&level).to_string();
-    let note = match command_settings(world, target, persist, SettingsAxis::Thinking(level)).await {
+    let note = match command_settings(owner, target, persist, SettingsAxis::Thinking(level)).await {
         Ok(note) => note,
         Err(refusal) => return Some(refusal),
     };
+    if owner.session != world.session() {
+        return note;
+    }
     match target {
         AgentId::Main => note_main_footer(world),
         AgentId::Sub(_) => patch_sub_footer(world, target, |settings| settings.thinking = name),
@@ -4796,15 +4803,19 @@ async fn confirm_thinking(
 /// Apply a confirmed model pick and reconcile the footer entry it moved.
 async fn confirm_model(
     world: &World,
+    owner: &SettingsOwner,
     target: AgentId,
     persist: PersistAction,
     info: ModelInfo,
 ) -> Option<String> {
     let note =
-        match command_settings(world, target, persist, SettingsAxis::Model(info.clone())).await {
+        match command_settings(owner, target, persist, SettingsAxis::Model(info.clone())).await {
             Ok(note) => note,
             Err(refusal) => return Some(refusal),
         };
+    if owner.session != world.session() {
+        return note;
+    }
     match target {
         AgentId::Main => note_main_footer(world),
         AgentId::Sub(_) => {
@@ -4866,23 +4877,38 @@ fn patch_sub_footer_window(
 /// Persist a skills-window toggle into `disabled_skills` (user layer). Only
 /// changes what new sessions list to the model; the running system prompt is
 /// frozen, which the notice says.
-fn apply_skill_toggle(world: &World, name: &str, disable: bool) -> String {
-    let save = aj_app::settings::persist_user(&world.config_layers, &world.config, |c| {
-        if disable {
-            if !c.disabled_skills.iter().any(|n| n == name) {
-                c.disabled_skills.push(name.to_string());
-            }
-        } else {
-            c.disabled_skills.retain(|n| n != name);
+fn settings_read_notice(feature: &str, err: &ControlError) -> String {
+    if err.unknown_endpoint() {
+        format!("This host does not serve the {feature}.")
+    } else {
+        format!("Could not use the host {feature}: {}", peer_refusal(err))
+    }
+}
+
+async fn apply_skill_toggle(owner: &SettingsOwner, name: &str, disable: bool) -> String {
+    match owner
+        .control
+        .toggle_skill(
+            &owner.session,
+            aj_wire::SkillToggle {
+                name: name.to_string(),
+                disable,
+            },
+        )
+        .await
+    {
+        Ok(()) => {
+            owner.finish_save(true);
+            format!(
+                "Skill {name} {}. Takes effect for new sessions.",
+                if disable { "disabled" } else { "enabled" }
+            )
         }
-    });
-    join_notice(
-        format!(
-            "Skill {name} {}. Takes effect for new sessions.",
-            if disable { "disabled" } else { "enabled" }
-        ),
-        save,
-    )
+        Err(err) => {
+            owner.fail_save(&err);
+            settings_read_notice("skills editor", &err)
+        }
+    }
 }
 
 /// Append an optional follow-up note (e.g. a persist failure) to a
@@ -4895,26 +4921,8 @@ fn join_notice(mut notice: String, note: Option<String>) -> String {
     notice
 }
 
-/// Revert a settings-window row's displayed value after a failed apply, so the
-/// window never shows a value that isn't actually active. No-op when the
-/// window has closed.
-fn revert_setting_row(shell: &Rc<RefCell<Shell>>, id: &str, value: &str) {
-    if let Some(ui) = shell.borrow().settings_ui.borrow().as_ref() {
-        ui.set_value(id, value);
-    }
-}
-
-/// Apply one settings-window change (or project clear) to the running session
-/// and persist it per `persist`. Returns the user-facing notice, `None` when
-/// the change is one the host announces itself.
-///
-/// The four session settings (model, thinking, speed, verbosity) go out as
-/// host commands, which is what makes them visible to every other client;
-/// the render toggles mutate the chat model; the theme row reloads the
-/// palette and re-tints live; the rest are plain config-backed values
-/// persisted with a "takes effect" note. A refused apply reverts the row's
-/// display through [`revert_setting_row`], so the window never shows a value
-/// that is not actually active.
+/// Exercise a focused edit without opening an overlay.
+#[cfg(test)]
 async fn apply_setting_change(
     world: &World,
     shell: &Rc<RefCell<Shell>>,
@@ -4923,305 +4931,245 @@ async fn apply_setting_change(
     id: &str,
     value: &str,
 ) -> Option<String> {
-    let drafting = shell.borrow().view().branch_anchor.borrow().is_some()
-        && matches!(id, MODEL_SETTING_ID | "thinking" | "speed" | "verbosity");
-    match id {
-        MODEL_SETTING_ID => {
-            let Some(info) = value.split_once('/').and_then(|(provider, model_id)| {
-                world
-                    .catalog
-                    .iter()
-                    .find(|m| m.provider == provider && m.id == model_id)
-                    .cloned()
-            }) else {
-                revert_setting_row(shell, MODEL_SETTING_ID, &active_model(world));
-                return Some(format!("Unknown model {value}."));
-            };
-            if drafting {
-                stage_branch_setting(world, shell, persist, SettingsAxis::Model(info));
-                return None;
+    let owner = SettingsOwner::capture(world, shell, Arc::clone(&world.catalog));
+    apply_owned_setting_change(world, shell, theme_watch, &owner, persist, id, value).await
+}
+
+/// Save on the captured host. Definite refusals restore the editable row.
+/// Unconfirmed or incomplete saves require reopening to refresh the defaults.
+async fn apply_host_setting_change(
+    owner: &SettingsOwner,
+    persist: PersistAction,
+    id: &str,
+    value: &str,
+) -> Option<String> {
+    if aj_app::settings::is_axis(id) {
+        let axis = match aj_app::settings::setting_axis(&owner.models, id, value) {
+            Ok(axis) => axis,
+            Err(err) => {
+                owner.reject_save();
+                return Some(err);
             }
-            let refused = confirm_model(world, AgentId::Main, persist, info).await;
-            // A refusal stages nothing, so the row is reverted to the model
-            // that is actually active. Compared rather than assumed, because
-            // the staged key is the only authority on what took.
-            let active = active_model(world);
-            if active != value {
-                revert_setting_row(shell, MODEL_SETTING_ID, &active);
-            }
-            refused
-        }
-        "thinking" => match thinking_config_from_name(value) {
-            Some(level) if drafting => {
-                stage_branch_setting(world, shell, persist, SettingsAxis::Thinking(level));
-                None
-            }
-            Some(level) => confirm_thinking(world, AgentId::Main, persist, level).await,
-            None => Some(format!("Unknown thinking level {value:?}.")),
-        },
-        "thinking_display" => {
-            let display = if value == UNSET_VALUE {
-                None
-            } else {
-                match value.parse::<ConfigThinkingDisplay>() {
-                    Ok(d) => Some(d),
-                    Err(err) => return Some(format!("Can't set thinking_display: {err}")),
-                }
-            };
-            // A real settings axis: the host stages it onto the session's
-            // stream options, persists it per `persist`, and publishes the
-            // confirmation itself (it is live-only, so nothing durable
-            // records it and the notice rides an untagged frame).
-            command_settings(
-                world,
-                AgentId::Main,
+        };
+        if owner.branch.is_some() && id != "thinking_display" {
+            let save = (persist != PersistAction::None).then(|| aj_wire::ConfigEdit {
+                key: id.to_string(),
+                value: (persist != PersistAction::ProjectClear).then(|| value.to_string()),
                 persist,
-                SettingsAxis::ThinkingDisplay(display),
+            });
+            let notice = stage_branch_setting(owner, save, axis).await;
+            return Some(notice);
+        }
+        let change = SettingsChange {
+            agent: AgentId::Main,
+            persist,
+            axis,
+        };
+        match owner
+            .control
+            .command(&owner.session, Command::Settings(change))
+            .await
+        {
+            Ok(CommandOutcome::Incomplete(message)) => {
+                owner.finish_save(false);
+                Some(message)
+            }
+            Ok(_) => {
+                owner.finish_save(true);
+                None
+            }
+            Err(err) => {
+                owner.fail_save(&err);
+                Some(settings_read_notice("settings editor", &err))
+            }
+        }
+    } else {
+        owner
+            .control
+            .edit_config(
+                &owner.session,
+                aj_wire::ConfigEdit {
+                    key: id.to_string(),
+                    value: (persist != PersistAction::ProjectClear).then(|| value.to_string()),
+                    persist,
+                },
             )
             .await
-            .unwrap_or_else(Some)
-        }
-        "speed" => match speed_from_name(value) {
-            Some(speed) if drafting => {
-                stage_branch_setting(world, shell, persist, SettingsAxis::Speed(speed));
-                None
-            }
-            Some(speed) => {
-                match command_settings(world, AgentId::Main, persist, SettingsAxis::Speed(speed))
-                    .await
-                {
-                    Ok(note) => {
-                        note_main_footer(world);
-                        note
-                    }
-                    // The rebuild failed, so nothing was staged: revert the
-                    // row to the speed still in force.
-                    Err(notice) => {
-                        let previous = world
-                            .client()
-                            .settings()
-                            .map(|settings| settings.speed.clone());
-                        if let Some(previous) = previous {
-                            revert_setting_row(shell, "speed", &previous);
-                        }
-                        Some(notice)
-                    }
-                }
-            }
-            None => Some(format!("Unknown speed {value:?}.")),
-        },
-        "verbosity" => {
-            let verbosity = if value == UNSET_VALUE {
-                None
-            } else {
-                match value.parse::<ConfigVerbosity>() {
-                    Ok(v) => Some(v),
-                    Err(err) => return Some(format!("Can't set verbosity: {err}")),
-                }
-            };
-            if drafting {
-                stage_branch_setting(world, shell, persist, SettingsAxis::Verbosity(verbosity));
-                return None;
-            }
-            command_settings(
-                world,
-                AgentId::Main,
-                persist,
-                SettingsAxis::Verbosity(verbosity),
+            .map_or_else(
+                |err| {
+                    owner.fail_save(&err);
+                    Some(settings_read_notice("settings editor", &err))
+                },
+                |_| {
+                    owner.finish_save(true);
+                    Some(format!("{id} default saved."))
+                },
             )
-            .await
-            .unwrap_or_else(Some)
-        }
+    }
+}
+
+/// Apply the rendering effect immediately and prepare persistence off the input
+/// loop. Local hosts share these layers, so even a presentation save can wait
+/// behind another client's config write.
+fn presentation_save(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    theme_watch: &mut ThemeWatch,
+    owner: SettingsOwner,
+    persist: PersistAction,
+    id: String,
+    value: String,
+) -> Result<futures::future::LocalBoxFuture<'static, Option<String>>, String> {
+    let option = Config::option(&id).ok_or_else(|| format!("Unknown setting {id:?}."))?;
+    option
+        .apply_str(&value, &mut Config::default())
+        .map_err(|err| format!("Can't set {id}: {err}"))?;
+    if matches!(
+        persist,
+        PersistAction::ProjectSet | PersistAction::ProjectClear
+    ) && world
+        .config_layers
+        .lock()
+        .expect("config layers mutex poisoned")
+        .project_path
+        .is_none()
+    {
+        return Err("Presentation project settings need a git repository on this client.".into());
+    }
+    let on = value == "true";
+    let notice = match id.as_str() {
         "theme" => {
             let mode = shell.borrow().theme.color_mode();
-            match Theme::load_strict_with_mode(value, mode) {
-                Ok(loaded) => {
-                    {
-                        let s = shell.borrow();
-                        s.theme.replace(loaded);
-                    }
-                    // Re-tint the whole UI, including the open settings window.
-                    shell.borrow().restyle();
-                    // Re-point the hot-reload watcher at the new theme's file.
-                    *theme_watch = ThemeWatch::install(value);
-                    let save = aj_app::settings::persist_setting(
-                        &world.config_layers,
-                        &world.config,
-                        persist,
-                        "theme",
-                        Some(value),
-                        |c| c.theme = Some(value.to_string()),
-                    );
-                    Some(join_notice(format!("Theme set to {value}."), save))
-                }
-                Err(err) => {
-                    let active = {
-                        let cfg = world.config.lock().expect("config mutex poisoned");
-                        cfg.theme.clone().unwrap_or_else(|| "light".to_string())
-                    };
-                    revert_setting_row(shell, "theme", &active);
-                    Some(format!("Couldn't load theme {value:?}: {err}"))
-                }
-            }
+            let loaded = Theme::load_strict_with_mode(&value, mode)
+                .map_err(|err| format!("Couldn't load theme {value:?}: {err}"))?;
+            shell.borrow().theme.replace(loaded);
+            shell.borrow().restyle();
+            *theme_watch = ThemeWatch::install(&value);
+            format!("Theme set to {value}.")
         }
         "show_thinking_block" => {
-            let show = value == "true";
-            world.chat.borrow_mut().show_thinking_block = show;
-            let save = aj_app::settings::persist_setting(
-                &world.config_layers,
-                &world.config,
-                persist,
-                "show_thinking_block",
-                Some(value),
-                |c| c.show_thinking_block = show,
-            );
-            Some(join_notice(
-                format!(
-                    "Thinking blocks {}.",
-                    if show { "expanded" } else { "hidden" }
-                ),
-                save,
-            ))
+            world.chat.borrow_mut().show_thinking_block = on;
+            format!(
+                "Thinking blocks {}.",
+                if on { "expanded" } else { "hidden" }
+            )
         }
         "show_token_usage" => {
-            let show = value == "true";
-            world.chat.borrow_mut().show_token_usage = show;
-            let save = aj_app::settings::persist_setting(
-                &world.config_layers,
-                &world.config,
-                persist,
-                "show_token_usage",
-                Some(value),
-                |c| c.show_token_usage = show,
-            );
-            Some(join_notice(
-                format!(
-                    "Token-usage rows {}.",
-                    if show { "shown" } else { "hidden" }
-                ),
-                save,
-            ))
+            world.chat.borrow_mut().show_token_usage = on;
+            format!("Token-usage rows {}.", if on { "shown" } else { "hidden" })
         }
         "compact_transcript" => {
-            let on = value == "true";
             world.chat.borrow_mut().compact_transcript = on;
-            let save = aj_app::settings::persist_setting(
-                &world.config_layers,
-                &world.config,
-                persist,
-                "compact_transcript",
-                Some(value),
-                |c| c.compact_transcript = on,
-            );
-            Some(join_notice(
-                format!(
-                    "Compact transcript {}.",
-                    if on { "enabled" } else { "disabled" }
-                ),
-                save,
-            ))
+            format!(
+                "Compact transcript {}.",
+                if on { "enabled" } else { "disabled" }
+            )
         }
         "syntax_highlighting" => {
-            let on = value == "true";
             world.chat.borrow_mut().syntax_highlight = on;
-            let save = aj_app::settings::persist_setting(
-                &world.config_layers,
-                &world.config,
-                persist,
-                "syntax_highlighting",
-                Some(value),
-                |c| c.syntax_highlighting = on,
-            );
-            Some(join_notice(
-                format!(
-                    "Syntax highlighting {}.",
-                    if on { "enabled" } else { "disabled" }
-                ),
-                save,
-            ))
+            format!(
+                "Syntax highlighting {}.",
+                if on { "enabled" } else { "disabled" }
+            )
         }
         "show_image_in_terminal" => {
-            let show = value == "true";
-            world.chat.borrow_mut().show_image_in_terminal = show;
-            let save = aj_app::settings::persist_setting(
-                &world.config_layers,
-                &world.config,
-                persist,
-                "show_image_in_terminal",
-                Some(value),
-                |c| c.show_image_in_terminal = show,
-            );
-            Some(join_notice(
-                format!("show_image_in_terminal set to {show}."),
-                save,
-            ))
+            world.chat.borrow_mut().show_image_in_terminal = on;
+            format!("show_image_in_terminal set to {on}.")
         }
         "show_frame_stats" => {
-            let on = value == "true";
-            // Live-apply by flipping the shared Shell cell the box reads at
-            // draw, so the overlay appears or clears without a restart.
             shell.borrow().show_frame_stats.set(on);
-            let save = aj_app::settings::persist_setting(
-                &world.config_layers,
-                &world.config,
-                persist,
-                "show_frame_stats",
-                Some(value),
-                |c| c.show_frame_stats = on,
-            );
-            Some(join_notice(
-                format!(
-                    "Frame-stats overlay {}.",
-                    if on { "shown" } else { "hidden" }
-                ),
-                save,
-            ))
+            format!(
+                "Frame-stats overlay {}.",
+                if on { "shown" } else { "hidden" }
+            )
         }
-        "model_url" => {
-            let url = (!value.is_empty()).then(|| value.to_string());
-            let save = aj_app::settings::persist_setting(
-                &world.config_layers,
-                &world.config,
-                persist,
-                "model_url",
-                url.as_deref(),
-                |c| c.model_url = url.clone(),
-            );
-            let what = match &url {
-                Some(u) => format!("set to {u}"),
-                None => "unset".to_string(),
-            };
-            Some(join_notice(
-                format!("model_url {what}. Takes effect on restart."),
-                save,
-            ))
-        }
-        // Everything else is a plain config-backed value with no extra live
-        // side effect: route it through the schema so a freshly-added option
-        // is editable without a bespoke arm here. A project clear carries an
-        // already-valid inherited value, so it skips validation.
-        other => {
-            let Some(option) = Config::option(other) else {
-                return Some(format!("Unknown setting {other:?}."));
-            };
-            if persist != PersistAction::ProjectClear
-                && let Err(err) = option.apply_str(value, &mut Config::default())
-            {
-                return Some(format!("Can't set {other}: {err}"));
+        _ => format!("{id} set to {value}."),
+    };
+    let layers = Arc::clone(&world.config_layers);
+    let config = Arc::clone(&world.config);
+    Ok(Box::pin(async move {
+        let saved = tokio::task::spawn_blocking(move || {
+            aj_app::settings::persist_setting(&layers, &config, persist, &id, Some(&value), |c| {
+                option
+                    .apply_str(&value, c)
+                    .expect("validated presentation setting");
+            })
+        })
+        .await;
+        let error = match saved {
+            Ok(note) => note,
+            Err(_) => Some("Could not confirm the save. Reopen settings to refresh.".into()),
+        };
+        owner.finish_save(error.is_none());
+        Some(join_notice(notice, error))
+    }))
+}
+
+fn start_setting_change(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    theme_watch: &mut ThemeWatch,
+    owner: SettingsOwner,
+    persist: PersistAction,
+    id: String,
+    value: String,
+) {
+    if !owner.begin_save() {
+        return;
+    }
+    let save = if aj_app::settings::is_presentation(&id) {
+        match presentation_save(world, shell, theme_watch, owner.clone(), persist, id, value) {
+            Ok(save) => save,
+            Err(notice) => {
+                owner.reject_save();
+                shell.borrow().show_toast(notice);
+                return;
             }
-            let save = aj_app::settings::persist_setting(
-                &world.config_layers,
-                &world.config,
-                persist,
-                other,
-                Some(value),
-                |c| {
-                    // Pre-validated above, so this can't fail.
-                    let _ = option.apply_str(value, c);
-                },
-            );
-            Some(join_notice(format!("{other} set to {value}."), save))
         }
+    } else {
+        Box::pin(async move { apply_host_setting_change(&owner, persist, &id, &value).await })
+    };
+    park_setting_save(shell, save);
+}
+
+#[cfg(test)]
+async fn apply_owned_setting_change(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    theme_watch: &mut ThemeWatch,
+    owner: &SettingsOwner,
+    persist: PersistAction,
+    id: &str,
+    value: &str,
+) -> Option<String> {
+    if aj_app::settings::is_presentation(id) {
+        return match presentation_save(
+            world,
+            shell,
+            theme_watch,
+            owner.clone(),
+            persist,
+            id.into(),
+            value.into(),
+        ) {
+            Ok(save) => save.await,
+            Err(notice) => {
+                owner.reject_save();
+                Some(notice)
+            }
+        };
+    }
+    let notice = apply_host_setting_change(owner, persist, id, value).await;
+    if owner.branch.is_some() && id != "thinking_display" {
+        if let Some(notice) = notice {
+            shell.borrow().show_toast(notice);
+        }
+        None
+    } else {
+        if owner.session == world.session() {
+            note_main_footer(world);
+        }
+        notice
     }
 }
 
@@ -5374,28 +5322,255 @@ fn spawn_session_scan(
     tokio::spawn(async move { control.session_previews(tx).await });
 }
 
-/// Discover skills off the drive loop, delivering the discovered skills back
-/// to the host over `tx`.
-///
-/// `discover_skills` walks the working directory up to the git root reading
-/// `SKILL.md` files (blocking IO), so it runs on the blocking pool rather than
-/// the loop. Only the discovered skills (all `Send`) cross the task boundary.
-/// The host builds the `!Send` skills window in its fill arm once the walk
-/// lands, so discovery never delays input or render.
-fn spawn_skills_discovery(world: &World, tx: &UnboundedSender<Vec<Skill>>) {
-    let tx = tx.clone();
-    // Clone the disabled set out under a brief lock and drop the guard before
-    // the blocking walk, so the config lock is never held off the loop.
-    let disabled = world
-        .config
-        .lock()
-        .expect("config mutex poisoned")
-        .disabled_skills
-        .clone();
-    tokio::task::spawn_blocking(move || {
-        let (skills, _diagnostics) = aj_conf::skills::discover_skills(&disabled);
-        let _ = tx.send(skills);
-    });
+/// Open the model or thinking selector on a loading placeholder and capture
+/// what its fill needs: the host, the session, and the branch it was opened
+/// against, so neither a focus change nor a re-armed anchor can redirect the
+/// choice.
+fn open_host_selector(world: &World, shell: &Rc<RefCell<Shell>>, thinking: bool) -> SelectorFetch {
+    let target = editing_target(world, shell);
+    let handles = shell.borrow().overlay_handles();
+    let select = open_selector_loading(&handles.stack, &handles.editor, &handles.chrome, thinking);
+    let mut owner = SettingsOwner::capture(world, shell, Arc::new(Vec::new()));
+    if target != AgentId::Main {
+        owner.branch = None;
+    }
+    SelectorFetch {
+        select: Rc::downgrade(&select),
+        handles,
+        owner,
+        target,
+        model: editing_model(world, shell, target),
+        current_thinking: editing_thinking(world, shell, target),
+        thinking,
+    }
+}
+
+/// Open the skills window on a loading placeholder and capture the list its
+/// discovery fills.
+fn open_host_skills(world: &World, shell: &Rc<RefCell<Shell>>) -> SkillsFetch {
+    let handles = shell.borrow().overlay_handles();
+    open_skills(
+        &handles.stack,
+        &handles.editor,
+        &handles.chrome,
+        &handles.activity,
+        SettingsOwner::capture(world, shell, Arc::clone(&world.catalog)),
+    )
+}
+
+/// The list is weak so closing it prevents a late reply from installing choices.
+struct SelectorFetch {
+    select: std::rc::Weak<RefCell<vaxis::vxfw::FilterableSelect>>,
+    handles: OverlayHandles,
+    owner: SettingsOwner,
+    target: AgentId,
+    model: Option<(String, String)>,
+    current_thinking: Option<String>,
+    thinking: bool,
+}
+
+async fn fill_host_selector(fetch: SelectorFetch) {
+    if fetch.select.upgrade().is_none() {
+        return;
+    }
+    let result = fetch.owner.control.models(&fetch.owner.session).await;
+    let Some(select) = fetch.select.upgrade() else {
+        return;
+    };
+    let models = match result {
+        Ok(models) => models,
+        Err(err) => {
+            let notice = settings_read_notice("model selectors", &err);
+            show_toast(&fetch.handles.toasts, notice.clone());
+            select
+                .borrow()
+                .set_items(vec![vaxis::vxfw::SelectItem::new(notice, "")]);
+            return;
+        }
+    };
+    let mut owner = fetch.owner;
+    owner.models = Arc::new(models);
+    let handles = fetch.handles;
+    if fetch.thinking {
+        // Runtime-injected models and historical branch settings can be absent
+        // from the catalog. Their choices still pass through host validation.
+        let supported = fetch
+            .model
+            .as_ref()
+            .and_then(|(provider, id)| {
+                owner
+                    .models
+                    .iter()
+                    .find(|info| &info.provider == provider && &info.id == id)
+            })
+            .map(aj_app::commands::thinking_levels_for)
+            .unwrap_or_else(|| aj_app::commands::THINKING_LEVELS.iter().collect());
+        fill_thinking(
+            &handles,
+            &select,
+            owner,
+            fetch.target,
+            fetch.current_thinking.as_deref(),
+            supported,
+        );
+    } else {
+        let models = Arc::clone(&owner.models);
+        fill_model(&handles, &select, owner, models, fetch.target, fetch.model);
+    }
+}
+
+/// Client preferences are available independently of host discovery. These
+/// rows stay intact when the host answers, including an in-flight local edit.
+fn fill_client_settings(
+    handles: &OverlayHandles,
+    layers: &Arc<std::sync::Mutex<ConfigLayers>>,
+    list: &SkillsFill,
+    owner: SettingsOwner,
+    target: ConfigTarget,
+) -> bool {
+    let (user, effective, keys, has_project) = {
+        let layers = layers.lock().expect("config layers mutex poisoned");
+        let presentation = |config: &Config| {
+            let mut values = aj_app::settings::schema_values(config);
+            values.retain(|key, _| aj_app::settings::is_presentation(key));
+            values
+        };
+        (
+            presentation(&layers.user),
+            presentation(&layers.effective()),
+            layers
+                .project
+                .set_keys()
+                .filter(|key| aj_app::settings::is_presentation(key))
+                .map(String::from)
+                .collect(),
+            layers.project_path.is_some(),
+        )
+    };
+    fill_settings(
+        &handles.stack,
+        &handles.editor,
+        &handles.chrome,
+        &handles.activity,
+        target,
+        SettingsValues::from_values(
+            if target == ConfigTarget::Project {
+                effective
+            } else {
+                user.clone()
+            },
+            &[],
+        ),
+        SettingsValues::from_values(user, &[]),
+        keys,
+        SettingsCatalogs {
+            owner,
+            models: Arc::new(Vec::new()),
+            themes: Theme::available(),
+            tools: Vec::new(),
+            skills: Vec::new(),
+        },
+        list,
+    );
+    has_project
+}
+
+/// Add the host's rows only to the window that requested them. Client rows,
+/// their optimistic edits, and any open submenu remain owned by that window.
+async fn fill_host_settings(
+    handles: OverlayHandles,
+    list: SkillsFill,
+    mut owner: SettingsOwner,
+    target: ConfigTarget,
+    client_has_project: bool,
+) {
+    let result = owner.control.config(&owner.session).await;
+    if !handles
+        .settings_ui
+        .borrow()
+        .as_ref()
+        .is_some_and(|ui| Rc::ptr_eq(&ui.list, &list))
+    {
+        return;
+    }
+    let host = match result {
+        Ok(host) => host,
+        Err(err) => {
+            list.borrow()
+                .load_notice(Some(settings_read_notice("settings editor", &err)));
+            return;
+        }
+    };
+    let project_notice = match (target, host.has_project, client_has_project) {
+        (ConfigTarget::Project, false, false) => Some("Project settings need a git repository."),
+        (ConfigTarget::Project, false, true) => {
+            Some("Host-side project settings need a git repository.")
+        }
+        (ConfigTarget::Project, true, false) => {
+            Some("Client-side project settings need a git repository.")
+        }
+        _ => None,
+    };
+    list.borrow().load_notice(project_notice.map(String::from));
+    let models = Arc::new(host.models);
+    let values = SettingsValues::from_values(
+        if target == ConfigTarget::Project {
+            host.effective
+        } else {
+            host.user.clone()
+        },
+        &models,
+    );
+    let inherited = SettingsValues::from_values(host.user, &models);
+    owner.models = Arc::clone(&models);
+    let catalogs = SettingsCatalogs {
+        owner,
+        models,
+        themes: Theme::available(),
+        tools: host.tools,
+        skills: host.skills,
+    };
+    fill_settings(
+        &handles.stack,
+        &handles.editor,
+        &handles.chrome,
+        &handles.activity,
+        target,
+        values,
+        inherited,
+        host.project_keys.into_iter().collect(),
+        catalogs,
+        &list,
+    );
+}
+
+/// Each fetch owns its opening host and list, so completion order and focus
+/// cannot deliver another host's skills into this window.
+async fn fill_host_skills(fetch: SkillsFetch) {
+    match fetch.owner.control.skills(&fetch.owner.session).await {
+        Ok(skills) => fill_skills_window(
+            &fetch.list,
+            skills
+                .into_iter()
+                .map(|skill| Skill {
+                    name: skill.name,
+                    description: skill.description,
+                    path: skill.path.into(),
+                    enabled: skill.enabled,
+                    disable_model_invocation: skill.disable_model_invocation,
+                })
+                .collect(),
+        ),
+        Err(err) => {
+            fetch
+                .list
+                .borrow()
+                .set_rows(vec![skills_placeholder_row(&settings_read_notice(
+                    "skills editor",
+                    &err,
+                ))])
+        }
+    }
 }
 
 /// Fetch host-rendered HTML and save it on this client off the drive loop.
@@ -5601,9 +5776,6 @@ pub(crate) struct OverlayHandles {
     pub(crate) task_kill: Rc<RefCell<Option<TaskId>>>,
     /// Where the prompt-history overlay parks a scan request.
     pub(crate) history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
-    /// Where the skills window parks its fill handle on open, for the drive
-    /// loop to stream discovered rows into.
-    pub(crate) skills_fill: Rc<RefCell<Option<SkillsFill>>>,
     /// Where the prompt-history overlay parks a recalled prompt.
     pub(crate) recall_slot: Rc<RefCell<Option<String>>>,
     /// Where the session selector parks its preview-scan request.
@@ -5637,7 +5809,6 @@ impl OverlayHandles {
             picker_outcome: Rc::new(RefCell::new(None)),
             task_kill: Rc::new(RefCell::new(None)),
             history_fetch: Rc::new(RefCell::new(None)),
-            skills_fill: Rc::new(RefCell::new(None)),
             recall_slot: Rc::new(RefCell::new(None)),
             session_scan: Rc::new(RefCell::new(None)),
             session_request: Rc::new(RefCell::new(None)),
@@ -5943,7 +6114,7 @@ struct Shell {
     /// overlays can't reach the async cores or the session world). Drained
     /// after each input event.
     selector_activity: Rc<RefCell<Vec<SelectorActivity>>>,
-    /// Live handles to an open settings window, so a failed apply can revert a
+    /// Live handles to an open settings window, so a failed apply can mark a
     /// row and a theme swap can re-tint the window. `None` when no settings
     /// window is open.
     settings_ui: Rc<RefCell<Option<SettingsUi>>>,
@@ -5961,11 +6132,6 @@ struct Shell {
     /// A prompt-history scan request parked by the overlay (on open and
     /// on scope toggle) for the drive loop to run and fill.
     history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
-    /// The skills window's fill handle, parked on open. The drive loop's
-    /// skills fill arm replaces its loading placeholder with the discovered
-    /// rows through this captured handle (never the stack's `top()`) once the
-    /// off-loop walk lands.
-    skills_fill: Rc<RefCell<Option<SkillsFill>>>,
     /// A recalled prompt parked by the prompt-history overlay, collected
     /// by the drive loop and dropped into the editor.
     recall_slot: Rc<RefCell<Option<String>>>,
@@ -5984,7 +6150,12 @@ struct Shell {
     /// A confirmed authentication request parked by a picker and drained by
     /// the drive loop, which owns the credential store and login task machinery.
     auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
-    credential_fills: Vec<futures::future::LocalBoxFuture<'static, ()>>,
+    /// Reads that openers park for the drive loop to run to completion: a
+    /// window opens on a placeholder at once and its fill lands here. Each
+    /// fill holds its own window weakly and checks it is still the one on
+    /// show before writing, so a late reply cannot land on a reopened window
+    /// and closing a window is all it takes to discard its read.
+    fills: Vec<futures::future::LocalBoxFuture<'static, ()>>,
     /// A credential write belongs to the shell, not the selected session.
     credential_change: Option<CredentialChange>,
     /// Where the session-tag editor parks a confirmed label, read by the drive
@@ -6089,7 +6260,6 @@ impl Shell {
         let task_view: Rc<RefCell<Option<Rc<RefCell<TaskOutputView>>>>> =
             Rc::new(RefCell::new(None));
         let history_fetch: Rc<RefCell<Option<HistoryFetch>>> = Rc::new(RefCell::new(None));
-        let skills_fill: Rc<RefCell<Option<SkillsFill>>> = Rc::new(RefCell::new(None));
         let recall_slot: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let session_scan: Rc<RefCell<Option<SessionScan>>> = Rc::new(RefCell::new(None));
         let session_request: Rc<RefCell<Option<SessionRequest>>> = Rc::new(RefCell::new(None));
@@ -6359,13 +6529,12 @@ impl Shell {
             task_kill,
             task_view,
             history_fetch,
-            skills_fill,
             recall_slot,
             window_title,
             session_scan,
             session_request,
             auth_request,
-            credential_fills: Vec::new(),
+            fills: Vec::new(),
             credential_change: None,
             tag_edit,
             terminal_caps: Cell::new(TerminalCaps::default()),
@@ -6421,13 +6590,6 @@ impl Shell {
     /// Collect a prompt-history scan request parked by the overlay, if any.
     fn take_history_fetch(&self) -> Option<HistoryFetch> {
         self.history_fetch.borrow_mut().take()
-    }
-
-    /// Collect the skills window's fill handle parked on open, if any. The
-    /// drive loop drains it to kick off discovery and remember the list to
-    /// fill.
-    fn take_skills_fetch(&self) -> Option<SkillsFill> {
-        self.skills_fill.borrow_mut().take()
     }
 
     /// Collect a recalled prompt parked by the prompt-history overlay, if any.
@@ -6490,7 +6652,6 @@ impl Shell {
             picker_outcome: Rc::clone(&self.picker_outcome),
             task_kill: Rc::clone(&self.task_kill),
             history_fetch: Rc::clone(&self.history_fetch),
-            skills_fill: Rc::clone(&self.skills_fill),
             recall_slot: Rc::clone(&self.recall_slot),
             session_scan: Rc::clone(&self.session_scan),
             session_request: Rc::clone(&self.session_request),
@@ -7062,6 +7223,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut diagnostics = user_diagnostics;
     diagnostics.extend(project_diagnostics);
     let layers = ConfigLayers {
+        writes: Default::default(),
         user: user_config,
         project: project_layer,
         project_path: Config::project_config_file_path(),
@@ -7726,8 +7888,9 @@ async fn drive(
     // session's drive loop isn't re-toasted.
     let mut selection_copied_seen: Option<Instant> =
         shell.borrow().view().selection_copied.get().map(|c| c.at);
-    // Each fill owns its originating list and receiver. Requests can complete
-    // out of order, including after their overlay has been closed.
+    // Window reads and saves run here without blocking input. Each fill owns
+    // its opening window, so replies can arrive after closing or switching
+    // sessions. Unfinished fills return to the shell when this drive exits.
     let mut pending_fills: FuturesUnordered<futures::future::LocalBoxFuture<'static, ()>> =
         FuturesUnordered::new();
     // Prompt-history reads publish ranked snapshots here. The select stays on
@@ -7739,13 +7902,6 @@ async fn drive(
     // side in `pending_session` while the blocking scan sends only the
     // (Send) previews back.
     let mut pending_session: Option<SessionFill> = None;
-    // Skills discovery for the skills window runs off the loop. The walk reads
-    // `SKILL.md` files (blocking IO); only the discovered skills (Send) come
-    // back. The window is already open (with a loading placeholder) and its
-    // `!Send` list handle stays here in `pending_skills`, so the fill arm below
-    // targets that captured handle rather than the stack's `top()`.
-    let (skills_tx, mut skills_rx) = unbounded_channel::<Vec<Skill>>();
-    let mut pending_skills: Option<SkillsFill> = None;
     // Session HTML export renders and writes off the loop, delivering only its
     // result notice string back here.
     let (export_tx, mut export_rx) = unbounded_channel::<String>();
@@ -7828,7 +7984,7 @@ async fn drive(
         // already buffered when the loop is re-entered to be answered from rows
         // that predate the switch, and a stepping chord would name the session
         // just landed on.
-        pending_fills.extend(shell.borrow_mut().credential_fills.drain(..));
+        pending_fills.extend(shell.borrow_mut().fills.drain(..));
         if world.sync_working_directory() {
             shell.borrow_mut().rebind_working_directory(world);
             app.post_app_event(UserEvent {
@@ -7955,24 +8111,6 @@ async fn drive(
             // --- Async read-only overlay fill ---
             _ = pending_fills.next(), if !pending_fills.is_empty() => {
                 app.request_redraw();
-            }
-
-            // --- Skills window fill ---
-            // Discovery finished off the loop. The window is already open (with
-            // a loading placeholder) over the palette, so we fill its captured
-            // list handle (`pending_skills`) rather than touching the stack's
-            // `top()`. That is what keeps the flow safe. A confirm of another
-            // opener from the still-interactive palette can't misdirect it.
-            // `fill_skills_window` handles the empty result with a "no skills"
-            // placeholder, so the window conveys that itself and the palette
-            // stays underneath either way.
-            maybe_skills = skills_rx.recv() => {
-                if let Some(skills) = maybe_skills
-                    && let Some(list) = pending_skills.take()
-                {
-                    fill_skills_window(&list, skills);
-                    app.request_redraw();
-                }
             }
 
             result = recv_credential_change(&mut credential_change) => {
@@ -8151,7 +8289,7 @@ async fn drive(
                         // overlay (this event may have confirmed one).
                         let activity = shell.borrow().take_activity();
                         if !activity.is_empty()
-                            && apply_selector_activity(world, shell, theme_watch, activity)
+                            && dispatch_selector_activity(world, shell, theme_watch, activity)
                                 .await
                         {
                             app.request_redraw();
@@ -8173,15 +8311,6 @@ async fn drive(
                         // Replacing the receiver isolates superseded results.
                         if let Some(fetch) = shell.borrow().take_history_fetch() {
                             pending_history = Some(spawn_history_scan(world, fetch));
-                        }
-                        // A just-opened skills window: kick off discovery off
-                        // the loop and remember the captured list handle to fill
-                        // (never the stack's `top()`). The window is already up
-                        // with a loading placeholder; the fill arm streams the
-                        // discovered rows in when the walk lands.
-                        if let Some(fill) = shell.borrow().take_skills_fetch() {
-                            spawn_skills_discovery(world, &skills_tx);
-                            pending_skills = Some(fill);
                         }
                         // A session-selector open: give it a fresh channel,
                         // run the preview scan off the loop, and remember the
@@ -8627,6 +8756,9 @@ async fn drive(
         let outcome = (&mut session.handle).await;
         finish_login(world, shell, app, &mut login_session, outcome);
     }
+    // A session switch must not cancel a settings write or wait for credential
+    // I/O. Both keep their captured target and resume on the next drive.
+    shell.borrow_mut().fills.extend(pending_fills);
     shell.borrow_mut().credential_change = credential_change;
 
     // Recovery belongs to the world rather than one invocation of `drive`.
@@ -8711,6 +8843,9 @@ fn format_remote_resume_hint(url: &str, session: &str) -> String {
 #[cfg(test)]
 mod tests {
     mod credential_changes;
+    mod presentation_saves;
+    mod selector_parity;
+    mod settings_parity;
 
     use std::io::{PipeWriter, Write};
     use std::sync::{Arc, OnceLock};
@@ -9436,6 +9571,7 @@ mod tests {
     /// [`default_layers`] with the spill directory aimed inside `dir`.
     fn layers_spilling_into(dir: &TempDir) -> ConfigLayers {
         ConfigLayers {
+            writes: Default::default(),
             user: Config {
                 spill_dir: spill_dir_in(dir),
                 ..Config::default()
@@ -9448,6 +9584,7 @@ mod tests {
     /// exercise persistence.
     fn default_layers() -> ConfigLayers {
         ConfigLayers {
+            writes: Default::default(),
             user: Config::default(),
             project: aj_conf::ConfigLayer::default(),
             project_path: None,
@@ -11746,11 +11883,13 @@ mod tests {
         // Confirm `minimal` through the real apply path, then reconcile the
         // chrome the way the drive loop does.
         let mut watch = inert_theme_watch();
+        let selector_owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
         apply_selector_activity(
             &mut world,
             &shell,
             &mut watch,
             vec![SelectorActivity::ThinkingConfirmed {
+                owner: selector_owner.clone(),
                 target: AgentId::Main,
                 level: Some(ThinkingConfig::Minimal),
             }],
@@ -11765,11 +11904,13 @@ mod tests {
         );
 
         // Confirm `xhigh`: the border moves to the stronger tint.
+        let selector_owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
         apply_selector_activity(
             &mut world,
             &shell,
             &mut watch,
             vec![SelectorActivity::ThinkingConfirmed {
+                owner: selector_owner.clone(),
                 target: AgentId::Main,
                 level: Some(ThinkingConfig::XHigh),
             }],
@@ -13585,13 +13726,10 @@ mod tests {
         (world, shell)
     }
 
-    /// Invoke [`apply_command_action`] with a throwaway export delivery
-    /// channel, for the tests that exercise actions other than `ExportHtml`
-    /// (which is the only arm that sends on it). Tests that exercise the
-    /// export offload keep the receiver and call `apply_command_action`
-    /// directly.
-    async fn fill_credentials(shell: &Rc<RefCell<Shell>>) {
-        let fills = std::mem::take(&mut shell.borrow_mut().credential_fills);
+    /// Complete pending credential loads for component tests.
+    /// Run the fills openers parked for the drive loop, the way the loop does.
+    async fn run_fills(shell: &Rc<RefCell<Shell>>) {
+        let fills = std::mem::take(&mut shell.borrow_mut().fills);
         for fill in fills {
             fill.await;
         }
@@ -13607,11 +13745,11 @@ mod tests {
         let (export_tx, _export_rx) = unbounded_channel();
         let (redraw_tx, _redraw_rx) = unbounded_channel();
         let effect = apply_command_action(world, shell, action, &export_tx, &redraw_tx).await;
-        fill_credentials(shell).await;
+        run_fills(shell).await;
         effect
     }
-    /// bound to it, so tests can exercise the host arms that need all three
-    /// of the app, the world, and the shell (the login/logout flow).
+
+    /// Initialize a terminal app and scripted world for composed interactions.
     async fn init_app_with_world(
         dir: &TempDir,
         demo: &str,
@@ -14455,6 +14593,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        select_host_thinking_model(&mut world, &shell).await;
 
         // Open the palette (depth 1).
         writer.write_all(&[0x0f]).expect("write ctrl+o");
@@ -15335,7 +15474,7 @@ mod tests {
                 settle_pending_transition(&mut app, &shell, &mut world).await;
             }
             apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            fill_credentials(&shell).await;
+            run_fills(&shell).await;
             let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
             assert!(page.contains("credential-left"), "{page}");
             focus_overlay(&mut app, &root);
@@ -15382,7 +15521,7 @@ mod tests {
             )
             .await;
             apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            fill_credentials(&shell).await;
+            run_fills(&shell).await;
             focus_overlay(&mut app, &root);
             type_text(&mut app, &mut writer, "remove all").await;
             press(&mut app, &mut writer, b"\r").await;
@@ -15442,7 +15581,7 @@ mod tests {
             apply_command_action(&mut world, &shell, action, &export, &redraw).await;
             focus_overlay(&mut app, &root);
             type_text(&mut app, &mut writer, "credential-fake").await;
-            fill_credentials(&shell).await;
+            run_fills(&shell).await;
             let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
             assert!(
                 page.contains("does not support credential management")
@@ -16112,7 +16251,7 @@ mod tests {
             logout,
         )
         .await;
-        fill_credentials(&shell).await;
+        run_fills(&shell).await;
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
         focus_overlay(&mut app, &root);
         writer
@@ -16186,7 +16325,7 @@ mod tests {
             request,
         )
         .await;
-        fill_credentials(&shell).await;
+        run_fills(&shell).await;
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
         focus_overlay(&mut app, &root);
         // First row chooses the sibling as default; second removes all.
@@ -16915,7 +17054,7 @@ mod tests {
     #[tokio::test]
     async fn open_skills_opens_loading_over_palette_and_fills() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell, mut app, mut writer, root) =
+        let (world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
 
         // Open the palette (depth 1).
@@ -16925,9 +17064,9 @@ mod tests {
         app.render(&root).expect("render");
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "palette open");
 
-        // Confirm skills: the window opens NOW over the palette (depth 2).
-        let effect = apply_command(&mut world, &shell, CommandAction::OpenSkills).await;
-        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        // Confirm skills: the window opens NOW over the palette (depth 2),
+        // before its discovery has answered.
+        let fill = open_host_skills(&world, &shell);
         focus_overlay(&mut app, &root);
         assert_eq!(
             shell.borrow().overlays.borrow().depth(),
@@ -16940,15 +17079,9 @@ mod tests {
             "loading state: {loading}"
         );
 
-        // The window parked its fill handle for the drive loop.
-        let fill = shell
-            .borrow()
-            .take_skills_fetch()
-            .expect("skills window parked a fill handle");
-
-        // Deliver discovered skills the way the drive loop's fill arm does.
+        // Deliver discovered skills the way the fill does once it lands.
         fill_skills_window(
-            &fill,
+            &fill.list,
             vec![Skill {
                 name: "demo".to_string(),
                 description: "a demo skill".to_string(),
@@ -16983,7 +17116,7 @@ mod tests {
     #[tokio::test]
     async fn open_skills_empty_discovery_fills_the_no_skills_placeholder() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell, mut app, mut writer, root) =
+        let (world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
 
         writer.write_all(&[0x0f]).expect("write ctrl+o");
@@ -16991,17 +17124,12 @@ mod tests {
         app.handle_input(event);
         app.render(&root).expect("render");
 
-        let effect = apply_command(&mut world, &shell, CommandAction::OpenSkills).await;
-        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        let fill = open_host_skills(&world, &shell);
         focus_overlay(&mut app, &root);
         assert_eq!(shell.borrow().overlays.borrow().depth(), 2);
-        let fill = shell
-            .borrow()
-            .take_skills_fetch()
-            .expect("fill handle parked");
 
         let before = main_notices(&world).len();
-        fill_skills_window(&fill, Vec::new());
+        fill_skills_window(&fill.list, Vec::new());
         let rendered = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
             rendered.contains("No skills found"),
@@ -17019,30 +17147,21 @@ mod tests {
         );
     }
 
-    /// The drive loop's drain kicks off discovery off the loop once the window
-    /// parked its fill handle: `spawn_skills_discovery` delivers exactly one
-    /// result over the shared channel (the walk runs on the blocking pool). We
-    /// assert the offload, not a specific skill set, which depends on the
-    /// environment.
+    /// The fill the command parks completes host discovery without leaving
+    /// the loading placeholder behind.
     #[tokio::test]
     async fn open_skills_drain_spawns_discovery_off_the_loop() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let (skills_tx, mut skills_rx) = unbounded_channel();
-
-        // Opening the skills window parks a fill handle for the drive loop.
         let effect = apply_command(&mut world, &shell, CommandAction::OpenSkills).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
-        assert!(
-            shell.borrow().take_skills_fetch().is_some(),
-            "the window parked a fill handle"
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join(
+            "
+",
         );
-
-        // The drain then spawns discovery off the loop; it delivers one result.
-        spawn_skills_discovery(&world, &skills_tx);
         assert!(
-            skills_rx.recv().await.is_some(),
-            "discovery delivered a result"
+            !rows.contains("Loading skills"),
+            "host discovery completed: {rows}"
         );
     }
 
@@ -17954,6 +18073,24 @@ mod tests {
         ThemeWatch::install("dark")
     }
 
+    async fn select_host_thinking_model(world: &mut World, shell: &Rc<RefCell<Shell>>) {
+        let models = world.control.config(world.session()).await.unwrap().models;
+        let info = models
+            .into_iter()
+            .find(|info| {
+                aj_models::registry::supported_thinking_levels(info)
+                    .contains(&aj_models::types::ThinkingLevel::High)
+            })
+            .expect("host catalog offers a reasoning model");
+        let owner = SettingsOwner::capture(world, shell, Arc::clone(&world.catalog));
+        assert!(
+            confirm_model(world, &owner, AgentId::Main, PersistAction::None, info)
+                .await
+                .is_none()
+        );
+        assert_eq!(reattach(world, shell).await.unwrap(), CatchUp::Caught);
+    }
+
     /// The thinking selector, driven through real dispatch: open from the
     /// host path, filter to `high`, confirm. The change updates the footer and
     /// stages the run config, is recorded on the session log, and (session
@@ -17963,6 +18100,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        select_host_thinking_model(&mut world, &shell).await;
 
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenThinkingSelector).await,
@@ -18043,11 +18181,13 @@ mod tests {
         let info = world.catalog.first().cloned().expect("catalog non-empty");
 
         let mut watch = inert_theme_watch();
+        let selector_owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
         apply_selector_activity(
             &mut world,
             &shell,
             &mut watch,
             vec![SelectorActivity::ModelConfirmed {
+                owner: selector_owner.clone(),
                 target: AgentId::Main,
                 info: Box::new(info.clone()),
             }],
@@ -18160,6 +18300,7 @@ mod tests {
             .set_str("auto_compact", "false")
             .expect("valid override");
         let layers = ConfigLayers {
+            writes: Default::default(),
             user: Config::default(),
             project,
             project_path: Some(dir.path().join("repo").join(".aj").join("config.toml")),
@@ -18198,6 +18339,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let project_path = dir.path().join("repo").join(".aj").join("config.toml");
         let layers = ConfigLayers {
+            writes: Default::default(),
             user: Config::default(),
             project: aj_conf::ConfigLayer::default(),
             project_path: Some(project_path.clone()),
@@ -18245,74 +18387,20 @@ mod tests {
         );
     }
 
-    /// Project settings outside a git repo (no project path) folds a notice
-    /// rather than opening the window.
+    /// Project availability is resolved in the asynchronous loading window.
     #[tokio::test]
-    async fn project_settings_without_a_repo_folds_a_notice() {
+    async fn project_settings_without_a_repo_shows_a_notice() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenProjectSettings).await,
-            ActionEffect::Redraw
+            ActionEffect::OpenedOverlay
         ));
         assert!(
-            !shell.borrow().overlays.borrow().is_open(),
-            "no window opened"
+            top_overlay_rows(&shell)
+                .join("\n")
+                .contains("git repository")
         );
-        let notices: Vec<String> = world
-            .chat
-            .borrow()
-            .transcript(AgentId::Main)
-            .expect("main transcript")
-            .entries()
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EntryKind::Notice(n) => Some(n.text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            notices.iter().any(|n| n.contains("git repository")),
-            "{notices:?}"
-        );
-    }
-
-    /// A speed change whose provider rebuild fails (the scripted provider is
-    /// not in the registry) reverts the settings row to the previous value.
-    #[tokio::test]
-    async fn speed_change_failure_reverts_the_row() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let mut watch = inert_theme_watch();
-
-        // Open the settings window so the revert has a live row to fix.
-        apply_command(&mut world, &shell, CommandAction::OpenSettings).await;
-        // Simulate the widget's optimistic edit before the apply fails.
-        {
-            let ui = shell.borrow();
-            let ui = ui.settings_ui.borrow();
-            ui.as_ref().unwrap().set_value("speed", "fast");
-        }
-
-        let notice = apply_setting_change(
-            &world,
-            &shell,
-            &mut watch,
-            PersistAction::User,
-            "speed",
-            "fast",
-        )
-        .await
-        .expect("speed apply returns a notice");
-        assert!(notice.contains("Failed to set speed"), "got: {notice}");
-
-        // The row reverted to the still-active speed.
-        let reverted = {
-            let ui = shell.borrow();
-            let ui = ui.settings_ui.borrow();
-            ui.as_ref().unwrap().value_of("speed")
-        };
-        assert_eq!(reverted.as_deref(), Some("standard"));
     }
 
     /// A skills toggle persists into `disabled_skills` on the user layer.
@@ -18321,15 +18409,24 @@ mod tests {
         let Some(home) = isolated_test_home() else {
             return;
         };
+        let skill_dir = home.join(".agents/skills/demo-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: a test skill\n---\nInstructions",
+        )
+        .unwrap();
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let mut watch = inert_theme_watch();
 
+        let owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
         apply_selector_activity(
             &mut world,
             &shell,
             &mut watch,
             vec![SelectorActivity::SkillToggle {
+                owner,
                 name: "demo-skill".to_string(),
                 disable: true,
             }],
@@ -18570,11 +18667,13 @@ mod tests {
         // Pin the main view to a low level, then seed an observable sub-agent
         // at a high level, so the two views resolve to distinct border tints.
         let mut watch = inert_theme_watch();
+        let selector_owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
         apply_selector_activity(
             &mut world,
             &shell,
             &mut watch,
             vec![SelectorActivity::ThinkingConfirmed {
+                owner: selector_owner.clone(),
                 target: AgentId::Main,
                 level: Some(ThinkingConfig::Minimal),
             }],
@@ -18640,11 +18739,13 @@ mod tests {
 
         // Pin the main view to a low level so it resolves to a distinct tint.
         let mut watch = inert_theme_watch();
+        let selector_owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
         apply_selector_activity(
             &mut world,
             &shell,
             &mut watch,
             vec![SelectorActivity::ThinkingConfirmed {
+                owner: selector_owner.clone(),
                 target: AgentId::Main,
                 level: Some(ThinkingConfig::Minimal),
             }],
@@ -19908,7 +20009,25 @@ mod tests {
                     .await
                     .is_some();
                     let edited = if armed {
-                        writer.write_all(b"\x0fthinking\rhigh\r").unwrap();
+                        writer.write_all(b"\x0fthinking\r").unwrap();
+                        let loaded = settled(Duration::from_secs(3), || {
+                            (observed.borrow().overlays.borrow().is_open()
+                                && top_overlay_rows(&observed)
+                                    .join("\n")
+                                    .contains("Thinking effort")
+                                && !top_overlay_rows(&observed)
+                                    .join("\n")
+                                    .contains("Loading host models"))
+                            .then_some(())
+                        })
+                        .await
+                        .is_some();
+                        assert!(
+                            loaded,
+                            "thinking picker did not load: {}",
+                            flatten(&observed.borrow_mut().draw(&full_draw_ctx())).join("\n")
+                        );
+                        writer.write_all(b"high\r").unwrap();
                         settled(Duration::from_secs(3), || {
                             branch_settings(&observed)
                                 .is_some_and(|settings| {
@@ -20001,11 +20120,13 @@ mod tests {
         };
         arm_recorded_branch(&world, &shell, &message);
         let mut watch = inert_theme_watch();
+        let owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
         apply_selector_activity(
             &mut world,
             &shell,
             &mut watch,
             vec![SelectorActivity::SettingChange {
+                owner,
                 target: ConfigTarget::Project,
                 id: "thinking".into(),
                 value: "high".into(),
@@ -20059,11 +20180,13 @@ mod tests {
             Some(original.thinking.as_str()),
             "rearm inherits rather than carrying the discarded edit"
         );
+        let selector_owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
         apply_selector_activity(
             &mut world,
             &shell,
             &mut watch,
             vec![SelectorActivity::ThinkingConfirmed {
+                owner: selector_owner.clone(),
                 target: AgentId::Main,
                 level: Some(ThinkingConfig::Low),
             }],
@@ -20519,6 +20642,7 @@ mod tests {
                 .unwrap();
             confirm_thinking(
                 &world,
+                &SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog)),
                 AgentId::Main,
                 PersistAction::None,
                 Some(ThinkingConfig::Low),
@@ -20552,6 +20676,7 @@ mod tests {
                 .clone();
             confirm_thinking(
                 &world,
+                &SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog)),
                 AgentId::Main,
                 PersistAction::None,
                 Some(ThinkingConfig::High),
@@ -20582,16 +20707,19 @@ mod tests {
             );
             let (mut app, mut writer, root) = app_over(&shell).await;
             let mut watch = inert_theme_watch();
+            let selector_owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
             apply_selector_activity(
                 &mut world,
                 &shell,
                 &mut watch,
                 vec![
                     SelectorActivity::ModelConfirmed {
+                        owner: selector_owner.clone(),
                         target: AgentId::Main,
                         info: Box::new(info.clone()),
                     },
                     SelectorActivity::ThinkingConfirmed {
+                        owner: selector_owner.clone(),
                         target: AgentId::Main,
                         level: Some(ThinkingConfig::High),
                     },
@@ -24415,6 +24543,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let project_path = dir.path().join("repo").join(".aj").join("config.toml");
         let layers = ConfigLayers {
+            writes: Default::default(),
             user: Config::default(),
             project: aj_conf::ConfigLayer::default(),
             project_path: Some(project_path.clone()),
@@ -30282,9 +30411,15 @@ mod tests {
             id: "no-such-model".to_string(),
             ..aj_app::test_support::scripted_model_info()
         };
-        let notice = confirm_model(&world, AgentId::Main, PersistAction::None, unservable)
-            .await
-            .expect("the host refuses a model it cannot serve");
+        let notice = confirm_model(
+            &world,
+            &SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog)),
+            AgentId::Main,
+            PersistAction::None,
+            unservable,
+        )
+        .await
+        .expect("the host refuses a model it cannot serve");
         assert!(
             notice.contains("nowhere/no-such-model") && notice.contains("catalog"),
             "the peer's reason is folded verbatim: {notice}"

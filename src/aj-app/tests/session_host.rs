@@ -187,6 +187,7 @@ impl Harness {
                 user: Config::default(),
                 project: ConfigLayer::default(),
                 project_path: None,
+                writes: Default::default(),
             })),
             catalog: Arc::new(catalog),
             defaults: RunConfigDefaults::fixed(run_config),
@@ -245,6 +246,7 @@ impl Harness {
                 user: Config::default(),
                 project: ConfigLayer::default(),
                 project_path: None,
+                writes: Default::default(),
             })),
             catalog: Arc::new(Vec::new()),
             defaults: RunConfigDefaults::fixed(snapshot(scripted(messages, 0, Duration::ZERO))),
@@ -275,6 +277,176 @@ impl Harness {
             .await
             .expect("prompt accepted");
     }
+}
+
+/// User persistence resolves HOME, so only the child gets an isolated home.
+/// A current-thread runtime makes blocking a host caller observable even when
+/// the machine has spare worker threads.
+#[test]
+fn concurrent_config_edits_preserve_disables_and_keep_readers_available() {
+    const CHILD: &str = "AJ_CONFIG_EDITS_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = TempDir::new().unwrap();
+        let thread = std::thread::current();
+        let test = thread.name().expect("libtest names the test thread");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--format=pretty"])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "child failed:\n{}\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let harness = Harness::new(Vec::new());
+            let session = harness.create().await;
+            let names: Vec<_> = (0..12)
+                .map(|i| format!("concurrent-skill-{i:02}"))
+                .collect();
+            for name in &names {
+                let dir = harness._dir.path().join(".aj/skills").join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("SKILL.md"),
+                    format!("---\nname: {name}\ndescription: test skill\n---\nTest skill.\n"),
+                )
+                .unwrap();
+            }
+            let initial = harness.host.config(&session).await.unwrap();
+            assert_eq!(initial.skills.len(), names.len());
+            let path = Config::config_file_path().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "# config edits fixture\n").unwrap();
+            let lock_path = path.with_extension("toml.lock");
+            std::fs::create_dir(&lock_path).unwrap();
+
+            let mut writes = tokio::task::JoinSet::new();
+            for name in &names {
+                let host = harness.host.clone();
+                let session = session.clone();
+                let name = name.clone();
+                writes.spawn(async move {
+                    host.toggle_skill(
+                        &session,
+                        aj_wire::SkillToggle {
+                            name,
+                            disable: true,
+                        },
+                    )
+                    .await
+                });
+            }
+            let host = harness.host.clone();
+            let edit_session = session.clone();
+            writes.spawn(async move {
+                host.edit_config(
+                    &edit_session,
+                    aj_wire::ConfigEdit {
+                        key: "auto_compact".into(),
+                        value: Some("false".into()),
+                        persist: PersistAction::User,
+                    },
+                )
+                .await
+            });
+
+            // Keep persistence behind the disk lock while the callers contend.
+            // Neither a completed write nor a stalled runtime is acceptable.
+            let start = Instant::now();
+            let completion =
+                tokio::time::timeout(Duration::from_millis(250), writes.join_next()).await;
+            let snapshot = bounded(
+                "config readers during persistence",
+                harness.host.config(&session),
+            )
+            .await;
+            let responsive = start.elapsed() < Duration::from_secs(2);
+            let disk_before_release = Config::load();
+            std::fs::remove_dir(&lock_path).unwrap();
+            assert!(
+                responsive,
+                "config persistence blocked the runtime or snapshot reader"
+            );
+            assert!(
+                completion.is_err(),
+                "a write completed while its disk lock was held"
+            );
+            assert_eq!(
+                serde_json::to_value(snapshot.unwrap()).unwrap(),
+                serde_json::to_value(initial).unwrap(),
+                "unpersisted edits became visible"
+            );
+            assert!(disk_before_release.1.is_empty());
+            assert!(disk_before_release.0.disabled_skills.is_empty());
+            bounded("all config edits", async {
+                while let Some(result) = writes.join_next().await {
+                    result.unwrap().unwrap();
+                }
+            })
+            .await;
+
+            let (disk, diagnostics) = Config::load();
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let mut disabled = disk.disabled_skills.clone();
+            disabled.sort();
+            assert_eq!(disabled, names, "a concurrent skill disable was lost");
+            let snapshot = harness.host.config(&session).await.unwrap();
+            let disk_values = aj_app::settings::host_values(&disk);
+            assert_eq!(snapshot.user, disk_values);
+            assert_eq!(snapshot.effective, disk_values);
+            assert_eq!(
+                aj_app::settings::host_values(&harness.config.lock().unwrap()),
+                disk_values
+            );
+            assert_eq!(snapshot.user["auto_compact"], "false");
+
+            let saved = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, "[invalid TOML").unwrap();
+            let enable = aj_wire::SkillToggle {
+                name: names[0].clone(),
+                disable: false,
+            };
+            assert!(matches!(
+                harness.host.toggle_skill(&session, enable.clone()).await,
+                Err(HostError::Internal(_))
+            ));
+            assert_eq!(
+                serde_json::to_value(harness.host.config(&session).await.unwrap()).unwrap(),
+                serde_json::to_value(snapshot).unwrap()
+            );
+            assert_eq!(
+                aj_app::settings::host_values(&harness.config.lock().unwrap()),
+                disk_values
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "[invalid TOML");
+            std::fs::write(&path, saved).unwrap();
+            harness.host.toggle_skill(&session, enable).await.unwrap();
+            let (disk, diagnostics) = Config::load();
+            assert!(diagnostics.is_empty());
+            disabled = disk.disabled_skills.clone();
+            disabled.sort();
+            assert_eq!(disabled, names[1..]);
+            let snapshot = harness.host.config(&session).await.unwrap();
+            assert_eq!(snapshot.user, aj_app::settings::host_values(&disk));
+            assert_eq!(snapshot.effective, snapshot.user);
+            assert_eq!(
+                aj_app::settings::host_values(&harness.config.lock().unwrap()),
+                snapshot.user
+            );
+            harness.host.shutdown().await;
+        });
 }
 
 fn scripted(
@@ -2161,6 +2333,7 @@ async fn the_host_id_is_claimed_not_written_over() {
             user: Config::default(),
             project: ConfigLayer::default(),
             project_path: None,
+            writes: Default::default(),
         })),
         catalog: Arc::new(Vec::new()),
         defaults: RunConfigDefaults::fixed(snapshot(scripted(Vec::new(), 0, Duration::ZERO))),
@@ -2207,6 +2380,7 @@ async fn a_host_reports_the_name_it_was_given_or_derives_one() {
                 user: Config::default(),
                 project: ConfigLayer::default(),
                 project_path: None,
+                writes: Default::default(),
             })),
             catalog: Arc::new(Vec::new()),
             defaults: RunConfigDefaults::fixed(snapshot(scripted(Vec::new(), 0, Duration::ZERO))),
@@ -12655,6 +12829,7 @@ async fn branch_restore_harness() -> (Harness, String, String, String) {
             user: Config::default(),
             project: ConfigLayer::default(),
             project_path: None,
+            writes: Default::default(),
         })),
         catalog: Arc::new(catalog),
         defaults: RunConfigDefaults::fixed(RunConfigSnapshot {

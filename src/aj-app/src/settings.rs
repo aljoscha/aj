@@ -36,6 +36,209 @@ use crate::model::{
 use crate::session::SessionCore;
 use crate::session_setup::{RunConfigSnapshot, thinking_display_name, thinking_level_for};
 
+/// Presentation belongs to the connecting frontend, not the session host.
+/// All other schema options are host-owned defaults.
+pub fn is_presentation(key: &str) -> bool {
+    matches!(
+        key,
+        "theme"
+            | "show_thinking_block"
+            | "show_token_usage"
+            | "compact_transcript"
+            | "show_frame_stats"
+            | "sidebar_cols"
+            | "show_image_in_terminal"
+            | "syntax_highlighting"
+            | "keybindings"
+    )
+}
+
+/// Editable schema values, returned intact to the trusted peer.
+/// AuthStorage records and arbitrary config-file keys are not settings.
+pub fn host_values(config: &Config) -> std::collections::BTreeMap<String, String> {
+    let mut values = schema_values(config);
+    values.retain(|key, _| !is_presentation(key));
+    values
+}
+
+/// Every schema option in the editor's input vocabulary. Unset optionals keep
+/// the schema's explicit sentinel, distinct from an empty string.
+pub fn schema_values(config: &Config) -> std::collections::BTreeMap<String, String> {
+    Config::OPTIONS
+        .iter()
+        .map(|option| {
+            let value = if matches!(option.kind, aj_conf::ValueKind::StringList) {
+                option
+                    .to_toml(config)
+                    .and_then(|item| {
+                        item.as_array().map(|array| {
+                            array
+                                .iter()
+                                .filter_map(|item| item.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                    })
+                    .unwrap_or_default()
+            } else {
+                option.display(config)
+            };
+            (option.name.to_string(), value)
+        })
+        .collect()
+}
+
+/// The synthetic settings row folding `model_api` + `model_name` into one
+/// picker-backed entry. Its value is a `provider/id` string.
+pub const MODEL_SETTING_ID: &str = "model";
+
+/// The "leave unset" value for options whose absence has its own meaning
+/// (`thinking_display`, `verbosity`). Writing it removes the key.
+pub const UNSET_VALUE: &str = "default";
+
+/// Whether `key` is an inference axis: a value the running session applies
+/// as well as one the config files hold. Everything else in the schema is
+/// config only.
+pub fn is_axis(key: &str) -> bool {
+    matches!(
+        key,
+        MODEL_SETTING_ID | "thinking" | "thinking_display" | "speed" | "verbosity"
+    )
+}
+
+/// The settings axis an editor row names, with the model resolved against
+/// `models`.
+pub fn setting_axis(
+    models: &[ModelInfo],
+    key: &str,
+    value: &str,
+) -> Result<crate::host::SettingsAxis, String> {
+    use crate::host::SettingsAxis;
+    match key {
+        MODEL_SETTING_ID => value
+            .split_once('/')
+            .and_then(|(provider, model)| {
+                models
+                    .iter()
+                    .find(|info| info.provider == provider && info.id == model)
+            })
+            .cloned()
+            .map(SettingsAxis::Model)
+            .ok_or_else(|| format!("Unknown model {value}.")),
+        "thinking" => aj_models::thinking_config_from_name(value)
+            .map(SettingsAxis::Thinking)
+            .ok_or_else(|| format!("Unknown thinking level {value:?}.")),
+        "speed" => aj_models::speed_from_name(value)
+            .map(SettingsAxis::Speed)
+            .ok_or_else(|| format!("Unknown speed {value:?}.")),
+        "thinking_display" if value == UNSET_VALUE => Ok(SettingsAxis::ThinkingDisplay(None)),
+        "thinking_display" => value
+            .parse::<ConfigThinkingDisplay>()
+            .map(|value| SettingsAxis::ThinkingDisplay(Some(value))),
+        "verbosity" if value == UNSET_VALUE => Ok(SettingsAxis::Verbosity(None)),
+        "verbosity" => value
+            .parse::<ConfigVerbosity>()
+            .map(|value| SettingsAxis::Verbosity(Some(value))),
+        _ => Err(format!("Unknown settings axis {key:?}.")),
+    }
+}
+
+/// Write one config value into the layer the edit names, after validating
+/// the whole edit. Axis keys take the editor's vocabulary and land the same
+/// way a persisted settings command lands them, without touching any
+/// session. Presentation keys belong to the frontend and are refused.
+pub fn edit_config(
+    layers: &Arc<Mutex<ConfigLayers>>,
+    effective: &Arc<Mutex<Config>>,
+    models: &[ModelInfo],
+    edit: aj_wire::ConfigEdit,
+) -> Result<(), crate::host::HostError> {
+    use crate::host::HostError;
+    let option = Config::option(&edit.key).filter(|_| !is_presentation(&edit.key));
+    if option.is_none() && !is_axis(&edit.key) {
+        return Err(HostError::Invalid(format!(
+            "Unknown setting {:?}.",
+            edit.key
+        )));
+    }
+    match edit.persist {
+        PersistAction::None => {
+            return Err(HostError::Invalid(
+                "A config edit names the layer to write.".into(),
+            ));
+        }
+        PersistAction::ProjectClear if edit.value.is_some() => {
+            return Err(HostError::Invalid(
+                "A project clear must not carry a value.".into(),
+            ));
+        }
+        PersistAction::User | PersistAction::ProjectSet if edit.value.is_none() => {
+            return Err(HostError::Invalid(
+                "A setting write requires a value.".into(),
+            ));
+        }
+        _ => (),
+    }
+    if matches!(
+        edit.persist,
+        PersistAction::ProjectSet | PersistAction::ProjectClear
+    ) && layers
+        .lock()
+        .expect("config layers mutex poisoned")
+        .project_path
+        .is_none()
+    {
+        return Err(HostError::Invalid(
+            "Project settings need a git repository on the host.".into(),
+        ));
+    }
+    let note = if is_axis(&edit.key) {
+        match &edit.value {
+            Some(value) => {
+                let axis = setting_axis(models, &edit.key, value).map_err(HostError::Invalid)?;
+                persist_axis(layers, effective, edit.persist, &axis)
+            }
+            None if edit.key == MODEL_SETTING_ID => persist_project(
+                layers,
+                effective,
+                &[("model_api", None), ("model_name", None)],
+            ),
+            None => persist_project(layers, effective, &[(&edit.key, None)]),
+        }
+    } else {
+        let option = option.expect("checked above");
+        if let Some(value) = &edit.value {
+            option
+                .apply_str(value, &mut Config::default())
+                .map_err(|err| HostError::Invalid(err.to_string()))?;
+        }
+        let value = edit
+            .value
+            .as_deref()
+            .filter(|value| edit.key != "model_url" || !value.is_empty());
+        persist_setting(
+            layers,
+            effective,
+            edit.persist,
+            &edit.key,
+            value,
+            |config| {
+                if edit.key == "model_url" {
+                    config.model_url = value.map(String::from);
+                } else if let Some(value) = value {
+                    option
+                        .apply_str(value, config)
+                        .expect("validated schema value");
+                }
+            },
+        )
+    };
+    match note {
+        Some(note) => Err(HostError::Internal(note.into())),
+        None => Ok(()),
+    }
+}
+
 /// The two config-file layers a frontend can edit.
 ///
 /// The effective [`Config`] a running session reads is held separately
@@ -50,6 +253,8 @@ pub struct ConfigLayers {
     /// Where the project layer persists, or `None` when the process is
     /// not inside a git repository (project editing is unavailable).
     pub project_path: Option<PathBuf>,
+    /// Serializes complete edits without holding the snapshot lock during I/O.
+    pub writes: Arc<Mutex<()>>,
 }
 
 impl ConfigLayers {
@@ -69,32 +274,14 @@ pub enum ConfigTarget {
     Project,
 }
 
-/// How a setting change persists, independently of applying it to a session.
-///
-/// The `/thinking` and `/model` overlays are session-scoped
-/// ([`PersistAction::None`]); the settings windows persist to a config
-/// layer as the new default for future sessions. A project clear
-/// removes the key so the value falls back to the user (or built-in)
-/// default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PersistAction {
-    /// Session only: leave every config file untouched.
-    None,
-    /// Write the value to the user `config.toml`.
-    User,
-    /// Write the value to the project `config.toml` as an override.
-    ProjectSet,
-    /// Remove the key(s) from the project `config.toml`.
-    ProjectClear,
-}
+pub use aj_wire::PersistAction;
 
-impl PersistAction {
-    /// The persist action for a value change (not a clear) made in a
-    /// settings window targeting `target`.
-    pub fn set_for(target: ConfigTarget) -> Self {
-        match target {
-            ConfigTarget::User => PersistAction::User,
-            ConfigTarget::Project => PersistAction::ProjectSet,
+impl ConfigTarget {
+    /// Persist a value change to this config layer.
+    pub fn persist_action(self) -> PersistAction {
+        match self {
+            Self::User => PersistAction::User,
+            Self::Project => PersistAction::ProjectSet,
         }
     }
 }
@@ -117,81 +304,77 @@ pub fn config_thinking_level(thinking: Option<&aj_models::ThinkingConfig>) -> Co
     }
 }
 
-/// Apply `mutate` to the user config layer, refresh the effective
-/// config the running session reads, and persist the user
-/// `~/.aj/config.toml`.
+/// Write a user-layer edit to `~/.aj/config.toml`, then publish it in memory.
 ///
-/// Selector outcomes change live agent/TUI state for the running
-/// session; this mirrors the change into the user layer so it survives
-/// a restart. The in-memory mutation and the effective-config refresh
-/// happen first, under the layers lock, which is dropped before the
-/// file write so persistence never holds the lock across I/O. The
-/// write goes through [`Config::persist_changed`] (a comment-preserving
-/// per-key merge under a cross-process lock). A save failure returns a
-/// user-facing notice rather than an error.
+/// Disk goes first, so memory only ever reflects what was saved: a failed
+/// save leaves the layers and the effective config unchanged, and retrying
+/// the same value writes again instead of diffing against a layer that
+/// already has it. Edits sharing `layers` serialize from the baseline read
+/// through publication. Snapshot readers do not wait for the write lock or
+/// disk I/O. Callers on an async runtime must offload this blocking operation.
 pub fn persist_user(
     layers: &Arc<Mutex<ConfigLayers>>,
     effective: &Arc<Mutex<Config>>,
-    mutate: impl FnOnce(&mut Config),
+    mutate: impl Fn(&mut Config),
 ) -> Option<String> {
-    let (baseline, updated) = {
-        let mut l = layers.lock().expect("config layers mutex poisoned");
-        let baseline = l.user.clone();
-        mutate(&mut l.user);
-        let updated = l.user.clone();
-        *effective.lock().expect("config mutex poisoned") = l.effective();
-        (baseline, updated)
-    };
-    match updated.persist_changed(&baseline) {
-        Ok(()) => None,
-        Err(err) => Some(format!("(couldn't save to config.toml: {err})")),
+    let writes = Arc::clone(&layers.lock().expect("config layers mutex poisoned").writes);
+    let _write = writes.lock().expect("config write mutex poisoned");
+    let baseline = layers
+        .lock()
+        .expect("config layers mutex poisoned")
+        .user
+        .clone();
+    let mut updated = baseline.clone();
+    mutate(&mut updated);
+    if let Err(err) = updated.persist_changed(&baseline) {
+        return Some(format!("(couldn't save to config.toml: {err})"));
     }
+    let mut layers = layers.lock().expect("config layers mutex poisoned");
+    layers.user = updated;
+    *effective.lock().expect("config mutex poisoned") = layers.effective();
+    None
 }
 
-/// Set or clear keys in the project config layer, refresh the effective
-/// config, and persist the project `<git-root>/.aj/config.toml`.
-///
-/// Each entry is `(option_name, Some(value) to set | None to remove)`.
-/// A set stores an explicit override (presence-tracked), so even a
-/// value equal to the built-in default is written and shadows the user
-/// layer. Mirrors [`persist_user`]'s discipline: the in-memory edit and
-/// effective-config refresh run under the layers lock, the file write
-/// off it. Reports the first set error (or a save failure) as a notice;
-/// returns a notice too when there is no project (not in a git repo).
+/// Set or clear project-layer overrides in `<git-root>/.aj/config.toml`,
+/// then publish them in memory, with the same discipline as [`persist_user`].
 pub fn persist_project(
     layers: &Arc<Mutex<ConfigLayers>>,
     effective: &Arc<Mutex<Config>>,
     entries: &[(&str, Option<&str>)],
 ) -> Option<String> {
-    let (baseline, updated, path, set_error) = {
-        let mut l = layers.lock().expect("config layers mutex poisoned");
-        let Some(path) = l.project_path.clone() else {
-            return Some("(no project config: not inside a git repository)".to_string());
-        };
-        let baseline = l.project.clone();
-        let mut set_error = None;
+    let writes = Arc::clone(&layers.lock().expect("config layers mutex poisoned").writes);
+    let _write = writes.lock().expect("config write mutex poisoned");
+    fn apply(layer: &mut ConfigLayer, entries: &[(&str, Option<&str>)]) -> Option<String> {
         for (key, value) in entries {
             match value {
-                Some(v) => {
-                    if let Err(e) = l.project.set_str(key, v) {
-                        set_error = Some(format!("(couldn't set {key}: {e})"));
-                        break;
+                Some(value) => {
+                    if let Err(err) = layer.set_str(key, value) {
+                        return Some(format!("(couldn't set {key}: {err})"));
                     }
                 }
-                None => l.project.clear(key),
+                None => layer.clear(key),
             }
         }
-        let updated = l.project.clone();
-        *effective.lock().expect("config mutex poisoned") = l.effective();
-        (baseline, updated, path, set_error)
+        None
+    }
+    let (baseline, path) = {
+        let layers = layers.lock().expect("config layers mutex poisoned");
+        let Some(path) = layers.project_path.clone() else {
+            return Some("(no project config: not inside a git repository)".to_string());
+        };
+        (layers.project.clone(), path)
     };
-    if let Some(err) = set_error {
-        return Some(err);
+    let mut updated = baseline.clone();
+    if let Some(note) = apply(&mut updated, entries) {
+        return Some(note);
     }
-    match updated.persist(&baseline, &path) {
-        Ok(()) => None,
-        Err(err) => Some(format!("(couldn't save to project config.toml: {err})")),
+    if let Err(err) = updated.persist(&baseline, &path) {
+        return Some(format!("(couldn't save to project config.toml: {err})"));
     }
+    let mut layers = layers.lock().expect("config layers mutex poisoned");
+    layers.project = updated;
+    *effective.lock().expect("config mutex poisoned") = layers.effective();
+    None
 }
 
 /// Persist a single-key settings change to the layer named by
@@ -209,7 +392,7 @@ pub fn persist_setting(
     persist: PersistAction,
     key: &str,
     value: Option<&str>,
-    user_mutate: impl FnOnce(&mut Config),
+    user_mutate: impl Fn(&mut Config),
 ) -> Option<String> {
     match persist {
         PersistAction::None => None,

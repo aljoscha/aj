@@ -526,7 +526,7 @@ fn harness_config(dir: &TempDir) -> Config {
 /// read, and the layers a persisting settings change would write.
 ///
 /// Held by the caller as well as the host, so a test can assert that a remote
-/// change touched neither.
+/// session-only change touched neither.
 #[derive(Clone)]
 pub(crate) struct HostHandles {
     pub(crate) auth: AuthStorage,
@@ -543,6 +543,7 @@ impl HostHandles {
                 user: Config::default(),
                 project: ConfigLayer::default(),
                 project_path: None,
+                writes: Default::default(),
             })),
         }
     }
@@ -723,7 +724,7 @@ struct Fixture {
     server: RemoteServer,
     client: RemoteClient,
     /// The config the host's sessions read, and the layers a persisting
-    /// settings change would write. A remote change must touch neither.
+    /// settings change would write. A session-only change must touch neither.
     config: Arc<StdMutex<Config>>,
     layers: Arc<StdMutex<ConfigLayers>>,
 }
@@ -826,6 +827,7 @@ impl Fixture {
             .command(
                 session,
                 &RemoteCommand::Settings(SettingsRequest {
+                    persist: Default::default(),
                     agent: None,
                     change,
                 }),
@@ -2661,6 +2663,7 @@ async fn an_unknown_session_answers_404_on_every_route() {
         }),
         RemoteCommand::Compact(CompactRequest::default()),
         RemoteCommand::Settings(SettingsRequest {
+            persist: Default::default(),
             agent: None,
             change: SessionSettings {
                 thinking: Some("off".to_string()),
@@ -3176,10 +3179,9 @@ async fn an_unknown_endpoint_answers_404() {
     fixture.shutdown().await;
 }
 
-/// A settings change from the network is session-only however it was asked
-/// for: a peer must not be able to rewrite the host's config files.
+/// Omitting persistence keeps a network settings change session-only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_remote_settings_change_never_persists() {
+async fn a_remote_settings_change_without_persistence_is_session_only() {
     let fixture = Fixture::new(vec![finalized_text_message("answered")]).await;
     let session = fixture.create().await;
     let mut remote = fixture.remote(&session).await;
@@ -3804,6 +3806,7 @@ async fn probe_every_route(
             agent: None,
         }),
         RemoteCommand::Settings(SettingsRequest {
+            persist: Default::default(),
             agent: None,
             change: SessionSettings {
                 thinking: Some("off".to_string()),
