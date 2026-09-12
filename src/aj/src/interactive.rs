@@ -8714,6 +8714,44 @@ mod tests {
 
     use super::*;
 
+    /// Run an environment-sensitive test alone, without changing sibling tests'
+    /// environment. The parent owns HOME until the child process has exited,
+    /// including any background work that outlives the child's test body.
+    /// Returns the isolated HOME in the child, or None after the parent verifies it.
+    fn isolated_test_home() -> Option<PathBuf> {
+        const CHILD: &str = "AJ_INTERACTIVE_TEST_CHILD";
+        let thread = std::thread::current();
+        let test = thread.name().expect("libtest names the test thread");
+        if std::env::var(CHILD).as_deref() == Ok(test) {
+            return Some(PathBuf::from(std::env::var_os("HOME").expect("child HOME")));
+        }
+
+        let home = TempDir::new().expect("isolated HOME");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                test,
+                "--nocapture",
+                "--format=pretty",
+                "--test-threads=1",
+            ])
+            .env(CHILD, test)
+            .env("HOME", home.path())
+            .env_remove("AJ_DISABLE_SANDBOX_WARNING")
+            .output()
+            .expect("run isolated test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // libtest succeeds even when the exact filter matches no tests.
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "isolated test {test} did not pass ({status}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            status = output.status,
+        );
+        None
+    }
+
     fn arm_branch(anchor: &Rc<RefCell<Option<crate::branch::BranchDraft>>>, message_id: String) {
         *anchor.borrow_mut() = Some(crate::branch::BranchDraft::new(message_id, None));
     }
@@ -10252,15 +10290,10 @@ mod tests {
     /// message once the chat starts, while the warning-level notices below it
     /// are what the splash box surfaces.
     #[tokio::test]
-    #[serial_test::serial]
     async fn build_world_folds_context_as_leading_info_before_warnings() {
-        // Force the sandbox warning on so a warning-level notice deterministically
-        // follows the context, independent of the ambient environment.
-        let prev = std::env::var("AJ_DISABLE_SANDBOX_WARNING").ok();
-        // SAFETY: `#[serial]` keeps other env-mutating tests out; restored below.
-        unsafe {
-            std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING");
-        }
+        let Some(_home) = isolated_test_home() else {
+            return;
+        };
 
         let dir = TempDir::new().expect("tempdir");
         let world = scripted_world(&dir, "streaming-text").await;
@@ -10279,14 +10312,6 @@ mod tests {
                 })
                 .collect()
         };
-
-        // SAFETY: same serial scope as the remove above.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", v),
-                None => std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING"),
-            }
-        }
 
         let context_at = leading
             .iter()
@@ -16482,12 +16507,11 @@ mod tests {
     /// render + write off the loop and returns immediately, and the resulting
     /// notice comes back over the channel the drive loop's fill arm folds.
     #[tokio::test]
-    #[serial_test::serial]
     async fn export_html_spawns_and_delivers_notice() {
+        let Some(_home) = isolated_test_home() else {
+            return;
+        };
         let dir = TempDir::new().expect("tempdir");
-        // The export writes under `$HOME/.aj/exports`, so redirect HOME into
-        // the tempdir rather than the real home.
-        let _home = HomeGuard::set(dir.path());
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let (export_tx, mut export_rx) = unbounded_channel();
         let (redraw_tx, _redraw_rx) = unbounded_channel();
@@ -17273,35 +17297,6 @@ mod tests {
         ThemeWatch::install("dark")
     }
 
-    /// Pin `$HOME` to a scratch dir for the test, restoring it on drop, so
-    /// user-layer persistence writes into a tempdir rather than the real
-    /// `~/.aj`. Paired with `#[serial]` since env mutation is process-wide.
-    struct HomeGuard {
-        prior: Option<String>,
-    }
-
-    impl HomeGuard {
-        fn set(path: &std::path::Path) -> HomeGuard {
-            let prior = std::env::var("HOME").ok();
-            // SAFETY: `#[serial]` keeps other threads out; Drop restores it.
-            unsafe {
-                std::env::set_var("HOME", path);
-            }
-            HomeGuard { prior }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prior {
-                    Some(value) => std::env::set_var("HOME", value),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
     /// The thinking selector, driven through real dispatch: open from the
     /// host path, filter to `high`, confirm. The change updates the footer and
     /// stages the run config, is recorded on the session log, and (session
@@ -17423,10 +17418,11 @@ mod tests {
     /// user config, while the window stays open. A later session minted by the
     /// same host starts at that persisted default.
     #[tokio::test]
-    #[serial_test::serial]
     async fn settings_window_persists_thinking_to_user_config() {
+        let Some(home) = isolated_test_home() else {
+            return;
+        };
         let dir = TempDir::new().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
         let world = world_from_argv(
             &dir,
             &[
@@ -17473,7 +17469,7 @@ mod tests {
             Some(ThinkingConfig::High)
         );
         // Persisted to the tempdir user config.toml.
-        let config_path = dir.path().join(".aj").join("config.toml");
+        let config_path = home.join(".aj").join("config.toml");
         let contents = std::fs::read_to_string(&config_path).expect("config.toml written");
         assert!(contents.contains("thinking = \"high\""), "got: {contents}");
         // The settings window edits the process default, not only this
@@ -17664,10 +17660,11 @@ mod tests {
 
     /// A skills toggle persists into `disabled_skills` on the user layer.
     #[tokio::test]
-    #[serial_test::serial]
     async fn skill_toggle_persists_to_disabled_skills() {
+        let Some(home) = isolated_test_home() else {
+            return;
+        };
         let dir = TempDir::new().expect("tempdir");
-        let _home = HomeGuard::set(dir.path());
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let mut watch = inert_theme_watch();
 
@@ -17693,7 +17690,7 @@ mod tests {
                 .any(|s| s == "demo-skill"),
             "the skill is disabled in the user layer"
         );
-        let config_path = dir.path().join(".aj").join("config.toml");
+        let config_path = home.join(".aj").join("config.toml");
         let contents = std::fs::read_to_string(&config_path).expect("config.toml written");
         assert!(contents.contains("demo-skill"), "got: {contents}");
     }
@@ -26205,13 +26202,10 @@ mod tests {
     /// session runs: a connected client shows the sandbox disclaimer like a
     /// local run does, whether it attached a session or created one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[serial_test::serial]
     async fn a_connected_client_reports_its_own_process_notices() {
-        let prev = std::env::var("AJ_DISABLE_SANDBOX_WARNING").ok();
-        // SAFETY: `#[serial]` keeps other env-mutating tests out; restored below.
-        unsafe {
-            std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING");
-        }
+        let Some(_home) = isolated_test_home() else {
+            return;
+        };
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let (created, _) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
@@ -26219,14 +26213,6 @@ mod tests {
         let other = TempDir::new().expect("tempdir");
         let (attached, _) = connect_world_and_shell(&other, &remote, &[]).await;
         let attached_notices = main_notices(&attached);
-        // SAFETY: same serial scope as the remove above.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", v),
-                None => std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING"),
-            }
-        }
-
         for (mode, notices) in [("created", created_notices), ("attached", attached_notices)] {
             assert_eq!(
                 notices
