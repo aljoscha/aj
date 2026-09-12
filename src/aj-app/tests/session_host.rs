@@ -5557,16 +5557,10 @@ fn all_notices(state: &CanonicalState) -> Vec<(AgentId, String)> {
         .collect()
 }
 
-/// Cancelling a detached background sub-agent whose parent turn is over ends
-/// its run.
-///
-/// Without the task route, the run is in no turn's cancel map and the main
-/// turn is idle. Every assertion below then reads the other way round: the
-/// child answers in full, its task exits 0 carrying a report, its box reads
-/// done, and the parent hears a completed run.
-#[tokio::test]
-async fn cancelling_a_detached_background_sub_ends_its_run() {
-    let ending = end_detached_sub(EndDetached::Cancel, ParentTurn::Ended).await;
+/// A detached run is cut short and concludes cleanly without cancelling its
+/// parent's turn. These absolute outcomes also rule out two equally wrong
+/// endings passing the gesture comparison.
+fn assert_detached_sub_was_killed(ending: &DetachedEnding, parent: ParentTurn) {
     assert!(
         !ending.child_answered_in_full,
         "the child's run was cut short: {ending:?}",
@@ -5614,36 +5608,12 @@ async fn cancelling_a_detached_background_sub_ends_its_run() {
         ending.errors.is_empty(),
         "the ending was clean, no turn task died on the way: {ending:?}",
     );
-}
-
-/// Cancelling a detached background sub-agent whose parent turn is still
-/// running ends that run and nothing else.
-///
-/// A detached run is reached through its task whatever the parent is doing,
-/// so the cascade must not fire here: the parent never aimed at its own turn,
-/// and cancelling it would cut the answer the user is reading. That is what
-/// the assertions below pin, and a cascade in the detached route fails them
-/// while leaving every other test in this file green.
-#[tokio::test]
-async fn cancelling_a_detached_sub_spares_its_parents_live_turn() {
-    let ending = end_detached_sub(EndDetached::Cancel, ParentTurn::Live).await;
-    assert!(
-        ending.parent_answered_in_full,
-        "the parent's own turn ran to the end of its answer: {ending:?}",
-    );
-    assert_eq!(
-        ending.task,
-        TaskStatus::Killed,
-        "the child's run ended without collateral damage: {ending:?}",
-    );
-    assert!(
-        !ending.notices.iter().any(|(_, text)| text == CANCELLED),
-        "and nothing reported a cancelled turn, because none was: {ending:?}",
-    );
-    assert!(
-        ending.errors.is_empty(),
-        "the ending was clean, no turn task died on the way: {ending:?}",
-    );
+    if parent == ParentTurn::Live {
+        assert!(
+            ending.parent_answered_in_full,
+            "the parent's own turn ran to the end of its answer: {ending:?}",
+        );
+    }
 }
 
 /// The cancel gesture and the task surface's kill are two gestures for one
@@ -5659,6 +5629,8 @@ async fn a_cancelled_detached_sub_ends_exactly_as_a_killed_task_does() {
     for parent in [ParentTurn::Ended, ParentTurn::Live] {
         let cancelled = end_detached_sub(EndDetached::Cancel, parent).await;
         let killed = end_detached_sub(EndDetached::KillTask, parent).await;
+        assert_detached_sub_was_killed(&cancelled, parent);
+        assert_detached_sub_was_killed(&killed, parent);
         assert_eq!(
             cancelled, killed,
             "with the parent turn {parent:?}, the cancel gesture ended the run \
