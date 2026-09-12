@@ -226,17 +226,22 @@ mod tests {
 
     #[test]
     fn palette_rows_resolve_shortcuts_from_binding_data() {
-        // The palette-open command carries a bound action, so its row's
-        // shortcut column holds the data-derived chord rather than a literal.
         let items = palette_items();
-        let resolved = action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
-            .expect("palette-open has a default chord");
-        assert!(
-            items
+        for (command, action) in [
+            ("aj palette", aj_app::keybindings::ACTION_PALETTE_OPEN),
+            ("session new", aj_app::keybindings::ACTION_SESSION_NEW),
+        ] {
+            let resolved = action_shortcut(action).expect("action has a default chord");
+            let item = items
                 .iter()
-                .any(|i| i.shortcut.as_deref() == Some(resolved.as_str())),
-            "expected a row with resolved shortcut {resolved:?}"
-        );
+                .find(|item| item.filter_key == command)
+                .expect("command has a palette row");
+            assert_eq!(
+                item.shortcut.as_deref(),
+                Some(resolved.as_str()),
+                "expected {command} to show its resolved shortcut"
+            );
+        }
     }
 
     #[test]

@@ -139,7 +139,7 @@ pub const COMMANDS: &[Command] = &[
         title: "new",
         category: "session",
         description: "Start a fresh session (kept on disk).",
-        action_id: None,
+        action_id: Some(crate::keybindings::ACTION_SESSION_NEW),
         action: CommandAction::NewSession,
     },
     Command {
