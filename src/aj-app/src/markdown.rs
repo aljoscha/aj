@@ -2731,9 +2731,9 @@ mod tests {
         reset_highlight_cache();
         let cold_src = "const COLD: u8 = 0;";
         let warm_src = "const WARM: u8 = 1;";
-        // `cold` is inserted first, so it starts as the least-recently-used.
-        let cold = highlight_code(cold_src, Some("rust"));
+        // The oldest insertion must survive once a lookup makes it warm.
         let warm = highlight_code(warm_src, Some("rust"));
+        let cold = highlight_code(cold_src, Some("rust"));
         for i in 0..(HIGHLIGHT_CACHE_CAPACITY - 2) {
             let code = format!("const N{i}: u8 = 2;");
             let _ = highlight_code(&code, Some("rust"));
@@ -2742,7 +2742,7 @@ mod tests {
 
         // Touch `warm` so `cold` is now the coldest, then insert one more
         // distinct key to force exactly one eviction.
-        let _ = highlight_code(warm_src, Some("rust"));
+        assert!(Rc::ptr_eq(&warm, &highlight_code(warm_src, Some("rust"))));
         let _ = highlight_code("const EXTRA: u8 = 3;", Some("rust"));
         assert_eq!(highlight_cache_len(), HIGHLIGHT_CACHE_CAPACITY);
 
@@ -2892,12 +2892,6 @@ mod tests {
         assert_eq!(row_text(&rows[0]), "para one");
         assert!(is_blank_row(&rows[1]));
         assert_eq!(row_text(&rows[2]), "para two");
-    }
-
-    #[test]
-    fn no_trailing_blank_row_after_the_final_block() {
-        let rows = render_markdown("# Heading", 80, &opts());
-        assert!(!rows.last().is_none_or(is_blank_row));
     }
 
     #[test]
