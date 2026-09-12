@@ -28,3 +28,28 @@ pub(crate) mod tests;
 pub(crate) use client::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents, SILENCE};
 pub(crate) use identity::{IdentityError, IdentityGate, IdentityMode, TailscaleWhois};
 pub(crate) use server::RemoteServer;
+
+/// An endpoint label that cannot expose URL credentials.
+pub(crate) fn endpoint_label(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "remote host".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.as_str().trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    #[test]
+    fn endpoint_labels_omit_credentials_and_private_query_or_fragment_data() {
+        assert_eq!(
+            super::endpoint_label(
+                "https://operator:password@example.test:8443/agent/?token=query-secret#fragment-secret"
+            ),
+            "https://example.test:8443/agent"
+        );
+    }
+}

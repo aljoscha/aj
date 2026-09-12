@@ -37,8 +37,8 @@ use crate::fuzzy::FuzzyMatcher;
 use crate::key::{Key, Modifiers};
 use crate::vxfw::{
     Builder, DrawContext, Event, EventContext, ListView, MaxSize, PromptInput, RelativePoint,
-    RichText, ScrollBars, Size, Source, SubSurface, Surface, TextSpan, Widget, WidgetRef,
-    WidthBasis,
+    RichText, ScrollBars, Size, Source, SubSurface, Surface, TextAlign, TextSpan, Widget,
+    WidgetRef, WidthBasis,
 };
 
 /// The marker drawn before a filter overlay's query input, so the input reads
@@ -62,6 +62,8 @@ pub struct SelectStyles {
     /// Style for the right-aligned metadata column ([`SelectItem::prefix`]),
     /// typically dim.
     pub prefix: Style,
+    /// Style for the leading row marker, independent of the filter prompt.
+    pub row_marker: Style,
     /// Style for the key-hint column ([`SelectItem::shortcut`]), typically the
     /// keybinding-hint color, bold.
     pub shortcut: Style,
@@ -82,11 +84,44 @@ impl Default for SelectStyles {
             selected_bg: Color::Default,
             label: Style::default(),
             prefix: Style::default(),
+            row_marker: Style::default(),
             shortcut: Style::default(),
             secondary: Style::default(),
             scrollbar_thumb: Style::default(),
             marker: Style::default(),
         }
+    }
+}
+
+/// An inline metadata field, aligned with the same field in every item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectColumn {
+    pub text: String,
+    pub alignment: TextAlign,
+    /// Gap after the field. The largest request at this index applies to every row.
+    pub gap_after: usize,
+}
+
+impl SelectColumn {
+    /// Builds a left-aligned field.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            alignment: TextAlign::Left,
+            gap_after: 2,
+        }
+    }
+
+    /// Sets the gap after this field, excluding padding used for alignment.
+    pub fn with_gap_after(mut self, columns: usize) -> Self {
+        self.gap_after = columns;
+        self
+    }
+
+    /// Sets alignment within the field's shared terminal-cell width.
+    pub fn with_alignment(mut self, alignment: TextAlign) -> Self {
+        self.alignment = alignment;
+        self
     }
 }
 
@@ -101,7 +136,8 @@ impl Default for SelectStyles {
 /// A row can carry three optional columns around the label: a `prefix`
 /// (right-aligned metadata column, e.g. a command category), a `shortcut` (a
 /// key hint), and a `description`. The shortcut and the description share the
-/// right slot, and a shortcut wins when both are set.
+/// right slot, and a shortcut wins when both are set. Opt-ins add
+/// a leading marker and aligned inline metadata before the label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectItem {
     /// Row text shown in the list.
@@ -122,8 +158,17 @@ pub struct SelectItem {
     /// [`SelectStyles::shortcut`]. Wins the slot over `description`.
     pub shortcut: Option<String>,
     /// Optional dim secondary column (a wire-level id, a one-line
-    /// description), rendered in the right slot when no `shortcut` is set.
+    /// description), rendered after the label when no `shortcut` is set.
     pub description: Option<String>,
+    /// Optional single-column leading marker in [`SelectStyles::row_marker`].
+    pub marker: Option<char>,
+    /// Inline metadata after the marker and prefix, before the label, styled
+    /// with [`SelectStyles::secondary`]. Fields align by index across all items,
+    /// including filtered-out items. Missing or empty fields reserve their
+    /// column. Entirely empty columns consume no space.
+    pub columns: Vec<SelectColumn>,
+    /// Strike through all row text without changing colors or selection styling.
+    pub strikethrough: bool,
 }
 
 impl SelectItem {
@@ -138,6 +183,9 @@ impl SelectItem {
             prefix: None,
             shortcut: None,
             description: None,
+            marker: None,
+            columns: Vec::new(),
+            strikethrough: false,
         }
     }
 
@@ -167,9 +215,30 @@ impl SelectItem {
         self
     }
 
-    /// Adds a dim secondary column shown in the right slot after the label.
+    /// Adds a dim secondary column, shown after the label when no shortcut is set.
     pub fn with_description(mut self, description: impl Into<String>) -> SelectItem {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Adds a marker before the prefix, styled with [`SelectStyles::row_marker`].
+    /// The caller must supply a character that occupies one terminal column.
+    /// If any item carries a marker, every row reserves its column and a
+    /// one-column gap, even when filtering hides all marked items.
+    pub fn with_marker(mut self, marker: char) -> SelectItem {
+        self.marker = Some(marker);
+        self
+    }
+
+    /// Applies strikethrough to the marker, prefix, metadata, and label.
+    pub fn with_strikethrough(mut self, enabled: bool) -> SelectItem {
+        self.strikethrough = enabled;
+        self
+    }
+
+    /// Adds aligned inline metadata before the label.
+    pub fn with_columns(mut self, columns: Vec<SelectColumn>) -> SelectItem {
+        self.columns = columns;
         self
     }
 }
@@ -187,6 +256,8 @@ struct SelectState {
     visible: Vec<(usize, u32)>,
     /// The current filter text, mirrored from the filter field on change.
     query: String,
+    /// Navigation chooses a row, unlike an automatically ranked first result.
+    user_selected: bool,
     /// The optional narrowing sigil ([`FilterableSelect::set_scope_sigil`]).
     scope_sigil: Option<char>,
     matcher: FuzzyMatcher,
@@ -200,6 +271,11 @@ struct SelectState {
     /// columns hold a stable horizontal position as the filter narrows the
     /// visible rows.
     label_width: usize,
+    /// Derived from all items so filtering cannot remove the marker gutter.
+    has_marker: bool,
+    /// Terminal-cell width and trailing gap, shared across the full item set.
+    column_layout: Vec<(usize, usize)>,
+    width_method: crate::gwidth::Method,
 }
 
 /// Gap between the right-aligned prefix column and the label.
@@ -207,33 +283,6 @@ const PREFIX_COLUMN_GAP: usize = 2;
 /// Padding added past the widest label, so a shortcut in the right slot sits
 /// clear of the longest label rather than flush against it.
 const LABEL_COLUMN_PADDING: usize = 2;
-
-/// Recomputes the prefix and label column widths from the full item set.
-///
-/// Called wherever `items` changes (construction, `set_items`, `extend_items`)
-/// so the columns stay sized to the widest content even as batches stream in.
-///
-/// NOTE: widths count chars, not grapheme display width. Padding and width use
-/// the same measure so it is internally consistent, but a wide or combining
-/// char in a prefix or a shortcut-bearing label would misalign the shortcut
-/// column against the `RichText` layout. Every caller today is ASCII. Switch to
-/// gwidth here and in `build_row` if a non-ASCII prefix/shortcut caller appears.
-fn recompute_widths(state: &mut SelectState) {
-    state.prefix_width = state
-        .items
-        .iter()
-        .filter_map(|item| item.prefix.as_deref())
-        .map(|prefix| prefix.chars().count())
-        .max()
-        .unwrap_or(0);
-    state.label_width = state
-        .items
-        .iter()
-        .map(|item| item.label.chars().count())
-        .max()
-        .unwrap_or(0)
-        + LABEL_COLUMN_PADDING;
-}
 
 /// Builds one banded row widget per visible index, restyling the row the
 /// cursor is on. The `state` and `styles` cells are shared with the widget, so
@@ -252,8 +301,7 @@ impl Builder for RowBuilder {
             &state.items[item_idx],
             idx == cursor,
             &styles,
-            state.prefix_width,
-            state.label_width,
+            &state,
         ))
     }
 }
@@ -264,33 +312,48 @@ impl Builder for RowBuilder {
 /// span backgrounds are tinted too so text cells sit on the band rather than
 /// leaving default-colored holes.
 ///
-/// Columns (left to right): a right-aligned prefix in `prefix_width` plus a
-/// gap, the label, then the right slot. The shortcut wins the right slot over
-/// the description, matching the columns `aj` draws. When a shortcut follows,
-/// the label is padded to `label_width` so shortcuts line up in a column. A
-/// description keeps its original layout (label plus a two-cell gap) so rows
-/// that carry no prefix or shortcut render exactly as they did before columns.
+/// Columns (left to right): an optional marker gutter, a right-aligned prefix
+/// in `prefix_width` plus a gap, inline metadata, the label, then the right
+/// slot. A shortcut suppresses the description and pads the label to
+/// `label_width`. Otherwise, label and description have a two-cell gap.
 fn build_row(
     item: &SelectItem,
     selected: bool,
     styles: &SelectStyles,
-    prefix_width: usize,
-    label_width: usize,
+    state: &SelectState,
 ) -> WidgetRef {
+    let prefix_width = state.prefix_width;
+    let label_width = state.label_width;
+    let has_marker = state.has_marker;
+    let column_layout = &state.column_layout;
+    let width_method = state.width_method;
     let band = selected.then_some(styles.selected_bg);
     let tint = |mut style: Style| -> Style {
+        style.strikethrough |= item.strikethrough;
         if let Some(bg) = band {
             style.bg = bg;
         }
         style
     };
     let mut spans = Vec::new();
+    if has_marker {
+        spans.push(TextSpan {
+            text: format!("{} ", item.marker.unwrap_or(' ')),
+            style: tint(styles.row_marker),
+            ..TextSpan::default()
+        });
+    }
     // Right-aligned metadata column plus its gap, only when some item carries
     // a prefix. An item without one still fills the column with spaces so the
     // label stays in its aligned position.
     if prefix_width > 0 {
-        let prefix = item.prefix.as_deref().unwrap_or("");
-        let pad = prefix_width.saturating_sub(prefix.chars().count());
+        let prefix = clip_column(
+            item.prefix.as_deref().unwrap_or(""),
+            prefix_width,
+            width_method,
+        );
+        let pad =
+            prefix_width.saturating_sub(usize::from(crate::gwidth::gwidth(&prefix, width_method)));
         spans.push(TextSpan {
             text: format!(
                 "{}{}{}",
@@ -302,8 +365,38 @@ fn build_row(
             ..TextSpan::default()
         });
     }
+    for (index, &(width, gap)) in column_layout.iter().enumerate() {
+        if width == 0 {
+            continue;
+        }
+        let column = item.columns.get(index);
+        let text = clip_column(
+            column.map_or("", |column| column.text.as_str()),
+            width,
+            width_method,
+        );
+        let padding = width.saturating_sub(usize::from(crate::gwidth::gwidth(&text, width_method)));
+        let left = match column.map_or(TextAlign::Left, |column| column.alignment) {
+            TextAlign::Left => 0,
+            TextAlign::Center => padding / 2,
+            TextAlign::Right => padding,
+        };
+        spans.push(TextSpan {
+            text: format!(
+                "{}{}{}",
+                " ".repeat(left),
+                text,
+                " ".repeat(padding - left + gap)
+            ),
+            style: tint(styles.secondary),
+            ..TextSpan::default()
+        });
+    }
     if let Some(shortcut) = &item.shortcut {
-        let pad = label_width.saturating_sub(item.label.chars().count());
+        let pad = label_width.saturating_sub(usize::from(crate::gwidth::gwidth(
+            &item.label,
+            width_method,
+        )));
         spans.push(TextSpan {
             text: format!("{}{}", item.label, " ".repeat(pad)),
             style: tint(styles.label),
@@ -351,6 +444,32 @@ fn build_row(
     }
     let widget: WidgetRef = Rc::new(RefCell::new(rich));
     widget
+}
+
+/// Clip metadata without splitting a grapheme or borrowing the label's cells.
+fn clip_column(
+    text: &str,
+    width: usize,
+    method: crate::gwidth::Method,
+) -> std::borrow::Cow<'_, str> {
+    if usize::from(crate::gwidth::gwidth(text, method)) <= width {
+        return text.into();
+    }
+    let mut clipped = String::new();
+    let mut used = 0;
+    for grapheme in crate::unicode::grapheme_iterator(text) {
+        let text = grapheme.bytes(text);
+        let cells = usize::from(crate::gwidth::gwidth(text, method));
+        if used + cells > width.saturating_sub(1) {
+            break;
+        }
+        clipped.push_str(text);
+        used += cells;
+    }
+    if width > 0 {
+        clipped.push('…');
+    }
+    clipped.into()
 }
 
 /// Recomputes `visible` by scoring the full item set from scratch and resets
@@ -508,6 +627,7 @@ pub struct FilterableSelect {
     /// ([`Self::set_show_scrollbar`]). The bar is still hidden while the list
     /// fits.
     show_scrollbar: bool,
+    label_reserve: usize,
     state: Rc<RefCell<SelectState>>,
     styles: Rc<RefCell<SelectStyles>>,
     /// Fires on Enter/Ctrl+J with the highlighted item. No-op while the
@@ -521,16 +641,19 @@ impl FilterableSelect {
     /// A select over `items` styled by `styles`, initially unfiltered with the
     /// cursor on the first row.
     pub fn new(items: Vec<SelectItem>, styles: SelectStyles) -> FilterableSelect {
-        let mut initial = SelectState {
+        let initial = SelectState {
             visible: Vec::new(),
             items,
             query: String::new(),
+            user_selected: false,
             scope_sigil: None,
             matcher: FuzzyMatcher::new(),
             prefix_width: 0,
             label_width: 0,
+            has_marker: false,
+            column_layout: Vec::new(),
+            width_method: crate::gwidth::Method::Unicode,
         };
-        recompute_widths(&mut initial);
         let state = Rc::new(RefCell::new(initial));
         let styles = Rc::new(RefCell::new(styles));
         let mut list_view = ListView::new(Source::Builder(Box::new(RowBuilder {
@@ -569,6 +692,7 @@ impl FilterableSelect {
                 // mid-string change) may add matches, so rescore everything.
                 let is_append = text.starts_with(&state.query) && text.len() > state.query.len();
                 state.query = text.to_string();
+                state.user_selected = false;
                 if is_append {
                     narrow_filter(&mut state, &mut list);
                 } else {
@@ -583,6 +707,7 @@ impl FilterableSelect {
             list,
             bars,
             show_scrollbar: false,
+            label_reserve: 0,
             state,
             styles,
             on_confirm: None,
@@ -598,6 +723,15 @@ impl FilterableSelect {
     /// content overlays.
     pub fn set_show_scrollbar(&mut self, show: bool) {
         self.show_scrollbar = show;
+    }
+
+    /// Reserve label cells by clipping the widest leading metadata fields first.
+    /// The reserve is capped at half the row width after the marker and scrollbar,
+    /// rounded up, and at the widest visible label's actual needs. Zero (the
+    /// default) leaves metadata at its natural width. Metadata widths are shared
+    /// across rows, including filtered-out items, within that budget.
+    pub fn set_label_reserve(&mut self, cells: usize) {
+        self.label_reserve = cells;
     }
 
     /// Offer a one-character query scope: a query whose first character is
@@ -636,8 +770,26 @@ impl FilterableSelect {
     pub fn set_items(&self, items: Vec<SelectItem>) {
         let mut state = self.state.borrow_mut();
         state.items = items;
-        recompute_widths(&mut state);
+        state.user_selected = false;
         full_filter(&mut state, &mut self.list.borrow_mut());
+    }
+
+    /// Replace a ranked snapshot, following the best result until the user
+    /// navigates. A navigated row keeps its identity across later snapshots.
+    /// Callers must supply unique, stable filter keys. Editing the query or
+    /// replacing the source with `set_items` returns to automatic selection.
+    pub fn set_ranked_items(&self, items: Vec<SelectItem>) {
+        let selected = self
+            .state
+            .borrow()
+            .user_selected
+            .then(|| self.selected())
+            .flatten();
+        self.set_items(items);
+        if let Some(selected) = selected {
+            let retained = self.select_matching(|item| item.filter_key == selected.filter_key);
+            self.state.borrow_mut().user_selected = retained;
+        }
     }
 
     /// Append `items` to the row set and re-apply the active filter,
@@ -655,10 +807,44 @@ impl FilterableSelect {
         let mut state = self.state.borrow_mut();
         let old_len = state.items.len();
         state.items.extend(items);
-        recompute_widths(&mut state);
         // Score only the new tail and merge it into the ranking, rather
         // than rescoring the whole accumulated set.
         merge_extend(&mut state, &mut self.list.borrow_mut(), old_len);
+    }
+
+    /// Replace the item at `index` and re-rank, keeping the highlight on the
+    /// row it was on and the scroll where it was. Used when a row's text
+    /// arrives after the list is on screen: the row set is unchanged, so
+    /// nothing the user is looking at should move. Under a live query the
+    /// changed row can move in the ranking, and the highlight follows its
+    /// row, scrolling only if that row left the viewport. Out-of-range
+    /// indices are ignored.
+    pub fn update_item(&self, index: usize, item: SelectItem) {
+        let mut state = self.state.borrow_mut();
+        if index >= state.items.len() {
+            return;
+        }
+        let mut list = self.list.borrow_mut();
+        let highlighted = state
+            .visible
+            .get(usize::try_from(list.cursor).expect("cursor fits usize"))
+            .map(|&(i, _)| i);
+        state.items[index] = item;
+        let all = (0..state.items.len()).collect();
+        state.visible = rank(&mut state, all);
+        let count = u32::try_from(state.visible.len()).expect("row count fits u32");
+        list.item_count = Some(count);
+        let position = highlighted.and_then(|i| state.visible.iter().position(|&(j, _)| j == i));
+        match position {
+            Some(pos) => {
+                let pos = u32::try_from(pos).expect("pos fits u32");
+                if pos != list.cursor {
+                    list.cursor = pos;
+                    list.ensure_scroll();
+                }
+            }
+            None => list.cursor = list.cursor.min(count.saturating_sub(1)),
+        }
     }
 
     /// Move the cursor onto the first visible item matching `pred`, used to
@@ -706,6 +892,86 @@ impl FilterableSelect {
 
 impl Widget for FilterableSelect {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        {
+            let mut state = self.state.borrow_mut();
+            let mut layout = Vec::<(usize, usize)>::new();
+            let mut prefix_width = 0;
+            let mut label_width = 0;
+            let mut has_marker = false;
+            // Label width only controls shortcut alignment. Trailing previews
+            // can be long and need no full-text measurement for this layout.
+            let has_shortcut = state.items.iter().any(|item| item.shortcut.is_some());
+            for item in &state.items {
+                prefix_width =
+                    prefix_width.max(ctx.string_width(item.prefix.as_deref().unwrap_or("")));
+                if has_shortcut {
+                    label_width = label_width.max(ctx.string_width(&item.label));
+                }
+                has_marker |= item.marker.is_some();
+                layout.resize(layout.len().max(item.columns.len()), (0, 0));
+                for (index, column) in item.columns.iter().enumerate() {
+                    let (width, gap) = &mut layout[index];
+                    *width = (*width).max(ctx.string_width(&column.text));
+                    *gap = (*gap).max(column.gap_after);
+                }
+            }
+            if self.label_reserve > 0 {
+                let size = ctx.max.size();
+                let scrollbar = self.show_scrollbar
+                    && state.visible.len() > usize::from(size.height.saturating_sub(2));
+                let available = usize::from(size.width)
+                    .saturating_sub(usize::from(scrollbar))
+                    .saturating_sub(if has_marker { 2 } else { 0 });
+                let cap = self.label_reserve.min(available.div_ceil(2));
+                let mut reserve = 0;
+                // Short labels do not need empty reserved cells at the cost of
+                // clipped metadata. Stop measuring once the reserve is filled,
+                // so long prompts do not require full-text width scans.
+                for &(index, _) in &state.visible {
+                    let label = &state.items[index].label;
+                    let mut width = 0;
+                    for grapheme in crate::unicode::grapheme_iterator(label) {
+                        width = (width + ctx.string_width(grapheme.bytes(label))).min(cap);
+                        if width == cap {
+                            break;
+                        }
+                    }
+                    reserve = reserve.max(width);
+                    if reserve == cap {
+                        break;
+                    }
+                }
+                let budget = available - reserve;
+                // Treat the prefix like the inline fields for budgeting, while
+                // keeping its own style and alignment. Short fields keep their
+                // natural widths, so one long host or tag cannot crowd them out.
+                let mut fields = vec![(prefix_width, PREFIX_COLUMN_GAP)];
+                fields.extend_from_slice(&layout);
+                let mut used: usize = fields
+                    .iter()
+                    .filter(|(width, _)| *width > 0)
+                    .map(|(width, gap)| width + gap)
+                    .sum();
+                while used > budget {
+                    let (width, gap) = fields
+                        .iter_mut()
+                        .max_by_key(|(width, _)| *width)
+                        .expect("the prefix slot exists");
+                    *width -= 1;
+                    used -= 1;
+                    if *width == 0 {
+                        used -= *gap;
+                    }
+                }
+                prefix_width = fields[0].0;
+                layout.copy_from_slice(&fields[1..]);
+            }
+            state.prefix_width = prefix_width;
+            state.label_width = label_width + LABEL_COLUMN_PADDING;
+            state.has_marker = has_marker;
+            state.column_layout = layout;
+            state.width_method = ctx.width_method;
+        }
         let size = ctx.max.size();
         let mut surface = Surface::with_size(size);
 
@@ -805,11 +1071,13 @@ impl Widget for FilterableSelect {
         if key.matches(Key::DOWN, Modifiers::empty())
             || key.matches(u32::from('n'), Modifiers::CTRL)
         {
+            self.state.borrow_mut().user_selected = true;
             self.list.borrow_mut().next_item(ctx);
             return;
         }
         if key.matches(Key::UP, Modifiers::empty()) || key.matches(u32::from('p'), Modifiers::CTRL)
         {
+            self.state.borrow_mut().user_selected = true;
             self.list.borrow_mut().prev_item(ctx);
         }
     }
@@ -1040,6 +1308,7 @@ mod tests {
                 selected_bg: band,
                 label: Style::default(),
                 prefix: Style::default(),
+                row_marker: Style::default(),
                 shortcut: Style::default(),
                 secondary: Style::default(),
                 scrollbar_thumb: Style::default(),
@@ -1121,6 +1390,137 @@ mod tests {
     /// The row's graphemes concatenated, for locating a column by its text.
     fn row_text(cells: &[Cell]) -> String {
         cells.iter().map(|c| c.char.grapheme()).collect()
+    }
+
+    #[test]
+    fn label_reserve_accounts_for_marker_scrollbar_and_wide_metadata() {
+        let item = SelectItem::new("p".repeat(100), "search")
+            .with_marker('*')
+            .with_prefix("e\u{301}界".repeat(20))
+            .with_columns(vec![
+                SelectColumn::new("界e\u{301}".repeat(20)),
+                SelectColumn::new("7"),
+            ]);
+        let mut select = FilterableSelect::new(vec![item.clone(), item], SelectStyles::default());
+        select.set_label_reserve(12);
+        select.set_show_scrollbar(true);
+        for width in 10..=80 {
+            // One visible row forces a scrollbar. The marker takes two cells
+            // and the scrollbar takes one, neither belongs to the label budget.
+            let rows = row_cells(&mut select, width, 3);
+            let row = &rows[0];
+            assert_eq!(row.len(), usize::from(width - 1));
+            let reserve = 12.min(usize::from(width - 3).div_ceil(2));
+            let shown = row
+                .iter()
+                .filter(|cell| cell.char.grapheme() == "p")
+                .count();
+            assert!(shown >= reserve - 1, "width={width}: {}", row_text(row));
+            assert_eq!(row.last().unwrap().char.grapheme(), "…");
+        }
+    }
+
+    #[test]
+    fn inline_columns_align_and_keep_metadata_when_preview_is_clipped() {
+        let dim = Style {
+            dim: true,
+            fg: Color::Index(8),
+            ..Style::default()
+        };
+        let bright = Style {
+            fg: Color::Index(15),
+            ..Style::default()
+        };
+        let band = Color::Index(4);
+        let mut select = FilterableSelect::new(
+            vec![
+                SelectItem::new("preview alpha is long", "alpha")
+                    .with_marker('*')
+                    .with_prefix("界x")
+                    .with_columns(vec![
+                        SelectColumn::new("1h").with_gap_after(1),
+                        SelectColumn::new(""),
+                        SelectColumn::new("123").with_alignment(TextAlign::Right),
+                        SelectColumn::new("界"),
+                    ]),
+                SelectItem::new("preview bravo is long", "bravo")
+                    .with_prefix("tag")
+                    .with_columns(vec![
+                        SelectColumn::new("20min"),
+                        SelectColumn::new(""),
+                        SelectColumn::new("4").with_alignment(TextAlign::Right),
+                        SelectColumn::new("e\u{301}"),
+                    ]),
+            ],
+            SelectStyles {
+                prefix: dim,
+                row_marker: dim,
+                secondary: dim,
+                label: bright,
+                selected_bg: band,
+                ..SelectStyles::default()
+            },
+        );
+        let rows = row_cells(&mut select, 32, 6);
+        assert_eq!(rows.len(), 2);
+        // Read terminal cells, not byte offsets: the wide grapheme has a
+        // continuation cell and the combining sequence occupies one cell.
+        assert_eq!(rows[0][2].char.grapheme(), "界");
+        assert_eq!(rows[0][2].char.width, 2);
+        assert_eq!(rows[0][4].char.grapheme(), "x");
+        assert_eq!(row_text(&rows[0][5..19]), "  1h     123  ");
+        assert_eq!(row_text(&rows[1][..19]), "  tag  20min    4  ");
+        assert_eq!(rows[0][19].char.grapheme(), "界");
+        assert_eq!(rows[1][19].char.grapheme(), "e\u{301}");
+        assert_eq!(rows[1][20].char.grapheme(), " ");
+        for row in &rows {
+            assert_eq!(row_text(&row[23..]), "preview …");
+        }
+        for (index, row) in rows.iter().enumerate() {
+            // RichText stores a wide glyph's style on its leading cell.
+            let mut col = 0;
+            while col < 23 {
+                assert!(row[col].style.dim);
+                assert_eq!(row[col].style.fg, dim.fg);
+                col += usize::from(row[col].char.width).max(1);
+            }
+            assert!(
+                row[23..30]
+                    .iter()
+                    .all(|cell| { cell.style.fg == bright.fg && !cell.style.dim })
+            );
+            assert!(
+                row.iter().all(|cell| {
+                    cell.style.bg == if index == 0 { band } else { Color::Default }
+                })
+            );
+        }
+
+        // Hiding the only marked item must not move the surviving row left.
+        type_str(&mut select, "bravo");
+        let filtered = row_cells(&mut select, 32, 6);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(row_text(&filtered[0]), row_text(&rows[1]));
+
+        // A hidden batch still widens shared columns. Missing fields occupy
+        // their slots, while the entirely empty second column adds no gap.
+        select.extend_items(vec![
+            SelectItem::new("other", "other").with_columns(vec![SelectColumn::new("longer")]),
+        ]);
+        let extended = row_cells(&mut select, 40, 6);
+        assert_eq!(extended[0][17].char.grapheme(), "4");
+        assert_eq!(extended[0][24].char.grapheme(), "p");
+
+        select.set_items(vec![
+            SelectItem::new("preview", "bravo").with_columns(vec![
+                SelectColumn::new(""),
+                SelectColumn::new(""),
+                SelectColumn::new("7").with_alignment(TextAlign::Right),
+            ]),
+            SelectItem::new("hidden", "other").with_columns(vec![SelectColumn::new("abc")]),
+        ]);
+        let replaced = row_cells(&mut select, 24, 6);
+        assert_eq!(row_text(&replaced[0]).trim_end(), "     7  preview");
     }
 
     /// The prefix column is right-aligned within the widest prefix and drawn
@@ -1354,6 +1754,34 @@ mod tests {
         // A no-match predicate leaves the cursor where it was.
         select.select_matching(|item| item.filter_key == "nope");
         assert_eq!(select.selected().map(|i| i.label), Some("charlie".into()));
+    }
+
+    #[test]
+    fn ranked_snapshots_follow_the_best_result_until_the_user_navigates() {
+        let mut select = FilterableSelect::new(items(&["old"]), SelectStyles::default());
+        select.set_ranked_items(items(&["new", "old"]));
+        assert_eq!(select.selected().unwrap().filter_key, "new");
+
+        // Even a deliberate move back to the first row is a choice to retain.
+        send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+        send(&mut select, &key(Key::UP, Modifiers::empty()));
+        for snapshot in [
+            vec!["newest", "new", "old"],
+            vec!["fresh", "newest", "new", "old"],
+        ] {
+            select.set_ranked_items(items(&snapshot));
+            assert_eq!(select.selected().unwrap().filter_key, "new");
+        }
+
+        // A new query asks for the best match again, not the old row identity.
+        send(&mut select, &typed('o'));
+        select.set_ranked_items(items(&["o", "old"]));
+        assert_eq!(select.selected().unwrap().filter_key, "o");
+        send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+        select.set_ranked_items(items(&["other"]));
+        assert_eq!(select.selected().unwrap().filter_key, "other");
+        select.set_ranked_items(items(&["o", "other"]));
+        assert_eq!(select.selected().unwrap().filter_key, "o");
     }
 
     // --- Parity between the incremental paths and a full rescore. ---
@@ -1609,6 +2037,52 @@ mod tests {
             0,
             "append kept the scroll anchor instead of re-pinning it to the cursor"
         );
+    }
+
+    /// Replacing a row in place keeps the cursor on its row and leaves the
+    /// scroll anchor alone, whether the replaced row is the cursored one, above
+    /// it, or below it. Under a query the cursor follows its row when the new
+    /// text changes the ranking.
+    #[test]
+    fn update_item_keeps_the_cursor_row_and_scroll_anchor() {
+        let keys: Vec<String> = (0..40).map(|i| format!("row{i:02}")).collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let select = FilterableSelect::new(items(&refs), SelectStyles::default());
+        select.list.borrow_mut().jump_to_item(30);
+        select.list.borrow_mut().cursor = 33;
+        for index in [33usize, 5, 31] {
+            select.update_item(index, SelectItem::new(format!("filled {index}"), "zzz"));
+            assert_eq!(
+                select.list.borrow().cursor,
+                33,
+                "update of {index} moved the cursor"
+            );
+            assert_eq!(
+                select.list.borrow().scroll_top(),
+                30,
+                "update of {index} moved the anchor"
+            );
+        }
+        assert_eq!(select.visible_labels()[5], "filled 5");
+        assert_eq!(select.selected().unwrap().label, "filled 33");
+
+        // A query is live and the cursored row drops out of the match: the
+        // cursor stays in range rather than pointing past the end.
+        let select = FilterableSelect::new(items(&["ab", "ab", "ab"]), SelectStyles::default());
+        {
+            let mut state = select.state.borrow_mut();
+            state.query = "ab".to_string();
+            full_filter(&mut state, &mut select.list.borrow_mut());
+        }
+        select.list.borrow_mut().cursor = 2;
+        select.update_item(2, SelectItem::new("gone", "xy"));
+        assert_eq!(select.visible_labels().len(), 2);
+        assert_eq!(select.list.borrow().cursor, 1);
+        // The cursored row itself changes rank: the cursor follows it.
+        select.list.borrow_mut().cursor = 0;
+        select.update_item(0, SelectItem::new("weak", "a_b"));
+        assert_eq!(select.selected().unwrap().label, "weak");
+        assert_eq!(select.list.borrow().cursor, 1);
     }
 
     /// `narrow_filter` sorts its candidates by original index before rescoring

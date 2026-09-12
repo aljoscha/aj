@@ -105,7 +105,7 @@ pub(crate) fn min_cols_with_sidebar(cols: u16) -> u16 {
 }
 
 /// The focused row's marker, in the column left of the status glyph.
-const FOCUS_MARKER: &str = "▌";
+pub(crate) const FOCUS_MARKER: &str = "▌";
 
 /// The glyph a folded group's trailing line wears, pointing right at the count
 /// that stands in for the rows the cap holds back.

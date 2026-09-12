@@ -46,7 +46,9 @@ use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
 use crate::gateway::config::{AddressError, GatewayConfig, HostAddress};
-use crate::gateway::directory::{Adopted, Directory, DirectoryError, HostTarget, Reported, Route};
+use crate::gateway::directory::{
+    Adopted, AttachPlan, Directory, DirectoryError, HostTarget, Reported, Route,
+};
 use crate::gateway::enrollment::{EnrollmentError, EnrollmentFile};
 use crate::gateway::link::Link;
 pub(crate) use crate::gateway::server::GatewayServer;
@@ -306,15 +308,17 @@ impl Gateway {
     /// Protocol identity and capabilities.
     ///
     /// No working directory: a gateway serves none of its own, and that absence
-    /// is how a client tells the two roles apart. The capability list is empty
-    /// where a host's names the routes it serves past the baseline: this hello
-    /// is the gateway's own, and a gateway cannot answer for hosts that need
+    /// is how a client tells the two roles apart. Capabilities describe the
+    /// gateway's own features. A gateway cannot answer for hosts that need
     /// not agree with each other. A client that wants a route attempts it and
     /// reads the refusal.
     pub(crate) fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
-            capabilities: Vec::new(),
+            capabilities: vec![
+                aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
+                aj_wire::SESSION_PREVIEWS_CAPABILITY.to_string(),
+            ],
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.id.clone(),
             working_directory: None,
@@ -438,6 +442,11 @@ impl Gateway {
     /// only enrolled one, and ambiguity is refused rather than guessed.
     pub(crate) fn create_target(&self, named: Option<&str>) -> Result<HostTarget, GatewayError> {
         Ok(self.inner.directory.create_target(named)?)
+    }
+
+    /// Divide a set of namespaced session ids among the hosts that own them.
+    pub(crate) fn group(&self, requests: &[AttachRequest]) -> AttachPlan {
+        self.inner.directory.group(requests)
     }
 
     /// Open one client's event stream, splicing every session it attached.

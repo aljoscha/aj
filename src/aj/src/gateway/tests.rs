@@ -801,6 +801,270 @@ async fn a_client_only_ever_sees_namespaced_ids() {
     right.stop().await;
 }
 
+/// A preview batch may name sessions on several hosts. The gateway reads each
+/// owning host once, hands the answers back under the ids the client asked
+/// with, and names a host it could not read once, keeping the other host's
+/// rows. An id nobody owns is simply absent, like a session a host lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preview_batch_fans_out_per_host_and_names_the_ones_it_could_not_read() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let kept = left.create().await;
+    let other = left.create().await;
+    let lost = right.create().await;
+    left.prompt(&kept, "left needle").await;
+    settled(&left, &kept, 1).await;
+    left.prompt(&other, "left other").await;
+    settled(&left, &other, 1).await;
+    right.prompt(&lost, "right needle").await;
+    settled(&right, &lost, 1).await;
+    let fixture = Fixture::new(&[&left, &right]).await;
+    fixture
+        .until("all three sessions", |list| {
+            (list.sessions.len() == 3).then_some(())
+        })
+        .await;
+    let (kept, other, lost) = (
+        left.namespaced(&kept),
+        left.namespaced(&other),
+        right.namespaced(&lost),
+    );
+
+    let answer = fixture
+        .client
+        .session_previews(&[kept.clone(), lost.clone(), other.clone()])
+        .await
+        .expect("both hosts answer");
+    assert!(answer.incomplete.is_empty(), "{answer:?}");
+    let mut ids: Vec<&str> = answer
+        .previews
+        .iter()
+        .map(|p| p.session_id.as_str())
+        .collect();
+    ids.sort_unstable();
+    let mut expected = vec![kept.as_str(), other.as_str(), lost.as_str()];
+    expected.sort_unstable();
+    assert_eq!(
+        ids, expected,
+        "answers come back under the client's own ids"
+    );
+    let text = |id: &str| {
+        answer
+            .previews
+            .iter()
+            .find(|p| p.session_id == id)
+            .and_then(|p| p.first_user_message.clone())
+    };
+    assert_eq!(text(&kept).as_deref(), Some("left needle"));
+    assert_eq!(text(&lost).as_deref(), Some("right needle"));
+
+    right.stop().await;
+    fixture
+        .until("the right host to read unreachable", |list| {
+            list.sessions
+                .iter()
+                .any(|row| row.id == lost && row.unreachable)
+                .then_some(())
+        })
+        .await;
+    let answer = fixture
+        .client
+        .session_previews(&[
+            kept.clone(),
+            lost.clone(),
+            other.clone(),
+            "nobody/owns".to_string(),
+        ])
+        .await
+        .expect("the reachable host still answers");
+    let mut ids: Vec<&str> = answer
+        .previews
+        .iter()
+        .map(|p| p.session_id.as_str())
+        .collect();
+    ids.sort_unstable();
+    let mut expected = vec![kept.as_str(), other.as_str()];
+    expected.sort_unstable();
+    assert_eq!(ids, expected, "{answer:?}");
+    assert_eq!(answer.incomplete.len(), 1, "{answer:?}");
+    assert_eq!(answer.incomplete[0].host, right.host_name());
+    assert!(answer.incomplete[0].message.contains("unreachable"));
+
+    fixture.shutdown().await;
+    left.stop().await;
+}
+
+/// The client leaves the gateway time to return a healthy host's previews when
+/// another connected host accepts the read but never answers it.
+#[tokio::test]
+async fn a_preview_batch_outwaits_the_gateways_stalled_upstream() {
+    let mut healthy = Upstream::start().await;
+    let session = healthy.create().await;
+    healthy.prompt(&session, "healthy preview").await;
+    settled(&healthy, &session, 1).await;
+    let kept = healthy.namespaced(&session);
+    let (url, serving, requested) = wedged_host().await;
+    let fixture = Fixture::new(&[&healthy]).await;
+    assert_eq!(fixture.enroll(&url).await.status(), StatusCode::OK);
+    let stalled = "wedged:2026-01-01-00-00-00-000";
+    assert!(!fixture.row(stalled).await.unreachable);
+    assert!(!fixture.row(&kept).await.unreachable);
+
+    let client = fixture.client.clone();
+    let sessions = vec![kept.clone(), stalled.to_string()];
+    let reading = tokio::spawn(async move { client.session_previews(&sessions).await });
+    bounded(
+        "the connected host to accept the preview read",
+        requested.notified(),
+    )
+    .await;
+
+    // Advance the production deadlines without a thirty-second wall wait.
+    // Resume between steps so real loopback I/O can run without paused time
+    // automatically jumping to a deadline while a socket is waiting on the OS.
+    for _ in 0..=fixture.tuning.upstream_timeout.as_secs() {
+        if reading.is_finished() {
+            break;
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let answer = bounded("the partial preview response", reading)
+        .await
+        .expect("preview task")
+        .expect("the client outwaits the gateway's upstream deadline");
+    assert_eq!(answer.previews.len(), 1, "{answer:?}");
+    assert_eq!(answer.previews[0].session_id, kept);
+    assert_eq!(
+        answer.previews[0].first_user_message.as_deref(),
+        Some("healthy preview")
+    );
+    assert_eq!(answer.incomplete.len(), 1, "{answer:?}");
+    assert_eq!(answer.incomplete[0].host, "wedged");
+    assert_eq!(answer.incomplete[0].message, "preview read timed out");
+
+    fixture.shutdown().await;
+    healthy.stop().await;
+    serving.abort();
+}
+
+/// Stalled hosts must not make a healthy host wait for a read slot or make
+/// partial results wait for successive timeout waves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preview_batch_returns_healthy_hosts_without_timeout_waves() {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+    use futures::StreamExt;
+
+    let requested = Arc::new(StdMutex::new(Vec::new()));
+    let mut serving = tokio::task::JoinSet::new();
+    let mut addresses = Vec::new();
+    let sessions: Vec<_> = (0..16)
+        .map(|index| format!("h{index:02}:session"))
+        .collect();
+    for index in 0..16 {
+        let hello = serde_json::json!({
+            "protocol": PROTOCOL_VERSION, "capabilities": [], "app_version": "0",
+            "host_id": format!("h{index:02}"), "name": format!("host-{index:02}")
+        });
+        let requested = Arc::clone(&requested);
+        let app = axum::Router::new()
+            .route("/v1/hello", get(move || {
+                let hello = hello.clone();
+                async move { axum::Json(hello) }
+            }))
+            .route("/v1/events", get(|| async {
+                let list = serde_json::json!({"kind": "list", "sessions": [{
+                    "id": "session", "live": true, "working": false,
+                    "queued": {"steering": 0, "follow_up": 0}, "tasks": 0,
+                    "last_activity": "2026-01-01T00:00:00Z"
+                }]});
+                Sse::new(futures::stream::iter([Ok::<_, std::convert::Infallible>(
+                    Event::default().data(list.to_string())
+                )]).chain(futures::stream::pending()))
+            }))
+            .route("/v1/previews", get(move |axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>| {
+                let requested = Arc::clone(&requested);
+                async move {
+                    assert_eq!(params, [("session".to_string(), "session".to_string())]);
+                    requested.lock().unwrap().push(index);
+                    // A healthy host follows more than eight stalled hosts in
+                    // routing order. Their timeouts cannot hide its preview.
+                    if (4..15).contains(&index) {
+                        std::future::pending::<()>().await;
+                    }
+                    axum::Json(serde_json::json!({"previews": [{
+                        "session_id": "session", "modified": "2026-01-01T00:00:00Z",
+                        "created_at": "2026-01-01T00:00:00Z", "last_message_at": "2026-01-01T00:00:00Z",
+                        "size_bytes": 100, "message_count": 1,
+                        "first_user_message": format!("healthy preview {index}"),
+                        "tag": null, "archived": false
+                    }], "incomplete": []}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+            .await
+            .expect("bind peer");
+        addresses.push(
+            HostAddress::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        );
+        serving.spawn(async move { axum::serve(listener, app).await.unwrap() });
+    }
+    let budget = Duration::from_secs(1);
+    let fixture = Fixture::tuned(
+        TempDir::new().unwrap(),
+        addresses,
+        Tuning {
+            upstream_timeout: budget,
+            ..tuning()
+        },
+    )
+    .await;
+    fixture
+        .until("all sixteen connected peer sessions", |list| {
+            (list.sessions.len() == 16 && list.sessions.iter().all(|row| !row.unreachable))
+                .then_some(())
+        })
+        .await;
+
+    // Leave transport/scheduling margin, but not enough for a second wave.
+    let answer = tokio::time::timeout(
+        budget + budget / 2,
+        fixture.client.session_previews(&sessions),
+    )
+    .await
+    .expect("one batch budget, not two upstream waves")
+    .expect("a partial response, not a client timeout");
+    let mut previews = answer.previews;
+    previews.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    assert_eq!(previews.len(), 5);
+    for (index, preview) in [0, 1, 2, 3, 15].into_iter().zip(&previews) {
+        assert_eq!(preview.session_id, sessions[index]);
+        assert_eq!(
+            preview.first_user_message.as_deref(),
+            Some(format!("healthy preview {index}").as_str())
+        );
+    }
+    assert_eq!(answer.incomplete.len(), 11);
+    for (index, failure) in answer.incomplete.iter().enumerate() {
+        assert_eq!(failure.host, format!("host-{:02}", index + 4));
+        assert_eq!(failure.message, "preview read timed out");
+    }
+    let mut seen = requested.lock().unwrap().clone();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        (0..16).collect::<Vec<_>>(),
+        "every owning host receives its read within the batch budget"
+    );
+
+    fixture.shutdown().await;
+    serving.abort_all();
+    while serving.join_next().await.is_some() {}
+}
+
 /// A row travels as the host that owns it wrote it: the gateway
 /// rewrites the three fields it owns and passes everything else through, a field
 /// this build has no type for and a number literal no float survives included.
@@ -2307,6 +2571,15 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
         refusal(configured.create(r#"{"host":"configured-record"}"#).await).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(code, "host_unreachable");
+    let history = configured
+        .client
+        .prompt_history(None)
+        .await
+        .expect("all history");
+    assert!(history.prompts.is_empty());
+    assert_eq!(history.incomplete.len(), 1);
+    assert_eq!(history.incomplete[0].host, "configured-record");
+    assert!(history.incomplete[0].message.contains("not reachable"));
     assert_eq!(configured_requests.load(Ordering::SeqCst), 0);
 
     let configured = configured.restart().await;
@@ -2318,6 +2591,15 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
             .iter()
             .any(|host| { host.id.as_deref() == Some("configured-record") && !host.connected })
     );
+    let history = configured
+        .client
+        .prompt_history(None)
+        .await
+        .expect("all history");
+    assert!(history.prompts.is_empty());
+    assert_eq!(history.incomplete.len(), 1);
+    assert_eq!(history.incomplete[0].host, "configured-record");
+    assert!(history.incomplete[0].message.contains("not reachable"));
     assert_eq!(configured_requests.load(Ordering::SeqCst), 0);
     configured.shutdown().await;
     configured_server.abort();
@@ -2367,6 +2649,15 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
     let recorded = std::fs::read_to_string(remembered.state.path().join("hosts.json"))
         .expect("the remembered state remains");
     assert!(recorded.contains("remembered"));
+    let history = remembered
+        .client
+        .prompt_history(None)
+        .await
+        .expect("all history");
+    assert!(history.prompts.is_empty());
+    assert_eq!(history.incomplete.len(), 1);
+    assert_eq!(history.incomplete[0].host, "remembered");
+    assert!(history.incomplete[0].message.contains("not reachable"));
     assert_eq!(remembered_requests.load(Ordering::SeqCst), 0);
 
     let remembered = remembered.restart().await;
@@ -2379,6 +2670,15 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
             .any(|host| host.id.as_deref() == Some("remembered") && !host.connected),
         "the remembered enrollment did not survive restart",
     );
+    let history = remembered
+        .client
+        .prompt_history(None)
+        .await
+        .expect("all history");
+    assert!(history.prompts.is_empty());
+    assert_eq!(history.incomplete.len(), 1);
+    assert_eq!(history.incomplete[0].host, "remembered");
+    assert!(history.incomplete[0].message.contains("not reachable"));
     assert_eq!(remembered_requests.load(Ordering::SeqCst), 0);
     remembered.shutdown().await;
     remembered_server.abort();
@@ -6901,7 +7201,7 @@ async fn a_frame_kind_the_gateway_does_not_know_does_not_break_its_link() {
 /// stay silent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_answers_nothing_becomes_a_503() {
-    let (url, serving) = wedged_host().await;
+    let (url, serving, _) = wedged_host().await;
     let state = TempDir::new().expect("tempdir");
     let fixture = Fixture::tuned(
         state,
@@ -6940,11 +7240,17 @@ async fn a_host_that_answers_nothing_becomes_a_503() {
 
 /// A host that answers the handshake and the control stream, and then nothing
 /// at all: every other route hangs for as long as the connection lasts.
-async fn wedged_host() -> (String, tokio::task::JoinHandle<()>) {
+async fn wedged_host() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<tokio::sync::Notify>,
+) {
     use axum::response::sse::{Event, Sse};
     use axum::routing::get;
     use futures::StreamExt;
 
+    let requested = Arc::new(tokio::sync::Notify::new());
+    let notify = Arc::clone(&requested);
     let hello = serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
                                    "app_version": "0", "host_id": "wedged"});
     let list = r#"{"kind":"list","sessions":[{"id":"2026-01-01-00-00-00-000","live":true,
@@ -6970,9 +7276,13 @@ async fn wedged_host() -> (String, tokio::task::JoinHandle<()>) {
                 Sse::new(frames)
             }),
         )
-        .fallback(|| async {
-            std::future::pending::<()>().await;
-            StatusCode::IM_A_TEAPOT
+        .fallback(move || {
+            let notify = Arc::clone(&notify);
+            async move {
+                notify.notify_one();
+                std::future::pending::<()>().await;
+                StatusCode::IM_A_TEAPOT
+            }
         });
     let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
         .await
@@ -6981,7 +7291,7 @@ async fn wedged_host() -> (String, tokio::task::JoinHandle<()>) {
     let serving = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (format!("http://{bound}"), serving)
+    (format!("http://{bound}"), serving, requested)
 }
 
 /// A host that hangs up as soon as its stream opens is backed off like any other

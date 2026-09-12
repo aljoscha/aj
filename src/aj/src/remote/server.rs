@@ -189,7 +189,10 @@ fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/v1/hello", get(hello))
         .route("/v1/events", get(events))
+        .route("/v1/previews", get(session_previews))
         .route("/v1/sessions", get(sessions).post(create_session))
+        .route("/v1/prompt-history", get(all_prompt_history))
+        .route("/v1/sessions/{id}/prompt-history", get(prompt_history))
         .route("/v1/sessions/{id}/tasks", get(tasks))
         .route("/v1/sessions/{id}/tasks/{task_id}", get(task))
         .route("/v1/sessions/{id}/tasks/{task_id}/kill", post(kill_task))
@@ -348,6 +351,39 @@ async fn queue_command(
         CommandOutcome::Withdrawn(text) => Ok(Json(QueueOutcome { text }).into_response()),
         outcome => accepted(outcome),
     }
+}
+
+/// Previews for the sessions named by repeated `session` parameters, the
+/// same key the events route reads.
+async fn session_previews(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Result<Response, ApiError> {
+    let sessions: Vec<String> = params
+        .into_iter()
+        .filter(|(key, _)| key == "session")
+        .map(|(_, value)| value)
+        .collect();
+    let previews = state.host.session_previews_for(&sessions).await?;
+    Ok(Json(aj_wire::SessionPreviews {
+        previews: previews
+            .iter()
+            .map(aj_app::session_preview::to_wire)
+            .collect(),
+        incomplete: Vec::new(),
+    })
+    .into_response())
+}
+
+async fn all_prompt_history(State(state): State<Arc<ServerState>>) -> Result<Response, ApiError> {
+    Ok(Json(state.host.prompt_history(None, None).await?).into_response())
+}
+
+async fn prompt_history(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(state.host.prompt_history(Some(&session), None).await?).into_response())
 }
 
 async fn session_info(

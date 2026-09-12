@@ -763,6 +763,8 @@ impl SessionHost {
                 ARCHIVE_CAPABILITY.to_string(),
                 COMPACTION_USAGE_CAPABILITY.to_string(),
                 aj_wire::SESSION_INFO_CAPABILITY.to_string(),
+                aj_wire::SESSION_PREVIEWS_CAPABILITY.to_string(),
+                aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
                 aj_wire::SESSION_ENV_CAPABILITY.to_string(),
                 aj_wire::SESSION_ACCOUNTS_CAPABILITY.to_string(),
                 aj_wire::BRANCH_SETTINGS_CAPABILITY.to_string(),
@@ -1315,6 +1317,109 @@ impl SessionHost {
             })
             .collect();
         Ok(QueueState { queues })
+    }
+
+    /// Scan the named stored logs without materializing or locking them. An
+    /// id this store does not have, cannot read, or could never hold is left
+    /// out rather than failing the batch: the directory the ids came from is
+    /// refreshed separately. Dropping this future cancels the blocking reader.
+    pub async fn session_previews_for(
+        &self,
+        sessions: &[String],
+    ) -> Result<Vec<aj_session::SessionPreview>, HostError> {
+        let persistence = self.inner.persistence.clone();
+        let sessions = sessions.to_vec();
+        let cancel = CancellationToken::new();
+        let _guard = cancel.clone().drop_guard();
+        tokio::task::spawn_blocking(move || {
+            let mut previews = Vec::with_capacity(sessions.len());
+            for session in &sessions {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if let Ok(Some(preview)) =
+                    persistence.session_preview(session, &|| cancel.is_cancelled())
+                {
+                    previews.push(preview);
+                }
+            }
+            previews
+        })
+        .await
+        .map_err(|err| HostError::Internal(Box::new(err)))
+    }
+
+    /// Read submitted prompts without materializing sessions. `Some(session)`
+    /// selects its workspace, `None` selects every workspace in this host's
+    /// sessions store. Optional snapshots let a local reader paint during the
+    /// scan. Dropping the future cancels the blocking reader.
+    pub async fn prompt_history(
+        &self,
+        session: Option<&str>,
+        updates: Option<tokio::sync::watch::Sender<aj_wire::PromptHistory>>,
+    ) -> Result<aj_wire::PromptHistory, HostError> {
+        if let Some(session) = session {
+            validate_session_id(session)?;
+        }
+        // A newly created live session can have no log file yet. It still
+        // identifies this workspace and may recall prompts from older logs.
+        let live = match session {
+            Some(session) => self.inner.sessions.lock().await.contains_key(session),
+            None => false,
+        };
+        let persistence = self.inner.persistence.clone();
+        let session = session.map(str::to_string);
+        let host = self
+            .inner
+            .name
+            .clone()
+            .unwrap_or_else(|| self.inner.host_id.clone());
+        let cancel = CancellationToken::new();
+        let _guard = cancel.clone().drop_guard();
+        tokio::task::spawn_blocking(move || {
+            if let Some(session) = &session
+                && !live
+                && !persistence
+                    .sessions_dir()
+                    .join(format!("{session}.jsonl"))
+                    .is_file()
+            {
+                return Err(HostError::UnknownSession(session.clone()));
+            }
+            let all = session.is_none();
+            let dir = if all {
+                persistence
+                    .sessions_dir()
+                    .parent()
+                    .unwrap_or_else(|| persistence.sessions_dir())
+            } else {
+                persistence.sessions_dir()
+            };
+            let mut history = aj_wire::PromptHistory::default();
+            if let Err(err) = aj_session::prompt_history::recent_history_streaming(
+                dir,
+                all,
+                aj_wire::PROMPT_HISTORY_LIMIT,
+                &|| cancel.is_cancelled(),
+                &mut |prompts| {
+                    history.prompts = prompts
+                        .into_iter()
+                        .map(crate::prompt_history::to_wire)
+                        .collect();
+                    if let Some(updates) = &updates {
+                        updates.send_replace(history.clone());
+                    }
+                },
+            ) {
+                history.incomplete.push(aj_wire::HostFailure {
+                    host,
+                    message: err.to_string(),
+                });
+            }
+            Ok(history)
+        })
+        .await
+        .map_err(|err| HostError::Internal(Box::new(err)))?
     }
 
     /// Aggregate facts from the session log, materializing the session if needed.

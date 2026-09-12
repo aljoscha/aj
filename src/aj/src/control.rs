@@ -33,7 +33,7 @@ use aj_wire::{
     PromptRequest, QueueOperation, QueueRequest, QueueState, SessionList, SessionSettings,
     SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
 };
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use reqwest::StatusCode;
 
 use crate::remote::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents, SILENCE};
@@ -61,6 +61,8 @@ pub(crate) enum ControlError {
     /// carries, so the wording is the host's either way.
     #[error("{message}")]
     PartialCreate { session: String, message: String },
+    #[error("{0}")]
+    Preview(String),
 }
 
 impl From<CreateError> for ControlError {
@@ -90,7 +92,7 @@ impl ControlError {
             Self::Host(HostError::Conflict { .. }) => true,
             // A create that minted its session is not a refusal at all, so
             // none of these predicates hold for it.
-            Self::Host(_) | Self::PartialCreate { .. } => false,
+            Self::Host(_) | Self::PartialCreate { .. } | Self::Preview(_) => false,
             Self::Remote(err) => err.status() == Some(StatusCode::CONFLICT),
         }
     }
@@ -100,7 +102,7 @@ impl ControlError {
     pub(crate) fn unknown_entry(&self) -> bool {
         match self {
             Self::Host(HostError::UnknownEntry(_)) => true,
-            Self::Host(_) | Self::PartialCreate { .. } => false,
+            Self::Host(_) | Self::PartialCreate { .. } | Self::Preview(_) => false,
             Self::Remote(err) => err.code() == Some("unknown_entry"),
         }
     }
@@ -119,7 +121,7 @@ impl ControlError {
     pub(crate) fn unknown_endpoint(&self) -> bool {
         match self {
             // A host in this process has every endpoint this process knows.
-            Self::Host(_) | Self::PartialCreate { .. } => false,
+            Self::Host(_) | Self::PartialCreate { .. } | Self::Preview(_) => false,
             Self::Remote(err) => err.code() == Some("unknown_endpoint"),
         }
     }
@@ -132,7 +134,7 @@ impl ControlError {
     pub(crate) fn invalid(&self) -> bool {
         match self {
             Self::Host(HostError::Invalid(_)) => true,
-            Self::Host(_) | Self::PartialCreate { .. } => false,
+            Self::Host(_) | Self::PartialCreate { .. } | Self::Preview(_) => false,
             Self::Remote(err) => err.status() == Some(StatusCode::BAD_REQUEST),
         }
     }
@@ -145,11 +147,16 @@ impl ControlError {
     /// instead of relaying a refusal with no remedy in it.
     pub(crate) fn ambiguous_host(&self) -> bool {
         match self {
-            Self::Host(_) | Self::PartialCreate { .. } => false,
+            Self::Host(_) | Self::PartialCreate { .. } | Self::Preview(_) => false,
             Self::Remote(err) => err.code() == Some("ambiguous_host"),
         }
     }
 }
+
+/// Sessions per preview request. Small enough that the first rows of the
+/// browser fill within one round trip, large enough that a store of hundreds
+/// of sessions is a few dozen requests rather than one per row.
+const PREVIEW_BATCH: usize = 16;
 
 /// The host this frontend drives.
 #[derive(Clone)]
@@ -236,6 +243,19 @@ impl Control {
         }
     }
 
+    /// User-paced prompt history. Local snapshots are coalesced while the UI is
+    /// busy, so scanning cannot queue an unbounded number of full lists.
+    pub(crate) async fn prompt_history(
+        &self,
+        session: Option<&str>,
+        updates: Option<tokio::sync::watch::Sender<aj_wire::PromptHistory>>,
+    ) -> Result<aj_wire::PromptHistory, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.prompt_history(session, updates).await?),
+            Self::Remote(remote) => Ok(remote.client.prompt_history(session).await?),
+        }
+    }
+
     /// The session's branch tree, with its current head.
     pub(crate) async fn tree(&self, session: &str) -> Result<SessionTree, ControlError> {
         match self {
@@ -303,6 +323,95 @@ impl Control {
         match self {
             Self::Local(local) => Ok(local.host.sessions().await?),
             Self::Remote(remote) => Ok(remote.client.sessions().await?),
+        }
+    }
+
+    /// Read every available preview on request. Batches arrive independently,
+    /// errors do not discard healthy rows, and receiver closure cancels work.
+    pub(crate) async fn session_previews(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<
+            Result<Vec<aj_session::SessionPreview>, ControlError>,
+        >,
+    ) {
+        let directory = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            result = self.sessions() => match result {
+                Ok(directory) => directory,
+                Err(err) => { let _ = tx.send(Err(err)); return; }
+            },
+        };
+        // Start in directory order so the first rows fill first. A few batches
+        // in flight let healthy hosts make progress beside a slow one.
+        let ids: Vec<String> = directory.sessions.into_iter().map(|row| row.id).collect();
+        let batches: Vec<Vec<String>> = ids.chunks(PREVIEW_BATCH).map(<[String]>::to_vec).collect();
+        let mut reads = futures::stream::iter(batches)
+            .map(|batch| async move {
+                match self {
+                    Self::Local(local) => local
+                        .host
+                        .session_previews_for(&batch)
+                        .await
+                        .map(|previews| (previews, Vec::new()))
+                        .map_err(ControlError::from),
+                    Self::Remote(remote) => remote
+                        .client
+                        .session_previews(&batch)
+                        .await
+                        .map(|answer| {
+                            (
+                                answer
+                                    .previews
+                                    .into_iter()
+                                    .map(aj_app::session_preview::from_wire)
+                                    .collect(),
+                                answer.incomplete,
+                            )
+                        })
+                        .map_err(ControlError::from),
+                }
+            })
+            .buffer_unordered(4);
+        let mut reported = std::collections::HashSet::new();
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                next = reads.next() => next,
+            };
+            let Some(result) = next else {
+                break;
+            };
+            let sent = match result {
+                Ok((previews, incomplete)) => {
+                    let mut sent = tx.send(Ok(previews));
+                    for failure in incomplete {
+                        if sent.is_ok() && reported.insert(failure.host.clone()) {
+                            sent = tx.send(Err(ControlError::Preview(format!(
+                                "previews from {}: {}",
+                                failure.host, failure.message
+                            ))));
+                        }
+                    }
+                    sent
+                }
+                Err(err) => {
+                    // A refusal applies to the remaining batches too. Dropping
+                    // the stream cancels every in-flight request future.
+                    let message = if err.unknown_endpoint() {
+                        "previews: host does not support session previews (upgrade the host)"
+                            .to_string()
+                    } else {
+                        format!("previews: {err}")
+                    };
+                    let _ = tx.send(Err(ControlError::Preview(message)));
+                    return;
+                }
+            };
+            if sent.is_err() {
+                return;
+            }
         }
     }
 
@@ -640,5 +749,392 @@ impl Stream {
         if let Self::Remote { lost, .. } = self {
             *lost = Some(RemoteError::Stream("the connection was cut".to_string()));
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod history_tests {
+    use super::*;
+    use crate::remote::tests::{HostHandles, addr, bounded, scripted, scripted_host};
+    use crate::remote::{IdentityGate, RemoteServer};
+
+    pub(crate) fn write_prompts(dir: &std::path::Path, name: &str, prompts: &[(&str, i64)]) {
+        use std::io::Write;
+        std::fs::create_dir_all(dir).unwrap();
+        let mut file = std::fs::File::create(dir.join(format!("{name}.jsonl"))).unwrap();
+        for (i, (text, time)) in prompts.iter().enumerate() {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "id": i.to_string(), "thread": "user", "type": "message",
+                    "timestamp": chrono::DateTime::from_timestamp_millis(*time).unwrap(),
+                    "message": { "role": "user", "timestamp": time,
+                        "content": [{"type": "text", "text": text}] }
+                })
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_history_adapters_scope_rank_dedup_and_cap_without_materializing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("sessions");
+        // The newest prompt lives in the oldest-named file. Traversal-order
+        // truncation or selecting a duplicate's first occurrence loses it.
+        let text = format!("{}\nsearch-tail", "full prompt ".repeat(200));
+        write_prompts(&store, "a", &[(&text, 9000), (" shared ", 8000)]);
+        write_prompts(&store, "z", &[("shared", 1), ("workspace-only", 2)]);
+        let other = dir.path().join("other-workspace");
+        let bulk = (0..2100).map(|i| format!("other-{i}")).collect::<Vec<_>>();
+        let mut prompts = bulk.iter().map(|s| (s.as_str(), 3)).collect::<Vec<_>>();
+        prompts.push(("shared", 10000));
+        write_prompts(&other, "z", &prompts);
+        let host = scripted_host(
+            &dir,
+            scripted(vec![], 0, Duration::ZERO),
+            HostHandles::new(&dir),
+            None,
+        );
+        let server = RemoteServer::bind(host.clone(), addr("127.0.0.1:0"), IdentityGate::local())
+            .await
+            .unwrap();
+        let client = RemoteClient::new(&server.url()).unwrap();
+        assert!(
+            client
+                .hello()
+                .await
+                .unwrap()
+                .capabilities
+                .contains(&aj_wire::PROMPT_HISTORY_CAPABILITY.to_string())
+        );
+        let local = Control::local(host.clone());
+        let remote = Control::remote(client);
+        for session in [Some("a"), None] {
+            let left = bounded("local history", local.prompt_history(session, None))
+                .await
+                .unwrap();
+            let right = bounded("HTTP history", remote.prompt_history(session, None))
+                .await
+                .unwrap();
+            assert_eq!(left, right);
+            assert!(right.incomplete.is_empty());
+            if session.is_some() {
+                assert_eq!(
+                    right
+                        .prompts
+                        .iter()
+                        .map(|p| p.text.as_str())
+                        .collect::<Vec<_>>(),
+                    [&text, "shared", "workspace-only"]
+                );
+                assert!(right.prompts.iter().all(|p| p.project.is_none()));
+            } else {
+                assert_eq!(right.prompts.len(), aj_wire::PROMPT_HISTORY_LIMIT);
+                assert_eq!(right.prompts[0].text, "shared");
+                assert_eq!(right.prompts[0].project.as_deref(), Some("other-workspace"));
+                assert_eq!(right.prompts[1].text, text);
+                assert_eq!(
+                    right.prompts.iter().filter(|p| p.text == "shared").count(),
+                    1
+                );
+            }
+        }
+        assert!(
+            host.sessions()
+                .await
+                .unwrap()
+                .sessions
+                .iter()
+                .all(|row| !row.live)
+        );
+        assert!(local.prompt_history(Some("missing"), None).await.is_err());
+        assert!(remote.prompt_history(Some("missing"), None).await.is_err());
+        host.shutdown().await;
+        server.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::remote::tests::{HostHandles, addr, bounded, scripted, scripted_host};
+    use crate::remote::{IdentityGate, RemoteServer};
+
+    async fn collect(control: &Control) -> Vec<aj_wire::SessionPreview> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bounded("preview scan", control.session_previews(tx)).await;
+        let mut rows = Vec::new();
+        while let Some(batch) = rx.recv().await {
+            rows.extend(
+                batch
+                    .expect("preview batch")
+                    .iter()
+                    .map(aj_app::session_preview::to_wire),
+            );
+        }
+        rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        rows
+    }
+
+    #[tokio::test]
+    async fn preview_adapters_read_archived_and_locked_cold_logs_without_materializing() {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{Message, UserMessage};
+        use aj_session::log::{ConversationEntryKind, ThreadKind};
+        use aj_session::{ConversationLog, ConversationPersistence, SessionLock};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let text = format!("{} search-tail", "long prompt ".repeat(1000));
+        let mut log = ConversationLog::create(&persistence).expect("log");
+        let id = log.session_id().to_string();
+        log.append(
+            None,
+            ThreadKind::User,
+            None,
+            ConversationEntryKind::Message {
+                message: AgentMessage::wire(Message::User(UserMessage::text(&text))),
+            },
+        )
+        .expect("message");
+        drop(log);
+        persistence.write_tag(&id, Some("label")).expect("tag");
+        persistence.write_archived(&id, true).expect("archive");
+        let _lock = SessionLock::try_acquire(&persistence, &id, "other-writer")
+            .expect("lock")
+            .expect("not held");
+        let empty = ConversationLog::create(&persistence).expect("empty");
+        // Empty files can exist in the store even though creation alone is lazy.
+        std::fs::write(empty.path(), b"").expect("empty log file");
+        drop(empty);
+        let host = scripted_host(
+            &dir,
+            scripted(vec![], 0, Duration::ZERO),
+            HostHandles::new(&dir),
+            None,
+        );
+        let server = RemoteServer::bind(host.clone(), addr("127.0.0.1:0"), IdentityGate::local())
+            .await
+            .expect("server");
+        let client = RemoteClient::new(&server.url()).expect("client");
+        assert!(
+            client
+                .hello()
+                .await
+                .expect("hello")
+                .capabilities
+                .iter()
+                .any(|c| c == aj_wire::SESSION_PREVIEWS_CAPABILITY)
+        );
+        let before = host.sessions().await.expect("directory");
+        assert_eq!(before.sessions.len(), 2);
+        assert!(before.sessions.iter().all(|row| !row.live));
+        assert!(
+            before
+                .sessions
+                .iter()
+                .find(|row| row.id == id)
+                .expect("row")
+                .locked
+        );
+        let local = collect(&Control::local(host.clone())).await;
+        let remote = collect(&Control::remote(client.clone())).await;
+        assert_eq!(local, remote);
+        assert_eq!(remote.len(), 2);
+        let row = remote
+            .iter()
+            .find(|row| row.session_id == id)
+            .expect("preview");
+        assert_eq!(row.first_user_message.as_deref(), Some(text.as_str()));
+        assert_eq!(row.message_count, 1);
+        assert_eq!(row.tag.as_deref(), Some("label"));
+        assert!(row.archived);
+        assert!(
+            host.sessions()
+                .await
+                .expect("directory")
+                .sessions
+                .iter()
+                .all(|row| !row.live)
+        );
+        // Ids the store does not have, or could never hold, are left out of a
+        // batch rather than refusing the rows beside them.
+        let answer = client
+            .session_previews(&["absent".to_string(), "bad/id".to_string(), id.clone()])
+            .await
+            .expect("batch");
+        assert_eq!(answer.previews.len(), 1);
+        assert_eq!(answer.previews[0].session_id, id);
+        assert!(answer.incomplete.is_empty());
+        host.shutdown().await;
+        server.shutdown().await;
+    }
+
+    fn preview_json(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": id, "modified": "2026-01-01T00:00:00Z",
+            "created_at": "2026-01-01T00:00:00Z", "last_message_at": "2026-01-01T00:00:00Z",
+            "size_bytes": 0, "message_count": 0, "first_user_message": null,
+            "tag": null, "archived": false
+        })
+    }
+
+    fn directory_json(ids: &[&str]) -> serde_json::Value {
+        serde_json::json!({"sessions": ids.iter().map(|id| serde_json::json!({
+            "id": id, "live": false, "working": false,
+            "queued": {"steering": 0, "follow_up": 0}, "tasks": 0,
+            "last_activity": "2026-01-01T00:00:00Z"
+        })).collect::<Vec<_>>()})
+    }
+
+    fn requested(params: &[(String, String)]) -> Vec<String> {
+        params
+            .iter()
+            .filter(|(key, _)| key == "session")
+            .map(|(_, id)| id.clone())
+            .collect()
+    }
+
+    /// A batch that has answered reaches the browser while a later batch is
+    /// still being read, and closing the browser stops the remaining reads.
+    #[tokio::test]
+    async fn preview_remote_emits_ready_batches_and_cancels_abandoned_reads() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        let ids: Vec<String> = (0..PREVIEW_BATCH * 2).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let directory = directory_json(&refs);
+        let (started, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/v1/sessions", get(move || async move { Json(directory) }))
+            .route(
+                "/v1/previews",
+                get(move |Query(params): Query<Vec<(String, String)>>| {
+                    let started = started.clone();
+                    async move {
+                        let batch = requested(&params);
+                        let _ = started.send(batch.clone());
+                        // The second batch never answers.
+                        if batch.first().map(String::as_str) != Some("s00") {
+                            futures::future::pending::<()>().await;
+                        }
+                        Json(serde_json::json!({
+                            "previews": batch.iter().map(|id| preview_json(id)).collect::<Vec<_>>(),
+                            "incomplete": [],
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let control = Control::remote(
+            RemoteClient::new(&format!("http://{}", listener.local_addr().expect("addr")))
+                .expect("client"),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let scan = tokio::spawn(async move {
+            control.session_previews(tx).await;
+        });
+        let rows = bounded("first batch before the slow one completes", rx.recv())
+            .await
+            .expect("batch")
+            .expect("previews");
+        assert_eq!(rows.len(), PREVIEW_BATCH);
+        assert_eq!(rows[0].session_id, "s00");
+        let mut started = Vec::new();
+        for _ in 0..2 {
+            started.push(
+                bounded("in-flight request", requests.recv())
+                    .await
+                    .expect("request"),
+            );
+        }
+        assert!(started.iter().all(|batch| batch.len() == PREVIEW_BATCH));
+        drop(rx);
+        bounded("abandoned scan stops", scan)
+            .await
+            .expect("scan task");
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// Through a gateway a batch answers for the hosts it could read and names
+    /// the ones it could not. The client keeps the rows, reports each failing
+    /// host once, and treats a host that lacks the endpoint as a refusal.
+    #[tokio::test]
+    async fn preview_remote_keeps_partial_batches_and_reports_each_host_once() {
+        use axum::{Json, Router, extract::Query, response::IntoResponse, routing::get};
+        let ids: Vec<String> = (0..PREVIEW_BATCH + 1)
+            .map(|i| {
+                let host = if i % 2 == 0 { "good" } else { "old" };
+                format!("{host}/{i:02}")
+            })
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let directory = directory_json(&refs);
+        let app = Router::new()
+            .route("/v1/sessions", get(move || async move { Json(directory) }))
+            .route(
+                "/v1/previews",
+                get(|Query(params): Query<Vec<(String, String)>>| async move {
+                    let batch = requested(&params);
+                    let previews: Vec<_> = batch
+                        .iter()
+                        .filter(|id| id.starts_with("good"))
+                        // One good row is gone from the store.
+                        .filter(|id| !id.ends_with("/00"))
+                        .map(|id| preview_json(id))
+                        .collect();
+                    Json(serde_json::json!({
+                        "previews": previews,
+                        "incomplete": [{"host": "old", "message": "host does not support session previews (upgrade the host)"}],
+                    }))
+                    .into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let control = Control::remote(RemoteClient::new(&base).expect("client"));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bounded("scan", control.session_previews(tx)).await;
+        let mut rows = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(batch) = rx.recv().await {
+            match batch {
+                Ok(batch) => rows.extend(batch),
+                Err(err) => errors.push(err.to_string()),
+            }
+        }
+        assert_eq!(rows.len(), (PREVIEW_BATCH + 1).div_ceil(2) - 1, "{rows:?}");
+        assert!(rows.iter().all(|row| row.session_id.starts_with("good/")));
+        assert_eq!(
+            errors.len(),
+            1,
+            "two batches, one host named once: {errors:?}"
+        );
+        assert!(errors[0].contains("old") && errors[0].contains("upgrade"));
+
+        // A peer without the endpoint at all is one refusal, not one per batch.
+        let control =
+            Control::remote(RemoteClient::new(&format!("{base}/nowhere")).expect("client"));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bounded("scan", control.session_previews(tx)).await;
+        let mut errors = Vec::new();
+        while let Some(batch) = rx.recv().await {
+            errors.push(batch.expect_err("no rows without a directory").to_string());
+        }
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        server.abort();
+        let _ = server.await;
     }
 }

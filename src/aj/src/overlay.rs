@@ -296,6 +296,7 @@ pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
         selected_bg: vaxis_color(theme.bg_color(ThemeBg::SelectedBg), mode),
         label: fg(ThemeColor::Text),
         prefix: fg(ThemeColor::Muted),
+        row_marker: fg(ThemeColor::Accent),
         shortcut: Style {
             bold: true,
             ..fg(ThemeColor::KeybindingHint)

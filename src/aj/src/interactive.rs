@@ -88,14 +88,12 @@ use crate::login::{
 use crate::overlay::{MouseBlocker, OverlayChrome, OverlayStack, Scrim, close_key_label};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
-use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
+use crate::prompt_history::{HistoryFetch, HistoryScope, open_prompt_history};
 use crate::quit_hint::QuitHint;
 use crate::remote::RemoteError;
 use crate::selection_copied::SelectionCopied;
 use crate::session_env::open_session_env;
-use crate::session_selector::{
-    SessionScan, extend_session_scan, open_connected_session_selector, open_session_selector,
-};
+use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
 use crate::session_tag::{TagEdit, open_session_tag};
 use crate::session_tree::{build_tree_rows, open_session_tree};
 use crate::settings_ui::{
@@ -218,8 +216,8 @@ struct World {
     /// Credential store, shared with the async read-only overlays (auth
     /// status, usage) whose fetches run detached off the drive loop.
     auth: AuthStorage,
-    /// The project's sessions store, shared with the prompt-history scan
-    /// (run detached on a blocking thread off the drive loop).
+    /// This process's project sessions store. The ring bootstrap reads it only
+    /// for local runs. Host-facing overlays read through Control.
     persistence: ConversationPersistence,
     /// Environment armed for every create this invocation performs. It stays
     /// with the frontend rather than the host so unrelated remote creates on
@@ -3792,16 +3790,12 @@ async fn apply_command_action(
         // tree's confirm closure while busy. Neither needs an open-time guard.
         CommandAction::OpenSessionSelector => {
             let handles = shell.borrow().overlay_handles();
-            if world.control.is_remote() {
-                open_connected_session_selector(
-                    &handles,
-                    world.session().to_string(),
-                    world.directory.rows(),
-                    world.directory.hosts(),
-                );
-            } else {
-                open_session_selector(&handles, world.session().to_string());
-            }
+            open_session_selector(
+                &handles,
+                world.session().to_string(),
+                world.directory.rows(),
+                world.directory.hosts(),
+            );
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionTree => match open_tree_overlay(world, shell).await {
@@ -3879,22 +3873,6 @@ async fn apply_command_action(
             ActionEffect::Redraw
         }
         CommandAction::OpenPromptHistory => {
-            // NOTE: the scan walks this process's own session store (see
-            // `spawn_history_scan`), so over a connection the overlay would
-            // answer about the client's machine while looking like the
-            // session's history. Refusing is the honest answer until a
-            // host-side history read exists.
-            if world.control.is_remote() {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice(
-                        "search prompt history",
-                        "the prompts come off this machine's own session logs, \
-                         so run it on the host",
-                    ),
-                );
-                return ActionEffect::Redraw;
-            }
             let handles = shell.borrow().overlay_handles();
             open_prompt_history(
                 &handles.stack,
@@ -5227,91 +5205,64 @@ fn spawn_shell_overlay_fetch(
     spawn_overlay_fetch(world, kind, styles, width_method, tx);
 }
 
-/// Spawn the prompt-history scan for `scope` on a blocking thread,
-/// streaming its per-file entry batches back to the drive loop over `tx`
-/// and closing with [`ScanMsg::Done`].
-///
-/// The scan walks on-disk JSONL logs (blocking IO), so it runs on the
-/// blocking pool rather than the loop. The select widget it fills is
-/// `!Send`, so it stays on the host side; only the `Send` entries cross
-/// the task boundary. Each open or scope toggle gets its own channel, so
-/// a superseded scan's batches land on a dropped receiver and are
-/// ignored, no scope tag needed to filter stale results.
-fn spawn_history_scan(
-    world: &World,
-    scope: HistoryScope,
-    tx: UnboundedSender<ScanMsg<PromptEntry>>,
-) {
-    let persistence = world.persistence.clone();
-    tokio::task::spawn_blocking(move || {
-        {
-            // Stop the walk once the receiver is gone (overlay closed or the
-            // app is quitting): the scan runs on the blocking pool and would
-            // otherwise pin process shutdown until it finished reading.
-            let cancel = || tx.is_closed();
-            let mut emit = |batch: Vec<PromptEntry>| {
-                let _ = tx.send(ScanMsg::Batch(batch));
-            };
-            match scope {
-                HistoryScope::Workspace => aj_session::workspace_history_streaming(
-                    &persistence,
-                    MAX_ENTRIES,
-                    &cancel,
-                    &mut emit,
-                ),
-                HistoryScope::All => match Config::get_sessions_base_dir_path() {
-                    Ok(base) => aj_session::all_workspaces_history_streaming(
-                        &base,
-                        MAX_ENTRIES,
-                        &cancel,
-                        &mut emit,
-                    ),
-                    // Fall back to the current workspace so the toggle still
-                    // shows something when the base dir can't be resolved.
-                    Err(err) => {
-                        tracing::debug!("could not resolve sessions base dir: {err}");
-                        aj_session::workspace_history_streaming(
-                            &persistence,
-                            MAX_ENTRIES,
-                            &cancel,
-                            &mut emit,
-                        )
-                    }
-                },
+/// Read history through Control off the drive loop. A watch channel coalesces
+/// provisional local snapshots. Closing the overlay or changing scope drops
+/// the read future and cooperatively cancels its blocking scanner.
+fn spawn_history_scan(world: &World, fetch: HistoryFetch) -> HistoryFill {
+    let control = world.control.clone();
+    let session = world.session().to_string();
+    let (tx, rx) = tokio::sync::watch::channel(aj_wire::PromptHistory::default());
+    let cancel = fetch.cancel.clone();
+    tokio::spawn(async move {
+        let session = (fetch.scope == HistoryScope::Workspace).then_some(session.as_str());
+        tokio::select! {
+            _ = cancel.cancelled() => {},
+            _ = tx.closed() => {},
+            result = control.prompt_history(session, Some(tx.clone())) => {
+                let history = match result {
+                    Ok(history) => history,
+                    Err(err) => aj_wire::PromptHistory {
+                        prompts: tx.borrow().prompts.clone(),
+                        incomplete: vec![aj_wire::HostFailure {
+                            host: control.base_url().map(crate::remote::endpoint_label)
+                                .unwrap_or_else(|| "local host".to_string()),
+                            message: if err.unknown_endpoint() {
+                                "prompt history is not supported by this host".to_string()
+                            } else { err.to_string() },
+                        }],
+                    },
+                };
+                tx.send_replace(history);
             }
         }
-        let _ = tx.send(ScanMsg::Done);
     });
+    HistoryFill {
+        select: fetch.select,
+        subtitle: fetch.subtitle,
+        rx,
+    }
 }
 
-/// Scan the project's session previews on a blocking thread, streaming
-/// per-file preview batches to the drive loop over `tx` and closing with
-/// [`ScanMsg::Done`].
-///
-/// The scan walks on-disk JSONL logs (blocking IO), so it runs on the
-/// blocking pool rather than the loop. The select it fills is `!Send`, so
-/// it stays on the host side; only the `Send` previews cross the task
-/// boundary. [`ConversationPersistence::list_session_previews_streaming`]
-/// emits one batch per session file, newest-first, and the host appends
-/// each as it lands, matching the loop's progressive-fill overlay pattern.
-fn spawn_session_scan(world: &World, tx: UnboundedSender<ScanMsg<SessionPreview>>) {
-    let persistence = world.persistence.clone();
-    tokio::task::spawn_blocking(move || {
-        {
-            // Stop the walk once the receiver is gone (overlay closed or the
-            // app is quitting): the scan runs on the blocking pool and would
-            // otherwise pin process shutdown until it finished reading. The
-            // current session is the largest and is scanned first, so an
-            // in-file cancellation check (inside the streaming scan) is what
-            // actually bounds the stall.
-            let cancel = || tx.is_closed();
-            let mut emit = |batch: Vec<SessionPreview>| {
-                let _ = tx.send(ScanMsg::Batch(batch));
-            };
-            persistence.list_session_previews_streaming(&cancel, &mut emit);
-        }
-        let _ = tx.send(ScanMsg::Done);
-    });
+async fn recv_history(fill: Option<&mut HistoryFill>) -> Option<aj_wire::PromptHistory> {
+    match fill {
+        Some(fill) => fill
+            .rx
+            .changed()
+            .await
+            .ok()
+            .map(|()| fill.rx.borrow_and_update().clone()),
+        None => std::future::pending().await,
+    }
+}
+
+/// Request previews through the host boundary without blocking input or drawing.
+/// Dropping the receiver when the overlay closes cancels the remaining reads.
+fn spawn_session_scan(
+    world: &World,
+    tx: UnboundedSender<Result<Vec<SessionPreview>, ControlError>>,
+) {
+    let control = world.control.clone();
+    tokio::spawn(async move { control.session_previews(tx).await });
 }
 
 /// Discover skills off the drive loop, delivering the discovered skills back
@@ -5379,19 +5330,16 @@ fn spawn_session_export(
 /// machine's git root, while the session being driven lives on another
 /// machine: a seeded entry would be a prompt from unrelated work on this
 /// machine, loaded into the editor and one Enter away from being submitted
-/// into a session it was never typed for. It is the same store, and the same
-/// reasoning, that makes the prompt-history overlay refuse here (see
-/// [`CommandAction::OpenPromptHistory`]). The ring needs no notice of its own
-/// where the overlay does: Up is not an unsupported gesture afterwards, it
-/// serves what this run typed, and an empty ring is not an event.
+/// into a session it was never typed for. Up serves what this run typed over
+/// a connection, and an empty ring is not an event.
 /// Those submissions stay because they were typed at this keyboard, whichever
 /// machine holds the session they went to, and up-to-repeat-what-I-just-typed
 /// is what the ring is for.
 ///
 /// The scan walks on-disk JSONL logs (blocking IO), so it runs off the loop
 /// and never delays first paint. We reuse the shared
-/// [`aj_session::workspace_history`] scanner (the same one the prompt-history
-/// overlay uses), capped at the editor's own [`TextArea::HISTORY_LIMIT`]
+/// [`aj_session::workspace_history`] scanner, capped at the editor's own
+/// [`TextArea::HISTORY_LIMIT`]
 /// since the ring keeps no more. The scanner returns entries newest-first;
 /// we reverse to oldest-first for [`TextArea::seed_history`], which splices
 /// them in beneath any prompts submitted this session so an Up press still
@@ -5430,20 +5378,11 @@ async fn recv_prompt_history(
     }
 }
 
-/// One message from a streaming overlay scan: a batch of rows in scan
-/// order, then a single terminal [`ScanMsg::Done`]. A dropped sender
-/// (superseded scan) closes the channel without a `Done`, which the fill
-/// arm treats the same as `Done`.
-enum ScanMsg<T> {
-    Batch(Vec<T>),
-    Done,
-}
-
 /// Await the next message from an optional scan receiver, pending forever
 /// when there is no scan in flight. Mirrors [`recv_prompt_history`] so a
 /// `tokio::select!` arm can poll an `Option<Receiver>` without a nested
 /// match.
-async fn recv_scan<T>(rx: Option<&mut UnboundedReceiver<ScanMsg<T>>>) -> Option<ScanMsg<T>> {
+async fn recv_scan<T>(rx: Option<&mut UnboundedReceiver<T>>) -> Option<T> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -5455,27 +5394,16 @@ async fn recv_scan<T>(rx: Option<&mut UnboundedReceiver<ScanMsg<T>>>) -> Option<
 /// a superseded scope toggle's channel is simply dropped.
 struct HistoryFill {
     select: Rc<RefCell<FilterableSelect>>,
-    rx: UnboundedReceiver<ScanMsg<PromptEntry>>,
-    /// The first batch replaces the loading placeholder; later batches
-    /// append in place.
-    first: bool,
+    subtitle: Rc<RefCell<String>>,
+    rx: tokio::sync::watch::Receiver<aj_wire::PromptHistory>,
 }
 
 /// The in-flight session-preview scan the drive loop streams into. Holds
 /// the `!Send` [`SessionScan`] plus the scan's own receiver.
 struct SessionFill {
     scan: SessionScan,
-    rx: UnboundedReceiver<ScanMsg<SessionPreview>>,
-    /// The first batch replaces the loading placeholder; later batches
-    /// append in place.
-    first: bool,
-    /// Chase the active session's row until it streams in, then stop so a
-    /// late batch can't yank the cursor away from the user's navigation.
-    select_current_pending: bool,
-    /// The row the chase last parked the selection on. Once a later batch
-    /// finds the selection sitting elsewhere, the user has navigated, so
-    /// the chase gives up rather than yanking the cursor.
-    anchor: Option<String>,
+    rx: UnboundedReceiver<Result<Vec<SessionPreview>, ControlError>>,
+    failed: bool,
 }
 
 /// The editor's visible-row cap from the terminal height, `aj`'s
@@ -7693,12 +7621,9 @@ async fn drive(
     // Each fill owns its originating list and receiver. Requests can complete
     // out of order, including after their overlay has been closed.
     let mut pending_fills = FuturesUnordered::new();
-    // Prompt-history scans stream their per-file entry batches here. The
-    // select handle is `!Send`, so it stays paired with the scan's own
-    // receiver on the host side (`pending_history`) while the blocking scan
-    // sends only the (Send) entries back. Each open or scope toggle gets a
-    // fresh channel, so a superseded scan's batches land on a dropped
-    // receiver and never touch the current view.
+    // Prompt-history reads publish ranked snapshots here. The select stays on
+    // the UI thread, paired with a fresh receiver for each open or scope change.
+    // Superseded reads cannot fill the current scope.
     let mut pending_history: Option<HistoryFill> = None;
     // Session-selector preview scans stream their per-file preview batches
     // here. The `SessionScan` (holding the `!Send` select) stays on the host
@@ -7766,6 +7691,14 @@ async fn drive(
         data: None,
     });
     let exit = loop {
+        // Closing the selector also closes its read channel. Compare identity,
+        // since Esc can reveal the still-open palette beneath this window.
+        if pending_session
+            .as_ref()
+            .is_some_and(|fill| !fill.scan.is_open(&shell.borrow().overlays.borrow()))
+        {
+            pending_session = None;
+        }
         // Reconcile before paint as well as input, so a model replaced while
         // keyboard-focused opens at the tail with focus back in its editor.
         let rebuilt = view.transcript.borrow_mut().reconcile_model();
@@ -8118,17 +8051,10 @@ async fn drive(
                         }
                         // A prompt-history scan request (open or scope
                         // toggle): give it a fresh channel, run the scan off
-                        // the loop on a blocking thread, and remember the
-                        // select to stream into. A prior in-flight scan's
-                        // channel is dropped here, so its batches are ignored.
+                        // the loop through Control, and remember its select.
+                        // Replacing the receiver isolates superseded results.
                         if let Some(fetch) = shell.borrow().take_history_fetch() {
-                            let (tx, rx) = unbounded_channel();
-                            spawn_history_scan(world, fetch.scope, tx);
-                            pending_history = Some(HistoryFill {
-                                select: fetch.select,
-                                rx,
-                                first: true,
-                            });
+                            pending_history = Some(spawn_history_scan(world, fetch));
                         }
                         // A just-opened skills window: kick off discovery off
                         // the loop and remember the captured list handle to fill
@@ -8148,9 +8074,7 @@ async fn drive(
                             pending_session = Some(SessionFill {
                                 scan,
                                 rx,
-                                first: true,
-                                select_current_pending: true,
-                                anchor: None,
+                                failed: false,
                             });
                         }
                         // A confirmed authentication request from a picker.
@@ -8328,34 +8252,27 @@ async fn drive(
             // Below input, typing always wins and the list still fills between
             // keystrokes.
             //
-            // The first batch replaces the loading placeholder, later batches
-            // append. Superseded scans (a scope toggle) sit on a dropped
-            // channel, so their batches never reach here.
-            maybe_history = recv_scan(pending_history.as_mut().map(|f| &mut f.rx)) => {
-                if let Some(fill) = pending_history.as_mut() {
-                    match maybe_history {
-                        Some(ScanMsg::Batch(entries)) => {
-                            let items = crate::prompt_history::build_items(&entries);
-                            if fill.first {
-                                fill.select.borrow().set_items(items);
-                                fill.first = false;
-                            } else {
-                                fill.select.borrow().extend_items(items);
-                            }
-                            app.request_redraw();
-                        }
-                        // Done, or the sender was dropped: clear the loading
-                        // placeholder if nothing streamed in, then retire the
-                        // scan.
-                        Some(ScanMsg::Done) | None => {
-                            if fill.first {
-                                fill.select.borrow().set_items(Vec::new());
-                            }
-                            pending_history = None;
-                            app.request_redraw();
+            // Snapshots replace the list because a later-read file may hold
+            // newer prompts. The watch channel keeps only the latest snapshot.
+            maybe_history = recv_history(pending_history.as_mut()) => {
+                if let Some(history) = maybe_history {
+                    if let Some(fill) = &pending_history {
+                        let entries = history.prompts.into_iter().map(|p| PromptEntry {
+                            text: p.text, project: p.project,
+                        }).collect::<Vec<_>>();
+                        let select = fill.select.borrow();
+                        select.set_ranked_items(crate::prompt_history::build_items(&entries));
+                        if !history.incomplete.is_empty() {
+                            *fill.subtitle.borrow_mut() = format!("Incomplete history: {}", history.incomplete.iter()
+                                .map(|f| f.host.as_str()).collect::<Vec<_>>().join(", "));
+                            fold_notice(world, &format!("Incomplete prompt history: {}", history.incomplete.iter()
+                                .map(|f| format!("{}: {}", f.host, f.message)).collect::<Vec<_>>().join(" | ")));
                         }
                     }
+                } else {
+                    pending_history = None;
                 }
+                app.request_redraw();
             }
 
             // --- Session-selector preview fill ---
@@ -8363,47 +8280,21 @@ async fn drive(
             // prompt-history fill above: many streamed batches must not starve
             // typing in the filter field under `biased`.
             //
-            // Build the rows and append them (the first batch replaces the
-            // loading placeholder), and chase the active session's row until it
-            // appears, giving up once the user has navigated so a late batch
-            // can't yank the cursor.
             maybe_sessions = recv_scan(pending_session.as_mut().map(|f| &mut f.rx)) => {
                 if let Some(fill) = pending_session.as_mut() {
                     match maybe_sessions {
-                        Some(ScanMsg::Batch(previews)) => {
-                            // If the user moved the selection off where the
-                            // chase last parked it, stop chasing so this batch's
-                            // pre-select can't yank the cursor back. Skipped on
-                            // the first batch, which establishes the anchor.
-                            if !fill.first
-                                && fill.select_current_pending
-                                && fill.scan.selected_filter_key() != fill.anchor
-                            {
-                                fill.select_current_pending = false;
-                            }
-                            let selected = extend_session_scan(
-                                &fill.scan,
-                                &previews,
-                                Utc::now(),
-                                fill.first,
-                                fill.select_current_pending,
-                            );
-                            fill.first = false;
-                            if selected {
-                                fill.select_current_pending = false;
-                            }
-                            // Re-anchor to wherever the selection now sits so
-                            // later user movement is measured against it.
-                            fill.anchor = fill.scan.selected_filter_key();
+                        Some(Ok(previews)) => {
+                            extend_session_scan(&fill.scan, &previews, Utc::now());
                             app.request_redraw();
                         }
-                        // Done, or the sender was dropped: clear the loading
-                        // placeholder if nothing streamed in, then retire the
-                        // scan.
-                        Some(ScanMsg::Done) | None => {
-                            if fill.first {
-                                extend_session_scan(&fill.scan, &[], Utc::now(), true, false);
-                            }
+                        Some(Err(error)) => {
+                            fill.failed = true;
+                            fill.scan.finish(true);
+                            shell.borrow().show_toast(format!("Session previews: {}", peer_refusal(&error)));
+                            app.request_redraw();
+                        }
+                        None => {
+                            fill.scan.finish(fill.failed);
                             pending_session = None;
                             app.request_redraw();
                         }
@@ -18642,6 +18533,91 @@ mod tests {
         assert_eq!(fetch.scope, HistoryScope::All);
     }
 
+    /// An in-flight HTTP read must not hold input or survive a scope change or
+    /// close. An older peer is probed and its typed refusal reaches the UI fill.
+    #[tokio::test]
+    async fn prompt_history_http_reads_cancel_on_toggle_and_close_and_notice_unsupported() {
+        use axum::{Json, Router, routing::get};
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let (started, mut requests) = unbounded_channel();
+        let router = Router::new()
+            .route(
+                "/v1/sessions/{id}/prompt-history",
+                get(move || {
+                    let started = started.clone();
+                    async move {
+                        started.send(()).unwrap();
+                        std::future::pending::<Json<aj_wire::PromptHistory>>().await
+                    }
+                }),
+            )
+            .route(
+                "/v1/prompt-history",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        Json(aj_wire::ErrorResponse {
+                            code: "unknown_endpoint".to_string(),
+                            message: "no such endpoint".to_string(),
+                        }),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let local = world.control.clone();
+        world.control = Control::remote(crate::remote::RemoteClient::new(&url).unwrap());
+        apply_command(&mut world, &shell, CommandAction::OpenPromptHistory).await;
+        focus_overlay(&mut app, &root);
+        let mut initial = spawn_history_scan(&world, shell.borrow().take_history_fetch().unwrap());
+        crate::remote::tests::bounded("HTTP read started", requests.recv())
+            .await
+            .unwrap();
+        press(&mut app, &mut writer, b"\x14").await;
+        assert!(
+            crate::remote::tests::bounded(
+                "scope cancels pending read",
+                recv_history(Some(&mut initial))
+            )
+            .await
+            .is_none()
+        );
+        let mut all = spawn_history_scan(&world, shell.borrow().take_history_fetch().unwrap());
+        let history = crate::remote::tests::bounded(
+            "unsupported history reply",
+            recv_history(Some(&mut all)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(history.incomplete.len(), 1);
+        assert_eq!(history.incomplete[0].host, url);
+        assert!(history.incomplete[0].message.contains("not supported"));
+        press(&mut app, &mut writer, b"\x14").await;
+        let mut workspace =
+            spawn_history_scan(&world, shell.borrow().take_history_fetch().unwrap());
+        crate::remote::tests::bounded("second HTTP read started", requests.recv())
+            .await
+            .unwrap();
+        press(&mut app, &mut writer, b"\x1b").await;
+        app.render(&root).unwrap();
+        assert!(!shell.borrow().overlays.borrow().is_open());
+        assert!(
+            crate::remote::tests::bounded(
+                "close cancels pending read",
+                recv_history(Some(&mut workspace))
+            )
+            .await
+            .is_none()
+        );
+        world.control = local;
+        shut_down(&world).await;
+        serving.abort();
+        let _ = serving.await;
+    }
+
     // ---- Session selector, new session, rebuild loop (8D-3b-i) ----
 
     /// Build a scripted session over `dir`'s shared persistence, run one
@@ -18836,8 +18812,25 @@ mod tests {
         );
     }
 
-    /// The selector opens showing a loading placeholder, fills from a real
-    /// persistence scan, tags the current session, and confirming a
+    async fn refresh_browser_directory(world: &mut World) {
+        let directory = world.control.sessions().await.expect("host directory");
+        let _ = world.directory.apply(aj_wire::Frame::List {
+            sessions: directory.sessions,
+            hosts: directory.hosts,
+        });
+    }
+
+    async fn fill_browser_previews(world: &World, scan: &SessionScan) {
+        let (tx, mut rx) = unbounded_channel();
+        world.control.session_previews(tx).await;
+        while let Some(batch) = rx.recv().await {
+            extend_session_scan(scan, &batch.expect("host previews"), Utc::now());
+        }
+        scan.finish(false);
+    }
+
+    /// The selector starts with selectable directory rows, fills host previews,
+    /// marks the current session, and confirming a
     /// different row parks a resume request the drive loop turns into
     /// `SessionExit::Switch`.
     #[tokio::test]
@@ -18848,9 +18841,10 @@ mod tests {
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         // Give the current session recognizable on-disk content so its row
-        // scans in and can carry the `(current)` tag.
+        // scans in and can carry the current-session marker.
         run_prompt(&mut world, "current session prompt").await;
 
+        refresh_browser_directory(&mut world).await;
         let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         focus_overlay(&mut app, &root);
@@ -18859,24 +18853,25 @@ mod tests {
             .take_session_scan()
             .expect("open parked a preview scan");
         let loading = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-        assert!(loading.contains("Loading"), "loading state: {loading}");
-
-        // Run the scan synchronously (what `spawn_session_scan` does off the
-        // loop) and fill, as the drive loop's fill arm would.
-        let mut previews = Vec::new();
-        world
-            .persistence
-            .list_session_previews_streaming(&|| false, &mut |batch| previews.extend(batch));
         assert!(
-            previews.len() >= 2,
-            "alpha + the current session are on disk: {}",
-            previews.len()
+            loading.contains("loading previews"),
+            "loading state: {loading}"
         );
-        extend_session_scan(&scan, &previews, Utc::now(), true, true);
+        assert_eq!(scan.select.borrow().visible_labels().len(), 2);
+        assert!(
+            loading.contains("live") && loading.contains("idle"),
+            "{loading}"
+        );
+
+        fill_browser_previews(&world, &scan).await;
         app.render(&root).expect("render");
 
         let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-        assert!(rows.contains("(current)"), "current session tagged: {rows}");
+        assert!(
+            rows.lines()
+                .any(|line| line.contains("▌") && line.contains("current session prompt")),
+            "current session marked: {rows}"
+        );
 
         // Filter to alpha and confirm; the switch request is parked and the
         // overlay closes.
@@ -18909,7 +18904,7 @@ mod tests {
     #[tokio::test]
     async fn the_selector_toggle_reveals_an_archived_session() {
         let dir = TempDir::new().expect("tempdir");
-        let put_away = create_disk_session(&dir, "the session I am done with").await;
+        let put_away = create_disk_session(&dir, "done with it").await;
 
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
@@ -18919,6 +18914,7 @@ mod tests {
             .write_archived(&put_away, true)
             .expect("archive the session on disk");
 
+        refresh_browser_directory(&mut world).await;
         let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         focus_overlay(&mut app, &root);
@@ -18926,15 +18922,7 @@ mod tests {
             .borrow()
             .take_session_scan()
             .expect("open parked a preview scan");
-        let mut previews = Vec::new();
-        world
-            .persistence
-            .list_session_previews_streaming(&|| false, &mut |batch| previews.extend(batch));
-        assert!(
-            previews.iter().any(|preview| preview.archived),
-            "the scan read no archived session, so this test measures nothing",
-        );
-        extend_session_scan(&scan, &previews, Utc::now(), true, true);
+        fill_browser_previews(&world, &scan).await;
         app.render(&root).expect("render");
 
         let listed = |shell: &Rc<RefCell<Shell>>| -> String {
@@ -18956,9 +18944,27 @@ mod tests {
             revealed.contains("done with"),
             "the chord revealed nothing: {revealed}",
         );
+        let window = Rc::clone(&shell.borrow().overlays.borrow().top().expect("open").widget);
+        let surface = window.borrow_mut().draw(&full_draw_ctx());
+        let cells = crate::test_support::flatten(&surface);
+        let archived_row = cells
+            .iter()
+            .find(|row| {
+                row.iter()
+                    .map(|cell| cell.char.grapheme())
+                    .collect::<String>()
+                    .contains("done with")
+            })
+            .expect("the archived row drew");
         assert!(
-            revealed.contains("archived ·"),
-            "the revealed row is not marked as archived: {revealed}",
+            archived_row
+                .iter()
+                .filter(|cell| {
+                    let glyph = cell.char.grapheme();
+                    !glyph.trim().is_empty() && glyph != "│"
+                })
+                .all(|cell| cell.style.strikethrough),
+            "the revealed row is struck through"
         );
 
         writer.write_all(&chord).expect("the toggle chord again");
@@ -18982,14 +18988,11 @@ mod tests {
         run_prompt(&mut world, "current session prompt").await;
 
         // Confirm the pre-selected current row through the real input parser.
+        refresh_browser_directory(&mut world).await;
         apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
         focus_overlay(&mut app, &root);
         let scan = shell.borrow().take_session_scan().expect("scan parked");
-        let mut previews = Vec::new();
-        world
-            .persistence
-            .list_session_previews_streaming(&|| false, &mut |batch| previews.extend(batch));
-        extend_session_scan(&scan, &previews, Utc::now(), true, true);
+        fill_browser_previews(&world, &scan).await;
         app.render(&root).expect("render");
         writer.write_all(b"\r").expect("enter on the current row");
         let event = app.next_input().await.expect("input event");
@@ -24745,6 +24748,7 @@ mod tests {
         run_prompt(&mut world, "a prompt").await;
         seed_tag(&mut world, &shell, "fix-auth").await;
 
+        refresh_browser_directory(&mut world).await;
         let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         let scan = shell
@@ -24752,13 +24756,7 @@ mod tests {
             .take_session_scan()
             .expect("the selector parked a scan");
 
-        // The scan's own walk is off the loop, so run it here as the drive
-        // loop's fill arm would, over the same store.
-        let mut previews = Vec::new();
-        world
-            .persistence
-            .list_session_previews_streaming(&|| false, &mut |batch| previews.extend(batch));
-        extend_session_scan(&scan, &previews, Utc::now(), true, true);
+        fill_browser_previews(&world, &scan).await;
 
         let row = scan
             .select
@@ -28339,12 +28337,8 @@ mod tests {
     /// A gesture connect mode has no path for folds a notice naming why, rather
     /// than silently doing nothing.
     ///
-    /// These are the three this arm refuses, all of them about this machine: an
-    /// export writes a file where the log is, prompt history scans that store's
-    /// logs, and usage reads this process's credential store. The session-info
-    /// overlay refuses too, in its fill rather than here, see
-    /// `spawn_overlay_fetch`. Session browsing, switching, and creation are no
-    /// longer among them.
+    /// Export writes a host-local file and usage reads credentials. Neither
+    /// gesture has a host endpoint here.
     #[tokio::test]
     async fn connect_mode_refuses_the_gestures_about_this_machine() {
         let dir = TempDir::new().expect("tempdir");
@@ -28355,10 +28349,6 @@ mod tests {
         // host-local thing it cannot reach.
         for (action, reason) in [
             (CommandAction::ExportHtml, "run the export there"),
-            (
-                CommandAction::OpenPromptHistory,
-                "this machine's own session logs",
-            ),
             (
                 CommandAction::OpenUsageStatus,
                 "this machine's credential store",
@@ -28525,124 +28515,82 @@ mod tests {
         assert_no_credential_harm("after remote shutdown");
     }
 
-    /// The refusal is what the keyboard gets, not just what the arm returns:
-    /// `Ctrl+R` over a connection travels the real path (input bytes, the
-    /// composed tree, the drive loop's own drain) and comes back a notice.
-    ///
-    /// And it changes nothing else. The chord is reachable from
-    /// transcript-focus mode, where the palette-entry path's pop-and-refocus
-    /// would drop the item cursor the user is navigating with, so the mode
-    /// surviving the refusal is pinned here too.
+    /// Both entry gestures use the real drive loop and adapters. The search
+    /// term is beyond the rendered first line, and Enter must only recall it.
     #[tokio::test]
-    async fn the_history_chord_refuses_over_a_connection_and_disturbs_nothing() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-        let (mut app, mut writer, root) = app_over(&shell).await;
-
-        // Transcript focus needs a user message to land on, so take a turn
-        // first. Tab then engages the mode.
-        assert!(handle_submit(&mut world, "over the wire".to_string()).await);
-        settle(&mut world).await;
-        press(&mut app, &mut writer, b"\t").await;
-        let transcript = Rc::clone(&shell.borrow().view().transcript);
-        assert!(
-            transcript.borrow().in_focus_mode(),
-            "the fixture never reached transcript focus, so the mode assertion \
-             below measures nothing",
-        );
-
-        // Ctrl+R, then EOF so the loop returns. Both are in the buffer before
-        // the loop reads either, and nothing reaches into the shell between
-        // them: a chord that parks nothing, or a drain that never runs the
-        // command, leaves the notice unfolded and fails here.
-        writer.write_all(&[0x12]).expect("ctrl+r");
-        drop(writer);
-        let mut theme_watch = inert_theme_watch();
-        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-
-        let exit = drive(
-            &mut app,
-            &root,
-            &shell,
-            &mut world,
-            &mut theme_watch,
-            &mut prompt_history_rx,
-        )
-        .await
-        .expect("drive exits without a fatal error");
-        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
-
-        // The overlay is where the scan is requested (`open_prompt_history`
-        // parks it as it builds), and the loop drains that slot itself, so on
-        // this path a closed overlay is the observable that no scan ran.
-        assert!(
-            !shell.borrow().overlays.borrow().is_open(),
-            "the chord opened the overlay instead of refusing",
-        );
-        assert!(
-            main_notices(&world)
-                .last()
-                .is_some_and(|n| n.contains("Can't search prompt history over a connection")),
-            "the chord folded the refusal: {:?}",
-            main_notices(&world),
-        );
-        assert!(
-            transcript.borrow().in_focus_mode(),
-            "the refusal stole focus from the transcript",
-        );
-        remote.shutdown().await;
-    }
-
-    /// And the palette entry to the same refusal keeps its own behavior: the
-    /// palette the confirm left on the stack is popped, so the transcript is
-    /// what the user comes back to.
-    ///
-    /// This is the other side of the drive loop's declined-opener gate. Both
-    /// sides run the real loop, because the two differ only in what the loop
-    /// finds on the overlay stack.
-    #[tokio::test]
-    async fn the_history_palette_command_refuses_and_closes_the_palette() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-        let (mut app, mut writer, root) = app_over(&shell).await;
-
-        // Ctrl+O, the query that filters to the one row, Enter to confirm, then
-        // EOF. All buffered before the loop reads any of it.
-        writer.write_all(&[0x0f]).expect("ctrl+o");
-        writer.write_all(b"history\r").expect("query + enter");
-        drop(writer);
-        let mut theme_watch = inert_theme_watch();
-        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
-
-        let exit = drive(
-            &mut app,
-            &root,
-            &shell,
-            &mut world,
-            &mut theme_watch,
-            &mut prompt_history_rx,
-        )
-        .await
-        .expect("drive exits without a fatal error");
-        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
-
-        // The notice is also the fixture check: it exists only if the palette
-        // opened, filtered to the history row, and confirmed it.
-        assert!(
-            main_notices(&world)
-                .last()
-                .is_some_and(|n| n.contains("Can't search prompt history over a connection")),
-            "the palette never confirmed the command, so this test measures \
-             nothing: {:?}",
-            main_notices(&world),
-        );
-        assert!(
-            !shell.borrow().overlays.borrow().is_open(),
-            "the refusal left the palette on the stack",
-        );
-        remote.shutdown().await;
+    async fn prompt_history_local_and_direct_ui_search_full_text_and_recall_without_submit() {
+        for connected in [false, true] {
+            let host_dir = TempDir::new().unwrap();
+            let client_dir = TempDir::new().unwrap();
+            let remote = if connected {
+                Some(RemoteHost::start(&host_dir, "streaming-text").await)
+            } else {
+                None
+            };
+            let (mut world, shell) = if let Some(remote) = &remote {
+                connect_world_and_shell(&client_dir, remote, &[]).await
+            } else {
+                world_and_shell(&host_dir, "streaming-text").await
+            };
+            let prompt = format!("{}\nrecallneedle", "a complete prompt ".repeat(15));
+            crate::control::history_tests::write_prompts(
+                &host_dir.path().join("sessions"),
+                "history",
+                &[(&prompt, 9000), ("not the pick", 1)],
+            );
+            if connected {
+                store_holding_a_prompt(&world.persistence, "client-only-history");
+            }
+            let before = user_messages(&world);
+            let observed = Rc::clone(&shell);
+            let (exit, (loaded, filtered, recalled)) =
+                drive_until(&mut world, &shell, move |mut writer| async move {
+                    writer
+                        .write_all(if connected { b"\x0fhistory\r" } else { b"\x12" })
+                        .unwrap();
+                    let loaded = poll_for(|| {
+                        if !observed.borrow().overlays.borrow().is_open() {
+                            return None;
+                        }
+                        let rows = top_overlay_rows(&observed).join("\n");
+                        (rows.contains("a complete prompt") && rows.contains("not the pick"))
+                            .then_some(rows)
+                    })
+                    .await;
+                    writer.write_all(b"recallneedle").unwrap();
+                    let filtered = poll_for(|| {
+                        let rows = top_overlay_rows(&observed).join("\n");
+                        (rows.contains("a complete prompt") && !rows.contains("not the pick"))
+                            .then_some(rows)
+                    })
+                    .await;
+                    writer.write_all(b"\r").unwrap();
+                    let recalled = poll_for(|| {
+                        let text = observed.borrow().view().editor.borrow().text();
+                        (!observed.borrow().overlays.borrow().is_open()
+                            && text.contains("recallneedle"))
+                        .then_some(text)
+                    })
+                    .await;
+                    drop(writer);
+                    (loaded, filtered, recalled)
+                })
+                .await;
+            assert!(matches!(exit, Ok(SessionExit::Quit)));
+            assert!(
+                !loaded
+                    .expect("history loaded")
+                    .contains("client-only-history")
+            );
+            filtered.expect("full text was searched");
+            assert_eq!(recalled.as_deref(), Some(prompt.as_str()));
+            assert_eq!(user_messages(&world), before, "recall never submits");
+            if let Some(remote) = remote {
+                remote.shutdown().await;
+            } else {
+                shut_down(&world).await;
+            }
+        }
     }
 
     /// Write a session into `persistence` whose one user prompt is `prompt`, as
@@ -29003,8 +28951,8 @@ mod tests {
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         focus_overlay(&mut app, &root);
         assert!(
-            shell.borrow().take_session_scan().is_none(),
-            "a connected selector parks no local preview scan",
+            shell.borrow().take_session_scan().is_some(),
+            "a connected selector requests host previews",
         );
         let drawn = top_overlay_rows(&shell);
         let target_line = drawn
@@ -29012,13 +28960,17 @@ mod tests {
             .find(|line| line.contains(&target_tag))
             .unwrap_or_else(|| panic!("the target row drew: {drawn:?}"));
         assert!(
-            target_line.contains("live · last "),
+            target_line
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("live last "),
             "the directory state and age drew: {target_line:?}",
         );
         assert_eq!(
             target_line.matches('·').count(),
-            1,
-            "a plain-host row has no host part: {target_line:?}",
+            0,
+            "aligned fields have no separator dots: {target_line:?}",
         );
 
         type_text(&mut app, &mut writer, &target_tag).await;
@@ -30133,6 +30085,401 @@ mod tests {
         (gateway, ids, world, shell)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prompt_history_credential_failures_are_safe_on_wire_and_in_ui() {
+        for through_gateway in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+            let local = world.control.clone();
+            // Reserve a port without accepting HTTP, then close it for a real
+            // connection refusal rather than a synthetic error string.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://history-user:history-password@{}",
+                listener.local_addr().unwrap()
+            );
+            drop(listener);
+            let expected_label = crate::remote::endpoint_label(&url);
+            let state = TempDir::new().unwrap();
+            let gateway = crate::gateway::Gateway::new(crate::gateway::GatewaySetup {
+                state_dir: state.path().to_path_buf(),
+                static_hosts: serde_json::from_value(serde_json::json!([url])).unwrap(),
+                tuning: crate::gateway::Tuning::default(),
+            })
+            .unwrap();
+            assert!(
+                gateway.hosts().hosts[0]
+                    .address
+                    .contains("history-user:history-password@")
+            );
+            let server = crate::gateway::GatewayServer::bind(
+                gateway.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                crate::remote::IdentityGate::local(),
+            )
+            .await
+            .unwrap();
+            world.control = Control::remote(
+                crate::remote::RemoteClient::new(
+                    if through_gateway { server.url() } else { url }.as_str(),
+                )
+                .unwrap(),
+            );
+            if through_gateway {
+                let history = world.control.prompt_history(None, None).await.unwrap();
+                assert_eq!(history.incomplete.len(), 1);
+                let wire = serde_json::to_string(&history).unwrap();
+                assert!(!wire.contains("history-user") && !wire.contains("history-password"));
+            }
+            let observed = Rc::clone(&shell);
+            let observed_chat = Rc::clone(&world.chat);
+            let (exit, rows) = drive_until(&mut world, &shell, move |mut writer| async move {
+                writer.write_all(b"\x12\x14").unwrap();
+                let rows = poll_for(|| {
+                    if !observed.borrow().overlays.borrow().is_open() {
+                        return None;
+                    }
+                    let rows = top_overlay_rows(&observed).join("\n");
+                    (rows.contains("Incomplete history") && rows.contains(&expected_label))
+                        .then_some(rows)
+                })
+                .await;
+                let history_notices = || {
+                    notices_of(&observed_chat.borrow())
+                        .iter()
+                        .filter(|notice| notice.contains("Incomplete prompt history"))
+                        .count()
+                };
+                let before_repeat = history_notices();
+                assert!(before_repeat > 0, "the failed read produced its notice");
+                writer.write_all(&[0x12; 20]).unwrap();
+                writer.write_all(b"repeat-drained").unwrap();
+                poll_for(|| {
+                    top_overlay_rows(&observed)
+                        .join("\n")
+                        .contains("repeat-drained")
+                        .then_some(())
+                })
+                .await
+                .expect("input after the buffered history chords was handled");
+                assert_eq!(observed.borrow().overlays.borrow().depth(), 1);
+                assert_eq!(
+                    history_notices(),
+                    before_repeat,
+                    "held Ctrl+R adds no notices"
+                );
+                drop(writer);
+                rows
+            })
+            .await;
+            assert!(matches!(exit, Ok(SessionExit::Quit)));
+            let rows = rows.expect("failure subtitle rendered");
+            let transcript = main_notices(&world).join("\n");
+            assert!(transcript.contains("Incomplete prompt history"));
+            assert!(transcript.contains(if through_gateway {
+                "not connected"
+            } else {
+                "could not reach the host"
+            }));
+            for rendered in [&rows, &transcript] {
+                assert!(
+                    !rendered.contains("history-user") && !rendered.contains("history-password")
+                );
+            }
+            world.control = local;
+            shut_down(&world).await;
+            server.shutdown().await;
+            gateway.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_prompt_history_scopes_merge_partial_failure_and_ui_recall() {
+        use crate::control::history_tests::write_prompts;
+        let left_dir = TempDir::new().unwrap();
+        let right_dir = TempDir::new().unwrap();
+        let client_dir = TempDir::new().unwrap();
+        let left = RemoteHost::named_at_directory(&left_dir, "history-left").await;
+        let right = RemoteHost::named_at_directory(&right_dir, "history-right").await;
+        let session = left.host.create().await.unwrap();
+        let target = format!("{}:{session}", left.host.hello().host_id);
+        let gateway = RemoteGateway::over(&[&left]).await;
+        let credential_url =
+            right
+                .url()
+                .replacen("http://", "http://history-user:history-password@", 1);
+        let enrolled = gateway.gateway.enroll(&credential_url).await.unwrap();
+        assert!(enrolled.address.contains("history-user:history-password@"));
+        gateway
+            .until("credential host connected", |hosts| {
+                (hosts.len() == 2 && hosts.iter().all(|host| !host.unreachable)).then_some(())
+            })
+            .await;
+        gateway.until_sessions(1).await;
+        let (mut world, shell) =
+            connect_world_and_shell_at(&client_dir, &gateway.url(), &[&target]).await;
+        assert_eq!(
+            world.session(),
+            target,
+            "workspace scope must follow the focused owner"
+        );
+        let prompt = format!("{}\nfarawayneedle", "left recall prompt ".repeat(12));
+        write_prompts(
+            &left_dir.path().join("sessions"),
+            "a-history",
+            &[(&prompt, 9000), ("shared", 8000)],
+        );
+        write_prompts(
+            &right_dir.path().join("sessions"),
+            "z-history",
+            &[("shared", 10000), ("right-only", 7000)],
+        );
+        write_prompts(
+            &left_dir.path().join("left-extra"),
+            "extra",
+            &[("left-extra", 6000)],
+        );
+        write_prompts(
+            &right_dir.path().join("right-extra"),
+            "extra",
+            &[("right-extra", 5000)],
+        );
+        store_holding_a_prompt(&world.persistence, "client-only-history");
+        let bulk = (0..2100).map(|i| format!("bulk-{i}")).collect::<Vec<_>>();
+        write_prompts(
+            &right_dir.path().join("right-extra"),
+            "bulk",
+            &bulk.iter().map(|s| (s.as_str(), 1)).collect::<Vec<_>>(),
+        );
+        let workspace = world
+            .control
+            .prompt_history(Some(&target), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            workspace
+                .prompts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>(),
+            [prompt.as_str(), "shared"]
+        );
+        let merged = world.control.prompt_history(None, None).await.unwrap();
+        assert!(merged.incomplete.is_empty());
+        let wire = serde_json::to_string(&merged).unwrap();
+        assert!(!wire.contains("history-user") && !wire.contains("history-password"));
+        assert_eq!(merged.prompts.len(), aj_wire::PROMPT_HISTORY_LIMIT);
+        assert_eq!(merged.prompts[0].text, "shared");
+        assert_eq!(merged.prompts[1].text, prompt);
+        assert_eq!(
+            merged.prompts.iter().filter(|p| p.text == "shared").count(),
+            1
+        );
+        for text in ["right-only", "left-extra", "right-extra"] {
+            assert!(merged.prompts.iter().any(|p| p.text == text));
+        }
+        assert!(
+            !merged
+                .prompts
+                .iter()
+                .any(|p| p.text == "client-only-history")
+        );
+        let before = user_messages(&world);
+        let observed = Rc::clone(&shell);
+        let (exit, (workspace_rows, all_rows, partial_rows, recalled)) =
+            drive_until(&mut world, &shell, move |mut writer| async move {
+                writer.write_all(b"\x12").unwrap();
+                let workspace_rows = poll_for(|| {
+                    if !observed.borrow().overlays.borrow().is_open() {
+                        return None;
+                    }
+                    let rows = top_overlay_rows(&observed).join("\n");
+                    (rows.contains("left recall prompt") && rows.contains("shared")).then_some(rows)
+                })
+                .await;
+                writer.write_all(b"\x14right-only").unwrap();
+                let all_rows = poll_for(|| {
+                    let rows = top_overlay_rows(&observed).join("\n");
+                    (rows.contains("right-only") && rows.contains("sessions")).then_some(rows)
+                })
+                .await;
+                // Fail an enrolled host between reads. All must retain the healthy
+                // host's prompts and name the failed host in the visible overlay.
+                right.shutdown().await;
+                writer.write_all(b"\x15\x14").unwrap();
+                let _ = poll_for(|| {
+                    let rows = top_overlay_rows(&observed).join("\n");
+                    rows.contains("left recall prompt").then_some(())
+                })
+                .await;
+                writer.write_all(b"\x14farawayneedle").unwrap();
+                let partial_rows = poll_for(|| {
+                    let rows = top_overlay_rows(&observed).join("\n");
+                    (rows.contains("Incomplete history")
+                        && rows.contains("history-right")
+                        && rows.contains("left recall prompt"))
+                    .then_some(rows)
+                })
+                .await;
+                writer.write_all(b"\r").unwrap();
+                let recalled = poll_for(|| {
+                    let text = observed.borrow().view().editor.borrow().text();
+                    (!observed.borrow().overlays.borrow().is_open()
+                        && text.contains("farawayneedle"))
+                    .then_some(text)
+                })
+                .await;
+                drop(writer);
+                (workspace_rows, all_rows, partial_rows, recalled)
+            })
+            .await;
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let rows = workspace_rows.expect("workspace history filled");
+        assert!(!rows.contains("right-only") && !rows.contains("left-extra"));
+        all_rows.expect("all scope searched the other host");
+        let rows = partial_rows
+            .expect("healthy results and named incomplete-history feedback remain visible");
+        let transcript = main_notices(&world).join("\n");
+        assert!(transcript.contains("Incomplete prompt history"));
+        for rendered in [&rows, &transcript] {
+            assert!(!rendered.contains("history-user") && !rendered.contains("history-password"));
+        }
+        assert_eq!(recalled.as_deref(), Some(prompt.as_str()));
+        assert_eq!(user_messages(&world), before, "recall did not submit");
+        drop(world);
+        gateway.shutdown().await;
+        left.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_preview_search_finds_an_offscreen_prompt_and_resumes_its_host() {
+        let left_dir = TempDir::new().unwrap();
+        let right_dir = TempDir::new().unwrap();
+        let client_dir = TempDir::new().unwrap();
+        let persistence = ConversationPersistence::new(left_dir.path().join("sessions"));
+        let prompt = format!("{} distantneedle", "an old session prompt ".repeat(6));
+        store_holding_a_prompt(&persistence, &prompt);
+        let target = persistence.list_session_previews(|_, _| {}).unwrap()[0]
+            .session_id
+            .clone();
+        for _ in 0..60 {
+            seed_session(&persistence);
+        }
+        let right_store = ConversationPersistence::new(right_dir.path().join("sessions"));
+        store_holding_a_prompt(&right_store, "right-host-preview");
+        let left = RemoteHost::named_at_directory(&left_dir, "preview-left").await;
+        let right = RemoteHost::named_at_directory(&right_dir, "preview-right").await;
+        let gateway = RemoteGateway::over(&[&left, &right]).await;
+        gateway.until_sessions(62).await;
+        let (mut world, shell) = connect_world_and_shell_at(&client_dir, &gateway.url(), &[]).await;
+        store_holding_a_prompt(&world.persistence, "client-only-preview");
+        let target = world
+            .directory
+            .rows()
+            .iter()
+            .find(|row| row.id.ends_with(&target))
+            .expect("target in directory")
+            .id
+            .clone();
+        assert!(
+            world
+                .directory
+                .rows()
+                .iter()
+                .position(|row| row.id == target)
+                .unwrap()
+                >= 50,
+            "target begins below the selector viewport"
+        );
+        assert_ne!(world.session(), target);
+        let observed = Rc::clone(&shell);
+        let (exit, (loaded, right_preview, filtered, last_right_rows)) =
+            drive_until(&mut world, &shell, move |mut writer| async move {
+                writer.write_all(b"\x0fresume\r").unwrap();
+                let loaded = poll_for(|| {
+                    if !observed.borrow().overlays.borrow().is_open() {
+                        return None;
+                    }
+                    let rows = top_overlay_rows(&observed).join("\n");
+                    (rows.contains("Resume session") && !rows.contains("loading previews"))
+                        .then_some(rows)
+                })
+                .await;
+                // Either host's rows may be outside the initial viewport.
+                // Find the second host by its prompt instead of assuming order.
+                writer.write_all(b"right-host-preview").unwrap();
+                let mut last_right_rows = String::new();
+                let right_preview = poll_for(|| {
+                    let rows = top_overlay_rows(&observed).join("\n");
+                    last_right_rows.clone_from(&rows);
+                    rows.lines()
+                        .any(|line| line.contains("right-host") && line.contains("preview-right"))
+                        .then_some(rows)
+                })
+                .await;
+                writer.write_all(b"\x15distantneedle").unwrap();
+                let filtered = poll_for(|| {
+                    if !observed.borrow().overlays.borrow().is_open() {
+                        return None;
+                    }
+                    let rows = top_overlay_rows(&observed).join("\n");
+                    (rows.contains("> distantneedle")
+                        && rows.contains("an old")
+                        && rows.contains("preview-left"))
+                    .then_some(rows)
+                })
+                .await;
+                if filtered.is_some() {
+                    writer.write_all(b"\r").unwrap();
+                }
+                let _ = poll_for(|| (!observed.borrow().overlays.borrow().is_open()).then_some(()))
+                    .await;
+                drop(writer);
+                (loaded, right_preview, filtered, last_right_rows)
+            })
+            .await;
+        let requested = match exit.expect("drive loop") {
+            SessionExit::Switch(id) => id,
+            _ => panic!("confirm must request a session switch"),
+        };
+        let loaded = loaded.expect("the production loop did not finish loading previews");
+        assert!(
+            !loaded.contains("an old"),
+            "target is offscreen before filtering: {loaded}"
+        );
+        right_preview.unwrap_or_else(|| {
+            panic!("the second host's prompt is searchable and rendered:\n{last_right_rows}")
+        });
+        assert!(
+            !loaded.contains("client-only-preview")
+                && !loaded.contains("preview search incomplete"),
+            "{loaded}"
+        );
+        let filtered = filtered
+            .expect("prompt text beyond the rendered prefix must find an initially offscreen row");
+        assert!(!filtered.contains("right-host"), "{filtered}");
+        assert_eq!(requested, target, "confirm preserves the qualified id");
+        let (mut app, _writer, _root) = app_over(&shell).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(requested),
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert_eq!(
+            world.session(),
+            target,
+            "confirm keeps the owning host's routing identity"
+        );
+        drop(world);
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
     /// The selector over a gateway is the merged client directory made
     /// interactive: both hosts' rows and labels draw, the host label filters,
     /// and confirming a row on the other host carries its opaque id through the
@@ -30249,7 +30596,7 @@ mod tests {
         let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         focus_overlay(&mut app, &root);
-        let parked_local_scan = shell.borrow().take_session_scan().is_some();
+        let parked_preview_scan = shell.borrow().take_session_scan().is_some();
         let opened = top_overlay_rows(&shell).join("\n");
         assert!(
             opened.contains("left-session") && opened.contains("right-session"),
@@ -30260,8 +30607,8 @@ mod tests {
             "each row carries its joined host label: {opened}",
         );
         assert!(
-            !parked_local_scan,
-            "a connected selector does not engage SessionFill or the local store",
+            parked_preview_scan,
+            "a connected selector requests previews for the merged rows",
         );
 
         type_text(&mut app, &mut writer, &target_host_label).await;

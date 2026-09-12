@@ -7,9 +7,8 @@
 //! first). Esc cancels.
 //!
 //! The scan is off the drive loop: the overlay opens showing a loading
-//! placeholder and the host streams rows in as the scan (run on a
-//! blocking thread) emits per-file batches, so the list fills
-//! progressively rather than blocking on the whole walk. The
+//! placeholder. Local scans publish provisional ranked snapshots while remote
+//! reads return through Control, without blocking input or drawing. The
 //! overlay-local `Ctrl+T` ([`ACTION_HISTORY_TOGGLE_SCOPE`]) flips the
 //! scope between the current workspace and all workspaces, re-parking a
 //! fetch for the host.
@@ -24,8 +23,8 @@ use std::rc::Rc;
 use aj_app::keybindings::{ACTION_HISTORY_TOGGLE_SCOPE, action_shortcut};
 use aj_session::PromptEntry;
 use vaxis::vxfw::{
-    DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectItem,
-    SubSurface, Surface, Widget, WidgetRef, draw_widget, to_widget_ref,
+    DrawContext, Event, EventContext, FilterableSelect, RelativePoint, SelectItem, SubSurface,
+    Surface, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
 use crate::keymap::action_matches;
@@ -34,10 +33,6 @@ use crate::overlay::{
     confirm_key_label,
 };
 use crate::settings_ui::push_window;
-
-/// Cap on how many prompts a scope retains. Generous enough to cover any
-/// realistic history while bounding the scan and the in-memory list.
-pub(crate) const MAX_ENTRIES: usize = 2000;
 
 /// How much of a prompt's first line the row label shows.
 const LABEL_MAX_CHARS: usize = 120;
@@ -55,6 +50,8 @@ pub(crate) enum HistoryScope {
 pub(crate) struct HistoryFetch {
     pub(crate) scope: HistoryScope,
     pub(crate) select: Rc<RefCell<FilterableSelect>>,
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
+    pub(crate) subtitle: Rc<RefCell<String>>,
 }
 
 /// The prompt-history widget: a [`FilterableSelect`] plus the scope and
@@ -62,24 +59,30 @@ pub(crate) struct HistoryFetch {
 pub(crate) struct PromptHistoryView {
     select: Rc<RefCell<FilterableSelect>>,
     scope: HistoryScope,
-    /// The window frame, kept so a scope toggle can refresh its dynamic
-    /// subtitle. `None` until wired after the push.
-    window: Option<Rc<RefCell<OverlayWindow>>>,
     fetch_slot: Rc<RefCell<Option<HistoryFetch>>>,
+    cancel: RefCell<tokio_util::sync::CancellationToken>,
+    subtitle: Rc<RefCell<String>>,
+}
+
+impl Drop for PromptHistoryView {
+    fn drop(&mut self) {
+        self.cancel.borrow().cancel();
+    }
 }
 
 impl PromptHistoryView {
-    fn set_window(&mut self, window: Rc<RefCell<OverlayWindow>>) {
-        self.window = Some(window);
-    }
-
     /// Park a scan request for the current scope and show the loading
     /// placeholder until it lands.
     fn request_scan(&self) {
+        self.cancel.borrow().cancel();
+        *self.cancel.borrow_mut() = tokio_util::sync::CancellationToken::new();
+        *self.subtitle.borrow_mut() = subtitle(self.scope);
         self.select.borrow().set_items(loading_items());
         *self.fetch_slot.borrow_mut() = Some(HistoryFetch {
             scope: self.scope,
             select: Rc::clone(&self.select),
+            cancel: self.cancel.borrow().clone(),
+            subtitle: Rc::clone(&self.subtitle),
         });
     }
 }
@@ -110,9 +113,6 @@ impl Widget for PromptHistoryView {
                 HistoryScope::All => HistoryScope::Workspace,
             };
             self.request_scan();
-            if let Some(window) = &self.window {
-                window.borrow_mut().subtitle = subtitle(self.scope);
-            }
             ctx.consume_and_redraw();
         }
         // Everything else (Enter/Esc/nav/typing) falls through to the
@@ -225,8 +225,9 @@ pub(crate) fn open_prompt_history(
     let view = Rc::new(RefCell::new(PromptHistoryView {
         select: Rc::clone(&select),
         scope,
-        window: None,
         fetch_slot: Rc::clone(fetch_slot),
+        cancel: RefCell::new(tokio_util::sync::CancellationToken::new()),
+        subtitle: Rc::new(RefCell::new(subtitle(scope))),
     }));
     let window = push_window(
         stack,
@@ -237,7 +238,7 @@ pub(crate) fn open_prompt_history(
         focus,
         OverlayPlacement::Large,
     );
-    view.borrow_mut().set_window(window);
+    window.borrow_mut().subtitle_source = Some(Rc::clone(&view.borrow().subtitle));
     // Park the current-workspace scan for the host to run and fill.
     view.borrow().request_scan();
 }
@@ -298,9 +299,12 @@ mod tests {
         let mut view = PromptHistoryView {
             select: Rc::clone(&select),
             scope: HistoryScope::Workspace,
-            window: None,
             fetch_slot: Rc::clone(&fetch_slot),
+            cancel: RefCell::new(tokio_util::sync::CancellationToken::new()),
+            subtitle: Rc::new(RefCell::new(subtitle(HistoryScope::Workspace))),
         };
+        view.request_scan();
+        let initial = fetch_slot.borrow_mut().take().unwrap().cancel;
         let ctrl_t = Event::KeyPress(Key {
             codepoint: u32::from('t'),
             mods: Modifiers::CTRL,
@@ -310,6 +314,10 @@ mod tests {
         ctx.phase = Phase::Capturing;
         view.capture_event(&mut ctx, &ctrl_t);
         assert_eq!(view.scope, HistoryScope::All);
+        assert!(
+            initial.is_cancelled(),
+            "scope changes cancel the previous read"
+        );
         let fetch = fetch_slot.borrow();
         assert!(
             matches!(
@@ -323,6 +331,9 @@ mod tests {
         );
         // The list shows the loading placeholder while the scan runs.
         assert_eq!(select.borrow().visible_labels(), vec!["Loading\u{2026}"]);
+        let current = fetch.as_ref().unwrap().cancel.clone();
+        drop(view);
+        assert!(current.is_cancelled(), "closing the view cancels its read");
     }
 
     /// The loading placeholder is inert on confirm: its empty filter key

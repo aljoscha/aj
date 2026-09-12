@@ -18,8 +18,16 @@ use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
+mod session_preview;
+pub use session_preview::{SessionPreview, SessionPreviews};
+
 mod session_info;
 pub use session_info::{SessionInfo, UsageBucket};
+
+mod prompt_history;
+pub use prompt_history::{
+    HistoryPrompt, PROMPT_HISTORY_CAPABILITY, PROMPT_HISTORY_LIMIT, PromptHistory,
+};
 
 /// The current remote-control protocol version.
 pub const PROTOCOL_VERSION: u32 = 3;
@@ -41,6 +49,16 @@ pub const SESSION_ENV_CAPABILITY: &str = "session_env";
 
 /// The capability for `GET /v1/sessions/{id}/info` session facts.
 pub const SESSION_INFO_CAPABILITY: &str = "session_info";
+
+/// The capability for `GET /v1/previews?session=…` batched log previews.
+pub const SESSION_PREVIEWS_CAPABILITY: &str = "session_previews";
+
+/// One host a fan-out read could not include, named for the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostFailure {
+    pub host: String,
+    pub message: String,
+}
 
 /// The capability for reading and selecting provider-local session accounts.
 pub const SESSION_ACCOUNTS_CAPABILITY: &str = "session_accounts";

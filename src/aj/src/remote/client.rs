@@ -60,7 +60,7 @@ pub(crate) enum RemoteError {
     #[error("invalid base url {url:?}: {reason}")]
     InvalidUrl { url: String, reason: String },
     #[error("could not reach the host: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(#[source] reqwest::Error),
     /// The host refused. `code` is the protocol's stable token when the body
     /// carried one, which is what a caller branches on.
     ///
@@ -89,6 +89,14 @@ pub(crate) enum RemoteError {
         "the host speaks protocol {found}, this build speaks {expected}: upgrade the older side"
     )]
     Protocol { found: u32, expected: u32 },
+}
+
+impl From<reqwest::Error> for RemoteError {
+    fn from(error: reqwest::Error) -> Self {
+        // Transport failures reach UI notices and gateway responses. The URL
+        // may carry credentials, while its removal retains the failure kind.
+        Self::Transport(error.without_url())
+    }
 }
 
 impl RemoteError {
@@ -209,8 +217,7 @@ impl RemoteClient {
         }
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(RemoteError::Transport)?;
+            .build()?;
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             http,
@@ -295,6 +302,42 @@ impl RemoteClient {
             }
         }
         let response = self.http.get(url).timeout(REQUEST_TIMEOUT).send().await?;
+        decode(refusal(response).await?).await
+    }
+
+    pub(crate) async fn session_previews(
+        &self,
+        sessions: &[String],
+    ) -> Result<aj_wire::SessionPreviews, RemoteError> {
+        let query: Vec<(&str, &str)> = sessions.iter().map(|id| ("session", id.as_str())).collect();
+        // Like prompt history, leave room for a gateway's bounded upstream reads
+        // to return partial results before this client gives up.
+        let response = self
+            .http
+            .get(format!("{}/v1/previews", self.base))
+            .query(&query)
+            .timeout(REQUEST_TIMEOUT * 2)
+            .send()
+            .await?;
+        decode(refusal(response).await?).await
+    }
+
+    pub(crate) async fn prompt_history(
+        &self,
+        session: Option<&str>,
+    ) -> Result<aj_wire::PromptHistory, RemoteError> {
+        let path = match session {
+            Some(session) => format!("/v1/sessions/{session}/prompt-history"),
+            None => "/v1/prompt-history".to_string(),
+        };
+        // Leave room for a gateway's bounded parallel reads to return partial
+        // results before this client gives up on the entire response.
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .timeout(REQUEST_TIMEOUT * 2)
+            .send()
+            .await?;
         decode(refusal(response).await?).await
     }
 

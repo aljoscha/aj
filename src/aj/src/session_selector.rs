@@ -5,16 +5,13 @@
 //! the overlay. The frontend treats the current session as a no-op unless
 //! retrying a refused attachment. Esc cancels without a request.
 //!
-//! A local selector fills progressively from a preview scan run off the drive
-//! loop. A selector over a connection is built synchronously from the merged
-//! directory snapshot the client already holds and never reads the client's
-//! local session store. The active session is pre-selected and tagged
-//! `(current)` in both modes.
+//! Every selector opens synchronously over a directory snapshot, then enriches
+//! its rows with host previews. The active session is pre-selected and marked
+//! with the sidebar's focus marker before any previews arrive.
 //!
-//! A local row's filter key is
-//! `"{first_user_message} {tag} {session_id}"`. A connected row's is
-//! `"{tag} {session_id} {host_label}"`. A `#`-prefixed query narrows either
-//! source to tags alone. The confirmed value is the session id, recovered
+//! Each row's filter key contains the full first prompt, tag, session id, and
+//! host label when supplied by the directory. A `#`-prefixed query narrows
+//! to tags alone. The confirmed value is the session id, recovered
 //! through a shared filter-key -> id map (the same indirection the command
 //! palette uses for its actions), since the widget hands the confirm callback
 //! only the row's filter key.
@@ -23,12 +20,12 @@
 //! overlay's own toggle ([`ACTION_SESSION_TOGGLE_ARCHIVED`]) puts the rest
 //! back inline, marked. A picker is where hiding them earns its keep, so the
 //! toggle belongs to this overlay rather than to whatever the strip is
-//! showing. Each source retains every row it has received, revealed or not, so
+//! showing. The source retains every preview it has received, revealed or not, so
 //! toggling never starts another read.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use aj_app::keybindings::{ACTION_SESSION_TOGGLE_ARCHIVED, action_shortcut};
 use aj_app::session::SessionRequest;
@@ -36,19 +33,21 @@ use aj_session::SessionPreview;
 use aj_wire::{DirectoryHost, SessionSummary};
 use chrono::{DateTime, Datelike, Utc};
 use vaxis::vxfw::{
-    DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectItem,
-    SubSurface, Surface, Widget, draw_widget, to_widget_ref,
+    DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectColumn,
+    SelectItem, SubSurface, Surface, TextAlign, Widget, draw_widget, to_widget_ref,
 };
 
 use crate::interactive::OverlayHandles;
 use crate::keymap::action_matches;
-use crate::overlay::{OverlayPlacement, close_all, close_key_label, close_top, confirm_key_label};
+use crate::overlay::{
+    OverlayPlacement, OverlayStack, close_all, close_key_label, close_top, confirm_key_label,
+};
 use crate::settings_ui::push_window;
-use crate::sidebar::{host_label, session_label, session_label_source};
+use crate::sidebar::{FOCUS_MARKER, host_label, session_label, session_label_source};
 use crate::text::one_line;
 
-/// How much source text a row's primary column shows.
-const PRIMARY_MAX_CHARS: usize = 60;
+/// Maximum length of an id-derived fallback label.
+const FALLBACK_LABEL_MAX_CHARS: usize = 60;
 
 /// How wide the tag column may get before truncating with an ellipsis. A tag
 /// can be 80 bytes, and the column is sized to the widest one on show, so
@@ -61,50 +60,51 @@ const TAG_COLUMN_MAX_CHARS: usize = 16;
 const TAG_SCOPE_SIGIL: char = '#';
 
 /// A parked request for the host to scan session previews and fill the
-/// selector's list. The select handle is `!Send`, so it stays on the host
-/// side; the spawned scan produces only the (Send) previews.
+/// selector's list. The select handle is `!Send`, so it stays on the UI
+/// thread. The spawned scan produces only the (Send) previews.
 pub(crate) struct SessionScan {
     pub(crate) select: Rc<RefCell<FilterableSelect>>,
-    /// The active session id, for the `(current)` tag and pre-selection.
+    /// The active session id, for its leading marker and pre-selection.
     current: String,
-    /// filter_key -> session_id, filled by [`extend_session_scan`] and read
+    /// filter_key -> session_id, indexed on open and preview updates, and read
     /// by the confirm callback (which sees only the row's filter key).
     ids: Rc<RefCell<HashMap<String, String>>>,
     /// Every preview delivered so far, archived ones included, shared with
     /// the widget so its toggle can rebuild the rows without rescanning.
-    seen: Rc<RefCell<Vec<SessionPreview>>>,
+    rows: SelectorRows,
     /// Whether archived sessions are being shown, flipped by the widget's
     /// toggle and read here so a batch arriving after it lands filters the
     /// same way.
     reveal: Rc<Cell<bool>>,
+    window: Option<Rc<RefCell<OverlayWindow>>>,
 }
 
 impl SessionScan {
-    /// The filter key of the currently highlighted row, or `None` while the
-    /// filtered set is empty. The host compares this across batches to tell
-    /// whether the user has moved the selection off where the chase last
-    /// parked it, so a late batch can stop chasing rather than yank the
-    /// cursor.
-    pub(crate) fn selected_filter_key(&self) -> Option<String> {
-        self.select.borrow().selected().map(|item| item.filter_key)
+    pub(crate) fn is_open(&self, stack: &OverlayStack) -> bool {
+        stack
+            .top()
+            .is_some_and(|overlay| Rc::ptr_eq(&overlay.focus, &self.select.borrow().focus_target()))
+    }
+
+    pub(crate) fn finish(&self, failed: bool) {
+        if let Some(window) = &self.window {
+            window.borrow_mut().title = if failed {
+                "Resume session · preview search incomplete"
+            } else {
+                "Resume session"
+            }
+            .to_string();
+        }
     }
 }
 
-/// The single loading placeholder shown until the scan lands. Its empty
-/// filter key is absent from the id map, so a confirm on it is inert.
-fn loading_items() -> Vec<SelectItem> {
-    vec![SelectItem::new("Loading\u{2026}", "")]
-}
-
 /// Rows the shared selector widget can rebuild when its archived toggle
-/// changes. Local rows accumulate behind a scan. Connected rows are an owned
-/// snapshot of the client's already-merged directory.
-enum SelectorRows {
-    Local(Rc<RefCell<Vec<SessionPreview>>>),
-    Connected {
-        rows: Vec<SessionSummary>,
-        hosts: Vec<DirectoryHost>,
-    },
+/// changes. The directory owns membership, order, tags, and archive state.
+#[derive(Clone)]
+struct SelectorRows {
+    rows: Vec<SessionSummary>,
+    hosts: Vec<DirectoryHost>,
+    previews: Rc<RefCell<Vec<SessionPreview>>>,
 }
 
 impl SelectorRows {
@@ -115,99 +115,63 @@ impl SelectorRows {
         reveal: bool,
         now: DateTime<Utc>,
     ) -> Vec<SelectItem> {
-        match self {
-            SelectorRows::Local(seen) => build_items(ids, &seen.borrow(), current, reveal, now),
-            SelectorRows::Connected { rows, hosts } => {
-                build_connected_items(ids, rows, hosts, current, reveal, now)
-            }
-        }
+        build_items(
+            ids,
+            &self.rows,
+            &self.hosts,
+            &self.previews.borrow(),
+            current,
+            reveal,
+            now,
+        )
     }
 }
 
-struct OpenedSelector {
-    select: Rc<RefCell<FilterableSelect>>,
-    ids: Rc<RefCell<HashMap<String, String>>>,
-    reveal: Rc<Cell<bool>>,
-}
-
-/// Open the session selector, showing a loading placeholder and parking a
-/// scan for the host in `handles.session_scan`. Any confirmed session row
+/// Open over a directory snapshot and park a preview scan in
+/// `handles.session_scan`. Basic rows remain selectable while previews load
+/// or when a host cannot supply them. Reopening refreshes both the directory
+/// snapshot and previews. Any confirmed session row
 /// lands a [`SessionRequest::Resume`] in `handles.session_request` and closes
 /// the overlay. Esc closes without a request. Does not move focus: the caller
 /// posts the refocus event.
 ///
 /// A switch is never refused for being busy. The session left behind stays
 /// attached and keeps folding, so its turn finishes unwatched.
-pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    let opened = push_session_selector(
-        handles,
-        current.clone(),
-        SelectorRows::Local(Rc::clone(&seen)),
-    );
-    *handles.session_scan.borrow_mut() = Some(SessionScan {
-        select: opened.select,
-        current,
-        ids: opened.ids,
-        seen,
-        reveal: opened.reveal,
-    });
-}
-
-/// Open the selector over one snapshot of a connected client's merged
-/// directory. All rows are present immediately and no local preview scan is
-/// parked. Reopening is the refresh operation for this picker.
-pub(crate) fn open_connected_session_selector(
+pub(crate) fn open_session_selector(
     handles: &OverlayHandles,
     current: String,
     rows: &[SessionSummary],
     hosts: &[DirectoryHost],
 ) {
-    push_session_selector(
-        handles,
-        current,
-        SelectorRows::Connected {
-            rows: rows.to_vec(),
-            hosts: hosts.to_vec(),
-        },
-    );
-}
-
-/// Push the one selector widget over either row source, sharing confirm,
-/// cancel, filtering, archived reveal, and overlay behavior by construction.
-fn push_session_selector(
-    handles: &OverlayHandles,
-    current: String,
-    rows: SelectorRows,
-) -> OpenedSelector {
+    let rows = SelectorRows {
+        rows: rows.to_vec(),
+        hosts: hosts.to_vec(),
+        previews: Rc::new(RefCell::new(Vec::new())),
+    };
     let ids: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
     let reveal = Rc::new(Cell::new(false));
-    let initial = match &rows {
-        SelectorRows::Local(_) => loading_items(),
-        SelectorRows::Connected { .. } => rows.items(&ids, &current, reveal.get(), Utc::now()),
-    };
+    let initial = rows.items(&ids, &current, reveal.get(), Utc::now());
     let select = Rc::new(RefCell::new(FilterableSelect::new(
         initial,
         handles.chrome.select.clone(),
     )));
-    if matches!(&rows, SelectorRows::Connected { .. }) {
-        select.borrow().select_matching(|item| {
-            ids.borrow().get(&item.filter_key).map(String::as_str) == Some(current.as_str())
-        });
-    }
+    select.borrow().select_matching(|item| {
+        ids.borrow().get(&item.filter_key).map(String::as_str) == Some(current.as_str())
+    });
     let focus = select.borrow().focus_target();
     {
         let mut sel = select.borrow_mut();
         // A project can hold many sessions, so show the vertical scroll bar.
         sel.set_show_scrollbar(true);
         sel.set_scope_sigil(TAG_SCOPE_SIGIL);
+        // Keep enough of the prompt to recognize a session, even when metadata
+        // needs clipping in a narrow overlay or beside a long host name.
+        sel.set_label_reserve(24);
         let ids_c = Rc::clone(&ids);
         let request_c = Rc::clone(&handles.session_request);
         let stack_c = Rc::clone(&handles.stack);
         let editor_c = Rc::clone(&handles.editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
-            // The loading placeholder (and any row not yet in the map) has
-            // no session to resume, so leave the overlay open.
             let Some(session_id) = ids_c.borrow().get(&item.filter_key).cloned() else {
                 return;
             };
@@ -228,7 +192,7 @@ fn push_session_selector(
     let selector = Rc::new(RefCell::new(SessionSelector {
         select: Rc::clone(&select),
         ids: Rc::clone(&ids),
-        rows,
+        rows: rows.clone(),
         reveal: Rc::clone(&reveal),
         current: current.clone(),
         window: None,
@@ -236,18 +200,21 @@ fn push_session_selector(
     let window = push_window(
         &handles.stack,
         &handles.chrome,
-        "Resume session",
+        "Resume session · loading previews",
         subtitle(false),
         to_widget_ref(Rc::clone(&selector)),
         focus,
         OverlayPlacement::Large,
     );
-    selector.borrow_mut().window = Some(window);
-    OpenedSelector {
+    selector.borrow_mut().window = Some(Rc::downgrade(&window));
+    *handles.session_scan.borrow_mut() = Some(SessionScan {
         select,
+        current,
         ids,
+        rows,
         reveal,
-    }
+        window: Some(window),
+    });
 }
 
 /// The selector widget: the list, and what the archived toggle needs to
@@ -263,15 +230,16 @@ pub(crate) struct SessionSelector {
     reveal: Rc<Cell<bool>>,
     current: String,
     /// The window frame, for the subtitle the toggle rewrites. `None` until
-    /// the push that creates it returns.
-    window: Option<Rc<RefCell<OverlayWindow>>>,
+    /// the push that creates it returns. The frame owns this widget, so the
+    /// back-reference must not retain it and its previews after closing.
+    window: Option<Weak<RefCell<OverlayWindow>>>,
 }
 
 impl SessionSelector {
     /// Rebuild the rows for the current setting of the toggle, keeping the
     /// highlight on the row it was on when that row survives.
     ///
-    /// From the retained source rows, so revealing starts no read. A local
+    /// From the retained source rows, so revealing starts no read. A preview
     /// batch still to arrive fills in behind this through
     /// [`extend_session_scan`], which reads the same flag.
     fn rebuild(&self, now: DateTime<Utc>) {
@@ -286,7 +254,7 @@ impl SessionSelector {
                 select.select_matching(|item| item.filter_key == key);
             }
         }
-        if let Some(window) = &self.window {
+        if let Some(window) = self.window.as_ref().and_then(Weak::upgrade) {
             window.borrow_mut().subtitle = subtitle(self.reveal.get());
         }
     }
@@ -323,103 +291,79 @@ impl Widget for SessionSelector {
     }
 }
 
-/// Append a streamed batch of previews to the selector's list: build one
-/// row per preview (newest-first, as scanned), record the filter-key -> id
-/// map for confirm, and optionally pre-select the active session's row.
-///
-/// `first` replaces the loading placeholder with this batch (the initial
-/// fill), later batches append in place keeping the cursor and scroll.
-/// `chase_current` asks to pre-select the active session's row this batch.
-/// Returns whether that row was found and selected, so the host can stop
-/// chasing once it lands. Deciding when the chase should give up (e.g. the
-/// user has started navigating) is the host's call, not this function's.
+/// Enrich directory rows in place, preserving the selected row and scroll.
+/// Retain hidden previews too, so archive reveal never requests another read.
 pub(crate) fn extend_session_scan(
     scan: &SessionScan,
     previews: &[SessionPreview],
     now: DateTime<Utc>,
-    first: bool,
-    chase_current: bool,
-) -> bool {
-    scan.seen.borrow_mut().extend_from_slice(previews);
-    let items = build_items(&scan.ids, previews, &scan.current, scan.reveal.get(), now);
-    if first {
-        scan.select.borrow().set_items(items);
-    } else {
-        scan.select.borrow().extend_items(items);
+) {
+    scan.rows.previews.borrow_mut().extend_from_slice(previews);
+    let select = scan.select.borrow();
+    for preview in previews {
+        let Some((index, row)) = scan
+            .rows
+            .rows
+            .iter()
+            .filter(|row| shown(row, &scan.current, scan.reveal.get()))
+            .enumerate()
+            .find(|(_, row)| row.id == preview.session_id)
+        else {
+            continue;
+        };
+        // Membership and order belong to the snapshot. Updating by source
+        // index also keeps a highlighted row anchored when its search key changes.
+        let item = build_item(row, &scan.rows.hosts, Some(preview), &scan.current, now);
+        scan.ids
+            .borrow_mut()
+            .insert(item.filter_key.clone(), row.id.clone());
+        select.update_item(index, item);
     }
-    if !chase_current {
-        return false;
-    }
-    // Pre-select the active session's row wherever it landed. The confirm
-    // map resolves each row's filter key back to its id.
-    let ids = Rc::clone(&scan.ids);
-    let current = scan.current.clone();
-    scan.select
-        .borrow()
-        .select_matching(|item| ids.borrow().get(&item.filter_key) == Some(&current))
 }
 
-/// Build the rows for `previews`, dropping the archived ones unless `reveal`,
-/// and record each row's filter key against its session id for confirm.
-///
-/// The session the user is in stays listed whatever its bit says, which is the
-/// sidebar's exemption for the row it draws as focused: archiving the session
-/// you are working in leaves it in front of you, and it goes when you leave.
-///
-/// The map keeps the rows a filter dropped: it is the only way back from a
-/// filter key to a session, and a row revealed later must resolve without
-/// having been rebuilt. It is never read for a row that is not on show, since
-/// only a highlighted row can be confirmed.
+/// Build selector rows from the client-side directory snapshot. The directory
+/// supplies fallback rows until previews arrive. Prompt text enriches both
+/// the label and the search corpus without changing the routing identity.
 fn build_items(
     ids: &Rc<RefCell<HashMap<String, String>>>,
+    rows: &[SessionSummary],
+    hosts: &[DirectoryHost],
     previews: &[SessionPreview],
     current: &str,
     reveal: bool,
     now: DateTime<Utc>,
 ) -> Vec<SelectItem> {
-    let mut ids = ids.borrow_mut();
-    previews
+    let previews: HashMap<_, _> = previews
         .iter()
-        .filter(|preview| reveal || !preview.archived || preview.session_id == current)
-        .map(|preview| {
-            let item = build_item(preview, preview.session_id == current, now);
-            ids.insert(item.filter_key.clone(), preview.session_id.clone());
-            item
-        })
-        .collect()
-    // The map borrow ends with this function, before the select is touched:
-    // the confirm callback fires from the widget's own dispatch and reads it.
-}
-
-/// Build selector rows from the client-side directory snapshot. The directory
-/// has no preview or message-count fields, so the id-derived label is primary
-/// and the host, state, and activity age form the description.
-fn build_connected_items(
-    ids: &Rc<RefCell<HashMap<String, String>>>,
-    rows: &[SessionSummary],
-    hosts: &[DirectoryHost],
-    current: &str,
-    reveal: bool,
-    now: DateTime<Utc>,
-) -> Vec<SelectItem> {
+        .map(|p| (p.session_id.as_str(), p))
+        .collect();
     let mut ids = ids.borrow_mut();
+    ids.clear();
     rows.iter()
-        .filter(|row| reveal || !row.archived || row.id == current)
+        .filter(|row| shown(row, current, reveal))
         .map(|row| {
-            let item = build_connected_item(row, hosts, row.id == current, now);
+            let preview = previews.get(row.id.as_str()).copied();
+            let item = build_item(row, hosts, preview, current, now);
             ids.insert(item.filter_key.clone(), row.id.clone());
             item
         })
         .collect()
 }
 
-/// Build one row from the fields an enumeration is allowed to carry. The
-/// complete id remains the confirm value and filter corpus even when its host
-/// qualifier is removed for display.
-fn build_connected_item(
+/// Whether a directory row is listed. Archived rows hide unless revealed, and
+/// the session the user is in stays listed whatever its bit says.
+fn shown(row: &SessionSummary, current: &str, reveal: bool) -> bool {
+    reveal || !row.archived || row.id == current
+}
+
+/// Build one row from the fields an enumeration is allowed to carry, plus the
+/// preview once its host has answered. The complete id remains the confirm
+/// value and filter corpus even when its host qualifier is removed for display.
+fn build_item(
     row: &SessionSummary,
     hosts: &[DirectoryHost],
-    is_current: bool,
+    preview: Option<&SessionPreview>,
+    current: &str,
     now: DateTime<Utc>,
 ) -> SelectItem {
     let tag = row.tag.as_deref().map(one_line);
@@ -431,27 +375,32 @@ fn build_connected_item(
             .unwrap_or(id);
         one_line(label)
     });
-    let label = session_label(
-        session_label_source(&row.id, row.host.as_deref()),
-        PRIMARY_MAX_CHARS,
-    );
-    let primary = if is_current {
-        format!("{label} (current)")
-    } else {
-        label
+    let label = match preview {
+        Some(preview) => format_primary(preview),
+        None => session_label(
+            session_label_source(&row.id, row.host.as_deref()),
+            FALLBACK_LABEL_MAX_CHARS,
+        ),
     };
     let tag_key = tag.as_deref().unwrap_or("");
     let host_key = host.as_deref().unwrap_or("");
-    let item = SelectItem::new(primary, format!("{tag_key} {} {host_key}", row.id))
-        .with_description(format_connected_secondary(row, host.as_deref(), now));
-    decorate_tag(item, tag)
+    let mut filter_key = format!("{tag_key} {} {host_key}", row.id);
+    if let Some(prompt) = preview.and_then(|preview| preview.first_user_message.as_deref()) {
+        filter_key = format!("{prompt} {filter_key}");
+    }
+    // The directory snapshot owns archive state, not a preview read racing
+    // an archive command.
+    let item = SelectItem::new(label, filter_key)
+        .with_columns(session_columns(row, host.as_deref(), preview, now))
+        .with_strikethrough(row.archived);
+    decorate_row(item, tag, row.id == current)
 }
 
-/// The connected row's textual state. Unreachable and working keep the
+/// The row's textual state. Unreachable and working keep the
 /// sidebar's priority, then this surface distinguishes a live session from a
 /// cold idle one. The sidebar's remaining state is unseen output instead, so
 /// its [`crate::sidebar::RowStatus`] is not this formatter's vocabulary.
-fn connected_state(row: &SessionSummary) -> &'static str {
+fn session_state(row: &SessionSummary) -> &'static str {
     if row.unreachable {
         "unreachable"
     } else if row.working {
@@ -463,63 +412,44 @@ fn connected_state(row: &SessionSummary) -> &'static str {
     }
 }
 
-fn format_connected_secondary(
+fn session_columns(
     row: &SessionSummary,
     host: Option<&str>,
+    preview: Option<&SessionPreview>,
     now: DateTime<Utc>,
-) -> String {
-    let mut facts = Vec::with_capacity(3);
-    if let Some(host) = host {
-        facts.push(host.to_string());
-    }
-    facts.push(connected_state(row).to_string());
-    facts.push(format!("last {}", format_age(now, row.last_activity)));
-    let line = facts.join(" · ");
-    if row.archived {
-        format!("archived · {line}")
-    } else {
-        line
-    }
+) -> Vec<SelectColumn> {
+    // Empty host fields reserve no space when every row is local or direct,
+    // but keep metadata aligned if a directory row has no host label.
+    let mut columns = vec![
+        SelectColumn::new(host.unwrap_or("")),
+        SelectColumn::new(session_state(row)),
+    ];
+    columns.extend(match preview {
+        Some(preview) => log_columns(preview, now),
+        None => vec![
+            SelectColumn::new("").with_gap_after(1),
+            SelectColumn::new(""),
+            SelectColumn::new(""),
+            SelectColumn::new(format!("last {}", format_age(now, row.last_activity))),
+        ],
+    });
+    columns
 }
 
-/// Build one row: the truncated first user message (tagged `(current)` for
-/// the active session) as the label, the session's own label as a column
-/// beside it, the metadata triplet as the dim description, and
-/// `"{first_user_message} {tag} {session_id}"` as the filter key so the
-/// prompt, the label, or the id all match.
-///
-/// The tag is the row's scope key too, so a `#`-prefixed query matches labels
-/// and nothing else. It is folded to one line before any of that: it comes
-/// from a file that may have been hand-edited, and a lone carriage return in a
-/// drawn row is a panic in the frame (see [`one_line`]). Folding once here is
-/// what keeps the drawn column and the text the filter matches identical.
-fn build_item(preview: &SessionPreview, is_current: bool, now: DateTime<Utc>) -> SelectItem {
-    let tag = preview.tag.as_deref().map(one_line);
-    let item = SelectItem::new(
-        format_primary(preview, is_current),
-        haystack(preview, tag.as_deref()),
-    )
-    .with_description(format_secondary(preview, now));
-    decorate_tag(item, tag)
-}
-
-/// Give either row source the same tag column, truncation, and `#` scope key.
-fn decorate_tag(item: SelectItem, tag: Option<String>) -> SelectItem {
+/// Give each row its current marker and scoped tag column. Tags are folded to
+/// one line before display and filtering so stored control characters cannot
+/// reach the terminal, and the scoped query matches the displayed text.
+fn decorate_row(item: SelectItem, tag: Option<String>, is_current: bool) -> SelectItem {
+    let mut item = item;
+    if is_current {
+        item = item.with_marker(FOCUS_MARKER.chars().next().expect("focus marker"));
+    }
     match tag {
         Some(tag) => item
             .with_prefix(truncate_chars(&tag, TAG_COLUMN_MAX_CHARS))
             .with_scope_key(tag),
         None => item,
     }
-}
-
-/// Searchable text for a preview: the first user message (when present), the
-/// user's tag, and the session id, so a substring of any of them finds the
-/// row.
-fn haystack(preview: &SessionPreview, tag: Option<&str>) -> String {
-    let first = preview.first_user_message.as_deref().unwrap_or("");
-    let tag = tag.unwrap_or("");
-    format!("{first} {tag} {}", preview.session_id)
 }
 
 /// The footer. Enter and Esc are the widget's built-in keys (not rebindable
@@ -537,45 +467,34 @@ fn subtitle(reveal: bool) -> String {
     format!("{confirm} to resume  \u{2022}  {toggle} {offer} archived  \u{2022}  {close} to close")
 }
 
-/// The primary (left) column: the first user message, truncated, with a
-/// `(current)` suffix on the active session's row. Falls back to a
-/// placeholder when the session has no user message yet.
-///
-/// The message is a whole prompt, so only its first line is shown, and that
-/// line is folded like every other value drawn here (see [`one_line`]).
-fn format_primary(preview: &SessionPreview, is_current: bool) -> String {
+/// The trailing preview shows the first prompt line. The row widget clips it
+/// to the space left after metadata. Search retains the entire prompt.
+fn format_primary(preview: &SessionPreview) -> String {
     let raw = preview
         .first_user_message
         .as_deref()
         .unwrap_or("(no user message yet)");
-    let first_line = one_line(raw.lines().next().unwrap_or(raw));
-    let truncated = truncate_chars(&first_line, PRIMARY_MAX_CHARS);
-    if is_current {
-        format!("{truncated} (current)")
-    } else {
-        truncated
-    }
+    one_line(raw.lines().next().unwrap_or(raw))
 }
 
-/// The secondary (right / description) column: message count, creation date,
-/// and time since the last message, e.g. `42 msgs · created May 8 · last 5m`.
-/// The session id is omitted (it's already the row's value and would dominate
-/// the column width), and the tag has a column of its own.
-fn format_secondary(preview: &SessionPreview, now: DateTime<Utc>) -> String {
-    let count = preview.message_count;
-    let msg_word = if count == 1 { "msg" } else { "msgs" };
-    let created = format_created(now, preview.created_at);
-    let last = format_age(now, preview.last_message_at);
-    let line = format!("{count} {msg_word} · created {created} · last {last}");
-    // Leading this column rather than the label's: being archived is a fact
-    // about the session, like its age and its size, and the label column is
-    // the user's own words. It also keeps clear of the `(current)` suffix,
-    // which answers a different question and can be on the same row.
-    if preview.archived {
-        format!("archived · {line}")
-    } else {
-        line
-    }
+/// Inline labels stay beside their values. Counts and units occupy separate
+/// cells so the numbers align even when the unit is singular.
+fn log_columns(preview: &SessionPreview, now: DateTime<Utc>) -> Vec<SelectColumn> {
+    vec![
+        SelectColumn::new(preview.message_count.to_string())
+            .with_alignment(TextAlign::Right)
+            .with_gap_after(1),
+        SelectColumn::new(if preview.message_count == 1 {
+            "msg"
+        } else {
+            "msgs"
+        }),
+        SelectColumn::new(format!(
+            "created {}",
+            format_created(now, preview.created_at)
+        )),
+        SelectColumn::new(format!("last {}", format_age(now, preview.last_message_at))),
+    ]
 }
 
 /// Render `then` as a coarse age relative to `now`: `now / 5m / 3h / 2d /
@@ -636,7 +555,6 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
 mod tests {
     use aj_wire::QueueCounts;
     use chrono::Duration;
-    use vaxis::vxfw::SelectStyles;
 
     use super::*;
 
@@ -661,7 +579,7 @@ mod tests {
         }
     }
 
-    fn connected_row(
+    fn directory_row(
         id: &str,
         tag: Option<&str>,
         host: Option<&str>,
@@ -692,15 +610,42 @@ mod tests {
         }
     }
 
+    /// Matching directory and preview fixtures, without reading a session store.
+    fn snapshot(previews: &[SessionPreview]) -> Vec<SessionSummary> {
+        previews
+            .iter()
+            .map(|preview| SessionSummary {
+                archived: preview.archived,
+                last_activity: preview.last_message_at,
+                ..directory_row(
+                    &preview.session_id,
+                    preview.tag.as_deref(),
+                    None,
+                    Duration::zero(),
+                )
+            })
+            .collect()
+    }
+
+    fn preview_item(preview: &SessionPreview, is_current: bool, now: DateTime<Utc>) -> SelectItem {
+        let rows = snapshot(std::slice::from_ref(preview));
+        let current = if is_current {
+            preview.session_id.as_str()
+        } else {
+            ""
+        };
+        build_item(&rows[0], &[], Some(preview), current, now)
+    }
+
     fn scan_over(previews: Vec<SessionPreview>, current: &str) -> (SessionScan, OverlayHandles) {
         let handles = OverlayHandles::for_tests();
-        open_session_selector(&handles, current.to_string());
+        open_session_selector(&handles, current.to_string(), &snapshot(&previews), &[]);
         let scan = handles
             .session_scan
             .borrow_mut()
             .take()
             .expect("open parked a scan");
-        extend_session_scan(&scan, &previews, Utc::now(), true, true);
+        extend_session_scan(&scan, &previews, Utc::now());
         (scan, handles)
     }
 
@@ -712,21 +657,30 @@ mod tests {
             17,
             Duration::hours(3),
         );
-        let current = build_item(&tagged(p.clone(), "fix-auth"), true, Utc::now());
+        let current = preview_item(&tagged(p.clone(), "fix-auth"), true, Utc::now());
         assert!(current.label.contains("debug the streaming protocol"));
-        assert!(current.label.ends_with("(current)"), "{}", current.label);
+        assert_eq!(current.marker, Some('▌'));
         // The filter key carries the prompt, the label, and the id.
         assert!(current.filter_key.contains("debug the streaming protocol"));
         assert!(current.filter_key.contains("fix-auth"));
         assert!(current.filter_key.contains("2025-05-09"));
 
-        let other = build_item(&p, false, Utc::now());
-        assert!(!other.label.contains("(current)"), "{}", other.label);
+        let other = preview_item(&p, false, Utc::now());
+        assert_eq!(other.marker, None);
         assert!(
             !other.filter_key.contains("fix-auth"),
             "an untagged row indexes no label: {}",
             other.filter_key,
         );
+    }
+
+    fn metadata_text(item: &SelectItem) -> String {
+        item.columns
+            .iter()
+            .map(|column| column.text.as_str())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// The tag supplements the row rather than displacing anything: it takes a
@@ -741,28 +695,22 @@ mod tests {
             42,
             Duration::hours(2),
         );
-        let item = build_item(&tagged(p.clone(), "fix-auth"), false, Utc::now());
+        let item = preview_item(&tagged(p.clone(), "fix-auth"), false, Utc::now());
         assert_eq!(item.prefix.as_deref(), Some("fix-auth"));
         assert_eq!(item.label, "debug the protocol");
         assert_eq!(item.scope_key.as_deref(), Some("fix-auth"));
-        assert!(
-            item.description
-                .as_deref()
-                .is_some_and(|d| d.starts_with("42 msgs · created ")),
-            "the metadata column is the metadata: {:?}",
-            item.description,
-        );
+        assert!(metadata_text(&item).starts_with("idle 42 msgs created "));
 
-        let untagged = build_item(&p, false, Utc::now());
+        let untagged = preview_item(&p, false, Utc::now());
         assert_eq!(untagged.prefix, None);
         assert_eq!(untagged.scope_key, None);
-        assert_eq!(untagged.description, item.description);
+        assert_eq!(metadata_text(&untagged), metadata_text(&item));
     }
 
     #[test]
-    fn a_connected_row_uses_the_directory_label_host_and_state() {
+    fn a_directory_row_uses_the_directory_label_host_and_state() {
         let now = Utc::now();
-        let mut row = connected_row(
+        let mut row = directory_row(
             "host-a:2025-05-09-14-30-00-000",
             Some("fix-auth"),
             Some("host-a"),
@@ -779,23 +727,21 @@ mod tests {
             unreachable: false,
         }];
 
-        let item = build_connected_item(&row, &hosts, true, now);
+        let item = build_item(&row, &hosts, None, &row.id, now);
 
         assert_eq!(item.prefix.as_deref(), Some("fix-auth"));
         assert_eq!(item.scope_key.as_deref(), Some("fix-auth"));
-        assert_eq!(item.label, "14-30-00 (current)");
-        assert_eq!(
-            item.description.as_deref(),
-            Some("Studio Left · working · last 2h"),
-        );
+        assert_eq!(item.label, "14-30-00");
+        assert_eq!(item.marker, Some('▌'));
+        assert_eq!(metadata_text(&item), "Studio Left working last 2h",);
         assert!(item.filter_key.contains("fix-auth"));
         assert!(item.filter_key.contains("host-a:2025-05-09-14-30-00-000"));
         assert!(item.filter_key.contains("Studio Left"));
     }
 
     #[test]
-    fn connected_state_precedence_keeps_live_distinct_from_idle() {
-        let base = connected_row("session", None, None, Duration::minutes(1));
+    fn session_state_precedence_keeps_live_distinct_from_idle() {
+        let base = directory_row("session", None, None, Duration::minutes(1));
         for (row, expected) in [
             (
                 SessionSummary {
@@ -823,74 +769,292 @@ mod tests {
             ),
             (base, "idle"),
         ] {
-            assert_eq!(connected_state(&row), expected);
+            assert_eq!(session_state(&row), expected);
         }
     }
 
     #[test]
-    fn connected_archived_rows_share_the_local_reveal_and_current_exemption() {
+    fn archived_rows_obey_reveal_and_current_exemption() {
         let now = Utc::now();
-        let mut current = connected_row("current", None, None, Duration::minutes(1));
+        let mut current = directory_row("current", None, None, Duration::minutes(1));
         current.archived = true;
         current.last_activity = now - Duration::minutes(1);
-        let mut other = connected_row("other", None, None, Duration::minutes(2));
+        let mut other = directory_row("other", None, None, Duration::minutes(2));
         other.archived = true;
         other.last_activity = now - Duration::minutes(2);
         let ids = Rc::new(RefCell::new(HashMap::new()));
-        let rows = SelectorRows::Connected {
+        let rows = SelectorRows {
             rows: vec![current, other],
             hosts: Vec::new(),
+            previews: Rc::new(RefCell::new(Vec::new())),
         };
 
         let hidden = rows.items(&ids, "current", false, now);
         assert_eq!(hidden.len(), 1);
-        assert_eq!(hidden[0].label, "current (current)");
+        assert_eq!(hidden[0].label, "current");
+        assert_eq!(hidden[0].marker, Some('▌'));
         assert_eq!(
-            hidden[0].description.as_deref(),
-            Some("archived · idle · last 1m"),
+            metadata_text(&hidden[0]),
+            "idle last 1m",
             "a plain-host row omits the host part",
         );
 
         let shown = rows.items(&ids, "current", true, now);
         assert_eq!(shown.len(), 2);
-        assert!(shown.iter().all(|item| {
-            item.description
-                .as_deref()
-                .is_some_and(|description| description.starts_with("archived · idle · last "))
-        }));
+        assert!(
+            shown
+                .iter()
+                .all(|item| metadata_text(item).starts_with("idle last "))
+        );
     }
 
     #[test]
-    fn a_connected_snapshot_preselects_the_current_row_without_a_scan() {
+    fn a_snapshot_preselects_before_previews_arrive() {
         let handles = OverlayHandles::for_tests();
-        let opened = push_session_selector(
+        open_session_selector(
             &handles,
             "current".to_string(),
-            SelectorRows::Connected {
-                rows: vec![
-                    connected_row("other", None, None, Duration::minutes(1)),
-                    connected_row("current", None, None, Duration::minutes(2)),
-                ],
-                hosts: Vec::new(),
-            },
+            &[
+                directory_row("other", None, None, Duration::minutes(1)),
+                directory_row("current", None, None, Duration::minutes(2)),
+            ],
+            &[],
         );
-
-        let selected = opened
+        let scan = handles
+            .session_scan
+            .borrow_mut()
+            .take()
+            .expect("preview scan parked");
+        let selected = scan
             .select
             .borrow()
             .selected()
-            .expect("the current row is selected");
+            .map(|item| item.filter_key)
+            .expect("current selected");
         assert_eq!(
-            opened
-                .ids
+            scan.ids.borrow().get(&selected).map(String::as_str),
+            Some("current")
+        );
+        assert!(scan.is_open(&handles.stack.borrow()));
+        extend_session_scan(
+            &scan,
+            &[preview(
+                "current",
+                Some("current prompt"),
+                2,
+                Duration::minutes(2),
+            )],
+            Utc::now(),
+        );
+        let selected = scan
+            .select
+            .borrow()
+            .selected()
+            .map(|item| item.filter_key)
+            .expect("current still selected");
+        assert_eq!(
+            scan.ids.borrow().get(&selected).map(String::as_str),
+            Some("current")
+        );
+        assert!(selected.contains("current prompt"));
+        assert_eq!(
+            scan.select.borrow().visible_labels().len(),
+            2,
+            "unread rows remain usable"
+        );
+        scan.finish(true);
+        let drawn = drawn_rows(&handles).join("\n");
+        assert!(drawn.contains("preview search incomplete"), "{drawn}");
+        scan.finish(false);
+        assert_eq!(
+            scan.window.as_ref().unwrap().borrow().title,
+            "Resume session"
+        );
+        if let Some(cancel) = scan.select.borrow_mut().on_cancel.as_mut() {
+            cancel(&mut EventContext::new());
+        }
+        assert!(!scan.is_open(&handles.stack.borrow()));
+        assert!(handles.session_request.borrow().is_none());
+    }
+
+    /// Previews land one at a time behind an already usable list. Each arrival
+    /// fills in its own row and leaves the highlight on the row the user put it
+    /// on, including when that row is the one being filled in.
+    #[test]
+    fn arriving_previews_fill_rows_in_place_and_keep_the_highlight() {
+        let handles = OverlayHandles::for_tests();
+        let rows: Vec<_> = (0..40)
+            .map(|i| directory_row(&format!("s{i:02}"), None, None, Duration::minutes(i)))
+            .collect();
+        open_session_selector(&handles, "s00".to_string(), &rows, &[]);
+        let scan = handles
+            .session_scan
+            .borrow_mut()
+            .take()
+            .expect("preview scan parked");
+        drawn_rows(&handles);
+        assert!(
+            scan.select
                 .borrow()
-                .get(&selected.filter_key)
-                .map(String::as_str),
-            Some("current"),
+                .select_matching(|item| item.filter_key.contains("s33"))
+        );
+        let before = drawn_rows(&handles);
+        let anchor = before
+            .iter()
+            .position(|row| row.contains("s32"))
+            .expect("an unchanged row is visible beside the selection");
+        for i in [33i64, 5, 31] {
+            extend_session_scan(
+                &scan,
+                &[preview(
+                    &format!("s{i:02}"),
+                    Some(&format!("prompt {i}")),
+                    1,
+                    Duration::minutes(i),
+                )],
+                Utc::now(),
+            );
+            let selected = scan
+                .select
+                .borrow()
+                .selected()
+                .map(|item| item.filter_key)
+                .expect("highlight present");
+            assert_eq!(
+                scan.ids.borrow().get(&selected).map(String::as_str),
+                Some("s33"),
+                "arrival of s{i:02} moved the highlight"
+            );
+            assert_eq!(
+                drawn_rows(&handles)
+                    .iter()
+                    .position(|row| row.contains("s32")),
+                Some(anchor),
+                "arrival of s{i:02} scrolled the viewport"
+            );
+        }
+        assert!(
+            scan.select
+                .borrow()
+                .selected()
+                .map(|item| item.filter_key)
+                .is_some_and(|key| key.contains("prompt 33"))
+        );
+        let labels = scan.select.borrow().visible_labels();
+        assert_eq!(labels.len(), 40);
+        assert_eq!(labels[5], "prompt 5");
+        assert_eq!(labels[31], "prompt 31");
+        assert_eq!(labels[32], "s32", "unread rows keep their fallback label");
+    }
+
+    #[test]
+    fn archive_toggle_retains_previews_and_directory_authority_across_batches() {
+        use vaxis::key::{Key, Modifiers};
+
+        let handles = OverlayHandles::for_tests();
+        let rows = [
+            directory_row("current", Some("directory-tag"), None, Duration::minutes(1)),
+            SessionSummary {
+                archived: true,
+                ..directory_row("hidden", None, None, Duration::hours(1))
+            },
+            SessionSummary {
+                archived: true,
+                ..directory_row("pending", None, None, Duration::hours(2))
+            },
+        ];
+        open_session_selector(&handles, "current".to_string(), &rows, &[]);
+        let scan = handles.session_scan.borrow_mut().take().expect("scan");
+        let widget = Rc::clone(&scan.window.as_ref().unwrap().borrow().child);
+        let toggle = || {
+            let key = Key {
+                codepoint: u32::from('t'),
+                mods: Modifiers::CTRL,
+                ..Key::default()
+            };
+            assert!(action_matches(&key, ACTION_SESSION_TOGGLE_ARCHIVED));
+            widget
+                .borrow_mut()
+                .capture_event(&mut EventContext::new(), &Event::KeyPress(key));
+        };
+        extend_session_scan(
+            &scan,
+            &[
+                put_away(tagged(
+                    preview("current", Some("current prompt"), 1, Duration::minutes(1)),
+                    "stale-tag",
+                )),
+                preview("hidden", Some("hidden prompt"), 2, Duration::hours(1)),
+                preview(
+                    "outside-snapshot",
+                    Some("must not appear"),
+                    1,
+                    Duration::zero(),
+                ),
+            ],
+            Utc::now(),
+        );
+        assert_eq!(scan.select.borrow().visible_labels(), ["current prompt"]);
+        let current = scan.select.borrow().selected().expect("current selected");
+        assert_eq!(current.scope_key.as_deref(), Some("directory-tag"));
+        assert!(!current.strikethrough);
+        assert!(!current.filter_key.contains("stale-tag"));
+
+        toggle();
+        assert_eq!(
+            scan.select.borrow().visible_labels(),
+            ["current prompt", "hidden prompt", "pending"]
+        );
+        extend_session_scan(
+            &scan,
+            &[preview(
+                "pending",
+                Some("pending prompt"),
+                3,
+                Duration::hours(2),
+            )],
+            Utc::now(),
+        );
+        assert_eq!(
+            scan.select.borrow().visible_labels(),
+            ["current prompt", "hidden prompt", "pending prompt"]
+        );
+        toggle();
+        extend_session_scan(
+            &scan,
+            &[preview(
+                "hidden",
+                Some("enriched hidden prompt"),
+                4,
+                Duration::hours(1),
+            )],
+            Utc::now(),
+        );
+        assert_eq!(scan.select.borrow().visible_labels(), ["current prompt"]);
+        toggle();
+        assert_eq!(
+            scan.select.borrow().visible_labels(),
+            ["current prompt", "enriched hidden prompt", "pending prompt"]
+        );
+        assert_eq!(
+            scan.select.borrow().selected().unwrap().filter_key,
+            current.filter_key
         );
         assert!(
-            handles.session_scan.borrow().is_none(),
-            "a synchronous directory snapshot parks no local scan",
+            scan.select
+                .borrow()
+                .select_matching(|item| item.label == "enriched hidden prompt")
+        );
+        let picked = scan.select.borrow().selected().unwrap();
+        assert!(
+            picked.strikethrough,
+            "archive state comes from the directory"
+        );
+        if let Some(confirm) = scan.select.borrow_mut().on_confirm.as_mut() {
+            confirm(&mut EventContext::new(), &picked);
+        }
+        assert!(
+            matches!(handles.session_request.borrow().as_ref(), Some(SessionRequest::Resume(id)) if id == "hidden")
         );
     }
 
@@ -903,7 +1067,7 @@ mod tests {
             preview("2025-05-09", Some("prompt"), 1, Duration::hours(1)),
             long,
         );
-        let item = build_item(&p, false, Utc::now());
+        let item = preview_item(&p, false, Utc::now());
         let column = item.prefix.expect("a tagged row has the column");
         assert_eq!(column.chars().count(), TAG_COLUMN_MAX_CHARS);
         assert!(column.ends_with('\u{2026}'), "{column}");
@@ -970,7 +1134,12 @@ mod tests {
         let handles = OverlayHandles::for_tests();
         handles.busy.set(busy);
 
-        open_session_selector(&handles, "current".to_string());
+        open_session_selector(
+            &handles,
+            "current".to_string(),
+            &[directory_row("other", None, None, Duration::hours(1))],
+            &[],
+        );
         let scan = handles
             .session_scan
             .borrow_mut()
@@ -982,7 +1151,7 @@ mod tests {
             1,
             Duration::hours(1),
         )];
-        extend_session_scan(&scan, &previews, Utc::now(), true, true);
+        extend_session_scan(&scan, &previews, Utc::now());
         scan.select
             .borrow()
             .select_matching(|item| item.filter_key.contains("other"));
@@ -1031,99 +1200,6 @@ mod tests {
         );
     }
 
-    /// Batches accumulate across a streamed fill: the first replaces the
-    /// loading placeholder, later batches append, and the current-session
-    /// chase lands the highlight once its row streams in.
-    #[test]
-    fn streaming_appends_batches_and_chases_current_across_them() {
-        let select = Rc::new(RefCell::new(FilterableSelect::new(
-            loading_items(),
-            SelectStyles::default(),
-        )));
-        let ids = Rc::new(RefCell::new(HashMap::new()));
-        let scan = SessionScan {
-            select,
-            current: "2025-05-08".to_string(),
-            ids,
-            seen: Rc::new(RefCell::new(Vec::new())),
-            reveal: Rc::new(Cell::new(false)),
-        };
-
-        // First batch: two newer sessions, no current row. Replaces the
-        // placeholder and lands the cursor on the first row.
-        let batch1 = vec![
-            preview("2025-05-10", Some("newest"), 1, Duration::minutes(1)),
-            preview("2025-05-09", Some("second"), 1, Duration::hours(1)),
-        ];
-        let found = extend_session_scan(&scan, &batch1, Utc::now(), true, true);
-        assert!(!found, "current is not in the first batch");
-        assert_eq!(scan.select.borrow().visible_labels().len(), 2);
-        assert!(
-            scan.selected_filter_key().unwrap().contains("2025-05-10"),
-            "cursor on the first streamed row"
-        );
-
-        // Second batch carries the current session; the chase selects it.
-        let batch2 = vec![preview(
-            "2025-05-08",
-            Some("current one"),
-            1,
-            Duration::hours(2),
-        )];
-        let found = extend_session_scan(&scan, &batch2, Utc::now(), false, true);
-        assert!(found, "current row found and selected in the second batch");
-        assert_eq!(
-            scan.select.borrow().visible_labels().len(),
-            3,
-            "rows accumulated across batches"
-        );
-        assert!(scan.selected_filter_key().unwrap().contains("2025-05-08"));
-    }
-
-    /// With the chase disabled (the host saw the user navigate), a later
-    /// batch carrying the current session does not move the selection.
-    #[test]
-    fn streaming_without_chase_keeps_the_user_selection() {
-        let select = Rc::new(RefCell::new(FilterableSelect::new(
-            loading_items(),
-            SelectStyles::default(),
-        )));
-        let ids = Rc::new(RefCell::new(HashMap::new()));
-        let scan = SessionScan {
-            select,
-            current: "2025-05-08".to_string(),
-            ids,
-            seen: Rc::new(RefCell::new(Vec::new())),
-            reveal: Rc::new(Cell::new(false)),
-        };
-
-        let batch1 = vec![
-            preview("2025-05-10", Some("newest"), 1, Duration::minutes(1)),
-            preview("2025-05-09", Some("second"), 1, Duration::hours(1)),
-        ];
-        extend_session_scan(&scan, &batch1, Utc::now(), true, true);
-        // The user navigates to the second row.
-        scan.select
-            .borrow()
-            .select_matching(|item| item.filter_key.contains("2025-05-09"));
-        let anchor = scan.selected_filter_key();
-
-        // Current streams in, but the chase is off, so the selection stays.
-        let batch2 = vec![preview(
-            "2025-05-08",
-            Some("current one"),
-            1,
-            Duration::hours(2),
-        )];
-        let found = extend_session_scan(&scan, &batch2, Utc::now(), false, false);
-        assert!(!found, "chase disabled reports no selection change");
-        assert_eq!(
-            scan.selected_filter_key(),
-            anchor,
-            "the user's selection stayed put"
-        );
-    }
-
     #[test]
     fn format_age_uses_expected_buckets() {
         let now = Utc::now();
@@ -1137,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn secondary_column_carries_count_created_and_last() {
+    fn inline_metadata_carries_count_created_and_last() {
         let now = chrono::NaiveDate::from_ymd_opt(2025, 5, 11)
             .unwrap()
             .and_hms_opt(20, 0, 0)
@@ -1159,12 +1235,12 @@ mod tests {
             archived: false,
         };
         assert_eq!(
-            format_secondary(&p, now),
-            "42 msgs · created 13:22 · last 2h"
+            metadata_text(&preview_item(&p, false, now)),
+            "idle 42 msgs created 13:22 last 2h"
         );
         assert_eq!(
-            format_secondary(&tagged(p, "fix-auth"), now),
-            "42 msgs · created 13:22 · last 2h",
+            metadata_text(&preview_item(&tagged(p, "fix-auth"), false, now)),
+            "idle 42 msgs created 13:22 last 2h",
             "the label has a column of its own and does not lead this one",
         );
     }
@@ -1182,7 +1258,7 @@ mod tests {
             preview("2025-05-09-14-30-00", Some("debug"), 42, Duration::hours(2)),
             "ab\rcd",
         );
-        let item = build_item(&p, false, Utc::now());
+        let item = preview_item(&p, false, Utc::now());
         assert_eq!(item.prefix.as_deref(), Some("abcd"));
         assert_eq!(item.scope_key.as_deref(), Some("abcd"));
         assert!(!item.filter_key.contains('\r'), "{}", item.filter_key);
@@ -1193,60 +1269,314 @@ mod tests {
     }
 
     #[test]
-    fn long_preview_truncates_with_ellipsis() {
-        let long = "a".repeat(200);
-        let p = preview("2025-05-11", Some(&long), 1, Duration::seconds(10));
-        let primary = format_primary(&p, false);
-        assert!(primary.ends_with('\u{2026}'), "{primary}");
-        assert_eq!(primary.chars().count(), PRIMARY_MAX_CHARS);
+    fn current_marker_uses_the_sidebar_accent_in_each_theme() {
+        use crate::transcript::vaxis_color;
+        use aj_app::theme::{ColorMode, Theme, ThemeColor};
+
+        for theme in [
+            Theme::bundled_dark_with_mode(ColorMode::Truecolor),
+            Theme::bundled_light_with_mode(ColorMode::Truecolor),
+        ] {
+            let accent = vaxis_color(theme.fg_color(ThemeColor::Accent), theme.color_mode());
+            let muted = vaxis_color(theme.fg_color(ThemeColor::Muted), theme.color_mode());
+            assert_ne!(
+                accent, muted,
+                "the fixture distinguishes marker and tag colors"
+            );
+            let mut handles = OverlayHandles::for_tests();
+            handles.chrome = crate::overlay::OverlayChrome::from_theme(&theme);
+            open_session_selector(
+                &handles,
+                "current".to_string(),
+                &[directory_row("current", None, None, Duration::hours(1))],
+                &[],
+            );
+            let scan = handles.session_scan.borrow_mut().take().expect("scan");
+            extend_session_scan(
+                &scan,
+                &[preview("current", Some("prompt"), 1, Duration::hours(1))],
+                Utc::now(),
+            );
+            let window = Rc::clone(&handles.stack.borrow().top().expect("open").widget);
+            let surface = window
+                .borrow_mut()
+                .draw(&crate::test_support::draw_ctx(100, Some(20)));
+            let cells = crate::test_support::flatten(&surface);
+            let marker = cells
+                .iter()
+                .flatten()
+                .find(|cell| cell.char.grapheme() == FOCUS_MARKER)
+                .expect("current marker drew");
+            assert_eq!(marker.style.fg, accent);
+        }
     }
 
-    /// A store holding one tagged session: an empty log under a valid id, the
-    /// state a session is in before its first prompt, plus its tag sidecar.
-    /// The `TempDir` guard is returned so the store outlives the caller's use
-    /// of it.
-    fn tagged_store(
-        tag: &str,
-    ) -> (
-        tempfile::TempDir,
-        aj_session::ConversationPersistence,
-        String,
-    ) {
-        let dir = tempfile::TempDir::with_prefix("aj-selector-tag-").expect("temp dir");
-        let persistence = aj_session::ConversationPersistence::new(dir.path().to_path_buf());
-        let id = "2025-05-09-14-30-00-000".to_string();
-        std::fs::write(dir.path().join(format!("{id}.jsonl")), "").expect("session log");
-        persistence.write_tag(&id, Some(tag)).expect("tag sidecar");
-        (dir, persistence, id)
-    }
-
-    /// The selector's rows carry the labels its own scan read, so a tagged
-    /// session shows its tag even though nothing has enumerated it into the
-    /// directory the sidebar draws.
     #[test]
-    fn a_tag_the_directory_never_saw_still_reaches_the_selector() {
-        let (_dir, persistence, id) = tagged_store("held-elsewhere");
-        let mut previews = Vec::new();
-        persistence.list_session_previews_streaming(&|| false, &mut |batch| {
-            previews.extend(batch);
-        });
-        assert_eq!(previews.len(), 1, "the store scan found the session");
-        assert_eq!(previews[0].session_id, id);
+    fn metadata_and_current_marker_survive_a_long_trailing_preview() {
+        for host in [None, Some("long-lab")] {
+            let handles = OverlayHandles::for_tests();
+            let text = format!("{}search-tail", "preview-start ".repeat(30));
+            let previews = vec![
+                tagged(
+                    preview("current", Some(&text), 42, Duration::hours(2)),
+                    "alpha",
+                ),
+                tagged(
+                    preview("other", Some("other prompt"), 1, Duration::hours(1)),
+                    "b",
+                ),
+            ];
+            let rows = [
+                SessionSummary {
+                    working: true,
+                    ..directory_row("current", Some("alpha"), host, Duration::hours(2))
+                },
+                directory_row("other", Some("b"), host, Duration::hours(1)),
+                directory_row("pending", None, host, Duration::minutes(1)),
+            ];
+            open_session_selector(&handles, "current".to_string(), &rows, &[]);
+            let scan = handles.session_scan.borrow_mut().take().expect("scan");
+            extend_session_scan(&scan, &previews, Utc::now());
+            assert!(
+                scan.select
+                    .borrow()
+                    .select_matching(|item| item.filter_key.contains("other"))
+            );
+            for width in [100, 120] {
+                let window = Rc::clone(&handles.stack.borrow().top().expect("open").widget);
+                let surface = window
+                    .borrow_mut()
+                    .draw(&crate::test_support::draw_ctx(width, Some(20)));
+                let rows = crate::test_support::rows(&surface);
+                let current = rows
+                    .iter()
+                    .find(|line| line.contains("alpha"))
+                    .expect("current row");
+                assert!(
+                    current.contains('▌'),
+                    "the current marker does not follow selection: {current}"
+                );
+                assert!(!current.contains("(current)"), "{current}");
+                for metadata in ["working", "42", "msgs", "created", "last 2h"] {
+                    assert!(
+                        current.find(metadata).expect("metadata visible")
+                            < current
+                                .find("preview-start")
+                                .expect("preview follows metadata"),
+                        "{current}"
+                    );
+                }
+                assert!(
+                    current.contains('…') && !current.contains("search-tail"),
+                    "only the preview tail clips: {current}"
+                );
+                let other = rows
+                    .iter()
+                    .find(|line| line.contains("other prompt"))
+                    .expect("selected other row");
+                assert!(
+                    !other.contains('▌'),
+                    "selection must not gain the current marker: {other}"
+                );
+                assert!(current.contains("42 msgs"), "{current}");
+                assert!(other.contains("1 msg "), "{other}");
+                assert!(!current.contains('·') && !other.contains('·'));
+                let column = |line: &str, text: &str| {
+                    line[..line.find(text).expect("field visible")]
+                        .chars()
+                        .count()
+                };
+                for field in ["msg", "created", "last", "preview-start"] {
+                    let other_field = if field == "preview-start" {
+                        "other prompt"
+                    } else {
+                        field
+                    };
+                    assert_eq!(
+                        column(current, field),
+                        column(other, other_field),
+                        "{current}\n{other}"
+                    );
+                }
+                assert_eq!(
+                    column(current, "42") + 2,
+                    column(other, "1") + 1,
+                    "counts right-align"
+                );
+            }
+        }
+    }
 
-        let handles = OverlayHandles::for_tests();
-        open_session_selector(&handles, "another-session".to_string());
-        let scan = handles
-            .session_scan
-            .borrow_mut()
-            .take()
-            .expect("open parked a scan");
-        extend_session_scan(&scan, &previews, Utc::now(), true, true);
+    #[test]
+    fn browser_budgets_metadata_for_prompts_on_resize_without_clipping_search() {
+        use vaxis::key::Key;
+        use vaxis::vxfw::{Event, EventContext, Phase};
 
-        let drawn = drawn_rows(&handles).join("\n");
-        assert!(
-            drawn.contains("held-elsewhere"),
-            "the drawn row carries the label the scan read: {drawn}",
-        );
+        let long_host = format!("{}host-needle", "h".repeat(69));
+        assert_eq!(long_host.len(), 80);
+        let unicode_host = "界e\u{301}".repeat(13);
+        for (mode, host) in [
+            ("local", None),
+            ("direct", None),
+            ("gateway", Some("lab")),
+            ("gateway", Some(long_host.as_str())),
+            ("gateway", Some(unicode_host.as_str())),
+        ] {
+            let handles = OverlayHandles::for_tests();
+            let prompt = "recognize this session and its long first line\nprompt-needle";
+            let mut previews = [
+                tagged(
+                    preview("current", Some(prompt), 123456, Duration::hours(2)),
+                    "tag",
+                ),
+                preview(
+                    "other",
+                    Some("another session prompt"),
+                    1,
+                    Duration::hours(1),
+                ),
+            ];
+            previews[0].created_at = Utc::now() - Duration::days(800);
+            let host_id = host.map(|_| "host-a");
+            let hosts = if mode == "local" {
+                Vec::new()
+            } else {
+                vec![DirectoryHost {
+                    id: host_id.map(str::to_string),
+                    address: Some("https://direct.example".to_string()),
+                    name: Some(
+                        host.unwrap_or("direct host must not be a column")
+                            .to_string(),
+                    ),
+                    working_directory: None,
+                    unreachable: false,
+                }]
+            };
+            let rows = [
+                SessionSummary {
+                    unreachable: true,
+                    ..directory_row("current", Some("tag"), host_id, Duration::hours(2))
+                },
+                directory_row("other", None, host.map(|_| "host-b"), Duration::hours(1)),
+            ];
+            open_session_selector(&handles, "current".to_string(), &rows, &hosts);
+            let scan = handles.session_scan.borrow_mut().take().expect("scan");
+            extend_session_scan(&scan, &previews, Utc::now());
+            let window = Rc::clone(&handles.stack.borrow().top().expect("open").widget);
+            let draw = |width| {
+                let (_, size) =
+                    OverlayPlacement::Large.resolve(vaxis::vxfw::Size { width, height: 24 });
+                let surface = window.borrow_mut().draw(&crate::test_support::draw_ctx(
+                    size.width,
+                    Some(size.height),
+                ));
+                crate::test_support::flatten(&surface)
+            };
+            let mut wide = None;
+            for width in [160, 100, 80, 64, 48, 160] {
+                let cells = draw(width);
+                let row = cells
+                    .iter()
+                    .find(|row| row.iter().any(|cell| cell.char.grapheme() == "▌"))
+                    .expect("the current row draws");
+                let text: String = row.iter().map(|cell| cell.char.grapheme()).collect();
+                assert!(
+                    text.contains("recognize this"),
+                    "mode={mode}, host={host:?}, width={width}: {text}"
+                );
+                assert!(
+                    !text.contains("direct host"),
+                    "direct connections need no host column: {text}"
+                );
+                let metadata = &text[..text.find("recognize").unwrap()];
+                // At very narrow widths even a short tag shares the clipping
+                // budget. Metadata still precedes a recognizable prompt.
+                if width == 48 {
+                    assert!(
+                        metadata
+                            .split('▌')
+                            .nth(1)
+                            .unwrap()
+                            .trim_start()
+                            .starts_with('t'),
+                        "tag remains identifiable: {text}"
+                    );
+                } else {
+                    assert!(metadata.contains("tag"), "{text}");
+                }
+                assert!(
+                    !text.contains("prompt-needle"),
+                    "search tail is not rendered"
+                );
+                // The host needs four cells to show both graphemes and an
+                // ellipsis. Narrower layouts may clip it to the wide glyph.
+                if host.is_some_and(|host| host.starts_with('界')) && width >= 80 {
+                    assert!(
+                        row.iter()
+                            .any(|cell| cell.char.grapheme() == "界" && cell.char.width == 2),
+                        "{text}"
+                    );
+                    assert!(
+                        row.iter()
+                            .any(|cell| cell.char.grapheme() == "e\u{301}" && cell.char.width == 1),
+                        "{text}"
+                    );
+                }
+                if width == 160 {
+                    for field in ["unreachable", "123456 msgs", "created", "last 2h"] {
+                        assert!(metadata.contains(field), "{text}");
+                    }
+                    if let Some(wide) = &wide {
+                        assert_eq!(&text, wide, "expanding restores the original layout");
+                    } else {
+                        wide = Some(text);
+                    }
+                }
+            }
+
+            // Query the clipped host suffix and the undisplayed second prompt
+            // line through the actual overlay's focus, not a shortened row key.
+            let queries = if host == Some(long_host.as_str()) {
+                vec!["host-needle", "prompt-needle"]
+            } else {
+                vec!["prompt-needle"]
+            };
+            let focus = Rc::clone(&handles.stack.borrow().top().expect("open").focus);
+            for query in queries {
+                let query_len = scan.select.borrow().query().chars().count();
+                for _ in 0..query_len {
+                    let mut ctx = EventContext::new();
+                    ctx.phase = Phase::AtTarget;
+                    focus.borrow_mut().handle_event(
+                        &mut ctx,
+                        &Event::KeyPress(Key {
+                            codepoint: Key::BACKSPACE,
+                            ..Key::default()
+                        }),
+                    );
+                }
+                for c in query.chars() {
+                    let mut ctx = EventContext::new();
+                    ctx.phase = Phase::AtTarget;
+                    focus.borrow_mut().handle_event(
+                        &mut ctx,
+                        &Event::KeyPress(Key {
+                            codepoint: u32::from(c),
+                            text: Some(c.to_string().into()),
+                            ..Key::default()
+                        }),
+                    );
+                }
+                assert_eq!(scan.select.borrow().visible_labels().len(), 1);
+                let text: String = draw(64)
+                    .iter()
+                    .flatten()
+                    .map(|cell| cell.char.grapheme())
+                    .collect();
+                assert!(text.contains("recognize this"), "{text}");
+                assert!(!text.contains("another session"), "{text}");
+            }
+        }
     }
 
     /// The composed overlay's drawn rows: the window the stack holds, drawn
@@ -1300,13 +1630,13 @@ mod tests {
         use vaxis::vxfw::{Event, EventContext, Phase};
 
         let handles = OverlayHandles::for_tests();
-        open_session_selector(&handles, "current".to_string());
+        open_session_selector(&handles, "current".to_string(), &snapshot(previews), &[]);
         let scan = handles
             .session_scan
             .borrow_mut()
             .take()
             .expect("open parked a scan");
-        extend_session_scan(&scan, previews, Utc::now(), true, true);
+        extend_session_scan(&scan, previews, Utc::now());
 
         let focus = Rc::clone(&handles.stack.borrow().top().expect("open").focus);
         for c in query.chars() {
@@ -1328,6 +1658,53 @@ mod tests {
         // Bound to a name so the `Ref` is released before `scan` drops.
         let labels = scan.select.borrow().visible_labels();
         labels
+    }
+
+    #[test]
+    fn preview_updates_refilter_the_full_prompt_and_keep_the_selected_identity() {
+        let (handles, scan) = selector_over(
+            &[
+                preview("first", Some("not a match"), 1, Duration::minutes(1)),
+                preview("second", Some("needle selected"), 1, Duration::hours(1)),
+            ],
+            "needle",
+        );
+        assert_eq!(scan.select.borrow().visible_labels(), ["needle selected"]);
+        extend_session_scan(
+            &scan,
+            &[
+                preview("first", Some("needle"), 2, Duration::minutes(1)),
+                preview(
+                    "second",
+                    Some("recognizable prompt\nneedle"),
+                    2,
+                    Duration::hours(1),
+                ),
+            ],
+            Utc::now(),
+        );
+        assert_eq!(scan.select.borrow().query(), "needle");
+        let labels = scan.select.borrow().visible_labels();
+        assert_eq!(labels.len(), 2);
+        assert!(labels.iter().any(|label| label == "recognizable prompt"));
+        let picked = scan
+            .select
+            .borrow()
+            .selected()
+            .expect("selection survives enrichment");
+        assert_eq!(
+            scan.ids
+                .borrow()
+                .get(&picked.filter_key)
+                .map(String::as_str),
+            Some("second")
+        );
+        if let Some(confirm) = scan.select.borrow_mut().on_confirm.as_mut() {
+            confirm(&mut EventContext::new(), &picked);
+        }
+        assert!(
+            matches!(handles.session_request.borrow().as_ref(), Some(SessionRequest::Resume(id)) if id == "second")
+        );
     }
 
     /// The tag joins the corpus the plain query already searched, so an id, a
@@ -1426,7 +1803,10 @@ mod tests {
         let preview_at = row.find("refactor the parser").expect("checked above");
         assert!(tag_at < preview_at, "tag column left of the preview: {row}");
         assert!(
-            row.contains("3 msgs · created "),
+            row.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("3 msgs created "),
             "and the metadata column is still there: {row}",
         );
 
@@ -1453,10 +1833,18 @@ mod tests {
     /// The rows for `previews`, as the overlay builds them.
     fn rows_for(previews: &[SessionPreview], current: &str, reveal: bool) -> Vec<String> {
         let ids = Rc::new(RefCell::new(HashMap::new()));
-        build_items(&ids, previews, current, reveal, Utc::now())
-            .into_iter()
-            .map(|item| item.label)
-            .collect()
+        build_items(
+            &ids,
+            &snapshot(previews),
+            &[],
+            previews,
+            current,
+            reveal,
+            Utc::now(),
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect()
     }
 
     /// Archived sessions are out of the list until the toggle asks for them,
@@ -1507,84 +1895,68 @@ mod tests {
         ];
         assert_eq!(
             rows_for(&previews, "current", false),
-            vec!["what I am in (current)"],
+            vec!["what I am in"],
             "the session on screen dropped out from under the user",
         );
     }
 
-    /// A revealed row says it is archived, in the column that carries the rest
-    /// of the session's facts.
     #[test]
-    fn a_revealed_row_is_marked_archived() {
-        // The same session either way, so the only difference between the two
-        // descriptions is what the bit adds.
-        let plain = preview("2025-05-09", Some("done with"), 1, Duration::hours(1));
+    fn archived_rows_strike_all_text_without_changing_layout_or_colors() {
         let now = Utc::now();
-        let described = |preview: &SessionPreview| format_secondary(preview, now);
-        assert!(
-            !described(&plain).contains("archived"),
-            "a session nobody archived is marked as one: {}",
-            described(&plain),
+        let text = format!("saved prompt {}", "x".repeat(200));
+        let base = tagged(
+            preview("session", Some(&text), 42, Duration::hours(1)),
+            "kept",
         );
-        assert_eq!(
-            described(&put_away(plain.clone())),
-            format!("archived · {}", described(&plain)),
-            "the marker displaced the row's own facts, or is not there at all",
-        );
-    }
-
-    /// A batch landing after the toggle filters the way the toggle set: the
-    /// scan is still streaming while the user works the overlay, and rows
-    /// arriving behind a reveal must not come out hidden.
-    #[test]
-    fn a_batch_after_the_toggle_follows_it() {
-        let (_handles, scan) = selector_over(
-            &[preview(
-                "2025-05-10",
-                Some("first"),
-                1,
-                Duration::minutes(1),
-            )],
-            "",
-        );
-        scan.reveal.set(true);
-
-        let later = vec![put_away(preview(
-            "2025-05-07",
-            Some("late and archived"),
-            1,
-            Duration::hours(3),
-        ))];
-        extend_session_scan(&scan, &later, Utc::now(), false, false);
-        assert_eq!(
-            scan.select.borrow().visible_labels(),
-            vec!["first", "late and archived"],
-            "the batch filtered against its own idea of the setting",
-        );
-    }
-
-    /// Every preview stays in the scan, revealed or not, so the toggle answers
-    /// from what has been read rather than walking the store again.
-    #[test]
-    fn the_scan_keeps_the_previews_it_filtered_out() {
-        let (_handles, scan) = selector_over(
-            &[put_away(preview(
-                "2025-05-09",
-                Some("done with"),
-                1,
-                Duration::hours(1),
-            ))],
-            "",
-        );
-        assert!(
-            scan.select.borrow().visible_labels().is_empty(),
-            "the archived row was listed",
-        );
-        assert_eq!(
-            scan.seen.borrow().len(),
-            1,
-            "the filtered row was dropped, so a reveal would have to rescan",
-        );
+        for host in [None, Some("lab")] {
+            let draw = |archived: bool| {
+                let handles = OverlayHandles::for_tests();
+                let mut preview = base.clone();
+                let mut row = directory_row("session", Some("kept"), host, Duration::hours(1));
+                row.archived = archived;
+                // Preview reads may race archive changes. The directory's
+                // bit remains authoritative for every browser.
+                preview.archived = !archived;
+                open_session_selector(&handles, "session".to_string(), &[row], &[]);
+                let scan = handles.session_scan.borrow_mut().take().expect("scan");
+                extend_session_scan(&scan, &[preview], now);
+                let window = Rc::clone(&handles.stack.borrow().top().expect("open").widget);
+                let surface = window
+                    .borrow_mut()
+                    .draw(&crate::test_support::draw_ctx(100, Some(20)));
+                crate::test_support::flatten(&surface)
+                    .into_iter()
+                    .find(|row| {
+                        row.iter()
+                            .map(|cell| cell.char.grapheme())
+                            .collect::<String>()
+                            .contains("saved prompt")
+                    })
+                    .expect("session row drew")
+            };
+            let plain = draw(false);
+            let archived = draw(true);
+            assert_eq!(plain.len(), archived.len());
+            let text: String = archived.iter().map(|cell| cell.char.grapheme()).collect();
+            assert!(
+                text.contains('▌') && text.contains('…'),
+                "marker and clipped preview are exercised: {text}"
+            );
+            assert!(!text.contains("archived"), "no archive column: {text}");
+            for (plain, archived) in plain.iter().zip(&archived) {
+                assert_eq!(
+                    plain.char, archived.char,
+                    "archive state cannot move columns"
+                );
+                assert_eq!(plain.style.fg, archived.style.fg);
+                assert_eq!(plain.style.bg, archived.style.bg);
+                let glyph = archived.char.grapheme();
+                if !glyph.trim().is_empty() && glyph != "│" {
+                    assert!(!plain.style.strikethrough, "normal row: {glyph}");
+                    assert!(archived.style.strikethrough, "archived row: {glyph}");
+                }
+            }
+        }
     }
 
     /// The footer says the chord and what it offers, so the toggle is

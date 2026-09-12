@@ -86,7 +86,7 @@ pub use crate::vxfw::border::{Border, BorderAlignment, BorderLabel};
 pub use crate::vxfw::button::{Button, ButtonStyle};
 pub use crate::vxfw::center::Center;
 pub use crate::vxfw::filterable_select::{
-    FILTER_MARKER, FilterableSelect, SelectItem, SelectStyles,
+    FILTER_MARKER, FilterableSelect, SelectColumn, SelectItem, SelectStyles,
 };
 pub use crate::vxfw::flex_column::FlexColumn;
 pub use crate::vxfw::flex_row::FlexRow;

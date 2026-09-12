@@ -514,6 +514,30 @@ impl ConversationPersistence {
             .map(|metadata| metadata.session_id.clone()))
     }
 
+    /// Read one log without loading or locking its session. A sticky `cancel`
+    /// drops an interrupted read rather than returning partial counts.
+    pub fn session_preview(
+        &self,
+        session_id: &str,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<SessionPreview>, ConversationError> {
+        if !crate::is_valid_session_id(session_id) {
+            return Err(ConversationError::InvalidSessionId(session_id.to_string()));
+        }
+        if cancel() {
+            return Ok(None);
+        }
+        let mut preview =
+            read_session_preview_file(session_id, &self.session_path(session_id), cancel)?;
+        if cancel() {
+            return Ok(None);
+        }
+        // Sidecars have the listing's best-effort semantics.
+        preview.tag = self.read_tag(session_id).ok().flatten();
+        preview.archived = self.read_archived(session_id).unwrap_or(false);
+        Ok(Some(preview))
+    }
+
     /// List sessions with rich per-session previews — first user
     /// message, message count, modified time, file size.
     ///
@@ -1297,6 +1321,28 @@ mod tests {
         view.add_message(user_msg(u)).expect("append user");
         view.add_message(assistant_text(a))
             .expect("append assistant");
+    }
+
+    #[test]
+    fn session_preview_rejects_paths_and_drops_cancelled_reads() {
+        let (_dir, persistence) = fixture();
+        for id in ["../outside", "a/b", ""] {
+            assert!(matches!(
+                persistence.session_preview(id, &|| false),
+                Err(ConversationError::InvalidSessionId(_))
+            ));
+        }
+        let mut log = ConversationLog::create(&persistence).expect("log");
+        append_user_then_assistant(&mut log, "hello", "reply");
+        let polls = std::cell::Cell::new(0);
+        let preview = persistence
+            .session_preview(log.session_id(), &|| {
+                polls.set(polls.get() + 1);
+                polls.get() > 1
+            })
+            .expect("read");
+        assert!(polls.get() > 1, "cancelled within the reader");
+        assert!(preview.is_none(), "no partial preview escapes");
     }
 
     #[test]

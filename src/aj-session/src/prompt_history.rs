@@ -8,14 +8,9 @@
 //! process, so a corrupt or non-UTF-8 line is skipped without aborting
 //! the scan.
 //!
-//! Two collectors sit on the same per-file scanner:
-//!
-//! - [`workspace_history`] over the current project's sessions
-//!   directory.
-//! - [`all_workspaces_history`] over every project under
-//!   `~/.aj/sessions`, tagging each prompt with its project.
-//!
-//! Both are newest-first and deduplicated, capped at `max` entries.
+//! [`recent_history_streaming`] ranks prompts by their recorded timestamps for
+//! history search. The file-ordered [`workspace_history`] collector serves the
+//! editor ring's bounded bootstrap. Both share the same prompt extraction rules.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -36,6 +31,88 @@ pub struct PromptEntry {
     /// Project label (the `~/.aj/sessions` subdirectory name). `None`
     /// for the current-workspace scan, where the project is implicit.
     pub project: Option<String>,
+}
+
+/// A submitted prompt with its persisted time.
+#[derive(Debug, Clone)]
+pub struct RecordedPrompt {
+    pub entry: PromptEntry,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Retain the newest occurrence of each trimmed text, newest first, capped at
+/// `max`. Used by both file scans and merges of independently read hosts.
+///
+/// The sort is stable, so prompts with equal timestamps keep the order they
+/// were given in. Callers hand over each file's prompts newest line first,
+/// which is the only recency a log without per-entry timestamps records.
+pub fn retain_recent(prompts: &mut Vec<RecordedPrompt>, max: usize) {
+    for prompt in prompts.iter_mut() {
+        prompt.entry.text = prompt.entry.text.trim().to_string();
+    }
+    prompts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    let mut seen = HashSet::new();
+    prompts.retain(|p| !p.entry.text.is_empty() && seen.insert(p.entry.text.clone()));
+    prompts.truncate(max);
+}
+
+/// Scan every file, emitting provisional newest-first snapshots capped at `max`.
+/// A file's name or traversal position cannot exclude a newer prompt in another
+/// file. Cancellation is cooperative, including within large logs.
+pub fn recent_history_streaming(
+    dir: &Path,
+    all: bool,
+    max: usize,
+    cancel: &dyn Fn() -> bool,
+    emit: &mut dyn FnMut(Vec<RecordedPrompt>),
+) -> std::io::Result<()> {
+    if max == 0 || cancel() {
+        return Ok(());
+    }
+    let mut dirs = if all {
+        std::fs::read_dir(dir)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect::<Vec<_>>()
+    } else {
+        vec![dir.to_path_buf()]
+    };
+    dirs.sort();
+    let mut recent: Vec<RecordedPrompt> = Vec::new();
+    for dir in dirs {
+        if cancel() {
+            return Ok(());
+        }
+        let project = all.then(|| {
+            dir.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
+        let mut files = std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .collect::<Vec<_>>();
+        files.sort();
+        for path in files {
+            if cancel() {
+                return Ok(());
+            }
+            let mut prompts = scan_file_recorded_prompts(&path, cancel);
+            if cancel() {
+                return Ok(());
+            }
+            for prompt in &mut prompts {
+                prompt.entry.project = project.clone();
+            }
+            recent.extend(prompts.into_iter().rev());
+            retain_recent(&mut recent, max);
+            emit(recent.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Collect the current workspace's submitted prompts, newest-first and
@@ -239,6 +316,13 @@ pub fn scan_file_user_prompts(path: &Path) -> Vec<String> {
 /// blocking-pool scans. `cancel` is polled periodically while reading so a
 /// large file doesn't pin the scan after the consumer has gone away.
 fn scan_file_user_prompts_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Vec<String> {
+    scan_file_recorded_prompts(path, cancel)
+        .into_iter()
+        .map(|p| p.entry.text)
+        .collect()
+}
+
+fn scan_file_recorded_prompts(path: &Path, cancel: &dyn Fn() -> bool) -> Vec<RecordedPrompt> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
@@ -247,6 +331,20 @@ fn scan_file_user_prompts_cancellable(path: &Path, cancel: &dyn Fn() -> bool) ->
         }
     };
 
+    // A missing persisted time uses the session's creation time, then the file's
+    // modification time, then the epoch.
+    let fallback = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(crate::persistence::parse_session_id_created_at)
+        .or_else(|| {
+            file.metadata()
+                .ok()?
+                .modified()
+                .ok()
+                .map(chrono::DateTime::from)
+        })
+        .unwrap_or_default();
     let mut prompts = Vec::new();
     for (lineno, line) in BufReader::new(file).lines().enumerate() {
         // Cooperative cancellation: this runs on the blocking pool, so we
@@ -284,7 +382,19 @@ fn scan_file_user_prompts_cancellable(path: &Path, cancel: &dyn Fn() -> bool) ->
             && let ConversationEntryKind::Message { message: msg } = entry.entry
             && let Some(text) = extract_user_prompt_text(&msg)
         {
-            prompts.push(text);
+            let message_time = match &msg.kind {
+                AgentMessageKind::Wire(Message::User(user)) if user.timestamp > 0 => {
+                    chrono::DateTime::from_timestamp_millis(user.timestamp)
+                }
+                _ => None,
+            };
+            prompts.push(RecordedPrompt {
+                entry: PromptEntry {
+                    text,
+                    project: None,
+                },
+                timestamp: entry.timestamp.or(message_time).unwrap_or(fallback),
+            });
         }
     }
     prompts
@@ -394,6 +504,78 @@ mod tests {
         for line in lines {
             writeln!(f, "{line}").unwrap();
         }
+    }
+
+    #[test]
+    fn recent_history_preserves_extraction_and_deterministic_legacy_fallback() {
+        let dir = scratch_dir("recorded");
+        let stem = "2024-01-01-00-00-00-000";
+        let mut blocks: serde_json::Value =
+            serde_json::from_str(&user_line(" first ", "1")).unwrap();
+        blocks["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "text", "text": "second "}));
+        let mut sub = blocks.clone();
+        sub["thread"] = serde_json::json!("subagent");
+        serde_json::from_value::<ConversationEntry>(sub.clone()).expect("valid subagent fixture");
+        write_jsonl(
+            dir.path(),
+            stem,
+            &[
+                blocks.to_string(),
+                user_line(" ", "2"),
+                sub.to_string(),
+                notification_line("not a prompt", "3"),
+                "broken JSON".to_string(),
+                user_line("last", "4"),
+            ],
+        );
+        let path = dir.path().join(format!("{stem}.jsonl"));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\xff\n")
+            .unwrap();
+        let mut first = Vec::new();
+        recent_history_streaming(dir.path(), false, 2000, &|| false, &mut |p| first = p).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|p| p.entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["last", "first \nsecond"]
+        );
+        let expected = crate::persistence::parse_session_id_created_at(stem).unwrap();
+        assert!(first.iter().all(|p| p.timestamp == expected));
+        let mut second = Vec::new();
+        recent_history_streaming(dir.path(), false, 2000, &|| false, &mut |p| second = p).unwrap();
+        assert_eq!(
+            first.iter().map(|p| &p.entry.text).collect::<Vec<_>>(),
+            second.iter().map(|p| &p.entry.text).collect::<Vec<_>>(),
+            "equal fallback timestamps keep newest-line-first order across scans"
+        );
+        assert_eq!(
+            scan_file_user_prompts(&path),
+            [" first \nsecond ", " ", "last"]
+        );
+    }
+
+    #[test]
+    fn recent_history_emits_before_completion_and_cancels_between_files() {
+        let dir = scratch_dir("ranked-cancel");
+        write_jsonl(dir.path(), "a", &[user_line("first", "1")]);
+        write_jsonl(dir.path(), "z", &[user_line("second", "2")]);
+        let cancelled = std::cell::Cell::new(false);
+        let mut batches = Vec::new();
+        recent_history_streaming(dir.path(), false, 2000, &|| cancelled.get(), &mut |p| {
+            batches.push(p);
+            cancelled.set(true);
+        })
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0][0].entry.text, "first");
     }
 
     #[test]

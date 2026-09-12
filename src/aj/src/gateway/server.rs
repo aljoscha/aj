@@ -185,6 +185,8 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/hosts", get(hosts).post(enroll))
         .route("/v1/hosts/{id}", delete(withdraw))
         .route("/v1/sessions", get(sessions).post(create_session))
+        .route("/v1/prompt-history", get(prompt_history))
+        .route("/v1/previews", get(session_previews))
         // Everything about one session goes to the host that owns it, whether or
         // not this build knows the route. `{id}` on its own is here for the same
         // reason: a route a newer host serves there is not this gateway's to
@@ -199,6 +201,148 @@ fn router(state: Arc<ServerState>) -> Router {
             authorize,
         ))
         .with_state(state)
+}
+
+/// Previews for a batch of namespaced ids: one upstream read per owning host,
+/// answers re-namespaced, hosts that could not answer named once in
+/// `incomplete`. An id no enrolled host owns is left out, the same as an id a
+/// host does not have.
+async fn session_previews(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Json<aj_wire::SessionPreviews> {
+    use futures::StreamExt;
+    let requests: Vec<AttachRequest> = params
+        .into_iter()
+        .filter(|(key, _)| key == "session")
+        .map(|(_, session)| AttachRequest {
+            session,
+            cursor: None,
+        })
+        .collect();
+    let plan = state.gateway.group(&requests);
+    let directory = state.gateway.sessions();
+    // Start every owning host together, as for history. A stalled group must
+    // neither consume another group's read budget nor hide its healthy reply.
+    let concurrency = plan.groups.len().max(1);
+    let deadline = tokio::time::Instant::now() + state.gateway.tuning().upstream_timeout;
+    let reads = futures::stream::iter(plan.groups)
+        .map(|group| {
+            let label = directory
+                .hosts
+                .iter()
+                .find(|row| row.id.as_deref() == Some(group.host_id.as_str()))
+                .and_then(|row| row.name.clone())
+                .unwrap_or_else(|| group.host_id.clone());
+            async move {
+                let result = async {
+                    let address = group
+                        .dial
+                        .as_ref()
+                        .ok_or_else(|| "host is unreachable".to_string())?;
+                    let client = crate::remote::RemoteClient::new(address.url())
+                        .map_err(|e| e.to_string())?;
+                    let sessions: Vec<String> =
+                        group.attach.iter().map(|r| r.session.clone()).collect();
+                    client.session_previews(&sessions).await.map_err(|e| {
+                        if e.code() == Some("unknown_endpoint") {
+                            "host does not support session previews (upgrade the host)".to_string()
+                        } else {
+                            e.to_string()
+                        }
+                    })
+                };
+                let result = tokio::time::timeout_at(deadline, result)
+                    .await
+                    .unwrap_or_else(|_| Err("preview read timed out".to_string()));
+                (group.host_id, label, result)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    let mut merged = aj_wire::SessionPreviews::default();
+    for (host_id, host, result) in reads {
+        match result {
+            Ok(answer) => {
+                for mut preview in answer.previews {
+                    preview.session_id =
+                        SessionAddress::new(&host_id, &preview.session_id).to_string();
+                    merged.previews.push(preview);
+                }
+                merged.incomplete.extend(answer.incomplete);
+            }
+            Err(message) => merged
+                .incomplete
+                .push(aj_wire::HostFailure { host, message }),
+        }
+    }
+    merged.incomplete.sort_by(|a, b| a.host.cmp(&b.host));
+    Json(merged)
+}
+
+async fn prompt_history(State(state): State<Arc<ServerState>>) -> Json<aj_wire::PromptHistory> {
+    use futures::StreamExt;
+    let hosts = state.gateway.hosts().hosts;
+    let concurrency = hosts.len().max(1);
+    let directory = state.gateway.sessions();
+    let mut reads = futures::stream::iter(hosts)
+        .map(|host| {
+            let timeout = state.gateway.tuning().upstream_timeout;
+            let label = directory
+                .hosts
+                .iter()
+                .find(|row| row.id == host.id)
+                .and_then(|row| row.name.clone())
+                .or_else(|| host.id.clone())
+                .unwrap_or_else(|| crate::remote::endpoint_label(&host.address));
+            // Enrollment alone is not authority to dial. Use the same adopted,
+            // connected target selection as other host-directed operations.
+            let target = host
+                .id
+                .as_deref()
+                .ok_or_else(|| "host is not connected".to_string())
+                .and_then(|id| {
+                    state
+                        .gateway
+                        .create_target(Some(id))
+                        .map_err(|error| error.to_string())
+                });
+            async move {
+                let result = async {
+                    let target = target?;
+                    let client = crate::remote::RemoteClient::new(target.address.url())
+                        .map_err(|e| e.to_string())?;
+                    client.prompt_history(None).await.map_err(|e| {
+                        if e.code() == Some("unknown_endpoint") {
+                            "prompt history is not supported by this host".to_string()
+                        } else {
+                            e.to_string()
+                        }
+                    })
+                };
+                let result = tokio::time::timeout(timeout, result)
+                    .await
+                    .unwrap_or_else(|_| Err("prompt history read timed out".to_string()));
+                (label, result)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    // Merge in host-label order, so equal timestamps across hosts resolve the
+    // same way whichever host answered first.
+    reads.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged = aj_wire::PromptHistory::default();
+    for (host, result) in reads {
+        match result {
+            Ok(history) => aj_app::prompt_history::merge(&mut merged, history),
+            Err(message) => merged
+                .incomplete
+                .push(aj_wire::HostFailure { host, message }),
+        }
+    }
+    Json(merged)
 }
 
 /// Reject a peer the gate does not accept, before the request is routed.
@@ -664,7 +808,12 @@ async fn send(
     }
     let response = match request.body(body).send().await {
         Ok(response) => response,
-        Err(err) => return Err(ApiError::unreachable(&address.to_string(), err)),
+        Err(err) => {
+            return Err(ApiError::unreachable(
+                &crate::remote::endpoint_label(address.url()),
+                err.without_url(),
+            ));
+        }
     };
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
@@ -672,7 +821,12 @@ async fn send(
         Ok(body) => body,
         // The head arrived and the body did not, so the answer is as lost as if
         // nothing had arrived at all.
-        Err(err) => return Err(ApiError::unreachable(&address.to_string(), err)),
+        Err(err) => {
+            return Err(ApiError::unreachable(
+                &crate::remote::endpoint_label(address.url()),
+                err.without_url(),
+            ));
+        }
     };
     Ok(Answer {
         status,

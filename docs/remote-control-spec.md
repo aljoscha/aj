@@ -512,6 +512,43 @@ code.
   `session_id` is the host-local log identity, not a gateway routing id.
   Clients render the facts and fetch only when the info overlay opens.
   Capability `session_info` (section 5.10).
+- `GET /v1/previews?session=<id>` (repeatable): the session browser's
+  `SessionPreviews` in `aj-wire`, `{previews, incomplete}`. Each preview
+  carries the full first user text block, message count, creation and
+  last-message timestamps, file modification time and size, tag, and archive
+  bit, describing the whole log rather than the active branch. The read uses
+  the ordinary preview scanner without materializing any session. An id the
+  host does not have, cannot read, or could never hold is left out rather than
+  refusing the batch. A gateway splits a batch by owning host, reads each host
+  once, returns previews under the ids the client asked with, and names a host
+  it could not read once in `incomplete` `[{host, message}]`, keeping the other
+  hosts' rows. Owning hosts are read concurrently within one batch deadline,
+  so stalled hosts do not delay healthy reads behind timeout waves.
+  Capability `session_previews` (section 5.10).
+- `GET /v1/sessions/{id}/prompt-history`: submitted prompts from the focused
+  session's workspace on its owning host. A gateway forwards this read to that
+  host, not to the client's workspace.
+- `GET /v1/prompt-history`: submitted prompts from every workspace in the host's
+  sessions store. A gateway reads adopted, connected hosts concurrently and merges
+  their replies. Other enrolled hosts are named partial failures without receiving
+  a history request. Both history endpoints return `PromptHistory` in `aj-wire`:
+  `{prompts: [{text, project, timestamp}], incomplete: [{host, message}]}`.
+  Text is the full trimmed prompt, joining user text blocks with newlines.
+  Only top-level user-thread messages contribute, across all branches and
+  archived sessions. Assistant, tool-result, sub-agent, and task-notification
+  content is excluded. Corrupt and non-UTF-8 lines and unreadable files are
+  skipped independently, as in the ordinary prompt extractor.
+  `project` is the sessions-store workspace directory label in All scope and
+  null in Workspace scope. `timestamp` is the persisted entry's UTC timestamp,
+  falling back to a positive user-message millisecond timestamp, session-id
+  creation time, file modification time, then the Unix epoch. Results are
+  newest first; prompts sharing a timestamp keep their log order, later lines
+  first. Exact equality of trimmed text deduplicates to the newest occurrence,
+  including its workspace label. The limit is 2000 distinct prompts globally,
+  applied after ranking and deduplication, not by truncating a directory walk.
+  A gateway keeps healthy results when another host fails or lacks the endpoint
+  and names failures in `incomplete`. Reads do not materialize sessions or alter
+  their state. Capability `prompt_history` (section 5.10).
 - `GET /v1/sessions/{id}/env`: a JSON object mapping strings to strings,
   the full environment map selected by the active branch. Values are
   unredacted on the trusted control port. Export-only redaction does not
@@ -667,14 +704,15 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `transcript_settings` | user-message `branch_settings` and `GET /v1/sessions/{id}/env/before/{entry}` | hosts |
   | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
   | `session_info` | `GET /v1/sessions/{id}/info` | hosts |
+  | `session_previews` | `GET /v1/previews` | hosts and gateways |
+  | `prompt_history` | Workspace and All prompt-history reads | hosts and gateways |
   | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
   | `compaction_usage` | optional cumulative `usage` on durable `compaction_end`, identified by the frame's `entry_id` | hosts |
 
   A capability is self-description, never a gate: probing an endpoint
   (404 `unknown_endpoint` vs 2xx) is a valid fallback check. A gateway's
-  `hello` advertises nothing, since it cannot answer for hosts that need
-  not agree, so a client attempts the route through it and reads the
-  refusal.
+  `hello` advertises only its own features, not those of hosts that need
+  not agree. A client attempts the route through it and reads the refusal.
 
 ### 5.11 Securing the control port
 
@@ -871,7 +909,7 @@ userinfo, query parameters, fragments, or control characters are replaced
 by `"$AJ_CONNECT_URL"`, with an instruction to set it to the same connection
 URL. No usage summary is printed. Refused, each with a notice naming why: the
 HTML export (host-local files no endpoint
-serves), prompt-history search (this client's own store), and the usage
+serves), and the usage
 overlay and credential management (this client's credential store). An
 unsupported action never silently does nothing.
 
@@ -879,8 +917,44 @@ Account selection attempts the host's endpoint and shows the ordinary
 unsupported-endpoint notice if the peer lacks it. It does not fall back to
 reading or modifying the client's auth store.
 
+Prompt-history search uses Control in local, direct, and gateway modes. Opening
+or switching scope starts a user-paced read off the input and render loops.
+Local scans publish coalesced provisional snapshots as files are read. HTTP
+reads return a complete bounded list or partial results with named failures.
+The overlay remains interactive while loading. Search covers the full prompt,
+and selection recalls into the editor without submitting. Provisional snapshots
+select the best-ranked result until the user navigates, then retain that prompt
+across updates. Changing the query starts best-match selection again.
+Closing or changing scope cancels the outstanding client read. No history cache
+or journal is persisted, and no history read belongs to directory or sidebar polling.
+Unsupported endpoints produce a notice rather than a capability pre-gate.
+The up-arrow ring is independent, retaining local bootstrap behavior and only
+this run's submissions over a connection.
+
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer.
+
+The same session browser opens locally, directly connected, and through a
+gateway. It starts with selectable directory rows and progressively enriches
+them with previews from their owning hosts, read in small batches in
+directory order so the top of the list fills first and the rest keeps landing
+behind it. An arriving preview fills in its own row and leaves the highlight
+and the scroll where the user put them.
+It reads the complete list, including archived sessions, so prompt-text search
+does not depend on which rows have been visible. Search covers the full first user text block even when
+the displayed preview is truncated, plus tags, ids, and host labels. Loading
+is shown while the search corpus is incomplete. Failed reads leave the basic
+rows selectable, with a notice and an incomplete-search indicator. Reopening
+refreshes previews. Closing cancels remaining reads. Preview reads belong to
+this user gesture, never to periodic directory enumeration or the sidebar.
+Rows place the current-session marker (`▌`), tag, and aligned metadata columns
+before the preview. Session state is shown in every mode. Gateway rows also
+name their host. Metadata keeps its inline labels, without separator dots
+or a table header, and yields space to a recognizable prompt on narrow screens.
+The preview uses the remaining width and clips at the right edge.
+The current-session marker is independent of the keyboard selection highlight.
+Archived rows strike through all their text without adding a column or changing
+their colors and selection highlight.
 
 ### 8.2 The sidebar
 
@@ -977,13 +1051,6 @@ cancel, compact, kill, or dispatch inference.
 - A resumed sub-agent's report text is bracket-scoped: which child's
   report survives a resume depends on how their log lines interleaved.
   Accepted while it misleads nobody, per-run scoping is the named fix.
-- Banked, wanted: previews in connect mode. The directory contract
-  forbids content reads per row, so the shape is an on-demand per-session
-  preview read for visible rows.
-- Banked, wanted: prompt history across hosts, as a capped, user-paced
-  history read on the host behind its own endpoint and capability
-  string, with the client merging sources and a gateway merging per-host
-  reads.
 - Banked, wanted: provider usage over a connection. Resolving an expired
   OAuth credential writes it back and the reset consumes a credit, so
   the host owns both ends: a user-paced usage read plus a separate reset
