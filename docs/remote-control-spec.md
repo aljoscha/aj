@@ -930,28 +930,24 @@ id-derived label.
 
 ## 9. Testing
 
-The core correctness property is **reducer equivalence**: a client that
-connects mid-session, or reconnects after drops, converges to the same
-durable-derived state as a client with an uninterrupted connection. The
-comparison operates on a **canonical form** of `ChatState`: a projection
-covering transcript entries (including message ids), sub-agent boxes
-(status, conclusion, report), task table, queue state, footer accounting
-and usage, and lifecycle, excluding wall-clock fields and
-client-relative state. The harness runs a scripted-provider session on
-an in-process host, attaches a client through the real HTTP stack over
-loopback, and asserts canonical-form equality with a locally-reduced
-`ChatState` at quiescent points. The adversarial variant injects seeded
-disconnects at random frame boundaries, forcing re-attach with cursors,
-and asserts convergence at quiescence.
+A client that connects mid-session or reconnects after drops must converge
+on the same durable-derived conversation as an uninterrupted client. This
+includes transcript content and identity, sub-agent status and reports,
+tasks, queued messages, settings, usage and lifecycle. Wall-clock timings
+and client-local view choices need not agree.
 
-The fault variant compares the canonical form's **convergent tier**,
-which masks exactly the rows no durable entry backs: reliable-transient
-frames are not replayable (section 5.4), so a client disconnected across
-a notice's window legitimately never has it. A row with a durable origin
-is compared in both tiers, whatever its kind, the line is durability,
-not row type. The no-fault comparison uses the full form, notices
-included, and the fault sweep includes a scripted turn that emits a
-notice, so the masking is load-bearing.
+Exercise that promise through the real host and HTTP client, including
+seeded disconnects and cursor-based reattachment. Keep independent expected
+conversation outcomes so two equally broken clients cannot satisfy a
+comparison. Tests should observe stable application and peer boundaries,
+not internal indexes or incidental counts of frames and transcript rows.
+
+A disconnected client cannot recover a reliable-transient notice whose only
+delivery happened while it was away (section 5.4), or unfinished streaming
+text superseded by a durable message. Recovery comparisons exclude those
+artifacts, but keep every durable-backed row. Uninterrupted clients must
+agree on transient notices too. Fault scenarios must actually interrupt
+durable history and include a notice raised while the client is away.
 
 Sharp edges, each pinned by a test: attach cut between a tool's
 `ToolExecutionEnd` and its durable `MessageEnd`, reconnect while a tool

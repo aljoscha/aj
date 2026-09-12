@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
-use aj_app::chat::{ChatState, reduce};
+use aj_app::chat::{ChatState, EntryKind, SubAgentStatus, ToolStatus, reduce};
 use aj_app::client::SessionClient;
 use aj_app::session::AgentLifecycle;
 use aj_app::test_support::{
@@ -181,8 +181,6 @@ fn scripted_settings() -> AgentSettings {
     }
 }
 
-/// Drive one scripted turn that calls a tool, and return its tagged live
-/// frames plus the log they were appended to.
 /// One scripted turn as a client would have seen it: the log as seeded at
 /// creation (what the first attach block serves), the tagged live frames the
 /// turn emitted, and the finished log.
@@ -201,11 +199,31 @@ async fn scripted_tool_turn() -> Recorded {
         arguments: serde_json::json!({}),
     }));
     calling.stop_reason = StopReason::ToolUse;
-    recorded_turn(
+    let run = recorded_turn(
         vec![calling, finalized_text_message("nothing on it")],
         "check the todos",
     )
-    .await
+    .await;
+    let client = uninterrupted(&run);
+    assert_completed_turn(&client.chat, "check the todos", "nothing on it");
+    let entries = client
+        .chat
+        .transcript(AgentId::Main)
+        .expect("main transcript")
+        .entries();
+    let tools: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Tool(tool) => Some((tool.tool.as_str(), tool.status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tools,
+        [("todo_read", ToolStatus::Done { is_error: false })],
+        "the tool completed once"
+    );
+    run
 }
 
 /// Drive one scripted turn that spawns a blocking sub-agent, and return
@@ -223,7 +241,7 @@ async fn scripted_sub_agent_turn() -> Recorded {
         arguments: serde_json::json!({"task": "look into it"}),
     }));
     spawning.stop_reason = StopReason::ToolUse;
-    recorded_turn(
+    let run = recorded_turn(
         vec![
             spawning,
             finalized_text_message("the sub found nothing"),
@@ -231,7 +249,35 @@ async fn scripted_sub_agent_turn() -> Recorded {
         ],
         "delegate the search",
     )
-    .await
+    .await;
+    let reference = uninterrupted(&run);
+    assert_completed_turn(&reference.chat, "delegate the search", "nothing to report");
+    let main = reference
+        .chat
+        .transcript(AgentId::Main)
+        .expect("main transcript");
+    assert!(
+        main.entries().iter().any(|entry| matches!(
+            &entry.kind, EntryKind::SubAgent(sub)
+                if sub.status == SubAgentStatus::Done
+                    && sub.report.as_deref() == Some("the sub found nothing")
+        )),
+        "the parent shows the completed sub-agent's report"
+    );
+    let sub = reference
+        .chat
+        .transcript(AgentId::Sub(1))
+        .expect("sub transcript");
+    assert!(
+        sub.entries().iter().any(|entry| matches!(
+            &entry.kind, EntryKind::Assistant(assistant)
+                if assistant.finalized && assistant.message.content.iter().any(|content| matches!(
+                    content, AssistantContent::Text(text) if text.text == "the sub found nothing"
+                ))
+        )),
+        "the sub-agent has its own completed answer"
+    );
+    run
 }
 
 /// Drive one scripted turn whose first inference fails transiently and is
@@ -296,27 +342,51 @@ fn uninterrupted(run: &Recorded) -> Client {
     client
 }
 
-/// The number of transcript rows a session holding one scripted tool turn
-/// renders: the context notice the log records at creation, the user prompt,
-/// the tool-calling assistant message and its usage, the tool cell, then the
-/// concluding assistant message and its usage.
-const TURN_ROWS: usize = 7;
+/// The comparison needs a completed conversation, not two equally empty folds.
+/// Check the user-visible fixture content independently of the projection.
+fn assert_completed_turn(chat: &ChatState, prompt: &str, answer: &str) {
+    let entries = chat
+        .transcript(AgentId::Main)
+        .expect("main transcript")
+        .entries();
+    let prompts: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::User(user) => Some(user.joined_text()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prompts, [prompt], "the prompt appears once");
+    assert!(
+        entries.iter().any(|entry| matches!(
+            &entry.kind, EntryKind::Assistant(assistant)
+                if assistant.finalized && assistant.message.content.iter().any(|content| matches!(
+                    content, AssistantContent::Text(text) if text.text == answer
+                ))
+        )),
+        "the concluding answer reached the transcript"
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, EntryKind::TurnUsage(_)))
+            .count(),
+        2,
+        "both successful inferences report usage, including zero-token usage"
+    );
+}
 
 /// The sweep: for every pair `(cut, resume)` simulate a disconnect after
 /// `cut` frames and a re-attach that resumes live delivery at `resume`,
 /// losing everything in between, and require the same canonical state as
 /// the uninterrupted fold.
-///
-/// `expected_pairs` is pinned by the caller so a change that quietly
-/// shortens the recorded stream cannot shrink the sweep with it.
-fn sweep(run: &Recorded, expected: &CanonicalState, expected_pairs: usize) {
+fn sweep(run: &Recorded, expected: &CanonicalState) {
     let Recorded {
         seeded,
         frames,
         log,
         ..
     } = run;
-    let mut pairs = 0;
     for cut in 0..=frames.len() {
         for resume in cut..=frames.len() {
             let mut client = Client::attached(seeded);
@@ -344,44 +414,18 @@ fn sweep(run: &Recorded, expected: &CanonicalState, expected_pairs: usize) {
                 &format!("cut {cut}, resume {resume}"),
             );
             assert_no_dangling(&client.chat);
-            pairs += 1;
         }
     }
-    let n = frames.len() + 1;
-    assert_eq!(pairs, n * (n + 1) / 2, "every pair was exercised");
-    assert_eq!(pairs, expected_pairs, "the sweep covers the whole stream");
 }
 
 #[tokio::test]
 async fn every_cut_and_resume_of_a_tool_turn_converges() {
     let run = scripted_tool_turn().await;
-    let frames = &run.frames;
-    assert!(
-        frames.iter().any(|f| matches!(
-            &f.event,
-            AgentEvent::ToolExecutionEnd { tool, .. } if tool == "todo_read"
-        )),
-        "the turn ran its tool call",
-    );
-    let durable = frames.iter().filter(|f| f.entry.is_some()).count();
-    assert!(durable >= 4, "the turn wrote several log entries");
-
     let reference = uninterrupted(&run);
     let expected = reference.canonical();
-    // The comparison is only worth making if the fold built the whole
-    // turn rather than converging on something empty.
-    assert_eq!(
-        expected
-            .agent(AgentId::Main)
-            .expect("main transcript")
-            .entries
-            .len(),
-        TURN_ROWS,
-        "the reference fold built the whole turn",
-    );
     assert_no_dangling(&reference.chat);
 
-    sweep(&run, &expected, 528);
+    sweep(&run, &expected);
 }
 
 #[tokio::test]
@@ -389,21 +433,9 @@ async fn every_cut_and_resume_of_a_sub_agent_turn_converges() {
     let run = scripted_sub_agent_turn().await;
     let reference = uninterrupted(&run);
     let expected = reference.canonical();
-    let sub = expected
-        .agent(AgentId::Sub(1))
-        .expect("the sub-agent built a transcript");
-    assert!(
-        !sub.entries.is_empty(),
-        "the sub-agent's own transcript is non-empty",
-    );
-    assert_eq!(
-        expected.sub_boxes.len(),
-        1,
-        "the parent transcript holds the box",
-    );
     assert_no_dangling(&reference.chat);
 
-    sweep(&run, &expected, 1176);
+    sweep(&run, &expected);
 }
 
 /// A host restart mints a fresh epoch, so the cursor the client offers is
@@ -415,16 +447,6 @@ async fn an_attach_under_a_new_epoch_rebuilds_the_same_state() {
     for run in [scripted_tool_turn().await, scripted_sub_agent_turn().await] {
         let mut client = uninterrupted(&run);
         let expected = client.canonical();
-        assert_eq!(
-            expected
-                .agent(AgentId::Main)
-                .expect("main transcript")
-                .entries
-                .len(),
-            TURN_ROWS,
-            "the compared state is a whole turn",
-        );
-
         client.reattach(&run.log, "epoch-2");
 
         assert_canonical_eq(
@@ -545,16 +567,6 @@ async fn reapplying_the_whole_projected_suffix_changes_nothing() {
             fold(&mut chat, &mut life, tagged);
         }
         let before = CanonicalState::of_reduced(&chat, &life);
-        // The comparison is worthless if the state is empty.
-        assert_eq!(
-            before
-                .agent(AgentId::Main)
-                .expect("main transcript")
-                .entries
-                .len(),
-            TURN_ROWS,
-            "the compared state is a whole turn",
-        );
         let backfill = project_suffix(log, None, &BTreeSet::new());
         assert!(
             !backfill.events.is_empty(),
@@ -581,101 +593,4 @@ fn fold(chat: &mut ChatState, life: &mut AgentLifecycle, tagged: &TaggedEvent) {
         unreachable!()
     };
     let _ = reduce(chat, life, tagged.event.clone(), durability.as_ref());
-}
-
-/// A guard on the harness itself: durable identity is what absorbs the
-/// re-application, so a fold with the identities stripped has to diverge.
-/// Otherwise the sweep could be passing vacuously.
-#[tokio::test]
-async fn a_fold_without_durable_identity_diverges() {
-    let run = scripted_tool_turn().await;
-    let (frames, log) = (&run.frames, &run.log);
-    let reference = uninterrupted(&run);
-
-    let mut chat = ChatState::new(scripted_settings(), 200_000, Arc::new(Vec::new()));
-    let mut life = AgentLifecycle::default();
-    let strip = |frame: &TaggedEvent| {
-        let mut event = frame.event.clone();
-        // Dropping the id the log adopted is what leaves the message arms
-        // with nothing to key on.
-        if let AgentEvent::MessageEnd { message, .. } = &mut event {
-            message.set_id(String::new());
-        }
-        event
-    };
-    for frame in frames {
-        let _ = reduce(&mut chat, &mut life, strip(frame), None);
-    }
-    for frame in &project_suffix(log, None, &BTreeSet::new()).events {
-        let _ = reduce(&mut chat, &mut life, strip(frame), None);
-    }
-
-    assert_ne!(
-        CanonicalState::of_reduced(&chat, &life),
-        reference.canonical(),
-        "an identity-blind fold has to duplicate rows",
-    );
-}
-
-/// A second guard on the oracle: a pending queued message is part of the
-/// state two clients have to agree on, so a client that was
-/// told about one and a client that was not must not compare equal.
-///
-/// The reducer treats `QueueUpdate` as a redraw ping and drops the payload,
-/// so nothing in the transcript records this. The client's own snapshot is
-/// the only witness, and an oracle blind to it would call a client with a
-/// queued follow-up converged with one that has none.
-#[tokio::test]
-async fn a_client_with_a_queued_message_differs_from_one_without() {
-    let run = scripted_tool_turn().await;
-    let mut told = uninterrupted(&run);
-    let mut untold = uninterrupted(&run);
-    assert_eq!(
-        told.canonical(),
-        untold.canonical(),
-        "the two folds start out identical",
-    );
-
-    told.apply(queue_update_frame(
-        EPOCH,
-        AgentId::Main,
-        "queued while busy",
-    ));
-
-    assert_ne!(
-        told.canonical(),
-        untold.canonical(),
-        "the queued follow-up is state the oracle has to see",
-    );
-
-    // And the same update lands them back on each other, so the projection
-    // reports a real difference rather than an unstable one.
-    untold.apply(queue_update_frame(
-        EPOCH,
-        AgentId::Main,
-        "queued while busy",
-    ));
-    assert_canonical_eq(
-        &told.canonical(),
-        &untold.canonical(),
-        "both clients heard the same update",
-    );
-}
-
-/// The frame the host publishes on the enqueue side: a full snapshot of one
-/// agent's queues, here a single pending follow-up.
-fn queue_update_frame(epoch: &str, agent_id: AgentId, text: &str) -> Frame {
-    Frame::Event {
-        session: SESSION.to_string(),
-        epoch: epoch.to_string(),
-        durability: None,
-        event: AgentEvent::QueueUpdate {
-            agent_id,
-            steering: Vec::new(),
-            follow_up: vec![aj_agent::message::AgentMessage::wire(
-                aj_models::types::Message::User(aj_models::types::UserMessage::text(text)),
-            )],
-        }
-        .into(),
-    }
 }

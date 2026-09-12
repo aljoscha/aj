@@ -432,15 +432,6 @@ pub struct AgentRender {
     pub(crate) last_usage_origin: Option<UsageOrigin>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
-impl AgentRender {
-    pub(crate) fn last_usage_source(&self) -> Option<&str> {
-        self.last_usage_origin
-            .as_ref()
-            .and_then(UsageOrigin::source_entry)
-    }
-}
-
 /// One background task tracked from `TaskStart` / `TaskEnd`. Drives a
 /// footer's task count, a picker's task rows, and the routing of task
 /// events to the launching tool call's transcript cell.

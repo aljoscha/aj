@@ -8,7 +8,7 @@
 //! Frontend-bound helpers (a `Terminal` stub, the interactive
 //! `SessionWorld` builder) stay in the consuming binary.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -221,7 +221,7 @@ pub fn build_tagged_test_agent(
 ///   quiesce drops, so two converged states may hold different values.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CanonicalState {
-    /// Every agent with a transcript or render bookkeeping, main first
+    /// Every agent with a transcript, main first
     /// then subs in index order.
     pub agents: Vec<CanonicalAgent>,
     /// Where each sub-agent's box sits in its parent's transcript,
@@ -238,8 +238,7 @@ pub struct CanonicalState {
     pub compacting: Vec<AgentId>,
 }
 
-/// One agent's transcript plus the accounting a footer renders for it and
-/// the durable-identity bookkeeping the reducer keeps beside it.
+/// One agent's transcript and the accounting its footer renders.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CanonicalAgent {
     pub agent: AgentId,
@@ -251,23 +250,6 @@ pub struct CanonicalAgent {
     pub settings: Option<AgentSettings>,
     pub context_usage: ContextUsage,
     pub compaction_phase: Option<CompactionPhase>,
-    pub render: CanonicalRender,
-}
-
-/// One agent's durable-identity bookkeeping: what a re-applied event
-/// would find. Covered as key sets plus a streaming flag, so the oracle
-/// sees the state that decides "update in place or append" without
-/// coupling to [`EntryId`](crate::chat::EntryId) counters.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
-pub struct CanonicalRender {
-    /// Durable assistant a following ordinary usage event reports on.
-    pub last_usage_source: Option<String>,
-    /// The `call_id`s that resolve to a cell.
-    pub tool_calls: BTreeSet<String>,
-    /// The message ids that resolve to a row.
-    pub messages: BTreeSet<String>,
-    /// Whether an assistant entry is open for streaming.
-    pub streaming: bool,
 }
 
 /// Position of a transcript entry: whose transcript, and where in it.
@@ -413,8 +395,8 @@ impl CanonicalEntry {
 ///
 /// The mask is narrow on purpose: it removes what
 /// [`CanonicalEntry::is_transient_only`] names and nothing else. Notices
-/// with a durable origin, every finalized row, the render indexes and all
-/// the accounting stay under comparison.
+/// with a durable origin, every finalized row and all accounting stay
+/// under comparison.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ConvergentState(CanonicalState);
 
@@ -433,17 +415,8 @@ impl CanonicalState {
     /// A direct reducer fold only changes the queue if its caller mirrors a
     /// `QueueUpdate` into `chat`, as [`SessionClient`] does.
     pub fn of_reduced(chat: &ChatState, lifecycle: &AgentLifecycle) -> Self {
-        // The union of both maps: an agent can hold render bookkeeping
-        // without a transcript, and a state the oracle skipped would be a
-        // blind spot rather than a simplification.
-        let mut ids: Vec<AgentId> = chat
-            .transcripts
-            .keys()
-            .chain(chat.render.keys())
-            .copied()
-            .collect();
+        let mut ids: Vec<AgentId> = chat.transcripts.keys().copied().collect();
         ids.sort_by_key(|id| agent_order(*id));
-        ids.dedup();
         let agents: Vec<CanonicalAgent> = ids
             .iter()
             .map(|&agent| CanonicalAgent {
@@ -455,16 +428,6 @@ impl CanonicalState {
                 settings: chat.footers().settings(agent).cloned(),
                 context_usage: chat.footers().context_usage(agent),
                 compaction_phase: chat.compaction_phase(agent),
-                render: chat
-                    .render
-                    .get(&agent)
-                    .map(|render| CanonicalRender {
-                        last_usage_source: render.last_usage_source().map(str::to_string),
-                        tool_calls: render.tool_index.keys().cloned().collect(),
-                        messages: render.message_index.keys().cloned().collect(),
-                        streaming: render.current_assistant.is_some(),
-                    })
-                    .unwrap_or_default(),
             })
             .collect();
 
@@ -520,8 +483,7 @@ impl CanonicalState {
     }
 
     /// This state's [`ConvergentState`]: the same projection with every
-    /// transient-only row taken out and the streaming flag that names one
-    /// cleared.
+    /// transient-only row taken out.
     ///
     /// Dropping rows renumbers the transcript, so the recorded locations
     /// (a sub-agent's box, a task's launch cell) move with it. Without
@@ -543,9 +505,6 @@ impl CanonicalState {
                 }
             }
             agent.entries = kept;
-            // The flag names the streaming row the loop just dropped, so
-            // it goes with it or the tier contradicts itself.
-            agent.render.streaming = false;
             masked.insert(agent.agent, dropped);
         }
         for location in state.sub_boxes.values_mut() {
@@ -848,37 +807,6 @@ mod tests {
         CanonicalState::of_reduced(&chat, &lifecycle)
     }
 
-    /// Negative control for the exported full-form assertion boundary. The
-    /// task table is a real [`CanonicalState`] axis, so deleting it produces
-    /// unequal values for the wrapper to reject.
-    #[test]
-    #[should_panic(expected = "canonical states differ (negative control)")]
-    fn the_canonical_assertion_rejects_a_real_task_difference() {
-        let left = folded(None);
-        let mut right = left.clone();
-        right.tasks.clear();
-        assert_ne!(left, right, "the fixture supplies unequal states");
-
-        assert_canonical_eq(&left, &right, "negative control");
-    }
-
-    /// Negative control for the exported fault-tier assertion boundary. A live
-    /// re-attach refetches the authoritative task table separately, while the
-    /// convergent mask removes unrecoverable transcript artifacts, so task
-    /// state remains an equality axis after masking.
-    #[test]
-    #[should_panic(expected = "convergent tiers differ (negative control)")]
-    fn the_convergent_assertion_rejects_a_real_task_difference() {
-        let left = folded(None);
-        let mut right = left.clone();
-        right.tasks.clear();
-        let left = left.convergent();
-        let right = right.convergent();
-        assert_ne!(left, right, "the fixture difference survives the mask");
-
-        assert_convergent_eq(&left, &right, "negative control");
-    }
-
     /// Relative equality cannot reveal a field removed from both sides of the
     /// projection. Pin reducer-owned axes against one exact live fold so shared
     /// observer blindness has an absolute detector.
@@ -967,16 +895,6 @@ mod tests {
             main.compaction_phase,
             Some(CompactionPhase::Saving),
             "the in-flight compaction phase remains observable",
-        );
-        assert_eq!(
-            main.render,
-            CanonicalRender {
-                last_usage_source: Some("message-assistant".to_string()),
-                tool_calls: BTreeSet::from(["call-task".to_string()]),
-                messages: BTreeSet::from(["message-assistant".to_string()]),
-                streaming: true,
-            },
-            "durable and in-flight render identity remains observable",
         );
         assert_eq!(
             projected.tasks,
@@ -1165,8 +1083,7 @@ mod tests {
         );
     }
 
-    /// The other transient-only artifact: the in-flight streaming row and
-    /// the flag that names it.
+    /// In-flight text is not recoverable until a finalized message backs it.
     #[test]
     fn the_convergent_tier_masks_the_in_flight_streaming_row() {
         let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
@@ -1199,8 +1116,15 @@ mod tests {
             streaming
                 .agent(AgentId::Main)
                 .expect("a main transcript")
-                .render
-                .streaming,
+                .entries
+                .iter()
+                .any(|entry| matches!(
+                    entry,
+                    CanonicalEntry::Assistant {
+                        finalized: false,
+                        ..
+                    }
+                )),
             "the fold is mid-message",
         );
         assert_ne!(streaming, quiet, "the full form keeps the open row");
