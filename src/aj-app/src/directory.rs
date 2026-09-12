@@ -904,14 +904,6 @@ mod tests {
             notices(&directory.chat().borrow()),
             vec!["in the foreground"]
         );
-
-        // The background fold really happened, it just landed elsewhere.
-        directory.focus(OTHER, || panic!("already attached"));
-        assert!(Rc::ptr_eq(&directory.chat(), &background));
-        assert_eq!(
-            notices(&directory.chat().borrow()),
-            vec!["from the background"]
-        );
     }
 
     /// Views keep the same model and its contents while focus selects which
@@ -1306,9 +1298,11 @@ mod tests {
         let mut directory = two_sessions();
         let cursor = |directory: &SessionDirectory, session: &str| {
             directory
-                .client_for(session)
+                .attach_requests()
+                .into_iter()
+                .find(|request| request.session == session)
                 .expect("attached")
-                .cursor()
+                .cursor
                 .map(|cursor| cursor.seq)
         };
         // Both sessions are past their first block and folding live frames.

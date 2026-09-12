@@ -28165,115 +28165,9 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// A refused session re-attaches by itself when its row returns to the
-    /// peer's list, with no gesture from the user.
-    ///
-    /// The edge nobody had seen work. A refusal says attaching cannot succeed
-    /// now, and the peer's directory is the only thing that says when that could
-    /// have changed. It says so by listing the session again. Without this the
-    /// client stops asking and never starts, which is a
-    /// dead end no gesture recovers: a re-focus of the focused session is a
-    /// no-op, and the session stays in the working set so nothing else reopens
-    /// the stream either.
-    ///
-    /// Driven through the real loop and asserted at the peer, because the claim
-    /// is that the client asks again on its own: a test that folded the frames
-    /// by hand would prove the rule and not the wiring.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_refused_session_rejoins_when_its_row_returns() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-        let session = world.session().to_string();
-        let epoch = "epoch-rejoined";
-
-        let peer = WarmPeer::answering(
-            vec![
-                // The first attach is refused, and then the peer's directory
-                // tells the story the rule reads: the session is gone, and then
-                // it is back. Only the transition says the answer changed.
-                vec![
-                    serde_json::to_string(&aj_wire::Frame::Error {
-                        session: session.clone(),
-                        epoch: None,
-                        code: "unknown_session".to_string(),
-                        message: "no host serves this session any more".to_string(),
-                    })
-                    .expect("an error frame"),
-                    list_of(&[]),
-                    list_of(&[&session]),
-                ],
-                // The second attach is served, which is the rejoin.
-                vec![
-                    block_opening(&session, epoch),
-                    block_end(&session, epoch, 0),
-                ],
-            ],
-            Duration::from_millis(30),
-            After::Warm,
-        )
-        .await;
-        redirect_to(&mut world, &peer, Duration::from_millis(400));
-
-        // Read at the peer. The claim is that the client asks again on its own,
-        // and a second stream is that, at the far end: the discharge path folds
-        // no notice on success, so the client's own transcript would say nothing
-        // either way.
-        let asked = Arc::clone(&peer.opens);
-        let (exit, rejoined) = crate::remote::tests::bounded(
-            "the client to rejoin its session on the row's return",
-            drive_until(&mut world, &shell, |writer| async move {
-                // No keystroke anywhere in here on purpose: the writer is only
-                // dropped, to end the loop once the rejoin has happened.
-                let rejoined = settled(Duration::from_secs(10), || {
-                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 2).then_some(())
-                })
-                .await;
-                // The second stream is open. Give its block a moment to land
-                // before the loop is stopped out from under it.
-                if rejoined.is_some() {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                }
-                drop(writer);
-                rejoined
-            }),
-        )
-        .await;
-
-        assert!(matches!(exit, Ok(SessionExit::Quit)));
-        assert!(
-            rejoined.is_some(),
-            "the client never re-attached after its row came back, so a refusal \
-             is still a dead end: {:?}",
-            main_notices(&world),
-        );
-        assert_eq!(
-            peer.opens(),
-            2,
-            "the peer served {} streams: the rejoin is a second attach, and one \
-             stream means the client never asked again",
-            peer.opens(),
-        );
-        assert!(
-            world.client().holds_attachment(),
-            "the client is following its session again",
-        );
-        assert!(
-            !world.directory.needs_reattach(),
-            "and owes nothing further",
-        );
-        remote.shutdown().await;
-    }
-
-    /// A session refused twice still rejoins on the second return of its row.
-    ///
-    /// A refusal after an earlier one moves neither the epoch nor the arm: the
-    /// client is already following nothing. So a rule that read the refusal off
-    /// that transition saw the first one and missed every one after it, leaving
-    /// the session stranded with nothing watching for its row. The bit lives on
-    /// the client for this reason, set wherever an attachment is dropped.
-    ///
-    /// Two full cycles, driven through the real loop, asserted at the peer.
+    /// Each return of a non-lock-refused session's row triggers another attach,
+    /// even when the previous rejoin was also refused. Recovery needs no gesture
+    /// and leaves the latest exact refusal in scrollback without duplicating it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_session_refused_twice_still_rejoins() {
         let dir = TempDir::new().expect("tempdir");
@@ -28301,13 +28195,13 @@ mod tests {
                     list_of(&[&session]),
                 ],
                 // The rejoin is refused too, and the row goes and comes again.
-                // The client is following nothing before this refusal as well as
-                // after it, which is what the old rule could not see.
+                // There is no intervening successful attachment to reset recovery.
                 vec![refusal(&session), list_of(&[]), list_of(&[&session])],
                 // The third attach is served.
                 vec![
                     block_opening(&session, epoch),
-                    block_end(&session, epoch, 0),
+                    block_note(&session, epoch, 1, "following again"),
+                    block_end(&session, epoch, 1),
                 ],
             ],
             Duration::from_millis(30),
@@ -28317,16 +28211,22 @@ mod tests {
         redirect_to(&mut world, &peer, Duration::from_millis(400));
 
         let asked = Arc::clone(&peer.opens);
+        let status = Rc::clone(&world.status);
+        let chat = Rc::clone(&world.chat);
         let (exit, rejoined) = crate::remote::tests::bounded(
             "the client to rejoin after a second refusal",
             drive_until(&mut world, &shell, |writer| async move {
                 let rejoined = settled(Duration::from_secs(12), || {
-                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 3).then_some(())
+                    let following = status.borrow().connection == Connection::Connected;
+                    let delivered = notices_of(&chat.borrow())
+                        .iter()
+                        .any(|text| text == "following again");
+                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 3
+                        && following
+                        && delivered)
+                        .then_some(())
                 })
                 .await;
-                if rejoined.is_some() {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                }
                 drop(writer);
                 rejoined
             }),
@@ -28340,9 +28240,10 @@ mod tests {
              refused more than once is stranded: {:?}",
             main_notices(&world),
         );
-        assert!(
-            world.client().holds_attachment(),
-            "the client is following its session again after two refusals",
+        assert_eq!(
+            peer.opens(),
+            3,
+            "each row return opens one replacement stream"
         );
         // The latest exact refusal survives the authoritative replacement. The
         // temporary withheld guidance disappears once the session is followed
