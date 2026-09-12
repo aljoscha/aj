@@ -51,7 +51,6 @@ use aj_conf::{
 use aj_models::auth::{AuthError, AuthStorage, StoredProviderCredentials};
 use aj_models::registry::ModelInfo;
 use aj_models::types::UserContent;
-use aj_models::usage::default_reset_sources;
 use aj_models::{ThinkingConfig, speed_from_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter};
 use anyhow::{Context, Result, anyhow};
@@ -4148,26 +4147,7 @@ async fn apply_command_action(
             );
             ActionEffect::OpenedOverlay
         }
-        // The usage overlay is interactive (it carries the rate-limit-reset
-        // flow), so it can't ride the read-only content-fill path. The host
-        // builds it here where it owns the deps the widget needs: the
-        // credential store, the theme snapshot, the shared redraw ping, and
-        // the runtime handle it spawns its fetch/consume onto.
         CommandAction::OpenUsageStatus => {
-            // A connected world's credential store belongs to this client,
-            // not the session host the page would appear to describe. Refuse
-            // before cloning it because constructing the overlay starts a
-            // fetch that may refresh and rewrite an expired credential.
-            if world.control.is_remote() {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice(
-                        "show provider usage",
-                        "it would read this machine's credential store, so run it on the host",
-                    ),
-                );
-                return ActionEffect::Redraw;
-            }
             let handles = shell.borrow().overlay_handles();
             let styles = ContentStyles::from_theme(&shell.borrow().theme.read());
             open_usage_overlay(
@@ -4175,8 +4155,8 @@ async fn apply_command_action(
                 &handles.editor,
                 &handles.chrome,
                 styles,
-                world.auth.clone(),
-                default_reset_sources(),
+                world.control.clone(),
+                world.session().to_string(),
                 tokio::runtime::Handle::current(),
                 redraw_tx.clone(),
             );
@@ -28427,50 +28407,7 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// A gesture connect mode has no path for folds a notice naming why, rather
-    /// than silently doing nothing.
-    ///
-    /// Usage reads this process's credentials rather than the remote host's.
-    #[tokio::test]
-    async fn connect_mode_refuses_the_gestures_about_this_machine() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-
-        // The reason is pinned, not just the fact of a refusal: each names the
-        // host-local thing it cannot reach.
-        for (action, reason) in [(
-            CommandAction::OpenUsageStatus,
-            "this machine's credential store",
-        )] {
-            let before = main_notices(&world).len();
-            apply_command(&mut world, &shell, action).await;
-            // The harm first, then the notice: what a refusal has to prevent is
-            // the read of this machine's store, and prompt history parks its
-            // scan the moment the overlay is built.
-            assert!(
-                shell.borrow().take_history_fetch().is_none(),
-                "{action:?} asked for a scan of this machine's store",
-            );
-            let notices = main_notices(&world);
-            assert!(
-                notices.len() > before
-                    && notices
-                        .last()
-                        .is_some_and(|n| n.contains("over a connection") && n.contains(reason)),
-                "{action:?} folds a refusal explaining {reason:?}: {notices:?}"
-            );
-            assert!(
-                !shell.borrow().overlays.borrow().is_open(),
-                "{action:?} opened no overlay"
-            );
-        }
-        remote.shutdown().await;
-    }
-
-    /// The ownership guard is specific to a connection. A local session and
-    /// its usage overlay share the same credential store, so the production
-    /// gesture still opens the page there.
+    /// The local production gesture opens the shared usage page.
     #[tokio::test]
     async fn local_mode_opens_the_usage_overlay() {
         let dir = TempDir::new().expect("tempdir");
@@ -28482,126 +28419,199 @@ mod tests {
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
     }
 
-    /// Usage over a connection must stop before the connecting process's
-    /// credential store can be read. Reads acquire a file lock and therefore
-    /// create a missing parent directory, which gives the refusal a direct
-    /// filesystem observer without starting the usage fetch.
+    async fn usage_page_until(shell: &Rc<RefCell<Shell>>, needle: &str) -> String {
+        crate::remote::tests::bounded(needle, async {
+            loop {
+                let page = top_overlay_rows(shell).join("\n");
+                if page.contains(needle) {
+                    return page;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+    }
+
+    /// The composed overlay consumes only its opening host/account through all
+    /// adapters, including after focus moves. Client reads and writes are observed.
     #[tokio::test]
-    async fn connect_mode_refuses_usage_before_client_credentials_are_read() {
-        use aj_models::auth::AuthCredential;
+    async fn provider_usage_overlay_is_host_owned_locally_directly_and_through_gateway() {
+        use crate::remote::tests::provider_usage::FakeUsage;
+        for mode in ["local", "direct", "gateway"] {
+            let host_dir = TempDir::new().unwrap();
+            let other_dir = TempDir::new().unwrap();
+            let client_dir = TempDir::new().unwrap();
+            let source = FakeUsage::new("usage-owner");
+            let other_source = FakeUsage::new("other-host");
+            let host = source.host(&host_dir).await;
+            let other_host = other_source.host(&other_dir).await;
+            let session = host.create().await.unwrap();
+            let sibling = host.create().await.unwrap();
+            let other_session = other_host.create().await.unwrap();
+            let remote = RemoteHost {
+                server: crate::remote::RemoteServer::bind(
+                    host.clone(),
+                    "127.0.0.1:0".parse().unwrap(),
+                    crate::remote::IdentityGate::local(),
+                )
+                .await
+                .unwrap(),
+                host,
+            };
+            let other = RemoteHost {
+                server: crate::remote::RemoteServer::bind(
+                    other_host.clone(),
+                    "127.0.0.1:0".parse().unwrap(),
+                    crate::remote::IdentityGate::local(),
+                )
+                .await
+                .unwrap(),
+                host: other_host,
+            };
+            let gateway = RemoteGateway::over(&[&remote, &other]).await;
+            gateway.until_sessions(3).await;
+            let (url, opening, focus_next) = if mode == "gateway" {
+                (
+                    gateway.url(),
+                    format!("{}:{session}", remote.host.hello().host_id),
+                    format!("{}:{other_session}", other.host.hello().host_id),
+                )
+            } else {
+                (remote.url(), session.clone(), sibling)
+            };
+            let (mut world, shell) =
+                connect_world_and_shell_at(&client_dir, &url, &[&opening]).await;
+            if mode == "local" {
+                world.control = Control::local(remote.host.clone());
+            }
+            assert_eq!(world.session(), opening);
+            world
+                .auth
+                .insert_bare(
+                    "openai-codex",
+                    aj_models::auth::AuthCredential::ApiKey {
+                        key: "client-secret-sentinel".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let client_path = client_dir.path().join("client-auth.json");
+            let client_before = std::fs::read(&client_path).unwrap();
+            let host_before = std::fs::read(host_dir.path().join("auth.json")).unwrap();
+            assert_ne!(client_before, host_before);
+            assert!(String::from_utf8_lossy(&client_before).contains("client-secret-sentinel"));
+            assert!(String::from_utf8_lossy(&host_before).contains("usage-owner-work-secret"));
 
-        let dir = TempDir::new().expect("tempdir");
-        let host_auth_path = dir.path().join("auth.json");
-        let client_auth_path = dir.path().join("client-auth.json");
-        let host_auth = AuthStorage::new(host_auth_path.clone());
-        host_auth
-            .insert_bare(
-                "openai-codex",
-                AuthCredential::ApiKey {
-                    key: "host-credential-sentinel".to_string(),
-                },
-            )
-            .await
-            .expect("seed the host credential");
+            let unread_root = client_dir.path().join("must-stay-unread");
+            let unread_auth = AuthStorage::new(unread_root.join("auth.json"));
+            unread_auth.get("openai-codex").await.unwrap();
+            assert!(
+                unread_root.exists(),
+                "calibrate the credential read observer"
+            );
+            std::fs::remove_dir_all(&unread_root).unwrap();
+            world.auth = unread_auth;
+            let (mut app, mut writer, root) = app_over(&shell).await;
+            assert!(matches!(
+                apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await,
+                ActionEffect::OpenedOverlay
+            ));
+            focus_overlay(&mut app, &root);
+            let page = usage_page_until(&shell, "usage-owner work report").await;
+            assert!(page.contains("usage-owner personal report"));
+            assert_eq!(page.matches("2 available").count(), 2);
+            assert!(
+                !page.contains("other-host") && !page.contains("secret"),
+                "{page}"
+            );
+            assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+            assert_eq!(source.refreshes.load(Ordering::SeqCst), 2);
+            assert_eq!(other_source.refreshes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                other_source.reads.load(Ordering::SeqCst),
+                0,
+                "no gateway aggregation"
+            );
+            assert!(
+                String::from_utf8_lossy(&std::fs::read(host_dir.path().join("auth.json")).unwrap())
+                    .contains("-secret-refreshed")
+            );
 
+            press(&mut app, &mut writer, b"r").await;
+            assert!(top_overlay_rows(&shell).join("\n").contains("personal"));
+            press(&mut app, &mut writer, b"\x1b[B").await;
+            press(&mut app, &mut writer, b"\r").await;
+            assert!(
+                top_overlay_rows(&shell)
+                    .join("\n")
+                    .contains("openai-codex / work")
+            );
+            assert!(
+                source.spent().is_empty(),
+                "selection must not spend before confirmation"
+            );
+            // Keep the overlay alive while changing the same directory focus that
+            // subsequent commands read, without closing the overlay.
+            world.directory.focus(&focus_next, || {
+                Rc::new(RefCell::new(seeded_chat(
+                    &world.config,
+                    unknown_settings(),
+                    0,
+                    &world.catalog,
+                )))
+            });
+            assert_ne!(world.session(), opening);
+            press(&mut app, &mut writer, b"\r").await;
+            usage_page_until(&shell, "response lost after consumption").await;
+            press(&mut app, &mut writer, b"\r").await;
+            usage_page_until(&shell, "Usage reset.").await;
+            let attempts = source.attempts.lock().unwrap().clone();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0], attempts[1], "retry retains target and key");
+            assert_eq!(attempts[0].0.account(), Some("work"));
+            assert!(!attempts[0].1.is_empty());
+            assert_eq!(source.spent(), vec![attempts[0].0.clone()]);
+            assert!(other_source.spent().is_empty());
+            press(&mut app, &mut writer, b"\r").await;
+            let refreshed = usage_page_until(&shell, "usage-owner work report").await;
+            assert!(!refreshed.contains("other-host"));
+            assert_eq!(refreshed.matches("1 available").count(), 1);
+            assert_eq!(refreshed.matches("2 available").count(), 1);
+            assert_eq!(
+                source.reads.load(Ordering::SeqCst),
+                4,
+                "refresh uses opening host"
+            );
+            assert_eq!(other_source.reads.load(Ordering::SeqCst), 0);
+            assert!(
+                !unread_root.exists(),
+                "usage/reset read client credentials in {mode}"
+            );
+            assert_eq!(std::fs::read(&client_path).unwrap(), client_before);
+            drop(app);
+            drop(world);
+            gateway.shutdown().await;
+            remote.shutdown().await;
+            other.shutdown().await;
+            assert!(!unread_root.exists());
+            assert_eq!(std::fs::read(&client_path).unwrap(), client_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_usage_unsupported_is_not_pregated_and_is_rendered() {
+        let dir = TempDir::new().unwrap();
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-        world
-            .auth
-            .insert_bare(
-                "openai-codex",
-                AuthCredential::ApiKey {
-                    key: "client-credential-sentinel".to_string(),
-                },
-            )
-            .await
-            .expect("seed the client credential");
-
-        let host_before = std::fs::read(&host_auth_path).expect("read host sentinel");
-        let client_before = std::fs::read(&client_auth_path).expect("read client sentinel");
-        assert_ne!(host_before, client_before, "the stores are distinct");
-        assert!(
-            String::from_utf8_lossy(&host_before).contains("host-credential-sentinel"),
-            "the host precondition names its own credential",
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&format!("{}/nowhere", remote.url())).unwrap(),
         );
-        assert!(
-            String::from_utf8_lossy(&client_before).contains("client-credential-sentinel"),
-            "the client precondition names its own credential",
-        );
-
-        let effect = apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await;
-
-        assert!(matches!(effect, ActionEffect::Redraw));
-
-        // Positively calibrate the read observer, then remove the directory so
-        // the production gesture gets the same lazy store in its armed state.
-        // This root is independent of the remote fixture so evidence from work
-        // polled during fixture shutdown remains observable afterwards.
-        let auth_observer = TempDir::new().expect("auth observer tempdir");
-        let auth_root = auth_observer.path().join("client-auth-must-stay-unread");
-        let unread_auth = AuthStorage::new(auth_root.join("auth.json"));
-        assert!(!auth_root.exists(), "the lazy store starts untouched");
-        assert!(
-            unread_auth
-                .get("openai-codex")
-                .await
-                .expect("calibrate a credential read")
-                .is_none(),
-            "the calibration store is empty",
-        );
-        assert!(
-            auth_root.exists(),
-            "a credential read creates its lock parent"
-        );
-        std::fs::remove_dir_all(&auth_root).expect("re-arm the read observer");
-        world.auth = unread_auth;
-
-        let effect = apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await;
-        assert!(matches!(effect, ActionEffect::Redraw));
-
-        let assert_no_credential_harm = |stage: &str| {
-            assert!(
-                !auth_root.exists(),
-                "the connected usage gesture touched the client's credential store {stage}",
-            );
-            assert_eq!(
-                std::fs::read(&client_auth_path).expect("read client store after refusal"),
-                client_before,
-                "the client's credential store was rewritten {stage}",
-            );
-            assert_eq!(
-                std::fs::read(&host_auth_path).expect("read host store after refusal"),
-                host_before,
-                "the host credential store was rewritten {stage}",
-            );
-            assert!(
-                !shell.borrow().overlays.borrow().is_open(),
-                "the read refusal built a usage overlay {stage}",
-            );
-            let notices = main_notices(&world);
-            let refusal = notices.last().expect("the refusal is rendered");
-            assert!(
-                refusal.contains("over a connection")
-                    && refusal.contains("this machine's credential store"),
-                "the refusal does not name the ownership problem {stage}: {notices:?}",
-            );
-            assert!(
-                !notices.iter().any(|notice| {
-                    notice.contains("host-credential-sentinel")
-                        || notice.contains("client-credential-sentinel")
-                }),
-                "a credential was rendered {stage}: {notices:?}",
-            );
-        };
-
-        assert_no_credential_harm("before the scheduler barrier");
-        // A detached read spawned by the gesture may not receive its first poll
-        // until an await after the action returns. Keep every harm observer
-        // armed across both a scheduler turn and fixture shutdown.
-        tokio::task::yield_now().await;
-        assert_no_credential_harm("after the scheduler barrier");
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await,
+            ActionEffect::OpenedOverlay
+        ));
+        usage_page_until(&shell, "This host does not serve provider usage.").await;
         remote.shutdown().await;
-        assert_no_credential_harm("after remote shutdown");
     }
 
     /// Both entry gestures use the real drive loop and adapters. The search

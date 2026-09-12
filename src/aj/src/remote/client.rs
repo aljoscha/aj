@@ -348,6 +348,27 @@ impl RemoteClient {
         self.get(&format!("/v1/sessions/{session}/export")).await
     }
 
+    pub(crate) async fn provider_usage(
+        &self,
+        session: &str,
+    ) -> Result<aj_wire::ProviderUsageReport, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/usage")).await
+    }
+
+    pub(crate) async fn reset_provider_usage(
+        &self,
+        session: &str,
+        request: &aj_wire::UsageResetRequest,
+    ) -> Result<aj_wire::UsageResetResponse, RemoteError> {
+        let response = self
+            .post(
+                &format!("/v1/sessions/{session}/usage/reset"),
+                encode(request)?,
+            )
+            .await?;
+        decode(response).await
+    }
+
     pub(crate) async fn session_info(
         &self,
         session: &str,

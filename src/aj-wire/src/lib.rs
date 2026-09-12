@@ -21,6 +21,17 @@ use serde_json::value::RawValue;
 mod session_preview;
 pub use session_preview::{SessionPreview, SessionPreviews};
 
+mod provider_usage;
+pub use provider_usage::{
+    ProviderUsageReport, ProviderUsageStatus, UsageOutcome, UsageResetFailure, UsageResetRequest,
+    UsageResetResponse,
+};
+
+/// The capability for host provider usage at a session address.
+pub const PROVIDER_USAGE_CAPABILITY: &str = "provider_usage";
+/// The capability for spending host provider reset credits.
+pub const PROVIDER_USAGE_RESET_CAPABILITY: &str = "provider_usage_reset";
+
 mod session_info;
 pub use session_info::{SessionInfo, UsageBucket};
 
@@ -1033,6 +1044,7 @@ mod request {
 
     request_body!(EnvRequest, EnvRequest, |request| request);
     request_body!(AccountRequest, AccountRequest, |request| request);
+    request_body!(UsageResetRequest, UsageResetRequest, |request| request);
 
     request_body!(TagRequest, TagRequest, |request| request);
 

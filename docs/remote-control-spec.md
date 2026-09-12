@@ -521,6 +521,34 @@ code.
   id (including a gateway prefix), and report that local path in the notice.
   Capability `session_export` (section 5.10). Clients attempt the endpoint
   without capability gating and explain when the host does not support it.
+- `GET /v1/sessions/{id}/usage`: host provider-account plan usage, not the
+  session's token totals. Returns `ProviderUsageReport` in `aj-wire`, with
+  `statuses` sorted by provider and exact account label, and `reset_providers`
+  naming providers with a configured reset adapter. Each status contains
+  `provider_id`, nullable `account`, and `outcome`: `Usage` (windows, notes,
+  optional reset credits), `Unsupported` (reason), `NotConfigured`, `NoSource`,
+  or `Error` (message). Enums use serde's externally tagged representation.
+  A runtime credential override collapses its provider to one unlabeled row.
+  The host reads credentials and performs any OAuth refresh and writeback.
+  Capability `provider_usage` (section 5.10).
+- `POST /v1/sessions/{id}/usage/reset`: `{target, idempotency_key}`. The target
+  is copied unchanged from a report's `reset_credits.target`, containing
+  `provider_id`, nullable exact `account`, and `upstream_account_id`. It is an
+  identity claim, not a bearer credential or authorization. The host resolves
+  its own credentials and the provider revalidates the upstream identity before
+  spending. Account selection changes cannot retarget an offer. An unknown or
+  replaced account refuses as stale rather than falling back to a default.
+  The nonblank idempotency key identifies one confirmed attempt and is reused
+  unchanged on retries, including after an ambiguous transport failure.
+  A provider response is `{"Ok":"Reset"}`, `{"Ok":"AlreadyRedeemed"}`,
+  `{"Ok":"NothingToReset"}`, or `{"Ok":"NoCredit"}`. Provider failures are
+  `{"Err":"StaleTarget"}` (refresh required) or `{"Err":{"Error":"message"}}`
+  (retryable). These are HTTP 200 results. Session and transport refusals use
+  the ordinary error envelope. Capability `provider_usage_reset` (section 5.10).
+  Both endpoints validate the session before touching host credentials and do
+  not materialize it. The session address selects exactly one host through the
+  gateway's wildcard route, with no gateway-wide aggregation. No provider keys,
+  bearer tokens, or credential contents travel in either request or report.
 - `GET /v1/previews?session=<id>` (repeatable): the session browser's
   `SessionPreviews` in `aj-wire`, `{previews, incomplete}`. Each preview
   carries the full first user text block, message count, creation and
@@ -713,6 +741,8 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `transcript_settings` | user-message `branch_settings` and `GET /v1/sessions/{id}/env/before/{entry}` | hosts |
   | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
   | `session_export` | `GET /v1/sessions/{id}/export` | hosts |
+  | `provider_usage` | `GET /v1/sessions/{id}/usage` | hosts |
+  | `provider_usage_reset` | `POST /v1/sessions/{id}/usage/reset` | hosts |
   | `session_info` | `GET /v1/sessions/{id}/info` | hosts |
   | `session_previews` | `GET /v1/previews` | hosts and gateways |
   | `prompt_history` | Workspace and All prompt-history reads | hosts and gateways |
@@ -909,7 +939,8 @@ The boundary of what works over the wire is explicit. Supported: prompt,
 steer, cancel, queue withdraw and clear, settings including model switch
 and thinking display, compaction, task kill, the task-output overlay,
 tagging, archiving, environment overlay reads and edits, session account
-reads and selection, the session-info overlay, HTML export, the tree view and
+reads and selection, HTML export, the session-info and provider-usage overlays
+(including confirmed host reset-credit consumption), the tree view and
 head switching, and session
 creation and switching. The prompt recall ring holds this run's own
 submissions only. On exit, the client prints the focused session's id and
@@ -917,8 +948,8 @@ an `aj connect <url> <session>` command using the connected endpoint and
 the complete id, including its host prefix through a gateway. URLs with
 userinfo, query parameters, fragments, or control characters are replaced
 by `"$AJ_CONNECT_URL"`, with an instruction to set it to the same connection
-URL. No usage summary is printed. Refused, each with a notice naming why: the usage
-overlay and credential management (this client's credential store). An
+URL. No usage summary is printed. Credential management is refused with a
+notice because it reads this client’s credential store. An
 unsupported action never silently does nothing.
 
 Account selection attempts the host's endpoint and shows the ordinary
@@ -938,6 +969,14 @@ or journal is persisted, and no history read belongs to directory or sidebar pol
 Unsupported endpoints produce a notice rather than a capability pre-gate.
 The up-arrow ring is independent, retaining local bootstrap behavior and only
 this run's submissions over a connection.
+
+The usage overlay captures its Control connection and complete focused session
+address when opened. It renders that host's reports, offers eligible provider
+accounts with nonzero credits and a host reset adapter, confirms the exact
+account, and retains its target and idempotency key on retry. Completion offers
+a user-paced refresh against the same captured address, even if focus changes.
+It attempts both endpoints without capability pre-gating and renders a clear
+notice on `unknown_endpoint`, with no fallback to client credentials.
 
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer.
@@ -1059,9 +1098,3 @@ cancel, compact, kill, or dispatch inference.
 - A resumed sub-agent's report text is bracket-scoped: which child's
   report survives a resume depends on how their log lines interleaved.
   Accepted while it misleads nobody, per-run scoping is the named fix.
-- Banked, wanted: provider usage over a connection. Resolving an expired
-  OAuth credential writes it back and the reset consumes a credit, so
-  the host owns both ends: a user-paced usage read plus a separate reset
-  action, each behind its own endpoint and capability string. Credential
-  management is deliberately not banked: writing a host's credentials
-  from a remote client is its own question.

@@ -622,6 +622,7 @@ struct ShutdownState {
 }
 
 struct HostInner {
+    usage_sources: crate::usage::UsageSources,
     shared: Arc<HostShared>,
     persistence: ConversationPersistence,
     run_config_defaults: RunConfigDefaults,
@@ -687,6 +688,14 @@ impl SessionHost {
     /// Build a host over `setup`'s session store, minting or reading back
     /// the store's stable host id.
     pub fn new(setup: HostSetup) -> Result<Self, HostError> {
+        Self::with_usage_sources(setup, crate::usage::UsageSources::default())
+    }
+
+    /// Build a host with explicit provider usage and reset adapters.
+    pub fn with_usage_sources(
+        setup: HostSetup,
+        usage_sources: crate::usage::UsageSources,
+    ) -> Result<Self, HostError> {
         let HostSetup {
             config,
             layers,
@@ -709,6 +718,7 @@ impl SessionHost {
             .and_then(|name| normalize_host_name(&name).ok().flatten())
             .or_else(|| derive_host_name(&working_directory, aj_conf::home_dir().as_deref()));
         let inner = Arc::new(HostInner {
+            usage_sources,
             shared: Arc::new(HostShared {
                 config,
                 layers,
@@ -764,6 +774,8 @@ impl SessionHost {
                 COMPACTION_USAGE_CAPABILITY.to_string(),
                 aj_wire::SESSION_INFO_CAPABILITY.to_string(),
                 aj_wire::SESSION_EXPORT_CAPABILITY.to_string(),
+                aj_wire::PROVIDER_USAGE_CAPABILITY.to_string(),
+                aj_wire::PROVIDER_USAGE_RESET_CAPABILITY.to_string(),
                 aj_wire::SESSION_PREVIEWS_CAPABILITY.to_string(),
                 aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
                 aj_wire::SESSION_ENV_CAPABILITY.to_string(),
@@ -1421,6 +1433,36 @@ impl SessionHost {
         })
         .await
         .map_err(|err| HostError::Internal(Box::new(err)))?
+    }
+
+    /// Usage for the addressed session's host, not the session's token totals.
+    /// The session only routes the request, so it is validated but not
+    /// materialized before credentials are touched.
+    pub async fn provider_usage(
+        &self,
+        session: &str,
+    ) -> Result<aj_wire::ProviderUsageReport, HostError> {
+        self.live_or_cold(session).await?;
+        Ok(self
+            .inner
+            .usage_sources
+            .collect(&self.inner.shared.auth)
+            .await)
+    }
+
+    /// Spend a host credit for the exact report-issued account claim. The provider
+    /// revalidates identity against host credentials, never the current selection.
+    pub async fn reset_provider_usage(
+        &self,
+        session: &str,
+        request: &aj_wire::UsageResetRequest,
+    ) -> Result<aj_wire::UsageResetResponse, HostError> {
+        self.live_or_cold(session).await?;
+        Ok(self
+            .inner
+            .usage_sources
+            .reset(&self.inner.shared.auth, request)
+            .await)
     }
 
     /// Aggregate facts from the session log, materializing the session if needed.

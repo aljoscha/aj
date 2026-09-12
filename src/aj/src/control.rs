@@ -241,6 +241,32 @@ impl Control {
         }
     }
 
+    /// Provider account reports from exactly the host addressed by `session`.
+    pub(crate) async fn provider_usage(
+        &self,
+        session: &str,
+    ) -> Result<aj_wire::ProviderUsageReport, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.provider_usage(session).await?),
+            Self::Remote(remote) => Ok(remote.client.provider_usage(session).await?),
+        }
+    }
+
+    /// Execute one confirmed attempt. Retries retain the report target, session
+    /// address, and key rather than consulting the current focus or account.
+    pub(crate) async fn reset_provider_usage(
+        &self,
+        session: &str,
+        request: &aj_wire::UsageResetRequest,
+    ) -> Result<aj_wire::UsageResetResponse, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.reset_provider_usage(session, request).await?),
+            Self::Remote(remote) => {
+                Ok(remote.client.reset_provider_usage(session, request).await?)
+            }
+        }
+    }
+
     /// Aggregate facts from the host's log, loading the session if needed.
     pub(crate) async fn session_info(
         &self,

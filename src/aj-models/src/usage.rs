@@ -22,7 +22,7 @@ use thiserror::Error;
 use crate::auth::{AuthError, AuthStorage};
 
 /// One rate-limit window, ready to render.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UsageWindow {
     /// Human-readable window name, e.g. "5h limit".
     pub label: String,
@@ -34,7 +34,7 @@ pub struct UsageWindow {
 }
 
 /// A provider's full usage report.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderUsage {
     /// Rate-limit windows in the source's preferred display order.
     pub windows: Vec<UsageWindow>,
@@ -46,7 +46,7 @@ pub struct ProviderUsage {
 }
 
 /// Earned reset credits coupled to the account identity that reported them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RateLimitResetCredits {
     /// Number of credits currently available.
     pub available: u32,
@@ -68,9 +68,11 @@ impl RateLimitResetCredits {
 
 /// Opaque identity captured by a usage fetch for a later reset attempt.
 ///
-/// Callers can route it by provider id, but cannot construct or alter its
-/// account identities. A reset source must revalidate them before acting.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Callers route it by provider id and round-trip it unchanged over the wire.
+/// This is an identity claim, not authorization. A reset source must resolve
+/// host credentials and revalidate the account identity before acting.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitResetTarget {
     provider_id: String,
     account: Option<String>,
@@ -153,7 +155,7 @@ pub trait UsageSource: Send + Sync {
 }
 
 /// Outcome of spending one earned rate-limit reset credit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResetOutcome {
     /// A credit was consumed and the eligible windows were reset.
     Reset,
@@ -1216,6 +1218,7 @@ pub mod codex {
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use tempfile::TempDir;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
         use super::*;
@@ -1395,6 +1398,138 @@ pub mod codex {
         }
 
         #[tokio::test]
+        async fn reset_post_keeps_roundtripped_offer_binding_across_account_changes() {
+            let dir = TempDir::with_prefix("aj-usage-test-reset-binding-").unwrap();
+            let auth = AuthStorage::new(dir.path().join("auth.json"));
+            for (label, upstream) in [("work", "acct-work"), ("personal", "acct-personal")] {
+                auth.insert_account(
+                    PROVIDER_ID,
+                    label,
+                    AuthCredential::OAuth(OAuthCredentials::new(
+                        "refresh",
+                        access_token(upstream),
+                        i64::MAX,
+                    )),
+                )
+                .await
+                .unwrap();
+            }
+            auth.set_default_account(PROVIDER_ID, "work").await.unwrap();
+            let payload: UsagePayload = serde_json::from_str(TEAM_PLAN_RESPONSE).unwrap();
+            let offer = map_usage(&payload, reset_target("acct-work"))
+                .reset_credits
+                .unwrap();
+            let offer: RateLimitResetCredits =
+                serde_json::from_slice(&serde_json::to_vec(&offer).unwrap()).unwrap();
+            assert_eq!(offer.available, 2);
+            assert_eq!(offer.target.account(), Some("work"));
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/consume", listener.local_addr().unwrap());
+            let key = "attempt-Selected_Account/123";
+
+            // Observe the production POST, not a fake source's credential or
+            // deduplication logic. The endpoint only supplies a reset response.
+            async fn observe_post(listener: &TcpListener, token: &str, key: &str) {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "POST /consume HTTP/1.1\r\n");
+                let mut headers = std::collections::HashMap::new();
+                loop {
+                    line.clear();
+                    assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = line.trim_end().split_once(':').unwrap();
+                    assert!(
+                        headers
+                            .insert(name.to_ascii_lowercase(), value.trim().to_string())
+                            .is_none()
+                    );
+                }
+                assert_eq!(headers["authorization"], format!("Bearer {token}"));
+                assert_eq!(headers["chatgpt-account-id"], "acct-work");
+                assert_eq!(headers["content-type"], "application/json");
+                let mut body = vec![0; headers["content-length"].parse::<usize>().unwrap()];
+                stream.read_exact(&mut body).await.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                    serde_json::json!({"redeem_request_id": key})
+                );
+                let body = r#"{"code":"reset"}"#;
+                stream
+                    .write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ).as_bytes())
+                    .await
+                    .unwrap();
+            }
+
+            for default in ["work", "personal"] {
+                auth.set_default_account(PROVIDER_ID, default)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    auth.get_api_key(PROVIDER_ID, None)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .key,
+                    access_token(&format!("acct-{default}"))
+                );
+                let token = access_token("acct-work");
+                let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(
+                        OpenAICodexUsageSource.consume_reset_credit_at(
+                            &auth,
+                            &offer.target,
+                            key,
+                            &url
+                        ),
+                        observe_post(&listener, &token, key)
+                    )
+                })
+                .await
+                .expect("local reset POST completed");
+                assert_eq!(result.unwrap(), ResetOutcome::Reset);
+            }
+
+            auth.remove_account(PROVIDER_ID, "work").await.unwrap();
+            for rebound in [false, true] {
+                if rebound {
+                    auth.insert_account(
+                        PROVIDER_ID,
+                        "work",
+                        AuthCredential::OAuth(OAuthCredentials::new(
+                            "refresh",
+                            access_token("acct-rebound"),
+                            i64::MAX,
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let result = OpenAICodexUsageSource
+                    .consume_reset_credit_at(&auth, &offer.target, key, &url)
+                    .await;
+                assert!(
+                    matches!(result, Err(UsageError::StaleResetTarget)),
+                    "rebound={rebound}: {result:?}"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                        .await
+                        .is_err(),
+                    "stale target reached POST endpoint, rebound={rebound}"
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn stale_reset_target_sends_no_post() {
             let dir = TempDir::with_prefix("aj-usage-test-stale-reset-")
                 .expect("create scratch directory");
@@ -1418,13 +1553,12 @@ pub mod codex {
                     .await
                     .is_ok()
             });
+            let target: RateLimitResetTarget = serde_json::from_value(
+                serde_json::to_value(reset_target("account-from-usage")).unwrap(),
+            )
+            .unwrap();
             let result = OpenAICodexUsageSource
-                .consume_reset_credit_at(
-                    &auth,
-                    &reset_target("account-from-usage"),
-                    "attempt-1",
-                    &url,
-                )
+                .consume_reset_credit_at(&auth, &target, "attempt-1", &url)
                 .await;
 
             assert!(matches!(result, Err(UsageError::StaleResetTarget)));

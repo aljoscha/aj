@@ -8,7 +8,7 @@
 //! The page opens on a background fetch of every provider's usage report.
 //! A provider account is *eligible* for the reset action when its report
 //! carries non-zero [`aj_models::usage::ProviderUsage::reset_credits`] and a
-//! matching [`RateLimitResetSource`] is configured. When eligible, the
+//! matching reset source is advertised by the host. When eligible, the
 //! footer offers the `aj.usage.reset` chord, which drives the flow: pick an
 //! account (when more than one is eligible), confirm, spend the credit (a
 //! `POST` behind the source trait, run off the UI thread), show the outcome,
@@ -19,7 +19,7 @@
 //! The widget lives on the `!Send` UI thread, so it can't call
 //! `AsyncApp::request_redraw`. It spawns the fetch and the consume onto a
 //! [`tokio::runtime::Handle`] it holds, moving only `Send` data in (the
-//! `AuthStorage`, the `Arc<dyn RateLimitResetSource>`, the idempotency
+//! captured `Control` and session address, the idempotency
 //! key, the [`oneshot`] sender, and a clone of the redraw ping). Each task
 //! sends its result over a `oneshot` and pings the shared redraw sender.
 //! The drive loop turns the ping into a repaint, and both receivers are
@@ -28,12 +28,11 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use aj_app::keybindings::{ACTION_USAGE_RESET, action_shortcut};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome};
-use aj_models::auth::AuthStorage;
-use aj_models::usage::{RateLimitResetSource, RateLimitResetTarget, ResetOutcome, UsageError};
+use aj_models::usage::{RateLimitResetTarget, ResetOutcome, UsageError};
+use aj_wire::{ProviderUsageReport, UsageResetFailure, UsageResetRequest};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use vaxis::cell::{Segment, Style};
@@ -45,6 +44,7 @@ use vaxis::vxfw::{
 };
 
 use crate::content_overlay::{ContentStyles, Row, plain, usage_rows};
+use crate::control::Control;
 use crate::keymap::action_matches;
 use crate::overlay::{
     OverlayChrome, OverlayPlacement, OverlayStack, close_key_label, close_top, confirm_key_label,
@@ -146,10 +146,10 @@ pub(crate) struct UsageOverlay {
     /// Fetched per-provider statuses, once a fetch has landed.
     statuses: Option<Vec<ProviderUsageStatus>>,
     /// Pending fetch (initial or refetch). `None` once received.
-    statuses_rx: Option<oneshot::Receiver<Vec<ProviderUsageStatus>>>,
-    /// Set when a fetch's sender vanished, so `Display` shows an error row
-    /// instead of wedging in its loading state.
-    fetch_failed: bool,
+    statuses_rx: Option<oneshot::Receiver<Result<ProviderUsageReport, String>>>,
+    /// A host refusal, transport failure, or vanished fetch task, rendered
+    /// instead of leaving the page in its loading state.
+    fetch_error: Option<String>,
     /// Pending consume result. `Some` only while in `Consuming`.
     consume_rx: Option<oneshot::Receiver<Result<ResetOutcome, UsageError>>>,
     /// Rows of the current interactive menu phase, empty in read-only
@@ -170,8 +170,10 @@ pub(crate) struct UsageOverlay {
     /// open. A theme hot-reload while the overlay is up does not re-tint
     /// it, it re-tints on reopen.
     chrome_select: SelectStyles,
-    auth: AuthStorage,
-    reset_sources: Vec<Arc<dyn RateLimitResetSource>>,
+    // Frozen at open, including the gateway-qualified session address.
+    control: Control,
+    session: String,
+    reset_providers: Vec<String>,
     /// Where the fetch and consume tasks are spawned. Held so tests can
     /// pass their own runtime rather than relying on `Handle::current`.
     runtime: tokio::runtime::Handle,
@@ -192,8 +194,8 @@ impl UsageOverlay {
     /// fetch. The fetch pings `redraw` when it lands so the page repaints
     /// without a keypress.
     pub(crate) fn new(
-        auth: AuthStorage,
-        reset_sources: Vec<Arc<dyn RateLimitResetSource>>,
+        control: Control,
+        session: String,
         styles: ContentStyles,
         chrome_select: SelectStyles,
         runtime: tokio::runtime::Handle,
@@ -215,15 +217,16 @@ impl UsageOverlay {
             phase: Phase::Display,
             statuses: None,
             statuses_rx: None,
-            fetch_failed: false,
+            fetch_error: None,
             consume_rx: None,
             menu_items: Vec::new(),
             list,
             bars,
             styles,
             chrome_select,
-            auth,
-            reset_sources,
+            control,
+            session,
+            reset_providers: Vec::new(),
             runtime,
             redraw,
             on_close,
@@ -300,14 +303,7 @@ impl UsageOverlay {
     }
 
     fn has_reset_source(&self, provider_id: &str) -> bool {
-        self.reset_source_for(provider_id).is_some()
-    }
-
-    fn reset_source_for(&self, provider_id: &str) -> Option<Arc<dyn RateLimitResetSource>> {
-        self.reset_sources
-            .iter()
-            .find(|source| source.provider_id() == provider_id)
-            .cloned()
+        self.reset_providers.iter().any(|id| id == provider_id)
     }
 
     /// The reset credits available for `target`, for the confirm
@@ -348,26 +344,28 @@ impl UsageOverlay {
     /// Kick off spending one credit for `target` under idempotency key
     /// `key`. Spawns the request and moves to `Consuming`.
     fn begin_consume(&mut self, target: RateLimitResetTarget, key: String) {
-        let Some(source) = self.reset_source_for(target.provider_id()) else {
-            // The action is only offered for providers with a source, so
-            // this is defensive.
-            self.set_phase(Phase::Failed {
-                target,
-                key,
-                message: "Resetting is not supported for this provider.".to_string(),
-            });
-            return;
-        };
-
         let (tx, rx) = oneshot::channel();
-        let auth = self.auth.clone();
+        let control = self.control.clone();
+        let session = self.session.clone();
         let redraw = self.redraw.clone();
         let task_key = key.clone();
         let task_target = target.clone();
         self.runtime.spawn(async move {
-            let result = source
-                .consume_reset_credit(&auth, &task_target, &task_key)
-                .await;
+            let request = UsageResetRequest {
+                target: task_target,
+                idempotency_key: task_key,
+            };
+            let result = match control.reset_provider_usage(&session, &request).await {
+                Ok(result) => result.map_err(|err| match err {
+                    UsageResetFailure::StaleTarget => UsageError::StaleResetTarget,
+                    UsageResetFailure::Error(message) => UsageError::Fetch(message),
+                }),
+                Err(err) => Err(UsageError::Fetch(if err.unknown_endpoint() {
+                    "This host does not support provider usage resets.".into()
+                } else {
+                    err.to_string()
+                })),
+            };
             if tx.send(result).is_ok() {
                 // A dropped receiver (the overlay closed) makes this a
                 // no-op.
@@ -382,17 +380,24 @@ impl UsageOverlay {
     /// the initial load and the post-reset refresh.
     fn start_fetch(&mut self) {
         let (tx, rx) = oneshot::channel();
-        let auth = self.auth.clone();
+        let control = self.control.clone();
+        let session = self.session.clone();
         let redraw = self.redraw.clone();
         self.runtime.spawn(async move {
-            let statuses = aj_app::usage::collect_usage(&auth).await;
+            let statuses = control.provider_usage(&session).await.map_err(|err| {
+                if err.unknown_endpoint() {
+                    "This host does not serve provider usage.".into()
+                } else {
+                    format!("Usage fetch failed: {err}")
+                }
+            });
             if tx.send(statuses).is_ok() {
                 let _ = redraw.send(());
             }
         });
         self.statuses = None;
         self.statuses_rx = Some(rx);
-        self.fetch_failed = false;
+        self.fetch_error = None;
     }
 
     fn refresh_display(&mut self) {
@@ -444,18 +449,24 @@ impl UsageOverlay {
             return;
         };
         match rx.try_recv() {
-            Ok(statuses) => {
-                self.statuses = Some(statuses);
+            Ok(Ok(report)) => {
+                self.statuses = Some(report.statuses);
+                self.reset_providers = report.reset_providers;
                 self.statuses_rx = None;
-                self.fetch_failed = false;
+                self.fetch_error = None;
                 if matches!(self.phase, Phase::Display) {
                     self.rebuild_content();
                 }
             }
+            Ok(Err(message)) => {
+                self.statuses_rx = None;
+                self.fetch_error = Some(message);
+                self.rebuild_content();
+            }
             Err(oneshot::error::TryRecvError::Empty) => {}
             Err(oneshot::error::TryRecvError::Closed) => {
                 self.statuses_rx = None;
-                self.fetch_failed = true;
+                self.fetch_error = Some("Usage fetch failed.".into());
                 if matches!(self.phase, Phase::Display) {
                     self.rebuild_content();
                 }
@@ -532,8 +543,8 @@ impl UsageOverlay {
         if self.statuses_rx.is_some() {
             return vec![loading_row()];
         }
-        if self.fetch_failed {
-            return vec![plain("Usage fetch failed.")];
+        if let Some(message) = &self.fetch_error {
+            return vec![plain(message.clone())];
         }
         match self.statuses.as_ref() {
             Some(statuses) => usage_rows(statuses, &self.styles),
@@ -660,7 +671,7 @@ impl UsageOverlay {
     fn seed_statuses(&mut self, statuses: Vec<ProviderUsageStatus>) {
         self.statuses = Some(statuses);
         self.statuses_rx = None;
-        self.fetch_failed = false;
+        self.fetch_error = None;
         self.rebuild_content();
     }
 
@@ -753,8 +764,8 @@ pub(crate) fn open_usage_overlay(
     editor: &WidgetRef,
     chrome: &OverlayChrome,
     styles: ContentStyles,
-    auth: AuthStorage,
-    reset_sources: Vec<Arc<dyn RateLimitResetSource>>,
+    control: Control,
+    session: String,
     runtime: tokio::runtime::Handle,
     redraw: UnboundedSender<()>,
 ) {
@@ -768,8 +779,8 @@ pub(crate) fn open_usage_overlay(
     // it in the border afterwards.
     let footer_source = Rc::new(RefCell::new(String::new()));
     let overlay = Rc::new(RefCell::new(UsageOverlay::new(
-        auth,
-        reset_sources,
+        control,
+        session,
         styles,
         chrome.select.clone(),
         runtime,
@@ -936,9 +947,12 @@ fn new_idempotency_key() -> String {
 mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
-    use aj_models::usage::{ProviderUsage, RateLimitResetCredits, UsageError, UsageWindow};
+    use aj_models::auth::AuthStorage;
+    use aj_models::usage::{
+        ProviderUsage, RateLimitResetCredits, RateLimitResetSource, UsageError, UsageWindow,
+    };
     use async_trait::async_trait;
     use tempfile::TempDir;
     use vaxis::cell::Color;
@@ -966,11 +980,51 @@ mod tests {
     /// Each store still gets its own subdirectory, so tests running
     /// concurrently cannot see each other's credentials.
     fn scratch_auth() -> AuthStorage {
-        static ROOT: OnceLock<TempDir> = OnceLock::new();
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let root = ROOT.get_or_init(|| TempDir::with_prefix("aj-usage-").expect("create temp dir"));
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        AuthStorage::with_providers(root.path().join(format!("{n}/auth.json")), HashMap::new())
+        AuthStorage::with_providers(
+            usage_root().path().join(format!("{n}/auth.json")),
+            HashMap::new(),
+        )
+    }
+
+    fn usage_root() -> &'static TempDir {
+        static ROOT: OnceLock<TempDir> = OnceLock::new();
+        ROOT.get_or_init(|| TempDir::with_prefix("aj-usage-").expect("create temp dir"))
+    }
+
+    fn local_usage_control(
+        auth: AuthStorage,
+        resets: Vec<Arc<dyn RateLimitResetSource>>,
+    ) -> (Control, String) {
+        // Host background tasks share the fixture's process lifetime.
+        static DIRS: OnceLock<Mutex<Vec<TempDir>>> = OnceLock::new();
+        let dir = TempDir::new_in(usage_root().path()).unwrap();
+        let provider = crate::remote::tests::scripted(vec![], 0, std::time::Duration::ZERO);
+        let mut setup = crate::remote::tests::host_setup(
+            &dir,
+            crate::remote::tests::snapshot(provider),
+            crate::remote::tests::HostHandles::new(&dir),
+            None,
+        );
+        setup.auth = auth;
+        let (host, session) = runtime_handle().block_on(async {
+            let host = aj_app::host::SessionHost::with_usage_sources(
+                setup,
+                aj_app::usage::UsageSources {
+                    usage: aj_models::usage::default_usage_sources(),
+                    resets,
+                },
+            )
+            .unwrap();
+            let session = host.create().await.unwrap();
+            (host, session)
+        });
+        DIRS.get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push(dir);
+        (Control::local(host), session)
     }
 
     /// Distinct muted tint so a column left at the default fg fails the
@@ -1100,9 +1154,14 @@ mod tests {
             Box::new(move |_ctx| *closed.borrow_mut() = true)
         };
         let auth = scratch_auth();
+        let reset_providers = sources
+            .iter()
+            .map(|source| source.provider_id().to_string())
+            .collect();
+        let (control, session) = local_usage_control(auth, sources);
         let mut overlay = UsageOverlay::new(
-            auth,
-            sources,
+            control,
+            session,
             test_styles(),
             SelectStyles::default(),
             runtime_handle(),
@@ -1110,6 +1169,7 @@ mod tests {
             on_close,
             Rc::new(RefCell::new(String::new())),
         );
+        overlay.reset_providers = reset_providers;
         overlay.seed_statuses(statuses);
         (overlay, closed)
     }
@@ -1396,9 +1456,10 @@ mod tests {
             auth.set_runtime_api_key("openai-codex", "not-an-oauth-token".to_string())
                 .await;
         });
+        let (control, session) = local_usage_control(auth, Vec::new());
         let mut overlay = UsageOverlay::new(
-            auth,
-            Vec::new(),
+            control,
+            session,
             test_styles(),
             SelectStyles::default(),
             runtime_handle(),

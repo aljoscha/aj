@@ -1,4 +1,4 @@
-//! Binary-side usage-page helpers.
+//! Host-owned provider usage collection and reset actions, with display helpers.
 //!
 //! The fetching machinery (the [`UsageSource`] trait and its
 //! implementations) lives in `aj-models`; this module holds the
@@ -14,7 +14,9 @@ use std::sync::Arc;
 use chrono::{Datelike, Local, TimeZone, Utc};
 
 use aj_models::auth::AuthStorage;
-use aj_models::usage::{ProviderUsage, UsageReport, UsageSource, default_usage_sources};
+#[cfg(test)]
+use aj_models::usage::ProviderUsage;
+use aj_models::usage::{UsageError, UsageReport, UsageSource, default_usage_sources};
 
 /// Per-account timeout. The Anthropic source's HTTP request already
 /// caps itself at 5 s; this outer bound also covers credential
@@ -22,30 +24,77 @@ use aj_models::usage::{ProviderUsage, UsageReport, UsageSource, default_usage_so
 /// hold the whole page indefinitely.
 const SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// One provider account's resolved usage status, ready to render.
-#[derive(Debug, Clone)]
-pub struct ProviderUsageStatus {
-    pub provider_id: String,
-    /// The exact stored account label. `None` is the effective unlabeled
-    /// credential or an unconfigured provider.
-    pub account: Option<String>,
-    pub outcome: UsageOutcome,
+pub use aj_wire::{ProviderUsageStatus, UsageOutcome};
+
+/// Provider adapters owned by a session host. Credentials are supplied only by
+/// that host, including on refresh and reset retries.
+pub struct UsageSources {
+    pub usage: Vec<Arc<dyn UsageSource>>,
+    pub resets: Vec<Arc<dyn aj_models::usage::RateLimitResetSource>>,
 }
 
-/// What the `/usage` page shows for one provider account.
-#[derive(Debug, Clone)]
-pub enum UsageOutcome {
-    /// Usage numbers were fetched; render one row per window.
-    Usage(ProviderUsage),
-    /// Credentials exist but can't report usage (provider-supplied
-    /// reason, e.g. "only available with a subscription login").
-    Unsupported { reason: String },
-    /// No credentials configured for this provider.
-    NotConfigured,
-    /// No usage source implemented for this provider yet.
-    NoSource,
-    /// The fetch failed; the message is shown verbatim.
-    Error(String),
+impl Default for UsageSources {
+    fn default() -> Self {
+        Self {
+            usage: default_usage_sources(),
+            resets: aj_models::usage::default_reset_sources(),
+        }
+    }
+}
+
+impl UsageSources {
+    /// Collect every account through the supplied host credential store.
+    pub async fn collect(&self, auth: &AuthStorage) -> aj_wire::ProviderUsageReport {
+        aj_wire::ProviderUsageReport {
+            statuses: collect_usage_from_sources(auth, self.usage.clone(), SOURCE_TIMEOUT).await,
+            reset_providers: self
+                .resets
+                .iter()
+                .map(|source| source.provider_id().to_string())
+                .collect(),
+        }
+    }
+
+    /// Route a confirmed claim to its provider, which revalidates account identity
+    /// against host credentials before consuming a credit.
+    pub async fn reset(
+        &self,
+        auth: &AuthStorage,
+        request: &aj_wire::UsageResetRequest,
+    ) -> aj_wire::UsageResetResponse {
+        use aj_wire::UsageResetFailure;
+        let Some(source) = self
+            .resets
+            .iter()
+            .find(|source| source.provider_id() == request.target.provider_id())
+        else {
+            return Err(UsageResetFailure::Error(
+                "Resetting is not supported for this provider.".into(),
+            ));
+        };
+        if request.idempotency_key.trim().is_empty() {
+            return Err(UsageResetFailure::Error(
+                "A reset idempotency key is required.".into(),
+            ));
+        }
+        source
+            .consume_reset_credit(auth, &request.target, &request.idempotency_key)
+            .await
+            .map_err(|err| match err {
+                UsageError::StaleResetTarget => UsageResetFailure::StaleTarget,
+                err => UsageResetFailure::Error(usage_error_message(err)),
+            })
+    }
+}
+
+fn usage_error_message(error: UsageError) -> String {
+    match error {
+        // Credential parser and OAuth errors can contain secrets. Keep them
+        // host-local, while preserving the usage adapter's provider diagnostics.
+        UsageError::Auth(_) => "Could not resolve host credentials".into(),
+        UsageError::Fetch(message) => message,
+        UsageError::StaleResetTarget => error.to_string(),
+    }
 }
 
 /// Providers surfaced on the `/usage` page even without a usage
@@ -131,7 +180,7 @@ async fn collect_usage_from_sources(
                         UsageOutcome::Unsupported { reason }
                     }
                     Ok(Ok(UsageReport::NotConfigured)) => UsageOutcome::NotConfigured,
-                    Ok(Err(err)) => UsageOutcome::Error(err.to_string()),
+                    Ok(Err(err)) => UsageOutcome::Error(usage_error_message(err)),
                     Err(_) => UsageOutcome::Error("timed out".to_string()),
                 };
                 ProviderUsageStatus {
@@ -169,7 +218,7 @@ async fn account_labels(
     }
     let accounts = match tokio::time::timeout(timeout, auth.accounts(provider_id)).await {
         Ok(Ok(accounts)) => accounts,
-        Ok(Err(err)) => return Err(err.to_string()),
+        Ok(Err(err)) => return Err(usage_error_message(err.into())),
         Err(_) => return Err("timed out".to_string()),
     };
     let labels: Vec<Option<String>> = accounts
@@ -277,8 +326,8 @@ pub fn now_unix_ms() -> i64 {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use aj_models::auth::AuthCredential;
-    use aj_models::usage::{UsageError, UsageWindow};
+    use aj_models::auth::{AuthCredential, AuthError};
+    use aj_models::usage::{RateLimitResetTarget, UsageWindow};
     use async_trait::async_trait;
     use chrono::DateTime;
     use tempfile::TempDir;
@@ -356,6 +405,114 @@ mod tests {
         assert_eq!(
             ids,
             vec!["anthropic", "openai", "openai-codex", "openrouter"]
+        );
+    }
+
+    const CREDENTIAL_SENTINEL: &str = "secret-credential-sentinel";
+
+    async fn corrupt_credentials(auth: &AuthStorage) {
+        let malformed = serde_json::json!({
+            "openai-codex": {
+                "type": "oauth",
+                "access": "access-token",
+                "refresh": "refresh-token",
+                "expires": CREDENTIAL_SENTINEL,
+            }
+        });
+        std::fs::write(auth.path(), serde_json::to_vec(&malformed).unwrap()).unwrap();
+        let error = auth.accounts("openai-codex").await.unwrap_err();
+        assert!(matches!(error, AuthError::Parse(_)));
+        assert!(error.to_string().contains(CREDENTIAL_SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn discovery_errors_do_not_serialize_credential_contents() {
+        let dir = TempDir::with_prefix("aj-usage-discovery-error-").unwrap();
+        let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
+        corrupt_credentials(&auth).await;
+
+        let report = UsageSources::default().collect(&auth).await;
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains(CREDENTIAL_SENTINEL)
+        );
+        for provider in ["anthropic", "openai-codex"] {
+            let rows = accounts_of(&report.statuses, provider);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].outcome,
+                UsageOutcome::Error("Could not resolve host credentials".into())
+            );
+        }
+    }
+
+    struct CorruptingUsageSource;
+
+    #[async_trait]
+    impl UsageSource for CorruptingUsageSource {
+        fn provider_id(&self) -> &str {
+            "openai-codex"
+        }
+
+        async fn fetch(
+            &self,
+            auth: &AuthStorage,
+            account: Option<&str>,
+        ) -> Result<UsageReport, UsageError> {
+            // Discovery has finished. Exercise a credential failure during the
+            // real adapter's subsequent resolution, not the inventory read.
+            corrupt_credentials(auth).await;
+            aj_models::usage::codex::OpenAICodexUsageSource
+                .fetch(auth, account)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_errors_do_not_serialize_credential_contents() {
+        let dir = TempDir::with_prefix("aj-usage-fetch-error-").unwrap();
+        let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
+        let sources = UsageSources {
+            usage: vec![Arc::new(CorruptingUsageSource)],
+            resets: vec![],
+        };
+
+        let report = sources.collect(&auth).await;
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains(CREDENTIAL_SENTINEL)
+        );
+        let rows = accounts_of(&report.statuses, "openai-codex");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].outcome,
+            UsageOutcome::Error("Could not resolve host credentials".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_errors_do_not_serialize_credential_contents() {
+        let dir = TempDir::with_prefix("aj-usage-reset-error-").unwrap();
+        let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
+        corrupt_credentials(&auth).await;
+        let request = aj_wire::UsageResetRequest {
+            target: RateLimitResetTarget::new("openai-codex", None, "account-id".into()),
+            idempotency_key: "reset-attempt".into(),
+        };
+
+        let response = UsageSources::default().reset(&auth, &request).await;
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains(CREDENTIAL_SENTINEL)
+        );
+        assert_eq!(
+            response,
+            Err(aj_wire::UsageResetFailure::Error(
+                "Could not resolve host credentials".into()
+            ))
         );
     }
 

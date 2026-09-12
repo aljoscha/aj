@@ -59,6 +59,8 @@ use async_trait::async_trait;
 use reqwest::StatusCode;
 use tempfile::TempDir;
 
+pub(crate) mod provider_usage;
+
 use super::*;
 use crate::control::{Control, ControlError, ControlFrame};
 use crate::remote::identity::{
@@ -566,7 +568,17 @@ fn scripted_host_with_run_config(
     handles: HostHandles,
     name: Option<&str>,
 ) -> SessionHost {
-    SessionHost::new(HostSetup {
+    SessionHost::new(host_setup(dir, run_config, handles, name))
+        .expect("a host over the temp store")
+}
+
+pub(crate) fn host_setup(
+    dir: &TempDir,
+    run_config: RunConfigSnapshot,
+    handles: HostHandles,
+    name: Option<&str>,
+) -> HostSetup {
+    HostSetup {
         config: handles.config,
         layers: handles.layers,
         catalog: Arc::new(vec![catalog_model()]),
@@ -578,11 +590,10 @@ fn scripted_host_with_run_config(
         name: name.map(str::to_string),
         idle_grace: None,
         live_capacity: None,
-    })
-    .expect("a host over the temp store")
+    }
 }
 
-fn snapshot(provider: Arc<dyn Provider>) -> RunConfigSnapshot {
+pub(crate) fn snapshot(provider: Arc<dyn Provider>) -> RunConfigSnapshot {
     RunConfigSnapshot {
         accounts: Default::default(),
         provider,
