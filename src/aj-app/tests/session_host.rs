@@ -1822,7 +1822,7 @@ impl Drop for RivalWriter {
 /// empty set is also what a tick that never runs looks like, so the second half
 /// takes the set off empty and watches the probes start, which is the same tick
 /// proving it was alive for the first half.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn the_tick_probes_nothing_until_something_is_held() {
     let harness = Harness::new(vec![finalized_text_message("on the record")]);
     let session = harness.create().await;
@@ -1843,7 +1843,11 @@ async fn the_tick_probes_nothing_until_something_is_held() {
          set's and this test measures nothing",
     );
     let settled = harness.host.store_lock_probes();
+    // Only the probe windows use virtual time. Subprocess lock acquisition and
+    // session setup must make progress on the real scheduler.
+    tokio::time::pause();
     tokio::time::sleep(LOCK_PROBE_TICK * 3).await;
+    tokio::time::resume();
     assert_eq!(
         harness.host.store_lock_probes(),
         settled,
@@ -1868,7 +1872,9 @@ async fn the_tick_probes_nothing_until_something_is_held() {
     );
 
     let armed = host.host.store_lock_probes();
+    tokio::time::pause();
     tokio::time::sleep(LOCK_PROBE_TICK * 3).await;
+    tokio::time::resume();
     assert!(
         host.host.store_lock_probes() > armed,
         "the tick never asked about a session this host publishes as locked, so \
