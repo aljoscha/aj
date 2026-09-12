@@ -9,6 +9,8 @@
 #
 # The suite is built first, under the ambient temp directory, so that rustc's
 # own scratch files are not mistaken for a test's.
+# Arguments select a cargo test target or scheduling mode. With no arguments,
+# the guard runs the whole workspace with ordinary test parallelism.
 set -euo pipefail
 
 # State that legitimately outlives a test lives under one named per-process
@@ -38,15 +40,11 @@ trap 'rm -rf "$scratch"' EXIT
 scan="$(mktemp)"
 trap 'rm -rf "$scratch" "$scan"' EXIT
 
-cargo test --workspace --no-run --quiet
-# Gateway integration tests each own a multi-thread Tokio runtime. Letting
-# libtest run several of them together can starve their real loopback requests
-# on a small runner. Run every other target normally, then this module alone.
-# The guard still covers the whole suite, and the ordinary Test job retains the
-# parallel execution coverage.
-TMPDIR="$scratch" cargo test --workspace --exclude aj --quiet
-TMPDIR="$scratch" cargo test -p aj --quiet -- --skip gateway::tests
-TMPDIR="$scratch" cargo test -p aj --quiet gateway::tests -- --test-threads=1
+if (( $# == 0 )); then
+    set -- --workspace
+fi
+cargo test --no-run --quiet "$@"
+TMPDIR="$scratch" cargo test --quiet "$@"
 
 # Bash does not propagate a process substitution's status through its reader,
 # so materialize the NUL stream before accepting an empty scan as clean.

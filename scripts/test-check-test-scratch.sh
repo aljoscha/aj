@@ -8,11 +8,19 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir "$fixture/cargo-bin" "$fixture/scan-failure-bin"
 cat >"$fixture/cargo-bin/cargo" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n ${SCRATCH_CARGO_LOG:-} ]]; then
+    printf '<%s>' "$@" >>"$SCRATCH_CARGO_LOG"
+    printf '\n' >>"$SCRATCH_CARGO_LOG"
+fi
 if [[ " $* " == *" --no-run "* ]]; then
+    if [[ ${SCRATCH_FIXTURE:-} == build-failure ]]; then
+        exit 72
+    fi
     exit 0
 fi
 case "${SCRATCH_FIXTURE:-clean}" in
     clean) ;;
+    test-failure) exit 73 ;;
     allowed)
         mkdir -p \
             "$TMPDIR/aj-usage-A1b2C3" \
@@ -44,6 +52,48 @@ echo "injected residue scan failure" >&2
 exit 71
 EOF
 chmod +x "$fixture/cargo-bin/cargo" "$fixture/scan-failure-bin/find"
+
+for mode in workspace gateway; do
+    args=()
+    if [[ $mode == gateway ]]; then
+        args=(-p aj gateway::tests -- --test-threads=1)
+    fi
+    SCRATCH_CARGO_LOG="$fixture/$mode-commands" PATH="$fixture/cargo-bin:$PATH" \
+        "$repo/scripts/check-test-scratch.sh" "${args[@]}" >"$fixture/$mode-stdout"
+done
+cat >"$fixture/workspace-expected" <<'EOF'
+<test><--no-run><--quiet><--workspace>
+<test><--quiet><--workspace>
+EOF
+cat >"$fixture/gateway-expected" <<'EOF'
+<test><--no-run><--quiet><-p><aj><gateway::tests><--><--test-threads=1>
+<test><--quiet><-p><aj><gateway::tests><--><--test-threads=1>
+EOF
+for mode in workspace gateway; do
+    if ! cmp -s "$fixture/$mode-expected" "$fixture/$mode-commands"; then
+        echo "error: scratch guard did not build and run $mode exactly once" >&2
+        exit 1
+    fi
+done
+
+for phase in build test; do
+    status=0
+    SCRATCH_FIXTURE="$phase-failure" PATH="$fixture/cargo-bin:$PATH" \
+        "$repo/scripts/check-test-scratch.sh" >"$fixture/$phase-failure-stdout" \
+        2>"$fixture/$phase-failure-stderr" || status=$?
+    expected=72
+    if [[ $phase == test ]]; then
+        expected=73
+    fi
+    if [[ $status != "$expected" ]]; then
+        echo "error: scratch guard did not propagate the $phase failure" >&2
+        exit 1
+    fi
+    if grep -Fq "ok: the suite left no scratch residue" "$fixture/$phase-failure-stdout"; then
+        echo "error: scratch guard reported clean after a $phase failure" >&2
+        exit 1
+    fi
+done
 
 scan_stdout="$fixture/scan-stdout"
 scan_stderr="$fixture/scan-stderr"
@@ -125,3 +175,4 @@ fi
 
 echo "ok: scratch guard rejects residue scan failures"
 echo "ok: scratch guard allows only named process-lifetime roots"
+echo "ok: scratch guard runs the selected tests once and propagates failures"

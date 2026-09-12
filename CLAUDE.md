@@ -71,12 +71,12 @@ The current CI gate for review-ready work is:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test`
+- `./scripts/check-test-scratch.sh` (the ordinary parallel workspace suite)
 - `cargo build --all-targets`
 - `./scripts/check-no-tui-dep.sh`
 - `./scripts/check-no-http-dep.sh`
 - `./scripts/test-check-test-scratch.sh`
-- `./scripts/check-test-scratch.sh`
+- `./scripts/check-test-scratch.sh -p aj gateway::tests -- --test-threads=1`
 
 Scale targeted checks while iterating, but verify the final range against the
 guarantees it claims. Important behavior is exercised through the real composed
