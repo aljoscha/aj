@@ -21280,6 +21280,11 @@ mod tests {
                     "Session: {session} (resume with: aj connect '{url}' '{session}')"
                 )),
             );
+            // Named connects resolve through the directory. Creation can be
+            // acknowledged before the gateway has received its host's list.
+            if url == gateway.url() {
+                gateway.until_sessions(session_count(&remote).await).await;
+            }
             let resumed = connect_world_at(&client_dir, &url, &[&session]).await;
             assert_eq!(resumed.session(), session);
             app.shutdown().await;
