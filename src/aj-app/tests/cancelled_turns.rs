@@ -44,16 +44,22 @@ fn provider_run_config(
     provider: Arc<dyn Provider>,
     model: ModelInfo,
 ) -> Arc<Mutex<RunConfigSnapshot>> {
-    Arc::new(Mutex::new(RunConfigSnapshot {
-        accounts: Default::default(),
-        provider,
-        model_info: Arc::new(model),
-        stream_options: StreamOptions::default(),
-        thinking: None,
-        thinking_display: None,
-        speed: None,
-        model_key: ("scripted".to_string(), "scripted".to_string()),
-        session_id: None,
+    Arc::new(Mutex::new({
+        let main = aj_app::session_setup::ModelConfig {
+            provider,
+            model_info: Arc::new(model),
+            stream_options: StreamOptions::default(),
+            thinking: None,
+            thinking_display: None,
+            speed: None,
+            model_key: ("scripted".to_string(), "scripted".to_string()),
+        };
+        RunConfigSnapshot {
+            oracle: main.clone(),
+            main,
+            accounts: Default::default(),
+            session_id: None,
+        }
     }))
 }
 

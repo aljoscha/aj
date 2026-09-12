@@ -117,16 +117,22 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
             writes: Default::default(),
         })),
         catalog: Arc::new(Vec::new()),
-        defaults: RunConfigDefaults::fixed(RunConfigSnapshot {
-            accounts: Default::default(),
-            provider,
-            model_info: Arc::new(scripted_model_info()),
-            stream_options: aj_models::types::StreamOptions::default(),
-            thinking: None,
-            thinking_display: None,
-            speed: None,
-            model_key: ("scripted".to_string(), "scripted".to_string()),
-            session_id: None,
+        defaults: RunConfigDefaults::fixed({
+            let main = aj_app::session_setup::ModelConfig {
+                provider,
+                model_info: Arc::new(scripted_model_info()),
+                stream_options: aj_models::types::StreamOptions::default(),
+                thinking: None,
+                thinking_display: None,
+                speed: None,
+                model_key: ("scripted".to_string(), "scripted".to_string()),
+            };
+            RunConfigSnapshot {
+                oracle: main.clone(),
+                main,
+                accounts: Default::default(),
+                session_id: None,
+            }
         }),
         restore: None,
         persistence: persistence.clone(),

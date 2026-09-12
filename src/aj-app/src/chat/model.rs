@@ -201,6 +201,8 @@ pub struct SubAgentEntry {
     pub child: usize,
     /// Task description supplied by the parent.
     pub task: String,
+    /// Originating tool name for display identity. Empty is unspecified.
+    pub tool_name: String,
     pub status: SubAgentStatus,
     /// Final report, set on `SubAgentEnd`.
     pub report: Option<String>,
@@ -460,6 +462,8 @@ pub struct TaskInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentEntry {
     pub id: AgentId,
+    /// Originating tool name. Empty for Main or an unspecified child origin.
+    pub tool_name: String,
     /// The sub-agent's task description. `None` for the main agent.
     pub task: Option<String>,
     /// The sub-agent's run status. `None` for the main agent.
@@ -792,6 +796,7 @@ impl ChatState {
         let now = Instant::now();
         let mut out = vec![AgentEntry {
             id: AgentId::Main,
+            tool_name: String::new(),
             task: None,
             status: None,
             runtime: None,
@@ -808,6 +813,7 @@ impl ChatState {
             {
                 out.push(AgentEntry {
                     id: AgentId::Sub(n),
+                    tool_name: sub.tool_name.clone(),
                     task: Some(sub.task.clone()),
                     status: Some(sub.status),
                     runtime: Some(

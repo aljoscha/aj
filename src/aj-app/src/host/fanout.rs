@@ -557,6 +557,7 @@ mod tests {
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
+            oracle_settings: None,
             credential_warning: None,
             last_seq,
         }

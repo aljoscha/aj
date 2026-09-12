@@ -19,7 +19,7 @@ pub mod types;
 pub use error::BoxError;
 pub use sanitize::sanitize_terminal_output;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
@@ -209,6 +209,9 @@ pub struct Agent {
     assembled_system_prompt: String,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<UnifiedToolDefinition>,
+    /// Explicitly configured children retain their supplied tool names as a
+    /// capability ceiling across bundle swaps. Normal agents have no ceiling.
+    allowed_tool_names: Option<HashSet<String>>,
     /// The exclusion list handed to [`Agent::with_provider`], forwarded
     /// verbatim to agents spawned from here. Nothing filters by it: a
     /// child's catalog is a clone of this agent's, so the restriction is
@@ -378,6 +381,7 @@ impl Agent {
             assembled_system_prompt: String::new(),
             tool_definitions,
             tools: api_tools,
+            allowed_tool_names: None,
             disabled_tools,
             provider,
             model_info,
@@ -881,7 +885,12 @@ impl Agent {
     /// The provider-facing definitions and executable lookup are rebuilt
     /// together so a model switch cannot advertise stale tools or execute a
     /// tool that is no longer visible to the model.
-    pub fn set_tools(&mut self, tools: Vec<ErasedToolDefinition>) {
+    /// Explicitly configured children intersect this catalog with their original
+    /// tool names, preserving their capability ceiling across bundle swaps.
+    pub fn set_tools(&mut self, mut tools: Vec<ErasedToolDefinition>) {
+        if let Some(allowed) = &self.allowed_tool_names {
+            tools.retain(|tool| allowed.contains(&tool.name));
+        }
         self.tools = tools
             .iter()
             .map(|tool| UnifiedToolDefinition {
@@ -3399,19 +3408,16 @@ struct SessionContextWrapper<'a> {
     session_state: SessionState,
     /// The fully-assembled system prompt for the current run,
     /// captured at the moment the tool is invoked. Sub-agents
-    /// spawned through this wrapper inherit it verbatim so the
-    /// session has a single, consistent system prompt across all
-    /// agents.
+    /// spawned through this wrapper inherit it, optionally with an
+    /// explicitly configured suffix.
     assembled_system_prompt: String,
     disabled_tools: &'a [String],
-    /// Unified provider handle threaded into sub-agents. Cloned from
-    /// the parent's handle so the whole hierarchy talks to the same
-    /// backend.
+    /// Default provider handle for ordinary sub-agent spawns.
     provider: Arc<dyn Provider>,
     model_info: Arc<ModelInfo>,
     stream_options: StreamOptions,
     /// Snapshot of the parent's tool list. Sub-agents inherit this
-    /// minus the `agent` tool. Cloning per-spawn is cheap because
+    /// minus the `agent` and `oracle` tools. Cloning per-spawn is cheap because
     /// every `ErasedToolDefinition` field is `Clone` and the
     /// closure is `Arc`-shared.
     sub_agent_tools: Vec<ErasedToolDefinition>,
@@ -3473,31 +3479,34 @@ struct SessionContextWrapper<'a> {
     tool_args: serde_json::Value,
 }
 
-impl<'a> ToolContext for SessionContextWrapper<'a> {
-    fn working_directory(&self) -> PathBuf {
-        self.session_state.working_directory()
-    }
-
-    fn session_env(&self) -> BTreeMap<String, String> {
-        self.session_state.session_env()
-    }
-
-    fn get_todo_list(&self) -> Vec<TodoItem> {
-        self.session_state.get_todo_list()
-    }
-
-    fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
-        self.session_state.set_todo_list(todos);
-    }
-
-    fn spawn_agent<'b>(
+impl SessionContextWrapper<'_> {
+    fn spawn_child<'b>(
         &'b mut self,
         task: String,
         mode: SpawnMode,
+        config: Option<tool::SpawnAgentConfig>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<SpawnResult, BoxError>> + Send + 'b>,
     > {
         Box::pin(async move {
+            let allowed_tool_names = config
+                .as_ref()
+                .map(|config| config.tools.iter().map(|tool| tool.name.clone()).collect());
+            let config = config.unwrap_or_else(|| tool::SpawnAgentConfig {
+                provider: Arc::clone(&self.provider),
+                model_info: Arc::clone(&self.model_info),
+                stream_options: self.stream_options.clone(),
+                thinking: self.default_thinking.clone(),
+                speed: self.speed,
+                thinking_display: String::new(),
+                tools: self
+                    .sub_agent_tools
+                    .iter()
+                    .filter(|tool| tool.name != "agent" && tool.name != "oracle")
+                    .cloned()
+                    .collect(),
+                system_prompt_suffix: String::new(),
+            });
             // Get the next agent ID
             let agent_id = self.session_state.next_sub_agent_id();
             let child_id = AgentId::Sub(agent_id);
@@ -3509,81 +3518,64 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // group nested transcripts under the parent's
             // tool-execution component.
             // The bundle identity carried on the event mirrors the
-            // parent's bundle, which is exactly what the child is
+            // selected bundle, which is exactly what the child is
             // built from below.
             self.parent_bus
                 .emit(AgentEvent::SubAgentStart {
                     parent: self.agent_id,
                     child: child_id,
                     task: task.clone(),
+                    tool_name: self.tool_name.clone(),
                     background: matches!(mode, SpawnMode::Background),
                     settings: AgentSettings {
-                        provider: self.model_info.provider.clone(),
-                        model_id: self.model_info.id.clone(),
-                        thinking: aj_models::thinking_config_name(self.default_thinking.as_ref())
+                        provider: config.model_info.provider.clone(),
+                        model_id: config.model_info.id.clone(),
+                        thinking: aj_models::thinking_config_name(config.thinking.as_ref())
                             .to_string(),
-                        // The agent only has provider-specific stream options.
-                        // The canonical display choice lives in the session's
-                        // run-config snapshot and cannot be recovered here.
-                        thinking_display: String::new(),
-                        speed: aj_models::speed_name(self.speed).to_string(),
-                        verbosity: aj_models::verbosity_name(self.stream_options.verbosity)
+                        thinking_display: config.thinking_display,
+                        speed: aj_models::speed_name(config.speed).to_string(),
+                        verbosity: aj_models::verbosity_name(config.stream_options.verbosity)
                             .to_string(),
                     },
                 })
                 .await?;
 
-            // Build the sub-agent's tool list by cloning the
-            // parent's (the toolset is filtered upstream when the
-            // binary calls `Agent::with_provider`), then dropping
-            // the `agent` tool itself to prevent infinite recursion.
-            // We clone rather than re-call `get_builtin_tools` so
-            // `aj-agent` doesn't depend on `aj-tools`.
             let disabled_tools = self.disabled_tools.to_vec();
-            let sub_agent_tools: Vec<ErasedToolDefinition> = self
-                .sub_agent_tools
-                .iter()
-                .filter(|tool| tool.name != "agent")
-                .cloned()
-                .collect();
 
             // Create a new agent rooted in this session's working
             // directory and tools. Its transcript starts empty; the
             // prompt the tool invoked us with is appended as the first
-            // user message inside `run_single_turn`. Sub-agents share
-            // the parent's provider and model_info so the whole
-            // hierarchy talks to the same backend, and inherit its
-            // stream_options except for the prompt-cache key, which we
-            // scope to the child's id below. The thinking level is
-            // applied separately below via `set_default_thinking` so
-            // the child inherits the parent's resolved value.
+            // user message inside `run_single_turn`. The selected bundle
+            // is retained on the child for later continuations as well.
             //
             // Scoping the cache key keeps the child's distinct prefix
             // from colliding with the main thread's or a sibling's. A
-            // parent without a key (provider that doesn't key caching
+            // bundle without a key (provider that doesn't key caching
             // on it) leaves the child without one too.
-            let mut sub_stream_options = self.stream_options.clone();
-            if let Some(base) = self.stream_options.session_id.as_deref() {
+            let mut sub_stream_options = config.stream_options;
+            if let Some(base) = sub_stream_options.session_id.as_deref() {
                 sub_stream_options.session_id = Some(sub_agent_session_id(base, agent_id));
             }
             let mut sub_agent = Agent::with_provider(
                 self.session_state.working_directory(),
-                sub_agent_tools,
+                config.tools,
                 disabled_tools,
-                Arc::clone(&self.provider),
-                Arc::clone(&self.model_info),
+                config.provider,
+                config.model_info,
                 sub_stream_options,
                 None,
             );
+            sub_agent.allowed_tool_names = allowed_tool_names;
             sub_agent.set_agent_id(child_id);
-            // Sub-agents inherit the parent's assembled system
-            // prompt verbatim so the session has a single,
-            // consistent prompt across the hierarchy. The transcript
+            // Inherit the assembled prompt plus any explicit suffix. The transcript
             // and counter parts of the seed stay at their defaults:
             // the child starts with an empty history and mints no
             // persisted-id collisions of its own.
             sub_agent.seed_session(AgentSeed {
-                assembled_system_prompt: Some(self.assembled_system_prompt.clone()),
+                assembled_system_prompt: Some(format!(
+                    "{}{}",
+                    self.assembled_system_prompt, config.system_prompt_suffix
+                )),
                 ..AgentSeed::default()
             });
             // Sub-agents inherit the parent's `image_block` setting
@@ -3593,15 +3585,9 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // Tool subshells inherit the session overlay through the child's
             // own context rather than through its shared tool instances.
             sub_agent.session_state.session_env = Arc::clone(&self.session_state.session_env);
-            // Sub-agents inherit the parent's thinking level so they
-            // reason at the same effort and so a `None` default never
-            // gets serialized as an explicit `disabled` for models
-            // that reject it.
-            sub_agent.set_default_thinking(self.default_thinking.clone());
-            // Sub-agents inherit the parent's speed so their own
-            // spawn events (and the spawn entry persisted off them)
-            // report the speed they actually run at.
-            sub_agent.set_speed(self.speed);
+            // Keep the selected thinking and speed on the retained child.
+            sub_agent.set_default_thinking(config.thinking);
+            sub_agent.set_speed(config.speed);
             // Share the background-task registry so tasks the
             // sub-agent starts land in the same map the binary
             // observes, with notices scoped to the sub-agent's own
@@ -3741,6 +3727,45 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
                 })
             })
         })
+    }
+}
+
+impl ToolContext for SessionContextWrapper<'_> {
+    fn working_directory(&self) -> PathBuf {
+        self.session_state.working_directory()
+    }
+
+    fn session_env(&self) -> BTreeMap<String, String> {
+        self.session_state.session_env()
+    }
+
+    fn get_todo_list(&self) -> Vec<TodoItem> {
+        self.session_state.get_todo_list()
+    }
+
+    fn set_todo_list(&mut self, todos: Vec<TodoItem>) {
+        self.session_state.set_todo_list(todos);
+    }
+
+    fn spawn_agent<'b>(
+        &'b mut self,
+        task: String,
+        mode: SpawnMode,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SpawnResult, BoxError>> + Send + 'b>,
+    > {
+        self.spawn_child(task, mode, None)
+    }
+
+    fn spawn_configured_agent<'b>(
+        &'b mut self,
+        task: String,
+        mode: SpawnMode,
+        config: tool::SpawnAgentConfig,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SpawnResult, BoxError>> + Send + 'b>,
+    > {
+        self.spawn_child(task, mode, Some(config))
     }
 
     fn emit_update<'b>(
@@ -4154,13 +4179,15 @@ mod event_protocol_tests {
 
     use std::sync::{Arc, Mutex};
 
+    use aj_models::ThinkingConfig;
     use aj_models::provider::Provider;
     use aj_models::registry::{InputModality, ModelCost, ModelInfo};
     use aj_models::scripted::{ExhaustedBehavior, ProviderScript, ScriptedProvider};
-    use aj_models::streaming::{AssistantMessageEvent, DoneReason};
+    use aj_models::streaming::{AssistantMessageEvent, AssistantMessageEventStream, DoneReason};
     use aj_models::types::{
-        AssistantContent, AssistantMessage, Message, StopReason, StreamOptions, TextContent,
-        ToolCall, Usage, UsageCost, UserMessage,
+        AssistantContent, AssistantMessage, Context, Message, SimpleStreamOptions, Speed,
+        StopReason, StreamOptions, TextContent, ThinkingLevel, ToolCall, Usage, UsageCost,
+        UserMessage,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -4173,7 +4200,7 @@ mod event_protocol_tests {
         ToolDefinition, ToolDetails, ToolOutcome,
     };
     use crate::types::TokenUsage;
-    use crate::{Agent, AgentSeed, TaskRegistry, UsageAccounting};
+    use crate::{Agent, AgentSeed, SubAgentRegistry, TaskRegistry, UsageAccounting, tool};
 
     /// Trivial tool that returns a fixed string. Implements the
     /// [`ToolDefinition`] trait so the test exercises the same
@@ -4678,6 +4705,11 @@ mod event_protocol_tests {
 
         assert!(agent.tools.is_empty());
         assert!(agent.tool_definitions.is_empty());
+
+        agent.set_tools(vec![PingTool.into()]);
+
+        assert_eq!(agent.tool_names(), vec!["ping"]);
+        assert!(agent.tool_definitions.contains_key("ping"));
     }
 
     #[test]
@@ -6520,6 +6552,7 @@ mod event_protocol_tests {
     #[derive(Clone)]
     struct SpawnTool {
         mode: crate::tool::SpawnMode,
+        config: Option<tool::SpawnAgentConfig>,
         /// `(agent_id, task_id)` pairs recorded off
         /// [`crate::tool::SpawnResult::Started`] results.
         started: Arc<Mutex<Vec<(usize, usize)>>>,
@@ -6529,6 +6562,7 @@ mod event_protocol_tests {
         fn blocking() -> Self {
             Self {
                 mode: crate::tool::SpawnMode::Blocking,
+                config: None,
                 started: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -6538,6 +6572,7 @@ mod event_protocol_tests {
             (
                 Self {
                     mode: crate::tool::SpawnMode::Background,
+                    config: None,
                     started: Arc::clone(&started),
                 },
                 started,
@@ -6570,7 +6605,14 @@ mod event_protocol_tests {
             ctx: &mut dyn ToolContext,
             input: SpawnInput,
         ) -> Result<ToolOutcome, crate::BoxError> {
-            match ctx.spawn_agent(input.task, self.mode).await? {
+            let result = match &self.config {
+                Some(config) => {
+                    ctx.spawn_configured_agent(input.task, self.mode, config.clone())
+                        .await?
+                }
+                None => ctx.spawn_agent(input.task, self.mode).await?,
+            };
+            match result {
                 crate::tool::SpawnResult::Completed(spawned) => Ok(ToolOutcome {
                     content: vec![aj_models::types::UserContent::text(spawned.report.clone())],
                     details: ToolDetails::Text {
@@ -6593,6 +6635,213 @@ mod event_protocol_tests {
                 }
             }
         }
+    }
+
+    struct ChildRecordingProvider {
+        scripted: ScriptedProvider,
+        calls: Mutex<Vec<(ModelInfo, Context, SimpleStreamOptions)>>,
+    }
+
+    impl Provider for ChildRecordingProvider {
+        fn stream(
+            &self,
+            _: &ModelInfo,
+            _: &Context,
+            _: &StreamOptions,
+        ) -> AssistantMessageEventStream {
+            panic!("runtime should use stream_simple")
+        }
+
+        fn stream_simple(
+            &self,
+            model: &ModelInfo,
+            context: &Context,
+            options: &SimpleStreamOptions,
+        ) -> AssistantMessageEventStream {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((model.clone(), context.clone(), options.clone()));
+            self.scripted.stream_simple(model, context, options)
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_spawn_inherits_bundle_but_excludes_delegation_tools() {
+        let provider = Arc::new(ChildRecordingProvider {
+            scripted: ScriptedProvider::from_event_vecs(vec![
+                finalize_script(finalize_tool_use("tu-1", "agent")),
+                finalize_script(finalize_text("child report")),
+                finalize_script(finalize_text("parent done")),
+            ])
+            .on_exhausted(ExhaustedBehavior::Panic),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut oracle: ErasedToolDefinition = PingTool.into();
+        oracle.name = "oracle".into();
+        let mut parent = build_agent(
+            Vec::new(),
+            vec![SpawnTool::blocking().into(), oracle, PingTool.into()],
+        );
+        parent.provider = Arc::<ChildRecordingProvider>::clone(&provider);
+        parent.stream_options.temperature = Some(0.75);
+        parent.stream_options.session_id = Some("parent-cache".into());
+        parent.set_default_thinking(Some(ThinkingConfig::Low));
+        parent
+            .run_single_turn("parent-only history".into())
+            .await
+            .unwrap();
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        for (index, (model, context, options)) in calls.iter().enumerate() {
+            assert_eq!(model.id, parent.model_info.id);
+            assert_eq!(options.reasoning, ThinkingLevel::Low);
+            assert_eq!(options.base.temperature, Some(0.75));
+            assert_eq!(context.system_prompt.as_deref(), Some("test system prompt"));
+            let names: Vec<_> = context
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            if index == 1 {
+                assert_eq!(names, vec!["ping"]);
+                assert_eq!(context.messages.len(), 1);
+                assert_eq!(
+                    options.base.session_id.as_deref(),
+                    Some("parent-cache:sub:1")
+                );
+            } else {
+                assert!(
+                    names.contains(&"agent")
+                        && names.contains(&"oracle")
+                        && names.contains(&"ping")
+                );
+                assert_eq!(options.base.session_id.as_deref(), Some("parent-cache"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_spawn_uses_selected_bundle_and_retains_it_for_follow_up() {
+        let provider = Arc::new(ChildRecordingProvider {
+            scripted: ScriptedProvider::from_event_vecs(vec![
+                finalize_script(finalize_text("selected report")),
+                finalize_script(finalize_text("selected follow up")),
+            ])
+            .on_exhausted(ExhaustedBehavior::Panic),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut model = scripted_model_info();
+        model.id = "selected-model".into();
+        model.provider = "selected-provider".into();
+        let mut spawn = SpawnTool::blocking();
+        spawn.config = Some(tool::SpawnAgentConfig {
+            provider: Arc::<ChildRecordingProvider>::clone(&provider),
+            model_info: Arc::new(model),
+            stream_options: StreamOptions {
+                temperature: Some(0.25),
+                max_tokens: Some(321),
+                session_id: Some("selected-cache".into()),
+                speed: Some(Speed::Fast),
+                ..StreamOptions::default()
+            },
+            thinking: Some(ThinkingConfig::High),
+            speed: Some(Speed::Fast),
+            thinking_display: "visible".into(),
+            tools: vec![PingTool.into()],
+            system_prompt_suffix: "\nselected suffix".into(),
+        });
+        let mut spawn: ErasedToolDefinition = spawn.into();
+        spawn.name = "consult".into();
+        let mut parent = build_agent(
+            vec![
+                finalize_script(finalize_tool_use("tu-1", "consult")),
+                finalize_script(finalize_text("parent done")),
+            ],
+            vec![spawn],
+        );
+        let original_provider = Arc::clone(&parent.provider);
+        let original_model = Arc::clone(&parent.model_info);
+        let registry = SubAgentRegistry::default();
+        parent.set_sub_agent_registry(registry.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let _subscription = parent.subscribe(listener_from_sync(move |event| {
+            captured.lock().unwrap().push(event.clone());
+        }));
+        parent
+            .run_single_turn("private parent conversation".into())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&parent.provider, &original_provider));
+        assert!(Arc::ptr_eq(&parent.model_info, &original_model));
+        assert_eq!(parent.stream_options.temperature, None);
+        assert_eq!(parent.default_thinking, None);
+        assert_eq!(parent.speed, None);
+        let child = registry.get(1).unwrap();
+        let mut child = child.lock().await;
+        // A host's replacement catalog must not broaden the retained child's
+        // explicitly configured capabilities on its next provider request.
+        let mut extra: ErasedToolDefinition = PingTool.into();
+        extra.name = "extra".into();
+        child.set_tools(vec![PingTool.into(), extra]);
+        assert!(!child.tool_definitions.contains_key("extra"));
+        child
+            .prompt("follow up".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (model, context, options) in calls.iter() {
+            assert_eq!(model.id, "selected-model");
+            assert_eq!(model.provider, "selected-provider");
+            assert_eq!(options.base.temperature, Some(0.25));
+            assert_eq!(options.base.max_tokens, Some(321));
+            assert_eq!(options.base.speed, Some(Speed::Fast));
+            assert_eq!(
+                options.base.session_id.as_deref(),
+                Some("selected-cache:sub:1")
+            );
+            assert_eq!(options.reasoning, ThinkingLevel::High);
+            assert_eq!(
+                context.system_prompt.as_deref(),
+                Some("test system prompt\nselected suffix")
+            );
+            assert_eq!(
+                context
+                    .tools
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["ping"]
+            );
+            assert!(
+                !serde_json::to_string(&context.messages)
+                    .unwrap()
+                    .contains("private parent conversation")
+            );
+        }
+        assert_eq!(calls[0].1.messages.len(), 1);
+        assert_eq!(calls[1].1.messages.len(), 3);
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::SubAgentStart { parent: AgentId::Main, child: AgentId::Sub(1), tool_name, settings, background: false, .. }
+                if tool_name == "consult" && settings.model_id == "selected-model" && settings.provider == "selected-provider"
+                && settings.thinking == "high" && settings.thinking_display == "visible" && settings.speed == "fast"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report,
+                conclusion: SubAgentConclusion::Completed,
+            } if report == "selected report"
+        )));
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::ToolExecutionEnd { agent_id: AgentId::Main, result: ToolDetails::Text { body, .. }, is_error: false, .. }
+                if body == "selected report"
+        )));
     }
 
     /// After a spawn, the parent's injected registry retains the

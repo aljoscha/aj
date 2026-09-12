@@ -301,6 +301,35 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
     let settings = SessionSettings {
         model,
         account: args.account_selection(),
+        oracle_model: config
+            .oracle_model_name
+            .as_ref()
+            .map(|name| ModelSelection {
+                api: config
+                    .oracle_model_api
+                    .clone()
+                    .unwrap_or_else(|| aj_app::model::DEFAULT_PROVIDER_ID.to_string()),
+                name: name.clone(),
+                url: config.oracle_model_url.clone(),
+            }),
+        oracle_thinking: stated.has("oracle_thinking").then(|| {
+            thinking_config_name(
+                aj_app::model::default_thinking_from_config(config.oracle_thinking).as_ref(),
+            )
+            .to_string()
+        }),
+        oracle_speed: stated.has("oracle_speed").then(|| {
+            config
+                .oracle_speed
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "standard".into())
+        }),
+        oracle_verbosity: stated.has("oracle_verbosity").then(|| {
+            config
+                .oracle_verbosity
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "default".into())
+        }),
         // The effective config carries the value, the layers carry whether
         // anyone asked for it, so both are consulted per axis.
         thinking: (args.thinking.is_some() || stated.has("thinking")).then(|| {
@@ -388,6 +417,43 @@ mod tests {
         assert_eq!(settings.speed, None);
         assert_eq!(settings.verbosity, None);
         assert_eq!(settings.thinking_display, None);
+    }
+
+    #[test]
+    fn creator_settings_carry_only_stated_oracle_choices() {
+        assert!(creator_settings(&args(&["aj"]), &Config::default(), &nothing_stated()).is_none());
+        let config = Config {
+            oracle_model_api: Some("openai".into()),
+            oracle_model_name: Some("advisor".into()),
+            oracle_thinking: Some(aj_conf::ConfigThinkingLevel::Off),
+            oracle_speed: Some(aj_conf::ConfigSpeed::Fast),
+            oracle_verbosity: Some(aj_conf::ConfigVerbosity::High),
+            ..Config::default()
+        };
+        let stated = Stated::new(
+            wrote(&[
+                ("oracle_model_api", "openai"),
+                ("oracle_model_name", "advisor"),
+                ("oracle_thinking", "off"),
+                ("oracle_speed", "fast"),
+                ("oracle_verbosity", "high"),
+            ]),
+            ConfigLayer::default(),
+        );
+        assert_eq!(
+            creator_settings(&args(&["aj"]), &config, &stated),
+            Some(SessionSettings {
+                oracle_model: Some(ModelSelection {
+                    api: "openai".into(),
+                    name: "advisor".into(),
+                    url: None
+                }),
+                oracle_thinking: Some("off".into()),
+                oracle_speed: Some("fast".into()),
+                oracle_verbosity: Some("high".into()),
+                ..Default::default()
+            })
+        );
     }
 
     /// The CLI wins over config, and a pinned model travels as the triple the

@@ -1,8 +1,9 @@
 //! The sub-agent box: the parent-transcript widget for one sub-agent
 //! run.
 //!
-//! A gray box with a one-line `{glyph} agent {N} · {task}` title and a body,
-//! separated by a blank row. Once the sub-agent is done the body is its
+//! A gray box with a one-line `{glyph} agent[(tool)] {N} · {task}` title and a body,
+//! separated by a blank row. The originating tool qualifies non-ordinary agents,
+//! such as `agent(oracle)`. Once the sub-agent is done the body is its
 //! report, rendered as markdown the same way assistant prose renders in the
 //! transcript, and folded to a head preview when collapsed the same way tool
 //! cells fold long output (the shared tools-expand toggle shows the whole
@@ -68,7 +69,7 @@ fn spinner_frame(elapsed: Duration) -> &'static str {
 /// On-screen representation of one sub-agent run, boxed inside the
 /// parent's transcript.
 pub(crate) struct SubAgentBox {
-    /// The `{glyph} agent {N} · {task}` title spans, one logical line
+    /// The `{glyph} agent[(tool)] {N} · {task}` title spans, one logical line
     /// (the task text is whitespace-normalized at build time). The
     /// glyph is a check when done or a spinner frame while running.
     title: Vec<TextSpan>,
@@ -133,10 +134,14 @@ pub(crate) fn build_subagent_box(
     // Over-wide titles are truncated at draw time (the draw disables
     // soft wrapping, so the wrap engine's ellipsis overflow applies).
     let task = entry.task.split_whitespace().collect::<Vec<_>>().join(" ");
+    let label = match entry.tool_name.as_str() {
+        "" | "agent" => format!("agent {}", entry.child),
+        tool => format!("agent({tool}) {}", entry.child),
+    };
     let title = vec![
         glyph,
         span(" ".into(), styles.text),
-        span(format!("agent {}", entry.child), styles.bold),
+        span(label, styles.bold),
         span(" · ".into(), styles.text),
         span(task, styles.dim),
     ];
@@ -479,12 +484,17 @@ mod tests {
     /// start is the last live event). The child transcript is built too,
     /// which the metadata box ignores.
     fn reduce_sub_run(chat: &mut ChatState, life: &mut AgentLifecycle) {
+        reduce_sub_run_from(chat, life, "agent");
+    }
+
+    fn reduce_sub_run_from(chat: &mut ChatState, life: &mut AgentLifecycle, tool_name: &str) {
         let sub = AgentId::Sub(0);
         let events = vec![
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: sub,
                 task: "check the build setup".into(),
+                tool_name: tool_name.into(),
                 background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),
@@ -597,6 +607,24 @@ mod tests {
 
     fn draw_box(chat: &ChatState, width: u16) -> Surface {
         draw_box_with(chat, width, false)
+    }
+
+    #[test]
+    fn box_title_identifies_the_spawning_tool() {
+        for (tool_name, label) in [
+            ("oracle", "agent(oracle) 0"),
+            ("agent", "agent 0"),
+            ("", "agent 0"),
+            ("consult", "agent(consult) 0"),
+        ] {
+            let mut chat = chat();
+            let mut life = AgentLifecycle::default();
+            reduce_sub_run_from(&mut chat, &mut life, tool_name);
+            let title = format!("{label} · check the build setup");
+            assert!(rows(&draw_box(&chat, 80))[1].ends_with(&title));
+            reduce_sub_end(&mut chat, &mut life);
+            assert_eq!(rows(&draw_box(&chat, 80))[1], format!(" ✓ {title}"));
+        }
     }
 
     #[test]
@@ -1025,6 +1053,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(0),
                 task: long_task,
+                tool_name: "agent".into(),
                 background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),

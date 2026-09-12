@@ -165,20 +165,26 @@ fn model(api: &str, base_url: String) -> ModelInfo {
 }
 
 fn run_config(provider: Arc<dyn Provider>, model: ModelInfo) -> Arc<Mutex<RunConfigSnapshot>> {
-    Arc::new(Mutex::new(RunConfigSnapshot {
-        accounts: Default::default(),
-        provider,
-        model_info: Arc::new(model),
-        stream_options: StreamOptions {
-            api_key: Some("fixture-key".into()),
-            service_tier: Some(ServiceTier::Flex),
-            ..StreamOptions::default()
-        },
-        thinking: None,
-        thinking_display: None,
-        speed: None,
-        model_key: ("openai".into(), "gpt-test".into()),
-        session_id: None,
+    Arc::new(Mutex::new({
+        let main = aj_app::session_setup::ModelConfig {
+            provider,
+            model_info: Arc::new(model),
+            stream_options: StreamOptions {
+                api_key: Some("fixture-key".into()),
+                service_tier: Some(ServiceTier::Flex),
+                ..StreamOptions::default()
+            },
+            thinking: None,
+            thinking_display: None,
+            speed: None,
+            model_key: ("openai".into(), "gpt-test".into()),
+        };
+        RunConfigSnapshot {
+            oracle: main.clone(),
+            main,
+            accounts: Default::default(),
+            session_id: None,
+        }
     }))
 }
 

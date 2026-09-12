@@ -286,23 +286,24 @@ pub enum AgentEvent {
     },
 
     // --- Sub-agents --------------------------------------------------------
-    /// A sub-agent has been spawned. `parent` is the agent that
-    /// invoked the `agent` tool; `child` is the freshly assigned
-    /// sub-agent id.
+    /// A sub-agent has been spawned. `parent` invoked the spawning tool,
+    /// and `child` is the freshly assigned sub-agent id.
     SubAgentStart {
         parent: AgentId,
         child: AgentId,
         task: String,
+        /// Originating tool name, for display identity only. Empty means
+        /// unspecified and renders as an ordinary agent.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tool_name: String,
         /// Whether the sub was spawned to run in the background,
         /// concurrent with the parent's turn, rather than blocking it.
         /// The persistence listener writes it to the log's `SubAgentSpawn`
         /// entry so a picker can still show the run mode after a resume,
         /// when the transient task registry that reveals it live is empty.
         background: bool,
-        /// The child's bundle identity at spawn. Today sub-agents
-        /// mirror the parent's bundle. Flattened so the JSON wire
-        /// shape keeps the four settings fields at the top level of
-        /// the event object.
+        /// The child's bundle identity at spawn. Flattened so the JSON wire
+        /// shape keeps the settings fields at the top level of the event.
         #[serde(flatten)]
         settings: AgentSettings,
     },
@@ -495,6 +496,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(0),
             task: "test".into(),
+            tool_name: "agent".into(),
             background: false,
             settings: AgentSettings {
                 provider: "scripted".into(),
@@ -584,6 +586,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(2),
             task: "explore".into(),
+            tool_name: "oracle".into(),
             background: true,
             settings: AgentSettings {
                 provider: "anthropic".into(),
@@ -594,9 +597,10 @@ mod tests {
                 verbosity: "high".into(),
             },
         };
-        let json = serde_json::to_value(&spawn).expect("SubAgentStart serializes");
+        let mut json = serde_json::to_value(&spawn).expect("SubAgentStart serializes");
         assert_eq!(json["type"], "sub_agent_start");
         assert_eq!(json["task"], "explore");
+        assert_eq!(json["tool_name"], "oracle");
         assert_eq!(json["background"], true);
         assert_eq!(json["provider"], "anthropic");
         assert_eq!(json["model_id"], "claude-x");
@@ -604,6 +608,13 @@ mod tests {
         assert_eq!(json["speed"], "fast");
         assert_eq!(json["verbosity"], "high");
         assert!(json.get("settings").is_none());
+        let decoded: AgentEvent = serde_json::from_value(json.clone()).expect("spawn decodes");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json);
+        json.as_object_mut().unwrap().remove("tool_name");
+        let legacy: AgentEvent = serde_json::from_value(json).expect("legacy spawn decodes");
+        assert!(
+            matches!(legacy, AgentEvent::SubAgentStart { tool_name, .. } if tool_name.is_empty())
+        );
     }
 
     /// Lock the JSON-on-the-wire shape for the compaction lifecycle

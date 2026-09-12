@@ -289,29 +289,6 @@ fn holder_name(holder: &Option<LockHolder>) -> String {
     }
 }
 
-/// What an attaching client needs to know about this host's credential store
-/// for `provider`. Disabled for a scripted host, whose provider deliberately
-/// needs no credential and whose setup has no restore context.
-async fn credential_warning(
-    auth: &AuthStorage,
-    provider: &str,
-    credentials_required: bool,
-) -> Option<String> {
-    if !credentials_required {
-        return None;
-    }
-    match auth.try_has_auth(provider).await {
-        Ok(Some(true)) | Ok(None) => None,
-        Ok(Some(false)) => Some(format!(
-            "Heads up: {}",
-            crate::model::missing_key_message(provider)
-        )),
-        Err(err) => Some(format!(
-            "Couldn't check credentials for {provider:?}: {err}"
-        )),
-    }
-}
-
 /// What a host is built from: the process-wide handles a frontend already
 /// assembles at startup.
 pub struct HostSetup {
@@ -484,6 +461,10 @@ pub enum QueueOp {
 /// Which settings axis a change moves, and to what.
 #[derive(Clone)]
 pub enum SettingsAxis {
+    OracleModel(ModelInfo),
+    OracleThinking(Option<ThinkingConfig>),
+    OracleSpeed(Option<Speed>),
+    OracleVerbosity(Option<aj_conf::ConfigVerbosity>),
     Model(ModelInfo),
     Thinking(Option<ThinkingConfig>),
     ThinkingDisplay(Option<ConfigThinkingDisplay>),
@@ -1026,7 +1007,7 @@ impl SessionHost {
     ) -> Result<ModelInfo, HostError> {
         resolve_model_selection(
             &self.inner.shared.catalog,
-            self.inner.run_config_defaults.startup(),
+            &self.inner.run_config_defaults.startup().main,
             selection,
         )
     }
@@ -1597,8 +1578,7 @@ impl SessionHost {
     /// Aggregate facts from the session log, materializing the session if needed.
     pub async fn session_info(&self, session: &str) -> Result<aj_session::SessionStats, HostError> {
         let live = self.live(session).await?;
-        let stats = live.core.log.lock().await.stats();
-        Ok(stats)
+        Ok(live.core.log.lock().await.stats())
     }
 
     /// Render the complete session log as HTML, materializing it if needed.
@@ -1663,7 +1643,7 @@ impl SessionHost {
                 .run_config
                 .lock()
                 .expect("run config mutex poisoned");
-            let provider = provider.unwrap_or(&cfg.model_key.0).to_string();
+            let provider = provider.unwrap_or(&cfg.main.model_key.0).to_string();
             let selected = cfg.accounts.get(&provider);
             (provider, selected)
         };
@@ -2092,7 +2072,7 @@ impl SessionHost {
         {
             crate::model::validate_account_selection(
                 &self.inner.shared.auth,
-                &run_config.model_key.0,
+                &run_config.main.model_key.0,
                 selection.name.as_deref(),
             )
             .await
@@ -2147,11 +2127,13 @@ impl SessionHost {
             }
         };
         let log = core.log.lock().await;
+        let (settings, oracle_settings) = settings_of(&core.run_config);
         let status = SessionStatus {
             epoch: mint_epoch(),
             last_seq: log.last_seq(),
             working: false,
-            settings: settings_of(&core.run_config),
+            settings,
+            oracle_settings,
             // Nothing runs at materialization, so every sub-agent the log
             // names has finished. Seeding them is what keeps a backfill
             // concluding a resumed session's boxes while leaving the
@@ -2245,7 +2227,15 @@ impl SessionHost {
         // The snapshot and the epoch are read under the log lock, because a
         // head switch moves both under it: reading them separately could
         // pair the old projection with the new epoch.
-        let (snapshot, epoch, working_seen, settings_seen, finished_subs, driven_subs) = {
+        let (
+            snapshot,
+            epoch,
+            working_seen,
+            settings_seen,
+            oracle_settings_seen,
+            finished_subs,
+            driven_subs,
+        ) = {
             let log = tokio::select! {
                 biased;
                 _ = stopped.cancelled() => return false,
@@ -2257,6 +2247,7 @@ impl SessionHost {
                 status.epoch.clone(),
                 status.working,
                 status.settings.clone(),
+                status.oracle_settings.clone(),
                 status.finished_subs.clone(),
                 status.driven_subs.clone(),
             )
@@ -2276,7 +2267,7 @@ impl SessionHost {
         // scripted path has no credential-backed restore context and needs no
         // warning. An auth read failure is actionable for the same reason as a
         // missing credential, so carry its exact host-side answer too.
-        let credential_warning = credential_warning(
+        let credential_warning = crate::model::credential_warning(
             &self.inner.shared.auth,
             &settings_seen.provider,
             self.inner.shared.restore.is_some(),
@@ -2309,6 +2300,7 @@ impl SessionHost {
                 epoch: epoch.clone(),
                 working: working_seen,
                 settings: settings_seen.clone(),
+                oracle_settings: oracle_settings_seen.clone(),
                 credential_warning,
                 last_seq: boundary,
             },
@@ -2334,6 +2326,46 @@ impl SessionHost {
             {
                 return false;
             }
+        }
+        let oracle_run = session
+            .core
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned")
+            .clone();
+        let oracle_enabled = !self
+            .inner
+            .shared
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .disabled_tools
+            .iter()
+            .any(|tool| tool == "oracle");
+        let oracle_warning = crate::oracle::warning(
+            &oracle_run,
+            &self.inner.shared.auth,
+            self.inner.shared.restore.is_some() && oracle_enabled,
+        )
+        .await;
+        if let Some(text) = oracle_warning
+            && !send_block_frame(
+                block,
+                stopped,
+                Frame::Event {
+                    session: session.id().to_string(),
+                    epoch: epoch.clone(),
+                    durability: None,
+                    event: aj_agent::events::AgentEvent::Warning {
+                        agent_id: AgentId::Main,
+                        text,
+                    }
+                    .into(),
+                },
+            )
+            .await
+        {
+            return false;
         }
         // The opening half of the lifecycle repair: a sub-agent still
         // running when this client attached announced itself only through a
@@ -2422,13 +2454,15 @@ impl SessionHost {
             .fanout
             .finish_block(id, session.id(), boundary);
 
-        // `working` and `settings` were read before the projection, and a
+        // `working` and both settings were read before the projection, and a
         // change during it was held and dropped as lossy. One more `state`
         // frame is what self-heals that. Only when something actually
         // moved: an unconditional re-emission would make every attach look
         // like a state change to every other client on the host.
         session.publish_state(&self.inner.shared.fanout, |status| {
-            status.working != working_seen || status.settings != settings_seen
+            status.working != working_seen
+                || status.settings != settings_seen
+                || status.oracle_settings != oracle_settings_seen
         });
         true
     }
@@ -2487,7 +2521,7 @@ fn validate_prompt(content: &[UserContent]) -> Result<(), HostError> {
 
 fn resolve_model_selection(
     catalog: &[ModelInfo],
-    fallback: &RunConfigSnapshot,
+    fallback: &crate::session_setup::ModelConfig,
     selection: &ModelSelection,
 ) -> Result<ModelInfo, HostError> {
     validate_model_selection(selection)?;
@@ -2523,7 +2557,24 @@ fn apply_settings(
 ) -> Result<RunConfigSnapshot, HostError> {
     let default_settings = SessionSettings::default();
     let settings = settings.unwrap_or(&default_settings);
+    apply_model_settings(&mut run.main, settings, catalog, auth, inherit_unstated)?;
+    let oracle = settings.oracle();
+    apply_model_settings(&mut run.oracle, &oracle, catalog, auth, inherit_unstated)?;
+    if let Some(selection) = &settings.account {
+        run.accounts
+            .set(&run.main.model_key.0, selection.name.clone());
+    }
+    run.bind_accounts(auth);
+    Ok(run)
+}
 
+fn apply_model_settings(
+    run: &mut crate::session_setup::ModelConfig,
+    settings: &SessionSettings,
+    catalog: &[ModelInfo],
+    auth: &AuthStorage,
+    inherit_unstated: bool,
+) -> Result<(), HostError> {
     let speed = match settings.speed.as_deref() {
         Some(name) => speed_from_name(name).ok_or_else(|| {
             HostError::Invalid(format!("unknown speed {name:?}. Expected standard or fast"))
@@ -2534,7 +2585,7 @@ fn apply_settings(
     let verbosity = run.stream_options.verbosity;
     let mut bundle_model = None;
     if let Some(selection) = &settings.model {
-        let info = resolve_model_selection(catalog, &run, selection)?;
+        let info = resolve_model_selection(catalog, run, selection)?;
         let base_bundle = run.model_key == (selection.api.clone(), selection.name.clone())
             && catalog
                 .iter()
@@ -2569,9 +2620,9 @@ fn apply_settings(
         run.model_info = resolved.model_info;
         run.stream_options = resolved.stream_options;
     }
-    if inherit_unstated {
-        run.stream_options.verbosity = verbosity;
-    }
+    // A model choice changes only that axis. Keep the independently defaulted
+    // or inherited verbosity unless this request explicitly replaces it below.
+    run.stream_options.verbosity = verbosity;
     run.speed = speed;
     run.stream_options.speed = speed;
 
@@ -2631,11 +2682,7 @@ fn apply_settings(
         validate_thinking_level(&run.model_info, &level).map_err(HostError::Unsupported)?;
     }
 
-    if let Some(selection) = &settings.account {
-        run.accounts.set(&run.model_key.0, selection.name.clone());
-    }
-    run.bind_accounts(auth);
-    Ok(run)
+    Ok(())
 }
 
 fn validate_model_selection(selection: &ModelSelection) -> Result<(), HostError> {
@@ -2645,13 +2692,8 @@ fn validate_model_selection(selection: &ModelSelection) -> Result<(), HostError>
         ));
     }
     if let Some(url) = selection.url.as_deref() {
-        let parsed = url::Url::parse(url)
-            .map_err(|err| HostError::Invalid(format!("invalid model url {url:?}: {err}")))?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
-            return Err(HostError::Invalid(format!(
-                "model url {url:?} must be an absolute http or https URL"
-            )));
-        }
+        crate::model::validate_model_url(url)
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
     }
     Ok(())
 }
@@ -2933,6 +2975,12 @@ fn durable_event(
         seq: entry.seq,
         entry_id: entry.id,
         branch_settings: settings.map(|settings| aj_wire::BranchSettings {
+            oracle_model: settings
+                .oracle_model
+                .map(|(api, name)| aj_wire::RecordedModel { api, name }),
+            oracle_thinking: settings.oracle_thinking,
+            oracle_speed: settings.oracle_speed,
+            oracle_verbosity: settings.oracle_verbosity,
             model: settings
                 .model
                 .map(|(api, name)| aj_wire::RecordedModel { api, name }),
@@ -2955,15 +3003,21 @@ mod tests {
     async fn the_credential_warning_describes_the_hosts_store() {
         let dir = tempfile::tempdir().expect("tempdir");
         let auth = AuthStorage::new(dir.path().join("auth.json"));
-        let warning = credential_warning(&auth, "anthropic", true)
+        let warning = crate::model::credential_warning(&auth, "anthropic", true)
             .await
             .expect("an empty host store warns");
         assert!(warning.contains("no credentials for provider \"anthropic\""));
 
         auth.set_runtime_api_key("anthropic", "host-key".into())
             .await;
-        assert_eq!(credential_warning(&auth, "anthropic", true).await, None);
-        assert_eq!(credential_warning(&auth, "scripted", false).await, None);
+        assert_eq!(
+            crate::model::credential_warning(&auth, "anthropic", true).await,
+            None
+        );
+        assert_eq!(
+            crate::model::credential_warning(&auth, "scripted", false).await,
+            None
+        );
     }
 
     /// The name a host falls back to is its whole working directory, written

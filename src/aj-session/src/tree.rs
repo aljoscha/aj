@@ -269,6 +269,10 @@ fn kind_placeholder(kind: &ConversationEntryKind) -> &'static str {
         ConversationEntryKind::Message { .. } => "(message)",
         ConversationEntryKind::SystemPrompt { .. } => "(system prompt)",
         ConversationEntryKind::ModelChange { .. }
+        | ConversationEntryKind::OracleModelChange { .. }
+        | ConversationEntryKind::OracleThinkingChange { .. }
+        | ConversationEntryKind::OracleSpeedChange { .. }
+        | ConversationEntryKind::OracleVerbosityChange { .. }
         | ConversationEntryKind::AccountChange { .. }
         | ConversationEntryKind::ThinkingChange { .. }
         | ConversationEntryKind::SpeedChange { .. }
@@ -542,7 +546,14 @@ mod tests {
             verbosity: "default".into(),
         };
         let spawn = log
-            .append_subagent_spawn(1, spawner.clone(), "do the thing", false, &settings)
+            .append_subagent_spawn(
+                1,
+                spawner.clone(),
+                "do the thing",
+                "agent",
+                false,
+                &settings,
+            )
             .expect("spawn root")
             .id;
         {

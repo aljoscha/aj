@@ -184,20 +184,27 @@ internally tagged with `kind`:
   if and only if the event is durable (section 5.4). The envelope's
   semantics apply whether or not the nested event type is known to the
   receiver. Durable main-thread user-message ends carry `branch_settings`:
-  the recorded model (`{api, name}`), thinking, speed, verbosity, and provider
-  account pins at that message's parent. Unrecorded inference axes are omitted,
+  the recorded model (`{api, name}`), thinking, speed, verbosity, their independent
+  `oracle_model`, `oracle_thinking`, `oracle_speed`, and `oracle_verbosity`
+  counterparts, and provider account pins at that message's parent.
+  Unrecorded inference axes are omitted,
   distinct from explicit `off` or `default`. An absent provider pin follows the
   provider's current default. This is historical context, not a prediction of
   the host's runtime fallback or validation. It contains no environment values,
   credentials, or live-only thinking display. Live delivery and backfill supply
   the same context, including across compaction. Older hosts may omit the field.
-- `state`: `{kind, session, epoch, working, settings, last_seq}`.
+- `state`: `{kind, session, epoch, working, settings, oracle_settings?, last_seq}`.
   `working` says whether the session's **main agent** has a turn in
   flight, `settings` is the active `AgentSettings` (`provider`,
   `model_id`, `thinking`, `thinking_display`, `speed`, `verbosity`),
+  `oracle_settings` carries the independently staged Oracle bundle in the same
+  `AgentSettings` shape. Hosts with Oracle support always supply it. Older hosts
+  may omit it.
+  Both identities are staged for the next main turn, including runtime fallbacks,
+  unlike the recorded facts in session-info and `branch_settings`.
   `last_seq` is the durable high-water mark. Sent at the start of every
   attach block, before the backfill, and whenever `working` or
-  `settings` changes, never for `last_seq` alone. The host publishes no
+  `settings` or `oracle_settings` changes, never for `last_seq` alone. The host publishes no
   "restored session" notice, a client renders one from the first
   attach's `state`. `working` applies on every `state` frame and
   self-heals a spinner left running by a missed `AgentEnd`. It says
@@ -430,7 +437,7 @@ agent" locally take an optional `agent` field (default: the main agent).
 | `.../{id}/cancel` | `{agent?}` | Cancel the targeted agent through the mechanism that owns its run: its driven turn, a detached sub-agent's background task, or the foreground-sub-agent-cancels-main cascade. A running mark with no owning turn or task is 409 `conflict`. An idle or completed target is accepted. |
 | `.../{id}/queue` | `{op: "remove", agent?}` or `{op: "clear"}` | Withdraw one agent's pending message, or clear the session's queues. A withdrawal answers 200 `{text?}` with the text it took, which is what makes the dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index. A clear answers 202. |
 | `.../{id}/compact` | `{instructions?}` | Manual compaction. |
-| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, optional `agent`, `persist` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. `persist` defaults to `none`, or is `user`, `project_set`, or `project_clear`, and also writes the value into that host config layer. Persistence is main-agent only. Capability `host_config`. |
+| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, `oracle_model`, `oracle_thinking`, `oracle_speed`, `oracle_verbosity`, optional `agent`, `persist` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. `persist` defaults to `none`, or is `user`, `project_set`, or `project_clear`, and also writes the value into that host config layer. Oracle axes reject sub-agent targets. Persistence is main-agent only. Capability `host_config`. |
 | `.../{id}/account` | `{provider, account?}` | Select an account for this session and provider from the host-local auth store. Missing or null `account` resets to Provider default, `""` pins the unnamed account, any other string pins that exact label. Does not change the provider's auth-store default. Read the result through `accounts`. Capability `session_accounts` (section 5.10). |
 | `.../{id}/env` | `{key, value}` | Set one session environment value, including the empty string. Null or an absent `value` removes the key from the map, not from the inherited process environment. Idle-only: 409 `conflict` while a turn or background task is live. Validates before mutation and persists the full resulting active-branch map. Capability `session_env` (section 5.10). |
 | `.../{id}/tag` | `{tag}`, empty or absent clears | Set the session's tag (section 5.8): one trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
@@ -979,8 +986,60 @@ must be servable by the host (present in its catalog, with credentials).
 Unstated axes are the host's to default, model-aware: its own configured
 default when the chosen model supports it, otherwise a supported value.
 After creation the settings command mutates the axes, from any client,
-as peers, under the same strictness. Thinking display is an inference
+as peers, with host-owned model resolution. Model edits preserve the current
+effort, and the next inference validates the combination. Thinking display is an inference
 setting because it changes what the provider is asked to emit.
+
+Oracle is an advisory child with its own model, thinking effort, speed, and
+verbosity. Its `oracle_*` settings use the same vocabularies and precedence as
+main's settings, with independent built-in, user, and project defaults. An
+Oracle model selection requires both `api` and `name` and may include a URL
+override. There is no partial model selection or follow-main mode. Oracle
+thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
+For verbosity, `default` means the Oracle provider's default, not main's value.
+
+Oracle calls use the same inputs and delivery modes as the `agent` tool. Calls
+block by default. With `run_in_background: true`, the tool returns the task id
+immediately and the report arrives as a task completion notice. Background
+Oracle children use ordinary task cancellation and shutdown ownership.
+
+A creator sends only stated Oracle choices. The host resolves omitted choices
+from its Oracle defaults and defaults unstated effort against the selected
+Oracle model. Explicit creation and branch choices are validated together.
+After creation, each model or inference edit uses the same per-axis application
+path as main. A model edit does not require changing the saved effort first.
+The next inference validates that model/effort combination.
+
+Oracle settings are recorded on the selected user branch and restored on resume.
+New sessions and cold resumes start from Oracle's effective configuration, then
+recorded axes replace those defaults. A head switch restores recorded axes over
+the current runtime choices, just as for main. Unrecorded historical axes remain
+unknown in session-info and branch metadata. Live selectors use `oracle_settings`
+from state frames, while armed branch selectors use only historical metadata.
+Each main turn captures its Oracle bundle at turn start. Edits during that turn
+apply to consultations in the next main turn. Main edits never change Oracle's
+choices, and a retained child keeps its own bundle. Session selectors change
+only the current session.
+Settings-window edits also save the chosen default on the host, whether the
+client is local or connected. Endpoint defaults, like main's `model_url`, take
+effect on host restart.
+
+Main and Oracle both require resolvable model defaults. Invalid model or endpoint
+configuration fails startup for either one. Both restore recorded settings over
+their configured defaults using the same rules. If a recorded model is no longer
+available, restoration retains that agent's current resolved model and reports
+the fallback.
+
+Credentials resolve lazily for both models. Known missing credentials for a
+separate Oracle provider are reported against the host's store during attach and
+print startup. Login takes effect without rebuilding the session. A failed
+consultation returns a tool error through the ordinary child lifecycle.
+
+Sub-agent spawn events carry `tool_name`, the originating tool, and the spawn
+record preserves it for replay and reconnect. The transcript identifies Oracle
+children as `agent(oracle) N`, as does the agent switcher, where the origin is
+also searchable. An absent or empty origin remains an ordinary `agent N`, as
+does the `agent` tool.
 
 Creation may also supply `settings.account: {name: ...}` for the initial
 provider. An absent or null outer `account` leaves the choice unchanged.

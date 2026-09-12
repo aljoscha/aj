@@ -168,16 +168,22 @@ impl Store {
                 writes: Default::default(),
             })),
             catalog: Arc::new(Vec::new()),
-            defaults: RunConfigDefaults::fixed(RunConfigSnapshot {
-                accounts: Default::default(),
-                provider: Arc::<CredentialProvider>::clone(&self.provider),
-                model_info: Arc::new(scripted_model_info()),
-                stream_options: StreamOptions::default(),
-                thinking: None,
-                thinking_display: None,
-                speed: None,
-                model_key: (PROVIDER.into(), "scripted".into()),
-                session_id: None,
+            defaults: RunConfigDefaults::fixed({
+                let main = aj_app::session_setup::ModelConfig {
+                    provider: Arc::<CredentialProvider>::clone(&self.provider),
+                    model_info: Arc::new(scripted_model_info()),
+                    stream_options: StreamOptions::default(),
+                    thinking: None,
+                    thinking_display: None,
+                    speed: None,
+                    model_key: (PROVIDER.into(), "scripted".into()),
+                };
+                RunConfigSnapshot {
+                    oracle: main.clone(),
+                    main,
+                    accounts: Default::default(),
+                    session_id: None,
+                }
             }),
             restore: None,
             persistence: ConversationPersistence::new(self.dir.path().join("sessions")),
@@ -418,7 +424,13 @@ async fn session_pins_are_isolated_while_provider_defaults_stay_live() {
         )
         .await;
         let handles = host.local_handles(&pinned).await.unwrap();
-        let options = handles.run_config.lock().unwrap().stream_options.clone();
+        let options = handles
+            .run_config
+            .lock()
+            .unwrap()
+            .main
+            .stream_options
+            .clone();
         assert_eq!(options.resolve_api_key().await.unwrap().key, expected);
     }
     bounded(host.shutdown()).await;

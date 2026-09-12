@@ -733,6 +733,7 @@ mod tests {
             epoch: EPOCH.to_string(),
             working: false,
             settings: settings(),
+            oracle_settings: None,
             credential_warning: None,
             last_seq: 0,
         }

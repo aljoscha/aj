@@ -847,15 +847,41 @@ fn settings_change(
         persist,
         ..
     } = request;
+    let oracle = change.oracle();
+    let is_oracle = oracle != SessionSettings::default();
+    let named = [&change.model, &change.oracle_model]
+        .into_iter()
+        .filter(|v| v.is_some())
+        .count()
+        + [
+            &change.thinking,
+            &change.thinking_display,
+            &change.speed,
+            &change.verbosity,
+            &change.oracle_thinking,
+            &change.oracle_speed,
+            &change.oracle_verbosity,
+        ]
+        .into_iter()
+        .filter(|v| v.is_some())
+        .count();
+    if named != 1 {
+        return Err(ApiError::invalid(format!(
+            "a settings change names {named} axes: send exactly one model, thinking, thinking_display, speed, verbosity, oracle_model, oracle_thinking, oracle_speed, or oracle_verbosity"
+        )));
+    }
+    if is_oracle && agent.is_some_and(|agent| agent != AgentId::Main) {
+        return Err(ApiError::invalid("Oracle settings belong to the session"));
+    }
+    let account = change.account.clone();
     let SessionSettings {
         model,
         thinking,
         thinking_display,
         speed,
         verbosity,
-        account,
-    } = change;
-
+        ..
+    } = if is_oracle { oracle } else { change };
     if account.is_some() {
         return Err(ApiError::invalid(
             "account changes use the account endpoint",
@@ -863,24 +889,6 @@ fn settings_change(
     }
 
     let mut axes = Vec::new();
-    // Counted before anything is resolved, so a body naming two axes reads as
-    // malformed rather than as whatever the first of them happened to fail on.
-    let named = [
-        model.is_some(),
-        thinking.is_some(),
-        thinking_display.is_some(),
-        speed.is_some(),
-        verbosity.is_some(),
-    ]
-    .into_iter()
-    .filter(|named| *named)
-    .count();
-    if named != 1 {
-        return Err(ApiError::invalid(format!(
-            "a settings change names {named} axes: send exactly one of model, thinking, \
-             thinking_display, speed, or verbosity"
-        )));
-    }
     if let Some(selection) = model {
         // Resolved against the host's own catalog and credentials: the wire
         // carries the (api, url, name) triple, never a catalog object.
@@ -922,6 +930,11 @@ fn settings_change(
     }
 
     let axis = axes.pop().expect("exactly one axis was named");
+    let axis = if is_oracle {
+        aj_app::settings::ModelTarget::Oracle.axis(axis)
+    } else {
+        axis
+    };
 
     Ok(SettingsChange {
         agent: agent.unwrap_or(AgentId::Main),
@@ -1034,5 +1047,83 @@ impl From<IdentityError> for ApiError {
                 _ => err.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod oracle_settings_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oracle_settings_share_axis_parsing_and_refuse_invalid_requests() {
+        use crate::remote::tests::{HostHandles, scripted, scripted_host};
+        let dir = tempfile::TempDir::new().unwrap();
+        let host = scripted_host(
+            &dir,
+            scripted(Vec::new(), 0, std::time::Duration::ZERO),
+            HostHandles::new(&dir),
+            None,
+        );
+        for (level, expected) in [
+            ("off", None),
+            ("high", Some(aj_models::ThinkingConfig::High)),
+        ] {
+            let decoded = settings_change(
+                &host,
+                SettingsRequest {
+                    persist: Default::default(),
+                    agent: None,
+                    change: SessionSettings {
+                        oracle_thinking: Some(level.into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap_or_else(|err| panic!("{}", err.message));
+            assert!(
+                matches!(decoded.axis, SettingsAxis::OracleThinking(value) if value == expected)
+            );
+        }
+        for change in [
+            SessionSettings {
+                oracle_thinking: Some("high".into()),
+                thinking: Some("off".into()),
+                ..Default::default()
+            },
+            SessionSettings {
+                oracle_thinking: Some("default".into()),
+                ..Default::default()
+            },
+            SessionSettings {
+                oracle_speed: Some("invalid".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                settings_change(
+                    &host,
+                    SettingsRequest {
+                        persist: Default::default(),
+                        agent: None,
+                        change
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            settings_change(
+                &host,
+                SettingsRequest {
+                    persist: Default::default(),
+                    agent: Some(AgentId::Sub(0)),
+                    change: SessionSettings {
+                        oracle_thinking: Some("off".into()),
+                        ..Default::default()
+                    }
+                }
+            )
+            .is_err()
+        );
     }
 }

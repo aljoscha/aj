@@ -114,6 +114,12 @@ fn event_frame(epoch: &str, tagged: &TaggedEvent) -> Frame {
             entry_id: entry.id.clone(),
             branch_settings: tagged.branch_settings.clone().map(|settings| {
                 aj_wire::BranchSettings {
+                    oracle_model: settings
+                        .oracle_model
+                        .map(|(api, name)| aj_wire::RecordedModel { api, name }),
+                    oracle_thinking: settings.oracle_thinking,
+                    oracle_speed: settings.oracle_speed,
+                    oracle_verbosity: settings.oracle_verbosity,
                     model: settings
                         .model
                         .map(|(api, name)| aj_wire::RecordedModel { api, name }),
@@ -134,6 +140,7 @@ fn state_frame(epoch: &str, last_seq: u64, working: bool) -> Frame {
         epoch: epoch.to_string(),
         working,
         settings: scripted_settings(),
+        oracle_settings: None,
         credential_warning: None,
         last_seq,
     }

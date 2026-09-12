@@ -597,16 +597,22 @@ pub(crate) fn host_setup(
 }
 
 pub(crate) fn snapshot(provider: Arc<dyn Provider>) -> RunConfigSnapshot {
-    RunConfigSnapshot {
-        accounts: Default::default(),
-        provider,
-        model_info: Arc::new(scripted_model_info()),
-        stream_options: aj_models::types::StreamOptions::default(),
-        thinking: None,
-        thinking_display: None,
-        speed: None,
-        model_key: ("scripted".to_string(), "scripted".to_string()),
-        session_id: None,
+    {
+        let main = aj_app::session_setup::ModelConfig {
+            provider,
+            model_info: Arc::new(scripted_model_info()),
+            stream_options: aj_models::types::StreamOptions::default(),
+            thinking: None,
+            thinking_display: None,
+            speed: None,
+            model_key: ("scripted".to_string(), "scripted".to_string()),
+        };
+        RunConfigSnapshot {
+            oracle: main.clone(),
+            main,
+            accounts: Default::default(),
+            session_id: None,
+        }
     }
 }
 
@@ -1544,10 +1550,10 @@ async fn control_create_defaults_unstated_thinking_against_the_selected_model() 
     let dir = TempDir::new().expect("tempdir");
     let handles = HostHandles::new(&dir);
     let mut base = snapshot(scripted(Vec::new(), 0, Duration::ZERO));
-    base.thinking = Some(aj_models::ThinkingConfig::XHigh);
-    assert_eq!(base.thinking, Some(aj_models::ThinkingConfig::XHigh));
+    base.main.thinking = Some(aj_models::ThinkingConfig::XHigh);
+    assert_eq!(base.main.thinking, Some(aj_models::ThinkingConfig::XHigh));
     assert_eq!(
-        aj_models::registry::supported_thinking_levels(&base.model_info),
+        aj_models::registry::supported_thinking_levels(&base.main.model_info),
         vec![aj_models::types::ThinkingLevel::Off],
         "the selected scripted model accepts only the off default",
     );
@@ -2250,6 +2256,7 @@ async fn defaultable_unknown_fields_leave_session_state_untouched() {
             .run_config
             .lock()
             .expect("run config mutex poisoned")
+            .main
             .thinking
             .is_none(),
         "the settings change landed before its unknown field was refused",

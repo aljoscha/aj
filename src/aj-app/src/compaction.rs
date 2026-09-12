@@ -624,7 +624,7 @@ mod tests {
         ]);
         {
             let mut guard = run_config.lock().expect("run config mutex poisoned");
-            guard.model_info = Arc::new(aj_models::registry::ModelInfo {
+            guard.main.model_info = Arc::new(aj_models::registry::ModelInfo {
                 cost: aj_models::registry::ModelCost {
                     input: 3.0,
                     output: 15.0,

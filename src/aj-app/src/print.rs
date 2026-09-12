@@ -223,7 +223,7 @@ async fn run_inner<W: Write + Send + 'static>(
     let (mut run_config, restore_context) =
         build_initial_run_config(&args, &config, &auth, thinking, speed)?;
     if let Some(provider) = provider_override {
-        run_config.provider = provider;
+        run_config.main.provider = provider;
     }
     let run_config = Arc::new(std::sync::Mutex::new(run_config));
 
@@ -236,7 +236,7 @@ async fn run_inner<W: Write + Send + 'static>(
     {
         let provider_id = {
             let cfg = run_config.lock().expect("run config mutex poisoned");
-            cfg.model_key.0.clone()
+            cfg.main.model_key.0.clone()
         };
         auth.set_runtime_api_key(&provider_id, key).await;
     }
@@ -274,12 +274,24 @@ async fn run_inner<W: Write + Send + 'static>(
     } = prepare_log(
         &conversation_persistence,
         &source,
-        &config,
         &run_config,
         restore_context.as_ref(),
     )?;
     if let Some(notice) = &recovery_notice {
         eprintln!("aj: {notice}");
+    }
+    let oracle_run = run_config
+        .lock()
+        .expect("run config mutex poisoned")
+        .clone();
+    if let Some(warning) = crate::oracle::warning(
+        &oracle_run,
+        &auth,
+        restore_context.is_some() && !config.disabled_tools.iter().any(|tool| tool == "oracle"),
+    )
+    .await
+    {
+        eprintln!("{warning}");
     }
     for notice in &restore_notices {
         eprintln!("aj: {notice}");
@@ -325,17 +337,9 @@ async fn run_inner<W: Write + Send + 'static>(
     // provider/model/thinking/speed bundle plus the disabled-tools
     // filter and a freshly-read `AgentEnv`. Surface any
     // skill-discovery diagnostics to stderr.
-    let (provider, model_info, stream_options, thinking, agent_speed, verbosity, model_key) = {
+    let model_key = {
         let cfg = run_config.lock().expect("run config mutex poisoned");
-        (
-            Arc::clone(&cfg.provider),
-            Arc::clone(&cfg.model_info),
-            cfg.stream_options.clone(),
-            cfg.thinking.clone(),
-            cfg.speed,
-            cfg.stream_options.verbosity,
-            cfg.model_key.clone(),
-        )
+        cfg.main.model_key.clone()
     };
     let BuiltAgent {
         mut agent,
@@ -343,11 +347,7 @@ async fn run_inner<W: Write + Send + 'static>(
         include_skills,
     } = build_agent(
         &config,
-        provider,
-        model_info,
-        stream_options,
-        thinking.clone(),
-        agent_speed,
+        &run_config.lock().expect("run config mutex poisoned"),
     );
     agent.set_session_env(session_env.unwrap_or_default());
     for d in &env.skill_diagnostics {
@@ -376,10 +376,7 @@ async fn run_inner<W: Write + Send + 'static>(
         &env,
         include_skills,
         source.creation_env(),
-        &model_key,
-        thinking.as_ref(),
-        agent_speed,
-        verbosity,
+        &run_config.lock().expect("run config mutex poisoned"),
     )?;
 
     if let Some(selection) = args.account_selection() {

@@ -763,7 +763,7 @@ mod tests {
             .id;
 
         let spawn = log
-            .append_subagent_spawn(7, active_head, "measure", true, &spawn_settings())
+            .append_subagent_spawn(7, active_head, "measure", "agent", true, &spawn_settings())
             .unwrap();
         let subagent_tie = log
             .append(

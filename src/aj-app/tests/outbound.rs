@@ -112,6 +112,7 @@ fn state(last_seq: u64) -> Frame {
             speed: "standard".into(),
             verbosity: "default".into(),
         },
+        oracle_settings: None,
         credential_warning: None,
         last_seq,
     }

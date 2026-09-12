@@ -24,10 +24,9 @@ use aj_models::registry::{ModelInfo, ModelRegistry};
 ///   stable item id, and the fuzzy-search anchor.
 /// - `title`: friendly label shown as the primary column in the
 ///   command palette and help overlay. Decoupled from `name` so the
-///   UI can read cleanly (e.g. category `model` + title `use`)
+///   UI can read cleanly (e.g. category `agent` + title `oracle model`)
 ///   without the token having to carry the whole phrase.
-/// - `category`: short label grouping commands in the palette UI;
-///   currently one of `"model"`, `"session"`, `"prompt"`, or `"aj"`.
+/// - `category`: short label grouping commands in the palette UI.
 ///   Also part of the palette's fuzzy-search key, so typing a
 ///   category surfaces the whole group.
 /// - `description`: one-line human-readable summary.
@@ -57,18 +56,34 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "thinking",
         title: "thinking effort",
-        category: "model",
-        description: "Set the reasoning effort for this session.",
+        category: "agent",
+        description: "Set the focused agent's reasoning effort for this session.",
         action_id: None,
         action: CommandAction::OpenThinkingSelector,
     },
     Command {
         name: "model",
-        title: "use",
-        category: "model",
-        description: "Use a different model for this session.",
+        title: "model",
+        category: "agent",
+        description: "Use a different model for the focused agent in this session.",
         action_id: None,
         action: CommandAction::OpenModelSelector,
+    },
+    Command {
+        name: "oracle-model",
+        title: "oracle model",
+        category: "agent",
+        description: "Set this session's Oracle model, starting with the next Main turn.",
+        action_id: None,
+        action: CommandAction::OpenOracleModelSelector,
+    },
+    Command {
+        name: "oracle-thinking",
+        title: "oracle thinking effort",
+        category: "agent",
+        description: "Set this session's Oracle reasoning effort, starting with the next Main turn.",
+        action_id: None,
+        action: CommandAction::OpenOracleThinkingSelector,
     },
     Command {
         name: "login",
@@ -296,6 +311,10 @@ pub enum CommandAction {
     /// affects the current session only. Use the settings window to
     /// change the default for new sessions.
     OpenModelSelector,
+    /// Choose the model for this session's Oracle consultations.
+    OpenOracleModelSelector,
+    /// Choose reasoning effort for this session's Oracle consultations.
+    OpenOracleThinkingSelector,
     /// Choose a session-specific account for the viewed model's provider.
     OpenAccountSelector,
     /// Open the OAuth provider/account picker. Adding an account opens the login

@@ -125,6 +125,14 @@ pub struct SessionSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_model: Option<ModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_speed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_verbosity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_display: Option<String>,
@@ -135,6 +143,19 @@ pub struct SessionSettings {
     /// Creation-only account choice. Absence leaves the choice unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<AccountSelection>,
+}
+
+impl SessionSettings {
+    /// Project only Oracle inference overrides onto the ordinary settings axes.
+    pub fn oracle(&self) -> Self {
+        Self {
+            model: self.oracle_model.clone(),
+            thinking: self.oracle_thinking.clone(),
+            speed: self.oracle_speed.clone(),
+            verbosity: self.oracle_verbosity.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 /// A prompt represented either as plain text or typed content blocks.
@@ -395,6 +416,14 @@ pub struct RecordedModel {
 pub struct BranchSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<RecordedModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_model: Option<RecordedModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_speed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_verbosity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1099,6 +1128,14 @@ mod request {
         #[serde(default)]
         model: Option<ModelSelection>,
         #[serde(default)]
+        oracle_model: Option<ModelSelection>,
+        #[serde(default)]
+        oracle_thinking: Option<String>,
+        #[serde(default)]
+        oracle_speed: Option<String>,
+        #[serde(default)]
+        oracle_verbosity: Option<String>,
+        #[serde(default)]
         thinking: Option<String>,
         #[serde(default)]
         thinking_display: Option<String>,
@@ -1116,6 +1153,10 @@ mod request {
             agent: request.agent,
             change: SessionSettings {
                 model: request.model,
+                oracle_model: request.oracle_model,
+                oracle_thinking: request.oracle_thinking,
+                oracle_speed: request.oracle_speed,
+                oracle_verbosity: request.oracle_verbosity,
                 thinking: request.thinking,
                 thinking_display: request.thinking_display,
                 speed: request.speed,
@@ -1454,6 +1495,9 @@ pub enum Frame {
         epoch: String,
         working: bool,
         settings: AgentSettings,
+        /// Oracle settings staged for the next main turn. Absent when unresolved
+        /// or when the host has no Oracle support.
+        oracle_settings: Option<AgentSettings>,
         /// A problem with the host-side credentials for `settings.provider`,
         /// when the host could not confirm that inference can authenticate.
         /// Present on an attach block's opening state only. Live state updates
@@ -1637,6 +1681,8 @@ enum FrameRef<'a> {
         working: bool,
         settings: &'a AgentSettings,
         #[serde(skip_serializing_if = "Option::is_none")]
+        oracle_settings: Option<&'a AgentSettings>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         credential_warning: Option<&'a str>,
         last_seq: u64,
     },
@@ -1689,6 +1735,7 @@ impl Serialize for Frame {
                 epoch,
                 working,
                 settings,
+                oracle_settings,
                 credential_warning,
                 last_seq,
             } => FrameRef::State {
@@ -1696,6 +1743,7 @@ impl Serialize for Frame {
                 epoch,
                 working: *working,
                 settings,
+                oracle_settings: oracle_settings.as_ref(),
                 credential_warning: credential_warning.as_deref(),
                 last_seq: *last_seq,
             },
@@ -1793,6 +1841,7 @@ impl<'de> Deserialize<'de> for Frame {
                     epoch,
                     working,
                     settings,
+                    oracle_settings,
                     credential_warning,
                     last_seq,
                 } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
@@ -1801,6 +1850,7 @@ impl<'de> Deserialize<'de> for Frame {
                     epoch,
                     working,
                     settings,
+                    oracle_settings,
                     credential_warning,
                     last_seq,
                 })
@@ -1871,6 +1921,8 @@ struct StateFrameFields {
     epoch: String,
     working: bool,
     settings: AgentSettings,
+    #[serde(default)]
+    oracle_settings: Option<AgentSettings>,
     #[serde(default)]
     credential_warning: Option<String>,
     last_seq: u64,

@@ -367,7 +367,7 @@ async fn build_world(
             .run_config
             .lock()
             .expect("run config mutex poisoned");
-        (cfg.settings(), cfg.model_info.context_window)
+        (cfg.settings(), cfg.main.model_info.context_window)
     };
     *chat.borrow_mut() = seeded_chat(&config, settings, context_window, &catalog);
     let mut world = World {
@@ -653,7 +653,7 @@ fn local_settings_seed(handles: &LocalHandles) -> (AgentSettings, u64) {
         .run_config
         .lock()
         .expect("run config mutex poisoned");
-    (cfg.settings(), cfg.model_info.context_window)
+    (cfg.settings(), cfg.main.model_info.context_window)
 }
 
 /// The settings placeholder a connect-mode chat model starts on, replaced by
@@ -3936,6 +3936,9 @@ async fn apply_command_action(
         CommandAction::ExportHtml => Some("export the session"),
         CommandAction::OpenThinkingSelector => Some("change thinking effort"),
         CommandAction::OpenModelSelector => Some("change the model"),
+        CommandAction::OpenOracleModelSelector | CommandAction::OpenOracleThinkingSelector => {
+            Some("change Oracle settings")
+        }
         CommandAction::OpenAccountSelector => Some("change the account"),
         CommandAction::OpenSessionTag => Some("change the session tag"),
         CommandAction::OpenSessionEnv => Some("edit the session environment"),
@@ -3944,7 +3947,10 @@ async fn apply_command_action(
     let local_choice = shell.borrow().view().branch_anchor.borrow().is_some()
         && matches!(
             action,
-            CommandAction::OpenThinkingSelector | CommandAction::OpenModelSelector
+            CommandAction::OpenThinkingSelector
+                | CommandAction::OpenModelSelector
+                | CommandAction::OpenOracleModelSelector
+                | CommandAction::OpenOracleThinkingSelector
         );
     if !local_choice && gated.is_some_and(|verb| refuse_while_attaching(world, shell, verb)) {
         return ActionEffect::Redraw;
@@ -3980,9 +3986,24 @@ async fn apply_command_action(
         // The host-backed editors open on a placeholder at once and park
         // their read in `Shell::fills` for the drive loop, so the window is
         // there and cancellable before the host has answered.
-        CommandAction::OpenThinkingSelector | CommandAction::OpenModelSelector => {
-            let thinking = matches!(action, CommandAction::OpenThinkingSelector);
-            let fetch = open_host_selector(world, shell, thinking);
+        CommandAction::OpenThinkingSelector
+        | CommandAction::OpenModelSelector
+        | CommandAction::OpenOracleModelSelector
+        | CommandAction::OpenOracleThinkingSelector => {
+            let thinking = matches!(
+                action,
+                CommandAction::OpenThinkingSelector | CommandAction::OpenOracleThinkingSelector
+            );
+            let oracle = matches!(
+                action,
+                CommandAction::OpenOracleModelSelector | CommandAction::OpenOracleThinkingSelector
+            );
+            let target = if oracle {
+                crate::settings_ui::SelectorTarget::Oracle
+            } else {
+                editing_target(world, shell).into()
+            };
+            let fetch = open_host_selector(world, shell, thinking, target);
             shell
                 .borrow_mut()
                 .fills
@@ -4534,7 +4555,8 @@ async fn dispatch_selector_activity(
     for item in activity {
         changed = true;
         let session_mutation = match &item {
-            SelectorActivity::ThinkingConfirmed { .. }
+            SelectorActivity::OracleConfirmed { .. }
+            | SelectorActivity::ThinkingConfirmed { .. }
             | SelectorActivity::ModelConfirmed { .. }
             | SelectorActivity::EnvironmentEdit(_) => true,
             SelectorActivity::SettingChange { id, .. }
@@ -4543,18 +4565,27 @@ async fn dispatch_selector_activity(
         };
         let draft_choice = shell.borrow().view().branch_anchor.borrow().is_some()
             && match &item {
+                SelectorActivity::OracleConfirmed { .. } => true,
                 SelectorActivity::ThinkingConfirmed { target, .. }
                 | SelectorActivity::ModelConfirmed { target, .. } => *target == AgentId::Main,
                 SelectorActivity::SettingChange { id, .. }
                 | SelectorActivity::SettingClear { id, .. } => matches!(
                     id.as_str(),
-                    MODEL_SETTING_ID | "thinking" | "speed" | "verbosity"
+                    MODEL_SETTING_ID
+                        | "thinking"
+                        | "speed"
+                        | "verbosity"
+                        | "oracle_model"
+                        | "oracle_thinking"
+                        | "oracle_speed"
+                        | "oracle_verbosity"
                 ),
                 SelectorActivity::EnvironmentEdit(edit) => edit.session == world.session(),
                 _ => false,
             };
         let opening_owner = match &item {
-            SelectorActivity::ThinkingConfirmed { owner, .. }
+            SelectorActivity::OracleConfirmed { owner, .. }
+            | SelectorActivity::ThinkingConfirmed { owner, .. }
             | SelectorActivity::ModelConfirmed { owner, .. }
             | SelectorActivity::SettingChange { owner, .. }
             | SelectorActivity::SettingClear { owner, .. }
@@ -4575,6 +4606,17 @@ async fn dispatch_selector_activity(
             continue;
         }
         match item {
+            SelectorActivity::OracleConfirmed { owner, axis } => {
+                if owner.branch.is_some() {
+                    let notice = stage_branch_setting(&owner, None, axis).await;
+                    shell.borrow().show_toast(notice);
+                } else {
+                    match command_settings(&owner, AgentId::Main, PersistAction::None, axis).await {
+                        Ok(Some(notice)) | Err(notice) => shell.borrow().show_toast(notice),
+                        Ok(None) => {}
+                    }
+                }
+            }
             SelectorActivity::ThinkingConfirmed {
                 owner,
                 target,
@@ -4819,19 +4861,10 @@ async fn confirm_model(
     match target {
         AgentId::Main => note_main_footer(world),
         AgentId::Sub(_) => {
-            // The host rebuilds a sub's bundle at the session's speed, so
-            // that is the speed to show for it.
-            let speed = world
-                .client()
-                .settings()
-                .map(|settings| settings.speed.clone());
             let window = info.context_window;
             patch_sub_footer_window(world, target, window, |settings| {
                 settings.provider = info.provider.clone();
                 settings.model_id = info.id.clone();
-                if let Some(speed) = speed {
-                    settings.speed = speed;
-                }
             });
         }
     }
@@ -5326,12 +5359,43 @@ fn spawn_session_scan(
 /// what its fill needs: the host, the session, and the branch it was opened
 /// against, so neither a focus change nor a re-armed anchor can redirect the
 /// choice.
-fn open_host_selector(world: &World, shell: &Rc<RefCell<Shell>>, thinking: bool) -> SelectorFetch {
-    let target = editing_target(world, shell);
+fn open_host_selector(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    thinking: bool,
+    target: crate::settings_ui::SelectorTarget,
+) -> SelectorFetch {
+    use crate::settings_ui::SelectorTarget;
+    let title = match (target, thinking) {
+        (SelectorTarget::Oracle, true) => "Oracle thinking effort",
+        (SelectorTarget::Oracle, false) => "Oracle model",
+        (_, true) => "Thinking effort",
+        (_, false) => "Select model",
+    };
+    let (model, current_thinking) = match target {
+        SelectorTarget::Agent(agent) => (
+            editing_model(world, shell, agent),
+            editing_thinking(world, shell, agent),
+        ),
+        SelectorTarget::Oracle => {
+            if let Some(settings) = branch_settings(shell) {
+                (
+                    settings.oracle_model.map(|m| (m.api, m.name)),
+                    settings.oracle_thinking,
+                )
+            } else {
+                let settings = world.client().oracle_settings();
+                (
+                    settings.map(|s| (s.provider.clone(), s.model_id.clone())),
+                    settings.map(|s| s.thinking.clone()),
+                )
+            }
+        }
+    };
     let handles = shell.borrow().overlay_handles();
-    let select = open_selector_loading(&handles.stack, &handles.editor, &handles.chrome, thinking);
+    let select = open_selector_loading(&handles.stack, &handles.editor, &handles.chrome, title);
     let mut owner = SettingsOwner::capture(world, shell, Arc::new(Vec::new()));
-    if target != AgentId::Main {
+    if matches!(target, SelectorTarget::Agent(AgentId::Sub(_))) {
         owner.branch = None;
     }
     SelectorFetch {
@@ -5339,8 +5403,8 @@ fn open_host_selector(world: &World, shell: &Rc<RefCell<Shell>>, thinking: bool)
         handles,
         owner,
         target,
-        model: editing_model(world, shell, target),
-        current_thinking: editing_thinking(world, shell, target),
+        model,
+        current_thinking,
         thinking,
     }
 }
@@ -5363,7 +5427,7 @@ struct SelectorFetch {
     select: std::rc::Weak<RefCell<vaxis::vxfw::FilterableSelect>>,
     handles: OverlayHandles,
     owner: SettingsOwner,
-    target: AgentId,
+    target: crate::settings_ui::SelectorTarget,
     model: Option<(String, String)>,
     current_thinking: Option<String>,
     thinking: bool,
@@ -9418,6 +9482,7 @@ mod tests {
             &mut chat.borrow_mut(),
             &mut lifecycle,
             AgentEvent::SubAgentStart {
+                tool_name: "agent".into(),
                 parent: AgentId::Main,
                 child: AgentId::Sub(7),
                 task: "inspect the picker wiring".into(),
@@ -9733,7 +9798,7 @@ mod tests {
             .run_config
             .lock()
             .expect("run config mutex poisoned");
-        cfg.provider = Arc::new(aj_models::scripted::ScriptedProvider::from_messages(
+        cfg.main.provider = Arc::new(aj_models::scripted::ScriptedProvider::from_messages(
             messages,
             1,
             Duration::from_millis(50),
@@ -10727,6 +10792,7 @@ mod tests {
             .run_config
             .lock()
             .expect("run config mutex poisoned")
+            .main
             .thinking
             .clone();
         assert_eq!(
@@ -10779,13 +10845,13 @@ mod tests {
                 .lock()
                 .expect("run config mutex poisoned");
             assert_eq!(
-                run_config.model_key,
+                run_config.main.model_key,
                 ("openai-codex".to_string(), "gpt-5.2".to_string()),
                 "the fixture did not cross the requested registry arm",
             );
-            assert_eq!(run_config.model_info.api, "openai-codex-responses");
+            assert_eq!(run_config.main.model_info.api, "openai-codex-responses");
             assert_eq!(
-                run_config.thinking,
+                run_config.main.thinking,
                 Some(aj_models::ThinkingConfig::XHigh),
                 "the composed registry run dropped the config fallback",
             );
@@ -18091,6 +18157,341 @@ mod tests {
         assert_eq!(reattach(world, shell).await.unwrap(), CatchUp::Caught);
     }
 
+    #[tokio::test]
+    async fn oracle_state_refreshes_after_a_backpressured_attach() {
+        let dir = TempDir::new().unwrap();
+        let mut world = scripted_world(&dir, "streaming-text").await;
+        drive_demo_to_completion(&mut world).await;
+        let mut stream = world
+            .host()
+            .attach(&[AttachRequest {
+                session: world.session().to_string(),
+                cursor: None,
+            }])
+            .await
+            .unwrap();
+        let opening = tokio::time::timeout(SETTLE_DEADLINE, stream.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let aj_wire::Frame::State {
+            settings,
+            oracle_settings: Some(oracle),
+            ..
+        } = opening
+        else {
+            panic!("attach must open with main and Oracle settings");
+        };
+        let level = if oracle.thinking == "high" {
+            None
+        } else {
+            Some(ThinkingConfig::High)
+        };
+        let expected = aj_models::thinking_config_name(level.as_ref());
+        // The completed turn gives the capacity-one attach channel more frames
+        // than it can buffer, so withholding reads keeps the change inside the block.
+        world
+            .control
+            .command(
+                world.session(),
+                Command::Settings(SettingsChange {
+                    agent: AgentId::Main,
+                    persist: PersistAction::None,
+                    axis: SettingsAxis::OracleThinking(level.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(SETTLE_DEADLINE, async {
+            let mut caught = false;
+            loop {
+                match stream.recv().await.expect("attach remains open") {
+                    aj_wire::Frame::CaughtUp { .. } => caught = true,
+                    aj_wire::Frame::State {
+                        settings: main,
+                        oracle_settings,
+                        ..
+                    } => {
+                        assert!(caught, "the refresh follows the attach block");
+                        assert_eq!(main, settings, "only Oracle settings changed");
+                        assert_eq!(oracle_settings.unwrap().thinking, expected);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("Oracle-only change must survive the attach block");
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn oracle_selectors_allow_repair_without_live_state_and_keep_unknown_branch_history() {
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        fold_ready_frames(&mut world);
+        let frame = aj_wire::Frame::State {
+            session: world.session().into(),
+            epoch: world.client().cursor().unwrap().epoch,
+            working: false,
+            settings: world.client().settings().unwrap().clone(),
+            oracle_settings: None,
+            credential_warning: None,
+            last_seq: 0,
+        };
+        let _ = world.directory.apply(frame);
+        for action in [
+            CommandAction::OpenOracleModelSelector,
+            CommandAction::OpenOracleThinkingSelector,
+        ] {
+            assert!(matches!(
+                apply_command(&mut world, &shell, action).await,
+                ActionEffect::OpenedOverlay
+            ));
+            assert!(!top_overlay_rows(&shell).join("\n").contains("(current)"));
+            shell.borrow().overlays.borrow_mut().close_all();
+        }
+        *shell.borrow().view().branch_anchor.borrow_mut() = Some(crate::branch::BranchDraft::new(
+            "historical-message".into(),
+            None,
+        ));
+        assert!(matches!(
+            apply_command(
+                &mut world,
+                &shell,
+                CommandAction::OpenOracleThinkingSelector
+            )
+            .await,
+            ActionEffect::OpenedOverlay
+        ));
+        assert!(!top_overlay_rows(&shell).join("\n").contains("(current)"));
+        assert!(branch_settings(&shell).unwrap().oracle_thinking.is_none());
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn oracle_agent_picker_preserves_origin_for_search_and_selection() {
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let settings = world.handles().run_config.lock().unwrap().oracle.settings();
+        let mut lifecycle = AgentLifecycle::default();
+        for (n, tool) in [(3, ""), (5, "agent"), (7, "oracle")] {
+            let _ = reduce(
+                &mut world.chat.borrow_mut(),
+                &mut lifecycle,
+                AgentEvent::SubAgentStart {
+                    parent: AgentId::Main,
+                    child: AgentId::Sub(n),
+                    task: "Inspect the implementation".into(),
+                    tool_name: tool.into(),
+                    background: true,
+                    settings: settings.clone(),
+                },
+                None,
+            );
+        }
+        apply_command(&mut world, &shell, CommandAction::OpenAgentPicker).await;
+        focus_overlay(&mut app, &root);
+        let page = top_overlay_rows(&shell).join("\n");
+        for label in ["agent 3", "agent 5", "agent(oracle) 7"] {
+            assert!(page.contains(label), "missing {label}: {page}");
+        }
+        type_text(&mut app, &mut writer, "oracle").await;
+        let page = top_overlay_rows(&shell).join("\n");
+        assert!(page.contains("agent(oracle) 7"), "{page}");
+        assert!(
+            !page.contains("agent 3") && !page.contains("agent 5"),
+            "{page}"
+        );
+        press(&mut app, &mut writer, b"\r").await;
+        assert_eq!(
+            shell.borrow().take_picker_outcome(),
+            Some(AgentPickerOutcome::Observe(AgentId::Sub(7))),
+        );
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn oracle_selectors_use_independent_settings_and_branch_history() {
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        fold_ready_frames(&mut world);
+        let before = world.client().settings().unwrap().clone();
+        let oracle_before = world.client().oracle_settings().unwrap().clone();
+        assert_eq!(
+            world
+                .control
+                .session_info(world.session())
+                .await
+                .unwrap()
+                .settings,
+            world.handles().log.lock().await.stats().settings,
+            "session info reports recorded facts, not runtime defaults"
+        );
+        apply_command(
+            &mut world,
+            &shell,
+            CommandAction::OpenOracleThinkingSelector,
+        )
+        .await;
+        focus_overlay(&mut app, &root);
+        let page = top_overlay_rows(&shell).join("\n");
+        assert!(!page.contains("Follow main"));
+        assert!(page.contains(&format!("{} (current)", oracle_before.thinking)));
+        writer.write_all(b"low\r").unwrap();
+        for _ in 0..4 {
+            let event = app.next_input().await.unwrap();
+            app.handle_input(event);
+        }
+        let activity = shell.borrow().take_activity();
+        assert_eq!(activity.len(), 1);
+        apply_selector_activity(&mut world, &shell, &mut inert_theme_watch(), activity).await;
+        fold_ready_frames(&mut world);
+        assert_eq!(world.client().oracle_settings().unwrap().thinking, "low");
+        assert_eq!(world.client().settings(), Some(&before));
+        let info = world.catalog.first().unwrap().clone();
+        let selection = aj_wire::RecordedModel {
+            api: info.provider.clone(),
+            name: info.id.clone(),
+        };
+        *shell.borrow().view().branch_anchor.borrow_mut() = Some(crate::branch::BranchDraft::new(
+            "historical-message".into(),
+            Some(aj_wire::BranchSettings {
+                oracle_model: Some(selection.clone()),
+                oracle_thinking: Some("high".into()),
+                ..Default::default()
+            }),
+        ));
+        apply_command(&mut world, &shell, CommandAction::OpenOracleModelSelector).await;
+        focus_overlay(&mut app, &root);
+        let page = top_overlay_rows(&shell).join("\n");
+        assert!(page.contains(&format!("{} (current)", info.name)));
+        assert!(!page.contains("Follow main"));
+        writer.write_all(b"\r").unwrap();
+        let event = app.next_input().await.unwrap();
+        app.handle_input(event);
+        let activity = shell.borrow().take_activity();
+        assert_eq!(activity.len(), 1);
+        apply_selector_activity(&mut world, &shell, &mut inert_theme_watch(), activity).await;
+        assert_eq!(
+            branch_settings(&shell).unwrap().oracle_model,
+            Some(selection)
+        );
+        assert_eq!(
+            world
+                .control
+                .session_info(world.session())
+                .await
+                .unwrap()
+                .settings
+                .oracle_thinking
+                .as_deref(),
+            Some("low")
+        );
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn oracle_control_local_and_remote_settings_agree() {
+        let Some(home) = isolated_test_home() else {
+            return;
+        };
+        let dir = TempDir::new().unwrap();
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let session = remote.host.create().await.unwrap();
+        let (world, _) = connect_world_and_shell(&dir, &remote, &[&session]).await;
+        let client_thinking = world.config.lock().unwrap().oracle_thinking;
+        let local = Control::local(remote.host.clone());
+        let before = local.session_info(&session).await.unwrap().settings;
+        for (control, saved_level) in [
+            (&local, ThinkingConfig::Low),
+            (&world.control, ThinkingConfig::High),
+        ] {
+            for level in [None, Some(ThinkingConfig::High)] {
+                control
+                    .command(
+                        &session,
+                        Command::Settings(SettingsChange {
+                            agent: AgentId::Main,
+                            persist: PersistAction::None,
+                            axis: SettingsAxis::OracleThinking(level.clone()),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let expected = aj_models::thinking_config_name(level.as_ref());
+                for reader in [&local, &world.control] {
+                    let settings = reader.session_info(&session).await.unwrap().settings;
+                    assert_eq!(settings.oracle_thinking.as_deref(), Some(expected));
+                    assert_eq!(settings.thinking, before.thinking);
+                    assert_eq!(settings.model, before.model);
+                }
+            }
+            control
+                .command(
+                    &session,
+                    Command::Settings(SettingsChange {
+                        agent: AgentId::Main,
+                        persist: PersistAction::None,
+                        axis: SettingsAxis::OracleVerbosity(Some(aj_conf::ConfigVerbosity::High)),
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                local
+                    .session_info(&session)
+                    .await
+                    .unwrap()
+                    .settings
+                    .oracle_verbosity
+                    .as_deref(),
+                Some("high")
+            );
+            assert_eq!(
+                world
+                    .control
+                    .session_info(&session)
+                    .await
+                    .unwrap()
+                    .settings
+                    .oracle_verbosity
+                    .as_deref(),
+                Some("high")
+            );
+            control
+                .command(
+                    &session,
+                    Command::Settings(SettingsChange {
+                        agent: AgentId::Main,
+                        persist: PersistAction::User,
+                        axis: SettingsAxis::OracleThinking(Some(saved_level.clone())),
+                    }),
+                )
+                .await
+                .unwrap();
+            let expected = aj_models::thinking_config_name(Some(&saved_level));
+            for reader in [&local, &world.control] {
+                let saved = reader.config(&session).await.unwrap();
+                assert_eq!(saved.user["oracle_thinking"], expected);
+                assert_eq!(saved.effective["oracle_thinking"], expected);
+            }
+            assert_eq!(
+                world.config.lock().unwrap().oracle_thinking,
+                client_thinking
+            );
+            assert!(
+                std::fs::read_to_string(home.join(".aj/config.toml"))
+                    .unwrap()
+                    .contains(&format!("oracle_thinking = {expected:?}"))
+            );
+        }
+        remote.host.shutdown().await;
+    }
+
     /// The thinking selector, driven through real dispatch: open from the
     /// host path, filter to `high`, confirm. The change updates the footer and
     /// stages the run config, is recorded on the session log, and (session
@@ -18137,7 +18538,7 @@ mod tests {
         );
         // The run config staged it for the next turn.
         assert_eq!(
-            world.handles().run_config.lock().unwrap().thinking,
+            world.handles().run_config.lock().unwrap().main.thinking,
             Some(ThinkingConfig::High)
         );
         // Session-scoped: the user config layer's default is unchanged (still
@@ -18165,7 +18566,7 @@ mod tests {
             .await
             .expect("next session handles");
         assert_eq!(
-            next_handles.run_config.lock().unwrap().thinking,
+            next_handles.run_config.lock().unwrap().main.thinking,
             None,
             "a session-scoped selector choice did not become a host default"
         );
@@ -18262,7 +18663,7 @@ mod tests {
 
         // Staged into the run config for the next turn.
         assert_eq!(
-            world.handles().run_config.lock().unwrap().thinking,
+            world.handles().run_config.lock().unwrap().main.thinking,
             Some(ThinkingConfig::High)
         );
         // Persisted to the tempdir user config.toml.
@@ -18279,7 +18680,7 @@ mod tests {
             .await
             .expect("next session handles");
         assert_eq!(
-            next_handles.run_config.lock().unwrap().thinking,
+            next_handles.run_config.lock().unwrap().main.thinking,
             Some(ThinkingConfig::High)
         );
         // The window stays open across an edit.
@@ -18385,6 +18786,169 @@ mod tests {
             world.config.lock().unwrap().auto_compact,
             "effective reverts to the user default"
         );
+    }
+
+    #[tokio::test]
+    async fn oracle_settings_apply_to_session_and_save_defaults() {
+        let Some(home) = isolated_test_home() else {
+            return;
+        };
+        let dir = TempDir::new().unwrap();
+        let layers = ConfigLayers {
+            writes: Default::default(),
+            user: Config::default(),
+            project: Default::default(),
+            project_path: Some(dir.path().join(".aj/config.toml")),
+        };
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", layers).await;
+        let before = world.handles().run_config.lock().unwrap().settings();
+        apply_command(&mut world, &shell, CommandAction::OpenSettings).await;
+        focus_overlay(&mut app, &root);
+        writer.write_all(b"oracle_thinking\r").unwrap();
+        for _ in 0..16 {
+            let event = app.next_input().await.unwrap();
+            app.handle_input(event);
+        }
+        writer.write_all(b"high\r").unwrap();
+        for _ in 0..5 {
+            let event = app.next_input().await.unwrap();
+            app.handle_input(event);
+        }
+        let activity = shell.borrow().take_activity();
+        assert_eq!(activity.len(), 1);
+        apply_selector_activity(&mut world, &shell, &mut inert_theme_watch(), activity).await;
+        let live = world
+            .control
+            .session_info(world.session())
+            .await
+            .unwrap()
+            .settings;
+        assert_eq!(live.oracle_thinking.as_deref(), Some("high"));
+        assert_eq!(
+            world.handles().run_config.lock().unwrap().settings(),
+            before
+        );
+        assert!(
+            std::fs::read_to_string(home.join(".aj/config.toml"))
+                .unwrap()
+                .contains("oracle_thinking = \"high\"")
+        );
+        let mut watch = inert_theme_watch();
+        assert!(
+            apply_setting_change(
+                &world,
+                &shell,
+                &mut watch,
+                PersistAction::ProjectSet,
+                "oracle_thinking",
+                "low"
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(
+            world
+                .control
+                .session_info(world.session())
+                .await
+                .unwrap()
+                .settings
+                .oracle_thinking
+                .as_deref(),
+            Some("low")
+        );
+        assert!(
+            apply_setting_change(
+                &world,
+                &shell,
+                &mut watch,
+                PersistAction::ProjectClear,
+                "oracle_thinking",
+                "high"
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(
+            world
+                .control
+                .session_info(world.session())
+                .await
+                .unwrap()
+                .settings
+                .oracle_thinking
+                .as_deref(),
+            Some("high")
+        );
+        assert!(
+            !std::fs::read_to_string(dir.path().join(".aj/config.toml"))
+                .unwrap()
+                .contains("oracle_thinking")
+        );
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn settings_effort_picker_follows_model_edits_without_reopening() {
+        for (model_row, effort_row) in [("model", "thinking"), ("oracle_model", "oracle_thinking")]
+        {
+            let dir = TempDir::new().unwrap();
+            let layers = ConfigLayers {
+                user: Config::default(),
+                project: Default::default(),
+                project_path: Some(dir.path().join(".aj/config.toml")),
+                writes: Default::default(),
+            };
+            let (mut world, shell, mut app, mut writer, root) =
+                world_shell_app(&dir, "streaming-text", layers).await;
+            apply_command(&mut world, &shell, CommandAction::OpenProjectSettings).await;
+            focus_overlay(&mut app, &root);
+            type_text(&mut app, &mut writer, model_row).await;
+            press(&mut app, &mut writer, b"\r").await;
+            let title = if model_row == "oracle_model" {
+                "Oracle model"
+            } else {
+                "Select model"
+            };
+            assert!(top_overlay_rows(&shell).join("\n").contains(title));
+            type_text(&mut app, &mut writer, "openai gpt-5.5").await;
+            press(&mut app, &mut writer, b"\r").await;
+            let activity = shell.borrow().take_activity();
+            assert_eq!(activity.len(), 1);
+            apply_selector_activity(&mut world, &shell, &mut inert_theme_watch(), activity).await;
+            let config = world.control.config(world.session()).await.unwrap();
+            let key = if model_row == "model" {
+                "model_name"
+            } else {
+                "oracle_model_name"
+            };
+            assert_eq!(
+                config.effective[key], "gpt-5.5",
+                "the model edit reached the host"
+            );
+            for _ in 0..model_row.len() {
+                press(&mut app, &mut writer, b"\x7f").await;
+            }
+            type_text(&mut app, &mut writer, effort_row).await;
+            press(&mut app, &mut writer, b"\r").await;
+            let page = top_overlay_rows(&shell).join("\n");
+            let title = if effort_row == "oracle_thinking" {
+                "Oracle thinking effort"
+            } else {
+                "Thinking effort"
+            };
+            assert!(page.contains(title), "{page}");
+            assert!(
+                page.contains("off"),
+                "new model's effort is missing: {page}"
+            );
+            assert!(
+                !page.contains("max"),
+                "previous model's effort is still offered: {page}"
+            );
+            shut_down(&world).await;
+        }
     }
 
     /// Project availability is resolved in the asynchronous loading window.
@@ -18496,6 +19060,7 @@ mod tests {
         };
         let events = [
             AgentEvent::SubAgentStart {
+                tool_name: "agent".into(),
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "do the thing".into(),
@@ -18682,6 +19247,7 @@ mod tests {
         fold_event(
             &mut world,
             AgentEvent::SubAgentStart {
+                tool_name: "agent".into(),
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -18758,6 +19324,7 @@ mod tests {
         fold_event(
             &mut world,
             AgentEvent::SubAgentStart {
+                tool_name: "agent".into(),
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -18837,6 +19404,7 @@ mod tests {
         fold_event(
             &mut world,
             AgentEvent::SubAgentStart {
+                tool_name: "agent".into(),
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -18899,6 +19467,7 @@ mod tests {
         fold_event(
             &mut world,
             AgentEvent::SubAgentStart {
+                tool_name: "agent".into(),
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -18951,6 +19520,7 @@ mod tests {
         fold_event(
             &mut world,
             AgentEvent::SubAgentStart {
+                tool_name: "agent".into(),
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -19033,6 +19603,7 @@ mod tests {
         fold_event(
             &mut world,
             AgentEvent::SubAgentStart {
+                tool_name: "agent".into(),
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "reason harder".into(),
@@ -20621,7 +21192,7 @@ mod tests {
             // Keep catalog-backed restoration while making the seed inference
             // deterministic and entirely local. Scripted CLI mode deliberately
             // has no restoration context, so it cannot test this contract.
-            handles.run_config.lock().unwrap().provider =
+            handles.run_config.lock().unwrap().main.provider =
                 Arc::new(aj_models::scripted::ScriptedProvider::from_messages(
                     vec![aj_app::test_support::finalized_text_message(
                         "original answer",
@@ -23954,7 +24525,7 @@ mod tests {
         let before = painted_rows(&shell, 100, 30);
         assert!(before.iter().any(|row| row.contains("context row 000")));
         assert!(!transcript.borrow().is_following_tail());
-        world.handles().run_config.lock().unwrap().provider =
+        world.handles().run_config.lock().unwrap().main.provider =
             Arc::new(aj_models::scripted::ScriptedProvider::from_messages(
                 vec![aj_app::test_support::finalized_text_message(
                     "branch response complete",
@@ -26866,6 +27437,7 @@ mod tests {
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
+            oracle_settings: None,
             credential_warning: credential_warning.map(str::to_string),
             last_seq: 0,
         })

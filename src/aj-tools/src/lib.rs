@@ -36,6 +36,7 @@ pub use tools::agent::AgentTool;
 pub use tools::apply_patch::ApplyPatchTool;
 pub use tools::bash::BashTool;
 pub use tools::edit_file::EditFileTool;
+pub use tools::oracle::OracleTool;
 pub use tools::read_file::ReadFileTool;
 pub use tools::task::{TaskOutputTool, TaskStopTool};
 pub use tools::todo::{TodoReadTool, TodoWriteTool};
@@ -76,6 +77,7 @@ impl Default for BuiltinToolOptions {
 pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefinition> {
     vec![
         AgentTool.into(),
+        OracleTool::default().into(),
         ApplyPatchTool.into(),
         BashTool::new(options.bash_rtk, options.spill_dir.clone()).into(),
         ReadFileTool::with_auto_resize(options.image_auto_resize).into(),
@@ -124,7 +126,7 @@ pub fn builtin_tools_for_model(
 /// name-set contract in a single place rather than re-applied at each
 /// frontend's call site. The agent never advertises a filtered tool
 /// to the model; sub-agents inherit the filtered list (minus the
-/// `agent` tool) by cloning.
+/// `agent` and `oracle` tools) by cloning.
 pub fn builtin_tools(
     options: &BuiltinToolOptions,
     disabled: &[String],

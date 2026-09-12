@@ -380,12 +380,129 @@ fn selected_model() -> ModelSelection {
 fn session_settings() -> SessionSettings {
     SessionSettings {
         model: Some(selected_model()),
+        oracle_model: None,
+        oracle_thinking: None,
+        oracle_speed: None,
+        oracle_verbosity: None,
         thinking: Some("high".into()),
         thinking_display: Some("detailed".into()),
         speed: Some("standard".into()),
         verbosity: Some("medium".into()),
         account: None,
     }
+}
+
+#[test]
+fn oracle_settings_roundtrip_independent_choices() {
+    for value in [
+        json!({}),
+        json!({"oracle_model": {"api": "openai", "name": "oracle"}, "oracle_thinking": "off", "oracle_speed": "standard", "oracle_verbosity": "default"}),
+        json!({"oracle_model": {"api": "openai", "name": "oracle", "url": "https://example.com"}, "oracle_thinking": "high", "oracle_speed": "fast", "oracle_verbosity": "low"}),
+    ] {
+        let body = serde_json::to_vec(&value).unwrap();
+        let request = decode_request::<SettingsRequest>(&body).unwrap();
+        assert_eq!(serde_json::to_value(&request.change).unwrap(), value);
+        assert_public_request_round_trip(request.clone());
+        let creation = decode_request::<CreateSessionRequest>(
+            &serde_json::to_vec(&json!({"settings": value})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(creation.settings, Some(request.change.clone()));
+        let head = decode_request::<HeadRequest>(
+            &serde_json::to_vec(&json!({"entry": "head", "changes": {"settings": value}})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.changes.settings, request.change);
+        let mut recorded_value = value;
+        if let Some(model) = recorded_value.get_mut("oracle_model") {
+            model.as_object_mut().unwrap().remove("url");
+        }
+        let recorded: aj_wire::BranchSettings =
+            serde_json::from_value(recorded_value.clone()).unwrap();
+        assert_eq!(
+            recorded.oracle_model,
+            request
+                .change
+                .oracle_model
+                .map(|model| aj_wire::RecordedModel {
+                    api: model.api,
+                    name: model.name,
+                })
+        );
+        assert_eq!(recorded.oracle_thinking, request.change.oracle_thinking);
+        assert_eq!(recorded.oracle_speed, request.change.oracle_speed);
+        assert_eq!(recorded.oracle_verbosity, request.change.oracle_verbosity);
+        assert_eq!(serde_json::to_value(recorded).unwrap(), recorded_value);
+    }
+}
+
+#[test]
+fn oracle_models_require_concrete_api_and_name() {
+    for model in [
+        json!({}),
+        json!({"api": "openai"}),
+        json!({"name": "oracle"}),
+        json!({"api": "openai", "url": "https://example.com"}),
+        json!({"api": null, "name": "oracle"}),
+        json!({"api": "openai", "name": null}),
+    ] {
+        let value = json!({"oracle_model": model});
+        let body = serde_json::to_vec(&value).unwrap();
+        assert!(decode_request::<SettingsRequest>(&body).is_err());
+        assert!(serde_json::from_value::<SessionSettings>(value.clone()).is_err());
+        assert!(serde_json::from_value::<aj_wire::BranchSettings>(value.clone()).is_err());
+        assert!(
+            decode_request::<CreateSessionRequest>(
+                &serde_json::to_vec(&json!({"settings": value})).unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            decode_request::<HeadRequest>(
+                &serde_json::to_vec(&json!({"entry": "head", "changes": {"settings": value}}))
+                    .unwrap()
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        decode_request::<SettingsRequest>(
+            br#"{"oracle_model":{"api":"openai","name":"oracle","future":true}}"#
+        )
+        .is_err()
+    );
+    assert!(
+        decode_request::<SettingsRequest>(br#"{"oracle_thinking":"off","future":true}"#).is_err()
+    );
+}
+
+#[test]
+fn oracle_projection_excludes_main_settings_and_account() {
+    let main = SessionSettings {
+        account: Some(AccountSelection {
+            name: Some("work".into()),
+        }),
+        ..session_settings()
+    };
+    assert_eq!(main.oracle(), SessionSettings::default());
+    let settings = SessionSettings {
+        oracle_model: Some(ModelSelection {
+            api: "anthropic".into(),
+            name: "oracle".into(),
+            url: Some("https://oracle.example".into()),
+        }),
+        oracle_thinking: Some("off".into()),
+        oracle_speed: Some("fast".into()),
+        oracle_verbosity: Some("default".into()),
+        ..main
+    };
+    assert_eq!(
+        serde_json::to_value(settings.oracle()).unwrap(),
+        json!({
+            "model": {"api": "anthropic", "name": "oracle", "url": "https://oracle.example"},
+            "thinking": "off", "speed": "fast", "verbosity": "default"
+        })
+    );
 }
 
 #[test]
@@ -649,6 +766,7 @@ fn state_and_task_detail_models_pin_the_new_phase_two_fields() {
         epoch: "epoch-1".into(),
         working: false,
         settings,
+        oracle_settings: None,
         credential_warning: Some("host credentials are missing".into()),
         last_seq: 4,
     };
@@ -669,6 +787,58 @@ fn state_and_task_detail_models_pin_the_new_phase_two_fields() {
     .unwrap();
     assert_eq!(detail.id, 3);
     assert_eq!(detail.stdout_total_bytes + detail.stderr_total_bytes, 24);
+}
+
+#[test]
+fn state_round_trips_independent_oracle_settings() {
+    let main = AgentSettings {
+        provider: "main-provider".into(),
+        model_id: "main-model".into(),
+        thinking: "off".into(),
+        thinking_display: "default".into(),
+        speed: "standard".into(),
+        verbosity: "default".into(),
+    };
+    let oracle = AgentSettings {
+        provider: "oracle-provider".into(),
+        model_id: "oracle-model".into(),
+        thinking: "high".into(),
+        thinking_display: "detailed".into(),
+        speed: "fast".into(),
+        verbosity: "high".into(),
+    };
+    for oracle_settings in [Some(oracle), None] {
+        let frame = Frame::State {
+            session: "session-1".into(),
+            epoch: "epoch-1".into(),
+            working: false,
+            settings: main.clone(),
+            oracle_settings: oracle_settings.clone(),
+            credential_warning: None,
+            last_seq: 0,
+        };
+        let encoded = serde_json::to_value(frame).unwrap();
+        assert_eq!(
+            encoded.get("oracle_settings").is_some(),
+            oracle_settings.is_some()
+        );
+        let decoded: DecodedFrame = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+        let DecodedFrame::Known(decoded) = decoded else {
+            panic!("expected known state");
+        };
+        let Frame::State {
+            settings,
+            oracle_settings: actual,
+            ..
+        } = decoded.value()
+        else {
+            panic!("expected state");
+        };
+        assert_eq!(settings, &main);
+        assert_eq!(actual, &oracle_settings);
+        assert_eq!(serde_json::to_value(decoded.value()).unwrap(), encoded);
+    }
 }
 
 #[test]
@@ -959,6 +1129,7 @@ fn frame_decode_is_forward_compatible() {
     assert!(matches!(
         state.value(),
         Frame::State {
+            oracle_settings: None,
             credential_warning: None,
             ..
         }
@@ -2727,6 +2898,7 @@ fn local_frames() -> Vec<Frame> {
                 speed: "standard".to_string(),
                 verbosity: "default".to_string(),
             },
+            oracle_settings: None,
             credential_warning: None,
             last_seq: 7,
         },
@@ -2917,6 +3089,13 @@ fn durable_branch_settings_are_optional_additive_and_losslessly_forwarded() {
             api: "missing-provider".into(),
             name: "missing-model".into(),
         }),
+        oracle_model: Some(aj_wire::RecordedModel {
+            api: "oracle-provider".into(),
+            name: "oracle-model".into(),
+        }),
+        oracle_thinking: Some("high".into()),
+        oracle_speed: Some("fast".into()),
+        oracle_verbosity: Some("low".into()),
         thinking: Some("off".into()),
         accounts: BTreeMap::from([("openai".into(), String::new())]),
         ..Default::default()

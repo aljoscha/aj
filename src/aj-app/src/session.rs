@@ -355,23 +355,14 @@ impl SessionCore {
             restore_notices,
             recovery_notice,
             session_env,
-        } = prepare_log(persistence, &source, config, &run_config, restore)?;
+        } = prepare_log(persistence, &source, &run_config, restore)?;
 
         // Build a fresh agent off the run-config snapshot, which at this
         // point reflects both runtime `/model` / `/thinking` choices and
         // any settings just restored from the resumed log.
-        let (provider, model_info, stream_options, thinking, speed, verbosity, model_key, settings) = {
+        let settings = {
             let cfg = run_config.lock().expect("run config mutex poisoned");
-            (
-                Arc::clone(&cfg.provider),
-                Arc::clone(&cfg.model_info),
-                cfg.stream_options.clone(),
-                cfg.thinking.clone(),
-                cfg.speed,
-                cfg.stream_options.verbosity,
-                cfg.model_key.clone(),
-                cfg.settings(),
-            )
+            cfg.settings()
         };
         let BuiltAgent {
             mut agent,
@@ -379,11 +370,7 @@ impl SessionCore {
             include_skills,
         } = build_agent(
             config,
-            provider,
-            model_info,
-            stream_options,
-            thinking.clone(),
-            speed,
+            &run_config.lock().expect("run config mutex poisoned"),
         );
         agent.set_session_env(session_env.unwrap_or_default());
 
@@ -397,10 +384,7 @@ impl SessionCore {
             &env,
             include_skills,
             source.creation_env(),
-            &model_key,
-            thinking.as_ref(),
-            speed,
-            verbosity,
+            &run_config.lock().expect("run config mutex poisoned"),
         )?;
         if matches!(source, SessionSource::Create { .. }) {
             let accounts = run_config

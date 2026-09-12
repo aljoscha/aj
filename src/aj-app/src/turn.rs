@@ -41,7 +41,7 @@ fn tools_for_turn(
 ) -> Vec<aj_agent::tool::ErasedToolDefinition> {
     let mut tools = builtin_tools_for_model(options, disabled, family);
     if !include_agent_tool {
-        tools.retain(|tool| tool.name != "agent");
+        tools.retain(|tool| tool.name != "agent" && tool.name != "oracle");
     }
     tools
 }
@@ -124,10 +124,12 @@ pub(crate) fn apply_turn_config(
 ) {
     // Cloned out before any other lock is taken, so this never nests
     // with the run-config or sub-overrides locks.
-    let (tool_options, disabled_tools) = {
+    let config = {
         let c = config.lock().expect("config mutex poisoned");
-        (builtin_tool_options(&c), c.disabled_tools.clone())
+        c.clone()
     };
+    let tool_options = builtin_tool_options(&config);
+    let disabled_tools = &config.disabled_tools;
     match target {
         AgentId::Main => {
             let cfg = run_config.lock().expect("run config mutex poisoned");
@@ -135,11 +137,11 @@ pub(crate) fn apply_turn_config(
             // mid-session model swap rebuilds `stream_options` from
             // registry defaults, which carry none, so we restore it
             // from the durable `session_id`.
-            let mut stream_options = cfg.stream_options.clone();
+            let mut stream_options = cfg.main.stream_options.clone();
             stream_options.session_id = cfg.session_id.clone();
             agent.set_provider(
-                Arc::clone(&cfg.provider),
-                Arc::clone(&cfg.model_info),
+                Arc::clone(&cfg.main.provider),
+                Arc::clone(&cfg.main.model_info),
                 stream_options,
             );
             // NOTE: the same exclusion list also gates the skills listing
@@ -147,14 +149,16 @@ pub(crate) fn apply_turn_config(
             // and that prompt is frozen for the life of the session. So
             // disabling `read_file` here leaves the listing in place, and
             // enabling it does not make a missing listing appear.
-            agent.set_tools(tools_for_turn(
+            let mut tools = tools_for_turn(
                 &tool_options,
-                &disabled_tools,
-                cfg.model_info.family.as_deref(),
+                disabled_tools,
+                cfg.main.model_info.family.as_deref(),
                 true,
-            ));
-            agent.set_default_thinking(cfg.thinking.clone());
-            agent.set_speed(cfg.speed);
+            );
+            crate::oracle::configure_tool(&mut tools, &config, &cfg);
+            agent.set_tools(tools);
+            agent.set_default_thinking(cfg.main.thinking.clone());
+            agent.set_speed(cfg.main.speed);
         }
         AgentId::Sub(n) => {
             // Base session key used to scope the sub-agent's bundle
@@ -186,7 +190,7 @@ pub(crate) fn apply_turn_config(
                 // one without an override keeps what it inherited.
                 agent.set_tools(tools_for_turn(
                     &tool_options,
-                    &disabled_tools,
+                    disabled_tools,
                     model_info.family.as_deref(),
                     false,
                 ));

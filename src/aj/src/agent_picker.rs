@@ -286,9 +286,15 @@ fn build_items(
 /// key stays clean so it both decodes unambiguously and fuzzy-matches the human
 /// name (and, for a sub, its full task text).
 fn agent_item(entry: &AgentEntry, active: AgentId) -> SelectItem {
-    let name = match entry.id {
+    let key = match entry.id {
         AgentId::Main => MAIN_KEY.to_string(),
         AgentId::Sub(n) => format!("{AGENT_PREFIX}{n}"),
+    };
+    let name = match (entry.id, entry.tool_name.as_str()) {
+        (AgentId::Sub(n), tool) if !tool.is_empty() && tool != "agent" => {
+            format!("agent({tool}) {n}")
+        }
+        _ => key.clone(),
     };
     // Main has no tracked run status, so it carries no glyph. A sub-agent leads
     // with its glyph, matching the transcript's sub-agent box.
@@ -303,10 +309,13 @@ fn agent_item(entry: &AgentEntry, active: AgentId) -> SelectItem {
     // Flatten it so the row widget's hard-newline break can't spill it onto
     // extra rows. The full flattened task rides in the filter key for matching.
     let task = entry.task.as_deref().map(single_line);
-    let filter_key = match &task {
-        Some(task) => format!("{name} {task}"),
-        None => name,
+    let mut filter_key = match &task {
+        Some(task) => format!("{key} {task}"),
+        None => key,
     };
+    if !entry.tool_name.is_empty() && entry.tool_name != "agent" {
+        filter_key.push_str(&format!(" {}", entry.tool_name));
+    }
     let mut item = SelectItem::new(label, filter_key);
     if let Some(task) = &task {
         // Metadata leads, task trails: the row truncates from the right, so a
@@ -544,6 +553,7 @@ mod tests {
     fn main_entry() -> AgentEntry {
         AgentEntry {
             id: AgentId::Main,
+            tool_name: String::new(),
             task: None,
             status: None,
             runtime: None,
@@ -554,6 +564,7 @@ mod tests {
     fn sub_entry(n: usize, status: SubAgentStatus) -> AgentEntry {
         AgentEntry {
             id: AgentId::Sub(n),
+            tool_name: String::new(),
             task: Some(format!("task {n}")),
             status: Some(status),
             runtime: Some(Duration::from_secs(5)),
@@ -671,6 +682,7 @@ mod tests {
     fn agent_item_flattens_a_multiline_sub_task_into_one_row() {
         let entry = AgentEntry {
             id: AgentId::Sub(1),
+            tool_name: String::new(),
             task: Some("line one\nline two\nline three".to_string()),
             status: Some(SubAgentStatus::Running),
             runtime: None,
@@ -701,6 +713,7 @@ mod tests {
     fn agent_row_glyph_reflects_the_conclusion() {
         let truncated = AgentEntry {
             id: AgentId::Sub(1),
+            tool_name: String::new(),
             task: Some("scan".to_string()),
             status: Some(SubAgentStatus::Truncated),
             runtime: Some(Duration::from_secs(5)),
@@ -715,6 +728,7 @@ mod tests {
 
         let failed = AgentEntry {
             id: AgentId::Sub(2),
+            tool_name: String::new(),
             task: Some("scan".to_string()),
             status: Some(SubAgentStatus::Failed),
             runtime: Some(Duration::from_secs(5)),
@@ -734,6 +748,7 @@ mod tests {
     fn agent_row_shows_mode_and_runtime() {
         let running_bg = AgentEntry {
             id: AgentId::Sub(1),
+            tool_name: String::new(),
             task: Some("do the thing".to_string()),
             status: Some(SubAgentStatus::Running),
             runtime: Some(Duration::from_secs(83)),
@@ -748,6 +763,7 @@ mod tests {
 
         let done_fg = AgentEntry {
             id: AgentId::Sub(2),
+            tool_name: String::new(),
             task: Some("other work".to_string()),
             status: Some(SubAgentStatus::Done),
             runtime: Some(Duration::from_secs(5)),
@@ -774,6 +790,7 @@ mod tests {
             main_entry(),
             AgentEntry {
                 id: AgentId::Sub(1),
+                tool_name: String::new(),
                 task: Some("line one\nline two\nline three".to_string()),
                 status: Some(SubAgentStatus::Running),
                 runtime: Some(Duration::from_secs(5)),
@@ -816,6 +833,7 @@ mod tests {
         let agents = vec![
             AgentEntry {
                 id: AgentId::Sub(1),
+                tool_name: String::new(),
                 task: Some(long.clone()),
                 status: Some(SubAgentStatus::Running),
                 runtime: Some(Duration::from_secs(83)),
@@ -823,6 +841,7 @@ mod tests {
             },
             AgentEntry {
                 id: AgentId::Sub(2),
+                tool_name: String::new(),
                 task: Some(long),
                 status: Some(SubAgentStatus::Done),
                 runtime: Some(Duration::from_secs(5)),

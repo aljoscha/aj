@@ -46,9 +46,9 @@ async fn host_with_handles(
         }],
         ..aj_app::test_support::scripted_model_info()
     };
-    run.model_key = (model.provider.clone(), model.id.clone());
-    run.model_info = Arc::new(model.clone());
-    run.thinking = Some(ThinkingConfig::Low);
+    run.main.model_key = (model.provider.clone(), model.id.clone());
+    run.main.model_info = Arc::new(model.clone());
+    run.main.thinking = Some(ThinkingConfig::Low);
     let second = ModelInfo {
         id: format!("{name}-second"),
         name: format!("{name} second"),
@@ -75,7 +75,7 @@ fn open(world: &World, shell: &Rc<RefCell<Shell>>, action: CommandAction) -> Sel
         CommandAction::OpenModelSelector => false,
         other => panic!("not a selector: {other:?}"),
     };
-    open_host_selector(world, shell, thinking)
+    open_host_selector(world, shell, thinking, editing_target(world, shell).into())
 }
 
 async fn focus(world: &mut World, shell: &Rc<RefCell<Shell>>, app: &mut AsyncApp, session: &str) {
@@ -97,7 +97,7 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
         let other = other_host.host.create().await.unwrap();
         let opening = left.host.local_handles(&session).await.unwrap();
         let elsewhere = other_host.host.local_handles(&other).await.unwrap();
-        let other_before = elsewhere.run_config.lock().unwrap().model_key.clone();
+        let other_before = elsewhere.run_config.lock().unwrap().main.model_key.clone();
         let gateway = RemoteGateway::over(&[&left, &right]).await;
         gateway.until_sessions(2).await;
         let (url, initial, other) = if mode == "gateway" {
@@ -133,7 +133,7 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
             (CommandAction::OpenThinkingSelector, "high"),
         ] {
             let fetch = open(&world, &shell, action);
-            assert_eq!(fetch.target, AgentId::Sub(sub));
+            assert_eq!(fetch.target, AgentId::Sub(sub).into());
             fill_host_selector(fetch).await;
             focus_overlay(&mut app, &root);
             type_text(&mut app, &mut writer, query).await;
@@ -153,11 +153,11 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
         }
         assert!(elsewhere.sub_overrides.lock().unwrap().is_empty());
         assert_eq!(
-            opening.run_config.lock().unwrap().model_key.1,
+            opening.run_config.lock().unwrap().main.model_key.1,
             "selector-left-first"
         );
         assert_eq!(
-            opening.run_config.lock().unwrap().thinking,
+            opening.run_config.lock().unwrap().main.thinking,
             Some(ThinkingConfig::Low)
         );
         focus(&mut world, &shell, &mut app, &initial).await;
@@ -194,18 +194,21 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
             focus(&mut world, &shell, &mut app, &other).await;
             apply_selector_activity(&mut world, &shell, &mut watch, edits).await;
             assert_eq!(
-                opening.run_config.lock().unwrap().model_key.1,
+                opening.run_config.lock().unwrap().main.model_key.1,
                 "selector-left-second",
                 "{mode}: model confirmation belongs to the opening session"
             );
-            assert_eq!(elsewhere.run_config.lock().unwrap().model_key, other_before);
             assert_eq!(
-                elsewhere.run_config.lock().unwrap().thinking,
+                elsewhere.run_config.lock().unwrap().main.model_key,
+                other_before
+            );
+            assert_eq!(
+                elsewhere.run_config.lock().unwrap().main.thinking,
                 Some(ThinkingConfig::Low)
             );
         }
         assert_eq!(
-            opening.run_config.lock().unwrap().thinking,
+            opening.run_config.lock().unwrap().main.thinking,
             Some(ThinkingConfig::High)
         );
         assert!(
@@ -243,10 +246,13 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
                 assert_eq!(staged.unwrap().name, "selector-left-first");
             }
             assert_eq!(
-                opening.run_config.lock().unwrap().model_key.1,
+                opening.run_config.lock().unwrap().main.model_key.1,
                 "selector-left-second"
             );
-            assert_eq!(elsewhere.run_config.lock().unwrap().model_key, other_before);
+            assert_eq!(
+                elsewhere.run_config.lock().unwrap().main.model_key,
+                other_before
+            );
             focus(&mut world, &shell, &mut app, &initial).await;
         }
         gateway.shutdown().await;
@@ -315,7 +321,7 @@ async fn selector_parity_uncatalogued_runtime_keeps_thinking_edits() {
         );
         let handles = remote.host.local_handles(&session).await.unwrap();
         assert_ne!(
-            handles.run_config.lock().unwrap().thinking,
+            handles.run_config.lock().unwrap().main.thinking,
             Some(ThinkingConfig::High)
         );
         let (mut app, mut writer, root) = app_over(&shell).await;
@@ -332,7 +338,7 @@ async fn selector_parity_uncatalogued_runtime_keeps_thinking_edits() {
         );
         apply_selector_activity(&mut world, &shell, &mut inert_theme_watch(), edits).await;
         assert_eq!(
-            handles.run_config.lock().unwrap().thinking,
+            handles.run_config.lock().unwrap().main.thinking,
             Some(ThinkingConfig::High)
         );
         gateway.shutdown().await;

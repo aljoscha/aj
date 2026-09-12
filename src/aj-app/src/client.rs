@@ -166,6 +166,7 @@ pub struct SessionClient {
     applied: Option<u64>,
     attach: Attach,
     settings: Option<AgentSettings>,
+    oracle_settings: Option<AgentSettings>,
     working: bool,
     first_attach_settings: Option<AgentSettings>,
     /// The host-side credential warning carried by the first attach's opening
@@ -211,6 +212,7 @@ impl SessionClient {
             applied: None,
             attach: Attach::Live,
             settings: None,
+            oracle_settings: None,
             working: false,
             first_attach_settings: None,
             first_attach_credential_warning: None,
@@ -340,6 +342,7 @@ impl SessionClient {
                 epoch,
                 working,
                 settings,
+                oracle_settings,
                 credential_warning,
                 ..
             } => {
@@ -363,6 +366,7 @@ impl SessionClient {
                     .note_settings(AgentId::Main, settings.clone(), context_window);
                 self.seed_lifecycle(working);
                 self.settings = Some(settings);
+                self.oracle_settings = oracle_settings;
                 self.working = working;
                 Redraw(true)
             }
@@ -520,6 +524,12 @@ impl SessionClient {
     /// The active settings, as of the last `state` frame.
     pub fn settings(&self) -> Option<&AgentSettings> {
         self.settings.as_ref()
+    }
+
+    /// Oracle settings staged for the next main turn, as of the last `state` frame.
+    /// Absent when unresolved or when the host has no Oracle support.
+    pub fn oracle_settings(&self) -> Option<&AgentSettings> {
+        self.oracle_settings.as_ref()
     }
 
     /// Takes the settings carried by the first attach state exactly once.
@@ -895,6 +905,7 @@ mod tests {
             epoch: epoch.to_string(),
             working,
             settings,
+            oracle_settings: None,
             credential_warning: credential_warning.map(str::to_string),
             last_seq: 0,
         }
@@ -906,6 +917,50 @@ mod tests {
             epoch: epoch.to_string(),
             last_seq,
         }
+    }
+
+    #[test]
+    fn oracle_settings_follow_each_accepted_state_without_inference() {
+        let mut client = SessionClient::new(SESSION.into());
+        let mut chat = chat();
+        assert!(client.oracle_settings().is_none());
+        let mut oracle = settings();
+        oracle.model_id = "oracle-model".into();
+        oracle.thinking = "high".into();
+        let state = |session: &str, epoch: &str, oracle_settings| Frame::State {
+            session: session.into(),
+            epoch: epoch.into(),
+            working: false,
+            settings: settings(),
+            oracle_settings,
+            credential_warning: None,
+            last_seq: 0,
+        };
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(SESSION, EPOCH, Some(oracle.clone())));
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+        assert_eq!(client.oracle_settings(), Some(&oracle));
+        assert_eq!(client.settings(), Some(&settings()));
+        for (session, epoch) in [("other-session", EPOCH), (SESSION, "old-epoch")] {
+            assert!(!client.apply(&mut chat, state(session, epoch, None)).0);
+            assert_eq!(client.oracle_settings(), Some(&oracle));
+        }
+        oracle.thinking = "low".into();
+        let _ = client.apply(&mut chat, state(SESSION, EPOCH, Some(oracle.clone())));
+        assert_eq!(client.oracle_settings(), Some(&oracle));
+        assert_eq!(client.settings(), Some(&settings()));
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(SESSION, "new-epoch", None));
+        assert!(
+            client.oracle_settings().is_none(),
+            "older hosts cannot inherit cached Oracle settings"
+        );
+        let _ = client.apply(&mut chat, state(SESSION, "new-epoch", Some(oracle.clone())));
+        let _ = client.apply(&mut chat, state(SESSION, "new-epoch", None));
+        assert!(
+            client.oracle_settings().is_none(),
+            "every accepted State replaces Oracle settings"
+        );
     }
 
     fn durable(epoch: &str, seq: u64, entry_id: &str, event: AgentEvent) -> Frame {

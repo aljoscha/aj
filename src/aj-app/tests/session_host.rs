@@ -222,7 +222,7 @@ impl Harness {
             .run_config
             .lock()
             .expect("run config mutex poisoned");
-        cfg.provider = scripted(messages, 0, Duration::ZERO);
+        cfg.main.provider = scripted(messages, 0, Duration::ZERO);
     }
 
     /// A second host over the same session store, as a restart or a rival
@@ -461,16 +461,22 @@ fn scripted(
 }
 
 fn snapshot(provider: Arc<ScriptedProvider>) -> RunConfigSnapshot {
-    RunConfigSnapshot {
-        accounts: Default::default(),
-        provider,
-        model_info: Arc::new(scripted_model_info()),
-        stream_options: aj_models::types::StreamOptions::default(),
-        thinking: None,
-        thinking_display: None,
-        speed: None,
-        model_key: ("scripted".to_string(), "scripted".to_string()),
-        session_id: None,
+    {
+        let main = aj_app::session_setup::ModelConfig {
+            provider,
+            model_info: Arc::new(scripted_model_info()),
+            stream_options: aj_models::types::StreamOptions::default(),
+            thinking: None,
+            thinking_display: None,
+            speed: None,
+            model_key: ("scripted".to_string(), "scripted".to_string()),
+        };
+        RunConfigSnapshot {
+            oracle: main.clone(),
+            main,
+            accounts: Default::default(),
+            session_id: None,
+        }
     }
 }
 
@@ -852,7 +858,7 @@ async fn thinking(host: &SessionHost, session: &str) -> Option<aj_models::Thinki
         .run_config
         .lock()
         .expect("run config mutex poisoned");
-    cfg.thinking.clone()
+    cfg.main.thinking.clone()
 }
 
 /// The `(status, finished)` of sub-agent `child`'s box in the main
@@ -1042,6 +1048,10 @@ async fn explicit_creation_applies_settings_before_its_first_prompt() {
                 thinking_display: Some("detailed".into()),
                 speed: Some("fast".into()),
                 verbosity: Some("high".into()),
+                oracle_model: None,
+                oracle_thinking: None,
+                oracle_speed: None,
+                oracle_verbosity: None,
             }),
             Some(vec![UserContent::text("begin")]),
             None,
@@ -1295,7 +1305,7 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
     // A host whose configured level its own model has no word for, which is
     // ordinary: the level comes from a config file, the model from a catalog.
     let mut base = snapshot(scripted(Vec::new(), 0, Duration::ZERO));
-    base.thinking = Some(aj_models::ThinkingConfig::XHigh);
+    base.main.thinking = Some(aj_models::ThinkingConfig::XHigh);
     let harness = Harness::with_run_config(base, Vec::new(), None, None);
 
     // Something is stated, but not thinking, so the host defaults that axis
@@ -1519,7 +1529,10 @@ async fn creation_resolves_real_models_from_the_host_catalog_with_lazy_auth() {
             .run_config
             .lock()
             .expect("run config mutex poisoned");
-        (config.model_key.clone(), config.model_info.base_url.clone())
+        (
+            config.main.model_key.clone(),
+            config.main.model_info.base_url.clone(),
+        )
     };
     assert_eq!(model_key, ("openai".into(), "gpt-catalog".into()));
     assert_eq!(base_url, "https://override.example/v1");
@@ -2494,7 +2507,7 @@ async fn two_sessions_on_one_host_stay_independent() {
             .expect("run config mutex poisoned");
         assert_eq!(cfg.session_id.as_deref(), Some(session.as_str()));
         assert_eq!(
-            cfg.stream_options.session_id.as_deref(),
+            cfg.main.stream_options.session_id.as_deref(),
             Some(session.as_str())
         );
     }
@@ -5112,8 +5125,8 @@ async fn thinking_display_is_live_only_and_survives_bundle_rebuilds() {
             .lock()
             .expect("run config mutex poisoned");
         (
-            cfg.thinking_display,
-            cfg.stream_options.reasoning_summary.clone(),
+            cfg.main.thinking_display,
+            cfg.main.stream_options.reasoning_summary.clone(),
         )
     };
     assert_eq!(display, Some(ConfigThinkingDisplay::Detailed));
@@ -5271,7 +5284,7 @@ async fn a_settings_change_that_did_not_apply_is_refused() {
             .lock()
             .expect("run config mutex poisoned");
         assert_eq!(
-            cfg.model_key,
+            cfg.main.model_key,
             ("scripted".to_string(), "scripted".to_string()),
             "the refused change staged nothing",
         );
@@ -7184,6 +7197,7 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         .run_config
         .lock()
         .expect("run config mutex poisoned")
+        .main
         .provider = Arc::new(GatedSummaryProvider {
         message: priced("SUMMARY", summarizer),
         started: Arc::clone(&started),
@@ -12832,16 +12846,22 @@ async fn branch_restore_harness() -> (Harness, String, String, String) {
             writes: Default::default(),
         })),
         catalog: Arc::new(catalog),
-        defaults: RunConfigDefaults::fixed(RunConfigSnapshot {
-            provider: bundle.provider,
-            model_info: bundle.model_info,
-            stream_options: bundle.stream_options,
-            accounts: Default::default(),
-            thinking: None,
-            thinking_display: Some(ConfigThinkingDisplay::Detailed),
-            speed: None,
-            model_key: ("openai".into(), "historical".into()),
-            session_id: None,
+        defaults: RunConfigDefaults::fixed({
+            let main = aj_app::session_setup::ModelConfig {
+                provider: bundle.provider,
+                model_info: bundle.model_info,
+                stream_options: bundle.stream_options,
+                thinking: None,
+                thinking_display: Some(ConfigThinkingDisplay::Detailed),
+                speed: None,
+                model_key: ("openai".into(), "historical".into()),
+            };
+            RunConfigSnapshot {
+                oracle: main.clone(),
+                main,
+                accounts: Default::default(),
+                session_id: None,
+            }
         }),
         restore: Some(aj_app::session_setup::RestoreContext {
             registry,
@@ -13070,12 +13090,17 @@ async fn branch_draft_refusals_leave_live_and_durable_state_unchanged() {
             BTreeMap::from([("openai".into(), "active".into())])
         );
         assert_eq!(
-            run.stream_options.resolve_api_key().await.unwrap().key,
+            run.main.stream_options.resolve_api_key().await.unwrap().key,
             "synthetic-active",
             "installed resolver still follows the live branch"
         );
         assert_eq!(
-            live.stream_options.resolve_api_key().await.unwrap().key,
+            live.main
+                .stream_options
+                .resolve_api_key()
+                .await
+                .unwrap()
+                .key,
             "synthetic-active",
             "previously handed-out resolvers are untouched"
         );
@@ -13104,7 +13129,7 @@ async fn branch_draft_refusals_leave_live_and_durable_state_unchanged() {
 async fn environment_before_runs_during_a_turn_without_mutating_branch_state() {
     let (harness, session, historical, _) = branch_restore_harness().await;
     let handles = harness.host.local_handles(&session).await.unwrap();
-    handles.run_config.lock().unwrap().provider = scripted(
+    handles.run_config.lock().unwrap().main.provider = scripted(
         vec![finalized_text_message("a fairly long answer to stream")],
         1,
         Duration::from_millis(20),
@@ -13150,7 +13175,7 @@ async fn environment_before_runs_during_a_turn_without_mutating_branch_state() {
     let run = handles.run_config.lock().unwrap().clone();
     assert_eq!(run.settings().model_id, "active");
     assert_eq!(
-        run.stream_options.resolve_api_key().await.unwrap().key,
+        run.main.stream_options.resolve_api_key().await.unwrap().key,
         "synthetic-active"
     );
     stream.pump_until_idle().await;
@@ -13192,9 +13217,12 @@ async fn branch_draft_can_override_effort_speed_and_account_without_changing_oth
     assert_eq!(settings.thinking_display, "detailed");
     assert_eq!(settings.thinking, "low");
     assert_eq!(settings.speed, "standard");
-    assert_eq!(aj_models::speed_name(run.stream_options.speed), "standard");
     assert_eq!(
-        run.stream_options.resolve_api_key().await.unwrap().key,
+        aj_models::speed_name(run.main.stream_options.speed),
+        "standard"
+    );
+    assert_eq!(
+        run.main.stream_options.resolve_api_key().await.unwrap().key,
         "synthetic-active"
     );
     assert_eq!(
@@ -13221,7 +13249,7 @@ async fn branch_draft_can_override_effort_speed_and_account_without_changing_oth
     assert_eq!(run.settings().thinking_display, "detailed");
     assert_eq!(run.accounts.get("openai").as_deref(), Some("historical"));
     assert_eq!(
-        run.stream_options.resolve_api_key().await.unwrap().key,
+        run.main.stream_options.resolve_api_key().await.unwrap().key,
         "synthetic-historical"
     );
     assert_eq!(
@@ -13324,7 +13352,7 @@ async fn transcript_settings_follow_recorded_messages_live_backfill_and_across_b
     let mut scripts = sub_agent_turn();
     scripts[1].provider = "sub-provider".into();
     scripts[1].model = "sub-model".into();
-    handles.run_config.lock().unwrap().provider = scripted(scripts, 1, Duration::ZERO);
+    handles.run_config.lock().unwrap().main.provider = scripted(scripts, 1, Duration::ZERO);
     harness.prompt(&session, "delegate").await;
     let frames = client.pump_until_idle().await;
     assert!(events(&frames).iter().any(|event| matches!(
@@ -13397,7 +13425,7 @@ async fn transcript_settings_follow_recorded_messages_live_backfill_and_across_b
         .await
         .unwrap();
     client.reattach(&harness.host, cursor).await;
-    handles.run_config.lock().unwrap().provider =
+    handles.run_config.lock().unwrap().main.provider =
         scripted(vec![finalized_text_message("replaced")], 1, Duration::ZERO);
     harness.prompt(&session, "replacement").await;
     client.pump_until_idle().await;

@@ -4,6 +4,7 @@ pub mod agent;
 pub mod apply_patch;
 pub mod bash;
 pub mod edit_file;
+pub mod oracle;
 pub mod read_file;
 pub mod task;
 pub mod todo;

@@ -64,10 +64,28 @@ use crate::overlay::{
 
 pub(crate) use aj_app::settings::{MODEL_SETTING_ID, UNSET_VALUE};
 
+/// A model picker can configure a live agent or the Oracle consultations in the next main turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectorTarget {
+    Agent(AgentId),
+    Oracle,
+}
+
+impl From<AgentId> for SelectorTarget {
+    fn from(agent: AgentId) -> Self {
+        Self::Agent(agent)
+    }
+}
+
 /// A confirmed edit parked by an overlay for the drive loop to apply through
 /// the shared settings core. The overlays cannot reach the async cores or the
 /// `SessionCore`, so they only record intent; the host reconciles.
 pub(crate) enum SelectorActivity {
+    /// A session-only Oracle choice, always targeting Main.
+    OracleConfirmed {
+        owner: crate::interactive::SettingsOwner,
+        axis: aj_app::host::SettingsAxis,
+    },
     /// A thinking level was confirmed for `target` (session-scoped).
     ThinkingConfirmed {
         owner: crate::interactive::SettingsOwner,
@@ -166,7 +184,7 @@ pub(crate) fn open_selector_loading(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
     chrome: &OverlayChrome,
-    thinking: bool,
+    title: &str,
 ) -> Rc<RefCell<FilterableSelect>> {
     let select = Rc::new(RefCell::new(FilterableSelect::new(
         vec![SelectItem::new("Loading host models…", "")],
@@ -181,11 +199,7 @@ pub(crate) fn open_selector_loading(
     push_window(
         stack,
         chrome,
-        if thinking {
-            "Thinking effort"
-        } else {
-            "Select model"
-        },
+        title,
         subtitle_confirm_close(),
         to_widget_ref(Rc::clone(&select)),
         focus,
@@ -218,10 +232,11 @@ pub(crate) fn fill_thinking(
     handles: &crate::interactive::OverlayHandles,
     select: &Rc<RefCell<FilterableSelect>>,
     owner: crate::interactive::SettingsOwner,
-    target: AgentId,
+    target: impl Into<SelectorTarget>,
     current: Option<&str>,
     supported: Vec<&'static ThinkingLevel>,
 ) {
+    let target = target.into();
     let current_name = current.unwrap_or("");
     select
         .borrow()
@@ -236,13 +251,17 @@ pub(crate) fn fill_thinking(
         let editor_c = Rc::clone(&handles.editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
             if let Some(level) = aj_app::commands::parse_thinking_level(&item.filter_key) {
-                activity
-                    .borrow_mut()
-                    .push(SelectorActivity::ThinkingConfirmed {
+                activity.borrow_mut().push(match target {
+                    SelectorTarget::Agent(target) => SelectorActivity::ThinkingConfirmed {
                         owner: owner.clone(),
                         target,
                         level,
-                    });
+                    },
+                    SelectorTarget::Oracle => SelectorActivity::OracleConfirmed {
+                        owner: owner.clone(),
+                        axis: aj_app::host::SettingsAxis::OracleThinking(level),
+                    },
+                });
             }
             // A confirmed pick is terminal: tear the whole stack down
             // (palette included) back to the transcript. Cancel uses
@@ -315,9 +334,10 @@ pub(crate) fn fill_model(
     select: &Rc<RefCell<FilterableSelect>>,
     owner: crate::interactive::SettingsOwner,
     catalog: Arc<Vec<ModelInfo>>,
-    target: AgentId,
+    target: impl Into<SelectorTarget>,
     current: Option<(String, String)>,
 ) {
+    let target = target.into();
     select
         .borrow()
         .set_items(model_items(&catalog, current.as_ref()));
@@ -341,13 +361,17 @@ pub(crate) fn fill_model(
                 .iter()
                 .find(|m| model_filter_key(m) == item.filter_key)
             {
-                activity
-                    .borrow_mut()
-                    .push(SelectorActivity::ModelConfirmed {
+                activity.borrow_mut().push(match target {
+                    SelectorTarget::Agent(target) => SelectorActivity::ModelConfirmed {
                         owner: owner.clone(),
                         target,
                         info: Box::new(info.clone()),
-                    });
+                    },
+                    SelectorTarget::Oracle => SelectorActivity::OracleConfirmed {
+                        owner: owner.clone(),
+                        axis: aj_app::host::SettingsAxis::OracleModel(info.clone()),
+                    },
+                });
             }
             // A confirmed pick is terminal: tear the whole stack down
             // (palette included) back to the transcript. Cancel uses
@@ -356,6 +380,8 @@ pub(crate) fn fill_model(
         }));
     }
 }
+
+// ============================================================================
 
 // ============================================================================
 // SettingList: the stay-open editable list
@@ -1174,6 +1200,7 @@ impl Widget for TextEditOverlay {
 /// The live values a settings window opens with. Strings use the same
 /// canonical vocabulary the host's apply path parses.
 pub(crate) struct SettingsValues {
+    oracle_model_key: (String, String),
     pub(crate) model_key: (String, String),
     values: std::collections::BTreeMap<String, String>,
 }
@@ -1194,17 +1221,18 @@ impl SettingsValues {
                 .filter(|value| value.as_str() != "<unset>")
                 .cloned()
         };
-        let provider =
-            set("model_api").unwrap_or_else(|| aj_app::model::DEFAULT_PROVIDER_ID.to_string());
-        let model = set("model_name").unwrap_or_else(|| {
-            catalog
-                .iter()
-                .find(|model| model.provider == provider)
-                .map(|model| model.id.clone())
-                .unwrap_or_default()
-        });
+        let model_key = |api: &str, name: &str| {
+            let provider = set(api).unwrap_or_else(|| aj_app::model::DEFAULT_PROVIDER_ID.into());
+            let model = set(name).unwrap_or_else(|| {
+                aj_app::model::default_model_for(catalog.iter(), &provider)
+                    .map(|model| model.id.clone())
+                    .unwrap_or_default()
+            });
+            (provider, model)
+        };
         Self {
-            model_key: (provider, model),
+            model_key: model_key("model_api", "model_name"),
+            oracle_model_key: model_key("oracle_model_api", "oracle_model_name"),
             values,
         }
     }
@@ -1224,6 +1252,8 @@ fn enum_values(option: &aj_conf::ConfigOption) -> Vec<String> {
 fn row_is_project_set(row_id: &str, set_keys: &BTreeSet<String>) -> bool {
     if row_id == MODEL_SETTING_ID {
         set_keys.contains("model_api") || set_keys.contains("model_name")
+    } else if row_id == "oracle_model" {
+        set_keys.contains("oracle_model_api") || set_keys.contains("oracle_model_name")
     } else {
         set_keys.contains(row_id)
     }
@@ -1250,9 +1280,9 @@ fn row_value_kind(
     let raw = values.values.get(name)?;
     let value = if raw == "<unset>" {
         match name {
-            "thinking" => "off",
-            "speed" => "standard",
-            "thinking_display" | "verbosity" => UNSET_VALUE,
+            "thinking" | "oracle_thinking" => "off",
+            "speed" | "oracle_speed" => "standard",
+            "thinking_display" | "verbosity" | "oracle_verbosity" => UNSET_VALUE,
             "theme" => "light",
             _ => "",
         }
@@ -1261,13 +1291,21 @@ fn row_value_kind(
         raw.clone()
     };
     Some(match name {
+        "oracle_model_api" => (
+            format!(
+                "{}/{}",
+                values.oracle_model_key.0, values.oracle_model_key.1
+            ),
+            RowKind::Submenu,
+        ),
+        "oracle_model_name" => return None,
         "model_api" => (
             format!("{}/{}", values.model_key.0, values.model_key.1),
             RowKind::Submenu,
         ),
         "model_name" => return None,
-        "thinking" => (value, RowKind::Submenu),
-        "thinking_display" | "verbosity" => {
+        "thinking" | "oracle_thinking" => (value, RowKind::Submenu),
+        "thinking_display" | "verbosity" | "oracle_verbosity" => {
             let mut choices = vec![UNSET_VALUE.to_string()];
             choices.extend(enum_values(option));
             (value, RowKind::Cycle(choices))
@@ -1291,6 +1329,7 @@ fn bool_cycle() -> RowKind {
 fn row_id_for(option_name: &str) -> &str {
     match option_name {
         "model_api" => MODEL_SETTING_ID,
+        "oracle_model_api" => "oracle_model",
         other => other,
     }
 }
@@ -1369,16 +1408,6 @@ pub(crate) fn fill_settings(
     list: &SkillsFill,
 ) {
     let project_mode = target == ConfigTarget::Project;
-    // The thinking submenu is filtered to what the current model offers.
-    // We bind it here at window-build time (the submenu handler only sees
-    // its own row's value, not the model row's), so switching the model
-    // inside this window is reflected on the next open.
-    let thinking_supported: Vec<&'static ThinkingLevel> = catalogs
-        .models
-        .iter()
-        .find(|m| m.provider == values.model_key.0 && m.id == values.model_key.1)
-        .map(thinking_levels_for)
-        .unwrap_or_else(|| THINKING_LEVELS.iter().collect());
     let mut rows = build_setting_rows(&values, &inherited, project_mode, &set_keys);
     if catalogs.owner.is_remote() {
         for row in &mut rows {
@@ -1411,10 +1440,34 @@ pub(crate) fn fill_settings(
         let chrome_open = chrome.clone();
         let activity_open = Rc::clone(activity);
         let list_open = Rc::downgrade(list);
+        // Dispatch already borrows the widget. Read its shared row state instead.
+        let state_open = Rc::clone(&l.state);
         l.on_open = Some(Box::new(move |ctx, id, value| {
             let Some(list_open) = list_open.upgrade() else {
                 return;
             };
+            let model_row = if id == "oracle_thinking" {
+                "oracle_model"
+            } else {
+                MODEL_SETTING_ID
+            };
+            let selected = state_open
+                .borrow()
+                .rows
+                .iter()
+                .find(|row| row.id == model_row)
+                .map(|row| row.value.clone());
+            let supported = selected
+                .as_deref()
+                .and_then(|value| value.split_once('/'))
+                .and_then(|(provider, id)| {
+                    catalogs
+                        .models
+                        .iter()
+                        .find(|model| model.provider == provider && model.id == id)
+                })
+                .map(thinking_levels_for)
+                .unwrap_or_else(|| THINKING_LEVELS.iter().collect());
             open_setting_submenu(
                 ctx,
                 &stack_open,
@@ -1424,7 +1477,7 @@ pub(crate) fn fill_settings(
                 &list_open,
                 target,
                 &catalogs,
-                &thinking_supported,
+                &supported,
                 id,
                 value,
             );
@@ -1537,7 +1590,7 @@ fn open_setting_submenu(
     value: &str,
 ) {
     match id {
-        MODEL_SETTING_ID => {
+        MODEL_SETTING_ID | "oracle_model" => {
             let current = value
                 .split_once('/')
                 .map(|(p, i)| (p.to_string(), i.to_string()));
@@ -1561,7 +1614,11 @@ fn open_setting_submenu(
                 activity,
                 target,
                 catalogs.owner.clone(),
-                "Select model",
+                if id == "oracle_model" {
+                    "Oracle model"
+                } else {
+                    "Select model"
+                },
                 id.to_string(),
                 items,
                 current_key,
@@ -1573,7 +1630,7 @@ fn open_setting_submenu(
                 }),
             );
         }
-        "thinking" => {
+        "thinking" | "oracle_thinking" => {
             let items = thinking_items(value, thinking_supported);
             open_picker_submenu(
                 ctx,
@@ -1584,7 +1641,11 @@ fn open_setting_submenu(
                 activity,
                 target,
                 catalogs.owner.clone(),
-                "Thinking effort",
+                if id == "oracle_thinking" {
+                    "Oracle thinking effort"
+                } else {
+                    "Thinking effort"
+                },
                 id.to_string(),
                 items,
                 Some(value.to_string()),
@@ -2425,7 +2486,7 @@ mod tests {
         let rows = build_setting_rows(&values, &inherited, false, &BTreeSet::new());
         for option in Config::OPTIONS {
             // `model_name` folds into the model row (`model_api`).
-            if option.name == "model_name" {
+            if matches!(option.name, "model_name" | "oracle_model_name") {
                 continue;
             }
             let id = row_id_for(option.name);
@@ -2438,6 +2499,52 @@ mod tests {
         // The model pair folds to exactly one row.
         assert_eq!(rows.iter().filter(|r| r.id == MODEL_SETTING_ID).count(), 1);
         assert!(!rows.iter().any(|r| r.id == "model_name"));
+    }
+
+    #[test]
+    fn oracle_settings_show_their_own_defaults_and_standard_controls() {
+        use crate::test_support::{draw_ctx, rows};
+        let registry = aj_models::registry::ModelRegistry::load();
+        let catalog: Vec<_> = registry
+            .providers()
+            .into_iter()
+            .flat_map(|p| registry.models(p))
+            .cloned()
+            .collect();
+        let defaults = SettingsValues::from_config(&Config::default(), &catalog);
+        let configured = SettingsValues::from_config(
+            &Config {
+                model_api: Some("openai".into()),
+                model_name: Some("different-main".into()),
+                thinking: Some(aj_conf::ConfigThinkingLevel::Off),
+                ..Config::default()
+            },
+            &catalog,
+        );
+        assert_eq!(configured.oracle_model_key, defaults.oracle_model_key);
+        let settings = build_setting_rows(&configured, &defaults, false, &BTreeSet::new());
+        let oracle: Vec<_> = settings
+            .into_iter()
+            .filter(|row| row.id.starts_with("oracle_"))
+            .collect();
+        assert_eq!(oracle.len(), 5);
+        assert!(matches!(
+            oracle
+                .iter()
+                .find(|row| row.id == "oracle_thinking")
+                .unwrap()
+                .kind,
+            RowKind::Submenu
+        ));
+        let mut list = SettingList::new(oracle, styles(), false);
+        let page = rows(&list.draw(&draw_ctx(100, Some(18)))).join("\n");
+        assert!(page.contains("oracle_model"));
+        assert!(page.contains(&format!(
+            "{}/{}",
+            defaults.oracle_model_key.0, defaults.oracle_model_key.1
+        )));
+        assert!(!page.contains("Follow main"));
+        assert!(!page.contains("inherits the main"));
     }
 
     /// `from_config` seeds `show_frame_stats` and it surfaces as a bool cycle

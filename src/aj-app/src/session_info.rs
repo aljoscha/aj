@@ -40,6 +40,14 @@ pub fn to_wire(stats: &SessionStats) -> aj_wire::SessionInfo {
         compaction_usage: stats.compaction_usage.clone(),
         compactions_with_usage: stats.compactions_with_usage,
         settings: aj_wire::BranchSettings {
+            oracle_model: stats
+                .settings
+                .oracle_model
+                .clone()
+                .map(|(api, name)| aj_wire::RecordedModel { api, name }),
+            oracle_thinking: stats.settings.oracle_thinking.clone(),
+            oracle_speed: stats.settings.oracle_speed.clone(),
+            oracle_verbosity: stats.settings.oracle_verbosity.clone(),
             model: stats
                 .settings
                 .model
@@ -89,6 +97,13 @@ pub fn from_wire(info: aj_wire::SessionInfo) -> SessionStats {
         compaction_usage: info.compaction_usage,
         compactions_with_usage: info.compactions_with_usage,
         settings: aj_session::SessionSettings {
+            oracle_model: info
+                .settings
+                .oracle_model
+                .map(|model| (model.api, model.name)),
+            oracle_thinking: info.settings.oracle_thinking,
+            oracle_speed: info.settings.oracle_speed,
+            oracle_verbosity: info.settings.oracle_verbosity,
             model: info.settings.model.map(|model| (model.api, model.name)),
             accounts: info.settings.accounts,
             thinking: info.settings.thinking,
@@ -150,6 +165,41 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
         kv(
             "verbosity",
             stats.settings.verbosity.as_deref().unwrap_or("(default)"),
+        ),
+        InfoRow::Blank,
+        InfoRow::Header("Oracle settings".to_string()),
+        kv(
+            "model",
+            &stats
+                .settings
+                .oracle_model
+                .as_ref()
+                .map(|(provider, model)| format!("{provider} / {model}"))
+                .unwrap_or_else(|| "(not recorded)".to_string()),
+        ),
+        kv(
+            "thinking",
+            stats
+                .settings
+                .oracle_thinking
+                .as_deref()
+                .unwrap_or("(not recorded)"),
+        ),
+        kv(
+            "speed",
+            stats
+                .settings
+                .oracle_speed
+                .as_deref()
+                .unwrap_or("(not recorded)"),
+        ),
+        kv(
+            "verbosity",
+            stats
+                .settings
+                .oracle_verbosity
+                .as_deref()
+                .unwrap_or("(not recorded)"),
         ),
     ];
 
@@ -429,6 +479,10 @@ mod tests {
                 thinking: Some("medium".to_string()),
                 speed: None,
                 verbosity: None,
+                oracle_model: None,
+                oracle_thinking: None,
+                oracle_speed: None,
+                oracle_verbosity: None,
             },
             session_env: None,
         }
@@ -481,6 +535,12 @@ mod tests {
             RowView::Kv("speed".to_string(), "(default)".to_string()),
             RowView::Kv("verbosity".to_string(), "(default)".to_string()),
             RowView::Blank,
+            RowView::Header("Oracle settings".to_string()),
+            RowView::Kv("model".to_string(), "(not recorded)".to_string()),
+            RowView::Kv("thinking".to_string(), "(not recorded)".to_string()),
+            RowView::Kv("speed".to_string(), "(not recorded)".to_string()),
+            RowView::Kv("verbosity".to_string(), "(not recorded)".to_string()),
+            RowView::Blank,
             RowView::Header("Activity".to_string()),
             RowView::Kv("created".to_string(), "(unknown)".to_string()),
             RowView::Kv("last activity".to_string(), "(none)".to_string()),
@@ -520,6 +580,30 @@ mod tests {
             RowView::Kv("Bash".to_string(), "8".to_string()),
         ];
         assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn digest_shows_oracle_records_independently_of_main_settings() {
+        let mut stats = sample_stats();
+        stats.settings.oracle_model = Some(("openai".into(), "gpt-5.5".into()));
+        stats.settings.oracle_thinking = Some("off".into());
+        stats.settings.oracle_speed = Some("fast".into());
+        stats.settings.oracle_verbosity = Some("default".into());
+
+        let rows = view(&digest(&stats, None));
+        let oracle = rows
+            .iter()
+            .position(|row| row == &RowView::Header("Oracle settings".into()))
+            .expect("Oracle settings section");
+        assert_eq!(
+            &rows[oracle + 1..oracle + 5],
+            &[
+                RowView::Kv("model".into(), "openai / gpt-5.5".into()),
+                RowView::Kv("thinking".into(), "off".into()),
+                RowView::Kv("speed".into(), "fast".into()),
+                RowView::Kv("verbosity".into(), "default".into()),
+            ]
+        );
     }
 
     /// Environment is recorded state, not a defaulted setting. A recorded map

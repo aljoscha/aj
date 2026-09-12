@@ -714,6 +714,23 @@ pub(crate) fn settings_request(change: SettingsChange) -> SettingsRequest {
     } = change;
     let mut wire = SessionSettings::default();
     match axis {
+        SettingsAxis::OracleModel(info) => {
+            wire.oracle_model = Some(ModelSelection {
+                api: info.provider,
+                name: info.id,
+                url: None,
+            })
+        }
+        SettingsAxis::OracleThinking(level) => {
+            wire.oracle_thinking = Some(thinking_config_name(level.as_ref()).to_string())
+        }
+        SettingsAxis::OracleSpeed(speed) => wire.oracle_speed = Some(speed_name(speed).to_string()),
+        SettingsAxis::OracleVerbosity(verbosity) => {
+            wire.oracle_verbosity = Some(
+                verbosity_name(verbosity.map(aj_app::model::config_verbosity_to_unified))
+                    .to_string(),
+            )
+        }
         SettingsAxis::Model(info) => {
             // The triple, never the catalog row: the host resolves
             // `(api, name)` against its own catalog and credentials. The url

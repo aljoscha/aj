@@ -1034,6 +1034,7 @@ fn subagent_fingerprint(s: &SubAgentEntry, hasher: &mut DefaultHasher) {
         SubAgentStatus::Failed => 3u8.hash(hasher),
     }
     s.task.hash(hasher);
+    s.tool_name.hash(hasher);
     s.report.hash(hasher);
     s.latest_activity.hash(hasher);
     s.background.hash(hasher);
@@ -6834,6 +6835,7 @@ mod tests {
                 } else {
                     format!("scout the code as agent {child}")
                 },
+                tool_name: "agent".into(),
                 background: false,
                 settings: cache_settings(),
             },
@@ -6962,6 +6964,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(0),
                 task: "scout".into(),
+                tool_name: "agent".into(),
                 background: false,
                 settings: cache_settings(),
             },

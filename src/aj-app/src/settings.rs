@@ -34,7 +34,9 @@ use crate::model::{
     ResolvedModel, apply_thinking_display, config_verbosity_to_unified, from_model_info,
 };
 use crate::session::SessionCore;
-use crate::session_setup::{RunConfigSnapshot, thinking_display_name, thinking_level_for};
+use crate::session_setup::{
+    ModelConfig, RunConfigSnapshot, thinking_display_name, thinking_level_for,
+};
 
 /// Presentation belongs to the connecting frontend, not the session host.
 /// All other schema options are host-owned defaults.
@@ -102,7 +104,15 @@ pub const UNSET_VALUE: &str = "default";
 pub fn is_axis(key: &str) -> bool {
     matches!(
         key,
-        MODEL_SETTING_ID | "thinking" | "thinking_display" | "speed" | "verbosity"
+        MODEL_SETTING_ID
+            | "thinking"
+            | "thinking_display"
+            | "speed"
+            | "verbosity"
+            | "oracle_model"
+            | "oracle_thinking"
+            | "oracle_speed"
+            | "oracle_verbosity"
     )
 }
 
@@ -114,7 +124,14 @@ pub fn setting_axis(
     value: &str,
 ) -> Result<crate::host::SettingsAxis, String> {
     use crate::host::SettingsAxis;
-    match key {
+    if !is_axis(key) {
+        return Err(format!("Unknown settings axis {key:?}."));
+    }
+    let (target, key) = match key.strip_prefix("oracle_") {
+        Some(key) => (ModelTarget::Oracle, key),
+        None => (ModelTarget::Main, key),
+    };
+    let axis = match key {
         MODEL_SETTING_ID => value
             .split_once('/')
             .and_then(|(provider, model)| {
@@ -140,7 +157,8 @@ pub fn setting_axis(
             .parse::<ConfigVerbosity>()
             .map(|value| SettingsAxis::Verbosity(Some(value))),
         _ => Err(format!("Unknown settings axis {key:?}.")),
-    }
+    }?;
+    Ok(target.axis(axis))
 }
 
 /// Write one config value into the layer the edit names, after validating
@@ -198,10 +216,27 @@ pub fn edit_config(
                 let axis = setting_axis(models, &edit.key, value).map_err(HostError::Invalid)?;
                 persist_axis(layers, effective, edit.persist, &axis)
             }
-            None if edit.key == MODEL_SETTING_ID => persist_project(
+            None if edit.key == MODEL_SETTING_ID || edit.key == "oracle_model" => persist_project(
                 layers,
                 effective,
-                &[("model_api", None), ("model_name", None)],
+                &[
+                    (
+                        if edit.key == MODEL_SETTING_ID {
+                            "model_api"
+                        } else {
+                            "oracle_model_api"
+                        },
+                        None,
+                    ),
+                    (
+                        if edit.key == MODEL_SETTING_ID {
+                            "model_name"
+                        } else {
+                            "oracle_model_name"
+                        },
+                        None,
+                    ),
+                ],
             ),
             None => persist_project(layers, effective, &[(&edit.key, None)]),
         }
@@ -212,10 +247,9 @@ pub fn edit_config(
                 .apply_str(value, &mut Config::default())
                 .map_err(|err| HostError::Invalid(err.to_string()))?;
         }
-        let value = edit
-            .value
-            .as_deref()
-            .filter(|value| edit.key != "model_url" || !value.is_empty());
+        let value = edit.value.as_deref().filter(|value| {
+            !matches!(edit.key.as_str(), "model_url" | "oracle_model_url") || !value.is_empty()
+        });
         persist_setting(
             layers,
             effective,
@@ -225,6 +259,8 @@ pub fn edit_config(
             |config| {
                 if edit.key == "model_url" {
                     config.model_url = value.map(String::from);
+                } else if edit.key == "oracle_model_url" {
+                    config.oracle_model_url = value.map(String::from);
                 } else if let Some(value) = value {
                     option
                         .apply_str(value, config)
@@ -402,6 +438,72 @@ pub fn persist_setting(
     }
 }
 
+/// The independently configured model whose settings a session edit changes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ModelTarget {
+    Main,
+    Oracle,
+}
+
+impl ModelTarget {
+    pub fn model(self, run: &RunConfigSnapshot) -> &ModelConfig {
+        match self {
+            Self::Main => &run.main,
+            Self::Oracle => &run.oracle,
+        }
+    }
+    pub fn model_mut(self, run: &mut RunConfigSnapshot) -> &mut ModelConfig {
+        match self {
+            Self::Main => &mut run.main,
+            Self::Oracle => &mut run.oracle,
+        }
+    }
+    fn key(self, key: &'static str) -> &'static str {
+        match (self, key) {
+            (Self::Main, _) => key,
+            (Self::Oracle, "model_api") => "oracle_model_api",
+            (Self::Oracle, "model_name") => "oracle_model_name",
+            (Self::Oracle, "thinking") => "oracle_thinking",
+            (Self::Oracle, "speed") => "oracle_speed",
+            (Self::Oracle, "verbosity") => "oracle_verbosity",
+            _ => unreachable!("unsupported model setting"),
+        }
+    }
+    /// Target an ordinary model, effort, speed, or verbosity edit. Oracle has
+    /// no separate thinking-display axis, so callers must not pass one here.
+    pub fn axis(self, axis: crate::host::SettingsAxis) -> crate::host::SettingsAxis {
+        use crate::host::SettingsAxis::*;
+        if self == Self::Main {
+            return axis;
+        }
+        match axis {
+            Model(v) => OracleModel(v),
+            Thinking(v) => OracleThinking(v),
+            Speed(v) => OracleSpeed(v),
+            Verbosity(v) => OracleVerbosity(v),
+            _ => unreachable!("unsupported Oracle axis"),
+        }
+    }
+    fn notice(self, notice: String) -> String {
+        match self {
+            Self::Main => notice,
+            Self::Oracle => format!("Oracle: {notice}"),
+        }
+    }
+}
+
+impl crate::host::SettingsAxis {
+    pub fn model_target(&self) -> ModelTarget {
+        use crate::host::SettingsAxis::*;
+        match self {
+            OracleModel(_) | OracleThinking(_) | OracleSpeed(_) | OracleVerbosity(_) => {
+                ModelTarget::Oracle
+            }
+            _ => ModelTarget::Main,
+        }
+    }
+}
+
 /// Save an axis choice as a config default, refreshing `config` from the layers.
 ///
 /// Does not change runtime settings or append to the session log, so a frontend
@@ -415,66 +517,93 @@ pub fn persist_axis(
 ) -> Option<String> {
     use crate::host::SettingsAxis;
 
+    let target = axis.model_target();
     match axis {
-        SettingsAxis::Thinking(level) => persist_setting(
+        SettingsAxis::Thinking(level) | SettingsAxis::OracleThinking(level) => persist_setting(
             layers,
             config,
             persist,
-            "thinking",
+            target.key("thinking"),
             Some(thinking_level_name(level)),
-            |c| c.thinking = Some(config_thinking_level(level.as_ref())),
+            |c| {
+                let value = Some(config_thinking_level(level.as_ref()));
+                if target == ModelTarget::Main {
+                    c.thinking = value;
+                } else {
+                    c.oracle_thinking = value;
+                }
+            },
         ),
-        SettingsAxis::Model(info) => {
+        SettingsAxis::Model(info) | SettingsAxis::OracleModel(info) => {
             // `model_url` is a user-supplied endpoint override, not part of
             // the model choice. Saving the catalog URL would freeze out
             // updates to models.json.
             match persist {
                 PersistAction::None => None,
                 PersistAction::User => persist_user(layers, config, |c| {
-                    c.model_api = Some(info.provider.clone());
-                    c.model_name = Some(info.id.clone());
+                    if target == ModelTarget::Main {
+                        c.model_api = Some(info.provider.clone());
+                        c.model_name = Some(info.id.clone());
+                    } else {
+                        c.oracle_model_api = Some(info.provider.clone());
+                        c.oracle_model_name = Some(info.id.clone());
+                    }
                 }),
                 PersistAction::ProjectSet => persist_project(
                     layers,
                     config,
                     &[
-                        ("model_api", Some(info.provider.as_str())),
-                        ("model_name", Some(info.id.as_str())),
+                        (target.key("model_api"), Some(info.provider.as_str())),
+                        (target.key("model_name"), Some(info.id.as_str())),
                     ],
                 ),
-                PersistAction::ProjectClear => {
-                    persist_project(layers, config, &[("model_api", None), ("model_name", None)])
-                }
+                PersistAction::ProjectClear => persist_project(
+                    layers,
+                    config,
+                    &[
+                        (target.key("model_api"), None),
+                        (target.key("model_name"), None),
+                    ],
+                ),
             }
         }
-        SettingsAxis::Speed(speed) => {
+        SettingsAxis::Speed(speed) | SettingsAxis::OracleSpeed(speed) => {
             // Standard removes the user key but is an explicit project
             // override, so a project can override a user default of fast.
             persist_setting(
                 layers,
                 config,
                 persist,
-                "speed",
+                target.key("speed"),
                 Some(speed_name(*speed)),
                 |c| {
-                    c.speed = match speed {
+                    let value = match speed {
                         None | Some(Speed::Standard) => None,
                         Some(Speed::Fast) => Some(ConfigSpeed::Fast),
                     };
+                    if target == ModelTarget::Main {
+                        c.speed = value;
+                    } else {
+                        c.oracle_speed = value;
+                    }
                 },
             )
         }
-        SettingsAxis::Verbosity(verbosity) => {
+        SettingsAxis::Verbosity(verbosity) | SettingsAxis::OracleVerbosity(verbosity) => {
             // The default choice removes the key in either layer.
             let value = verbosity.map(|value| value.to_string());
             persist_setting(
                 layers,
                 config,
                 persist,
-                "verbosity",
+                target.key("verbosity"),
                 value.as_deref(),
                 |c| {
-                    c.verbosity = *verbosity;
+                    if target == ModelTarget::Main {
+                        c.verbosity = *verbosity;
+                    } else {
+                        c.oracle_verbosity = *verbosity;
+                    }
                 },
             )
         }
@@ -501,12 +630,12 @@ pub struct FooterUpdate {
     pub context_window: u64,
 }
 
-/// Result of a main-agent thinking or model confirm.
+/// Result of a main or Oracle thinking or model confirm.
 ///
 /// `footer` is `Some` when the change applied and the frontend should
 /// refresh the Main footer entry. It is `None` when the change did not
 /// apply (a provider rebuild failure) and the footer is left as-is.
-pub struct MainConfirm {
+pub struct ModelConfirm {
     pub footer: Option<FooterUpdate>,
     /// The confirmation line on its own, which is also what the log
     /// entry's projection renders.
@@ -596,7 +725,7 @@ macro_rules! confirmation {
     };
 }
 
-confirmation!(MainConfirm);
+confirmation!(ModelConfirm);
 confirmation!(SubConfirm);
 confirmation!(VerbosityConfirm);
 
@@ -624,8 +753,8 @@ pub struct ConfirmOutcome {
     pub entry: Option<EntryRef>,
 }
 
-impl From<MainConfirm> for ConfirmOutcome {
-    fn from(confirm: MainConfirm) -> Self {
+impl From<ModelConfirm> for ConfirmOutcome {
+    fn from(confirm: ModelConfirm) -> Self {
         Self {
             applied: confirm.footer.is_some(),
             notice: confirm.notice,
@@ -683,25 +812,27 @@ impl From<SpeedConfirm> for ConfirmOutcome {
     }
 }
 
-/// Apply a confirmed thinking pick to the main agent: stage it into the
+/// Apply a confirmed thinking pick to the selected model: stage it into the
 /// run config, record it on the session log's user thread, and persist
 /// it per `persist`. Returns the new footer identity and the notice.
 /// The frontend applies the border tint and footer note.
-pub async fn confirm_thinking_for_main(
+pub async fn confirm_thinking(
+    target: ModelTarget,
     level: Option<ThinkingConfig>,
     persist: PersistAction,
     run_config: &Arc<Mutex<RunConfigSnapshot>>,
     config: &Arc<Mutex<Config>>,
     layers: &Arc<Mutex<ConfigLayers>>,
     core: &SessionCore,
-) -> MainConfirm {
+) -> ModelConfirm {
     // Stage the new thinking effort into the loop-side snapshot; the
     // next turn applies it. Never locks the agent, so it's safe while
     // a turn is running (the in-flight turn keeps its effort; the
     // change takes effect next turn). Read the rest of the settings
     // identity back for the footer entry.
     let (settings, context_window) = {
-        let mut cfg = run_config.lock().expect("run config mutex poisoned");
+        let mut run = run_config.lock().expect("run config mutex poisoned");
+        let cfg = target.model_mut(&mut run);
         cfg.thinking = level.clone();
         (cfg.settings(), cfg.model_info.context_window)
     };
@@ -710,7 +841,10 @@ pub async fn confirm_thinking_for_main(
     // resume restores this level.
     let (entry, log_note) = {
         let mut log = core.log.lock().await;
-        record(log.append_thinking_change(ThreadFilter::USER, name))
+        record(match target {
+            ModelTarget::Main => log.append_thinking_change(ThreadFilter::USER, name),
+            ModelTarget::Oracle => log.append_oracle_thinking_change(name),
+        })
     };
     // Persist as the new default only when the change should outlive
     // this session (the settings windows). The `/thinking` overlay
@@ -720,14 +854,14 @@ pub async fn confirm_thinking_for_main(
         layers,
         config,
         persist,
-        &crate::host::SettingsAxis::Thinking(level),
+        &target.axis(crate::host::SettingsAxis::Thinking(level)),
     );
-    MainConfirm {
+    ModelConfirm {
         footer: Some(FooterUpdate {
             settings,
             context_window,
         }),
-        notice: format!("Thinking effort set to {name}."),
+        notice: target.notice(format!("Thinking effort set to {name}.")),
         notes: [save_note, log_note].into_iter().flatten().collect(),
         entry,
     }
@@ -755,8 +889,8 @@ fn record(
 /// Deliberately does not touch `config.toml` or the run config. Those
 /// record the session default, which is main's concern.
 ///
-/// `tracked_model` is the model the frontend currently shows for the
-/// target, resolved to a catalog entry. It is the validation fallback
+/// `tracked_model` is the target child's recorded model, resolved to a
+/// catalog entry. It is the validation fallback
 /// used when no bundle override is staged for the agent. Validation is
 /// lenient: with no model to check against it is skipped, matching
 /// scripted mode.
@@ -777,8 +911,8 @@ pub async fn confirm_thinking_for_sub(
     }
     let name = thinking_level_name(&level);
     // Validate the chosen level (including off) against the target's
-    // model: the staged bundle override's info if present, else the model
-    // the frontend tracks, else skip (no model in scope, e.g. scripted).
+    // model: the staged bundle override's info if present, else its recorded
+    // model, else skip (no model in scope, e.g. scripted).
     let wire = level
         .as_ref()
         .map(thinking_level_for)
@@ -825,12 +959,13 @@ pub async fn confirm_thinking_for_sub(
     }
 }
 
-/// Apply a confirmed model pick to the main agent: rebuild the bundle,
+/// Apply a confirmed model pick to the selected model: rebuild the bundle,
 /// stage it into the run config, record it on the session log's user
 /// thread, and (per `persist`) write or clear the choice in a config
 /// layer as the default for new sessions. Returns the new footer
 /// identity (or `None` on a rebuild failure) and the notice.
-pub async fn confirm_model_for_main(
+pub async fn confirm_model(
+    target: ModelTarget,
     info: ModelInfo,
     persist: PersistAction,
     auth: &AuthStorage,
@@ -838,42 +973,34 @@ pub async fn confirm_model_for_main(
     config: &Arc<Mutex<Config>>,
     layers: &Arc<Mutex<ConfigLayers>>,
     core: &SessionCore,
-) -> MainConfirm {
-    // Construct a fresh provider handle from the picked catalog entry,
-    // carrying the active speed over so e.g. `--speed fast` survives a
-    // model pick (degrading silently on providers that ignore it).
-    let (speed, display, verbosity) = {
-        let cfg = run_config.lock().expect("run config mutex poisoned");
-        (
-            cfg.speed,
-            cfg.thinking_display,
-            cfg.stream_options.verbosity,
-        )
+) -> ModelConfirm {
+    let previous = {
+        let run = run_config.lock().expect("run config mutex poisoned");
+        target.model(&run).clone()
     };
-    match from_model_info(auth, info.clone(), speed) {
-        Ok(ResolvedModel {
-            provider,
-            model_info,
-            mut stream_options,
-        }) => {
-            // Re-apply this session's choices. The host config is only the
-            // seed for a new session and may differ from its creator's.
-            apply_thinking_display(&mut stream_options, display);
-            stream_options.verbosity = verbosity;
-            // Stage the swap into the loop-side snapshot (provider +
-            // model + options + the pre-select key); the next turn
-            // applies it. Never locks the agent, so it's safe mid-turn —
-            // the in-flight turn keeps its model and the swap takes
-            // effect next turn. Thinking effort is preserved; read it
-            // back for the footer entry.
+    let replacement = from_model_info(auth, info.clone(), previous.speed).map(|bundle| {
+        let mut options = bundle.stream_options;
+        apply_thinking_display(&mut options, previous.thinking_display);
+        options.verbosity = previous.stream_options.verbosity;
+        ModelConfig {
+            provider: bundle.provider,
+            model_info: bundle.model_info,
+            stream_options: options,
+            model_key: (info.provider.clone(), info.id.clone()),
+            ..previous
+        }
+    });
+    match replacement {
+        Ok(mut model) => {
+            // Never lock the agent here. A running turn retains its bundle,
+            // while the next main turn takes these staged choices.
             let settings = {
-                let mut cfg = run_config.lock().expect("run config mutex poisoned");
-                cfg.provider = provider;
-                cfg.model_info = model_info;
-                cfg.stream_options = stream_options;
-                cfg.model_key = (info.provider.clone(), info.id.clone());
-                cfg.bind_accounts(auth);
-                cfg.settings()
+                let mut run = run_config.lock().expect("run config mutex poisoned");
+                run.accounts
+                    .install(&mut model.stream_options, auth, &model.model_info.provider);
+                let settings = model.settings();
+                *target.model_mut(&mut run) = model;
+                settings
             };
             // Record the new settings identity so the footer's model
             // line and context-window denominator reflect the swap
@@ -883,7 +1010,12 @@ pub async fn confirm_model_for_main(
             // later resume restores this model.
             let (entry, log_note) = {
                 let mut log = core.log.lock().await;
-                record(log.append_model_change(ThreadFilter::USER, &info.provider, &info.id))
+                record(match target {
+                    ModelTarget::Main => {
+                        log.append_model_change(ThreadFilter::USER, &info.provider, &info.id)
+                    }
+                    ModelTarget::Oracle => log.append_oracle_model_change(&info.provider, &info.id),
+                })
             };
             // Persist the model choice (provider + id) as the new
             // default only when the change should outlive this session
@@ -894,24 +1026,24 @@ pub async fn confirm_model_for_main(
                 layers,
                 config,
                 persist,
-                &crate::host::SettingsAxis::Model(info.clone()),
+                &target.axis(crate::host::SettingsAxis::Model(info.clone())),
             );
-            MainConfirm {
+            ModelConfirm {
                 footer: Some(FooterUpdate {
                     settings,
                     context_window,
                 }),
-                notice: format!(
+                notice: target.notice(format!(
                     "Model set to {} ({}/{}).",
                     info.name, info.provider, info.id
-                ),
+                )),
                 notes: [save_note, log_note].into_iter().flatten().collect(),
                 entry,
             }
         }
-        Err(err) => MainConfirm {
+        Err(err) => ModelConfirm {
             footer: None,
-            notice: format!("Failed to switch to {}: {err}", info.name),
+            notice: target.notice(format!("Failed to switch to {}: {err}", info.name)),
             notes: Vec::new(),
             entry: None,
         },
@@ -919,18 +1051,18 @@ pub async fn confirm_model_for_main(
 }
 
 /// Apply a confirmed model pick to sub-agent `n`: rebuild the bundle at
-/// `effective_speed` and stage it into the sub-override map (applied at
+/// the child's speed and stage it into the sub-override map (applied at
 /// the sub's next turn start), then record on the sub's log thread.
 /// Deliberately does not touch `config.toml` or the run config.
 ///
-/// `effective_speed` is the speed the frontend resolved for the target
-/// (its staged override if any, else its tracked speed), so the rebuilt
-/// bundle re-stamps the same speed-derived headers.
+/// `recorded_speed` is the target child's recorded baseline. A staged speed
+/// or model bundle takes precedence, keeping request options in step with
+/// the child's own identity rather than the main agent's settings.
 pub async fn confirm_model_for_sub(
     info: &ModelInfo,
     n: usize,
     auth: &AuthStorage,
-    effective_speed: Option<Speed>,
+    recorded_speed: Option<Speed>,
     core: &SessionCore,
 ) -> SubConfirm {
     let target = AgentId::Sub(n);
@@ -942,6 +1074,20 @@ pub async fn confirm_model_for_sub(
             applied: false,
         };
     }
+    let effective_speed = core
+        .sub_overrides
+        .lock()
+        .expect("sub overrides mutex poisoned")
+        .get(&n)
+        .and_then(|overrides| {
+            overrides.speed.or_else(|| {
+                overrides
+                    .bundle
+                    .as_ref()
+                    .map(|(_, _, options, _)| options.speed)
+            })
+        })
+        .unwrap_or(recorded_speed);
     match from_model_info(auth, info.clone(), effective_speed) {
         Ok(ResolvedModel {
             provider,
@@ -960,7 +1106,7 @@ pub async fn confirm_model_for_sub(
             // come from `from_model_info` (defaults), so a sub's
             // `thinking_display` and `verbosity` revert to the server
             // default on a model swap. Unlike the main path
-            // (`confirm_model_for_main`), we don't re-apply the config
+            // (`confirm_model`), we don't re-apply the config
             // values here. The two settings behave identically, and
             // sub-agent display tuning isn't exposed, so we accept the
             // gap rather than thread config through the sub path.
@@ -1000,15 +1146,16 @@ pub async fn confirm_model_for_sub(
     }
 }
 
-/// Apply a confirmed output-verbosity pick to the main agent: stage it
+/// Apply a confirmed output-verbosity pick to the selected model: stage it
 /// onto the run config's stream options, persist per `persist`, and
 /// record it on the session log's user thread. Verbosity is a plain
 /// stream-option field (no headers, no bundle rebuild), so unlike
-/// [`confirm_speed_for_main`] this neither rebuilds the provider nor
+/// [`confirm_speed`] this neither rebuilds the provider nor
 /// touches the footer. Providers gate the field on per-model support,
 /// so on a model that ignores verbosity this records the preference
 /// without changing what's sent. Returns the user-facing notice.
-pub async fn confirm_verbosity_for_main(
+pub async fn confirm_verbosity(
+    target: ModelTarget,
     verbosity: Option<ConfigVerbosity>,
     persist: PersistAction,
     run_config: &Arc<Mutex<RunConfigSnapshot>>,
@@ -1019,22 +1166,28 @@ pub async fn confirm_verbosity_for_main(
     let unified = verbosity.map(config_verbosity_to_unified);
     let name = verbosity_name(unified);
     {
-        let mut cfg = run_config.lock().expect("run config mutex poisoned");
+        let mut run = run_config.lock().expect("run config mutex poisoned");
+        let cfg = target.model_mut(&mut run);
         cfg.stream_options.verbosity = unified;
     }
     // Record on the user thread so a later resume restores this value.
     let (entry, log_note) = {
         let mut log = core.log.lock().await;
-        record(log.append_verbosity_change(ThreadFilter::USER, name))
+        record(match target {
+            ModelTarget::Main => log.append_verbosity_change(ThreadFilter::USER, name),
+            ModelTarget::Oracle => log.append_oracle_verbosity_change(name),
+        })
     };
     let save_note = persist_axis(
         layers,
         config,
         persist,
-        &crate::host::SettingsAxis::Verbosity(verbosity),
+        &target.axis(crate::host::SettingsAxis::Verbosity(verbosity)),
     );
     VerbosityConfirm {
-        notice: format!("Output verbosity set to {name}. Takes effect next turn."),
+        notice: target.notice(format!(
+            "Output verbosity set to {name}. Takes effect next turn."
+        )),
         notes: [save_note, log_note].into_iter().flatten().collect(),
         entry,
     }
@@ -1054,8 +1207,8 @@ pub fn confirm_thinking_display_for_main(
 ) -> ConfirmOutcome {
     {
         let mut cfg = run_config.lock().expect("run config mutex poisoned");
-        cfg.thinking_display = display;
-        apply_thinking_display(&mut cfg.stream_options, display);
+        cfg.main.thinking_display = display;
+        apply_thinking_display(&mut cfg.main.stream_options, display);
     }
     let name = thinking_display_name(display);
     let save_note = persist_axis(
@@ -1072,13 +1225,14 @@ pub fn confirm_thinking_display_for_main(
     }
 }
 
-/// Apply a speed change to the main agent: rebuild the provider bundle
+/// Apply a speed change to the selected model: rebuild the provider bundle
 /// at the current model so the speed-derived headers are re-stamped,
 /// stage it into the run config, persist per `persist`, and record on
 /// the session log's user thread. On a rebuild failure (e.g. scripted
 /// mode, whose provider isn't in the registry) nothing is staged and
 /// the caller reverts the settings row via [`SpeedConfirm::Failed`].
-pub async fn confirm_speed_for_main(
+pub async fn confirm_speed(
+    target: ModelTarget,
     speed: Option<Speed>,
     persist: PersistAction,
     auth: &AuthStorage,
@@ -1089,7 +1243,8 @@ pub async fn confirm_speed_for_main(
 ) -> SpeedConfirm {
     let name = speed_name(speed);
     let (model_info, prev_speed, display, verbosity) = {
-        let cfg = run_config.lock().expect("run config mutex poisoned");
+        let run = run_config.lock().expect("run config mutex poisoned");
+        let cfg = target.model(&run);
         (
             (*cfg.model_info).clone(),
             cfg.speed,
@@ -1110,39 +1265,44 @@ pub async fn confirm_speed_for_main(
             // Stage into the loop-side snapshot; the next turn applies
             // it. Never locks the agent, so it's safe mid-turn.
             let (settings, context_window) = {
-                let mut cfg = run_config.lock().expect("run config mutex poisoned");
+                let mut run = run_config.lock().expect("run config mutex poisoned");
+                let accounts = run.accounts.clone();
+                let cfg = target.model_mut(&mut run);
                 cfg.provider = provider;
                 cfg.model_info = model_info;
                 cfg.stream_options = stream_options;
                 cfg.speed = speed;
-                cfg.bind_accounts(auth);
+                accounts.install(&mut cfg.stream_options, auth, &cfg.model_info.provider);
                 (cfg.settings(), cfg.model_info.context_window)
             };
             // Record the change on the session log's user thread so a
             // later resume restores this speed.
             let (entry, log_note) = {
                 let mut log = core.log.lock().await;
-                record(log.append_speed_change(ThreadFilter::USER, name))
+                record(match target {
+                    ModelTarget::Main => log.append_speed_change(ThreadFilter::USER, name),
+                    ModelTarget::Oracle => log.append_oracle_speed_change(name),
+                })
             };
             let save_note = persist_axis(
                 layers,
                 config,
                 persist,
-                &crate::host::SettingsAxis::Speed(speed),
+                &target.axis(crate::host::SettingsAxis::Speed(speed)),
             );
             SpeedConfirm::Applied {
                 footer: FooterUpdate {
                     settings,
                     context_window,
                 },
-                notice: format!("Speed set to {name}. Takes effect next turn."),
+                notice: target.notice(format!("Speed set to {name}. Takes effect next turn.")),
                 notes: [save_note, log_note].into_iter().flatten().collect(),
                 entry,
             }
         }
         Err(err) => SpeedConfirm::Failed {
             previous: speed_name(prev_speed).to_string(),
-            notice: format!("Failed to set speed {name}: {err}"),
+            notice: target.notice(format!("Failed to set speed {name}: {err}")),
         },
     }
 }
@@ -1159,10 +1319,11 @@ pub fn option_description(option: &aj_conf::ConfigOption) -> String {
     match option.name {
         // The model row folds `model_api` + `model_name`, so its text names
         // both keys rather than describing `model_api` alone.
+        "oracle_model_api" => "Model Oracle uses, applied from the next turn. Persisted as oracle_model_api + oracle_model_name.".to_string(),
         "model_api" => "Model the main agent uses, applied from the next turn. \
              Persisted as model_api + model_name."
             .to_string(),
-        "model_url" => describe(
+        "model_url" | "oracle_model_url" => describe(
             option,
             "Takes effect on restart. Submit an empty value to unset.",
         ),
@@ -1170,8 +1331,8 @@ pub fn option_description(option: &aj_conf::ConfigOption) -> String {
             option,
             "\"default\" keeps the provider's stock behavior. Takes effect next turn.",
         ),
-        "speed" => describe(option, "Takes effect next turn."),
-        "verbosity" => describe(
+        "speed" | "oracle_speed" | "oracle_thinking" => describe(option, "Takes effect next turn."),
+        "verbosity" | "oracle_verbosity" => describe(
             option,
             "\"default\" leaves the server default. Takes effect next turn.",
         ),

@@ -791,22 +791,37 @@ impl Driver {
         } = change;
         let core = &self.session.core;
         let shared = &self.shared;
+        let target = axis.model_target();
+        if target == crate::settings::ModelTarget::Oracle && agent != AgentId::Main {
+            return Err(HostError::Invalid(
+                "Oracle settings belong to the session".into(),
+            ));
+        }
         let mut transient_confirmation = false;
         let outcome: ConfirmOutcome = match (axis, agent) {
-            (SettingsAxis::Thinking(level), AgentId::Main) => {
-                crate::settings::confirm_thinking_for_main(
-                    level,
-                    persist,
-                    &core.run_config,
-                    &shared.config,
-                    &shared.layers,
-                    core,
-                )
-                .await
-                .into()
-            }
+            (
+                SettingsAxis::Thinking(level) | SettingsAxis::OracleThinking(level),
+                AgentId::Main,
+            ) => crate::settings::confirm_thinking(
+                target,
+                level,
+                persist,
+                &core.run_config,
+                &shared.config,
+                &shared.layers,
+                core,
+            )
+            .await
+            .into(),
             (SettingsAxis::Thinking(level), AgentId::Sub(n)) => {
-                let tracked = self.tracked_model();
+                let tracked = self.sub_settings(n).await.model.and_then(|key| {
+                    self.shared
+                        .catalog
+                        .iter()
+                        .find(|info| info.provider == key.0 && info.id == key.1)
+                        .cloned()
+                        .map(Arc::new)
+                });
                 crate::settings::confirm_thinking_for_sub(level, n, tracked, core)
                     .await
                     .into()
@@ -821,41 +836,38 @@ impl Driver {
                     &shared.layers,
                 )
             }
-            (SettingsAxis::Model(info), AgentId::Main) => crate::settings::confirm_model_for_main(
-                info,
-                persist,
-                &shared.auth,
-                &core.run_config,
-                &shared.config,
-                &shared.layers,
-                core,
-            )
-            .await
-            .into(),
+            (SettingsAxis::Model(info) | SettingsAxis::OracleModel(info), AgentId::Main) => {
+                crate::settings::confirm_model(
+                    target,
+                    info,
+                    persist,
+                    &shared.auth,
+                    &core.run_config,
+                    &shared.config,
+                    &shared.layers,
+                    core,
+                )
+                .await
+                .into()
+            }
             (SettingsAxis::Model(info), AgentId::Sub(n)) => {
-                let speed = {
-                    let cfg = core.run_config.lock().expect("run config mutex poisoned");
-                    cfg.speed
-                };
+                let speed = self
+                    .sub_settings(n)
+                    .await
+                    .speed
+                    .as_deref()
+                    .and_then(aj_models::speed_from_name)
+                    .flatten();
                 crate::settings::confirm_model_for_sub(&info, n, &shared.auth, speed, core)
                     .await
                     .into()
             }
-            (SettingsAxis::Speed(speed), AgentId::Main) => crate::settings::confirm_speed_for_main(
-                speed,
-                persist,
-                &shared.auth,
-                &core.run_config,
-                &shared.config,
-                &shared.layers,
-                core,
-            )
-            .await
-            .into(),
-            (SettingsAxis::Verbosity(verbosity), AgentId::Main) => {
-                crate::settings::confirm_verbosity_for_main(
-                    verbosity,
+            (SettingsAxis::Speed(speed) | SettingsAxis::OracleSpeed(speed), AgentId::Main) => {
+                crate::settings::confirm_speed(
+                    target,
+                    speed,
                     persist,
+                    &shared.auth,
                     &core.run_config,
                     &shared.config,
                     &shared.layers,
@@ -865,7 +877,25 @@ impl Driver {
                 .into()
             }
             (
-                SettingsAxis::ThinkingDisplay(_)
+                SettingsAxis::Verbosity(verbosity) | SettingsAxis::OracleVerbosity(verbosity),
+                AgentId::Main,
+            ) => crate::settings::confirm_verbosity(
+                target,
+                verbosity,
+                persist,
+                &core.run_config,
+                &shared.config,
+                &shared.layers,
+                core,
+            )
+            .await
+            .into(),
+            (
+                SettingsAxis::OracleModel(_)
+                | SettingsAxis::OracleThinking(_)
+                | SettingsAxis::OracleSpeed(_)
+                | SettingsAxis::OracleVerbosity(_)
+                | SettingsAxis::ThinkingDisplay(_)
                 | SettingsAxis::Speed(_)
                 | SettingsAxis::Verbosity(_),
                 AgentId::Sub(n),
@@ -913,9 +943,10 @@ impl Driver {
                 },
             );
         }
-        let settings = settings_of(&self.session.core.run_config);
+        let (settings, oracle_settings) = settings_of(&self.session.core.run_config);
         self.session.publish_state(&self.shared.fanout, |status| {
             status.settings = settings;
+            status.oracle_settings = oracle_settings;
             true
         });
         Ok(incomplete.map_or(CommandOutcome::Accepted, CommandOutcome::Incomplete))
@@ -1087,25 +1118,15 @@ impl Driver {
         }
     }
 
-    /// The catalog entry for the session's active model, the validation
-    /// fallback a sub-agent thinking change uses when the sub has no staged
-    /// bundle of its own.
-    fn tracked_model(&self) -> Option<Arc<aj_models::registry::ModelInfo>> {
-        let key = {
-            let cfg = self
-                .session
-                .core
-                .run_config
-                .lock()
-                .expect("run config mutex poisoned");
-            cfg.model_key.clone()
-        };
-        self.shared
-            .catalog
-            .iter()
-            .find(|info| info.provider == key.0 && info.id == key.1)
-            .cloned()
-            .map(Arc::new)
+    /// A child's spawn snapshot and recorded edits, without taking its agent
+    /// lock, which may be held for a running turn. Staged overrides take
+    /// precedence when applying a setting to that child.
+    async fn sub_settings(&self, n: usize) -> aj_session::SessionSettings {
+        let filter = ThreadFilter::subagent(n);
+        let log = self.session.core.log.lock().await;
+        log.latest_leaf(filter)
+            .map(|head| log.linearize(&head, filter).settings())
+            .unwrap_or_default()
     }
 
     fn require_idle(&self) -> Result<(), HostError> {
@@ -1142,15 +1163,8 @@ impl Driver {
             .lock()
             .expect("run config mutex poisoned")
             .clone();
-        let config = self
-            .shared
-            .config
-            .lock()
-            .expect("config mutex poisoned")
-            .clone();
         super::head::prepare(
             run,
-            &config,
             &log.linearize(entry, ThreadFilter::USER).settings(),
             &self.shared,
             env,
@@ -1227,7 +1241,7 @@ impl Driver {
             // an attach that snapshots the log cannot pair the new
             // projection with the old epoch.
             let mut status = self.session.status();
-            status.settings = settings_of(&self.session.core.run_config);
+            (status.settings, status.oracle_settings) = settings_of(&self.session.core.run_config);
             status.epoch = mint_epoch();
             status.last_seq = log.last_seq();
             status.note_activity();

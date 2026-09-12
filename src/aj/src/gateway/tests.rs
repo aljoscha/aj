@@ -6465,6 +6465,7 @@ fn state_frame(session: &str, epoch: &str, last_seq: u64) -> String {
         epoch: epoch.to_string(),
         working: false,
         settings: fake_settings(),
+        oracle_settings: None,
         credential_warning: None,
         last_seq,
     })

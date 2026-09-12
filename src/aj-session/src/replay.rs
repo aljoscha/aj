@@ -47,6 +47,10 @@
 //!   around the tool_result is also emitted so persistence listeners
 //!   replaying the stream see the same shape live runs produce.
 //! - [`ConversationEntryKind::ModelChange`] /
+//!   [`ConversationEntryKind::OracleModelChange`] /
+//!   [`ConversationEntryKind::OracleThinkingChange`] /
+//!   [`ConversationEntryKind::OracleSpeedChange`] /
+//!   [`ConversationEntryKind::OracleVerbosityChange`] /
 //!   [`ConversationEntryKind::AccountChange`] /
 //!   [`ConversationEntryKind::ThinkingChange`] /
 //!   [`ConversationEntryKind::SpeedChange`] /
@@ -652,6 +656,7 @@ fn conclusion_from_stop_reason(stop_reason: &StopReason) -> SubAgentConclusion {
 fn sub_start_event(
     n: usize,
     task: String,
+    tool_name: String,
     background: bool,
     settings: AgentSettings,
 ) -> AgentEvent {
@@ -659,6 +664,7 @@ fn sub_start_event(
         parent: AgentId::Main,
         child: AgentId::Sub(n),
         task,
+        tool_name,
         background,
         settings,
     }
@@ -750,12 +756,19 @@ impl ReplayState {
         match &entry.entry {
             ConversationEntryKind::SubAgentSpawn {
                 task,
+                tool_name,
                 background,
                 settings,
             } => {
                 self.open_run(
                     n,
-                    sub_start_event(n, task.clone(), *background, settings.clone()),
+                    sub_start_event(
+                        n,
+                        task.clone(),
+                        tool_name.clone(),
+                        *background,
+                        settings.clone(),
+                    ),
                     at,
                     keep,
                     out,
@@ -772,7 +785,13 @@ impl ReplayState {
                 // start stays untagged: this entry's durable frame is its
                 // own `MessageEnd`.
                 let start = self.spawned.get(&n).cloned().unwrap_or_else(|| {
-                    sub_start_event(n, subagent_task(entry), false, fallback_settings())
+                    sub_start_event(
+                        n,
+                        subagent_task(entry),
+                        String::new(),
+                        false,
+                        fallback_settings(),
+                    )
                 });
                 self.open_run(n, start, None, keep, out);
             }
@@ -780,6 +799,10 @@ impl ReplayState {
             // bracket; the first `Message` entry does. A compaction
             // marker likewise opens no bracket.
             ConversationEntryKind::ModelChange { .. }
+            | ConversationEntryKind::OracleModelChange { .. }
+            | ConversationEntryKind::OracleThinkingChange { .. }
+            | ConversationEntryKind::OracleSpeedChange { .. }
+            | ConversationEntryKind::OracleVerbosityChange { .. }
             | ConversationEntryKind::AccountChange { .. }
             | ConversationEntryKind::ThinkingChange { .. }
             | ConversationEntryKind::SpeedChange { .. }
@@ -866,6 +889,7 @@ impl ReplayState {
             out.push_back(transient(sub_start_event(
                 n,
                 String::new(),
+                String::new(),
                 false,
                 fallback_settings(),
             )));
@@ -923,11 +947,16 @@ impl ReplayState {
             ConversationEntryKind::SystemPrompt { .. } => {
                 // Model-facing metadata; not user-visible.
             }
-            ConversationEntryKind::ModelChange { provider, model_id } => {
+            ConversationEntryKind::ModelChange { provider, model_id }
+            | ConversationEntryKind::OracleModelChange { provider, model_id } => {
+                let label = match &entry.entry {
+                    ConversationEntryKind::OracleModelChange { .. } => "Oracle model",
+                    _ => "Model",
+                };
                 self.state_notice(
                     agent_id,
                     at,
-                    format!("Model set to {provider}/{model_id}."),
+                    format!("{label} set to {provider}/{model_id}."),
                     out,
                 );
             }
@@ -939,24 +968,31 @@ impl ReplayState {
                 };
                 self.state_notice(agent_id, at, format!("{provider} account: {label}."), out);
             }
-            ConversationEntryKind::ThinkingChange { level } => {
-                self.state_notice(
-                    agent_id,
-                    at,
-                    format!("Thinking effort set to {level}."),
-                    out,
-                );
+            ConversationEntryKind::ThinkingChange { level }
+            | ConversationEntryKind::OracleThinkingChange { level } => {
+                let label = match &entry.entry {
+                    ConversationEntryKind::OracleThinkingChange { .. } => "Oracle thinking effort",
+                    _ => "Thinking effort",
+                };
+                self.state_notice(agent_id, at, format!("{label} set to {level}."), out);
             }
-            ConversationEntryKind::SpeedChange { speed } => {
-                self.state_notice(agent_id, at, format!("Speed set to {speed}."), out);
+            ConversationEntryKind::SpeedChange { speed }
+            | ConversationEntryKind::OracleSpeedChange { speed } => {
+                let label = match &entry.entry {
+                    ConversationEntryKind::OracleSpeedChange { .. } => "Oracle speed",
+                    _ => "Speed",
+                };
+                self.state_notice(agent_id, at, format!("{label} set to {speed}."), out);
             }
-            ConversationEntryKind::VerbosityChange { verbosity } => {
-                self.state_notice(
-                    agent_id,
-                    at,
-                    format!("Output verbosity set to {verbosity}."),
-                    out,
-                );
+            ConversationEntryKind::VerbosityChange { verbosity }
+            | ConversationEntryKind::OracleVerbosityChange { verbosity } => {
+                let label = match &entry.entry {
+                    ConversationEntryKind::OracleVerbosityChange { .. } => {
+                        "Oracle output verbosity"
+                    }
+                    _ => "Output verbosity",
+                };
+                self.state_notice(agent_id, at, format!("{label} set to {verbosity}."), out);
             }
             ConversationEntryKind::EnvChange { env } => {
                 let keys = env
@@ -1387,6 +1423,151 @@ mod tests {
     }
 
     #[test]
+    fn oracle_settings_roundtrip_selected_ancestry_and_replay() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).unwrap();
+        log.set_system_prompt("p".into()).unwrap();
+        log.append_model_change(ThreadFilter::USER, "main", "seed")
+            .unwrap();
+        log.append_thinking_change(ThreadFilter::USER, "medium")
+            .unwrap();
+        log.append_speed_change(ThreadFilter::USER, "standard")
+            .unwrap();
+        log.append_verbosity_change(ThreadFilter::USER, "high")
+            .unwrap();
+        log.append_account_change("main", Some("work")).unwrap();
+        let legacy = ConversationView::user(&mut log)
+            .add_message(user_msg("legacy"))
+            .unwrap();
+        let change = log.append_oracle_model_change("openai", "oracle").unwrap();
+        assert_eq!(log.parent_of(&change.id), Some(&legacy.id));
+        log.append_oracle_thinking_change("off").unwrap();
+        log.append_oracle_speed_change("fast").unwrap();
+        log.append_oracle_verbosity_change("low").unwrap();
+        let fork = ConversationView::user(&mut log)
+            .add_message(user_msg("fork"))
+            .unwrap();
+        log.append_oracle_model_change("anthropic", "alternate")
+            .unwrap();
+        log.append_oracle_thinking_change("max").unwrap();
+        log.append_oracle_speed_change("standard").unwrap();
+        log.append_oracle_verbosity_change("default").unwrap();
+        let alternate = ConversationView::user(&mut log)
+            .add_message(user_msg("alternate"))
+            .unwrap();
+        log.set_head(fork.id.clone()).unwrap();
+        log.append_model_change(ThreadFilter::USER, "main", "changed")
+            .unwrap();
+        log.append_oracle_thinking_change("high").unwrap();
+        let selected = ConversationView::user(&mut log)
+            .add_message(user_msg("selected"))
+            .unwrap();
+        let session = log.session_id().to_string();
+        drop(log);
+        let mut log = ConversationLog::resume(&persistence, &session).unwrap();
+        assert_eq!(log.head(), Some(&selected.id));
+        for (head, model, thinking, speed, verbosity) in [
+            (&legacy.id, None, None, None, None),
+            (
+                &fork.id,
+                Some(("openai", "oracle")),
+                Some("off"),
+                Some("fast"),
+                Some("low"),
+            ),
+            (
+                &alternate.id,
+                Some(("anthropic", "alternate")),
+                Some("max"),
+                Some("standard"),
+                Some("default"),
+            ),
+            (
+                &selected.id,
+                Some(("openai", "oracle")),
+                Some("high"),
+                Some("fast"),
+                Some("low"),
+            ),
+        ] {
+            log.set_head(head.clone()).unwrap();
+            let settings = log.settings_at(head);
+            assert_eq!(
+                settings.oracle(),
+                SessionSettings {
+                    model: model.map(|(api, name)| (api.into(), name.into())),
+                    thinking: thinking.map(str::to_string),
+                    speed: speed.map(str::to_string),
+                    verbosity: verbosity.map(str::to_string),
+                    ..Default::default()
+                }
+            );
+            assert_eq!(
+                settings.model,
+                Some((
+                    "main".into(),
+                    if head == &selected.id {
+                        "changed"
+                    } else {
+                        "seed"
+                    }
+                    .into()
+                ))
+            );
+            let projection = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+            let recorded = projection
+                .events
+                .iter()
+                .filter_map(|e| e.branch_settings.as_ref())
+                .next_back()
+                .unwrap();
+            assert_eq!(recorded, &settings);
+            let notices: Vec<_> = replay(&log)
+                .filter_map(|event| match event {
+                    AgentEvent::Notice { agent_id, text } if text.starts_with("Oracle ") => {
+                        assert_eq!(agent_id, AgentId::Main);
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut expected = Vec::new();
+            if head != &legacy.id {
+                expected.extend([
+                    "Oracle model set to openai/oracle.",
+                    "Oracle thinking effort set to off.",
+                    "Oracle speed set to fast.",
+                    "Oracle output verbosity set to low.",
+                ]);
+            }
+            if head == &alternate.id {
+                expected.extend([
+                    "Oracle model set to anthropic/alternate.",
+                    "Oracle thinking effort set to max.",
+                    "Oracle speed set to standard.",
+                    "Oracle output verbosity set to default.",
+                ]);
+            } else if head == &selected.id {
+                expected.push("Oracle thinking effort set to high.");
+            }
+            assert_eq!(notices, expected);
+        }
+        for entry in log.entries_in_order() {
+            if matches!(
+                entry.entry,
+                ConversationEntryKind::OracleModelChange { .. }
+                    | ConversationEntryKind::OracleThinkingChange { .. }
+                    | ConversationEntryKind::OracleSpeedChange { .. }
+                    | ConversationEntryKind::OracleVerbosityChange { .. }
+            ) {
+                assert_eq!(entry.thread, ThreadKind::User);
+                assert!(!entry.entry.is_punctuation());
+            }
+        }
+    }
+
+    #[test]
     fn branch_settings_follow_selected_ancestry_and_the_suffix_prefix() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
@@ -1396,18 +1577,31 @@ mod tests {
             .unwrap();
         log.append_thinking_change(ThreadFilter::USER, "high")
             .unwrap();
+        log.append_oracle_model_change("openai", "oracle").unwrap();
+        log.append_oracle_thinking_change("low").unwrap();
+        log.append_oracle_speed_change("fast").unwrap();
+        log.append_oracle_verbosity_change("high").unwrap();
         let first = ConversationView::user(&mut log)
             .add_message(user_msg("first"))
             .unwrap();
         let expected = SessionSettings {
             model: Some(("provider".into(), "seed".into())),
             thinking: Some("high".into()),
+            oracle_model: Some(("openai".into(), "oracle".into())),
+            oracle_thinking: Some("low".into()),
+            oracle_speed: Some("fast".into()),
+            oracle_verbosity: Some("high".into()),
             ..SessionSettings::default()
         };
         log.append_model_change(ThreadFilter::USER, "abandoned", "model")
             .unwrap();
         log.append_thinking_change(ThreadFilter::USER, "off")
             .unwrap();
+        log.append_oracle_model_change("anthropic", "abandoned")
+            .unwrap();
+        log.append_oracle_thinking_change("off").unwrap();
+        log.append_oracle_speed_change("standard").unwrap();
+        log.append_oracle_verbosity_change("low").unwrap();
         log.append_account_change("abandoned", Some("account"))
             .unwrap();
         let abandoned = ConversationView::user(&mut log)
@@ -2351,12 +2545,26 @@ mod tests {
         };
 
         let mut heads = [
-            log.append_subagent_spawn(1, parent_head.clone(), "first task", false, &sub_settings())
-                .expect("spawn 1")
-                .id,
-            log.append_subagent_spawn(2, parent_head, "second task", false, &other_sub_settings())
-                .expect("spawn 2")
-                .id,
+            log.append_subagent_spawn(
+                1,
+                parent_head.clone(),
+                "first task",
+                "agent",
+                false,
+                &sub_settings(),
+            )
+            .expect("spawn 1")
+            .id,
+            log.append_subagent_spawn(
+                2,
+                parent_head,
+                "second task",
+                "agent",
+                false,
+                &other_sub_settings(),
+            )
+            .expect("spawn 2")
+            .id,
         ];
 
         let task = |n: usize| user_msg(&format!("task {n}"));
@@ -2975,6 +3183,10 @@ mod tests {
             .expect("tc");
         log.append_speed_change(crate::log::ThreadFilter::USER, "fast")
             .expect("sc");
+        log.append_oracle_model_change("openai", "oracle").unwrap();
+        log.append_oracle_thinking_change("off").unwrap();
+        log.append_oracle_speed_change("standard").unwrap();
+        log.append_oracle_verbosity_change("default").unwrap();
         {
             let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
@@ -3236,7 +3448,7 @@ mod tests {
             speed: "fast".into(),
             verbosity: "high".into(),
         };
-        log.append_subagent_spawn(1, user_head, "subtask", true, &settings)
+        log.append_subagent_spawn(1, user_head, "subtask", "agent", true, &settings)
             .expect("spawn entry");
         {
             let sub_head = log
@@ -3317,7 +3529,7 @@ mod tests {
             speed: "fast".into(),
             verbosity: "high".into(),
         };
-        log.append_subagent_spawn(1, user_head, "subtask", false, &settings)
+        log.append_subagent_spawn(1, user_head, "subtask", "agent", false, &settings)
             .expect("spawn entry");
         {
             let sub_head = log
@@ -3505,7 +3717,7 @@ mod tests {
             speed: "fast".into(),
             verbosity: "default".into(),
         };
-        log.append_subagent_spawn(1, user_head, "subtask", false, &settings)
+        log.append_subagent_spawn(1, user_head, "subtask", "agent", false, &settings)
             .expect("spawn");
         {
             let sub_leaf = log
@@ -3565,7 +3777,7 @@ mod tests {
 
         let settings = super::fallback_settings();
         let mut sub_head = log
-            .append_subagent_spawn(1, user_head.clone(), "bg subtask", true, &settings)
+            .append_subagent_spawn(1, user_head.clone(), "bg subtask", "agent", true, &settings)
             .expect("spawn")
             .id;
 
@@ -3940,7 +4152,14 @@ mod tests {
             .id
         };
         let spawn_a = log
-            .append_subagent_spawn(1, a_a.clone(), "sub A task", false, &fallback_settings())
+            .append_subagent_spawn(
+                1,
+                a_a.clone(),
+                "sub A task",
+                "agent",
+                false,
+                &fallback_settings(),
+            )
             .expect("spawn 1")
             .id;
         {
@@ -3965,7 +4184,7 @@ mod tests {
             .id
         };
         let spawn_b = log
-            .append_subagent_spawn(2, a_b, "sub B task", false, &fallback_settings())
+            .append_subagent_spawn(2, a_b, "sub B task", "agent", false, &fallback_settings())
             .expect("spawn 2")
             .id;
         {
@@ -4030,7 +4249,14 @@ mod tests {
             .id
         };
         let spawn_a = log
-            .append_subagent_spawn(1, a_a.clone(), "sub A task", false, &fallback_settings())
+            .append_subagent_spawn(
+                1,
+                a_a.clone(),
+                "sub A task",
+                "agent",
+                false,
+                &fallback_settings(),
+            )
             .expect("spawn A")
             .id;
         {
@@ -4056,7 +4282,7 @@ mod tests {
             .id
         };
         let spawn_b = log
-            .append_subagent_spawn(1, a_b, "sub B task", false, &fallback_settings())
+            .append_subagent_spawn(1, a_b, "sub B task", "agent", false, &fallback_settings())
             .expect("spawn B")
             .id;
         {
@@ -4218,7 +4444,7 @@ mod tests {
         .expect("compaction");
         let parent_head = log.head().cloned().expect("head present");
         let spawn = log
-            .append_subagent_spawn(1, parent_head, "do thing", true, &sub_settings())
+            .append_subagent_spawn(1, parent_head, "do thing", "oracle", true, &sub_settings())
             .expect("spawn root");
         {
             let mut view = ConversationView::subagent(&mut log, spawn.id, 1);
@@ -4294,6 +4520,7 @@ mod tests {
                 1,
                 parent_head.clone(),
                 "first bg task",
+                "agent",
                 true,
                 &sub_settings(),
             )
@@ -4304,6 +4531,7 @@ mod tests {
                 2,
                 parent_head,
                 "second bg task",
+                "agent",
                 true,
                 &other_sub_settings(),
             )
@@ -4521,7 +4749,7 @@ mod tests {
             view.head().cloned().expect("head")
         };
         let sub_head = log
-            .append_subagent_spawn(1, parent_head, "subtask", false, &sub_settings())
+            .append_subagent_spawn(1, parent_head, "subtask", "agent", false, &sub_settings())
             .expect("spawn root")
             .id;
         {
@@ -4972,12 +5200,14 @@ mod tests {
                 parent,
                 child,
                 task,
+                tool_name,
                 background,
                 settings,
             } => {
                 assert_eq!(*parent, AgentId::Main);
                 assert_eq!(*child, AgentId::Sub(1));
                 assert_eq!(task, "do thing", "the spawn root's real task");
+                assert_eq!(tool_name, "oracle", "the spawn root's originating tool");
                 assert!(*background, "the spawn root's real run mode");
                 assert_eq!(settings, &sub_settings(), "the spawn root's settings");
             }
@@ -5042,12 +5272,14 @@ mod tests {
             AgentEvent::SubAgentStart {
                 child,
                 task,
+                tool_name,
                 background,
                 settings,
                 ..
             } => {
                 assert_eq!(*child, AgentId::Sub(1));
                 assert_eq!(task, "legacy subtask", "taken from the task message");
+                assert!(tool_name.is_empty(), "a legacy log carries no origin");
                 assert!(!background, "a legacy log carries no run mode");
                 assert_eq!(*settings, fallback_settings());
             }
@@ -5085,6 +5317,7 @@ mod tests {
                 1,
                 active.clone(),
                 "active task",
+                "agent",
                 false,
                 &fallback_settings(),
             )
@@ -5112,7 +5345,14 @@ mod tests {
             .id
         };
         let spawn_abandoned = log
-            .append_subagent_spawn(2, abandoned, "abandoned task", false, &fallback_settings())
+            .append_subagent_spawn(
+                2,
+                abandoned,
+                "abandoned task",
+                "agent",
+                false,
+                &fallback_settings(),
+            )
             .expect("spawn 2")
             .id;
         {

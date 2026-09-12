@@ -117,6 +117,8 @@ pub(crate) struct SessionStatus {
     /// The settings the next main turn runs against, cached off the run
     /// config so a `state` frame needs no lock of its own.
     pub(crate) settings: AgentSettings,
+    /// The Oracle settings staged for the next main turn, cached beside main.
+    pub(crate) oracle_settings: Option<AgentSettings>,
     /// The sub-agents the host has observed going idle, plus every one the
     /// log already named when the session was materialized (nothing runs at
     /// that point, so they are all finished).
@@ -182,21 +184,20 @@ impl SessionStatus {
             epoch: self.epoch.clone(),
             working: self.working,
             settings: self.settings.clone(),
+            oracle_settings: self.oracle_settings.clone(),
             credential_warning: None,
             last_seq: self.last_seq,
         }
     }
 }
 
-/// Read the settings identity a `state` frame reports off a session's run
-/// config. The run config is what the next main turn is stamped from, so it
-/// is the authority for "the active model", not the agent (whose copy lags
-/// by one turn).
-pub(crate) fn settings_of(run_config: &StdMutex<RunConfigSnapshot>) -> AgentSettings {
-    run_config
-        .lock()
-        .expect("run config mutex poisoned")
-        .settings()
+/// Read the main and Oracle settings from the run config, the authority for
+/// the next main turn rather than the agent's last-turn copy.
+pub(crate) fn settings_of(
+    run_config: &StdMutex<RunConfigSnapshot>,
+) -> (AgentSettings, Option<AgentSettings>) {
+    let run = run_config.lock().expect("run config mutex poisoned");
+    (run.main.settings(), Some(run.oracle.settings()))
 }
 
 /// A session the host holds live.

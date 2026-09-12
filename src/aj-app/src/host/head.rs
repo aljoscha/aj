@@ -6,7 +6,6 @@ use aj_session::ThreadFilter;
 /// leave its lazy credential resolvers attached to the live branch.
 pub(super) async fn prepare(
     mut run: RunConfigSnapshot,
-    config: &Config,
     historical: &aj_session::SessionSettings,
     shared: &HostShared,
     mut env: BTreeMap<String, String>,
@@ -18,7 +17,7 @@ pub(super) async fn prepare(
     run.bind_accounts(auth);
     if let Some(restore) = &shared.restore {
         let detached = Arc::new(StdMutex::new(run));
-        crate::session_setup::restore_session_settings(config, &detached, historical, restore);
+        crate::session_setup::restore_session_settings(&detached, historical, restore);
         run = detached.lock().expect("run config mutex poisoned").clone();
     }
     if changes.settings.account.is_some() {
@@ -68,6 +67,20 @@ pub(super) fn append_changes(
 ) -> Result<(), HostError> {
     let settings = run.settings();
     let persist = |err| HostError::Internal(Box::new(err));
+    if let Some(model) = &changes.settings.oracle_model {
+        log.append_oracle_model_change(&model.api, &model.name)
+            .map_err(persist)?;
+    }
+    if let Some(effort) = &changes.settings.oracle_thinking {
+        log.append_oracle_thinking_change(effort).map_err(persist)?;
+    }
+    if let Some(speed) = &changes.settings.oracle_speed {
+        log.append_oracle_speed_change(speed).map_err(persist)?;
+    }
+    if let Some(verbosity) = &changes.settings.oracle_verbosity {
+        log.append_oracle_verbosity_change(verbosity)
+            .map_err(persist)?;
+    }
     if changes.settings.model.is_some() {
         log.append_model_change(ThreadFilter::USER, &settings.provider, &settings.model_id)
             .map_err(persist)?;

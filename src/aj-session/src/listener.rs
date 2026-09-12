@@ -369,6 +369,7 @@ fn persist(
             parent,
             child,
             task,
+            tool_name,
             background,
             settings,
         } => {
@@ -386,8 +387,14 @@ fn persist(
                     "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
                 ))
             })?;
-            let appended =
-                log.append_subagent_spawn(*child_n, parent_head, task, *background, settings)?;
+            let appended = log.append_subagent_spawn(
+                *child_n,
+                parent_head,
+                task,
+                tool_name,
+                *background,
+                settings,
+            )?;
             Ok(Some(appended))
         }
         AgentEvent::MessageEnd { agent_id, message } => {
@@ -618,6 +625,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(n),
             task: task.to_string(),
+            tool_name: "agent".into(),
             background: false,
             settings: AgentSettings {
                 provider: "anthropic".to_string(),
@@ -842,7 +850,7 @@ mod tests {
         // one `SubAgentSpawn` entry anchored at the parent's
         // `latest_leaf`; the sub-agent's first `MessageEnd` then
         // chains onto it.
-        let (_dir, log) = fresh_log();
+        let (dir, log) = fresh_log();
         let parent_anchor = {
             let mut log_guard = log.lock().await;
             let mut view = ConversationView::user(&mut log_guard);
@@ -856,9 +864,11 @@ mod tests {
         let bus = EventBus::new();
         let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
 
-        bus.emit(sub_start(1, "do thing"))
-            .await
-            .expect("emit start");
+        let mut start = sub_start(1, "do thing");
+        if let AgentEvent::SubAgentStart { tool_name, .. } = &mut start {
+            *tool_name = "oracle".into();
+        }
+        bus.emit(start).await.expect("emit start");
 
         bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Sub(1),
@@ -874,17 +884,25 @@ mod tests {
         .await
         .expect("emit assistant");
 
-        let log_guard = log.lock().await;
-        let sub_head = log_guard
+        let session_id = log.lock().await.session_id().to_string();
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        let sub_head = resumed
             .latest_leaf(ThreadFilter::subagent(1))
             .expect("sub-agent thread head exists");
-        let convo = log_guard.linearize(&sub_head, ThreadFilter::subagent(1));
+        let convo = resumed.linearize(&sub_head, ThreadFilter::subagent(1));
         let entries: Vec<_> = convo.entries().to_vec();
         // One spawn entry followed by the two messages.
         assert_eq!(entries.len(), 3, "got entries: {entries:#?}");
         match &entries[0].entry {
-            ConversationEntryKind::SubAgentSpawn { task, settings, .. } => {
+            ConversationEntryKind::SubAgentSpawn {
+                task,
+                tool_name,
+                settings,
+                ..
+            } => {
                 assert_eq!(task, "do thing");
+                assert_eq!(tool_name, "oracle");
                 assert_eq!(settings.provider, "anthropic");
                 assert_eq!(settings.model_id, "claude-x");
                 assert_eq!(settings.thinking, "medium");
@@ -900,6 +918,13 @@ mod tests {
             ConversationEntryKind::Message { .. }
         ));
         assert_eq!(entries[2].parent_id.as_ref(), Some(&entries[1].id));
+        assert!(
+            crate::replay::replay(&resumed).any(|event| matches!(
+                event,
+                AgentEvent::SubAgentStart { tool_name, .. } if tool_name == "oracle"
+            )),
+            "replay retains the persisted spawning tool"
+        );
     }
 
     #[tokio::test]

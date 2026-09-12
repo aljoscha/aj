@@ -590,6 +590,18 @@ pub struct Config {
     /// [`ConfigVerbosity`]. Distinct from `thinking_display`, which
     /// controls the reasoning channel rather than the answer.
     pub verbosity: Option<ConfigVerbosity>,
+    /// Oracle model API backend. Uses its own built-in model defaults when unset.
+    pub oracle_model_api: Option<String>,
+    /// Custom Oracle model endpoint URL.
+    pub oracle_model_url: Option<String>,
+    /// Oracle model name override.
+    pub oracle_model_name: Option<String>,
+    /// Oracle thinking level, independent of the main agent.
+    pub oracle_thinking: Option<ConfigThinkingLevel>,
+    /// Oracle inference speed override (Anthropic only).
+    pub oracle_speed: Option<ConfigSpeed>,
+    /// Oracle output answer verbosity override for models that support it.
+    pub oracle_verbosity: Option<ConfigVerbosity>,
     /// Interactive TUI theme name. Resolved against the bundled
     /// catalog (`dark`, `light`) plus any `*.json` files in
     /// `~/.aj/themes/`. Defaults to `light` when unset.
@@ -703,6 +715,12 @@ impl Default for Config {
             thinking_display: Some(ConfigThinkingDisplay::Summarized),
             speed: None,
             verbosity: None,
+            oracle_model_api: None,
+            oracle_model_url: None,
+            oracle_model_name: None,
+            oracle_thinking: Some(ConfigThinkingLevel::XHigh),
+            oracle_speed: None,
+            oracle_verbosity: None,
             theme: None,
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
@@ -883,6 +901,72 @@ impl Config {
             },
             display_fn: |c| display_opt(&c.verbosity),
             to_toml_fn: |c| opt_value_item(&c.verbosity),
+        },
+        ConfigOption {
+            name: "oracle_model_api",
+            description: "Oracle model API backend (e.g. \"anthropic\", \"openai\").",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.oracle_model_api = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.oracle_model_api),
+            to_toml_fn: |c| opt_value_item(&c.oracle_model_api),
+        },
+        ConfigOption {
+            name: "oracle_model_url",
+            description: "Custom Oracle model endpoint URL.",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.oracle_model_url = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.oracle_model_url),
+            to_toml_fn: |c| opt_value_item(&c.oracle_model_url),
+        },
+        ConfigOption {
+            name: "oracle_model_name",
+            description: "Oracle model name override.",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.oracle_model_name = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.oracle_model_name),
+            to_toml_fn: |c| opt_value_item(&c.oracle_model_name),
+        },
+        ConfigOption {
+            name: "oracle_thinking",
+            description: "Oracle thinking level override.",
+            kind: ValueKind::Enum(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+            apply_toml_fn: |v, c| {
+                c.oracle_thinking = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.oracle_thinking),
+            to_toml_fn: |c| opt_value_item(&c.oracle_thinking),
+        },
+        ConfigOption {
+            name: "oracle_speed",
+            description: "Oracle inference speed mode (Anthropic only).",
+            kind: ValueKind::Enum(&["standard", "fast"]),
+            apply_toml_fn: |v, c| {
+                c.oracle_speed = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.oracle_speed),
+            to_toml_fn: |c| opt_value_item(&c.oracle_speed),
+        },
+        ConfigOption {
+            name: "oracle_verbosity",
+            description: "Oracle output answer verbosity (only models that support it).",
+            kind: ValueKind::Enum(&["low", "medium", "high"]),
+            apply_toml_fn: |v, c| {
+                c.oracle_verbosity = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.oracle_verbosity),
+            to_toml_fn: |c| opt_value_item(&c.oracle_verbosity),
         },
         ConfigOption {
             name: "theme",
@@ -2055,6 +2139,12 @@ thinking = "low"
 thinking_display = "summarized"
 speed = "fast"
 verbosity = "low"
+oracle_model_api = "openai"
+oracle_model_url = "https://oracle.example.test"
+oracle_model_name = "oracle-x"
+oracle_thinking = "max"
+oracle_speed = "standard"
+oracle_verbosity = "high"
 theme = "dark"
 disabled_tools = ["bash"]
 disabled_skills = ["scratch"]
@@ -2078,6 +2168,15 @@ bash_rtk = true
         );
         assert_eq!(config.speed, Some(ConfigSpeed::Fast));
         assert_eq!(config.verbosity, Some(ConfigVerbosity::Low));
+        assert_eq!(config.oracle_model_api.as_deref(), Some("openai"));
+        assert_eq!(
+            config.oracle_model_url.as_deref(),
+            Some("https://oracle.example.test")
+        );
+        assert_eq!(config.oracle_model_name.as_deref(), Some("oracle-x"));
+        assert_eq!(config.oracle_thinking, Some(ConfigThinkingLevel::Max));
+        assert_eq!(config.oracle_speed, Some(ConfigSpeed::Standard));
+        assert_eq!(config.oracle_verbosity, Some(ConfigVerbosity::High));
         assert_eq!(config.theme.as_deref(), Some("dark"));
         assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
         assert_eq!(config.disabled_skills, vec!["scratch".to_string()]);
@@ -2086,6 +2185,66 @@ bash_rtk = true
         assert!(config.show_frame_stats);
         assert_eq!(config.sidebar_cols, 40);
         assert!(config.bash_rtk);
+    }
+
+    #[test]
+    fn oracle_options_have_independent_defaults_and_layers() {
+        let path = Path::new("/p/.aj/config.toml");
+        let (empty, diag) = parse_config("", path);
+        assert!(diag.is_empty(), "{diag:?}");
+        for (name, user_value, project_value) in [
+            ("model_api", "anthropic", "openai"),
+            ("model_url", "https://user.test", "https://project.test"),
+            ("model_name", "user-model", "project-model"),
+            ("thinking", "low", "off"),
+            ("speed", "fast", "standard"),
+            ("verbosity", "high", "low"),
+        ] {
+            let key = format!("oracle_{name}");
+            let option = Config::option(&key).unwrap();
+            let primary = Config::option(name).unwrap();
+            assert_eq!(option.kind.to_string(), primary.kind.to_string());
+            for config in [&Config::default(), &empty] {
+                assert_eq!(
+                    option.display(config),
+                    option.display(&Config::default()),
+                    "{key}"
+                );
+            }
+
+            // Editing main leaves Oracle defaults untouched.
+            let (base, diag) = parse_config(&format!("{name} = {user_value:?}"), path);
+            assert!(diag.is_empty(), "{diag:?}");
+            assert_eq!(option.display(&base), option.display(&Config::default()));
+            let (user, diag) = parse_config(
+                &format!("{name} = {user_value:?}\n{key} = {user_value:?}"),
+                path,
+            );
+            assert!(diag.is_empty(), "{diag:?}");
+            assert_eq!(option.display(&user), user_value);
+            let (mut project, diag) = parse_layer(&format!("{key} = {project_value:?}"), path);
+            assert!(diag.is_empty(), "{diag:?}");
+            assert!(project.is_set(&key));
+            let effective = project.overlay_onto(&user);
+            assert_eq!(option.display(&effective), project_value);
+            assert_eq!(primary.display(&effective), user_value);
+
+            let rewritten = rewrite_changed("", &Config::default(), &effective);
+            let (reloaded, diag) = parse_config(&rewritten, path);
+            assert!(diag.is_empty(), "{diag:?}");
+            assert_eq!(option.display(&reloaded), project_value);
+
+            project.clear(&key);
+            assert!(!project.is_set(&key));
+            assert_eq!(option.display(&project.overlay_onto(&user)), user_value);
+            let (invalid, diag) = parse_layer(&format!("{key} = 42"), path);
+            assert!(matches!(
+                diag.as_slice(),
+                [ConfigDiagnostic::InvalidValue { key: bad_key, .. }] if bad_key == &key
+            ));
+            assert!(!invalid.is_set(&key));
+            assert_eq!(option.display(&invalid.overlay_onto(&user)), user_value);
+        }
     }
 
     #[test]

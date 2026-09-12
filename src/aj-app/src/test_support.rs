@@ -91,8 +91,7 @@ pub fn finalized_text_message_with_usage(text: &str, input_tokens: u64) -> Assis
 /// `messages`. `ExhaustedBehavior::Panic` makes any unscripted
 /// extra inference fail loudly.
 pub fn scripted_run_config(messages: Vec<AssistantMessage>) -> Arc<StdMutex<RunConfigSnapshot>> {
-    Arc::new(StdMutex::new(RunConfigSnapshot {
-        accounts: Default::default(),
+    let main = crate::session_setup::ModelConfig {
         provider: Arc::new(
             ScriptedProvider::from_messages(messages, 0, Duration::ZERO)
                 .on_exhausted(ExhaustedBehavior::Panic),
@@ -103,6 +102,11 @@ pub fn scripted_run_config(messages: Vec<AssistantMessage>) -> Arc<StdMutex<RunC
         thinking_display: None,
         speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
+    };
+    Arc::new(StdMutex::new(RunConfigSnapshot {
+        oracle: main.clone(),
+        main,
+        accounts: Default::default(),
         session_id: None,
     }))
 }
@@ -116,8 +120,7 @@ pub fn scripted_run_config_with_window(
 ) -> Arc<StdMutex<RunConfigSnapshot>> {
     let mut model_info = scripted_model_info();
     model_info.context_window = context_window;
-    Arc::new(StdMutex::new(RunConfigSnapshot {
-        accounts: Default::default(),
+    let main = crate::session_setup::ModelConfig {
         provider: Arc::new(
             ScriptedProvider::from_messages(messages, 0, Duration::ZERO)
                 .on_exhausted(ExhaustedBehavior::Panic),
@@ -128,6 +131,11 @@ pub fn scripted_run_config_with_window(
         thinking_display: None,
         speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
+    };
+    Arc::new(StdMutex::new(RunConfigSnapshot {
+        oracle: main.clone(),
+        main,
+        accounts: Default::default(),
         session_id: None,
     }))
 }
@@ -324,6 +332,7 @@ pub enum CanonicalEntry {
     SubAgent {
         child: usize,
         task: String,
+        tool_name: String,
         status: SubAgentStatus,
         report: Option<String>,
         background: bool,
@@ -691,6 +700,7 @@ fn canonical_entry(entry: &Entry) -> CanonicalEntry {
         EntryKind::SubAgent(s) => CanonicalEntry::SubAgent {
             child: s.child,
             task: s.task.clone(),
+            tool_name: s.tool_name.clone(),
             status: s.status,
             report: s.report.clone(),
             background: s.background,
@@ -779,6 +789,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "look into it".to_string(),
+                tool_name: "agent".into(),
                 background: false,
                 settings: agent_settings(),
             },
@@ -940,6 +951,7 @@ mod tests {
                 epoch: epoch.to_string(),
                 working: false,
                 settings: agent_settings(),
+                oracle_settings: None,
                 credential_warning: None,
                 last_seq: 0,
             },

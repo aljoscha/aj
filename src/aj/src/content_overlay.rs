@@ -1781,6 +1781,10 @@ mod tests {
                 speed: None,
                 verbosity: None,
                 accounts: Default::default(),
+                oracle_model: None,
+                oracle_thinking: None,
+                oracle_speed: None,
+                oracle_verbosity: None,
             },
             session_env: None,
         }

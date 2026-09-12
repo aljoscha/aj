@@ -37,6 +37,7 @@ pub mod keybindings;
 pub mod markdown;
 pub mod model;
 pub mod notices;
+pub mod oracle;
 pub mod outbound;
 pub mod print;
 pub mod prompt_history;

@@ -79,6 +79,33 @@ async fn settings_parity_local_and_http_adapters() {
             );
             assert_eq!(Config::load().0.model_url.as_deref(), Some(endpoint));
         }
+        for endpoint in ["https://oracle.example.org/v1", ""] {
+            control
+                .edit_config(
+                    &session,
+                    aj_wire::ConfigEdit {
+                        key: "oracle_model_url".into(),
+                        value: Some(endpoint.into()),
+                        persist: PersistAction::User,
+                    },
+                )
+                .await
+                .unwrap();
+            let expected = (!endpoint.is_empty()).then_some(endpoint);
+            let saved = Config::load().0;
+            assert_eq!(saved.oracle_model_url.as_deref(), expected);
+            assert_eq!(
+                saved.model_url.as_deref(),
+                Some(values.user["model_url"].as_str())
+            );
+            let view = control.config(&session).await.unwrap();
+            assert_eq!(view.user["oracle_model_url"], expected.unwrap_or("<unset>"));
+            assert_eq!(
+                view.effective["oracle_model_url"],
+                view.user["oracle_model_url"]
+            );
+            assert_eq!(view.user["model_url"], values.user["model_url"]);
+        }
         assert!(!values.user.contains_key("theme"));
         assert_eq!(
             values.user.len(),
@@ -218,7 +245,7 @@ async fn settings_parity_local_and_http_adapters() {
                 )
                 .await
                 .unwrap();
-            assert_eq!(live.run_config.lock().unwrap().thinking, Some(level));
+            assert_eq!(live.run_config.lock().unwrap().main.thinking, Some(level));
             assert_eq!(
                 control
                     .config(&session)
@@ -254,7 +281,7 @@ async fn settings_parity_local_and_http_adapters() {
             );
         }
         assert_eq!(
-            live.run_config.lock().unwrap().thinking,
+            live.run_config.lock().unwrap().main.thinking,
             Some(ThinkingConfig::High),
             "a config edit cannot change the running session"
         );
@@ -1174,6 +1201,7 @@ async fn settings_parity_failed_saves_leave_defaults_coherent_and_retry_writes_d
                     .run_config
                     .lock()
                     .unwrap()
+                    .main
                     .thinking
                     .as_ref()
                     .map(|thinking| aj_models::thinking_config_name(Some(thinking))),
@@ -1187,6 +1215,7 @@ async fn settings_parity_failed_saves_leave_defaults_coherent_and_retry_writes_d
                 .run_config
                 .lock()
                 .unwrap()
+                .main
                 .model_key
                 .clone();
             let model = owner
@@ -1232,6 +1261,7 @@ async fn settings_parity_failed_saves_leave_defaults_coherent_and_retry_writes_d
                     .run_config
                     .lock()
                     .unwrap()
+                    .main
                     .model_key,
                 (model.provider.clone(), model.id.clone())
             );
@@ -1475,6 +1505,7 @@ async fn settings_parity_branch_draft_saves_config_without_touching_the_session(
             .run_config
             .lock()
             .unwrap()
+            .main
             .thinking
             .clone();
         arm_branch(&shell.borrow().view().branch_anchor, "m1".to_string());
@@ -1510,6 +1541,7 @@ async fn settings_parity_branch_draft_saves_config_without_touching_the_session(
                 .run_config
                 .lock()
                 .unwrap()
+                .main
                 .thinking,
             live_before,
             "the running session waits for the branch"
@@ -1534,35 +1566,48 @@ async fn settings_parity_branch_draft_saves_config_without_touching_the_session(
         shell.borrow().overlays.borrow_mut().close_all();
         apply_command(&mut world, &shell, CommandAction::OpenProjectSettings).await;
         let list = Rc::clone(&shell.borrow().settings_ui.borrow().as_ref().unwrap().list);
-        let before = list.borrow().value_of("thinking");
         let mut owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
         owner.bind_rows(&list);
-        for choice in ["minimal", "max"] {
-            list.borrow().set_value("thinking", choice);
-            apply_selector_activity(
-                &mut world,
-                &shell,
-                &mut watch,
-                vec![SelectorActivity::SettingChange {
-                    owner: owner.clone(),
-                    target: ConfigTarget::Project,
-                    id: "thinking".into(),
-                    value: choice.into(),
-                }],
-            )
-            .await;
-            assert_eq!(list.borrow().value_of("thinking"), before);
-            assert_eq!(
-                branch_settings(&shell).unwrap().thinking.as_deref(),
-                Some(choice)
-            );
-            let page = top_overlay_rows(&shell).join("\n");
-            assert!(!page.contains("Reopen this window"), "{page}");
+        let live = host.local_handles(world.session()).await.unwrap();
+        let (main_before, oracle_before) = {
+            let run = live.run_config.lock().unwrap();
+            (run.main.settings(), run.oracle.settings())
+        };
+        let defaults_before = Config::load().0;
+        for key in ["thinking", "oracle_thinking"] {
+            let before = list.borrow().value_of(key);
+            for choice in ["minimal", "max"] {
+                list.borrow().set_value(key, choice);
+                apply_selector_activity(
+                    &mut world,
+                    &shell,
+                    &mut watch,
+                    vec![SelectorActivity::SettingChange {
+                        owner: owner.clone(),
+                        target: ConfigTarget::Project,
+                        id: key.into(),
+                        value: choice.into(),
+                    }],
+                )
+                .await;
+                assert_eq!(list.borrow().value_of(key), before);
+                let draft = branch_settings(&shell).unwrap();
+                let staged = if key == "thinking" {
+                    draft.thinking
+                } else {
+                    draft.oracle_thinking
+                };
+                assert_eq!(staged.as_deref(), Some(choice));
+                let page = top_overlay_rows(&shell).join("\n");
+                assert!(!page.contains("Reopen this window"), "{page}");
+                let run = live.run_config.lock().unwrap();
+                assert_eq!(run.main.settings(), main_before);
+                assert_eq!(run.oracle.settings(), oracle_before);
+            }
         }
-        assert_eq!(
-            Config::load().0.thinking.map(|value| value.to_string()),
-            Some(level.to_string())
-        );
+        let defaults = Config::load().0;
+        assert_eq!(defaults.thinking, defaults_before.thinking);
+        assert_eq!(defaults.oracle_thinking, defaults_before.oracle_thinking);
         *shell.borrow().view().branch_anchor.borrow_mut() = None;
         shell.borrow().overlays.borrow_mut().close_all();
     }
@@ -1580,6 +1625,7 @@ async fn settings_parity_client_edits_do_not_wait_for_host_rows() {
     let before = world.config.lock().unwrap().show_token_usage;
     let mut defaults = world.control.config(world.session()).await.unwrap();
     defaults.user.insert("auto_compact".into(), "false".into());
+    defaults.user.insert("oracle_thinking".into(), "low".into());
     let release = Arc::new(tokio::sync::Notify::new());
     let router = axum::Router::new().route(
         "/v1/sessions/{id}/config",
@@ -1616,6 +1662,17 @@ async fn settings_parity_client_edits_do_not_wait_for_host_rows() {
             })
             .await
             .is_some()
+        );
+        assert!(
+            observed
+                .borrow()
+                .settings_ui
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .value_of("oracle_thinking")
+                .is_none(),
+            "Oracle choices must come from the host, not the client defaults"
         );
         writer.write_all(b"show_token_usage\r").unwrap();
         let edited = poll_for(|| (Config::load().0.show_token_usage != before).then_some(())).await;
@@ -1659,6 +1716,26 @@ async fn settings_parity_client_edits_do_not_wait_for_host_rows() {
             poll_for(|| top_overlay_rows(&observed)
                 .join("\n")
                 .contains("auto_compact *")
+                .then_some(()))
+            .await
+            .is_some()
+        );
+        assert_eq!(
+            observed
+                .borrow()
+                .settings_ui
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .value_of("oracle_thinking")
+                .as_deref(),
+            Some("low")
+        );
+        writer.write_all(b"\x15oracle_thinking").unwrap();
+        assert!(
+            poll_for(|| top_overlay_rows(&observed)
+                .join("\n")
+                .contains("oracle_thinking *")
                 .then_some(()))
             .await
             .is_some()
@@ -1737,7 +1814,7 @@ async fn settings_parity_rejected_values_can_be_corrected_without_reopening() {
                 speed_before
             );
             assert_eq!(
-                aj_models::speed_name(run_config.lock().unwrap().speed),
+                aj_models::speed_name(run_config.lock().unwrap().main.speed),
                 "standard"
             );
             writer.write_all(b"\x15compact_threshold\r").unwrap();

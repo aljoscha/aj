@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 const DESCRIPTION: &str = r#"
 Give a sub-agent a bounded research, analysis, or implementation task and receive
 its final report. It inherits your model, system instructions, and tools except
-this agent tool, but not your conversation history. It shares your working
+agent and oracle, but not your conversation history. It shares your working
 directory and can edit files and run commands. The user can steer it from its
 view, but this tool does not provide a way for you to message it mid-task.
 
@@ -128,50 +128,45 @@ impl ToolDefinition for AgentTool {
         } else {
             SpawnMode::Blocking
         };
-        match ctx.spawn_agent(task.clone(), mode).await? {
-            // Wire content goes back to the parent model verbatim —
-            // it's the text the sub-agent produced and what the parent
-            // expects to read as the tool result. The `details`
-            // payload is the structured triple the renderer /
-            // persistence listener uses to group nested transcripts
-            // under this tool call.
-            SpawnResult::Completed(spawned) => {
-                // A truncated report is partial (the sub hit the token cap):
-                // deliver the text so the parent can still use it, but flag
-                // the result and annotate the wire content so the model
-                // doesn't take a cut-off answer as final. Any non-`Completed`
-                // conclusion is flagged; `Failed` cannot reach this arm (it
-                // arrives as an `Err` from `spawn_agent`), but flagging it
-                // keeps the invariant safe if that ever changes.
-                let content = aj_agent::delivered_report(spawned.conclusion, &spawned.report);
-                Ok(ToolOutcome {
-                    content: vec![UserContent::text(content)],
-                    details: ToolDetails::SubAgentReport {
-                        agent_id: spawned.agent_id,
-                        task,
-                        report: spawned.report,
-                    },
-                    is_error: spawned.conclusion != SubAgentConclusion::Completed,
-                })
+        let result = ctx.spawn_agent(task.clone(), mode).await?;
+        Ok(spawn_outcome(task, result))
+    }
+}
+
+/// Deliver configured and ordinary children through the same report contract.
+pub(super) fn spawn_outcome(task: String, result: SpawnResult) -> ToolOutcome {
+    match result {
+        SpawnResult::Completed(spawned) => {
+            // Preserve partial reports, but label them so the parent does not
+            // mistake cancellation or truncation for a completed assignment.
+            let content = aj_agent::delivered_report(spawned.conclusion, &spawned.report);
+            ToolOutcome {
+                content: vec![UserContent::text(content)],
+                details: ToolDetails::SubAgentReport {
+                    agent_id: spawned.agent_id,
+                    task,
+                    report: spawned.report,
+                },
+                is_error: spawned.conclusion != SubAgentConclusion::Completed,
             }
-            // A background spawn needs no rich details variant: the
-            // `SubAgentStart` event already created the transcript
-            // box, and the report reaches the transcript through the
-            // completion notice.
-            SpawnResult::Started { agent_id, task_id } => {
-                let summary = format!("agent {agent_id} started in background (task #{task_id})");
-                let wire = format!(
-                    "{summary}. You will be notified when it completes and \
-                     delivers its report."
-                );
-                Ok(ToolOutcome {
-                    content: vec![UserContent::text(wire)],
-                    details: ToolDetails::Text {
-                        summary,
-                        body: String::new(),
-                    },
-                    is_error: false,
-                })
+        }
+        // A background spawn needs no rich details variant: the
+        // `SubAgentStart` event already created the transcript
+        // box, and the report reaches the transcript through the
+        // completion notice.
+        SpawnResult::Started { agent_id, task_id } => {
+            let summary = format!("agent {agent_id} started in background (task #{task_id})");
+            let wire = format!(
+                "{summary}. You will be notified when it completes and \
+             delivers its report."
+            );
+            ToolOutcome {
+                content: vec![UserContent::text(wire)],
+                details: ToolDetails::Text {
+                    summary,
+                    body: String::new(),
+                },
+                is_error: false,
             }
         }
     }

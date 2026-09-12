@@ -32,6 +32,18 @@ impl BranchDraft {
         })
         .change;
         let settings = &mut self.changes.settings;
+        if change.oracle_model.is_some() {
+            settings.oracle_model = change.oracle_model;
+        }
+        if change.oracle_thinking.is_some() {
+            settings.oracle_thinking = change.oracle_thinking;
+        }
+        if change.oracle_speed.is_some() {
+            settings.oracle_speed = change.oracle_speed;
+        }
+        if change.oracle_verbosity.is_some() {
+            settings.oracle_verbosity = change.oracle_verbosity;
+        }
         if change.model.is_some() {
             settings.model = change.model;
         }
@@ -51,6 +63,21 @@ impl BranchDraft {
     pub(crate) fn settings(&self) -> BranchSettings {
         let mut state = self.inherited.clone().unwrap_or_default();
         let changes = &self.changes.settings;
+        if let Some(model) = &changes.oracle_model {
+            state.oracle_model = Some(aj_wire::RecordedModel {
+                api: model.api.clone(),
+                name: model.name.clone(),
+            });
+        }
+        if changes.oracle_thinking.is_some() {
+            state.oracle_thinking.clone_from(&changes.oracle_thinking);
+        }
+        if changes.oracle_speed.is_some() {
+            state.oracle_speed.clone_from(&changes.oracle_speed);
+        }
+        if changes.oracle_verbosity.is_some() {
+            state.oracle_verbosity.clone_from(&changes.oracle_verbosity);
+        }
         if let Some(model) = &changes.model {
             state.model = Some(aj_wire::RecordedModel {
                 api: model.api.clone(),

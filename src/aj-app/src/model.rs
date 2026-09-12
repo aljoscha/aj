@@ -237,11 +237,23 @@ pub fn resolve(
 ) -> Result<ResolvedModel> {
     let mut model_info = pick_model(registry, selection.provider_id(), selection.name.as_deref())?;
     if let Some(url) = &selection.url {
+        validate_model_url(url)?;
         // A custom URL trumps the catalog default, but everything else
         // (capability flags, pricing) stays sourced from the registry.
         model_info.base_url = url.clone();
     }
     from_model_info(auth, model_info, speed)
+}
+
+/// Reject endpoint overrides that cannot address an HTTP provider.
+pub(crate) fn validate_model_url(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).map_err(|err| anyhow!("invalid model url {url:?}: {err}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return Err(anyhow!(
+            "model url {url:?} must be an absolute http or https URL"
+        ));
+    }
+    Ok(())
 }
 
 /// Build a [`ResolvedModel`] from a pre-picked [`ModelInfo`] — used by
@@ -320,6 +332,28 @@ pub fn missing_key_message(provider_id: &str) -> String {
     }
 }
 
+/// Report known credential problems from the inference credential store.
+/// Pass false for runs that do not use credentials, such as scripted fixtures.
+pub(crate) async fn credential_warning(
+    auth: &AuthStorage,
+    provider: &str,
+    credentials_required: bool,
+) -> Option<String> {
+    if !credentials_required {
+        return None;
+    }
+    match auth.try_has_auth(provider).await {
+        Ok(Some(true)) | Ok(None) => None,
+        Ok(Some(false)) => Some(format!(
+            "Heads up: {}",
+            crate::model::missing_key_message(provider)
+        )),
+        Err(err) => Some(format!(
+            "Couldn't check credentials for {provider:?}: {err}"
+        )),
+    }
+}
+
 /// Pick a [`ModelInfo`] for the given `(provider, model)` pair.
 ///
 /// Errors with a structured message if the provider is unknown or
@@ -336,7 +370,7 @@ fn pick_model(
             .get(provider_id, id)
             .cloned()
             .ok_or_else(|| anyhow!("model {provider_id}/{id} not found in registry")),
-        None => default_model_for(registry, provider_id)
+        None => default_model_for(registry.models(provider_id), provider_id)
             .cloned()
             .ok_or_else(|| anyhow!("no models listed for provider {provider_id:?}")),
     }
@@ -349,15 +383,25 @@ fn pick_model(
 /// that id is present in the catalog, otherwise falls back to the first
 /// listed model. The registry preserves catalog insertion order, so the
 /// fallback is deterministic given a fixed catalog.
-fn default_model_for<'a>(registry: &'a ModelRegistry, provider_id: &str) -> Option<&'a ModelInfo> {
-    // Honor the preferred-default policy only when the model still
-    // exists in the catalog; a refresh that drops it must not break
-    // startup.
+pub fn default_model_for<'a>(
+    models: impl IntoIterator<Item = &'a ModelInfo>,
+    provider_id: &str,
+) -> Option<&'a ModelInfo> {
     let preferred = PREFERRED_DEFAULT_MODELS
         .iter()
         .find(|(provider, _)| *provider == provider_id)
-        .and_then(|(_, id)| registry.get(provider_id, id));
-    preferred.or_else(|| registry.models(provider_id).into_iter().next())
+        .map(|(_, id)| *id);
+    let mut first = None;
+    for model in models {
+        if model.provider != provider_id {
+            continue;
+        }
+        first.get_or_insert(model);
+        if preferred == Some(model.id.as_str()) {
+            return Some(model);
+        }
+    }
+    first
 }
 
 /// Fan the configured [`ConfigThinkingDisplay`] (if any) out onto

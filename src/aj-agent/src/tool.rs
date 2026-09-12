@@ -14,7 +14,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aj_models::types::UserContent;
+use aj_models::ThinkingConfig;
+use aj_models::provider::Provider;
+use aj_models::registry::ModelInfo;
+use aj_models::types::{Speed, StreamOptions, UserContent};
 use schemars::JsonSchema;
 use schemars::generate::SchemaSettings;
 use serde::de::{DeserializeOwned, Error as _};
@@ -1154,7 +1157,7 @@ pub trait ToolDefinition: Send + Sync {
 ///
 /// Held behind an `Arc` so [`ErasedToolDefinition`] is cheaply
 /// cloneable: the agent clones the parent's tool list for each
-/// sub-agent it spawns (filtered to drop the `agent` tool itself),
+/// ordinary sub-agent it spawns (without delegation tools),
 /// and bumping a refcount per tool keeps that path allocation-free.
 pub type ErasedToolFn = Arc<
     dyn for<'a> Fn(
@@ -1210,6 +1213,21 @@ where
 // Tool context
 // ---------------------------------------------------------------------------
 
+/// Explicit execution bundle for a child agent. Resolution and tool policy
+/// belong to the caller; the runtime supplies the shared session lifecycle.
+#[derive(Clone)]
+pub struct SpawnAgentConfig {
+    pub provider: Arc<dyn Provider>,
+    pub model_info: Arc<ModelInfo>,
+    pub stream_options: StreamOptions,
+    pub thinking: Option<ThinkingConfig>,
+    pub speed: Option<Speed>,
+    pub thinking_display: String,
+    pub tools: Vec<ErasedToolDefinition>,
+    /// Appended verbatim to the parent's assembled system prompt.
+    pub system_prompt_suffix: String,
+}
+
 /// Runtime context passed to [`ToolDefinition::execute`].
 ///
 /// Provides access to agent-scoped state (working directory, todo
@@ -1246,6 +1264,17 @@ pub trait ToolContext: Send {
         task: String,
         mode: SpawnMode,
     ) -> Pin<Box<dyn Future<Output = Result<SpawnResult, BoxError>> + Send + 'a>>;
+
+    /// Spawn with an explicit execution bundle and the same lifecycle as
+    /// [`Self::spawn_agent`]. Contexts without this capability reject it.
+    fn spawn_configured_agent<'a>(
+        &'a mut self,
+        _task: String,
+        _mode: SpawnMode,
+        _config: SpawnAgentConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<SpawnResult, BoxError>> + Send + 'a>> {
+        Box::pin(async { Err("configured child execution is unsupported".into()) })
+    }
 
     /// Emit a partial [`ToolDetails`] snapshot through the bus as a
     /// [`crate::events::AgentEvent::ToolExecutionUpdate`]. Tools that

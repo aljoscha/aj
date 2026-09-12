@@ -414,6 +414,14 @@ pub enum ConversationEntryKind {
     /// The active model changed (or was first recorded). `provider`
     /// and `model_id` key into the model catalog.
     ModelChange { provider: String, model_id: String },
+    /// Oracle model choice on the user branch, keyed into the model catalog.
+    OracleModelChange { provider: String, model_id: String },
+    /// Oracle thinking effort, with the same values as [`Self::ThinkingChange`].
+    OracleThinkingChange { level: String },
+    /// Oracle speed, with the same values as [`Self::SpeedChange`].
+    OracleSpeedChange { speed: String },
+    /// Oracle output verbosity, with the same values as [`Self::VerbosityChange`].
+    OracleVerbosityChange { verbosity: String },
     /// A session-wide account choice on the user branch. `None` removes the
     /// provider's pin, `Some("")` pins its unnamed account, and any other label
     /// pins that exact account. Sub-agent snapshots do not store account choices.
@@ -460,6 +468,9 @@ pub enum ConversationEntryKind {
     /// replay can synthesize the spawn event without look-ahead.
     SubAgentSpawn {
         task: String,
+        /// Originating tool name for display identity. Empty is unspecified.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tool_name: String,
         /// Whether the sub was spawned to run in the background, concurrent
         /// with the parent's turn, rather than blocking it. `#[serde(default)]`
         /// so logs written before mode tracking still deserialize (missing ->
@@ -529,6 +540,10 @@ impl ConversationEntryKind {
             Self::Message { .. } | Self::Compaction { .. } => true,
             Self::SystemPrompt { .. }
             | Self::ModelChange { .. }
+            | Self::OracleModelChange { .. }
+            | Self::OracleThinkingChange { .. }
+            | Self::OracleSpeedChange { .. }
+            | Self::OracleVerbosityChange { .. }
             | Self::AccountChange { .. }
             | Self::ThinkingChange { .. }
             | Self::SpeedChange { .. }
@@ -655,6 +670,14 @@ pub struct SessionSettings {
     /// assistant messages, and sub-agent spawn snapshots each replace it
     /// in path order.
     pub model: Option<(String, String)>,
+    /// Last recorded Oracle (provider, model_id). Absence means nothing recorded.
+    pub oracle_model: Option<(String, String)>,
+    /// Last recorded Oracle effort. Absence is distinct from explicit "off".
+    pub oracle_thinking: Option<String>,
+    /// Last recorded Oracle speed. Absence means nothing recorded.
+    pub oracle_speed: Option<String>,
+    /// Last recorded Oracle verbosity. "default" pins the server default.
+    pub oracle_verbosity: Option<String>,
     /// Session-wide provider account pins folded on the user path. An absent
     /// provider uses its default, an empty label pins its unnamed account, and
     /// other labels are exact pins. Logs without account entries yield no pins.
@@ -676,12 +699,35 @@ pub struct SessionSettings {
 }
 
 impl SessionSettings {
+    /// Project only recorded Oracle choices onto the ordinary settings axes.
+    pub fn oracle(&self) -> Self {
+        Self {
+            model: self.oracle_model.clone(),
+            thinking: self.oracle_thinking.clone(),
+            speed: self.oracle_speed.clone(),
+            verbosity: self.oracle_verbosity.clone(),
+            ..Default::default()
+        }
+    }
+
     /// Fold one recorded entry in path order, without resolving runtime defaults.
     /// The caller selects the thread and ancestry before applying entries.
     pub(crate) fn apply(&mut self, entry: &ConversationEntryKind) {
         match entry {
             ConversationEntryKind::ModelChange { provider, model_id } => {
                 self.model = Some((provider.clone(), model_id.clone()));
+            }
+            ConversationEntryKind::OracleModelChange { provider, model_id } => {
+                self.oracle_model = Some((provider.clone(), model_id.clone()));
+            }
+            ConversationEntryKind::OracleThinkingChange { level } => {
+                self.oracle_thinking = Some(level.clone());
+            }
+            ConversationEntryKind::OracleSpeedChange { speed } => {
+                self.oracle_speed = Some(speed.clone());
+            }
+            ConversationEntryKind::OracleVerbosityChange { verbosity } => {
+                self.oracle_verbosity = Some(verbosity.clone());
             }
             ConversationEntryKind::AccountChange { provider, account } => match account {
                 Some(label) => {
@@ -2040,6 +2086,61 @@ impl ConversationLog {
         )
     }
 
+    /// Record an Oracle model choice on the active user branch.
+    /// See [`Self::append_state_entry`] for anchoring and durability.
+    pub fn append_oracle_model_change(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<EntryRef, ConversationError> {
+        self.append_state_entry(
+            ThreadFilter::USER,
+            ConversationEntryKind::OracleModelChange {
+                provider: provider.to_string(),
+                model_id: model_id.to_string(),
+            },
+        )
+    }
+
+    /// Record Oracle effort on the active user branch. See [`Self::append_state_entry`].
+    pub fn append_oracle_thinking_change(
+        &mut self,
+        level: &str,
+    ) -> Result<EntryRef, ConversationError> {
+        self.append_state_entry(
+            ThreadFilter::USER,
+            ConversationEntryKind::OracleThinkingChange {
+                level: level.to_string(),
+            },
+        )
+    }
+
+    /// Record Oracle speed on the active user branch. See [`Self::append_state_entry`].
+    pub fn append_oracle_speed_change(
+        &mut self,
+        speed: &str,
+    ) -> Result<EntryRef, ConversationError> {
+        self.append_state_entry(
+            ThreadFilter::USER,
+            ConversationEntryKind::OracleSpeedChange {
+                speed: speed.to_string(),
+            },
+        )
+    }
+
+    /// Record Oracle verbosity on the active user branch. See [`Self::append_state_entry`].
+    pub fn append_oracle_verbosity_change(
+        &mut self,
+        verbosity: &str,
+    ) -> Result<EntryRef, ConversationError> {
+        self.append_state_entry(
+            ThreadFilter::USER,
+            ConversationEntryKind::OracleVerbosityChange {
+                verbosity: verbosity.to_string(),
+            },
+        )
+    }
+
     /// Record a session-wide account choice on the active user branch.
     ///
     /// `None` removes the provider's pin (Provider default), `Some("")` pins the
@@ -2177,6 +2278,7 @@ impl ConversationLog {
         agent_id: usize,
         parent_head: EntryId,
         task: &str,
+        tool_name: &str,
         background: bool,
         settings: &AgentSettings,
     ) -> Result<EntryRef, ConversationError> {
@@ -2191,6 +2293,7 @@ impl ConversationLog {
             Some(agent_id),
             ConversationEntryKind::SubAgentSpawn {
                 task: task.to_string(),
+                tool_name: tool_name.to_string(),
                 background,
                 settings,
             },
@@ -5168,7 +5271,7 @@ mod tests {
                 let mut view = ConversationView::user(&mut log);
                 view.add_message(user_text("hi")).expect("u").id
             };
-            log.append_subagent_spawn(1, user_id, "subtask", true, &spawn_settings())
+            log.append_subagent_spawn(1, user_id, "subtask", "agent", true, &spawn_settings())
                 .expect("spawn entry");
             {
                 let sub_head = log
@@ -5190,6 +5293,7 @@ mod tests {
                 task,
                 background,
                 settings,
+                ..
             } => {
                 assert_eq!(task, "subtask");
                 assert!(*background, "background mode round-trips through resume");
@@ -5200,14 +5304,12 @@ mod tests {
     }
 
     #[test]
-    fn subagent_spawn_without_background_defaults_to_foreground() {
-        // A log written before mode tracking has no `background` key on the
-        // spawn line. Resume deserializes whole `ConversationEntry` lines, and
+    fn subagent_spawn_without_metadata_defaults_to_ordinary_foreground() {
+        // Resume deserializes whole `ConversationEntry` lines, and
         // the spawn kind is `#[serde(flatten)]`-ed into that wrapper over an
         // internally-tagged enum. That flatten + tag + `#[serde(default)]`
         // combination is the real read path (and a known serde trap), so we
-        // exercise it through the wrapper rather than the kind in isolation: a
-        // missing `background` must yield foreground, not an error.
+        // exercise it through the wrapper rather than the kind in isolation.
         let record = ConversationEntry {
             id: "0000abcd".to_string(),
             parent_id: Some("00000001".to_string()),
@@ -5216,6 +5318,7 @@ mod tests {
             agent_id: Some(1),
             entry: ConversationEntryKind::SubAgentSpawn {
                 task: "t".to_string(),
+                tool_name: "oracle".into(),
                 background: true,
                 settings: spawn_settings(),
             },
@@ -5228,11 +5331,20 @@ mod tests {
                 .is_some(),
             "background sits at the flattened top level before removal"
         );
+        assert_eq!(
+            json.as_object_mut().unwrap().remove("tool_name"),
+            Some(serde_json::json!("oracle"))
+        );
         let restored: ConversationEntry =
             serde_json::from_value(json).expect("legacy line deserializes");
         match restored.entry {
-            ConversationEntryKind::SubAgentSpawn { background, .. } => {
+            ConversationEntryKind::SubAgentSpawn {
+                background,
+                tool_name,
+                ..
+            } => {
                 assert!(!background, "missing background must default to foreground");
+                assert!(tool_name.is_empty(), "missing origin is unspecified");
             }
             other => panic!("expected SubAgentSpawn, got {other:?}"),
         }
@@ -5244,6 +5356,7 @@ mod tests {
         // must not materialize the log file on their own.
         let spawn = ConversationEntryKind::SubAgentSpawn {
             task: "t".to_string(),
+            tool_name: "agent".into(),
             background: false,
             settings: spawn_settings(),
         };
@@ -5262,7 +5375,7 @@ mod tests {
             let mut view = ConversationView::user(&mut log);
             view.add_message(user_text("hi")).expect("u").id
         };
-        log.append_subagent_spawn(1, user_id, "subtask", false, &spawn_settings())
+        log.append_subagent_spawn(1, user_id, "subtask", "agent", false, &spawn_settings())
             .expect("spawn entry");
 
         let sub_head = log
@@ -5644,7 +5757,14 @@ mod tests {
         };
         refs.push(assistant.clone());
         let spawn = log
-            .append_subagent_spawn(1, assistant.id.clone(), "task", false, &spawn_settings())
+            .append_subagent_spawn(
+                1,
+                assistant.id.clone(),
+                "task",
+                "agent",
+                false,
+                &spawn_settings(),
+            )
             .expect("spawn root");
         refs.push(spawn.clone());
         refs.push(
@@ -5724,8 +5844,15 @@ mod tests {
             view.add_message(assistant_text("ho"))
                 .expect("assistant message")
         };
-        log.append_subagent_spawn(1, assistant.id.clone(), "task", false, &spawn_settings())
-            .expect("spawn root");
+        log.append_subagent_spawn(
+            1,
+            assistant.id.clone(),
+            "task",
+            "agent",
+            false,
+            &spawn_settings(),
+        )
+        .expect("spawn root");
 
         let snapshot = log.snapshot();
         let ids = |conv: &Conversation| -> Vec<EntryId> {
@@ -5917,7 +6044,7 @@ mod tests {
 
         // A sub-agent spawn and its messages must not touch the head.
         let spawn = log
-            .append_subagent_spawn(1, a1.clone(), "task", false, &spawn_settings())
+            .append_subagent_spawn(1, a1.clone(), "task", "agent", false, &spawn_settings())
             .expect("spawn")
             .id;
         assert_eq!(log.head(), Some(&a1), "sub-agent spawn leaves the head");
@@ -5984,7 +6111,14 @@ mod tests {
             view.add_message(user_text("hi")).expect("u").id
         };
         let spawn = log
-            .append_subagent_spawn(1, user_id.clone(), "task", false, &spawn_settings())
+            .append_subagent_spawn(
+                1,
+                user_id.clone(),
+                "task",
+                "agent",
+                false,
+                &spawn_settings(),
+            )
             .expect("spawn")
             .id;
         let sub_msg = {

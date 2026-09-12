@@ -165,16 +165,17 @@ pub fn reduce(
 
         // ---- Tool execution -------------------------------------------------
         //
-        // The parent's `agent` tool call is represented by the
+        // The parent's delegation tool call is represented by the
         // sub-agent box, not a tool cell, so its events are skipped to
-        // avoid duplicating the report.
+        // avoid duplicating the report. Oracle failures before spawning have
+        // no child box and are rendered from the tool's error result.
         AgentEvent::ToolExecutionStart {
             agent_id,
             call_id,
             tool,
             args,
         } => {
-            if tool == "agent" {
+            if tool == "agent" || tool == "oracle" {
                 return Redraw(false);
             }
             // A sub-agent's tool start is its latest live activity. Main's
@@ -208,7 +209,7 @@ pub fn reduce(
             content,
             ..
         } => {
-            if tool == "agent" {
+            if tool == "agent" || tool == "oracle" {
                 return Redraw(false);
             }
             let Some(id) = indexed_tool(state, agent_id, &call_id) else {
@@ -242,7 +243,10 @@ pub fn reduce(
             content,
             is_error,
         } => {
-            if tool == "agent" {
+            if tool == "agent"
+                || (tool == "oracle"
+                    && (!is_error || matches!(result, ToolDetails::SubAgentReport { .. })))
+            {
                 return Redraw(false);
             }
             // If we never saw `ToolExecutionStart` (replay path), build
@@ -443,6 +447,7 @@ pub fn reduce(
             parent,
             child,
             task,
+            tool_name,
             background,
             settings,
         } => {
@@ -460,6 +465,7 @@ pub fn reduce(
                             .append(EntryKind::SubAgent(SubAgentEntry {
                                 child: n,
                                 task,
+                                tool_name,
                                 status: SubAgentStatus::Running,
                                 report: None,
                                 started_at: Instant::now(),
@@ -1412,6 +1418,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(n),
             task: format!("task {n}"),
+            tool_name: "agent".into(),
             background: false,
             settings: sub_settings(provider, model_id),
         }
@@ -2038,6 +2045,78 @@ mod tests {
                 assert_eq!(b.report.as_deref(), Some("done"));
             }
             other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oracle_results_use_child_boxes_but_errors_stay_visible() {
+        for result in [
+            ToolDetails::SubAgentReport {
+                agent_id: 1,
+                task: "review".into(),
+                report: "evidence".into(),
+            },
+            ToolDetails::Text {
+                summary: "agent 1 started in background (task #1)".into(),
+                body: String::new(),
+            },
+        ] {
+            let mut s = state();
+            let mut life = AgentLifecycle::default();
+            apply(
+                &mut s,
+                &mut life,
+                tool_start(AgentId::Main, "consult", "oracle"),
+            );
+            apply(&mut s, &mut life, sub_agent_start(1, "advisor", "model"));
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::SubAgentEnd {
+                    parent: AgentId::Main,
+                    child: AgentId::Sub(1),
+                    report: "evidence".into(),
+                    conclusion: SubAgentConclusion::Completed,
+                },
+            );
+            apply(
+                &mut s,
+                &mut life,
+                tool_end(AgentId::Main, "consult", "oracle", result),
+            );
+            assert_eq!(entries(&s, AgentId::Main).len(), 1);
+            assert!(matches!(
+                entries(&s, AgentId::Main)[0].kind,
+                EntryKind::SubAgent(_)
+            ));
+
+            apply(
+                &mut s,
+                &mut life,
+                tool_start(AgentId::Main, "invalid", "oracle"),
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::ToolExecutionEnd {
+                    agent_id: AgentId::Main,
+                    call_id: "invalid".into(),
+                    tool: "oracle".into(),
+                    result: ToolDetails::Text {
+                        summary: "Oracle configuration".into(),
+                        body: "unknown model".into(),
+                    },
+                    content: vec![UserContent::text("unknown model")].into(),
+                    is_error: true,
+                },
+            );
+            let rows = entries(&s, AgentId::Main);
+            assert_eq!(rows.len(), 2);
+            let EntryKind::Tool(error) = &rows[1].kind else {
+                panic!("visible configuration error")
+            };
+            assert_eq!(error.status, ToolStatus::Done { is_error: true });
+            assert_eq!(joined_user_text(&error.content), "unknown model");
         }
     }
 
@@ -2684,6 +2763,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(2),
                 task: "task 2".into(),
+                tool_name: "agent".into(),
                 background: true,
                 settings: sub_settings("scripted", "scripted"),
             },
