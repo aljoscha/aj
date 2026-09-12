@@ -529,6 +529,7 @@ fn harness_config(dir: &TempDir) -> Config {
 /// change touched neither.
 #[derive(Clone)]
 pub(crate) struct HostHandles {
+    pub(crate) auth: AuthStorage,
     pub(crate) config: Arc<StdMutex<Config>>,
     pub(crate) layers: Arc<StdMutex<ConfigLayers>>,
 }
@@ -536,6 +537,7 @@ pub(crate) struct HostHandles {
 impl HostHandles {
     pub(crate) fn new(dir: &TempDir) -> Self {
         Self {
+            auth: AuthStorage::new(dir.path().join("auth.json")),
             config: Arc::new(StdMutex::new(harness_config(dir))),
             layers: Arc::new(StdMutex::new(ConfigLayers {
                 user: Config::default(),
@@ -585,7 +587,7 @@ pub(crate) fn host_setup(
         defaults: aj_app::session_setup::RunConfigDefaults::fixed(run_config),
         restore: None,
         persistence: ConversationPersistence::new(dir.path().join("sessions")),
-        auth: AuthStorage::new(dir.path().join("auth.json")),
+        auth: handles.auth,
         working_directory: dir.path().to_path_buf(),
         name: name.map(str::to_string),
         idle_grace: None,

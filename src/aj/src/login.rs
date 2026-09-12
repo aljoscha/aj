@@ -1,33 +1,18 @@
 //! The OAuth login flow: provider/account action pickers, the login dialog
 //! overlay, and the [`OAuthCallbacks`] driver that streams updates into it.
 //!
-//! Unlike the other overlays (synchronous "confirm parks an outcome, the
-//! host polls it" selectors), an OAuth login is async and long-running:
-//! the flow binds a localhost callback server, opens the browser, and
-//! waits for the redirect, or for the user to paste the redirect URL back
-//! when their browser is on another machine.
+//! The OAuth flow runs in this process, where the browser is, and its result
+//! is stored on the session's host through Control. Credential reads and the
+//! other mutations go through Control too.
 //!
-//! The split mirrors the credential engine's headless-provider pattern:
+//! [`DialogCallbacks`] relays progress into shared [`LoginDialogState`] and
+//! parks a [`oneshot`] sender for each input request. [`LoginDialog`] renders
+//! that state and delivers submitted input to the pending callback. Esc/Ctrl+C
+//! request cancellation, which stops authorization at once; a store already
+//! in flight still reports its own answer.
 //!
-//! - The login flow ([`aj_models::oauth::OAuthProvider`]) runs on a
-//!   spawned tokio task and *asks* the UI for things via
-//!   [`OAuthCallbacks`].
-//! - [`DialogCallbacks`] satisfies those asks by writing into a shared
-//!   [`LoginDialogState`] and pinging a redraw. Fire-and-forget asks
-//!   (`on_auth`, `on_progress`) push display lines; input-gathering asks
-//!   (`on_prompt`, `on_manual_code_input`) install a [`oneshot`] sender
-//!   and await its receiver.
-//! - [`LoginDialog`] renders that shared state and, on Enter (via its
-//!   inner [`TextField`]'s submit), delivers the typed value to whichever
-//!   callback is awaiting. Esc/Ctrl+C flip a shared cancel flag the drive
-//!   loop polls to tear the dialog down and abort the task.
-//!
-//! The redraw wake crosses threads: the login task runs on tokio, off the
-//! `!Send` drive-loop thread, so it can't call `AsyncApp::request_redraw`
-//! directly. Instead the callbacks send `()` on an [`UnboundedSender`] the
-//! drive loop selects on, turning each ping into a repaint. No lock is
-//! ever held across an `.await`, so the plain [`std::sync::Mutex`] shared
-//! between the UI thread and the login task is safe.
+//! The callbacks run on a Send task and wake the UI with an [`UnboundedSender`].
+//! Widgets stay on the UI thread. No shared-state lock is held across an await.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -35,6 +20,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+pub(crate) use aj_app::auth::LoginTarget;
 use aj_app::auth::{LoginLine, auth_lines, browser_available, copy_to_clipboard, open_browser};
 use aj_app::keybindings::{fixed_keys, format_keybinding};
 use aj_app::theme::{Theme, ThemeColor};
@@ -672,6 +658,7 @@ pub(crate) struct DialogCallbacks {
     state: Arc<StdMutex<LoginDialogState>>,
     pending_input: PendingInput,
     redraw: UnboundedSender<()>,
+    can_open_browser: bool,
 }
 
 impl DialogCallbacks {
@@ -686,6 +673,7 @@ impl DialogCallbacks {
             state,
             pending_input,
             redraw,
+            can_open_browser: browser_available(),
         }
     }
 
@@ -766,7 +754,7 @@ impl OAuthCallbacks for DialogCallbacks {
         // automatic URL is pointless: its redirect targets this machine's
         // loopback, which the remote browser can't reach. `auth_lines`
         // steers the user to the manual flow accordingly.
-        let can_open = browser_available();
+        let can_open = self.can_open_browser;
         let (lines, url) = auth_lines(can_open, &info, fixed_keys::CTRL_Y);
         {
             let mut st = self.state.lock().expect("login dialog state poisoned");
@@ -807,13 +795,11 @@ impl OAuthCallbacks for DialogCallbacks {
     }
 }
 
-/// Which explicit OAuth storage intent a login row names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LoginTarget {
-    /// Insert a new credential without replacing any exact key.
-    NewAccount,
-    /// Replace the selected existing bare credential or exact account key.
-    ExistingAccount(Option<String>),
+#[async_trait]
+impl aj_app::auth::LoginCallbacks for DialogCallbacks {
+    async fn prompt_account_label(&self, existing: &[String]) -> Result<String, OAuthError> {
+        DialogCallbacks::prompt_account_label(self, existing).await
+    }
 }
 
 /// An action over one or more labeled accounts.
@@ -838,14 +824,33 @@ pub(crate) enum AccountAction {
     },
 }
 
-/// What confirming an auth picker row asks the host to do. Parked in the
-/// shell's `auth_request` slot for the drive loop to drain after the confirming
-/// keystroke.
+/// The immutable destination of every action offered by one auth picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AuthPickerRequest {
+pub(crate) struct AuthPickerTarget {
+    pub(crate) session: String,
+    pub(crate) host: String,
+}
+
+impl AuthPickerTarget {
+    pub(crate) fn request(&self, action: AuthPickerAction) -> AuthPickerRequest {
+        AuthPickerRequest {
+            target: self.clone(),
+            action,
+        }
+    }
+}
+
+/// A confirmed action, bound to the host the picker opened on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuthPickerRequest {
+    pub(crate) target: AuthPickerTarget,
+    pub(crate) action: AuthPickerAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AuthPickerAction {
     /// Select for the captured session/provider, regardless of later UI focus.
     SelectAccount {
-        session: String,
         provider: String,
         account: Option<String>,
     },
@@ -863,7 +868,7 @@ pub(crate) enum AuthPickerRequest {
 
 /// One auth picker row with separate render, search, and action identity.
 pub(crate) struct AuthRow {
-    pub(crate) request: AuthPickerRequest,
+    pub(crate) request: AuthPickerAction,
     pub(crate) label: String,
     pub(crate) filter_key: String,
     pub(crate) summary: Option<String>,
@@ -895,7 +900,7 @@ fn picker_items(rows: &[AuthRow]) -> Vec<SelectItem> {
         .collect()
 }
 
-fn picker_requests(rows: Vec<AuthRow>) -> HashMap<String, AuthPickerRequest> {
+fn picker_requests(rows: Vec<AuthRow>) -> HashMap<String, AuthPickerAction> {
     rows.into_iter()
         .enumerate()
         .map(|(index, row)| (format!("auth-row-{index}"), row.request))
@@ -915,24 +920,33 @@ pub(crate) fn open_auth_picker(
     request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
     title: &str,
     rows: Vec<AuthRow>,
-) {
+    target: AuthPickerTarget,
+) -> AuthPickerFill {
     let select = Rc::new(RefCell::new(FilterableSelect::new(
-        picker_items(&rows),
+        if rows.is_empty() {
+            vec![SelectItem::new("Loading credentials…", "")]
+        } else {
+            picker_items(&rows)
+        },
         chrome.select.clone(),
     )));
     let focus = select.borrow().focus_target();
-    let map = picker_requests(rows);
+    let map = Rc::new(RefCell::new(picker_requests(rows)));
+    let fill = AuthPickerFill {
+        select: Rc::clone(&select),
+        requests: Rc::clone(&map),
+    };
     {
         let mut sel = select.borrow_mut();
         let request_c = Rc::clone(request_slot);
         let stack_c = Rc::clone(stack);
         let editor_c = Rc::clone(editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
-            if let Some(value) = item.value.as_deref()
-                && let Some(request) = map.get(value)
-            {
-                *request_c.borrow_mut() = Some(request.clone());
-            }
+            let requests = map.borrow();
+            let Some(request) = item.value.as_deref().and_then(|value| requests.get(value)) else {
+                return;
+            };
+            *request_c.borrow_mut() = Some(target.request(request.clone()));
             // A confirmed pick is terminal: tear the whole stack down
             // (palette and picker) so the host can continue with a login
             // dialog or direct mutation. Cancel
@@ -957,59 +971,26 @@ pub(crate) fn open_auth_picker(
         focus,
         OverlayPlacement::Small,
     );
+    fill
 }
 
-/// Open the `/login` picker over OAuth provider/account action rows.
-pub(crate) fn open_login_picker(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
-    rows: Vec<AuthRow>,
-) {
-    open_auth_picker(stack, editor, chrome, request_slot, "Log in", rows);
+/// The captured picker is filled in place, never whichever overlay is on top.
+pub(crate) struct AuthPickerFill {
+    select: Rc<RefCell<FilterableSelect>>,
+    requests: Rc<RefCell<HashMap<String, AuthPickerAction>>>,
 }
 
-/// Open the `/logout` picker over stored provider/account rows. Each confirmed
-/// row retains its exact raw removal or default-resolution action.
-pub(crate) fn open_logout_picker(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
-    rows: Vec<AuthRow>,
-) {
-    open_auth_picker(stack, editor, chrome, request_slot, "Log out", rows);
-}
-
-/// Open the store-default account picker.
-pub(crate) fn open_default_account_picker(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
-    rows: Vec<AuthRow>,
-) {
-    open_auth_picker(stack, editor, chrome, request_slot, "Default account", rows);
-}
-
-/// Open the explicit resolution picker for removing a default account that
-/// still has siblings.
-pub(crate) fn open_default_logout_picker(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    request_slot: &Rc<RefCell<Option<AuthPickerRequest>>>,
-    rows: Vec<AuthRow>,
-) {
-    open_auth_picker(
-        stack,
-        editor,
-        chrome,
-        request_slot,
-        "Choose a new default or remove all accounts",
-        rows,
-    );
+impl AuthPickerFill {
+    pub(crate) fn fill(self, rows: Vec<AuthRow>, empty: &str) {
+        let items = if rows.is_empty() {
+            // A query typed during the read must not hide its empty/error result.
+            vec![SelectItem::new(empty, self.select.borrow().query())]
+        } else {
+            picker_items(&rows)
+        };
+        *self.requests.borrow_mut() = picker_requests(rows);
+        self.select.borrow().set_items(items);
+    }
 }
 
 /// Build the login dialog over the shared handles and push it as the top
@@ -1086,6 +1067,7 @@ mod tests {
                 state: Arc::clone(state),
                 pending_input: Arc::clone(pending),
                 redraw: tx,
+                can_open_browser: false,
             },
             rx,
         )
@@ -1133,9 +1115,6 @@ mod tests {
         assert_eq!(st.url.as_deref(), Some(expected_url));
     }
 
-    /// The dialog auto-copies the URL the first time it appears (on the
-    /// UI thread in draw), sets the notice once, and stays idempotent on
-    /// later frames.
     #[test]
     fn draw_auto_copies_the_url_once() {
         let (mut dialog, state, _pending, _cancel) = make();
@@ -1714,20 +1693,20 @@ mod tests {
     fn sample_rows() -> Vec<AuthRow> {
         vec![
             AuthRow {
-                request: AuthPickerRequest::Login {
+                request: AuthPickerAction::Login {
                     provider_id: "anthropic".to_string(),
                     provider_name: "Anthropic (Claude Pro/Max)".to_string(),
-                    target: LoginTarget::NewAccount,
+                    target: LoginTarget::new_account(None),
                 },
                 label: "Anthropic (Claude Pro/Max)".to_string(),
                 filter_key: "anthropic Anthropic (Claude Pro/Max)".to_string(),
                 summary: Some("subscription".to_string()),
             },
             AuthRow {
-                request: AuthPickerRequest::Login {
+                request: AuthPickerAction::Login {
                     provider_id: "openai".to_string(),
                     provider_name: "OpenAI".to_string(),
-                    target: LoginTarget::NewAccount,
+                    target: LoginTarget::new_account(None),
                 },
                 label: "OpenAI".to_string(),
                 filter_key: "openai OpenAI".to_string(),
@@ -1757,7 +1736,7 @@ mod tests {
         let map = picker_requests(sample_rows());
         assert!(matches!(
             map.get(items[0].value.as_deref().expect("opaque value")),
-            Some(AuthPickerRequest::Login { provider_id, provider_name, .. })
+            Some(AuthPickerAction::Login { provider_id, provider_name, .. })
                 if provider_id == "anthropic" && provider_name.contains("Anthropic")
         ));
         assert!(!map.contains_key("nope"));
@@ -1771,12 +1750,34 @@ mod tests {
 
         let stack = Rc::new(RefCell::new(OverlayStack::default()));
         let request = Rc::new(RefCell::new(None));
-        open_login_picker(&stack, &editor, &chrome, &request, sample_rows());
+        open_auth_picker(
+            &stack,
+            &editor,
+            &chrome,
+            &request,
+            "Log in",
+            sample_rows(),
+            AuthPickerTarget {
+                session: "session".into(),
+                host: "host".into(),
+            },
+        );
         assert!(stack.borrow().is_open(), "login picker pushed");
 
         let stack = Rc::new(RefCell::new(OverlayStack::default()));
         let request = Rc::new(RefCell::new(None));
-        open_logout_picker(&stack, &editor, &chrome, &request, sample_rows());
+        open_auth_picker(
+            &stack,
+            &editor,
+            &chrome,
+            &request,
+            "Log out",
+            sample_rows(),
+            AuthPickerTarget {
+                session: "session".into(),
+                host: "host".into(),
+            },
+        );
         assert!(stack.borrow().is_open(), "logout picker pushed");
     }
 }

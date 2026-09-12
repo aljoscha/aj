@@ -111,7 +111,7 @@ impl RemoteServer {
 
     /// [`Self::bind`] with the heartbeat interval named, so a test can watch
     /// an idle stream without a thirty-second wait.
-    pub(super) async fn bind_with(
+    pub(crate) async fn bind_with(
         host: SessionHost,
         addr: SocketAddr,
         gate: IdentityGate,
@@ -206,6 +206,10 @@ fn router(state: Arc<ServerState>) -> Router {
         .route(
             "/v1/sessions/{id}/env/before/{entry}",
             get(environment_before),
+        )
+        .route(
+            "/v1/sessions/{id}/credentials",
+            get(credential_overview).post(credential_command),
         )
         .route("/v1/sessions/{id}/accounts", get(accounts))
         .route("/v1/sessions/{id}/account", post(account))
@@ -462,6 +466,21 @@ async fn tree(
 #[derive(serde::Deserialize)]
 struct AccountsQuery {
     provider: Option<String>,
+}
+
+async fn credential_overview(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(state.host.credential_overview(&session).await?).into_response())
+}
+
+async fn credential_command(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(request): Body<aj_wire::CredentialMutation>,
+) -> Result<Response, ApiError> {
+    Ok(Json(state.host.mutate_credentials(&session, request).await?).into_response())
 }
 
 async fn accounts(

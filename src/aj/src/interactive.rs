@@ -48,17 +48,22 @@ use aj_conf::skills::Skill;
 use aj_conf::{
     AgentEnv, Config, ConfigDiagnostic, ConfigThinkingDisplay, ConfigVerbosity, Severity,
 };
-use aj_models::auth::{AuthError, AuthStorage, StoredProviderCredentials};
+use aj_models::auth::AuthStorage;
+use aj_models::oauth::OAuthError;
 use aj_models::registry::ModelInfo;
 use aj_models::types::UserContent;
 use aj_models::{ThinkingConfig, speed_from_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter};
+use aj_wire::{
+    CredentialMutation, CredentialOutcome, CredentialOverview, StoredCredentialMetadata,
+};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use vaxis::cell::{Color, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::tty::PosixTty;
@@ -80,9 +85,8 @@ use crate::host_picker::{choice_is_ambiguous, open_host_picker};
 use crate::image_store::ImageStore;
 use crate::keymap::{HostCtx, build_keymap};
 use crate::login::{
-    AccountAction, AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, LoginTarget,
-    account_label_text, open_default_account_picker, open_default_logout_picker, open_login_dialog,
-    open_login_picker, open_logout_picker,
+    AccountAction, AuthPickerAction, AuthPickerRequest, AuthPickerTarget, AuthRow, DialogCallbacks,
+    LoginDialogState, LoginTarget, account_label_text, open_login_dialog,
 };
 use crate::overlay::{MouseBlocker, OverlayChrome, OverlayStack, Scrim, close_key_label};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
@@ -179,6 +183,8 @@ struct World {
     /// is the protocol's gateway discriminator. Direct and local hosts serve one
     /// directory themselves, so their value stays fixed across session focus.
     working_directory_follows_focus: bool,
+    /// The direct peer names itself at handshake. A gateway names hosts in its directory.
+    direct_host_label: Option<String>,
     /// Where this client stands with its host. Mirrored into the status chrome
     /// by [`sync_status`].
     connection: Connection,
@@ -212,8 +218,9 @@ struct World {
     /// window's model submenu. Also seeds [`ChatState`]'s context-window
     /// resolver.
     catalog: Arc<Vec<ModelInfo>>,
-    /// Credential store, shared with the async read-only overlays (auth
-    /// status, usage) whose fetches run detached off the drive loop.
+    /// This process's credential store. Login uses only its OAuth provider
+    /// registry: the flow runs here, where the browser is, and the result is
+    /// stored through Control. In connect mode the store itself is never read.
     auth: AuthStorage,
     /// This process's project sessions store. The ring bootstrap reads it only
     /// for local runs. Host-facing overlays read through Control.
@@ -374,6 +381,7 @@ async fn build_world(
         local: Some(handles),
         working_directory: env.working_directory.clone(),
         working_directory_follows_focus: false,
+        direct_host_label: None,
         connection: Connection::CatchingUp,
         resume: None,
         transition: None,
@@ -529,6 +537,7 @@ async fn build_connect_world(
         control,
         session,
         working_directory,
+        host_label,
         created,
     } = connected;
     let working_directory_follows_focus = working_directory.is_none();
@@ -552,6 +561,7 @@ async fn build_connect_world(
         // `@file` completions and tool output all name paths on that machine.
         working_directory: working_directory.unwrap_or_default(),
         working_directory_follows_focus,
+        direct_host_label: host_label,
         connection: Connection::CatchingUp,
         resume: None,
         transition: None,
@@ -1176,12 +1186,6 @@ async fn refresh_client_reads(world: &mut World) {
 /// what decides if the loop has to wake for their paced retry.
 fn owes_client_reads(world: &World) -> bool {
     world.client().needs_task_refetch() || world.client().needs_queue_refetch()
-}
-
-/// The notice a gesture with no connect-mode path folds, naming why (spec
-/// 9.1: such a gesture must never silently do nothing).
-fn remote_unsupported_notice(what: &str, why: &str) -> String {
-    format!("Can't {what} over a connection: {why}.")
 }
 
 /// The label the peer's directory carries for `session`, `None` for an
@@ -2267,7 +2271,237 @@ fn fold_warning(world: &mut World, text: &str) {
     fold_event(world, warning_event(text));
 }
 
-/// An in-flight OAuth login the drive loop is tracking.
+/// Presentation uses the directory's host-name preference without its address
+/// fallback, which can contain connection credentials.
+fn credential_host(world: &World) -> String {
+    let id = world
+        .directory
+        .rows()
+        .iter()
+        .find(|row| row.id == world.session())
+        .and_then(|row| row.host.as_deref());
+    let host = world
+        .directory
+        .hosts()
+        .iter()
+        .find(|host| host.id.as_deref() == id);
+    host.and_then(|host| {
+        let mut safe = host.clone();
+        safe.address = None;
+        crate::sidebar::host_label(&safe).map(str::to_string)
+    })
+    .or_else(|| id.map(str::to_string))
+    .or_else(|| world.direct_host_label.clone())
+    .or_else(|| {
+        world.control.host().map(|host| {
+            let hello = host.hello();
+            hello.name.unwrap_or(hello.host_id)
+        })
+    })
+    .map(|name| crate::text::one_line(&name))
+    .unwrap_or_else(|| "session host".to_string())
+}
+
+fn credential_error(err: &ControlError, write: bool) -> String {
+    // reqwest diagnostics can embed a base URL's userinfo or query secrets.
+    // The overlay already identifies the host without displaying its address.
+    let reason = match err {
+        ControlError::Remote(RemoteError::Transport(err)) if err.is_timeout() => {
+            "The host connection timed out.".to_string()
+        }
+        ControlError::Remote(RemoteError::Transport(_)) => "Could not reach the host.".to_string(),
+        _ => peer_refusal(err),
+    };
+    if err.unknown_endpoint() {
+        "This host does not support credential management.".to_string()
+    } else if write {
+        format!(
+            "Could not confirm the change. Reopen auth status before retrying. {}",
+            reason
+        )
+    } else {
+        format!("Could not read credentials: {}", reason)
+    }
+}
+
+fn open_credential_picker(world: &World, shell: &Rc<RefCell<Shell>>, action: CommandAction) {
+    let host = credential_host(world);
+    let session = world.session().to_string();
+    let title = match action {
+        CommandAction::OpenLoginSelector => "Log in",
+        CommandAction::OpenLogoutSelector => "Log out",
+        _ => "Default account",
+    };
+    let handles = shell.borrow().overlay_handles();
+    let fill = crate::login::open_auth_picker(
+        &handles.stack,
+        &handles.editor,
+        &handles.chrome,
+        &handles.auth_request,
+        &format!("{title} · {host}"),
+        Vec::new(),
+        AuthPickerTarget {
+            session: session.to_string(),
+            host: host.to_string(),
+        },
+    );
+    let control = world.control.clone();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(control.credential_overview(&session).await);
+    });
+    shell
+        .borrow_mut()
+        .credential_fills
+        .push(Box::pin(async move {
+            match rx.await {
+                Ok(Ok(overview)) => {
+                    let (rows, empty) = credential_picker_rows(action, overview);
+                    fill.fill(rows, empty);
+                }
+                Ok(Err(err)) => fill.fill(Vec::new(), &credential_error(&err, false)),
+                Err(_) => fill.fill(Vec::new(), "Credential read task stopped."),
+            }
+        }));
+}
+
+fn credential_picker_rows(
+    action: CommandAction,
+    overview: CredentialOverview,
+) -> (Vec<AuthRow>, &'static str) {
+    match action {
+        CommandAction::OpenLoginSelector => {
+            let mut rows = Vec::new();
+            for provider in &overview.oauth_providers {
+                let id = &provider.id;
+                let name = &provider.name;
+                let summary = overview
+                    .statuses
+                    .iter()
+                    .find(|s| &s.provider_id == id)
+                    .map(|s| s.summary.clone())
+                    .unwrap_or_default();
+                let stored = overview.stored.get(id).cloned();
+                rows.push(AuthRow {
+                    request: AuthPickerAction::Login {
+                        provider_id: id.clone(),
+                        provider_name: name.clone(),
+                        target: LoginTarget::new_account(stored.as_ref()),
+                    },
+                    label: name.clone(),
+                    filter_key: format!("{id} {name} add account"),
+                    summary: Some(if stored.is_some() {
+                        "add another account".to_string()
+                    } else {
+                        summary
+                    }),
+                });
+                match stored {
+                    Some(StoredCredentialMetadata::Bare) => rows.push(AuthRow {
+                        request: AuthPickerAction::Login {
+                            provider_id: id.clone(),
+                            provider_name: name.clone(),
+                            target: LoginTarget::ExistingAccount(None),
+                        },
+                        label: format!("{name} · Unnamed account"),
+                        filter_key: format!(
+                            "{id} {name} Unnamed account existing credential reauthenticate"
+                        ),
+                        summary: Some("log in again and replace this account".to_string()),
+                    }),
+                    Some(StoredCredentialMetadata::Accounts { accounts, .. }) => {
+                        rows.extend(accounts.into_iter().map(|account_label| {
+                            let shown = account_label_text(&account_label);
+                            let request = AuthPickerAction::Login {
+                                provider_id: id.clone(),
+                                provider_name: name.clone(),
+                                target: LoginTarget::ExistingAccount(Some(account_label)),
+                            };
+                            AuthRow {
+                                request,
+                                label: format!("{name} · {shown}"),
+                                filter_key: format!("{id} {name} {shown} reauthenticate"),
+                                summary: Some("log in again and replace this account".to_string()),
+                            }
+                        }));
+                    }
+                    None => {}
+                }
+            }
+            (rows, "No OAuth providers are available to log in to.")
+        }
+        CommandAction::OpenLogoutSelector => {
+            let mut rows = Vec::new();
+            for (id, stored) in &overview.stored {
+                match stored.clone() {
+                    StoredCredentialMetadata::Bare => rows.push(AuthRow {
+                        request: AuthPickerAction::LogoutBare {
+                            provider_id: id.clone(),
+                        },
+                        label: format!("{id} · Unnamed account"),
+                        filter_key: format!("{id} Unnamed account bare credential"),
+                        summary: Some("remove the stored credential".to_string()),
+                    }),
+                    StoredCredentialMetadata::Accounts { default, accounts } => {
+                        rows.extend(accounts.into_iter().map(|account_label| {
+                            let shown = account_label_text(&account_label);
+                            let suffix = if account_label == default {
+                                "default account"
+                            } else {
+                                "account"
+                            };
+                            let action = AccountAction::Logout {
+                                provider_id: id.clone(),
+                                account_label: account_label.clone(),
+                            };
+                            AuthRow {
+                                request: AuthPickerAction::ApplyAccount(action),
+                                label: format!("{id} · {shown}"),
+                                filter_key: format!("{id} {shown}"),
+                                summary: Some(format!("remove this {suffix}")),
+                            }
+                        }));
+                    }
+                }
+            }
+            (
+                rows,
+                "No stored credentials to remove. Env vars and --api-key aren't stored and can't be logged out.",
+            )
+        }
+        CommandAction::OpenDefaultAccountSelector => {
+            let mut rows = Vec::new();
+            for (id, stored) in &overview.stored {
+                let (default, accounts) = match stored.clone() {
+                    StoredCredentialMetadata::Bare => (String::new(), vec![String::new()]),
+                    StoredCredentialMetadata::Accounts { default, accounts } => (default, accounts),
+                };
+                rows.extend(accounts.into_iter().map(|account_label| {
+                    let is_current = account_label == default;
+                    let shown = account_label_text(&account_label);
+                    let action = AccountAction::SetDefault {
+                        provider_id: id.clone(),
+                        account_label: account_label.clone(),
+                    };
+                    AuthRow {
+                        request: AuthPickerAction::ApplyAccount(action),
+                        label: if is_current {
+                            format!("{id} · {shown} (current)")
+                        } else {
+                            format!("{id} · {shown}")
+                        },
+                        filter_key: format!("{id} {shown}"),
+                        summary: None,
+                    }
+                }));
+            }
+            (rows, "No stored account can become a new provider default.")
+        }
+        _ => unreachable!("credential picker action"),
+    }
+}
+
+/// An in-flight login the drive loop is tracking.
 ///
 /// Kept outside the overlay stack because the flow is async and
 /// long-running rather than a synchronous confirm/cancel selector, but
@@ -2278,16 +2512,29 @@ struct LoginSession {
     provider_name: String,
     target: LoginTarget,
     cancel: Arc<AtomicBool>,
-    handle: tokio::task::JoinHandle<Result<(), AuthError>>,
+    token: CancellationToken,
+    handle: tokio::task::JoinHandle<LoginOutcome>,
 }
 
-/// Mount the login dialog and spawn the OAuth flow, tracking it in
+/// How a login task ended. Authorization runs on this machine and stores
+/// nothing, so cancelling or failing there leaves every store untouched. Only
+/// the store step can end uncertain.
+#[derive(Debug)]
+enum LoginOutcome {
+    Cancelled,
+    Authorization(OAuthError),
+    Store(Result<CredentialOutcome, ControlError>),
+}
+
+/// Mount the login dialog and spawn the login, tracking it in
 /// `login_session`.
 ///
-/// The dialog widget (Rc/RefCell) stays host-side; only the `Send` shared
-/// handles (the `Arc<Mutex>` state + pending-input slot and the redraw
-/// sender) cross into the spawned task via [`DialogCallbacks`], so the
-/// `!Send` widget is never moved onto the tokio task.
+/// The provider's OAuth flow runs in this process because the browser is
+/// here, whichever host stores the result. The dialog widget (Rc/RefCell)
+/// stays on the UI thread. Only the `Send` shared handles (the `Arc<Mutex>`
+/// state + pending-input slot and the redraw sender) cross into the spawned
+/// task via [`DialogCallbacks`], so the `!Send` widget is never moved onto
+/// the tokio task.
 fn start_login(
     world: &World,
     shell: &Rc<RefCell<Shell>>,
@@ -2297,7 +2544,10 @@ fn start_login(
     provider_id: String,
     provider_name: String,
     target: LoginTarget,
+    session: String,
+    host: String,
 ) {
+    let provider_name = format!("{provider_name} on {host}");
     // Shared handles: the dialog (UI thread) holds clones; the originals
     // move into the login task's callbacks.
     let state = Arc::new(StdMutex::new(LoginDialogState::default()));
@@ -2330,44 +2580,41 @@ fn start_login(
         );
     }
 
+    let control = world.control.clone();
     let auth = world.auth.clone();
+    let token = CancellationToken::new();
+    let task_token = token.clone();
     let redraw = redraw_tx.clone();
     let task_state = Arc::clone(&state);
     let task_pending = Arc::clone(&pending_input);
     let completion_target = target.clone();
     let handle = tokio::spawn(async move {
         let callbacks = DialogCallbacks::new(task_state, task_pending, redraw);
-        match target {
-            LoginTarget::NewAccount => {
-                let stored = auth.stored_credentials(&provider_id).await?;
-                match stored {
-                    None => auth.login(&provider_id, &callbacks).await,
-                    Some(stored) => {
-                        let existing = match stored {
-                            StoredProviderCredentials::Bare(_) => {
-                                vec![aj_models::auth::DEFAULT_ACCOUNT_LABEL.to_string()]
-                            }
-                            StoredProviderCredentials::Accounts(set) => {
-                                set.accounts.into_iter().map(|(label, _)| label).collect()
-                            }
-                        };
-                        let label = callbacks.prompt_account_label(&existing).await?;
-                        auth.login_account(&provider_id, Some(&label), &callbacks)
-                            .await
-                    }
-                }
-            }
-            LoginTarget::ExistingAccount(label) => {
-                auth.replace_login_account(&provider_id, label.as_deref(), &callbacks)
-                    .await
-            }
-        }
+        let authorize = async {
+            let provider = auth.oauth_provider(&provider_id).await.map_err(|_| {
+                OAuthError::Other(format!("this aj has no login flow for {provider_id}"))
+            })?;
+            aj_app::auth::login(provider.as_ref(), target, &callbacks).await
+        };
+        let mutation = tokio::select! {
+            biased;
+            _ = task_token.cancelled() => return LoginOutcome::Cancelled,
+            result = authorize => match result {
+                Ok(mutation) => mutation,
+                Err(OAuthError::Cancelled) => return LoginOutcome::Cancelled,
+                Err(err) => return LoginOutcome::Authorization(err),
+            },
+        };
+        // The one step that writes. It runs to its answer whatever the token
+        // says, so cancellation never leaves a write in doubt.
+        LoginOutcome::Store(control.mutate_credentials(&session, mutation).await)
     });
 
     *login_session = Some(LoginSession {
         provider_name,
         target: completion_target,
         cancel,
+        token,
         handle,
     });
     // The overlay was pushed from the host (no EventContext), so hand the
@@ -2392,29 +2639,24 @@ fn close_login_overlay(shell: &Rc<RefCell<Shell>>, app: &mut AsyncApp) {
 /// Open the explicit alternatives for removing a default account with
 /// siblings. Each replacement row retains both exact raw keys, and removing
 /// the set carries the complete expected key set for stale-choice protection.
-async fn open_default_logout_resolution(
-    world: &World,
-    shell: &Rc<RefCell<Shell>>,
-    app: &mut AsyncApp,
+fn default_logout_rows(
+    mut overview: CredentialOverview,
     provider_id: String,
     account_label: String,
-) -> bool {
-    let Ok(Some(set)) = world.auth.accounts(&provider_id).await else {
-        return false;
+) -> Vec<AuthRow> {
+    let Some(StoredCredentialMetadata::Accounts { default, accounts }) =
+        overview.stored.remove(&provider_id)
+    else {
+        return Vec::new();
     };
-    if set.default != account_label || set.accounts.len() < 2 {
-        return false;
+    if default != account_label || accounts.len() < 2 {
+        return Vec::new();
     }
-    let expected_accounts = set
-        .accounts
+    let expected_accounts = accounts.clone();
+    let mut rows = accounts
         .iter()
-        .map(|(label, _)| label.clone())
-        .collect::<Vec<_>>();
-    let mut rows = set
-        .accounts
-        .iter()
-        .filter(|(label, _)| label != &account_label)
-        .map(|(new_default, _)| {
+        .filter(|label| *label != &account_label)
+        .map(|new_default| {
             let shown = account_label_text(new_default);
             let action = AccountAction::LogoutWithNewDefault {
                 provider_id: provider_id.clone(),
@@ -2422,7 +2664,7 @@ async fn open_default_logout_resolution(
                 new_default: new_default.clone(),
             };
             AuthRow {
-                request: AuthPickerRequest::ApplyAccount(action),
+                request: AuthPickerAction::ApplyAccount(action),
                 filter_key: format!("{provider_id} {shown}"),
                 label: shown,
                 summary: Some("make default, then remove the selected account".to_string()),
@@ -2430,7 +2672,7 @@ async fn open_default_logout_resolution(
         })
         .collect::<Vec<_>>();
     rows.push(AuthRow {
-        request: AuthPickerRequest::ApplyAccount(AccountAction::LogoutAll {
+        request: AuthPickerAction::ApplyAccount(AccountAction::LogoutAll {
             provider_id: provider_id.clone(),
             expected_accounts,
         }),
@@ -2438,40 +2680,82 @@ async fn open_default_logout_resolution(
         filter_key: format!("{provider_id} remove all accounts"),
         summary: Some("remove the complete labeled set".to_string()),
     });
+    rows
+}
+
+fn open_default_logout_resolution(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+    app: &mut AsyncApp,
+    provider_id: String,
+    account_label: String,
+    session: &str,
+    host: &str,
+) {
     let handles = shell.borrow().overlay_handles();
-    open_default_logout_picker(
+    let fill = crate::login::open_auth_picker(
         &handles.stack,
         &handles.editor,
         &handles.chrome,
         &handles.auth_request,
-        rows,
+        &format!("Choose a new default or remove all accounts · {host}"),
+        Vec::new(),
+        AuthPickerTarget {
+            session: session.to_string(),
+            host: host.to_string(),
+        },
     );
+    let control = world.control.clone();
+    let session = session.to_string();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(control.credential_overview(&session).await);
+    });
+    shell
+        .borrow_mut()
+        .credential_fills
+        .push(Box::pin(async move {
+            match rx.await {
+                Ok(Ok(overview)) => {
+                    let rows = default_logout_rows(overview, provider_id, account_label);
+                    fill.fill(rows, "The account set changed. Reopen the logout picker.");
+                }
+                Ok(Err(err)) => fill.fill(Vec::new(), &credential_error(&err, false)),
+                Err(_) => fill.fill(Vec::new(), "Credential read task stopped."),
+            }
+        }));
     app.post_app_event(UserEvent {
         name: REFOCUS_OVERLAY_EVENT.to_string(),
         data: None,
     });
     app.request_redraw();
-    true
 }
 
 /// Removal changes stored credentials, not environment or runtime overrides.
-async fn logout_notice(world: &World, provider: &str, removed: &str) -> String {
-    let status = aj_app::auth::provider_status(&world.auth, provider, None).await;
-    if status.configured {
-        format!(
-            "{removed} Provider default: {}.",
-            crate::text::one_line(&status.summary)
-        )
-    } else {
-        removed.to_string()
+async fn logout_notice(control: &Control, session: &str, provider: &str, removed: &str) -> String {
+    match control.credential_overview(session).await {
+        Ok(overview) => {
+            if let Some(status) = overview
+                .statuses
+                .iter()
+                .find(|s| s.provider_id == provider && (s.is_default || s.account_label.is_none()))
+                && status.configured
+            {
+                return format!(
+                    "{removed} Provider default: {}.",
+                    crate::text::one_line(&status.summary)
+                );
+            }
+            removed.to_string()
+        }
+        Err(err) => format!("{removed} {}", credential_error(&err, false)),
     }
 }
 
-/// Each row carries its captured target. Following the default and pinning
-/// that same exact account are distinct choices, even when their source agrees.
-fn session_account_rows(session: &str, provider: &str, list: aj_wire::AccountList) -> Vec<AuthRow> {
-    let request = |account| AuthPickerRequest::SelectAccount {
-        session: session.to_string(),
+/// Following the default and pinning that exact account are distinct choices,
+/// even when their credential source agrees. The picker owns their target.
+fn session_account_rows(provider: &str, list: aj_wire::AccountList) -> Vec<AuthRow> {
+    let request = |account| AuthPickerAction::SelectAccount {
         provider: provider.to_string(),
         account,
     };
@@ -2504,23 +2788,82 @@ fn session_account_rows(session: &str, provider: &str, list: aj_wire::AccountLis
     rows
 }
 
-/// Apply a confirmed authentication picker request. Login mounts the dialog
-/// and spawns the flow. Logout and labeled account mutations write inline,
-/// with explicit resolution when removing a default that has siblings.
-async fn apply_auth_request(
+struct CredentialChange {
+    session: String,
+    host: String,
+    handle: tokio::task::JoinHandle<CredentialChangeResult>,
+}
+
+impl Drop for CredentialChange {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+enum CredentialChangeResult {
+    Notice(String),
+    RemovingDefault {
+        provider: String,
+        account_label: String,
+    },
+}
+
+async fn recv_credential_change(
+    change: &mut Option<CredentialChange>,
+) -> Result<CredentialChangeResult, tokio::task::JoinError> {
+    match change {
+        Some(change) => (&mut change.handle).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn finish_credential_change(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    app: &mut AsyncApp,
+    change: CredentialChange,
+    result: Result<CredentialChangeResult, tokio::task::JoinError>,
+) {
+    let notice = match result {
+        Ok(CredentialChangeResult::Notice(notice)) => notice,
+        Ok(CredentialChangeResult::RemovingDefault {
+            provider,
+            account_label,
+        }) => {
+            open_default_logout_resolution(
+                world,
+                shell,
+                app,
+                provider,
+                account_label,
+                &change.session,
+                &change.host,
+            );
+            return;
+        }
+        Err(_) => "Could not confirm the change. Reopen auth status before retrying.".into(),
+    };
+    fold_notice(world, &format!("{}: {notice}", change.host));
+    app.request_redraw();
+}
+
+/// Credential writes run off the input loop. A second change waits for the
+/// first result, with explicit choices when removing a default with siblings.
+async fn start_auth_request(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     app: &mut AsyncApp,
     login_session: &mut Option<LoginSession>,
     redraw_tx: &UnboundedSender<()>,
     request: AuthPickerRequest,
+    pending: &mut Option<CredentialChange>,
 ) {
+    let AuthPickerRequest {
+        target: AuthPickerTarget { session, host },
+        action: request,
+    } = request;
     match request {
-        AuthPickerRequest::SelectAccount {
-            session,
-            provider,
-            account,
-        } => {
+        AuthPickerAction::SelectAccount { provider, account } => {
             if session == world.session() && shell.borrow().view().branch_anchor.borrow().is_some()
             {
                 if let Some(draft) = shell.borrow().view().branch_anchor.borrow_mut().as_mut() {
@@ -2542,11 +2885,11 @@ async fn apply_auth_request(
                 } else {
                     format!("Account not changed: {}", peer_refusal(&err))
                 };
-                fold_notice(world, &message);
+                fold_notice(world, &format!("{host}: {message}"));
             }
             app.request_redraw();
         }
-        AuthPickerRequest::Login {
+        AuthPickerAction::Login {
             provider_id,
             provider_name,
             target,
@@ -2559,216 +2902,195 @@ async fn apply_auth_request(
             provider_id,
             provider_name,
             target,
+            session,
+            host,
         ),
-        AuthPickerRequest::LogoutBare { provider_id } => {
-            let notice = match world.auth.remove_bare(&provider_id).await {
-                Ok(()) => {
-                    logout_notice(
-                        world,
-                        &provider_id,
-                        &format!("Logged out of {provider_id} (Unnamed account)."),
-                    )
-                    .await
-                }
-                Err(err) => format!("Failed to log out of {provider_id}: {err}"),
+        request => {
+            if pending.is_some() {
+                shell
+                    .borrow()
+                    .show_toast("A credential change is still in progress.");
+                return;
+            }
+            let (provider, mutation, success, removed) = match request {
+                AuthPickerAction::LogoutBare { provider_id } => (
+                    provider_id.clone(),
+                    CredentialMutation::LogoutBare {
+                        provider: provider_id.clone(),
+                    },
+                    format!("Logged out of {provider_id} (Unnamed account)."),
+                    true,
+                ),
+                AuthPickerAction::ApplyAccount(action) => match action {
+                    AccountAction::Logout {
+                        provider_id,
+                        account_label,
+                    } => {
+                        let success = format!(
+                            "Logged out of {provider_id} account {}.",
+                            account_label_text(&account_label)
+                        );
+                        (
+                            provider_id.clone(),
+                            CredentialMutation::Logout {
+                                provider: provider_id,
+                                account_label,
+                            },
+                            success,
+                            true,
+                        )
+                    }
+                    AccountAction::SetDefault {
+                        provider_id,
+                        account_label,
+                    } => {
+                        let success = format!(
+                            "{provider_id} default account: {}.",
+                            account_label_text(&account_label)
+                        );
+                        (
+                            provider_id.clone(),
+                            CredentialMutation::SetDefault {
+                                provider: provider_id,
+                                account_label,
+                            },
+                            success,
+                            false,
+                        )
+                    }
+                    AccountAction::LogoutWithNewDefault {
+                        provider_id,
+                        account_label,
+                        new_default,
+                    } => {
+                        let success = format!(
+                            "Logged out of {provider_id} account {}. {provider_id} default account: {}.",
+                            account_label_text(&account_label),
+                            account_label_text(&new_default)
+                        );
+                        (
+                            provider_id.clone(),
+                            CredentialMutation::LogoutWithNewDefault {
+                                provider: provider_id,
+                                account_label,
+                                new_default,
+                            },
+                            success,
+                            true,
+                        )
+                    }
+                    AccountAction::LogoutAll {
+                        provider_id,
+                        expected_accounts,
+                    } => {
+                        let success = format!("Logged out of all {provider_id} accounts.");
+                        (
+                            provider_id.clone(),
+                            CredentialMutation::LogoutAll {
+                                provider: provider_id,
+                                expected_accounts,
+                            },
+                            success,
+                            true,
+                        )
+                    }
+                },
+                _ => unreachable!("credential mutation"),
             };
-            fold_notice(world, &notice);
+            let control = world.control.clone();
+            let target = session.clone();
+            let handle = tokio::spawn(async move {
+                let notice = match control.mutate_credentials(&target, mutation).await {
+                    Ok(CredentialOutcome::Applied) if removed => {
+                        logout_notice(&control, &target, &provider, &success).await
+                    }
+                    Ok(CredentialOutcome::Applied) => success,
+                    Ok(CredentialOutcome::RemovingDefault {
+                        provider,
+                        account_label,
+                    }) => {
+                        return CredentialChangeResult::RemovingDefault {
+                            provider,
+                            account_label,
+                        };
+                    }
+                    Ok(CredentialOutcome::Failed { message, .. }) => {
+                        format!("Credential change failed: {message}")
+                    }
+                    Err(err) => credential_error(&err, true),
+                };
+                CredentialChangeResult::Notice(notice)
+            });
+            *pending = Some(CredentialChange {
+                session,
+                host,
+                handle,
+            });
+            shell.borrow().show_toast("Updating credentials…");
             app.request_redraw();
         }
-        AuthPickerRequest::ApplyAccount(action) => match action {
-            AccountAction::Logout {
-                provider_id,
-                account_label,
-            } => match world
-                .auth
-                .remove_account(&provider_id, &account_label)
-                .await
-            {
-                Ok(()) => {
-                    let shown = account_label_text(&account_label);
-                    let notice = logout_notice(
-                        world,
-                        &provider_id,
-                        &format!("Logged out of {provider_id} account {shown}."),
-                    )
-                    .await;
-                    fold_notice(world, &notice);
-                    app.request_redraw();
-                }
-                Err(AuthError::RemovingDefault { .. }) => {
-                    if !open_default_logout_resolution(
-                        world,
-                        shell,
-                        app,
-                        provider_id.clone(),
-                        account_label,
-                    )
-                    .await
-                    {
-                        fold_warning(
-                            world,
-                            &format!(
-                                "The {provider_id} account set changed. Reopen the logout picker."
-                            ),
-                        );
-                    }
-                }
-                Err(err) => {
-                    fold_warning(world, &format!("Failed to log out of {provider_id}: {err}"));
-                    app.request_redraw();
-                }
-            },
-            AccountAction::SetDefault {
-                provider_id,
-                account_label,
-            } => {
-                let shown = account_label_text(&account_label);
-                let notice = match world
-                    .auth
-                    .set_default_account(&provider_id, &account_label)
-                    .await
-                {
-                    Ok(()) => format!("{provider_id} default account: {shown}."),
-                    Err(err) => format!("Failed to change {provider_id}'s default account: {err}"),
-                };
-                fold_notice(world, &notice);
-                app.request_redraw();
-            }
-            AccountAction::LogoutWithNewDefault {
-                provider_id,
-                account_label,
-                new_default,
-            } => {
-                let removed = account_label_text(&account_label);
-                let selected = account_label_text(&new_default);
-                let notice = match world
-                    .auth
-                    .remove_default_account(&provider_id, &account_label, &new_default)
-                    .await
-                {
-                    Ok(()) => logout_notice(world, &provider_id, &format!(
-                        "Logged out of {provider_id} account {removed}. {provider_id} default account: {selected}."
-                    )).await,
-                    Err(err) => format!("Failed to update {provider_id}'s accounts: {err}"),
-                };
-                fold_notice(world, &notice);
-                app.request_redraw();
-            }
-            AccountAction::LogoutAll {
-                provider_id,
-                expected_accounts,
-            } => {
-                let notice = match world
-                    .auth
-                    .remove_all_accounts(&provider_id, &expected_accounts)
-                    .await
-                {
-                    Ok(()) => {
-                        logout_notice(
-                            world,
-                            &provider_id,
-                            &format!("Logged out of all {provider_id} accounts."),
-                        )
-                        .await
-                    }
-                    Err(err) => format!("Failed to log out of {provider_id}: {err}"),
-                };
-                fold_notice(world, &notice);
-                app.request_redraw();
-            }
-        },
     }
 }
 
-/// Tear down the login dialog when the shared cancel flag is set (the
-/// dialog's Esc/Ctrl+C flipped it). Aborts the task, waits for it to terminate,
-/// and then folds its actual outcome. A no-op when no login is in flight or the
-/// flag is clear.
-///
-/// We take `login_session` before aborting so the completion arm (which
-/// keys off `login_session`) then sees `None` and its future pends,
-/// avoiding a double-close of the overlay.
-async fn cancel_login(
+#[cfg(test)]
+async fn apply_auth_request(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     app: &mut AsyncApp,
     login_session: &mut Option<LoginSession>,
+    redraw_tx: &UnboundedSender<()>,
+    request: AuthPickerRequest,
 ) {
-    if !login_session
-        .as_ref()
-        .is_some_and(|s| s.cancel.load(Ordering::Relaxed))
-    {
-        return;
-    }
-    let session = login_session.take().expect("login session present");
-    session.handle.abort();
-
-    // Intentionally no timeout. `abort` stops a task at its next suspension,
-    // including while it waits for the credential lock, but cannot interrupt
-    // the synchronous read/modify/write after that lock is acquired. Returning
-    // on a deadline would detach exactly that task and allow a later credential
-    // commit after the UI had reported cancellation. The drive loop may pause
-    // behind a stuck filesystem operation here, which is preferable to stating
-    // an outcome before the commit boundary has resolved.
-    let outcome = session.handle.await;
-    complete_login(
+    let mut pending = None;
+    start_auth_request(
         world,
         shell,
         app,
-        session.provider_name,
-        session.target,
-        outcome,
-        true,
-    );
+        login_session,
+        redraw_tx,
+        request,
+        &mut pending,
+    )
+    .await;
+    if pending.is_some() {
+        let result = recv_credential_change(&mut pending).await;
+        finish_credential_change(world, shell, app, pending.take().unwrap(), result);
+    }
 }
 
-/// Handle the login task completing: close the dialog, fold the outcome
-/// notice, and clear the session.
-///
-/// The abort branch is effectively unreachable through the cancel-poll,
-/// which takes `login_session` before aborting (so this select arm then
-/// sees `None` and its future pends forever). We keep it so a task
-/// cancelled by any other means stays quiet rather than surfacing a
-/// spurious error.
+/// Cancel a login the dialog asked to cancel. The task reports through the
+/// drive loop's completion arm like any other ending, so the UI never waits
+/// here: authorization stops at once, and a store already in flight answers
+/// on its own.
+fn cancel_login(login_session: &Option<LoginSession>) {
+    if let Some(session) = login_session
+        && session.cancel.load(Ordering::Relaxed)
+    {
+        session.token.cancel();
+    }
+}
+
+/// Close the dialog and report how the login task ended.
 fn finish_login(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     app: &mut AsyncApp,
     login_session: &mut Option<LoginSession>,
-    outcome: Result<Result<(), AuthError>, tokio::task::JoinError>,
+    outcome: Result<LoginOutcome, tokio::task::JoinError>,
 ) {
     let Some(session) = login_session.take() else {
         return;
     };
-    complete_login(
-        world,
-        shell,
-        app,
-        session.provider_name,
-        session.target,
-        outcome,
-        false,
-    );
-}
-
-/// Close the login dialog and report the task outcome after its termination
-/// barrier. A requested cancellation is reported only when abort won. A task
-/// that reached its uninterruptible credential write and completed still
-/// reports success.
-fn complete_login(
-    world: &mut World,
-    shell: &Rc<RefCell<Shell>>,
-    app: &mut AsyncApp,
-    provider_name: String,
-    target: LoginTarget,
-    outcome: Result<Result<(), AuthError>, tokio::task::JoinError>,
-    cancellation_requested: bool,
-) {
+    let LoginSession {
+        provider_name,
+        target,
+        ..
+    } = session;
     close_login_overlay(shell, app);
     match outcome {
-        Ok(Ok(())) => {
+        Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied))) => {
             let detail = match target {
-                LoginTarget::NewAccount => "Account added.".to_string(),
+                LoginTarget::NewAccount { .. } => "Account added.".to_string(),
                 LoginTarget::ExistingAccount(label) => format!(
                     "Replaced {}.",
                     account_label_text(label.as_deref().unwrap_or("")),
@@ -2776,12 +3098,30 @@ fn complete_login(
             };
             fold_notice(world, &format!("Logged in to {provider_name}. {detail}"));
         }
-        Ok(Err(err)) => fold_warning(world, &format!("Login to {provider_name} failed: {err}")),
-        Err(join) if join.is_cancelled() && cancellation_requested => {
+        Ok(LoginOutcome::Cancelled) => {
             fold_notice(world, &format!("Login to {provider_name} cancelled."))
         }
-        Err(join) if join.is_cancelled() => {}
-        Err(join) => fold_warning(world, &format!("Login task error: {join}")),
+        Ok(LoginOutcome::Authorization(err)) => {
+            fold_warning(world, &format!("Login to {provider_name} failed: {err}"))
+        }
+        Ok(LoginOutcome::Store(Ok(CredentialOutcome::Failed { message, .. }))) => fold_warning(
+            world,
+            &format!("Login to {provider_name} failed: {message}"),
+        ),
+        Ok(LoginOutcome::Store(Ok(CredentialOutcome::RemovingDefault { .. }))) => fold_warning(
+            world,
+            &format!("Login to {provider_name} failed: unexpected default-removal outcome."),
+        ),
+        Ok(LoginOutcome::Store(Err(err))) => fold_warning(
+            world,
+            &format!("Login to {provider_name}: {}", credential_error(&err, true)),
+        ),
+        Err(join) => fold_warning(
+            world,
+            &format!(
+                "Login to {provider_name}: task error: {join}. Outcome is uncertain. Check auth status before retrying."
+            ),
+        ),
     }
     app.request_redraw();
 }
@@ -3884,6 +4224,7 @@ async fn apply_command_action(
         }
         CommandAction::OpenAccountSelector => {
             let session = world.session().to_string();
+            let host = credential_host(world);
             let target = editing_target(world, shell);
             let Some((provider, _)) = editing_model(world, shell, target) else {
                 shell.borrow().show_toast(
@@ -3916,15 +4257,19 @@ async fn apply_command_action(
                     if let Some(state) = branch_settings(shell) {
                         list.selected = state.accounts.get(&provider).cloned();
                     }
-                    let rows = session_account_rows(&session, &provider, list);
+                    let rows = session_account_rows(&provider, list);
                     let handles = shell.borrow().overlay_handles();
                     crate::login::open_auth_picker(
                         &handles.stack,
                         &handles.editor,
                         &handles.chrome,
                         &handles.auth_request,
-                        &format!("Account · {}", crate::text::one_line(&provider)),
+                        &format!("Account · {} · {host}", crate::text::one_line(&provider)),
                         rows,
+                        AuthPickerTarget {
+                            session: session.to_string(),
+                            host: host.to_string(),
+                        },
                     );
                     ActionEffect::OpenedOverlay
                 }
@@ -3934,217 +4279,15 @@ async fn apply_command_action(
                     } else {
                         format!("Could not read accounts: {}", peer_refusal(&err))
                     };
-                    fold_notice(world, &message);
+                    fold_notice(world, &format!("{host}: {message}"));
                     ActionEffect::Redraw
                 }
             }
         }
-        CommandAction::OpenLoginSelector => {
-            if world.control.is_remote() {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice(
-                        "manage credentials",
-                        "credentials belong to the machine running the session, so run it there",
-                    ),
-                );
-                return ActionEffect::Redraw;
-            }
-            // The picker needs the OAuth provider list plus each one's
-            // credential summary, both async. `apply_command_action` is
-            // already async, so build the rows inline and open a fully
-            // populated picker (no loading/fill dance needed).
-            let providers = world.auth.oauth_provider_ids().await;
-            if providers.is_empty() {
-                fold_notice(world, "No OAuth providers are available to log in to.");
-                return ActionEffect::Redraw;
-            }
-            let mut rows = Vec::new();
-            for (id, name) in &providers {
-                let status = aj_app::auth::provider_status(&world.auth, id, Some(name)).await;
-                let stored = world.auth.stored_credentials(id).await.ok().flatten();
-                rows.push(AuthRow {
-                    request: AuthPickerRequest::Login {
-                        provider_id: id.clone(),
-                        provider_name: name.clone(),
-                        target: LoginTarget::NewAccount,
-                    },
-                    label: name.clone(),
-                    filter_key: format!("{id} {name} add account"),
-                    summary: Some(if stored.is_some() {
-                        "add another account".to_string()
-                    } else {
-                        status.summary
-                    }),
-                });
-                match stored {
-                    Some(StoredProviderCredentials::Bare(_)) => rows.push(AuthRow {
-                        request: AuthPickerRequest::Login {
-                            provider_id: id.clone(),
-                            provider_name: name.clone(),
-                            target: LoginTarget::ExistingAccount(None),
-                        },
-                        label: format!("{name} · Unnamed account"),
-                        filter_key: format!(
-                            "{id} {name} Unnamed account existing credential reauthenticate"
-                        ),
-                        summary: Some("log in again and replace this account".to_string()),
-                    }),
-                    Some(StoredProviderCredentials::Accounts(set)) => {
-                        rows.extend(set.accounts.into_iter().map(|(account_label, _)| {
-                            let shown = account_label_text(&account_label);
-                            let request = AuthPickerRequest::Login {
-                                provider_id: id.clone(),
-                                provider_name: name.clone(),
-                                target: LoginTarget::ExistingAccount(Some(account_label)),
-                            };
-                            AuthRow {
-                                request,
-                                label: format!("{name} · {shown}"),
-                                filter_key: format!("{id} {name} {shown} reauthenticate"),
-                                summary: Some("log in again and replace this account".to_string()),
-                            }
-                        }));
-                    }
-                    None => {}
-                }
-            }
-            let handles = shell.borrow().overlay_handles();
-            open_login_picker(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.auth_request,
-                rows,
-            );
-            ActionEffect::OpenedOverlay
-        }
-        CommandAction::OpenLogoutSelector => {
-            if world.control.is_remote() {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice(
-                        "manage credentials",
-                        "credentials belong to the machine running the session, so run it there",
-                    ),
-                );
-                return ActionEffect::Redraw;
-            }
-            // Only stored credentials can be logged out: env vars and
-            // --api-key aren't persisted, so they never appear here.
-            let mut stored = world.auth.list().await.unwrap_or_default();
-            if stored.is_empty() {
-                fold_notice(
-                    world,
-                    "No stored credentials to remove. (Env vars and --api-key aren't \
-                     stored and can't be logged out.)",
-                );
-                return ActionEffect::Redraw;
-            }
-            stored.sort();
-            let mut rows = Vec::new();
-            for id in &stored {
-                match world.auth.stored_credentials(id).await {
-                    Ok(Some(StoredProviderCredentials::Bare(_))) => rows.push(AuthRow {
-                        request: AuthPickerRequest::LogoutBare {
-                            provider_id: id.clone(),
-                        },
-                        label: format!("{id} · Unnamed account"),
-                        filter_key: format!("{id} Unnamed account bare credential"),
-                        summary: Some("remove the stored credential".to_string()),
-                    }),
-                    Ok(Some(StoredProviderCredentials::Accounts(set))) => {
-                        let default = set.default;
-                        rows.extend(set.accounts.into_iter().map(|(account_label, _)| {
-                            let shown = account_label_text(&account_label);
-                            let suffix = if account_label == default {
-                                "default account"
-                            } else {
-                                "account"
-                            };
-                            let action = AccountAction::Logout {
-                                provider_id: id.clone(),
-                                account_label: account_label.clone(),
-                            };
-                            AuthRow {
-                                request: AuthPickerRequest::ApplyAccount(action),
-                                label: format!("{id} · {shown}"),
-                                filter_key: format!("{id} {shown}"),
-                                summary: Some(format!("remove this {suffix}")),
-                            }
-                        }));
-                    }
-                    Ok(None) | Err(_) => {}
-                }
-            }
-            let handles = shell.borrow().overlay_handles();
-            open_logout_picker(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.auth_request,
-                rows,
-            );
-            ActionEffect::OpenedOverlay
-        }
-        CommandAction::OpenDefaultAccountSelector => {
-            if world.control.is_remote() {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice(
-                        "manage credentials",
-                        "credentials belong to the machine running the session, so run it there",
-                    ),
-                );
-                return ActionEffect::Redraw;
-            }
-            let mut stored = world.auth.list().await.unwrap_or_default();
-            stored.sort();
-            let mut rows = Vec::new();
-            for id in stored {
-                let Ok(Some(stored)) = world.auth.stored_credentials(&id).await else {
-                    continue;
-                };
-                let (default, accounts) = match stored {
-                    StoredProviderCredentials::Bare(credential) => {
-                        (String::new(), vec![(String::new(), credential)])
-                    }
-                    StoredProviderCredentials::Accounts(set) => (set.default, set.accounts),
-                };
-                rows.extend(accounts.into_iter().map(|(account_label, _)| {
-                    let is_current = account_label == default;
-                    let shown = account_label_text(&account_label);
-                    let action = AccountAction::SetDefault {
-                        provider_id: id.clone(),
-                        account_label: account_label.clone(),
-                    };
-                    AuthRow {
-                        request: AuthPickerRequest::ApplyAccount(action),
-                        label: if is_current {
-                            format!("{id} · {shown} (current)")
-                        } else {
-                            format!("{id} · {shown}")
-                        },
-                        filter_key: format!("{id} {shown}"),
-                        summary: None,
-                    }
-                }));
-            }
-            if rows.is_empty() {
-                fold_notice(
-                    world,
-                    "No stored account can become a new provider default.",
-                );
-                return ActionEffect::Redraw;
-            }
-            let handles = shell.borrow().overlay_handles();
-            open_default_account_picker(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.auth_request,
-                rows,
-            );
+        action @ (CommandAction::OpenLoginSelector
+        | CommandAction::OpenLogoutSelector
+        | CommandAction::OpenDefaultAccountSelector) => {
+            open_credential_picker(world, shell, action);
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenUsageStatus => {
@@ -5111,20 +5254,21 @@ fn spawn_overlay_fetch(
 ) {
     match kind {
         FetchKind::Auth => {
-            if world.control.is_remote() {
-                let rows = vec![crate::content_overlay::plain(
-                    "Auth status is local to the session host. Run this command there.",
-                )];
-                let _ = tx.send(rows);
-                return;
-            }
-            let auth = world.auth.clone();
+            let control = world.control.clone();
+            let session = world.session().to_string();
+            let host = credential_host(world);
             tokio::spawn(async move {
-                let rows = auth_rows(
-                    &aj_app::auth::collect_statuses(&auth).await,
-                    &styles,
-                    width_method,
-                );
+                let mut rows = vec![crate::content_overlay::plain(format!(
+                    "Credentials on {host}"
+                ))];
+                match control.credential_overview(&session).await {
+                    Ok(overview) => {
+                        rows.extend(auth_rows(&overview.statuses, &styles, width_method))
+                    }
+                    Err(err) => {
+                        rows.push(crate::content_overlay::plain(credential_error(&err, false)))
+                    }
+                }
                 let _ = tx.send(rows);
             });
         }
@@ -5840,6 +5984,9 @@ struct Shell {
     /// A confirmed authentication request parked by a picker and drained by
     /// the drive loop, which owns the credential store and login task machinery.
     auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
+    credential_fills: Vec<futures::future::LocalBoxFuture<'static, ()>>,
+    /// A credential write belongs to the shell, not the selected session.
+    credential_change: Option<CredentialChange>,
     /// Where the session-tag editor parks a confirmed label, read by the drive
     /// loop, which owns the control surface the tag command travels over.
     tag_edit: Rc<RefCell<Option<TagEdit>>>,
@@ -6218,6 +6365,8 @@ impl Shell {
             session_scan,
             session_request,
             auth_request,
+            credential_fills: Vec::new(),
+            credential_change: None,
             tag_edit,
             terminal_caps: Cell::new(TerminalCaps::default()),
             width_method: Cell::new(vaxis::gwidth::Method::Unicode),
@@ -7579,7 +7728,8 @@ async fn drive(
         shell.borrow().view().selection_copied.get().map(|c| c.at);
     // Each fill owns its originating list and receiver. Requests can complete
     // out of order, including after their overlay has been closed.
-    let mut pending_fills = FuturesUnordered::new();
+    let mut pending_fills: FuturesUnordered<futures::future::LocalBoxFuture<'static, ()>> =
+        FuturesUnordered::new();
     // Prompt-history reads publish ranked snapshots here. The select stays on
     // the UI thread, paired with a fresh receiver for each open or scope change.
     // Superseded reads cannot fill the current scope.
@@ -7610,6 +7760,7 @@ async fn drive(
     // stack) because it is async and long-running, but paired with the
     // dialog overlay it pushed.
     let mut login_session: Option<LoginSession> = None;
+    let mut credential_change = shell.borrow_mut().credential_change.take();
     // Set while the focused session's stream is down, in either mode: a
     // subscription is lost for ordinary reasons even in process (see the frame
     // arm), and the re-attach is what tells that apart from a host that is
@@ -7677,6 +7828,7 @@ async fn drive(
         // already buffered when the loop is re-entered to be answered from rows
         // that predate the switch, and a stepping chord would name the session
         // just landed on.
+        pending_fills.extend(shell.borrow_mut().credential_fills.drain(..));
         if world.sync_working_directory() {
             shell.borrow_mut().rebind_working_directory(world);
             app.post_app_event(UserEvent {
@@ -7714,7 +7866,9 @@ async fn drive(
             if shell.borrow().show_frame_stats.get() {
                 shell.borrow().frame_stats.set(Some(app.frame_stats()));
             }
-            app.render(root)?;
+            if let Err(error) = app.render(root) {
+                break Err(error.into());
+            }
             last_render = Some(Instant::now());
             // The frame just drawn recorded any visible-but-untransmitted
             // images as pending. Transmit them now so the next frame places
@@ -7821,7 +7975,12 @@ async fn drive(
                 }
             }
 
-            // --- Session export notice fill ---
+            result = recv_credential_change(&mut credential_change) => {
+                let change = credential_change.take().expect("credential write was pending");
+                finish_credential_change(world, shell, app, change, result);
+            }
+
+            // --- Background operation notice ---
             // The render + write finished off the loop. Fold its result notice.
             maybe_export = export_rx.recv() => {
                 if let Some(notice) = maybe_export {
@@ -7985,7 +8144,7 @@ async fn drive(
                                 // matching the overlay chrome.
                                 let (tx, rx) = oneshot::channel();
                                 spawn_shell_overlay_fetch(world, shell, fetch.kind, tx);
-                                pending_fills.push(fill_overlay(fetch.list, rx));
+                                pending_fills.push(Box::pin(fill_overlay(fetch.list, rx)));
                             }
                         }
                         // Config edits parked by a selector or settings
@@ -8040,20 +8199,20 @@ async fn drive(
                         // Bind out first so no RefCell ref crosses the await.
                         let auth_request = shell.borrow().take_auth_request();
                         if let Some(request) = auth_request {
-                            apply_auth_request(
+                            start_auth_request(
                                 world,
                                 shell,
                                 app,
                                 &mut login_session,
                                 &redraw_tx,
                                 request,
+                                &mut credential_change,
                             )
                             .await;
                         }
                         // Login cancellation: the dialog's Esc/Ctrl+C flipped
-                        // the shared flag. Abort and join before reporting which
-                        // side of the credential commit boundary won.
-                        cancel_login(world, shell, app, &mut login_session).await;
+                        // the shared flag.
+                        cancel_login(&login_session);
                         // A confirmed session-tag edit. Bound out of the borrow
                         // first: the command awaits on the peer.
                         let tag_edit = shell.borrow().take_tag_edit();
@@ -8460,6 +8619,16 @@ async fn drive(
         }
     };
 
+    // Every loop exit, including errors, passes this barrier: leaving the UI
+    // must not detach a credential writer, so a store in flight is awaited.
+    // Authorization stops at once and stores nothing.
+    if let Some(session) = login_session.as_mut() {
+        session.token.cancel();
+        let outcome = (&mut session.handle).await;
+        finish_login(world, shell, app, &mut login_session, outcome);
+    }
+    shell.borrow_mut().credential_change = credential_change;
+
     // Recovery belongs to the world rather than one invocation of `drive`.
     // A same-session action can leave and re-enter this loop while the selected
     // target is still catching up, and dropping this state would lose the only
@@ -8541,13 +8710,15 @@ fn format_remote_resume_hint(url: &str, session: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod credential_changes;
+
     use std::io::{PipeWriter, Write};
-    use std::sync::{Arc, Condvar, OnceLock};
+    use std::sync::{Arc, OnceLock};
 
     use aj_app::chat::{EntryKind, NoticeLevel, SubAgentStatus, ToolStatus, reduce};
     use aj_app::session::AgentLifecycle;
     use aj_app::test_support::CanonicalState;
-    use aj_models::auth::{AuthCredential, CredentialSource};
+    use aj_models::auth::AuthCredential;
     use aj_models::oauth::{OAuthCallbacks, OAuthCredentials, OAuthError, OAuthProvider};
     use aj_session::{AppendFault, AppendFaultFixture};
     use async_trait::async_trait;
@@ -13419,6 +13590,15 @@ mod tests {
     /// (which is the only arm that sends on it). Tests that exercise the
     /// export offload keep the receiver and call `apply_command_action`
     /// directly.
+    async fn fill_credentials(shell: &Rc<RefCell<Shell>>) {
+        let fills = std::mem::take(&mut shell.borrow_mut().credential_fills);
+        for fill in fills {
+            fill.await;
+        }
+    }
+
+    /// Invoke an action and settle its overlay loads for component tests.
+    /// Export tests retain their delivery channel and invoke the action directly.
     async fn apply_command(
         world: &mut World,
         shell: &Rc<RefCell<Shell>>,
@@ -13426,13 +13606,23 @@ mod tests {
     ) -> ActionEffect {
         let (export_tx, _export_rx) = unbounded_channel();
         let (redraw_tx, _redraw_rx) = unbounded_channel();
-        apply_command_action(world, shell, action, &export_tx, &redraw_tx).await
+        let effect = apply_command_action(world, shell, action, &export_tx, &redraw_tx).await;
+        fill_credentials(shell).await;
+        effect
     }
     /// bound to it, so tests can exercise the host arms that need all three
     /// of the app, the world, and the shell (the login/logout flow).
     async fn init_app_with_world(
         dir: &TempDir,
         demo: &str,
+    ) -> (AsyncApp, PipeWriter, World, Rc<RefCell<Shell>>, WidgetRef) {
+        init_app_with_world_and_tty(dir, demo, Box::new(TestTty::new())).await
+    }
+
+    async fn init_app_with_world_and_tty(
+        dir: &TempDir,
+        demo: &str,
+        tty: Box<dyn vaxis::tty::Tty>,
     ) -> (AsyncApp, PipeWriter, World, Rc<RefCell<Shell>>, WidgetRef) {
         let world = scripted_world(dir, demo).await;
         let (reader, mut writer) = std::io::pipe().expect("pipe");
@@ -13449,11 +13639,7 @@ mod tests {
             PathBuf::from("/tmp"),
         )));
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
-        let mut app = AsyncApp::new(
-            Vaxis::new(VaxisOptions::default()),
-            Box::new(TestTty::new()),
-            reader.into(),
-        );
+        let mut app = AsyncApp::new(Vaxis::new(VaxisOptions::default()), tty, reader.into());
         app.init(Rc::clone(&root), Options::default())
             .await
             .expect("init");
@@ -14733,44 +14919,10 @@ mod tests {
         );
     }
 
-    /// Whether a controlled OAuth flow yields forever or occupies one task poll
-    /// until the test releases it.
+    /// Whether a controlled OAuth flow yields forever or completes at once.
     enum LoginGate {
         Waiting,
         Ready,
-        NonYielding(Arc<NonYieldingLoginGate>),
-    }
-
-    /// A provider-side operation that cannot observe `JoinHandle::abort` while
-    /// it is running. Releasing it returns credentials in the same task poll,
-    /// allowing the immediately-ready credential lock and synchronous write to
-    /// commit before Tokio can enact the requested cancellation.
-    #[derive(Default)]
-    struct NonYieldingLoginGate {
-        released: StdMutex<bool>,
-        wake: Condvar,
-    }
-
-    impl NonYieldingLoginGate {
-        fn wait(&self) {
-            let mut released = self.released.lock().expect("login gate poisoned");
-            while !*released {
-                released = self.wake.wait(released).expect("login gate poisoned");
-            }
-        }
-
-        fn release(&self) {
-            *self.released.lock().expect("login gate poisoned") = true;
-            self.wake.notify_all();
-        }
-    }
-
-    struct LoginGateRelease(Arc<NonYieldingLoginGate>);
-
-    impl Drop for LoginGateRelease {
-        fn drop(&mut self) {
-            self.0.release();
-        }
     }
 
     struct LoginTermination(Arc<AtomicBool>);
@@ -14799,16 +14951,12 @@ mod tests {
             "Controlled OAuth"
         }
 
-        async fn login(
-            &self,
-            _callbacks: &dyn OAuthCallbacks,
-        ) -> Result<OAuthCredentials, OAuthError> {
+        async fn login(&self, _: &dyn OAuthCallbacks) -> Result<OAuthCredentials, OAuthError> {
             let _termination = LoginTermination(Arc::clone(&self.terminated));
             self.started.notify_one();
             match &self.gate {
                 LoginGate::Waiting => std::future::pending().await,
                 LoginGate::Ready => {}
-                LoginGate::NonYielding(gate) => gate.wait(),
             }
             Ok(self.credentials.clone())
         }
@@ -14861,23 +15009,652 @@ mod tests {
         std::fs::read(auth.path()).ok()
     }
 
-    /// `/logout` with nothing stored folds an explanatory notice instead
-    /// of opening an empty picker.
-    #[tokio::test]
-    async fn logout_picker_empty_folds_notice() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+    /// A host whose registry lists the controlled provider, so the login
+    /// picker offers it. The flow itself runs on whichever client logs in.
+    async fn credential_fixture(dir: &TempDir) -> (RemoteHost, AuthStorage) {
+        let handles = crate::remote::tests::HostHandles::new(dir);
+        let auth = handles.auth.clone();
+        auth.register_oauth_provider(Arc::new(ControlledOAuthProvider {
+            id: "credential-fake".into(),
+            started: Arc::new(Notify::new()),
+            terminated: Arc::new(AtomicBool::new(false)),
+            gate: LoginGate::Waiting,
+            credentials: OAuthCredentials::new("unused", "unused", i64::MAX),
+        }))
+        .await;
+        let provider = crate::remote::tests::scripted(
+            vec![aj_app::test_support::finalized_text_message("done")],
+            0,
+            Duration::ZERO,
+        );
+        let host =
+            crate::remote::tests::scripted_host(dir, provider, handles, Some("credential-left"));
+        let server = crate::remote::RemoteServer::bind(
+            host.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            crate::remote::IdentityGate::local(),
+        )
+        .await
+        .unwrap();
+        (RemoteHost { host, server }, auth)
+    }
 
-        let effect = apply_command(&mut world, &shell, CommandAction::OpenLogoutSelector).await;
-        assert!(matches!(effect, ActionEffect::Redraw));
-        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "no picker");
+    async fn pick_credential(
+        world: &mut World,
+        shell: &Rc<RefCell<Shell>>,
+        app: &mut AsyncApp,
+        writer: &mut PipeWriter,
+        root: &WidgetRef,
+        action: CommandAction,
+        filter: &str,
+    ) -> AuthPickerRequest {
+        assert!(matches!(
+            apply_command(world, shell, action).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(app, root);
+        type_text(app, writer, filter).await;
+        press(app, writer, b"\r").await;
+        shell
+            .borrow()
+            .take_auth_request()
+            .expect("credential row confirmed")
+    }
+
+    async fn answer_login(
+        shell: &Rc<RefCell<Shell>>,
+        app: &mut AsyncApp,
+        writer: &mut PipeWriter,
+        root: &WidgetRef,
+        marker: &str,
+        answer: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if flatten(&shell.borrow_mut().draw(&full_draw_ctx()))
+                    .join("\n")
+                    .contains(marker)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("login prompt arrives");
+        focus_overlay(app, root);
+        type_text(app, writer, answer).await;
+        press(app, writer, b"\r").await;
+    }
+
+    /// UI gestures share one Control path. A gateway focus switch cannot retarget
+    /// the login or the default-removal follow-up, and neither route touches the
+    /// deliberately different credential store carried by the client.
+    #[tokio::test]
+    async fn credential_ui_login_and_mutations_are_host_owned_local_direct_and_gateway() {
+        for mode in ["local", "direct", "gateway"] {
+            let host_dir = TempDir::new().unwrap();
+            let client_dir = TempDir::new().unwrap();
+            let right_dir = TempDir::new().unwrap();
+            let (left, auth) = credential_fixture(&host_dir).await;
+            auth.insert_bare(
+                "credential-fake",
+                AuthCredential::ApiKey {
+                    key: "host-old-secret".into(),
+                },
+            )
+            .await
+            .unwrap();
+            auth.insert_bare(
+                "host-sentinel",
+                AuthCredential::ApiKey {
+                    key: "host-sentinel-secret".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let left_session = left.host.create().await.unwrap();
+            let right = RemoteHost::named_at_directory(&right_dir, "credential-right").await;
+            let right_session = right.host.create().await.unwrap();
+            let gateway = RemoteGateway::over(&[&left, &right]).await;
+            gateway.until_sessions(2).await;
+            let (url, initial, other) = if mode == "gateway" {
+                (
+                    gateway.url(),
+                    format!("{}:{left_session}", left.host.hello().host_id),
+                    format!("{}:{right_session}", right.host.hello().host_id),
+                )
+            } else {
+                (left.url(), left_session.clone(), String::new())
+            };
+            let (mut world, shell) =
+                connect_world_and_shell_at(&client_dir, &url, &[&initial]).await;
+            if mode == "local" {
+                world.control = Control::local(left.host.clone());
+            }
+            let (mut app, mut writer, root) = app_over(&shell).await;
+            // The client runs the provider's flow itself, whichever host stores
+            // the result.
+            register_controlled_oauth(
+                &world,
+                "credential-fake",
+                "host-login-secret",
+                LoginGate::Ready,
+            )
+            .await;
+            world
+                .auth
+                .insert_bare(
+                    "client-sentinel",
+                    AuthCredential::ApiKey {
+                        key: "client-only-secret".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let client_before = stored_auth_bytes(&world.auth).unwrap();
+            assert_ne!(client_before, stored_auth_bytes(&auth).unwrap());
+            world.auth.reset_credential_read_count();
+            assert_eq!(credential_host(&world), "credential-left");
+            let (tx, rx) = oneshot::channel();
+            spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, tx);
+            let rows = rx.await.unwrap();
+            let page = rows
+                .iter()
+                .flatten()
+                .map(|s| s.text.as_str())
+                .collect::<String>();
+            assert!(
+                page.contains("credential-left") && page.contains("host-sentinel"),
+                "{page}"
+            );
+            assert!(
+                !page.contains("client-sentinel") && !page.contains("secret"),
+                "{page}"
+            );
+
+            let request = pick_credential(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut writer,
+                &root,
+                CommandAction::OpenLoginSelector,
+                "credential-fake add account",
+            )
+            .await;
+            assert!(request.target.session == initial && request.target.host == "credential-left");
+            if mode == "gateway" {
+                apply_focus_request(
+                    &mut app,
+                    &shell,
+                    &mut world,
+                    FocusRequest::Resume(other.clone()),
+                )
+                .await;
+                settle_pending_transition(&mut app, &shell, &mut world).await;
+                assert_eq!(credential_host(&world), "credential-right");
+            }
+            let (redraw, _) = unbounded_channel();
+            let mut login = None;
+            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+            answer_login(&shell, &mut app, &mut writer, &root, "Account name", "work").await;
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(3), &mut login.as_mut().unwrap().handle)
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied)))
+                ),
+                "{outcome:?}"
+            );
+            finish_login(&mut world, &shell, &mut app, &mut login, outcome);
+            assert!(
+                main_notices(&world)
+                    .last()
+                    .unwrap()
+                    .contains("on credential-left.")
+            );
+            assert!(
+                matches!(auth.get_account("credential-fake", "work").await.unwrap(), Some(AuthCredential::OAuth(c)) if c.access == "host-login-secret" && c.expires == i64::MAX)
+            );
+            if mode == "gateway" {
+                assert!(
+                    right
+                        .host
+                        .credential_overview(&right_session)
+                        .await
+                        .unwrap()
+                        .stored
+                        .is_empty()
+                );
+                apply_focus_request(
+                    &mut app,
+                    &shell,
+                    &mut world,
+                    FocusRequest::Resume(initial.clone()),
+                )
+                .await;
+                settle_pending_transition(&mut app, &shell, &mut world).await;
+            }
+            // Exact reauthentication changes only the selected account, not
+            // its sibling or the default slot, and never asks for a new label.
+            let unnamed_before =
+                serde_json::to_value(auth.get_account("credential-fake", "").await.unwrap())
+                    .unwrap();
+            auth.remove_account("credential-fake", "work")
+                .await
+                .unwrap();
+            auth.insert_account(
+                "credential-fake",
+                "work",
+                AuthCredential::ApiKey {
+                    key: "stale-work-secret".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let request = pick_credential(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut writer,
+                &root,
+                CommandAction::OpenLoginSelector,
+                "credential-fake work reauthenticate",
+            )
+            .await;
+            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(3), &mut login.as_mut().unwrap().handle)
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied)))
+                ),
+                "{outcome:?}"
+            );
+            finish_login(&mut world, &shell, &mut app, &mut login, outcome);
+            assert_eq!(
+                serde_json::to_value(auth.get_account("credential-fake", "").await.unwrap())
+                    .unwrap(),
+                unnamed_before
+            );
+            assert_eq!(
+                auth.accounts("credential-fake")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .default,
+                ""
+            );
+            assert!(
+                matches!(auth.get_account("credential-fake", "work").await.unwrap(), Some(AuthCredential::OAuth(c)) if c.access == "host-login-secret")
+            );
+            let request = pick_credential(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut writer,
+                &root,
+                CommandAction::OpenDefaultAccountSelector,
+                "credential-fake work",
+            )
+            .await;
+            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+            assert_eq!(
+                auth.accounts("credential-fake")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .default,
+                "work"
+            );
+            let request = pick_credential(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut writer,
+                &root,
+                CommandAction::OpenLogoutSelector,
+                "credential-fake work",
+            )
+            .await;
+            if mode == "gateway" {
+                apply_focus_request(
+                    &mut app,
+                    &shell,
+                    &mut world,
+                    FocusRequest::Resume(other.clone()),
+                )
+                .await;
+                settle_pending_transition(&mut app, &shell, &mut world).await;
+            }
+            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+            fill_credentials(&shell).await;
+            let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+            assert!(page.contains("credential-left"), "{page}");
+            focus_overlay(&mut app, &root);
+            press(&mut app, &mut writer, b"\r").await;
+            let request = shell.borrow().take_auth_request().unwrap();
+            assert!(request.target.session == initial && request.target.host == "credential-left");
+            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+            let set = auth.accounts("credential-fake").await.unwrap().unwrap();
+            assert_eq!(set.default, "");
+            assert_eq!(set.accounts.len(), 1);
+            assert!(
+                main_notices(&world)
+                    .last()
+                    .unwrap()
+                    .starts_with("credential-left:")
+            );
+            if mode == "gateway" {
+                apply_focus_request(
+                    &mut app,
+                    &shell,
+                    &mut world,
+                    FocusRequest::Resume(initial.clone()),
+                )
+                .await;
+                settle_pending_transition(&mut app, &shell, &mut world).await;
+            }
+            auth.insert_account(
+                "credential-fake",
+                "sibling",
+                AuthCredential::ApiKey {
+                    key: "host-sibling-secret".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let request = pick_credential(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut writer,
+                &root,
+                CommandAction::OpenLogoutSelector,
+                "credential-fake Unnamed",
+            )
+            .await;
+            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+            fill_credentials(&shell).await;
+            focus_overlay(&mut app, &root);
+            type_text(&mut app, &mut writer, "remove all").await;
+            press(&mut app, &mut writer, b"\r").await;
+            let request = shell.borrow().take_auth_request().unwrap();
+            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+            assert!(auth.get("credential-fake").await.unwrap().is_none());
+            let request = pick_credential(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut writer,
+                &root,
+                CommandAction::OpenLogoutSelector,
+                "host-sentinel",
+            )
+            .await;
+            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+            assert!(auth.get("host-sentinel").await.unwrap().is_none());
+            assert_eq!(world.auth.credential_read_count(), 0);
+            assert_eq!(stored_auth_bytes(&world.auth).unwrap(), client_before);
+            gateway.shutdown().await;
+            right.shutdown().await;
+            left.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_ui_reports_unsupported_without_client_fallback() {
+        let host_dir = TempDir::new().unwrap();
+        let client_dir = TempDir::new().unwrap();
+        let (remote, auth) = credential_fixture(&host_dir).await;
+        let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &[]).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        register_controlled_oauth(&world, "credential-fake", "new-access", LoginGate::Ready).await;
+        world
+            .auth
+            .insert_bare(
+                "client-sentinel",
+                AuthCredential::ApiKey {
+                    key: "client-only-secret".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let before = stored_auth_bytes(&world.auth);
+        world.auth.reset_credential_read_count();
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&format!("{}/unsupported", remote.url())).unwrap(),
+        );
+        for action in [
+            CommandAction::OpenLoginSelector,
+            CommandAction::OpenLogoutSelector,
+            CommandAction::OpenDefaultAccountSelector,
+        ] {
+            let (export, _) = unbounded_channel();
+            let (redraw, _) = unbounded_channel();
+            apply_command_action(&mut world, &shell, action, &export, &redraw).await;
+            focus_overlay(&mut app, &root);
+            type_text(&mut app, &mut writer, "credential-fake").await;
+            fill_credentials(&shell).await;
+            let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+            assert!(
+                page.contains("does not support credential management")
+                    && page.contains("credential-left"),
+                "{page}"
+            );
+            shell.borrow().overlays.borrow_mut().close_all();
+        }
+        let (tx, rx) = oneshot::channel();
+        spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, tx);
+        let page = rx
+            .await
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|s| s.text.as_str())
+            .collect::<String>();
+        assert!(
+            page.contains("does not support credential management")
+                && page.contains("credential-left"),
+            "{page}"
+        );
+        let (redraw, _) = unbounded_channel();
+        let mut login = None;
+        let request = AuthPickerTarget {
+            session: world.session().to_string(),
+            host: credential_host(&world),
+        }
+        .request(AuthPickerAction::LogoutBare {
+            provider_id: "client-sentinel".into(),
+        });
+        apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
         assert!(
             main_notices(&world)
-                .iter()
-                .any(|n| n.contains("No stored credentials")),
-            "{:?}",
-            main_notices(&world)
+                .last()
+                .unwrap()
+                .contains("credential-left: This host does not support")
         );
+        start_login(
+            &world,
+            &shell,
+            &mut app,
+            &mut login,
+            &redraw,
+            "credential-fake".into(),
+            "Controlled OAuth".into(),
+            LoginTarget::new_account(None),
+            world.session().to_string(),
+            credential_host(&world),
+        );
+        let result = (&mut login.as_mut().unwrap().handle).await;
+        finish_login(&mut world, &shell, &mut app, &mut login, result);
+        let notice = main_notices(&world).last().unwrap().clone();
+        assert!(
+            notice.contains("on credential-left")
+                && notice.contains("does not support credential management"),
+            "{notice}"
+        );
+        assert!(!notice.contains("uncertain"), "{notice}");
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&format!(
+                "{}?token=url-credential-secret",
+                dead_url().await
+            ))
+            .unwrap(),
+        );
+        apply_command(&mut world, &shell, CommandAction::OpenLoginSelector).await;
+        let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            page.contains("Could not reach the host") && page.contains("credential-left"),
+            "{page}"
+        );
+        assert!(!page.contains("url-credential-secret"), "{page}");
+        assert_eq!(world.auth.credential_read_count(), 0);
+        assert_eq!(stored_auth_bytes(&world.auth), before);
+        assert!(auth.list().await.unwrap().is_empty());
+        remote.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn credential_ui_disconnect_is_uncertain_and_never_replayed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = TempDir::new().unwrap();
+        let (mut app, _, mut world, shell, _) = init_app_with_world(&dir, "streaming-text").await;
+        let local_host = world.host().clone();
+        register_controlled_oauth(&world, "credential-fake", "new-access", LoginGate::Ready).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap(),
+        );
+        let (release, released) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            // The store request arrives and the connection dies without an
+            // answer, so whether the host wrote is unknowable here.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let count = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.contains("/credentials") && request.contains("\"store\""));
+            socket.shutdown().await.unwrap();
+            drop(socket);
+            tokio::select! {
+                _ = released => {},
+                _ = listener.accept() => panic!("credential store was replayed after disconnect"),
+            }
+        });
+        let before = stored_auth_bytes(&world.auth);
+        let (redraw, _) = unbounded_channel();
+        let mut login = None;
+        start_login(
+            &world,
+            &shell,
+            &mut app,
+            &mut login,
+            &redraw,
+            "credential-fake".into(),
+            "Controlled OAuth".into(),
+            LoginTarget::new_account(None),
+            world.session().to_string(),
+            "opening-host".into(),
+        );
+        let result =
+            tokio::time::timeout(Duration::from_secs(3), &mut login.as_mut().unwrap().handle)
+                .await
+                .unwrap();
+        finish_login(&mut world, &shell, &mut app, &mut login, result);
+        let notice = main_notices(&world).last().unwrap().clone();
+        assert!(
+            notice.contains("opening-host") && notice.contains("Could not confirm the change"),
+            "{notice}"
+        );
+        assert!(
+            !notice.contains("cancelled") && !notice.contains("Logged in"),
+            "{notice}"
+        );
+        assert_eq!(stored_auth_bytes(&world.auth), before);
+        release.send(()).unwrap();
+        peer.await.unwrap();
+        local_host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn credential_ui_management_reads_do_not_block_the_drive_loop() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, mut writer, mut world, shell, root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        let local_host = world.host().clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap(),
+        );
+        let (accepted, accept_rx) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            let _ = released.await;
+            drop(socket);
+        });
+        let (export, _) = unbounded_channel();
+        let (redraw, _) = unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            apply_command_action(
+                &mut world,
+                &shell,
+                CommandAction::OpenLoginSelector,
+                &export,
+                &redraw,
+            ),
+        )
+        .await
+        .expect("opening cannot await the host read");
+        accept_rx.await.unwrap();
+        let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(page.contains("Loading credentials"), "{page}");
+        focus_overlay(&mut app, &root);
+        writer.write_all(b"\x1b").unwrap();
+        drop(writer);
+        let (mut theme, mut history) = drive_parts();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme,
+                &mut history,
+            ),
+        )
+        .await
+        .expect("drive exits while credential read remains pending")
+        .unwrap();
+        release.send(()).unwrap();
+        peer.await.unwrap();
+        local_host.shutdown().await;
+    }
+
+    /// An empty store explains why runtime and environment credentials cannot be removed.
+    #[tokio::test]
+    async fn logout_picker_empty_explains_storage_in_place() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenLogoutSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(page.contains("No stored credentials"), "{page}");
+        assert!(page.contains(&credential_host(&world)), "{page}");
+        shut_down(&world).await;
     }
 
     #[test]
@@ -14893,112 +15670,6 @@ mod tests {
         assert_eq!(many_spaces, "a    b", "a label shows as stored");
     }
 
-    #[tokio::test]
-    async fn connected_auth_refusals_use_a_positively_calibrated_zero_read_oracle() {
-        use aj_models::auth::AuthCredential;
-
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell, mut app, mut writer, root) =
-            world_shell_app(&dir, "streaming-text", default_layers()).await;
-
-        let observer = world.auth.clone();
-        world.auth.reset_credential_read_count();
-        observer
-            .list()
-            .await
-            .expect("calibration read through clone");
-        assert_eq!(world.auth.credential_read_count(), 1);
-        observer
-            .insert_bare(
-                "sentinel",
-                AuthCredential::ApiKey {
-                    key: "client-only-secret".to_string(),
-                },
-            )
-            .await
-            .expect("calibration read-modify-write through clone");
-        assert_eq!(world.auth.credential_read_count(), 2);
-        world.auth.reset_credential_read_count();
-
-        world.control = Control::remote(
-            crate::remote::RemoteClient::new("http://127.0.0.1:9")
-                .expect("syntactic remote endpoint"),
-        );
-        for action in [
-            CommandAction::OpenLoginSelector,
-            CommandAction::OpenLogoutSelector,
-            CommandAction::OpenDefaultAccountSelector,
-        ] {
-            assert!(matches!(
-                apply_command(&mut world, &shell, action).await,
-                ActionEffect::Redraw
-            ));
-        }
-        assert_eq!(
-            world.auth.credential_read_count(),
-            0,
-            "mutating auth commands refuse before the client store"
-        );
-
-        // Open /auth through the real palette and leave its PendingFetch for
-        // the production drive-loop drain.
-        writer.write_all(&[0x0f]).expect("write ctrl+o");
-        let event = app.next_input().await.expect("input event");
-        app.handle_input(event);
-        app.render(&root).expect("render palette");
-        writer
-            .write_all(b"auth status\r")
-            .expect("confirm auth status");
-        for _ in 0..12 {
-            let event = app.next_input().await.expect("input event");
-            app.handle_input(event);
-        }
-        assert!(shell.borrow().fetch_slot.borrow().is_some());
-
-        let mut theme_watch = inert_theme_watch();
-        let mut prompt_history_rx = None;
-
-        let observed_shell = Rc::clone(&shell);
-        let (exit, refused) = tokio::join!(
-            drive(
-                &mut app,
-                &root,
-                &shell,
-                &mut world,
-                &mut theme_watch,
-                &mut prompt_history_rx,
-            ),
-            async move {
-                writer.write_all(b"x").expect("wake drive loop");
-                let refused = settled(Duration::from_secs(3), || {
-                    let rows =
-                        flatten(&observed_shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-                    rows.contains("Auth status is local to the session host")
-                        .then_some(rows)
-                })
-                .await;
-                drop(writer);
-                refused
-            }
-        );
-        assert!(matches!(exit.unwrap(), SessionExit::Quit));
-        let refused = refused
-            .unwrap_or_else(|| flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n"));
-        assert!(
-            refused.contains("Auth status is local to the session host"),
-            "real auth fetch drain did not render refusal: {refused}"
-        );
-        assert!(!refused.contains("client-only-secret"));
-        assert_eq!(
-            world.auth.credential_read_count(),
-            0,
-            "the real auth fetch drain refused without a client-store read"
-        );
-    }
-
-    /// `/logout` lists a stored credential, and confirming it (the drive
-    /// loop's auth-request drain) removes it from `auth.json` and folds a
-    /// notice.
     #[tokio::test]
     async fn logout_removes_stored_credential_and_notes_it() {
         let dir = TempDir::new().expect("tempdir");
@@ -15044,7 +15715,7 @@ mod tests {
         assert!(
             main_notices(&world)
                 .iter()
-                .any(|n| n == "Logged out of anthropic (Unnamed account). Provider default: API key (--api-key override)."),
+                .any(|n| n == &format!("{}: Logged out of anthropic (Unnamed account). Provider default: API key (--api-key override).", credential_host(&world))),
             "{:?}",
             main_notices(&world)
         );
@@ -15076,8 +15747,8 @@ mod tests {
             .take_auth_request()
             .expect("bare logout request");
         assert!(matches!(
-            &request,
-            AuthPickerRequest::LogoutBare { provider_id } if provider_id == "anthropic"
+            &request.action,
+            AuthPickerAction::LogoutBare { provider_id } if provider_id == "anthropic"
         ));
 
         // A sibling adds an account after selection but before the host drains
@@ -15169,8 +15840,8 @@ mod tests {
             .take_auth_request()
             .expect("opaque row queued an account request");
         assert!(matches!(
-            &request,
-            AuthPickerRequest::ApplyAccount(AccountAction::Logout {
+            &request.action,
+            AuthPickerAction::ApplyAccount(AccountAction::Logout {
                 provider_id,
                 account_label,
             }) if provider_id == "a" && account_label == "b c"
@@ -15192,8 +15863,8 @@ mod tests {
         }
         let second_request = shell.borrow().take_auth_request().expect("second request");
         assert!(matches!(
-            &second_request,
-            AuthPickerRequest::ApplyAccount(AccountAction::Logout {
+            &second_request.action,
+            AuthPickerAction::ApplyAccount(AccountAction::Logout {
                 provider_id,
                 account_label,
             }) if provider_id == "a b" && account_label == "c"
@@ -15265,8 +15936,8 @@ mod tests {
         app.handle_input(event);
         let request = shell.borrow().take_auth_request().expect("queued request");
         assert!(matches!(
-            &request,
-            AuthPickerRequest::ApplyAccount(AccountAction::Logout {
+            &request.action,
+            AuthPickerAction::ApplyAccount(AccountAction::Logout {
                 provider_id,
                 account_label,
             }) if provider_id == "provider" && account_label == "wo\nrk"
@@ -15359,8 +16030,8 @@ mod tests {
         app.handle_input(event);
         let request = shell.borrow().take_auth_request().expect("account request");
         assert!(matches!(
-            &request,
-            AuthPickerRequest::ApplyAccount(AccountAction::SetDefault {
+            &request.action,
+            AuthPickerAction::ApplyAccount(AccountAction::SetDefault {
                 provider_id,
                 account_label,
             }) if provider_id == "provider" && account_label == "work"
@@ -15426,8 +16097,8 @@ mod tests {
             .take_auth_request()
             .expect("default account row parks a request");
         assert!(matches!(
-            &logout,
-            AuthPickerRequest::ApplyAccount(AccountAction::Logout {
+            &logout.action,
+            AuthPickerAction::ApplyAccount(AccountAction::Logout {
                 provider_id,
                 account_label,
             }) if provider_id == "provider" && account_label == "personal"
@@ -15441,6 +16112,7 @@ mod tests {
             logout,
         )
         .await;
+        fill_credentials(&shell).await;
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
         focus_overlay(&mut app, &root);
         writer
@@ -15453,8 +16125,8 @@ mod tests {
             .take_auth_request()
             .expect("replacement row parks a request");
         assert!(matches!(
-            &request,
-            AuthPickerRequest::ApplyAccount(AccountAction::LogoutWithNewDefault {
+            &request.action,
+            AuthPickerAction::ApplyAccount(AccountAction::LogoutWithNewDefault {
                 provider_id,
                 account_label,
                 new_default,
@@ -15497,18 +16169,24 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let mut login_session = None;
 
+        let request = AuthPickerTarget {
+            session: world.session().to_string(),
+            host: credential_host(&world),
+        }
+        .request(AuthPickerAction::ApplyAccount(AccountAction::Logout {
+            provider_id: "provider".to_string(),
+            account_label: "0safe".to_string(),
+        }));
         apply_auth_request(
             &mut world,
             &shell,
             &mut app,
             &mut login_session,
             &tx,
-            AuthPickerRequest::ApplyAccount(AccountAction::Logout {
-                provider_id: "provider".to_string(),
-                account_label: "0safe".to_string(),
-            }),
+            request,
         )
         .await;
+        fill_credentials(&shell).await;
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
         focus_overlay(&mut app, &root);
         // First row chooses the sibling as default; second removes all.
@@ -15522,8 +16200,8 @@ mod tests {
             .take_auth_request()
             .expect("remove all request");
         assert!(matches!(
-            &request,
-            AuthPickerRequest::ApplyAccount(AccountAction::LogoutAll {
+            &request.action,
+            AuthPickerAction::ApplyAccount(AccountAction::LogoutAll {
                 expected_accounts,
                 ..
             }) if expected_accounts == &vec!["0safe".to_string(), "work".to_string()]
@@ -15559,7 +16237,9 @@ mod tests {
             &tx,
             "anthropic".to_string(),
             "Anthropic (Claude Pro/Max)".to_string(),
-            LoginTarget::NewAccount,
+            LoginTarget::new_account(None),
+            world.session().to_string(),
+            credential_host(&world),
         );
 
         assert!(login_session.is_some(), "session tracked");
@@ -15590,7 +16270,9 @@ mod tests {
             &tx,
             provider.to_string(),
             "Controlled OAuth".to_string(),
-            LoginTarget::NewAccount,
+            LoginTarget::new_account(None),
+            world.session().to_string(),
+            credential_host(&world),
         );
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
         let outcome = tokio::time::timeout(
@@ -15599,7 +16281,13 @@ mod tests {
         )
         .await
         .expect("first login requires no account-name input");
-        assert!(matches!(outcome, Ok(Ok(()))), "{outcome:?}");
+        assert!(
+            matches!(
+                outcome,
+                Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied)))
+            ),
+            "{outcome:?}"
+        );
         finish_login(&mut world, &shell, &mut app, &mut login_session, outcome);
         assert!(login_session.is_none(), "session cleared");
         assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
@@ -15612,9 +16300,11 @@ mod tests {
         assert_eq!(accounts.default.as_deref(), Some(""));
         assert_eq!(accounts.selected, None);
         assert!(
-            main_notices(&world)
-                .iter()
-                .any(|n| n == "Logged in to Controlled OAuth. Account added."),
+            main_notices(&world).iter().any(|n| n
+                == &format!(
+                    "Logged in to Controlled OAuth on {}. Account added.",
+                    credential_host(&world)
+                )),
             "{:?}",
             main_notices(&world)
         );
@@ -15638,7 +16328,9 @@ mod tests {
             &tx,
             "anthropic".to_string(),
             "Anthropic".to_string(),
-            LoginTarget::NewAccount,
+            LoginTarget::new_account(None),
+            world.session().to_string(),
+            credential_host(&world),
         );
         login_session.as_mut().unwrap().handle.abort();
 
@@ -15647,16 +16339,17 @@ mod tests {
             &shell,
             &mut app,
             &mut login_session,
-            Ok(Err(AuthError::OAuth(
-                aj_models::oauth::OAuthError::Cancelled,
-            ))),
+            Ok(LoginOutcome::Store(Ok(CredentialOutcome::Failed {
+                code: "test".into(),
+                message: "failed".into(),
+            }))),
         );
         assert!(login_session.is_none());
         assert_eq!(shell.borrow().overlays.borrow().depth(), 0);
         assert!(
             main_notices(&world)
                 .iter()
-                .any(|n| n.contains("Login to Anthropic failed")),
+                .any(|n| n.contains("Login to Anthropic on") && n.contains("failed")),
             "{:?}",
             main_notices(&world)
         );
@@ -15781,10 +16474,10 @@ mod tests {
             .take_auth_request()
             .expect("provider add-account row parks a request");
         assert!(matches!(
-            &request,
-            AuthPickerRequest::Login {
+            &request.action,
+            AuthPickerAction::Login {
                 provider_id: selected,
-                target: LoginTarget::NewAccount,
+                target: LoginTarget::NewAccount { .. },
                 ..
             } if selected == provider_id
         ));
@@ -15828,7 +16521,10 @@ mod tests {
         .await
         .expect("typed account label reaches controlled OAuth");
         assert!(
-            matches!(result, Ok(Ok(()))),
+            matches!(
+                result,
+                Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied)))
+            ),
             "labeled login failed after account input: {result:?}"
         );
         finish_login(&mut world, &shell, &mut app, &mut login_session, result);
@@ -15860,239 +16556,222 @@ mod tests {
         );
     }
 
-    /// Esc reaches the same abort-and-join barrier through the drive loop. The
-    /// provider's drop witness makes removing the call site observable before
-    /// any post-drive await can let an otherwise detached task terminate.
     #[tokio::test]
-    async fn drive_loop_esc_joins_login_before_reporting_cancellation() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut app, mut writer, mut world, shell, root) =
-            init_app_with_world(&dir, "streaming-text").await;
-        let provider_id = "drive-cancel";
+    async fn drive_loop_render_error_cancels_and_joins_login() {
+        struct FailingTty {
+            inner: TestTty,
+            fail: Arc<AtomicBool>,
+        }
+
+        impl Write for FailingTty {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail.load(Ordering::Relaxed) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "terminal render failed",
+                    ));
+                }
+                vaxis::tty::Tty::writer(&mut self.inner).write(bytes)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl vaxis::tty::Tty for FailingTty {
+            fn writer(&mut self) -> &mut dyn Write {
+                self
+            }
+
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.inner.read(buf)
+            }
+
+            fn get_winsize(&self) -> std::io::Result<vaxis::Winsize> {
+                self.inner.get_winsize()
+            }
+
+            fn notify_winsize(
+                &self,
+                handler: vaxis::tty::ResizeHandler,
+            ) -> std::io::Result<vaxis::tty::HandlerId> {
+                self.inner.notify_winsize(handler)
+            }
+
+            fn remove_winsize(&self, id: vaxis::tty::HandlerId) {
+                self.inner.remove_winsize(id);
+            }
+        }
+
+        let dir = process_lifetime_test_dir();
+        let fail = Arc::new(AtomicBool::new(false));
+        let (mut app, mut writer, mut world, shell, root) = init_app_with_world_and_tty(
+            dir,
+            "streaming-text",
+            Box::new(FailingTty {
+                inner: TestTty::new(),
+                fail: Arc::clone(&fail),
+            }),
+        )
+        .await;
+        let provider_id = "render-error-login";
         let (started, terminated) =
             register_controlled_oauth(&world, provider_id, "new-access", LoginGate::Waiting).await;
         let before = stored_auth_bytes(&world.auth);
-        *shell.borrow().auth_request.borrow_mut() = Some(AuthPickerRequest::Login {
-            provider_id: provider_id.to_string(),
-            provider_name: "Controlled OAuth".to_string(),
-            target: LoginTarget::NewAccount,
-        });
-
-        // One ordinary key gives the input arm a turn to drain the parked login
-        // request. The provider witness then releases Esc and EOF only after the
-        // real task is waiting and the dialog has synchronously taken focus.
-        writer.write_all(b"x").expect("trigger auth request drain");
-        let cancel_input = tokio::spawn(async move {
-            started.notified().await;
-            writer.write_all(b"\x1b").expect("cancel login");
-            drop(writer);
-        });
+        *shell.borrow().auth_request.borrow_mut() = Some(
+            AuthPickerTarget {
+                session: world.session().to_string(),
+                host: credential_host(&world),
+            }
+            .request(AuthPickerAction::Login {
+                provider_id: provider_id.to_string(),
+                provider_name: "Controlled OAuth".to_string(),
+                target: LoginTarget::new_account(None),
+            }),
+        );
+        writer.write_all(b"x").expect("drain login request");
         let (mut theme_watch, mut prompt_history_rx) = drive_parts();
-        let exit = tokio::time::timeout(
-            Duration::from_secs(2),
-            drive(
+        let error = {
+            let driving = drive(
                 &mut app,
                 &root,
                 &shell,
                 &mut world,
                 &mut theme_watch,
                 &mut prompt_history_rx,
-            ),
-        )
-        .await
-        .expect("drive processes login cancellation")
-        .expect("drive exits without a fatal error");
-
-        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
+            );
+            tokio::pin!(driving);
+            tokio::select! {
+                _ = started.notified() => {}
+                _ = &mut driving => panic!("drive exited before login started"),
+                _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("login did not start"),
+            }
+            assert!(
+                !terminated.load(Ordering::Relaxed),
+                "provider is still waiting"
+            );
+            assert!(shell.borrow().keymap_ctx.borrow().login_active);
+            // Keep input open so only an actual terminal write failure can exit.
+            fail.store(true, Ordering::Relaxed);
+            writer.write_all(b"x").expect("wake drive for rendering");
+            tokio::time::timeout(Duration::from_secs(2), &mut driving)
+                .await
+                .expect("render failure must cancel and join login")
+                .err()
+                .expect("terminal rendering must fail")
+        };
+        // No yield after drive returns: a detached task cannot finish later and
+        // satisfy the provider future's destruction witness on this runtime.
+        assert!(terminated.load(Ordering::Relaxed), "login outlived drive");
+        let Some(vaxis::Error::Io(io_error)) = error.downcast_ref::<vaxis::Error>() else {
+            panic!("expected original terminal I/O error, got {error:?}");
+        };
+        assert_eq!(io_error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(io_error.to_string(), "terminal render failed");
+        assert_eq!(stored_auth_bytes(&world.auth), before);
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0);
         assert!(
-            terminated.load(Ordering::Relaxed),
-            "drive returned before the login task was destroyed"
+            main_notices(&world)
+                .last()
+                .is_some_and(|notice| notice.ends_with(" cancelled."))
         );
-        cancel_input.await.expect("cancel input task");
-        assert_eq!(stored_auth_bytes(&world.auth), before, "auth.json changed");
         assert!(
             world
                 .auth
                 .get_api_key(provider_id, None)
                 .await
-                .expect("resolve after drive cancellation")
-                .is_none(),
-            "drive cancellation installed a resolver winner"
+                .unwrap()
+                .is_none()
         );
-        let notices = main_notices(&world);
-        assert!(
-            notices
-                .last()
-                .is_some_and(|notice| notice == "Login to Controlled OAuth cancelled."),
-            "drive cancellation outcome: {notices:?}"
-        );
-        assert!(
-            notices
-                .iter()
-                .all(|notice| !notice.contains("Logged in to Controlled OAuth")),
-            "drive cancellation also reported success: {notices:?}"
-        );
-        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
     }
 
-    /// Esc during non-yielding provider work cannot close or report before the
-    /// task terminates. If that work returns credentials and the immediately
-    /// ready persistence path commits, the joined outcome is success. A parent
-    /// picker remains as a sentinel proving the login overlay closes once.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn drive_loop_esc_during_non_yielding_login_waits_for_committed_success() {
-        let dir = process_lifetime_test_dir();
-        let (mut app, mut writer, mut world, shell, root) =
-            init_app_with_world(dir, "streaming-text").await;
-        let provider_id = "cancel-reactivate";
-        let account = "work";
-        let gate = Arc::new(NonYieldingLoginGate::default());
-        // A failed assertion must not strand a runtime worker in the condition
-        // variable while the test runtime tries to shut down.
-        let _release_on_drop = LoginGateRelease(Arc::clone(&gate));
-        let (started, terminated) = register_controlled_oauth(
-            &world,
-            provider_id,
-            "new-access",
-            LoginGate::NonYielding(Arc::clone(&gate)),
-        )
-        .await;
-        world
-            .auth
-            .insert_account(
-                provider_id,
-                account,
-                AuthCredential::OAuth(OAuthCredentials::new("old-refresh", "old-access", i64::MAX)),
+    /// Esc and EOF reach the termination barrier through the drive loop. The
+    /// provider's drop witness makes removing the call site observable before
+    /// any post-drive await can let an otherwise detached task terminate.
+    #[tokio::test]
+    async fn drive_loop_esc_and_eof_join_login_before_reporting_cancellation() {
+        for cancel_key in [b"\x1b".as_slice(), b"".as_slice()] {
+            let dir = TempDir::new().expect("tempdir");
+            let (mut app, mut writer, mut world, shell, root) =
+                init_app_with_world(&dir, "streaming-text").await;
+            let provider_id = "drive-cancel";
+            let (started, terminated) =
+                register_controlled_oauth(&world, provider_id, "new-access", LoginGate::Waiting)
+                    .await;
+            let before = stored_auth_bytes(&world.auth);
+            *shell.borrow().auth_request.borrow_mut() = Some(
+                AuthPickerTarget {
+                    session: world.session().to_string(),
+                    host: credential_host(&world),
+                }
+                .request(AuthPickerAction::Login {
+                    provider_id: provider_id.to_string(),
+                    provider_name: "Controlled OAuth".to_string(),
+                    target: LoginTarget::new_account(None),
+                }),
+            );
+
+            // One ordinary key gives the input arm a turn to drain the parked login
+            // request. The provider witness then releases Esc and EOF only after the
+            // real task is waiting and the dialog has synchronously taken focus.
+            writer.write_all(b"x").expect("trigger auth request drain");
+            let cancel_input = tokio::spawn(async move {
+                started.notified().await;
+                writer
+                    .write_all(cancel_key)
+                    .expect("cancel login or send EOF");
+                drop(writer);
+            });
+            let (mut theme_watch, mut prompt_history_rx) = drive_parts();
+            let exit = tokio::time::timeout(
+                Duration::from_secs(2),
+                drive(
+                    &mut app,
+                    &root,
+                    &shell,
+                    &mut world,
+                    &mut theme_watch,
+                    &mut prompt_history_rx,
+                ),
             )
             .await
-            .expect("seed existing account");
-        let before = stored_auth_bytes(&world.auth).expect("seeded auth.json");
-        let resolved_before = world
-            .auth
-            .get_api_key(provider_id, None)
-            .await
-            .expect("resolve old default")
-            .expect("old default present");
-        assert_eq!(resolved_before.key, "old-access", "fixture old winner");
-        assert_eq!(
-            resolved_before.source,
-            CredentialSource::Account(account.to_string()),
-            "fixture default account"
-        );
-
-        let effect = apply_command(&mut world, &shell, CommandAction::OpenLoginSelector).await;
-        assert!(matches!(effect, ActionEffect::OpenedOverlay));
-        assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "sentinel open");
-        *shell.borrow().auth_request.borrow_mut() = Some(AuthPickerRequest::Login {
-            provider_id: provider_id.to_string(),
-            provider_name: "Controlled OAuth".to_string(),
-            target: LoginTarget::ExistingAccount(Some(account.to_string())),
-        });
-
-        let auth = world.auth.clone();
-        let chat = Rc::clone(&world.chat);
-        let overlays = Rc::clone(&shell.borrow().overlays);
-        let (mut theme_watch, mut prompt_history_rx) = drive_parts();
-        writer.write_all(b"x").expect("trigger auth request drain");
-        let mut drive = Box::pin(drive(
-            &mut app,
-            &root,
-            &shell,
-            &mut world,
-            &mut theme_watch,
-            &mut prompt_history_rx,
-        ));
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::select! {
-                () = started.notified() => {}
-                _ = &mut drive => panic!("drive returned before provider start"),
-            }
-        })
-        .await
-        .expect("provider enters non-yielding work");
-        writer.write_all(b"\x1b").expect("cancel login");
-        drop(writer);
-
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), &mut drive)
-                .await
-                .is_err(),
-            "drive returned before the non-yielding login terminated"
-        );
-        assert_eq!(
-            overlays.borrow().depth(),
-            2,
-            "login overlay closed before the termination barrier"
-        );
-        let pending_notices = notices_of(&chat.borrow());
-        assert!(
-            pending_notices.iter().all(|notice| {
-                !notice.contains("Logged in to Controlled OAuth")
-                    && !notice.contains("Login to Controlled OAuth cancelled")
-            }),
-            "login outcome reported before termination: {pending_notices:?}"
-        );
-        assert_eq!(
-            stored_auth_bytes(&auth),
-            Some(before.clone()),
-            "early auth write"
-        );
-        let still_old = auth
-            .get_api_key(provider_id, None)
-            .await
-            .expect("resolve while login remains blocked")
-            .expect("old default remains present");
-        assert_eq!(still_old.key, "old-access", "early resolver change");
-        assert_eq!(
-            still_old.source,
-            CredentialSource::Account(account.to_string()),
-            "blocked login changed the selected default slot"
-        );
-
-        gate.release();
-        let exit = tokio::time::timeout(Duration::from_secs(2), &mut drive)
-            .await
-            .expect("drive joins committed login")
+            .expect("drive processes login cancellation")
             .expect("drive exits without a fatal error");
-        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
-        drop(drive);
-        assert!(
-            terminated.load(Ordering::Relaxed),
-            "provider did not finish after release"
-        );
 
-        let after = stored_auth_bytes(&world.auth).expect("reactivated auth.json");
-        assert_ne!(after, before, "reactivation never committed");
-        let resolved_after = world
-            .auth
-            .get_api_key(provider_id, None)
-            .await
-            .expect("resolve reactivated default")
-            .expect("reactivated default present");
-        assert_eq!(resolved_after.key, "new-access", "new resolver winner");
-        assert_eq!(
-            resolved_after.source,
-            CredentialSource::Account(account.to_string()),
-            "reactivation kept the exact default slot"
-        );
-        let notices = main_notices(&world);
-        assert!(
-            notices
-                .last()
-                .is_some_and(|notice| notice
-                    == &format!("Logged in to Controlled OAuth. Replaced {account}.")),
-            "committed outcome: {notices:?}"
-        );
-        assert!(
-            notices.iter().all(|notice| !notice.contains("cancelled")),
-            "committed login also reported cancellation: {notices:?}"
-        );
-        assert_eq!(
-            shell.borrow().overlays.borrow().depth(),
-            1,
-            "login dialog must close exactly once and leave its parent"
-        );
+            assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
+            assert!(
+                terminated.load(Ordering::Relaxed),
+                "drive returned before the login task was destroyed"
+            );
+            cancel_input.await.expect("cancel input task");
+            assert_eq!(stored_auth_bytes(&world.auth), before, "auth.json changed");
+            assert!(
+                world
+                    .auth
+                    .get_api_key(provider_id, None)
+                    .await
+                    .expect("resolve after drive cancellation")
+                    .is_none(),
+                "drive cancellation installed a resolver winner"
+            );
+            let notices = main_notices(&world);
+            assert!(
+                notices.last().is_some_and(|notice| notice
+                    == &format!(
+                        "Login to Controlled OAuth on {} cancelled.",
+                        credential_host(&world)
+                    )),
+                "drive cancellation outcome: {notices:?}"
+            );
+            assert!(
+                notices
+                    .iter()
+                    .all(|notice| !notice.contains("Logged in to Controlled OAuth")),
+                "drive cancellation also reported success: {notices:?}"
+            );
+            assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "dialog closed");
+        }
     }
 
     /// Reopening info while a read is pending binds each reply to the overlay
@@ -19938,19 +20617,15 @@ mod tests {
             )
             .await;
             let (redraw, _rx) = unbounded_channel();
-            apply_auth_request(
-                &mut world,
-                &shell,
-                &mut app,
-                &mut None,
-                &redraw,
-                AuthPickerRequest::SelectAccount {
-                    session: session.clone(),
-                    provider: info.provider.clone(),
-                    account: None,
-                },
-            )
-            .await;
+            let request = AuthPickerTarget {
+                session: world.session().to_string(),
+                host: credential_host(&world),
+            }
+            .request(AuthPickerAction::SelectAccount {
+                provider: info.provider.clone(),
+                account: None,
+            });
+            apply_auth_request(&mut world, &shell, &mut app, &mut None, &redraw, request).await;
 
             assert!(matches!(
                 apply_command(&mut world, &shell, CommandAction::OpenSessionEnv).await,
@@ -24043,9 +24718,8 @@ mod tests {
                     .take_auth_request()
                     .expect("confirmed account");
                 assert_eq!(
-                    request,
-                    AuthPickerRequest::SelectAccount {
-                        session: session.clone(),
+                    &request.action,
+                    &AuthPickerAction::SelectAccount {
                         provider: provider.clone(),
                         account: expected.map(String::from),
                     }

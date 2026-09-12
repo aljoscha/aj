@@ -33,6 +33,8 @@ pub(crate) struct Connected {
     /// for a gateway, whose selected host's directory arrives in its directory
     /// rows instead.
     pub(crate) working_directory: Option<PathBuf>,
+    /// Safe display name for a direct host. Gateway names come from directory rows.
+    pub(crate) host_label: Option<String>,
     /// Whether the session was created by this connect, which is what decides
     /// if it gets a fresh session's notices.
     pub(crate) created: bool,
@@ -93,6 +95,16 @@ pub(crate) async fn connect(
     Ok(Connected {
         control,
         session,
+        host_label: working_directory.as_ref().and_then(|_| {
+            crate::sidebar::host_label(&DirectoryHost {
+                id: Some(hello.host_id),
+                name: hello.name,
+                address: None,
+                working_directory: None,
+                unreachable: false,
+            })
+            .map(str::to_string)
+        }),
         working_directory,
         created,
     })

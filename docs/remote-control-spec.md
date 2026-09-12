@@ -746,6 +746,7 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `session_info` | `GET /v1/sessions/{id}/info` | hosts |
   | `session_previews` | `GET /v1/previews` | hosts and gateways |
   | `prompt_history` | Workspace and All prompt-history reads | hosts and gateways |
+  | `credentials` | `GET` and `POST /v1/sessions/{id}/credentials` (section 5.12) | hosts |
   | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
   | `compaction_usage` | optional cumulative `usage` on durable `compaction_end`, identified by the frame's `entry_id` | hosts |
 
@@ -784,6 +785,41 @@ credential-free, protection is layered around it:
   not say why, and every accepted connection is logged with its resolved
   identity. The gate runs before routing, so an unauthorized peer cannot
   probe which endpoints exist.
+
+### 5.12 Host credentials
+
+`/v1/sessions/{id}/credentials` addresses the credential store of the
+session's owning host, so a gateway routes it like any session request. The
+session is only an address: the host checks it exists and neither resumes it
+nor takes its writer lock. Capability `credentials`.
+
+- `GET` returns `CredentialOverview`: the host's OAuth providers (id and
+  display name), one safe status row per provider account (provider, optional
+  label, default and configured flags, summary, optional detail), and a
+  `stored` map from provider id to `{kind:"bare"}` or `{kind:"accounts",
+  default, accounts:[labels...]}`. No keys or tokens are returned and the read
+  never refreshes anything.
+- `POST` takes one `CredentialMutation`, tagged by `action`:
+  `store {provider, target, credentials}`, `logout_bare {provider}`,
+  `logout {provider, account_label}`, `set_default {provider,
+  account_label}`, `logout_with_new_default {provider, account_label,
+  new_default}`, or `logout_all {provider, expected_accounts}`. Unknown
+  fields are refused before anything is written. The host applies the store's
+  own exact-label, storage-shape and lock-time checks. The answer is tagged by
+  `outcome`: `applied`, `removing_default {provider, account_label}` (the
+  frontend offers a replacement default or removal of the whole set), or
+  `failed {code, message}`.
+
+Login is the client's work up to the last step. The browser is where the user
+sits, so the client runs the provider's OAuth flow itself, exactly as a local
+run does, and then sends the finished credentials as a `store` mutation. Its
+`target` is `{kind:"new", label}` (`null` for a provider's first, bare
+credential, a string to add an account) or `{kind:"replace", label}` (`null`
+for the bare credential, a string for that exact account). A duplicate label
+is refused on the client before the browser opens. Cancelling during
+authorization stores nothing anywhere. A transport failure after the store
+request left is an uncertain write: the client says so and never retries on
+its own.
 
 ## 6. The gateway
 
@@ -884,8 +920,8 @@ After creation, selection uses the account route rather than the inference
 settings route. Account choices are session-scoped and provider-local,
 never changes to config or auth-store defaults. There is no account footer
 field and no new config setting. Login, logout, and auth default management
-remain local operations. The wire carries selection and non-secret account
-metadata only, not credentials.
+change the host's store through the credentials route (section 5.12). The
+account route carries selection and non-secret account metadata only.
 
 The session environment overlay is separate from inference settings. Any
 client can read or edit it after creation through the environment routes
@@ -939,8 +975,9 @@ The boundary of what works over the wire is explicit. Supported: prompt,
 steer, cancel, queue withdraw and clear, settings including model switch
 and thinking display, compaction, task kill, the task-output overlay,
 tagging, archiving, environment overlay reads and edits, session account
-reads and selection, HTML export, the session-info and provider-usage overlays
-(including confirmed host reset-credit consumption), the tree view and
+reads and selection, credential status, login, logout and provider defaults,
+HTML export, the session-info and provider-usage overlays (including confirmed
+host reset-credit consumption), the tree view and
 head switching, and session
 creation and switching. The prompt recall ring holds this run's own
 submissions only. On exit, the client prints the focused session's id and
@@ -948,13 +985,23 @@ an `aj connect <url> <session>` command using the connected endpoint and
 the complete id, including its host prefix through a gateway. URLs with
 userinfo, query parameters, fragments, or control characters are replaced
 by `"$AJ_CONNECT_URL"`, with an instruction to set it to the same connection
-URL. No usage summary is printed. Credential management is refused with a
-notice because it reads this client’s credential store. An
+URL. No usage summary is printed. An
 unsupported action never silently does nothing.
 
 Account selection attempts the host's endpoint and shows the ordinary
 unsupported-endpoint notice if the peer lacks it. It does not fall back to
-reading or modifying the client's auth store.
+reading or modifying the client's auth store. Credential pickers and the
+`/auth` overlay follow the same rule through section 5.12: they read the
+host's store, name the opening host, and keep its session address across
+focus changes. Login runs the OAuth flow on the client, opening the browser
+here when one is available, and stores the result on the host. Cancelling
+before the store closes the dialog with nothing written. A store request
+whose answer is lost is reported as unconfirmed, including a gateway's
+`host_unreachable` response. The notice asks the user to reopen auth status
+before retrying. Logout and provider-default changes also run off the input
+loop, including the status read after logout. Session switches do not wait
+for these writes, which retain their opening host. No write is retried
+automatically.
 
 Prompt-history search uses Control in local, direct, and gateway modes. Opening
 or switching scope starts a user-paced read off the input and render loops.

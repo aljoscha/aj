@@ -990,7 +990,7 @@ impl AuthStorage {
                     // neither validated nor refreshed. Treat it as
                     // unconfigured and let the caller prompt a fresh login
                     // rather than hard-erroring on what is effectively a typo.
-                    let Ok(provider) = self.lookup_oauth_provider(provider_id).await else {
+                    let Ok(provider) = self.oauth_provider(provider_id).await else {
                         return Ok(None);
                     };
                     let now = now_unix_ms();
@@ -1060,10 +1060,9 @@ impl AuthStorage {
         callbacks: &dyn OAuthCallbacks,
     ) -> Result<(), AuthError> {
         self.check_login_creation(provider_id, label).await?;
-        let provider = self.lookup_oauth_provider(provider_id).await?;
+        let provider = self.oauth_provider(provider_id).await?;
         let creds = provider.login(callbacks).await?;
-        self.commit_login_creation(provider_id, label, AuthCredential::OAuth(creds))
-            .await
+        self.store_new_login(provider_id, label, creds).await
     }
 
     /// Run OAuth for an explicitly selected existing bare credential or
@@ -1083,9 +1082,9 @@ impl AuthStorage {
         callbacks: &dyn OAuthCallbacks,
     ) -> Result<(), AuthError> {
         self.check_login_replacement(provider_id, label).await?;
-        let provider = self.lookup_oauth_provider(provider_id).await?;
+        let provider = self.oauth_provider(provider_id).await?;
         let creds = provider.login(callbacks).await?;
-        self.commit_login_replacement(provider_id, label, AuthCredential::OAuth(creds))
+        self.store_replacement_login(provider_id, label, creds)
             .await
     }
 
@@ -1105,12 +1104,16 @@ impl AuthStorage {
         }
     }
 
-    async fn commit_login_creation(
+    /// Store OAuth credentials obtained elsewhere as a new login, with the
+    /// same insert-only decision [`Self::login_account`] makes under its
+    /// final lock. This is how a host commits a login a client ran.
+    pub async fn store_new_login(
         &self,
         provider_id: &str,
         label: Option<&str>,
-        credential: AuthCredential,
+        credentials: OAuthCredentials,
     ) -> Result<(), AuthError> {
+        let credential = AuthCredential::OAuth(credentials);
         let _lock = FileLock::acquire(&self.path).await?;
         let mut data = self.read_credentials()?;
         match label {
@@ -1157,12 +1160,16 @@ impl AuthStorage {
         }
     }
 
-    async fn commit_login_replacement(
+    /// Store OAuth credentials obtained elsewhere over an existing login, with
+    /// the same exact-target decision [`Self::replace_login_account`] makes
+    /// under its final lock.
+    pub async fn store_replacement_login(
         &self,
         provider_id: &str,
         label: Option<&str>,
-        credential: AuthCredential,
+        credentials: OAuthCredentials,
     ) -> Result<(), AuthError> {
+        let credential = AuthCredential::OAuth(credentials);
         let _lock = FileLock::acquire(&self.path).await?;
         let mut data = self.read_credentials()?;
         match label {
@@ -1217,7 +1224,9 @@ impl AuthStorage {
     /// Look up an OAuth provider by id, returning a clone of the
     /// `Arc` so the caller can `.await` against it without holding
     /// the registry lock.
-    async fn lookup_oauth_provider(
+    /// The registered OAuth provider for `provider_id`. Running its flow needs
+    /// no stored state, so a client can authorize here and store elsewhere.
+    pub async fn oauth_provider(
         &self,
         provider_id: &str,
     ) -> Result<Arc<dyn OAuthProvider>, AuthError> {

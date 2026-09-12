@@ -369,6 +369,30 @@ impl RemoteClient {
         decode(response).await
     }
 
+    pub(crate) async fn credential_overview(
+        &self,
+        session: &str,
+    ) -> Result<aj_wire::CredentialOverview, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/credentials"))
+            .await
+    }
+
+    /// A transport failure after the request left is an uncertain write: the
+    /// caller reports that rather than retrying.
+    pub(crate) async fn mutate_credentials(
+        &self,
+        session: &str,
+        mutation: &aj_wire::CredentialMutation,
+    ) -> Result<aj_wire::CredentialOutcome, RemoteError> {
+        let response = self
+            .post(
+                &format!("/v1/sessions/{session}/credentials"),
+                encode(mutation)?,
+            )
+            .await?;
+        decode(response).await
+    }
+
     pub(crate) async fn session_info(
         &self,
         session: &str,

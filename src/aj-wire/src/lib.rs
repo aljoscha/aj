@@ -18,6 +18,9 @@ use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
+mod credentials;
+pub use credentials::*;
+
 mod session_preview;
 pub use session_preview::{SessionPreview, SessionPreviews};
 

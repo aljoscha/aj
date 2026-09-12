@@ -186,6 +186,33 @@ impl Control {
         Self::Remote(RemoteControl { client })
     }
 
+    /// The host's credential metadata: providers, status rows and stored
+    /// labels, never the credentials themselves.
+    pub(crate) async fn credential_overview(
+        &self,
+        session: &str,
+    ) -> Result<aj_wire::CredentialOverview, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.credential_overview(session).await?),
+            Self::Remote(remote) => Ok(remote.client.credential_overview(session).await?),
+        }
+    }
+
+    /// Change the host's credential store: store a login this client ran,
+    /// log out, or pick a default account.
+    pub(crate) async fn mutate_credentials(
+        &self,
+        session: &str,
+        mutation: aj_wire::CredentialMutation,
+    ) -> Result<aj_wire::CredentialOutcome, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.mutate_credentials(session, mutation).await?),
+            Self::Remote(remote) => {
+                Ok(remote.client.mutate_credentials(session, &mutation).await?)
+            }
+        }
+    }
+
     /// The in-process host, `None` in connect mode.
     ///
     /// For the two things only a local run can do: serving a control port
@@ -1175,3 +1202,6 @@ mod preview_tests {
         let _ = server.await;
     }
 }
+
+#[cfg(test)]
+mod credential_tests;

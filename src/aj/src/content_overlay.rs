@@ -24,7 +24,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use aj_app::auth::ProviderAuthStatus;
 use aj_app::commands::COMMANDS;
 use aj_app::keybindings::{
     ACTION_AGENT_PICKER, ACTION_BRANCH_MESSAGE, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP,
@@ -37,6 +36,7 @@ use aj_app::keybindings::{
 use aj_app::theme::{Theme, ThemeColor};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
 use aj_session::SessionStats;
+use aj_wire::CredentialStatus;
 use unicode_segmentation::UnicodeSegmentation;
 use vaxis::cell::{Segment, Style};
 use vaxis::key::{Key, Modifiers};
@@ -575,7 +575,7 @@ fn account_label_for_auth_row(
 /// account padding follows terminal cell width, and the summary is padded to a
 /// shared width on rows that carry a detail so subsequent columns line up.
 pub(crate) fn auth_rows(
-    statuses: &[ProviderAuthStatus],
+    statuses: &[CredentialStatus],
     styles: &ContentStyles,
     width_method: vaxis::gwidth::Method,
 ) -> Vec<Row> {
@@ -1151,7 +1151,7 @@ mod tests {
     fn auth_rows_render_summary_and_detail() {
         let rows = rows_text(&auth_rows(
             &[
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "anthropic".into(),
                     account_label: None,
                     is_default: false,
@@ -1159,7 +1159,7 @@ mod tests {
                     summary: "subscription".into(),
                     detail: Some("expires in 1h".into()),
                 },
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "openai".into(),
                     account_label: None,
                     is_default: false,
@@ -1181,7 +1181,7 @@ mod tests {
     fn auth_rows_represent_each_account_injectively_and_mark_only_the_default() {
         let rows = rows_text(&auth_rows(
             &[
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "anthropic".into(),
                     account_label: Some("work".into()),
                     is_default: true,
@@ -1189,7 +1189,7 @@ mod tests {
                     summary: "subscription".into(),
                     detail: None,
                 },
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "anthropic".into(),
                     account_label: Some("wo\nrk".into()),
                     is_default: false,
@@ -1197,7 +1197,7 @@ mod tests {
                     summary: "API key (stored)".into(),
                     detail: None,
                 },
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "anthropic".into(),
                     account_label: Some(String::new()),
                     is_default: false,
@@ -1229,7 +1229,7 @@ mod tests {
         let right = format!("{}y", "a".repeat(96));
         let rows = rows_text(&auth_rows(
             &[
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "provider".into(),
                     account_label: Some(left.clone()),
                     is_default: true,
@@ -1237,7 +1237,7 @@ mod tests {
                     summary: "subscription".into(),
                     detail: None,
                 },
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "provider".into(),
                     account_label: Some(right.clone()),
                     is_default: false,
@@ -1261,7 +1261,7 @@ mod tests {
     fn auth_rows_encode_spaces_before_the_prose_wrapper() {
         let rows = rows_text(&auth_rows(
             &[
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "provider".into(),
                     account_label: Some("a b".into()),
                     is_default: true,
@@ -1269,7 +1269,7 @@ mod tests {
                     summary: "subscription".into(),
                     detail: None,
                 },
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "provider".into(),
                     account_label: Some("a    b".into()),
                     is_default: false,
@@ -1291,7 +1291,7 @@ mod tests {
     fn auth_rows_disclose_bounded_geometry_for_over_limit_legacy_labels() {
         let label = format!("{}\u{1000}", "a".repeat(65_540));
         let rows = rows_text(&auth_rows(
-            &[ProviderAuthStatus {
+            &[CredentialStatus {
                 provider_id: "provider".into(),
                 account_label: Some(label),
                 is_default: true,
@@ -1321,7 +1321,7 @@ mod tests {
     fn auth_rows_budget_the_exact_limit_label_against_the_complete_row() {
         let label = format!("{}\u{0100}", "a".repeat(65_533));
         let rows = auth_rows(
-            &[ProviderAuthStatus {
+            &[CredentialStatus {
                 provider_id: "provider".into(),
                 account_label: Some(label),
                 is_default: true,
@@ -1359,7 +1359,7 @@ mod tests {
     fn auth_rows_tint_columns_from_styles() {
         let styles = test_styles();
         let rows = auth_rows(
-            &[ProviderAuthStatus {
+            &[CredentialStatus {
                 provider_id: "anthropic".into(),
                 account_label: None,
                 is_default: false,
@@ -1394,7 +1394,7 @@ mod tests {
     fn auth_rows_without_detail_have_no_muted_span() {
         let styles = test_styles();
         let rows = auth_rows(
-            &[ProviderAuthStatus {
+            &[CredentialStatus {
                 provider_id: "openai".into(),
                 account_label: None,
                 is_default: false,
@@ -1417,7 +1417,7 @@ mod tests {
         let styles = test_styles();
         let rows = auth_rows(
             &[
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "anthropic".into(), // widest id (9)
                     account_label: None,
                     is_default: false,
@@ -1425,7 +1425,7 @@ mod tests {
                     summary: "subscription".into(),
                     detail: Some("expires in 1h".into()),
                 },
-                ProviderAuthStatus {
+                CredentialStatus {
                     provider_id: "openai".into(), // shorter id (6)
                     account_label: None,
                     is_default: false,
@@ -1469,7 +1469,7 @@ mod tests {
         let assert_aligned = |left: &str, right: &str, method| {
             let rows = auth_rows(
                 &[
-                    ProviderAuthStatus {
+                    CredentialStatus {
                         provider_id: "provider".into(),
                         account_label: Some(left.into()),
                         is_default: false,
@@ -1477,7 +1477,7 @@ mod tests {
                         summary: "credential".into(),
                         detail: None,
                     },
-                    ProviderAuthStatus {
+                    CredentialStatus {
                         provider_id: "provider".into(),
                         account_label: Some(right.into()),
                         is_default: false,

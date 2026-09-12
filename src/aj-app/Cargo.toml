@@ -12,6 +12,7 @@ aj-tools = { path = "../aj-tools/" }
 aj-wire = { path = "../aj-wire/" }
 anyhow = { workspace = true }
 arboard = { workspace = true }
+async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -34,7 +35,6 @@ url = { workspace = true }
 
 [dev-dependencies]
 aj-tools = { path = "../aj-tools/", features = ["testing"] }
-async-trait = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The moved print-mode tests use `#[tokio::test(start_paused = true)]`,

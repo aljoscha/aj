@@ -32,6 +32,7 @@
 //! order: it is a strict leaf, taken only to read or replace a cache entry,
 //! and nothing is ever acquired while it is held.
 
+mod credentials;
 pub(crate) mod driver;
 mod fanout;
 mod head;
@@ -780,6 +781,7 @@ impl SessionHost {
                 aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
                 aj_wire::SESSION_ENV_CAPABILITY.to_string(),
                 aj_wire::SESSION_ACCOUNTS_CAPABILITY.to_string(),
+                aj_wire::CREDENTIALS_CAPABILITY.to_string(),
                 aj_wire::BRANCH_SETTINGS_CAPABILITY.to_string(),
                 aj_wire::TRANSCRIPT_SETTINGS_CAPABILITY.to_string(),
             ],

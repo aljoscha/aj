@@ -1,9 +1,13 @@
-//! Binary-side authentication helpers.
+//! Frontend-independent authentication behavior and presentation helpers.
 //!
 //! The credential engine ([`aj_models::auth::AuthStorage`], the OAuth
-//! flows) lives in `aj-models`; this module holds the pieces that are
-//! specifically about the *binary's* UX around it:
+//! flows) lives in `aj-models`. This module composes application login and
+//! the shared presentation around that engine:
 //!
+//! - [`login`] runs a provider's OAuth flow on this machine under the user's
+//!   account creation or replacement intent, asking the frontend for a label
+//!   through [`LoginCallbacks`] when needed, and yields the store mutation
+//!   the session's host commits.
 //! - [`collect_statuses`] / [`provider_status`] turn the stored
 //!   credentials, env vars, and runtime overrides into human-readable
 //!   rows for the `/auth` status overlay and the login/logout pickers.
@@ -23,6 +27,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aj_models::auth::{AuthCredential, AuthStorage, find_env_keys};
 use aj_models::oauth::OAuthAuthInfo;
 
+mod login;
+pub use login::{LoginCallbacks, LoginTarget, login};
+
 /// Providers we always surface in the `/auth` status overlay even
 /// when they have no credential yet, so the user can see what's
 /// available to log into / configure. The union with
@@ -30,28 +37,7 @@ use aj_models::oauth::OAuthAuthInfo;
 /// `auth.json` is computed at display time.
 const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openrouter"];
 
-/// One provider-level or labeled-account authentication row, ready to render.
-///
-/// For a provider-level row, `summary` describes the method and source that
-/// wins the resolution chain. For an account row, it describes that exact
-/// stored credential. `detail` carries secondary information such as an OAuth
-/// token's remaining lifetime.
-#[derive(Debug, Clone)]
-pub struct ProviderAuthStatus {
-    pub provider_id: String,
-    /// Exact raw account identity for a labeled row. `None` is the provider's
-    /// bare credential or a provider-level source such as an environment key.
-    pub account_label: Option<String>,
-    /// Whether `account_label` is the store default.
-    pub is_default: bool,
-    /// Whether any credential source is configured.
-    pub configured: bool,
-    /// Short method/source label (e.g. `"subscription"`,
-    /// `"env: ANTHROPIC_API_KEY"`, `"not configured"`).
-    pub summary: String,
-    /// Optional secondary line (e.g. `"expires in 1h 47m"`).
-    pub detail: Option<String>,
-}
+pub use aj_wire::CredentialStatus as ProviderAuthStatus;
 
 /// Compute the auth status for a single `provider_id`.
 ///
@@ -107,13 +93,13 @@ pub async fn provider_status(
         Ok(None) => {}
         // A corrupt/locked auth.json shouldn't take down the overlay;
         // surface it as the status itself.
-        Err(err) => {
+        Err(_) => {
             return ProviderAuthStatus {
                 provider_id: provider_id.to_string(),
                 account_label: None,
                 is_default: false,
                 configured: false,
-                summary: format!("error reading auth.json: {err}"),
+                summary: "error reading auth.json".to_string(),
                 detail: None,
             };
         }

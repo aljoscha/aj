@@ -27,6 +27,7 @@ aj-tools
 aj-wire
 anyhow
 arboard
+async-trait
 base64
 chrono
 clap
