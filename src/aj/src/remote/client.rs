@@ -184,6 +184,7 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RemoteError> {
 }
 
 /// A client against one host or gateway.
+#[derive(Clone)]
 pub(crate) struct RemoteClient {
     /// The base URL with no trailing slash, so every route is `{base}/v1/...`.
     base: String,
@@ -295,6 +296,13 @@ impl RemoteClient {
         }
         let response = self.http.get(url).timeout(REQUEST_TIMEOUT).send().await?;
         decode(refusal(response).await?).await
+    }
+
+    pub(crate) async fn session_info(
+        &self,
+        session: &str,
+    ) -> Result<aj_wire::SessionInfo, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/info")).await
     }
 
     pub(crate) async fn tree(&self, session: &str) -> Result<SessionTree, RemoteError> {

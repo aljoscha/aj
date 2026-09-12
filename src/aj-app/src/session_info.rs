@@ -8,6 +8,97 @@
 use aj_session::{SessionStats, UsageBucket};
 use chrono::{DateTime, Utc};
 
+/// Copy all recorded session facts into their wire representation.
+pub fn to_wire(stats: &SessionStats) -> aj_wire::SessionInfo {
+    aj_wire::SessionInfo {
+        session_id: stats.session_id.clone(),
+        path: stats.path.clone(),
+        created_at: stats.created_at,
+        last_activity: stats.last_activity,
+        size_bytes: stats.size_bytes,
+        total_entries: stats.total_entries,
+        user_messages: stats.user_messages,
+        assistant_messages: stats.assistant_messages,
+        tool_results: stats.tool_results,
+        tool_calls: stats.tool_calls,
+        tool_call_counts: stats.tool_call_counts.clone(),
+        subagents: stats.subagents,
+        compactions: stats.compactions,
+        usage: stats.usage.clone(),
+        usage_breakdown: stats
+            .usage_breakdown
+            .iter()
+            .map(|bucket| aj_wire::UsageBucket {
+                provider: bucket.provider.clone(),
+                model: bucket.model.clone(),
+                account: bucket.account.clone(),
+                usage: bucket.usage.clone(),
+                responses: bucket.responses,
+                unpriced_responses: bucket.unpriced_responses,
+            })
+            .collect(),
+        compaction_usage: stats.compaction_usage.clone(),
+        compactions_with_usage: stats.compactions_with_usage,
+        settings: aj_wire::BranchSettings {
+            model: stats
+                .settings
+                .model
+                .as_ref()
+                .map(|(api, name)| aj_wire::RecordedModel {
+                    api: api.clone(),
+                    name: name.clone(),
+                }),
+            accounts: stats.settings.accounts.clone(),
+            thinking: stats.settings.thinking.clone(),
+            speed: stats.settings.speed.clone(),
+            verbosity: stats.settings.verbosity.clone(),
+        },
+        session_env: stats.session_env.clone(),
+    }
+}
+
+/// Recover all recorded session facts without resolving defaults or rendering values.
+pub fn from_wire(info: aj_wire::SessionInfo) -> SessionStats {
+    SessionStats {
+        session_id: info.session_id,
+        path: info.path,
+        created_at: info.created_at,
+        last_activity: info.last_activity,
+        size_bytes: info.size_bytes,
+        total_entries: info.total_entries,
+        user_messages: info.user_messages,
+        assistant_messages: info.assistant_messages,
+        tool_results: info.tool_results,
+        tool_calls: info.tool_calls,
+        tool_call_counts: info.tool_call_counts,
+        subagents: info.subagents,
+        compactions: info.compactions,
+        usage: info.usage,
+        usage_breakdown: info
+            .usage_breakdown
+            .into_iter()
+            .map(|bucket| UsageBucket {
+                provider: bucket.provider,
+                model: bucket.model,
+                account: bucket.account,
+                usage: bucket.usage,
+                responses: bucket.responses,
+                unpriced_responses: bucket.unpriced_responses,
+            })
+            .collect(),
+        compaction_usage: info.compaction_usage,
+        compactions_with_usage: info.compactions_with_usage,
+        settings: aj_session::SessionSettings {
+            model: info.settings.model.map(|model| (model.api, model.name)),
+            accounts: info.settings.accounts,
+            thinking: info.settings.thinking,
+            speed: info.settings.speed,
+            verbosity: info.settings.verbosity,
+        },
+        session_env: info.session_env,
+    }
+}
+
 /// One digest row: a section header, an ordinary key/value pair, a raw
 /// environment pair, or a blank spacer between sections.
 ///

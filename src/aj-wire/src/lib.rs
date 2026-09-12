@@ -18,6 +18,9 @@ use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
+mod session_info;
+pub use session_info::{SessionInfo, UsageBucket};
+
 /// The current remote-control protocol version.
 pub const PROTOCOL_VERSION: u32 = 3;
 
@@ -35,6 +38,9 @@ pub const COMPACTION_USAGE_CAPABILITY: &str = "compaction_usage";
 
 /// The capability for reading and editing a session's active-branch environment.
 pub const SESSION_ENV_CAPABILITY: &str = "session_env";
+
+/// The capability for `GET /v1/sessions/{id}/info` session facts.
+pub const SESSION_INFO_CAPABILITY: &str = "session_info";
 
 /// The capability for reading and selecting provider-local session accounts.
 pub const SESSION_ACCOUNTS_CAPABILITY: &str = "session_accounts";

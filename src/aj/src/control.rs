@@ -152,17 +152,20 @@ impl ControlError {
 }
 
 /// The host this frontend drives.
+#[derive(Clone)]
 pub(crate) enum Control {
     Local(LocalControl),
     Remote(RemoteControl),
 }
 
 /// The in-process host: this process owns the sessions it renders.
+#[derive(Clone)]
 pub(crate) struct LocalControl {
     host: SessionHost,
 }
 
 /// A host reached over the control port.
+#[derive(Clone)]
 pub(crate) struct RemoteControl {
     client: RemoteClient,
 }
@@ -217,6 +220,19 @@ impl Control {
                 .client
                 .command(session, &wire_command(command))
                 .await?),
+        }
+    }
+
+    /// Aggregate facts from the host's log, loading the session if needed.
+    pub(crate) async fn session_info(
+        &self,
+        session: &str,
+    ) -> Result<aj_session::SessionStats, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.session_info(session).await?),
+            Self::Remote(remote) => Ok(aj_app::session_info::from_wire(
+                remote.client.session_info(session).await?,
+            )),
         }
     }
 

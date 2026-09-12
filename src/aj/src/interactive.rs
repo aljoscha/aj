@@ -57,7 +57,9 @@ use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFil
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chrono::Utc;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
 use vaxis::cell::{Color, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::tty::PosixTty;
@@ -5137,6 +5139,14 @@ async fn apply_setting_change(
     }
 }
 
+/// Deliver a result only to the overlay that requested it, even if a newer
+/// overlay of the same kind finishes first. The list stays on the UI thread.
+async fn fill_overlay(list: Rc<RefCell<ListView>>, rx: oneshot::Receiver<Vec<Row>>) {
+    if let Ok(rows) = rx.await {
+        set_rows(&list, rows);
+    }
+}
+
 /// Spawn the async fetch backing a read-only overlay, delivering its
 /// rendered rows back to the drive loop over `tx`.
 ///
@@ -5154,16 +5164,15 @@ fn spawn_overlay_fetch(
     kind: FetchKind,
     styles: ContentStyles,
     width_method: vaxis::gwidth::Method,
-    tx: &UnboundedSender<(FetchKind, Vec<Row>)>,
+    tx: oneshot::Sender<Vec<Row>>,
 ) {
-    let tx = tx.clone();
     match kind {
         FetchKind::Auth => {
             if world.control.is_remote() {
                 let rows = vec![crate::content_overlay::plain(
                     "Auth status is local to the session host. Run this command there.",
                 )];
-                let _ = tx.send((FetchKind::Auth, rows));
+                let _ = tx.send(rows);
                 return;
             }
             let auth = world.auth.clone();
@@ -5173,7 +5182,7 @@ fn spawn_overlay_fetch(
                     &styles,
                     width_method,
                 );
-                let _ = tx.send((FetchKind::Auth, rows));
+                let _ = tx.send(rows);
             });
         }
         FetchKind::SessionInfo => {
@@ -5181,23 +5190,23 @@ fn spawn_overlay_fetch(
             // modes can read it, so it is taken here rather than inside the
             // spawned read.
             let tag = focused_tag(world);
-            // Not supported over the wire: the stats come off
-            // the host's own log. The overlay is already open, so the refusal
-            // fills it rather than folding a notice behind it.
-            let Some(log) = world.local.as_ref().map(|local| Arc::clone(&local.log)) else {
-                let rows = vec![crate::content_overlay::plain(remote_unsupported_notice(
-                    "show session info",
-                    "it reads the host's own log, so run it there",
-                ))];
-                let _ = tx.send((FetchKind::SessionInfo, rows));
-                return;
-            };
+            let control = world.control.clone();
+            let session = world.session().to_string();
             tokio::spawn(async move {
-                let stats = { log.lock().await.stats() };
-                let _ = tx.send((
-                    FetchKind::SessionInfo,
-                    session_info_rows(&stats, tag.as_deref()),
-                ));
+                let rows = match control.session_info(&session).await {
+                    Ok(stats) => session_info_rows(&stats, tag.as_deref()),
+                    Err(err) => {
+                        let message = if err.unknown_endpoint() {
+                            "This host does not serve session info.".to_string()
+                        } else {
+                            format!("Could not read session info: {}", peer_refusal(&err))
+                        };
+                        // The overlay is already open, so failures belong there
+                        // rather than in the transcript behind it.
+                        vec![crate::content_overlay::plain(message)]
+                    }
+                };
+                let _ = tx.send(rows);
             });
         }
     }
@@ -5209,7 +5218,7 @@ fn spawn_shell_overlay_fetch(
     world: &World,
     shell: &Rc<RefCell<Shell>>,
     kind: FetchKind,
-    tx: &UnboundedSender<(FetchKind, Vec<Row>)>,
+    tx: oneshot::Sender<Vec<Row>>,
 ) {
     let shell = shell.borrow();
     let styles = ContentStyles::from_theme(&shell.theme.read());
@@ -7681,11 +7690,9 @@ async fn drive(
     // session's drive loop isn't re-toasted.
     let mut selection_copied_seen: Option<Instant> =
         shell.borrow().view().selection_copied.get().map(|c| c.at);
-    // Async read-only overlay fills. The list handle is `!Send`, so it
-    // stays here (paired with its `FetchKind`) while the detached fetch
-    // sends only the rendered rows back over the channel.
-    let (fetch_tx, mut fetch_rx) = unbounded_channel::<(FetchKind, Vec<Row>)>();
-    let mut pending_fills: Vec<(FetchKind, Rc<RefCell<ListView>>)> = Vec::new();
+    // Each fill owns its originating list and receiver. Requests can complete
+    // out of order, including after their overlay has been closed.
+    let mut pending_fills = FuturesUnordered::new();
     // Prompt-history scans stream their per-file entry batches here. The
     // select handle is `!Send`, so it stays paired with the scan's own
     // receiver on the host side (`pending_history`) while the blocking scan
@@ -7900,14 +7907,8 @@ async fn drive(
             }
 
             // --- Async read-only overlay fill ---
-            maybe_fill = fetch_rx.recv() => {
-                if let Some((kind, rows)) = maybe_fill
-                    && let Some(pos) = pending_fills.iter().position(|(k, _)| *k == kind)
-                {
-                    let (_, list) = pending_fills.remove(pos);
-                    set_rows(&list, rows);
-                    app.request_redraw();
-                }
+            _ = pending_fills.next(), if !pending_fills.is_empty() => {
+                app.request_redraw();
             }
 
             // --- Skills window fill ---
@@ -8090,13 +8091,9 @@ async fn drive(
                                 // Presentation state is snapshotted at fetch
                                 // time. A theme reload re-tints on next open,
                                 // matching the overlay chrome.
-                                spawn_shell_overlay_fetch(
-                                    world,
-                                    shell,
-                                    fetch.kind,
-                                    &fetch_tx,
-                                );
-                                pending_fills.push((fetch.kind, fetch.list));
+                                let (tx, rx) = oneshot::channel();
+                                spawn_shell_overlay_fetch(world, shell, fetch.kind, tx);
+                                pending_fills.push(fill_overlay(fetch.list, rx));
                             }
                         }
                         // Config edits parked by a selector or settings
@@ -14796,13 +14793,12 @@ mod tests {
             shell.borrow_mut().draw(&ctx);
             assert_eq!(shell.borrow().width_method(), method, "draw snapshot");
 
-            let (tx, mut rx) = unbounded_channel();
-            spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, &tx);
-            let (kind, rows) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            let (tx, rx) = oneshot::channel();
+            spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, tx);
+            let rows = tokio::time::timeout(Duration::from_secs(1), rx)
                 .await
                 .expect("auth fetch completes")
                 .expect("auth fetch channel remains open");
-            assert_eq!(kind, FetchKind::Auth);
             let rows = rows
                 .into_iter()
                 .filter(|row| row.iter().any(|segment| segment.text.contains(provider_id)))
@@ -14845,13 +14841,12 @@ mod tests {
         let mut width_ctx = full_draw_ctx();
         width_ctx.width_method = vaxis::gwidth::Method::Unicode;
         shell.borrow_mut().draw(&width_ctx);
-        let (tx, mut rx) = unbounded_channel();
-        spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, &tx);
-        let (kind, rows) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let (tx, rx) = oneshot::channel();
+        spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, tx);
+        let rows = tokio::time::timeout(Duration::from_secs(1), rx)
             .await
             .expect("auth fetch completes")
             .expect("auth fetch channel remains open");
-        assert_eq!(kind, FetchKind::Auth);
         let rows = rows
             .into_iter()
             .filter(|row| row.iter().any(|segment| segment.text.trim() == "provider"))
@@ -16251,11 +16246,10 @@ mod tests {
         );
     }
 
-    /// Confirming session info opens a "Loading…" overlay and parks a
-    /// fetch; filling it (what the host does after the async lookup)
-    /// replaces the body with the resolved content.
+    /// Reopening info while a read is pending binds each reply to the overlay
+    /// that requested it, even when the older reply arrives last.
     #[tokio::test]
-    async fn palette_session_info_opens_loading_then_fills() {
+    async fn palette_session_info_fills_its_own_overlay_when_replies_arrive_out_of_order() {
         let (mut app, mut writer, shell, root) = init_app().await;
         writer.write_all(&[0x0f]).expect("write ctrl+o");
         let event = app.next_input().await.expect("input event");
@@ -16281,14 +16275,35 @@ mod tests {
         let loading = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(loading.contains("Loading"), "loading state: {loading}");
 
-        // Fill the overlay the way the drive loop does once the fetch
-        // returns.
-        crate::content_overlay::set_rows(
-            &fetch.list,
-            vec![crate::content_overlay::plain("id  session-xyz")],
-        );
+        // Close and reopen while the first read is still outstanding.
+        writer.write_all(b"\x1b").expect("close info");
+        let event = app.next_input().await.expect("escape");
+        app.handle_input(event);
+        app.render(&root).expect("render palette");
+        writer.write_all(b"\r").expect("reopen info");
+        let event = app.next_input().await.expect("enter");
+        app.handle_input(event);
+        let reopened = shell.borrow().take_fetch().expect("second info request");
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+        let mut fills = FuturesUnordered::new();
+        fills.push(fill_overlay(fetch.list, first_rx));
+        fills.push(fill_overlay(reopened.list, second_rx));
+        second_tx
+            .send(vec![crate::content_overlay::plain("current info")])
+            .unwrap();
+        fills.next().await.expect("newer request finished first");
+        first_tx
+            .send(vec![crate::content_overlay::plain("stale info")])
+            .unwrap();
+        fills.next().await.expect("older request finished last");
+
         let filled = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-        assert!(filled.contains("session-xyz"), "filled state: {filled}");
+        assert!(filled.contains("current info"), "filled state: {filled}");
+        assert!(
+            !filled.contains("stale info"),
+            "old reply entered reopened overlay: {filled}"
+        );
         assert!(!filled.contains("Loading"), "loading replaced: {filled}");
     }
 
@@ -24604,10 +24619,9 @@ mod tests {
             bucket.usage.total_tokens, bucket.usage.cost.total
         );
 
-        let (tx, mut rx) = unbounded_channel();
-        spawn_shell_overlay_fetch(&world, &shell, FetchKind::SessionInfo, &tx);
-        let (kind, rows) = rx.recv().await.expect("the fetch delivered rows");
-        assert_eq!(kind, FetchKind::SessionInfo);
+        let (tx, rx) = oneshot::channel();
+        spawn_shell_overlay_fetch(&world, &shell, FetchKind::SessionInfo, tx);
+        let rows = rx.await.expect("the fetch delivered rows");
 
         let mut overlay = crate::content_overlay::ContentOverlay::new(rows);
         let page = flatten(&overlay.draw(&draw_ctx(80, 80))).join("\n");
@@ -24631,15 +24645,13 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// Session info remains host-local in connect mode. A value demonstrably
-    /// present in the remote host's focused log must yield only the unsupported
-    /// notice and never cross onto the connected client's drawn page.
+    /// The host's facts reach the drawn page through either remote route.
     #[tokio::test]
-    async fn connected_session_info_never_draws_the_hosts_environment() {
+    async fn connected_session_info_draws_the_hosts_facts_directly_and_through_gateway() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let sentinel_key = "REMOTE_INFO_SENTINEL";
-        let sentinel_value = "host-only-secret-value";
+        let sentinel_value = "host-value";
         let session = remote
             .host
             .create_with(
@@ -24653,65 +24665,72 @@ mod tests {
             )
             .await
             .expect("create env-bearing host session");
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[&session]).await;
-        assert!(world.local.is_none(), "the fixture must use connect mode");
-        assert!(handle_submit(&mut world, "persist the host log".to_string()).await);
-        settle(&mut world).await;
+        let (mut local_client, _) = connect_world_and_shell(&dir, &remote, &[&session]).await;
+        assert!(handle_submit(&mut local_client, "persist the host log".to_string()).await);
+        settle(&mut local_client).await;
+        drop(local_client);
 
-        let handles = remote
-            .host
-            .local_handles(&session)
-            .await
-            .expect("host local handles");
-        let (stats, log_path) = {
-            let log = handles.log.lock().await;
-            (log.stats(), log.path().to_path_buf())
-        };
+        let local = Control::local(remote.host.clone());
+        let stats = local.session_info(&session).await.expect("local stats");
         assert_eq!(
-            stats
-                .session_env
-                .as_ref()
-                .and_then(|env| env.get(sentinel_key))
-                .map(String::as_str),
-            Some(sentinel_value),
-            "the remote host holds the sentinel this boundary must not expose",
+            stats.session_env.as_ref().unwrap()[sentinel_key],
+            sentinel_value
         );
-        let persisted = std::fs::read_to_string(log_path).expect("read the host's log");
-        assert!(
-            persisted.contains("\"type\":\"env_change\"")
-                && persisted.contains(sentinel_key)
-                && persisted.contains(sentinel_value),
-            "the remote sentinel must be persisted before the refusal is observed: {persisted}",
-        );
+        assert!(stats.user_messages > 0 && !stats.usage_breakdown.is_empty());
+        let expected = session_info_rows(&stats, None);
+        let mut overlay = crate::content_overlay::ContentOverlay::new(expected);
+        let expected_page = flatten(&overlay.draw(&draw_ctx(120, 100))).join("\n");
+        let gateway = RemoteGateway::over(&[&remote]).await;
+        gateway.until_sessions(1).await;
 
-        let (tx, mut rx) = unbounded_channel();
-        spawn_shell_overlay_fetch(&world, &shell, FetchKind::SessionInfo, &tx);
-        let (kind, rows) = rx.recv().await.expect("the refusal delivered rows");
-        assert_eq!(kind, FetchKind::SessionInfo);
-        let fetched = rows
-            .iter()
-            .flat_map(|row| row.iter())
-            .map(|segment| segment.text.as_str())
-            .collect::<String>();
-        assert_eq!(rows.len(), 1, "connect mode returns only its refusal");
-        assert!(
-            fetched.contains("Can't show session info over a connection"),
-            "connect mode returns the unsupported notice: {fetched}",
-        );
-        assert!(
-            !fetched.contains(sentinel_key) && !fetched.contains(sentinel_value),
-            "host-local environment entered the complete fetched row set: {fetched}",
-        );
+        for url in [remote.url(), gateway.url()] {
+            let client_dir = TempDir::new().expect("client dir");
+            let (world, shell) = connect_world_and_shell_at(&client_dir, &url, &[]).await;
+            assert!(world.local.is_none(), "the fixture must use connect mode");
+            let (tx, rx) = oneshot::channel();
+            spawn_shell_overlay_fetch(&world, &shell, FetchKind::SessionInfo, tx);
+            let rows = rx.await.expect("the fetch delivered rows");
+            let mut overlay = crate::content_overlay::ContentOverlay::new(rows);
+            let page = flatten(&overlay.draw(&draw_ctx(120, 100))).join("\n");
+            assert!(
+                page.contains(sentinel_key) && page.contains(sentinel_value),
+                "{page}"
+            );
+            assert_eq!(
+                page, expected_page,
+                "remote and local facts render alike at {url}"
+            );
+        }
+        gateway.shutdown().await;
+        remote.shutdown().await;
+    }
 
+    #[tokio::test]
+    async fn session_info_distinguishes_unsupported_hosts_from_missing_sessions() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let missing = world
+            .control
+            .session_info("missing")
+            .await
+            .expect_err("unknown session");
+        assert!(
+            !missing.unknown_endpoint(),
+            "a missing session is not a missing feature"
+        );
+        assert!(peer_refusal(&missing).contains("missing"));
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&format!("{}/nowhere", remote.url())).unwrap(),
+        );
+        let (tx, rx) = oneshot::channel();
+        spawn_shell_overlay_fetch(&world, &shell, FetchKind::SessionInfo, tx);
+        let rows = rx.await.expect("the fetch delivered its refusal");
         let mut overlay = crate::content_overlay::ContentOverlay::new(rows);
-        let page = flatten(&overlay.draw(&draw_ctx(64, 8))).join("\n");
+        let page = flatten(&overlay.draw(&draw_ctx(120, 8))).join("\n");
         assert!(
-            page.contains("Can't show session info over a connection"),
-            "connect mode draws the unsupported notice: {page}",
-        );
-        assert!(
-            !page.contains(sentinel_key) && !page.contains(sentinel_value),
-            "host-local environment crossed the connection boundary: {page}",
+            page.contains("This host does not serve session info."),
+            "{page}"
         );
         remote.shutdown().await;
     }

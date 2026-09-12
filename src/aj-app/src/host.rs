@@ -763,6 +763,7 @@ impl SessionHost {
             capabilities: vec![
                 ARCHIVE_CAPABILITY.to_string(),
                 COMPACTION_USAGE_CAPABILITY.to_string(),
+                aj_wire::SESSION_INFO_CAPABILITY.to_string(),
                 aj_wire::SESSION_ENV_CAPABILITY.to_string(),
                 aj_wire::SESSION_ACCOUNTS_CAPABILITY.to_string(),
                 aj_wire::BRANCH_SETTINGS_CAPABILITY.to_string(),
@@ -1315,6 +1316,13 @@ impl SessionHost {
             })
             .collect();
         Ok(QueueState { queues })
+    }
+
+    /// Aggregate facts from the session log, materializing the session if needed.
+    pub async fn session_info(&self, session: &str) -> Result<aj_session::SessionStats, HostError> {
+        let live = self.live(session).await?;
+        let stats = live.core.log.lock().await.stats();
+        Ok(stats)
     }
 
     /// The selected branch's environment overlay, materializing the session if needed.

@@ -484,7 +484,7 @@ code.
   hosts?}`. Includes every session of the host's working directory,
   on-disk as well as live, with a liveness flag. Attaching or commanding
   a non-live session materializes it (lock permitting). A read never
-  does, except for the tree, environment, and account reads, which parse the log
+  does, except for the tree, environment, account, and session-info reads, which parse the log
   and materialize like a command. This is the discovery surface, there is
   no separate on-disk listing.
 - `GET /v1/sessions/{id}/tasks`: `{tasks: [{id, owner, call_id, kind,
@@ -501,6 +501,16 @@ code.
   segment-collapsed branch tree for the tree view and head switching.
   `head` is the current head entry id, absent only while the log has no
   head, and not derivable from the segments.
+- `GET /v1/sessions/{id}/info`: the session's aggregate log facts, encoded as
+  `SessionInfo` in `aj-wire`: identity and host-local file path, timestamps,
+  file size, message and tool counts, usage and its provider/model/account
+  breakdown, compaction usage, recorded settings, and session environment.
+  Counts and usage span all threads and branches. Settings and environment
+  reflect the active user branch. Environment values are unredacted, with
+  `null` meaning unrecorded and `{}` meaning recorded empty. The response's
+  `session_id` is the host-local log identity, not a gateway routing id.
+  Clients render the facts and fetch only when the info overlay opens.
+  Capability `session_info` (section 5.10).
 - `GET /v1/sessions/{id}/env`: a JSON object mapping strings to strings,
   the full environment map selected by the active branch. Values are
   unredacted on the trusted control port. Export-only redaction does not
@@ -655,6 +665,7 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `branch_settings` | `head.changes` | hosts |
   | `transcript_settings` | user-message `branch_settings` and `GET /v1/sessions/{id}/env/before/{entry}` | hosts |
   | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
+  | `session_info` | `GET /v1/sessions/{id}/info` | hosts |
   | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
   | `compaction_usage` | optional cumulative `usage` on durable `compaction_end`, identified by the frame's `entry_id` | hosts |
 
@@ -849,7 +860,7 @@ The boundary of what works over the wire is explicit. Supported: prompt,
 steer, cancel, queue withdraw and clear, settings including model switch
 and thinking display, compaction, task kill, the task-output overlay,
 tagging, archiving, environment overlay reads and edits, session account
-reads and selection, the tree view and
+reads and selection, the session-info overlay, the tree view and
 head switching, and session
 creation and switching. The prompt recall ring holds this run's own
 submissions only. On exit, the client prints the focused session's id and
@@ -858,7 +869,7 @@ the complete id, including its host prefix through a gateway. URLs with
 userinfo, query parameters, fragments, or control characters are replaced
 by `"$AJ_CONNECT_URL"`, with an instruction to set it to the same connection
 URL. No usage summary is printed. Refused, each with a notice naming why: the
-session-info overlay and HTML export (host-local files no endpoint
+HTML export (host-local files no endpoint
 serves), prompt-history search (this client's own store), and the usage
 overlay and credential management (this client's credential store). An
 unsupported action never silently does nothing.
