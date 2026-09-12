@@ -1,17 +1,17 @@
 //! Append-only conversation log + read-only inference view.
 //!
 //! Each session is one `.jsonl` file under the project's sessions directory.
-//! `ConversationLog` holds the in-memory image. A fresh log publishes its
-//! complete creation prefix plus first punctuation as one staged, no-replace
-//! image. Later appends reach the canonical file before mutating the in-memory
-//! maps, so a crashed process can diverge only at the final line, which
-//! [`ConversationLog::resume`] repairs with a warning.
+//! `ConversationLog` holds the in-memory image. The first punctuation creates
+//! the canonical file without replacing an existing path, then appends the
+//! buffered prefix and punctuation line by line. An interrupted first write
+//! can leave an empty file or a prefix of those records. Recovery uses the same
+//! [`ConversationLog::resume`] rules as any interrupted append.
 //!
 //! `ConversationView` is a short-lived, crate-internal mutation handle
 //! that tracks a head pointer and routes appends to a specific thread
 //! (the user's main conversation, or one sub-agent subtree). The first
-//! punctuation commits every buffered creation record and itself together. A
-//! later write reaches the OS before the call returns, so the entry survives a
+//! punctuation writes every buffered creation record before itself. A successful
+//! punctuation append reaches the OS before returning, so the entries survive a
 //! crash of *this* process. Writes are deliberately not `fsync`'d, so a host
 //! crash or power loss can still lose the most recent line(s).
 //! [`ConversationLog::resume`] repairs the undelimited final line an
@@ -111,7 +111,8 @@ impl PersistenceFailure {
         self.0.error.kind()
     }
 
-    /// Whether this live object had an installed canonical log before failure.
+    /// Whether this live object opened a canonical log before failure.
+    /// The file may be empty or incomplete and still require recovery on resume.
     pub fn can_reopen(&self) -> bool {
         self.0.durable_log
     }
@@ -902,11 +903,11 @@ pub struct LogSnapshot {
 /// and branch offshoots, held in memory and mirrored to a single JSONL file
 /// on disk.
 ///
-/// Punctuation is persisted before it enters the in-memory maps, so a failed
-/// write never leaves the two diverging. A fresh log's first punctuation
-/// publishes all creation records in one complete image. Later process crashes
-/// truncate at most the last line, which [ConversationLog::resume] drops with a
-/// warning before reopening the log for append.
+/// Punctuation is persisted before it enters the in-memory maps. Buffered
+/// records are written in order, including on the first punctuation, which
+/// creates the canonical file without replacement. An interrupted write can
+/// leave a partial final line, which [ConversationLog::resume] repairs with a
+/// warning. The first write can also leave an empty file or only a seed prefix.
 ///
 /// A returned persistence error permanently fuses this live object. The
 /// uncertain record and every unattempted record remain owned in memory for
@@ -930,18 +931,19 @@ pub struct ConversationLog {
     core: LogSnapshot,
     path: PathBuf,
     /// Lazily opened: `None` for a freshly-[ConversationLog::create]'d log
-    /// that has never had a real ("punctuation") entry appended, `Some`
-    /// once we've committed one (or for a [ConversationLog::resume]'d log
-    /// from the outset). Keeping creation lazy means a session the user
+    /// until the first real ("punctuation") append opens the canonical file.
+    /// The descriptor is retained even if that write fails. A
+    /// [ConversationLog::resume]'d log has one from the outset.
+    /// Keeping creation lazy means a session the user
     /// abandons before typing anything leaves no file in the sessions
     /// directory.
     file: Option<AppendWriter>,
     /// Pre-serialized lines for entries that have been [Self::append]ed
     /// in memory but whose persistence is deferred until the next
     /// "punctuation" append (see [`ConversationEntryKind::is_punctuation`]).
-    /// Retained in order until the next punctuation is successfully
-    /// published. Resume initialises this empty: anything on disk is already
-    /// committed, by definition.
+    /// Completed writes release their lines in order. A failed write retains
+    /// the uncertain line and all unattempted lines. Resume initialises this
+    /// empty: anything accepted from disk is already persisted.
     pending_writes: VecDeque<String>,
     /// A persistence error is terminal for this live object. The descriptor is
     /// retained for teardown ownership but is never touched again.
@@ -955,22 +957,7 @@ pub struct ConversationLog {
     /// bytes and record nothing.
     tail_repair: Option<TailRepair>,
     #[cfg(any(test, feature = "test-support"))]
-    initial_publication_writer_fault: Option<test_support::AppendFaultFixture>,
-}
-
-#[cfg(test)]
-fn initial_publication_checkpoint(name: &str) {
-    if std::env::var("AJ_TEST_INITIAL_PUBLICATION_CHECKPOINT").as_deref() != Ok(name) {
-        return;
-    }
-    println!("initial-publication-checkpoint:{name}");
-    std::io::stdout()
-        .flush()
-        .expect("flush initial-publication checkpoint");
-    let mut release = [0_u8; 1];
-    std::io::stdin()
-        .read_exact(&mut release)
-        .expect("checkpoint parent releases or kills the child");
+    append_writer_fault: Option<test_support::AppendFaultFixture>,
 }
 
 impl LogSnapshot {
@@ -1258,7 +1245,7 @@ impl ConversationLog {
             failure_signal: None,
             tail_repair: None,
             #[cfg(any(test, feature = "test-support"))]
-            initial_publication_writer_fault: None,
+            append_writer_fault: None,
         })
     }
 
@@ -1531,7 +1518,7 @@ impl ConversationLog {
             failure_signal: None,
             tail_repair: repair,
             #[cfg(any(test, feature = "test-support"))]
-            initial_publication_writer_fault: None,
+            append_writer_fault: None,
         };
         // Recover the head from the last-written user entry. The most
         // recently appended entry is always on the branch that was last
@@ -1552,10 +1539,10 @@ impl ConversationLog {
     /// Durability depends on the entry's kind (see
     /// [`ConversationEntryKind::is_punctuation`]):
     ///
-    /// - For a **punctuation** entry on a fresh log, this stages the complete
-    ///   buffered prefix and punctuation, flushes it, and atomically installs
-    ///   the canonical path without replacement. On a durable log it appends
-    ///   buffered lines and punctuation in order. After `Ok(_)`, the entry and
+    /// - For a **punctuation** entry, this lazily creates the canonical file
+    ///   without replacement and appends buffered lines and punctuation in
+    ///   order. An interrupted first append can leave an empty file, a complete
+    ///   prefix, or a partial final line. After `Ok(_)`, the entry and
     ///   everything preceding it have reached the OS. They survive a process
     ///   crash, though they are not `fsync`'d, so power loss can still lose the
     ///   tail. This write-before-return is what
@@ -1692,15 +1679,8 @@ impl ConversationLog {
 
         let punctuation = record.entry.is_punctuation();
         self.pending_writes.push_back(json);
-        if punctuation {
-            let persisted = if self.file.is_some() {
-                self.write_pending_lines()
-            } else {
-                self.publish_initial()
-            };
-            if let Err(error) = persisted {
-                return Err(self.fuse(error));
-            }
+        if punctuation && let Err(error) = self.write_pending_lines() {
+            return Err(self.fuse(error));
         }
 
         self.core.order.push(id.clone());
@@ -1719,104 +1699,25 @@ impl ConversationLog {
         })
     }
 
-    /// Publish a fresh log as one complete, no-replace initial image.
-    ///
-    /// The staging name is not a session-log candidate, so no reader can see
-    /// the pending prefix. A hard link installs the complete inode atomically
-    /// only when the canonical path remains absent. The staging descriptor is
-    /// opened with `O_APPEND` and retained after installation, preserving the
-    /// existing concurrent-writer contract without a post-commit reopen gap.
-    fn publish_initial(&mut self) -> std::io::Result<()> {
-        let mut image = String::new();
-        for line in &self.pending_writes {
-            image.push_str(line);
-            image.push('\n');
-        }
-
-        let (stage_path, stage) = self.create_initial_stage()?;
-        #[cfg(any(test, feature = "test-support"))]
-        let mut stage = match &self.initial_publication_writer_fault {
-            Some(fault) => AppendWriter::Faulting(fault.writer(stage)),
-            None => AppendWriter::File(stage),
-        };
-        #[cfg(not(any(test, feature = "test-support")))]
-        let mut stage = AppendWriter::File(stage);
-        let publish = (|| -> std::io::Result<()> {
-            stage.write_all(image.as_bytes())?;
-            #[cfg(test)]
-            initial_publication_checkpoint("written");
-
-            stage.flush()?;
-            #[cfg(test)]
-            initial_publication_checkpoint("flushed");
-
-            #[cfg(test)]
-            initial_publication_checkpoint("installing");
-            fs::hard_link(&stage_path, &self.path)?;
-            #[cfg(test)]
-            initial_publication_checkpoint("installed");
-            Ok(())
-        })();
-
-        if let Err(err) = publish {
-            drop(stage);
-            if let Err(cleanup) = fs::remove_file(&stage_path)
-                && cleanup.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(
-                    path = %stage_path.display(),
-                    "could not remove failed initial-publication stage: {cleanup}"
-                );
-            }
-            return Err(err);
-        }
-
-        // The canonical hard link is the commit. A cleanup failure can leave
-        // only an ignored staging alias and must not turn a committed append
-        // into a retry that collides with its own target.
-        if let Err(err) = fs::remove_file(&stage_path) {
-            tracing::warn!(
-                path = %stage_path.display(),
-                "could not remove committed initial-publication stage: {err}"
-            );
-        }
-        self.pending_writes.clear();
-        self.file = Some(stage);
-        Ok(())
-    }
-
-    /// Create one same-directory staging file outside the `.jsonl` namespace.
-    fn create_initial_stage(&self) -> std::io::Result<(PathBuf, File)> {
-        let dir = self.path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("session path {} has no parent", self.path.display()),
-            )
-        })?;
-        for _ in 0..1000 {
-            let path = dir.join(format!(
-                ".{}-{:032x}.stage",
-                self.session_id(),
-                rand::random::<u128>()
-            ));
-            match OpenOptions::new().create_new(true).append(true).open(&path) {
-                Ok(file) => return Ok((path, file)),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(err),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "could not mint an initial-publication stage for {}",
-                self.session_id()
-            ),
-        ))
-    }
-
     /// Write every owned line through the retained append descriptor. A line
     /// leaves `pending_writes` only after `write_all` completed for that line.
     fn write_pending_lines(&mut self) -> std::io::Result<()> {
+        if self.file.is_none() {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(&self.path)?;
+            #[cfg(any(test, feature = "test-support"))]
+            let file = match self.append_writer_fault.take() {
+                Some(fault) => AppendWriter::Faulting(fault.writer(file)),
+                None => AppendWriter::File(file),
+            };
+            #[cfg(not(any(test, feature = "test-support")))]
+            let file = AppendWriter::File(file);
+            // Retain ownership before writing so even an empty or partial first
+            // write leaves a canonical log available for ordinary recovery.
+            self.file = Some(file);
+        }
         while let Some(line) = self.pending_writes.front() {
             let framed = format!("{line}\n");
             self.file
@@ -1844,14 +1745,6 @@ impl ConversationLog {
             let _ = signal.send(failure.clone());
         }
         ConversationError::WriteFailed(failure)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn set_initial_publication_writer_fault(
-        &mut self,
-        fault: Option<test_support::AppendFaultFixture>,
-    ) {
-        self.initial_publication_writer_fault = fault;
     }
 
     /// Mint a fresh entry id: a random 128-bit value as 32 hex digits,
@@ -2448,10 +2341,14 @@ pub mod test_support {
             }
         }
 
-        /// Replace a materialized log's writer with a wrapper around a newly
-        /// opened `O_APPEND` descriptor for that same regular file.
+        /// Wrap the descriptor on the next canonical open for an unmaterialized
+        /// log, or a newly opened `O_APPEND` descriptor for an existing regular file.
         pub fn install(&self, log: &mut ConversationLog) -> std::io::Result<()> {
             log.ensure_writable().map_err(std::io::Error::other)?;
+            if log.file.is_none() {
+                log.append_writer_fault = Some(self.clone());
+                return Ok(());
+            }
             if !log.path.is_file() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -2460,20 +2357,6 @@ pub mod test_support {
             }
             let file = OpenOptions::new().append(true).open(&log.path)?;
             log.file = Some(AppendWriter::Faulting(self.writer(file)));
-            Ok(())
-        }
-
-        /// Apply this writer to the staging descriptor of the next first
-        /// publication. The canonical path remains absent until that operation.
-        pub fn install_initial(&self, log: &mut ConversationLog) -> std::io::Result<()> {
-            log.ensure_writable().map_err(std::io::Error::other)?;
-            if log.file.is_some() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "initial fault requires an unmaterialized log",
-                ));
-            }
-            log.set_initial_publication_writer_fault(Some(self.clone()));
             Ok(())
         }
 
@@ -2577,17 +2460,10 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::io::BufReader as StdBufReader;
-    use std::process::{Child, Command, Stdio};
-    use std::sync::mpsc::{self, Receiver};
-    use std::thread::JoinHandle;
-    use std::time::Duration;
-
     use tempfile::TempDir;
 
     use super::*;
     use crate::persistence::ConversationPersistence;
-    use crate::prompt_history::workspace_history;
     use aj_models::types::{
         AssistantContent, AssistantMessage, TextContent, ToolCall, ToolResultMessage, UserContent,
         UserMessage,
@@ -2627,108 +2503,6 @@ mod tests {
 
     fn punctuation(log: &mut ConversationLog, text: &str) -> Result<EntryRef, ConversationError> {
         ConversationView::user(log).add_message(user_text(text))
-    }
-
-    fn stage_paths(dir: &std::path::Path) -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
-            .expect("read sessions dir")
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                (path.extension().and_then(|ext| ext.to_str()) == Some("stage")).then_some(path)
-            })
-            .collect()
-    }
-
-    struct CrashChild {
-        child: Option<Child>,
-        lines: Receiver<String>,
-        reader: Option<JoinHandle<()>>,
-    }
-
-    impl CrashChild {
-        fn spawn(dir: &std::path::Path, checkpoint: &str) -> Self {
-            let mut child = Command::new(std::env::current_exe().expect("current test binary"))
-                .args([
-                    "--exact",
-                    "log::tests::initial_publication_crash_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("AJ_TEST_INITIAL_PUBLICATION_DIR", dir)
-                .env("AJ_TEST_INITIAL_PUBLICATION_CHECKPOINT", checkpoint)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn crash child");
-            let stdout = child.stdout.take().expect("child stdout");
-            let (tx, lines) = mpsc::channel();
-            let reader = std::thread::spawn(move || {
-                for line in StdBufReader::new(stdout).lines() {
-                    match line {
-                        Ok(line) => {
-                            if tx.send(line).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            Self {
-                child: Some(child),
-                lines,
-                reader: Some(reader),
-            }
-        }
-
-        fn wait_for(&self, expected: &str) -> Vec<String> {
-            let mut seen = Vec::new();
-            loop {
-                let line = self
-                    .lines
-                    .recv_timeout(Duration::from_secs(20))
-                    .unwrap_or_else(|err| {
-                        panic!("child did not announce {expected:?}: {err}; saw {seen:?}")
-                    });
-                let done = line == expected;
-                seen.push(line);
-                if done {
-                    return seen;
-                }
-            }
-        }
-
-        fn terminate(&mut self) {
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                child.wait().expect("reap crash child");
-            }
-            if let Some(reader) = self.reader.take() {
-                reader.join().expect("join crash child stdout reader");
-            }
-        }
-
-        fn release_and_wait(&mut self) -> std::process::ExitStatus {
-            let mut child = self.child.take().expect("live crash child");
-            child
-                .stdin
-                .take()
-                .expect("child checkpoint stdin")
-                .write_all(b"x")
-                .expect("release child checkpoint");
-            let status = child.wait().expect("wait for released child");
-            if let Some(reader) = self.reader.take() {
-                reader.join().expect("join released child stdout reader");
-            }
-            status
-        }
-    }
-
-    impl Drop for CrashChild {
-        fn drop(&mut self) {
-            self.terminate();
-        }
     }
 
     fn user_text(text: &str) -> AgentMessage {
@@ -4391,92 +4165,7 @@ mod tests {
     }
 
     #[test]
-    fn surfaced_initial_publication_failures_fuse_without_losing_owned_records() {
-        for (name, block_real_open, writer_fault, expected_calls) in [
-            ("open", true, None, None),
-            (
-                "write",
-                false,
-                Some(test_support::AppendFaultFixture::new(
-                    test_support::AppendFault::WriteZero,
-                )),
-                Some((1, 0)),
-            ),
-            (
-                "flush",
-                false,
-                Some(test_support::AppendFaultFixture::new(
-                    test_support::AppendFault::Flush,
-                )),
-                Some((1, 1)),
-            ),
-        ] {
-            let dir = fresh_sessions_dir();
-            let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-            let (mut log, _env) = seeded_env_log(&persistence);
-            if block_real_open {
-                let not_a_directory = dir.path().join("not-a-directory");
-                std::fs::write(&not_a_directory, b"fixture-owned blocker")
-                    .expect("create real open blocker");
-                log.path = not_a_directory.join("session.jsonl");
-            }
-            let canonical = log.path().to_path_buf();
-            let prefix_len = log.len();
-            let pending_len = log.pending_writes.len();
-            let prefix_head = log.head().cloned();
-            let prefix_order = log.core.order.clone();
-            let prefix_entries =
-                serde_json::to_value(log.entries_in_order()).expect("creation graph serializes");
-
-            log.set_initial_publication_writer_fault(writer_fault.clone());
-            let err = punctuation(&mut log, "first")
-                .expect_err("the selected initial-publication operation fails");
-            assert!(
-                matches!(err, ConversationError::WriteFailed(_)),
-                "{name}: {err}"
-            );
-            assert!(
-                !err.persistence_failure()
-                    .expect("typed persistence failure")
-                    .can_reopen(),
-                "{name}: first publication has no canonical log to reopen"
-            );
-            if let (Some(fault), Some((writes, flushes))) = (&writer_fault, expected_calls) {
-                assert_eq!(fault.writes(), writes, "{name}: real write calls");
-                assert_eq!(fault.flushes(), flushes, "{name}: real flush calls");
-            }
-            assert!(!canonical.exists(), "{name}: canonical target escaped");
-            assert_eq!(log.len(), prefix_len, "{name}: punctuation entered memory");
-            assert_eq!(log.head(), prefix_head.as_ref(), "{name}: head changed");
-            assert_eq!(log.core.order, prefix_order, "{name}: order changed");
-            assert_eq!(
-                serde_json::to_value(log.entries_in_order()).expect("faulted graph serializes"),
-                prefix_entries,
-                "{name}: existing graph changed"
-            );
-            assert_eq!(
-                log.pending_writes.len(),
-                pending_len + 1,
-                "{name}: creation prefix or failed punctuation lost ownership"
-            );
-            assert!(stage_paths(dir.path()).is_empty(), "{name}: stage leaked");
-
-            log.set_initial_publication_writer_fault(None);
-            let later = punctuation(&mut log, "retry")
-                .expect_err("a fused live log never retries uncertain bytes");
-            assert_eq!(later.to_string(), err.to_string(), "{name}");
-            assert_eq!(
-                later.persistence_failure(),
-                err.persistence_failure(),
-                "{name}: retry did not return the same first failure"
-            );
-            assert!(!canonical.exists(), "{name}: retry touched the store");
-            assert_eq!(log.pending_writes.len(), pending_len + 1, "{name}");
-        }
-    }
-
-    #[test]
-    fn initial_publication_never_replaces_a_rival_target_or_retries_after_failure() {
+    fn first_append_never_replaces_a_rival_target_or_retries_after_failure() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let (mut log, env) = seeded_env_log(&persistence);
@@ -4484,48 +4173,16 @@ mod tests {
         let sentinel = b"rival bytes stay byte-identical\n";
         std::fs::write(&canonical, sentinel).expect("install rival target");
 
-        let err = punctuation(&mut log, "blocked").expect_err("no-replace install refuses");
+        let err = punctuation(&mut log, "blocked").expect_err("create_new refuses the rival");
         assert!(matches!(err, ConversationError::WriteFailed(_)), "{err}");
         assert_eq!(std::fs::read(&canonical).expect("rival bytes"), sentinel);
         assert_eq!(log.session_env(), Some(&env));
-        assert!(stage_paths(dir.path()).is_empty(), "failed stage leaked");
 
         std::fs::remove_file(&canonical).expect("remove test-owned rival");
         let later = punctuation(&mut log, "retry")
-            .expect_err("the failed live log cannot publish after the rival leaves");
+            .expect_err("the failed live log cannot append after the rival leaves");
         assert_eq!(later.to_string(), err.to_string());
         assert!(!canonical.exists(), "a refused retry recreated the target");
-    }
-
-    #[test]
-    fn no_clobber_install_loses_an_actual_race_without_replacing_the_winner() {
-        let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let marker = "initial-publication-checkpoint:installing";
-        let mut child = CrashChild::spawn(dir.path(), "installing");
-        let lines = child.wait_for(marker);
-        let session_id = lines
-            .iter()
-            .find_map(|line| line.strip_prefix("initial-publication-session:"))
-            .expect("child announced its session id");
-        let canonical = persistence.session_path(session_id);
-        let sentinel = b"rival won after the publisher reached its install boundary\n";
-        std::fs::write(&canonical, sentinel).expect("rival publishes canonical target");
-
-        let status = child.release_and_wait();
-        assert!(
-            !status.success(),
-            "the child replaced the rival instead of surfacing no-clobber failure"
-        );
-        assert_eq!(
-            std::fs::read(&canonical).expect("winning target"),
-            sentinel,
-            "the publisher replaced a target created at the install boundary"
-        );
-        assert!(
-            stage_paths(dir.path()).is_empty(),
-            "losing stage was not removed"
-        );
     }
 
     #[test]
@@ -4533,7 +4190,7 @@ mod tests {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let (mut creator, _) = seeded_env_log(&persistence);
-        punctuation(&mut creator, "creator first").expect("publish initial image");
+        punctuation(&mut creator, "creator first").expect("first append");
         let session_id = creator.session_id().to_string();
 
         let mut resumed =
@@ -4565,147 +4222,6 @@ mod tests {
             user_texts,
             ["creator first", "resumed second", "creator third"],
             "the creator descriptor overwrote the resumer instead of appending"
-        );
-    }
-
-    #[test]
-    #[ignore = "spawned by transactional_first_publication_survives_process_crashes"]
-    fn initial_publication_crash_child() {
-        let dir = std::env::var_os("AJ_TEST_INITIAL_PUBLICATION_DIR")
-            .map(PathBuf::from)
-            .expect("child sessions directory");
-        let persistence = ConversationPersistence::new(dir);
-        let (mut log, _) = seeded_env_log(&persistence);
-        println!("initial-publication-session:{}", log.session_id());
-        std::io::stdout().flush().expect("flush child session id");
-        punctuation(&mut log, "crash boundary").expect("drive first punctuation");
-    }
-
-    #[test]
-    fn transactional_first_publication_survives_process_crashes() {
-        for checkpoint in ["written", "flushed", "installed"] {
-            let dir = fresh_sessions_dir();
-            let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-            let marker = format!("initial-publication-checkpoint:{checkpoint}");
-            let mut child = CrashChild::spawn(dir.path(), checkpoint);
-            let lines = child.wait_for(&marker);
-            let session_id = lines
-                .iter()
-                .find_map(|line| line.strip_prefix("initial-publication-session:"))
-                .expect("child announced its session id");
-            let canonical = persistence.session_path(session_id);
-            let stages = stage_paths(dir.path());
-            assert_eq!(stages.len(), 1, "{checkpoint}: expected one stage");
-            assert!(
-                stages[0].extension().and_then(|ext| ext.to_str()) != Some("jsonl"),
-                "{checkpoint}: staging entered the session-log namespace"
-            );
-
-            if checkpoint == "installed" {
-                assert!(canonical.is_file(), "install checkpoint has no target");
-                let entries: Vec<ConversationEntryKind> = std::fs::read_to_string(&canonical)
-                    .expect("read installed image")
-                    .lines()
-                    .map(|line| {
-                        serde_json::from_str::<ConversationEntry>(line)
-                            .expect("complete installed line")
-                            .entry
-                    })
-                    .collect();
-                let env_index = entries
-                    .iter()
-                    .position(|entry| matches!(entry, ConversationEntryKind::EnvChange { .. }))
-                    .expect("installed env entry");
-                assert!(
-                    entries[env_index + 1..]
-                        .iter()
-                        .any(ConversationEntryKind::is_punctuation),
-                    "installed image exposes env_change as its final record"
-                );
-            } else {
-                assert!(!canonical.exists(), "{checkpoint}: target published early");
-                assert!(
-                    persistence
-                        .list_sessions()
-                        .expect("list sessions")
-                        .is_empty(),
-                    "{checkpoint}: session discovery saw the stage"
-                );
-                assert!(
-                    workspace_history(&persistence, 100, &|| false).is_empty(),
-                    "{checkpoint}: prompt history saw the staged prompt"
-                );
-            }
-
-            child.terminate();
-            if checkpoint == "installed" {
-                let bytes = std::fs::read(&canonical).expect("installed bytes survive child kill");
-                assert!(!bytes.is_empty());
-                ConversationLog::resume(&persistence, session_id)
-                    .expect("installed image remains resumable after child death");
-            } else {
-                assert!(!canonical.exists(), "{checkpoint}: kill exposed a target");
-            }
-        }
-    }
-
-    #[test]
-    fn frozen_pre_env_codec_truncates_final_unknown_but_refuses_published_interior_unknown() {
-        let dir = fresh_sessions_dir();
-        let final_unknown = dir.path().join("final-unknown.jsonl");
-        let root = ConversationEntry {
-            id: "root".to_string(),
-            parent_id: None,
-            timestamp: None,
-            thread: ThreadKind::Meta,
-            agent_id: None,
-            entry: ConversationEntryKind::SystemPrompt {
-                text: "system".to_string(),
-            },
-        };
-        let env = ConversationEntry {
-            id: "env".to_string(),
-            parent_id: Some("root".to_string()),
-            timestamp: None,
-            thread: ThreadKind::Meta,
-            agent_id: None,
-            entry: ConversationEntryKind::EnvChange {
-                env: env_map(&[("BEADS_ACTOR", "session-actor")]),
-            },
-        };
-        let root_line = format!("{}\n", serde_json::to_string(&root).expect("root JSON"));
-        std::fs::write(
-            &final_unknown,
-            format!(
-                "{root_line}{}\n",
-                serde_json::to_string(&env).expect("env JSON")
-            ),
-        )
-        .expect("write final unknown fixture");
-
-        crate::pre_env_codec_fixture::resume(&final_unknown)
-            .expect("frozen codec truncates an unknown final record");
-        assert_eq!(
-            std::fs::read(&final_unknown).expect("truncated fixture"),
-            root_line.as_bytes(),
-            "the frozen decoder did not demonstrate the identity-losing tail rule"
-        );
-
-        let persistence = ConversationPersistence::new(dir.path().join("published"));
-        let (mut log, _) = seeded_env_log(&persistence);
-        punctuation(&mut log, "punctuation").expect("transactional publish");
-        let canonical = log.path().to_path_buf();
-        let before = std::fs::read(&canonical).expect("published bytes");
-        let err = crate::pre_env_codec_fixture::resume(&canonical)
-            .expect_err("frozen codec refuses an interior unknown record");
-        assert!(
-            err.contains("unknown variant") && err.contains("env_change"),
-            "{err}"
-        );
-        assert_eq!(
-            std::fs::read(&canonical).expect("bytes after refusal"),
-            before,
-            "old-codec interior refusal changed the published log"
         );
     }
 

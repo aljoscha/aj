@@ -42,8 +42,6 @@ pub mod listener;
 pub mod lock;
 pub mod log;
 pub mod persistence;
-#[cfg(test)]
-mod pre_env_codec_fixture;
 pub mod prompt_history;
 pub mod repair;
 pub mod replay;

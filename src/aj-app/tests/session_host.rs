@@ -7499,24 +7499,140 @@ async fn a_detached_writers_persistence_failure_ends_only_its_session() {
     harness.host.shutdown().await;
 }
 
-/// A session whose very first publication fails has no canonical log to
-/// reopen. The error says so, sends the user to a new session, and the id it
-/// was given is unknown from then on.
+/// An interrupted first save reopens through ordinary recovery. Only the
+/// creation records that reached disk survive, and the failed prompt is not
+/// resubmitted. Each case leaves a different recoverable prefix on disk.
 #[tokio::test]
-async fn a_failed_first_publication_says_the_message_was_not_recorded() {
+async fn an_interrupted_first_save_recovers_its_prefix_and_saves_later_work() {
+    for (saved_seeds, partial_record) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let harness = Harness::new(vec![finalized_text_message("unsaved answer")]);
+        let env = BTreeMap::from([("INITIAL_ENV".to_string(), "recorded-value".to_string())]);
+        let session = harness
+            .host
+            .create_with(None, None, None, Some(env.clone()))
+            .await
+            .expect("create with environment");
+        let mut client = Client::attach(&harness.host, &session).await;
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let (path, prefix) = {
+            let mut log = handles.log.lock().await;
+            assert!(!log.path().exists(), "creation alone leaves no saved log");
+            let seeds = log.entries_in_order();
+            let prefix = if saved_seeds {
+                seeds
+                    .iter()
+                    .flat_map(|entry| {
+                        let mut line = serde_json::to_vec(entry).expect("serialize seed");
+                        line.push(b'\n');
+                        line
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let fault = AppendFaultFixture::new(AppendFault::ShortWriteAfter {
+                complete_writes: if saved_seeds { seeds.len() } else { 0 },
+                bytes: usize::from(partial_record),
+            });
+            fault.install(&mut log).expect("interrupt first save");
+            (log.path().to_path_buf(), prefix)
+        };
+        drop(handles);
+
+        harness.prompt(&session, "interrupted first prompt").await;
+        let failed = frames_until(&mut client.stream, "the storage error", |frame| {
+            matches!(frame, Frame::Error { .. })
+        })
+        .await;
+        assert!(matches!(only(failed, &session).last(),
+            Some(Frame::Error { code, message, .. })
+                if code == "persistence_failed" && message.contains("reopen the session")
+        ));
+        bounded("failed writer releases the session lock", async {
+            while SessionLock::is_held(&harness.persistence, &session).expect("probe lock") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let torn = std::fs::read(&path).expect("direct write leaves a log");
+        assert!(torn.starts_with(&prefix));
+        assert_eq!(torn.len(), prefix.len() + usize::from(partial_record));
+
+        let mut reopened = harness
+            .host
+            .attach(&[attach_request(&session)])
+            .await
+            .expect("reopen");
+        let block = frames_until(&mut reopened, "caught_up", |frame| {
+            matches!(frame, Frame::CaughtUp { .. })
+        })
+        .await;
+        assert!(
+            !events(&block)
+                .iter()
+                .any(|event| matches!(event, AgentEvent::MessageEnd { .. })),
+            "an unrecorded prompt must not reappear in the transcript"
+        );
+        assert_eq!(std::fs::read(&path).expect("recovered bytes"), prefix);
+        let expected_env = if saved_seeds { env } else { BTreeMap::new() };
+        assert_eq!(
+            harness
+                .host
+                .environment(&session)
+                .await
+                .expect("restored env"),
+            expected_env
+        );
+        if partial_record {
+            let frame = bounded("the recovery notice", reopened.recv())
+                .await
+                .expect("notice frame");
+            assert!(events(&[frame]).iter().any(|event| matches!(event,
+                AgentEvent::Notice { text, .. } if text.contains("removed an incomplete final record")
+            )));
+        }
+
+        harness
+            .install_script(&session, vec![finalized_text_message("saved answer")])
+            .await;
+        harness.prompt(&session, "work after recovery").await;
+        assert_eq!(
+            assistant_text(&until_idle(&mut reopened).await),
+            "saved answer"
+        );
+        harness.host.shutdown().await;
+        let saved = std::fs::read(&path).expect("later work saved");
+        assert!(saved.starts_with(&prefix));
+        assert!(saved.ends_with(b"\n"));
+        let resumed =
+            ConversationLog::resume(&harness.persistence, &session).expect("resume later work");
+        let conversation =
+            resumed.linearize(resumed.head().expect("saved head"), ThreadFilter::USER);
+        let messages =
+            serde_json::to_string(&conversation.agent_messages()).expect("saved messages");
+        assert!(messages.contains("work after recovery") && messages.contains("saved answer"));
+        assert!(!messages.contains("interrupted first prompt"));
+    }
+}
+
+/// Failure to open a new log leaves nothing to recover. The user is directed
+/// to fix storage and start a new session.
+#[tokio::test]
+async fn a_failed_log_open_says_the_message_was_not_recorded() {
     let harness = Harness::new(vec![finalized_text_message("never persisted")]);
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
-    let handles = harness
-        .host
-        .local_handles(&session)
-        .await
-        .expect("live session");
-    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
-    fault
-        .install_initial(&mut *handles.log.lock().await)
-        .expect("install initial-publication fault");
-    drop(handles);
+    let path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{session}.jsonl"));
+    std::fs::create_dir(&path).expect("a directory blocks creation of the log file");
 
     harness.prompt(&session, "the first prompt").await;
     let failed = frames_until(&mut client.stream, "the storage error", |frame| {
@@ -7528,19 +7644,12 @@ async fn a_failed_first_publication_says_the_message_was_not_recorded() {
             assert_eq!(code, "persistence_failed");
             assert!(
                 message.contains("was not recorded") && message.contains("start a new session"),
-                "the first-publication message: {message}"
+                "the failed-open message: {message}"
             );
         }
         other => panic!("expected the storage error frame, got {other:?}"),
     }
-    assert!(
-        !harness
-            .persistence
-            .sessions_dir()
-            .join(format!("{session}.jsonl"))
-            .exists(),
-        "a failed first publication installs no canonical log"
-    );
+    assert!(path.is_dir(), "a failed open does not replace the blocker");
     let refused = bounded(
         "the re-ask to be refused",
         harness.host.attach(&[attach_request(&session)]),

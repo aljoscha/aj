@@ -108,14 +108,13 @@ pub const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(30);
 /// re-asks for the session at once: the host rebuilds it from disk.
 pub const PERSISTENCE_FAILED_CODE: &str = "persistence_failed";
 
-/// The one sentence a client sees for a fused log. A session with a canonical
-/// log on disk reopens; one whose first publication failed has nothing to
-/// reopen, so the user is sent to a new session instead.
+/// Direct the client to reopen whatever reached disk, or start a new session
+/// if saving failed before this log could open its file.
 pub(crate) fn persistence_failure_message(failure: &PersistenceFailure) -> String {
     if failure.can_reopen() {
         format!(
             "Saving this session failed: {failure}. To protect its history, AJ stopped the \
-             session and will not save more work to it. Free disk space, then reopen the \
+             session and will not save more work to it. Fix the storage problem, then reopen the \
              session. The interrupted action may need to be retried."
         )
     } else {

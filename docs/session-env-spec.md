@@ -83,10 +83,11 @@ with only seeds leaves no conversation file. A confirmed edit to an established
 log flushes the state entry before reporting success. An unchanged value or
 removal of an absent key appends nothing.
 
-First publication retains the log's existing transactional initial-write
-contract: the pending prefix and first punctuation are installed together at the
-canonical path without replacing an existing log. This feature does not change
-staging, error recovery, or power-loss durability.
+The first message saves the buffered creation records through the ordinary log
+writer, without replacing an existing log. An interrupted save may leave an
+empty file or a partial creation prefix. Reopening uses ordinary log recovery
+and restores only the records that reached disk, including any environment map.
+Writes are not synchronized to disk against power loss.
 
 ### Existing logs
 

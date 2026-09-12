@@ -113,11 +113,12 @@ The host layer depends on no terminal, which is what `aj serve` is.
   publishes one `error` frame with code `persistence_failed` on every
   stream attached to the session, detaches the session from those
   streams, and tears it down. The stream stays open and a later attach
-  or command re-materializes the session from disk. If the failure hit a
-  session's first publication there is no log to reopen: the message
-  says the submitted message was not recorded, and the id answers
-  `unknown_session` from then on. Fatal turn failures that do not
-  compromise persistence stay scoped to the turn.
+  or command re-materializes the session from disk, recovering the saved
+  prefix even if the first write left an empty or incomplete log. Creation
+  settings that never reached disk cannot be recovered. If saving failed
+  before opening the log, the message directs the user to start a new
+  session. An id with no log answers `unknown_session`. Fatal turn failures
+  that do not compromise persistence stay scoped to the turn.
 
 ## 5. Wire protocol
 
