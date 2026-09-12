@@ -4422,7 +4422,27 @@ struct CutTally {
 }
 
 /// Run `count` seeded cuts of `scenario`, tallying what they proved.
-async fn sweep(scenario: CutScenario, seed: u64, frames: usize, count: usize) -> CutTally {
+async fn sweep(scenario: CutScenario, seed: u64, count: usize) -> CutTally {
+    // How many live frames one turn produces, so the cuts land inside it.
+    // Counted against the same provider the cut runs use, since a chunked
+    // stream is what makes the frame count what it is.
+    let frames = {
+        let fixture = Fixture::with_provider(cut_provider(scenario.script())).await;
+        let session = fixture.create().await;
+        let mut remote = fixture.remote(&session).await;
+        fixture.prompt(&session, "do the thing").await;
+        let mut count = 0;
+        remote
+            .pump_until("the turn to finish", |frame| {
+                count += 1;
+                matches!(frame, Frame::State { working: false, .. })
+            })
+            .await;
+        fixture.shutdown().await;
+        count
+    };
+    assert!(frames > 5, "a turn is more than a handful of frames");
+
     let mut tally = CutTally {
         runs: 0,
         interrupted: 0,
@@ -4438,50 +4458,26 @@ async fn sweep(scenario: CutScenario, seed: u64, frames: usize, count: usize) ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stream_cut_at_seeded_boundaries_converges() {
-    // How many live frames one turn produces, so the cuts land inside it.
-    // Counted against the same provider the cut runs use, since a chunked
-    // stream is what makes the frame count what it is.
-    let frames = {
-        let fixture = Fixture::with_provider(cut_provider(tool_turn())).await;
-        let session = fixture.create().await;
-        let mut remote = fixture.remote(&session).await;
-        fixture.prompt(&session, "do the thing").await;
-        let mut count = 0;
-        remote
-            .pump_until("the turn to finish", |frame| {
-                count += 1;
-                matches!(frame, Frame::State { working: false, .. })
-            })
-            .await;
-        fixture.shutdown().await;
-        count
-    };
-    assert!(frames > 5, "a tool turn is more than a handful of frames");
-
-    let tally = sweep(CutScenario::ToolTurn, 0x5eed_1234_9abc_def0, frames, 6).await;
+async fn tool_turn_stream_cuts_at_seeded_boundaries_converge() {
+    let tally = sweep(CutScenario::ToolTurn, 0x5eed_1234_9abc_def0, 6).await;
     assert!(
         tally.interrupted > 0,
         "every cut landed past the turn's last durable entry, which proves nothing",
     );
+}
 
-    // And the same for a turn with a sub-agent in it, whose bracketing is the
-    // part a suffix projection has to get right.
-    let tally = sweep(CutScenario::SubAgentTurn, 0x1234_5678_9abc_def0, frames, 4).await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sub_agent_stream_cuts_at_seeded_boundaries_converge() {
+    let tally = sweep(CutScenario::SubAgentTurn, 0x1234_5678_9abc_def0, 4).await;
     assert!(
         tally.interrupted > 0,
         "every sub-agent cut landed past the turn's last durable entry",
     );
+}
 
-    // And the run the convergent tier exists for: a notice published while
-    // the client was gone, which nothing replays.
-    let tally = sweep(
-        CutScenario::NoticeWhileAway,
-        0x0bad_c0de_9abc_def0,
-        frames,
-        4,
-    )
-    .await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_cuts_converge_without_replaying_notices_raised_while_away() {
+    let tally = sweep(CutScenario::NoticeWhileAway, 0x0bad_c0de_9abc_def0, 4).await;
     assert!(
         tally.interrupted > 0,
         "every notice-run cut landed past the turn's last durable entry",
