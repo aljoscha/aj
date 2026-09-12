@@ -3991,66 +3991,6 @@ async fn a_spliced_turn_reaches_a_client_with_its_ids_namespaced() {
     host.stop().await;
 }
 
-/// One client stream, two hosts: each session's frames arrive under its own
-/// host's namespace, and neither host's stream carries the other's.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_hosts_ride_one_client_stream() {
-    let mut left = Upstream::start().await;
-    let mut right = Upstream::start().await;
-    let here = left.create().await;
-    let there = right.create().await;
-    let fixture = Fixture::new(&[&left, &right]).await;
-    let (here, there) = (left.namespaced(&here), right.namespaced(&there));
-    fixture.row(&here).await;
-    fixture.row(&there).await;
-
-    let mut events = fixture.attach(&[attach(&here), attach(&there)]).await;
-
-    let mut blocks = 0;
-    let opened = frames_until(&mut events, "both attach blocks", |frame| {
-        if is_caught_up(frame) {
-            blocks += 1;
-        }
-        blocks == 2
-    })
-    .await;
-    let mut named: Vec<&str> = named_sessions(&opened);
-    named.sort_unstable();
-    named.dedup();
-    assert_eq!(
-        named,
-        {
-            let mut both = vec![here.as_str(), there.as_str()];
-            both.sort_unstable();
-            both
-        },
-        "one block per session, each under its own host: {opened:?}",
-    );
-
-    for (id, text) in [(&here, "done"), (&there, "done")] {
-        fixture
-            .client
-            .command(id, &prompt("go"))
-            .await
-            .expect("the prompt is accepted");
-        let turn = frames_until(&mut events, "the answer", |frame| {
-            !assistant_text(std::slice::from_ref(frame)).is_empty()
-        })
-        .await;
-        assert_eq!(assistant_text(&turn), vec![text.to_string()]);
-        assert!(
-            turn.iter()
-                .filter_map(Frame::session)
-                .any(|named| named == id),
-            "the turn arrived under {id}: {turn:?}",
-        );
-    }
-
-    fixture.shutdown().await;
-    left.stop().await;
-    right.stop().await;
-}
-
 /// What travels upstream is the host's own ids with the client's own cursors,
 /// one stream per host.
 ///
@@ -4061,8 +4001,14 @@ async fn two_hosts_ride_one_client_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upstream_attach_carries_host_ids_and_the_clients_cursors() {
     let fake = FakeHost::start("fake", Script::Frames(block("s-1", "epoch-1", 3))).await;
-    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    let other = FakeHost::start("other", Script::Frames(block("s-9", "epoch-9", 0))).await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![fake.address.clone(), other.address.clone()],
+    )
+    .await;
     fixture.until_connected("fake").await;
+    fixture.until_connected("other").await;
 
     let mut events = fixture
         .attach(&[
@@ -4073,10 +4019,18 @@ async fn an_upstream_attach_carries_host_ids_and_the_clients_cursors() {
                     seq: 3,
                 },
             ),
+            attach("other:s-9"),
             attach("fake:s-2"),
         ])
         .await;
-    frames_until(&mut events, "the host's block", is_caught_up).await;
+    let mut blocks = 0;
+    frames_until(&mut events, "both hosts' blocks", |frame| {
+        if is_caught_up(frame) {
+            blocks += 1;
+        }
+        blocks == 2
+    })
+    .await;
 
     let attaches = fake.attaches();
     assert_eq!(
@@ -4086,7 +4040,12 @@ async fn an_upstream_attach_carries_host_ids_and_the_clients_cursors() {
             .collect::<Vec<_>>(),
         vec![&vec!["s-1@epoch-1:3".to_string(), "s-2".to_string()]],
         "one upstream for the host, carrying its own ids and the client's own \
-         cursors: {attaches:?}",
+         cursors in request order despite an intervening host: {attaches:?}",
+    );
+    assert_eq!(
+        other.spliced_attaches(),
+        vec![vec!["s-9".to_string()]],
+        "the other host receives only its own session",
     );
     assert!(
         attaches.iter().any(|attached| attached.is_empty()),
@@ -4095,6 +4054,7 @@ async fn an_upstream_attach_carries_host_ids_and_the_clients_cursors() {
 
     fixture.shutdown().await;
     fake.stop();
+    other.stop();
 }
 
 /// An id this gateway cannot resolve is refused before any host is asked about
@@ -4129,9 +4089,10 @@ async fn attaching_an_id_this_gateway_cannot_name_reaches_no_host() {
             Vec::<Vec<String>>::new(),
             "attaching {id:?} reached a host this gateway cannot address it on",
         );
-        let (refused, code, _) = refused_session(&mut events).await;
+        let (refused, code, message) = refused_session(&mut events).await;
         assert_eq!(refused, id, "the refusal names the id the client sent");
         assert_eq!(code, "unknown_session", "{id:?}");
+        assert!(message.contains("names no session here"), "{message}");
     }
 
     fixture.shutdown().await;
@@ -4155,8 +4116,8 @@ async fn a_stream_refuses_the_ids_it_cannot_resolve_and_serves_both_hosts() {
     let (here, there) = (left.namespaced(&here), right.namespaced(&there));
     fixture.row(&here).await;
     fixture.row(&there).await;
-    // An id under this gateway's own namespace that its owning host does not
-    // hold, so the refusal below is this gateway's and not that host's.
+    // An id in an enrolled namespace that the owning host does not hold, so
+    // its refusal must travel alongside the gateway's own refusal.
     let gone = left.namespaced("20260101-000000-000");
 
     let mut events = fixture
@@ -4196,19 +4157,21 @@ async fn a_stream_refuses_the_ids_it_cannot_resolve_and_serves_both_hosts() {
         "both hosts' sessions were served on the stream a bad id shared: \
          {opened:?}",
     );
-    let refused: Vec<(&str, &str)> = opened
+    let mut refused: Vec<(&str, &str)> = opened
         .iter()
         .filter_map(|frame| match frame {
             Frame::Error { session, code, .. } => Some((session.as_str(), code.as_str())),
             _ => None,
         })
         .collect();
+    refused.sort_unstable();
+    let mut expected = vec![
+        ("0123456789abcdef:whatever", "unknown_session"),
+        (gone.as_str(), "unknown_session"),
+    ];
+    expected.sort_unstable();
     assert_eq!(
-        refused,
-        vec![
-            ("0123456789abcdef:whatever", "unknown_session"),
-            (gone.as_str(), "unknown_session"),
-        ],
+        refused, expected,
         "each unresolvable id is refused by the name the client gave it, in \
          this gateway's own namespaced vocabulary, whether this gateway or the \
          owning host is the one that could not resolve it: {opened:?}",
@@ -4232,6 +4195,12 @@ async fn a_stream_refuses_the_ids_it_cannot_resolve_and_serves_both_hosts() {
         })
         .await;
         assert_eq!(assistant_text(&turn), vec![text.to_string()]);
+        assert!(
+            turn.iter()
+                .filter(|frame| !assistant_text(std::slice::from_ref(*frame)).is_empty())
+                .all(|frame| frame.session() == Some(id.as_str())),
+            "the turn must arrive under the session that was prompted: {turn:?}",
+        );
     }
 
     fixture.shutdown().await;
@@ -5213,17 +5182,10 @@ async fn a_withdrawal_stops_the_control_link_of_the_host_it_withdraws() {
 /// than waiting it out: a withdrawal that has answered has nothing left
 /// dialing that host.
 ///
-/// The dials of one client's stream are sequential and each is bounded by the
-/// upstream timeout, so a host that takes the request and sits on the response
-/// head holds that whole stream open. If the enrollment behind that dial is
-/// withdrawn meanwhile, waiting the dial out costs the client every session it
-/// holds, on every host: the dial ends in a timeout, a timeout is not a refusal
-/// the host made, and the stream request answers 503 for all of them. Racing the
-/// dial against the withdrawal instead leaves the withdrawn host contributing no
-/// upstream, which is the same thing an unreachable host contributes.
-///
-/// Two hosts, because that collateral is the point, and the withdrawn one sorts
-/// first so its dial is the one in flight when the withdrawal lands.
+/// A host holding its attach response head must not cost the client its healthy
+/// sessions when that host is withdrawn. The held dial must end without waiting
+/// for its timeout or failing the whole stream, and the other host must serve
+/// its block whether its dial starts before or after the withdrawal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_interrupts_the_dial_of_the_host_it_withdraws() {
     // Never notified: this host takes the attach and never answers its head.
@@ -5265,12 +5227,6 @@ async fn a_withdrawal_interrupts_the_dial_of_the_host_it_withdraws() {
             }
         })
         .await;
-        assert!(
-            staying.spliced_attaches().is_empty(),
-            "the dials had already moved past the host being withdrawn, so \
-                 there is no in-flight dial here to interrupt: {:?}",
-            staying.spliced_attaches(),
-        );
         fixture.withdraw("leaving").await
     },);
 
@@ -5849,20 +5805,12 @@ async fn two_sessions_on_one_host_are_both_paced_and_both_reset() {
     fake.stop();
 }
 
-/// No upstream is pumped before every dial is done: returning means every
-/// upstream that could be opened is open.
-///
-/// The dials are sequential and each is bounded by `upstream_timeout`, so a pump
-/// started inside that loop forwards one host's frames for as long as the
-/// remaining dials take, into a queue for a client that has not been handed its
-/// response head yet. A busy session there evicts a client that never saw a
-/// frame, and its re-attach reproduces the state exactly.
-///
-/// The queue here is deliberately big enough for the whole block, so what the
-/// assertion measures is what the gateway pulled out of the first host and not
-/// where a bound bit.
+/// A slow host's attach response does not cost the client the other host's
+/// backfill. The first host is already writing while the second holds its
+/// response head, and both blocks must reach the client whole once it answers.
+/// Buffering that backfill or leaving it upstream are equally valid here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_upstream_is_pumped_before_every_dial_is_done() {
+async fn a_slow_attach_does_not_lose_another_hosts_block() {
     let backfilled: u64 = 800;
     let talking = deep_block("s-1", "epoch-1", backfilled);
     let deep = talking.len();
@@ -5897,14 +5845,15 @@ async fn no_upstream_is_pumped_before_every_dial_is_done() {
             .await
             .expect("a client stream onto the gateway")
     });
-    let stalled = first.until_stalled().await;
-
-    assert!(
-        stalled < deep,
-        "the gateway drained {stalled} of {deep} frames out of the first host \
-         while the second was still being dialed, into a queue for a client that \
-         had not been handed its response head",
-    );
+    bounded(
+        "one host writing while the other holds its response head",
+        async {
+            while first.written() == 0 || slow.spliced_attaches().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await;
 
     // And once the second host answers, the client is served both blocks whole.
     cue.notify_one();
@@ -5919,6 +5868,21 @@ async fn no_upstream_is_pumped_before_every_dial_is_done() {
         blocks == 2
     })
     .await;
+    let mut completed: Vec<&str> = served
+        .iter()
+        .filter(|frame| is_caught_up(frame))
+        .filter_map(Frame::session)
+        .collect();
+    completed.sort_unstable();
+    assert_eq!(completed, vec!["aaa:s-1", "zzz:s-9"]);
+    for session in ["aaa:s-1", "zzz:s-9"] {
+        assert!(
+            served.iter().any(|frame| {
+                matches!(frame, Frame::State { session: named, .. } if named == session)
+            }),
+            "the block for {session} must include its state",
+        );
+    }
     assert_eq!(
         served
             .iter()

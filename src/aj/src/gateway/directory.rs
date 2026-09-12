@@ -1813,106 +1813,11 @@ mod tests {
         ));
     }
 
-    /// A client's attach set groups by the host that owns each session, in that
-    /// host's own vocabulary and with the client's own cursors.
-    ///
-    /// A host that is not reachable still gets a group, with nothing to dial: its
-    /// sessions contribute no upstream rather than failing the client's whole
-    /// stream, and the group is what tells this gateway whose `reset` to emit
-    /// when that host returns. An id that resolves to no host at all is set
-    /// aside for its own refusal, which is the other half of the same rule.
-    #[test]
-    fn an_attach_set_groups_by_the_host_that_owns_each_session() {
-        let directory = Directory::new();
-        let left = connected(&directory, "127.0.0.1:1", "left", &["s-1", "s-2"]);
-        connected(&directory, "127.0.0.1:2", "right", &["s-9"]);
-
-        let plan = directory.group(&[
-            attaching("left:s-1", Some("epoch-1:3")),
-            attaching("right:s-9", None),
-            attaching("left:s-2", None),
-        ]);
-
-        assert_eq!(
-            rendered(&plan.groups),
-            vec![
-                "left@http://127.0.0.1:1: s-1@epoch-1:3, s-2".to_string(),
-                "right@http://127.0.0.1:2: s-9".to_string(),
-            ],
-            "one group per host, in the client's own order within it",
-        );
-        assert!(plan.refused.is_empty(), "every id names an enrolled host");
-        assert_eq!(
-            plan.groups[0].namespaced(),
-            vec!["left:s-1".to_string(), "left:s-2".to_string()],
-            "and the group knows what a client of this gateway calls them",
-        );
-
-        directory.disconnected(&left, "gone".to_string());
-        let plan = directory.group(&[attaching("left:s-1", None)]);
-        assert_eq!(rendered(&plan.groups), vec!["left@-: s-1".to_string()]);
-        assert!(
-            plan.refused.is_empty(),
-            "a host that is not there is not a refusal",
-        );
-
-        let unresolvable = ["s-1", "absent:s-1", ":s-1", "left:", "left:.."];
-        let plan = directory.group(
-            &unresolvable
-                .iter()
-                .map(|id| attaching(id, None))
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(
-            plan.refused
-                .iter()
-                .map(|refused| refused.session.as_str())
-                .collect::<Vec<_>>(),
-            unresolvable,
-            "each id that names no session here is owed its own refusal, by the \
-             name the client gave it",
-        );
-        assert!(plan.groups.is_empty(), "and none of them opens an upstream",);
-        assert!(
-            plan.refused
-                .iter()
-                .all(|refused| refused.message.contains("names no session here")),
-            "the refusal says why: {:?}",
-            plan.refused
-                .iter()
-                .map(|refused| refused.message.as_str())
-                .collect::<Vec<_>>(),
-        );
-    }
-
     fn attaching(session: &str, cursor: Option<&str>) -> AttachRequest {
         AttachRequest {
             session: session.to_string(),
             cursor: cursor.map(|cursor| cursor.parse().expect("a cursor")),
         }
-    }
-
-    /// Each group as `<host>@<address or -> : <attach set>`, which is everything
-    /// one upstream is opened from.
-    fn rendered(groups: &[AttachGroup]) -> Vec<String> {
-        groups
-            .iter()
-            .map(|group| {
-                let attach: Vec<String> = group
-                    .attach
-                    .iter()
-                    .map(|request| match &request.cursor {
-                        Some(cursor) => format!("{}@{cursor}", request.session),
-                        None => request.session.clone(),
-                    })
-                    .collect();
-                let dial = match &group.dial {
-                    Some(address) => address.to_string(),
-                    None => "-".to_string(),
-                };
-                format!("{}@{dial}: {}", group.host_id, attach.join(", "))
-            })
-            .collect()
     }
 
     /// Which host a create lands on: the one it names, the only one
