@@ -444,7 +444,7 @@ pub fn format_for_display(lines: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{BufWriter, Write};
 
     use aj_models::types::UserContent;
     use tempfile::{NamedTempFile, TempDir};
@@ -612,11 +612,15 @@ mod tests {
     #[tokio::test]
     async fn offset_output_keeps_wide_absolute_gutters_and_blank_lines() {
         let mut file = NamedTempFile::new().expect("temp file");
-        for _ in 0..99_998 {
-            writeln!(file, "skip").unwrap();
+        {
+            let mut writer = BufWriter::new(&mut file);
+            for _ in 0..99_998 {
+                writeln!(writer, "skip").unwrap();
+            }
+            writeln!(writer).unwrap();
+            write!(writer, "last").unwrap();
+            writer.flush().expect("flush fixture");
         }
-        writeln!(file).unwrap();
-        write!(file, "last").unwrap();
         let path = file.path().to_path_buf();
 
         let mut ctx = DummyToolContext::default();
@@ -1030,10 +1034,9 @@ mod tests {
 
     #[tokio::test]
     async fn large_image_includes_dimension_note() {
-        // Solid color so PNG compresses below the budget even at
-        // 4000x3000, guaranteeing the resize path runs and the note
-        // is emitted.
-        let bytes = make_solid_png(4000, 3000);
+        // Exceed the default width limit with few pixels. Solid color
+        // keeps the byte budget from forcing additional downscaling.
+        let bytes = make_solid_png(4000, 40);
         let file = write_png_tempfile(&bytes);
         let path = file.path().to_path_buf();
 

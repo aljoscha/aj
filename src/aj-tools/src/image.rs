@@ -831,17 +831,26 @@ mod tests {
 
     #[test]
     fn resize_image_shrinks_large_input_preserving_aspect_ratio() {
-        let bytes = make_png(4000, 3000);
-        let resized =
-            resize_image(&bytes, "image/png", &ResizeOptions::default()).expect("resize result");
-        assert!(resized.was_resized);
-        assert_eq!(resized.original_width, 4000);
-        assert_eq!(resized.original_height, 3000);
-        // 2000 / 4000 = 0.5; height should scale to ~1500.
-        assert!(resized.width <= 2000, "width: {}", resized.width);
-        assert!(resized.height <= 2000, "height: {}", resized.height);
-        assert_eq!(resized.width, 2000);
-        assert_eq!(resized.height, 1500);
+        // Thin images exercise both default dimension limits and 2:1
+        // downscaling without processing millions of pixels.
+        for (width, height, expected_width, expected_height) in
+            [(4000, 40, 2000, 20), (40, 4000, 20, 2000)]
+        {
+            let bytes = make_png(width, height);
+            let resized = resize_image(&bytes, "image/png", &ResizeOptions::default())
+                .expect("resize result");
+            assert!(resized.was_resized);
+            assert_eq!(resized.original_width, width);
+            assert_eq!(resized.original_height, height);
+            assert_eq!(resized.width, expected_width);
+            assert_eq!(resized.height, expected_height);
+            let output = BASE64.decode(&resized.data).expect("base64 image");
+            let decoded = image::load_from_memory(&output).expect("decode resized image");
+            assert_eq!(
+                (decoded.width(), decoded.height()),
+                (expected_width, expected_height)
+            );
+        }
     }
 
     /// First-fit semantics: when a PNG encoding of the resized image
@@ -853,11 +862,19 @@ mod tests {
         // Solid-color PNG: compresses to a tiny payload, so PNG fits
         // comfortably under the default byte budget and first-fit
         // returns it before the JPEG ladder is tried.
-        let bytes = make_solid_png(4000, 3000);
-        let resized =
-            resize_image(&bytes, "image/png", &ResizeOptions::default()).expect("resize result");
+        let bytes = make_solid_png(80, 60);
+        let opts = ResizeOptions {
+            max_width: 40,
+            max_height: 40,
+            ..ResizeOptions::default()
+        };
+        let resized = resize_image(&bytes, "image/png", &opts).expect("resize result");
         assert!(resized.was_resized);
         assert_eq!(resized.mime_type, "image/png");
+        let output = BASE64.decode(&resized.data).expect("base64 image");
+        assert_eq!(image::guess_format(&output).unwrap(), ImageFormat::Png);
+        let decoded = image::load_from_memory(&output).expect("decode resized PNG");
+        assert_eq!((decoded.width(), decoded.height()), (40, 30));
     }
 
     /// When the byte budget is so tight that no PNG fits, the
