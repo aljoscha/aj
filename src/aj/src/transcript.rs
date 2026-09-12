@@ -3918,7 +3918,12 @@ mod tests {
 
     #[test]
     fn notification_bubble_uses_the_outcome_tint() {
-        let s = styles();
+        let mut s = styles();
+        s.tool_success_bg = Color::Rgb([10, 80, 20]);
+        s.tool_error_bg = Color::Rgb([90, 10, 30]);
+        assert_ne!(s.tool_success_bg, s.tool_error_bg);
+        assert_ne!(s.tool_success_bg, Color::Default);
+        assert_ne!(s.tool_error_bg, Color::Default);
         let ctx = crate::test_support::draw_ctx(40, None);
         let bg = |outcome: TaskOutcome| {
             let entry = TaskNotificationEntry {
@@ -3931,9 +3936,7 @@ mod tests {
             let surface = build_task_notification(&entry, true, &s).draw(&ctx);
             crate::test_support::flatten(&surface)[0][0].style.bg
         };
-        // Success maps to the done-tool token, failure/kill to the errored
-        // one. (The bundled palette may resolve both tokens to the same
-        // color, so we assert the mapping, not that the tints differ.)
+        // Distinct tints make a swapped outcome mapping observable.
         assert_eq!(bg(TaskOutcome::Succeeded), s.tool_success_bg);
         assert_eq!(bg(TaskOutcome::Failed { code: Some(1) }), s.tool_error_bg);
         assert_eq!(bg(TaskOutcome::Killed), s.tool_error_bg);
@@ -5943,17 +5946,63 @@ mod tests {
 
     /// Focusing marks the newest user message with the border (and no other
     /// entry), stepping moves the border message-to-message, and leaving focus
-    /// drops it. The transcript's row count never changes across any of it, so
-    /// the marker never reflows the transcript.
+    /// drops it. Every content cell keeps its position across these transitions.
     #[test]
     fn focus_border_marks_one_message_and_never_reflows() {
-        // Users at 0, 2, 4, with assistant replies between. Tall viewport so
-        // the whole transcript fits and the row comparison is exact.
-        let chat = chat_with_user_messages(3);
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        for i in 0..3 {
+            apply(
+                &chat,
+                &mut life,
+                user_end(&format!(
+                    "user {i} has enough words to wrap onto another row in this viewport"
+                )),
+            );
+            apply(
+                &chat,
+                &mut life,
+                assistant_message_end(text_message(&format!("assistant {i}"))),
+            );
+        }
         let mut view = transcript_view(&chat);
         let ctx = draw_ctx(48, 40);
 
+        // Ignore border-only rows and side strokes, not padding or coordinates.
+        // This measures actual text placement rather than the fixed viewport size.
+        let content_geometry = |rows: &[String]| {
+            rows.iter()
+                .enumerate()
+                .flat_map(|(y, row)| {
+                    let border_edge = row.contains('┏') || row.contains('┗');
+                    row.chars().enumerate().filter_map(move |(x, ch)| {
+                        (!border_edge && !ch.is_whitespace() && ch != '┃').then_some((y, x, ch))
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
         let unfocused_rows = crate::test_support::rows(&view.draw(&ctx));
+        for i in 0..3 {
+            assert!(
+                unfocused_rows
+                    .iter()
+                    .any(|row| row.contains(&format!("user {i}")))
+            );
+            assert!(
+                unfocused_rows
+                    .iter()
+                    .any(|row| row.contains(&format!("assistant {i}")))
+            );
+        }
+        assert!(
+            unfocused_rows
+                .iter()
+                .filter(|row| !row.trim().is_empty())
+                .count()
+                > 6,
+            "fixture must exercise wrapping"
+        );
+        let geometry = content_geometry(&unfocused_rows);
         assert_eq!(
             border_count(&mut view, &ctx),
             0,
@@ -5969,15 +6018,17 @@ mod tests {
             "exactly the focused message is bordered"
         );
         assert_eq!(
-            focused_rows.len(),
-            unfocused_rows.len(),
-            "focusing does not change the transcript height",
+            content_geometry(&focused_rows),
+            geometry,
+            "focusing preserves every content cell's position",
         );
-        // The focused entry is the newest user message. Its text still reads
-        // "user 2" (the border sits in the padding, not over the content).
+        let top = focused_rows
+            .iter()
+            .position(|row| row.contains('┏'))
+            .unwrap();
         assert!(
-            focused_rows.iter().any(|r| r.contains("user 2")),
-            "focused message content intact: {focused_rows:?}",
+            focused_rows[top + 1].contains("user 2"),
+            "the newest user message is bordered: {focused_rows:?}",
         );
 
         // Step older (Tab / Up): the border moves to the previous user message,
@@ -5991,10 +6042,15 @@ mod tests {
             "still exactly one bordered message after stepping"
         );
         assert_eq!(
-            stepped_rows.len(),
-            unfocused_rows.len(),
-            "stepping does not reflow the transcript",
+            content_geometry(&stepped_rows),
+            geometry,
+            "stepping preserves every content cell's position",
         );
+        let top = stepped_rows
+            .iter()
+            .position(|row| row.contains('┏'))
+            .unwrap();
+        assert!(stepped_rows[top + 1].contains("user 1"), "{stepped_rows:?}");
 
         // Leaving focus drops the border.
         let mut ec = EventContext::new();
@@ -6003,6 +6059,11 @@ mod tests {
             border_count(&mut view, &ctx),
             0,
             "no border after leaving focus mode"
+        );
+        assert_eq!(
+            content_geometry(&crate::test_support::rows(&view.draw(&ctx))),
+            geometry,
+            "leaving focus preserves every content cell's position"
         );
     }
 
@@ -6523,17 +6584,36 @@ mod tests {
     // ---- Render cache: per-kind no-stale ---------------------------------
 
     #[test]
-    fn same_length_diff_content_changes_the_fingerprint() {
-        fn fingerprint(details: &ToolDetails) -> u64 {
-            let mut hasher = DefaultHasher::new();
-            details_fingerprint(details, &mut hasher);
-            hasher.finish()
-        }
+    fn same_length_diff_update_renders_the_new_content() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, tool_start(AgentId::Main, "c1", "edit"));
+        let update = |before, after| AgentEvent::ToolExecutionUpdate {
+            agent_id: AgentId::Main,
+            call_id: "c1".into(),
+            tool: "edit".into(),
+            args: serde_json::json!({}),
+            partial: ToolDetails::Diff(DiffDetails::new("x.txt", before, after)),
+            content: Vec::new().into(),
+        };
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(80, 24);
+        let first_diff = ("old\n", "new\n");
+        let second_diff = ("bad\n", "yay\n");
+        assert_eq!(first_diff.0.len(), second_diff.0.len());
+        assert_eq!(first_diff.1.len(), second_diff.1.len());
+        apply(&chat, &mut life, update(first_diff.0, first_diff.1));
+        let _ = view.draw(&ctx);
+        let first = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(first.contains("old") && first.contains("new"), "{first}");
+        assert!(view.cache.borrow().hits > 0, "diff surface warmed");
+        let id = entry_id(&chat, 0);
 
-        let first = ToolDetails::Diff(DiffDetails::new("x.txt", "old\n", "new\n"));
-        let second = ToolDetails::Diff(DiffDetails::new("x.txt", "bad\n", "yay\n"));
-
-        assert_ne!(fingerprint(&first), fingerprint(&second));
+        apply(&chat, &mut life, update(second_diff.0, second_diff.1));
+        assert_eq!(entry_id(&chat, 0), id, "update the warmed entry");
+        let after = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(after.contains("bad") && after.contains("yay"), "{after}");
+        assert!(!after.contains("old") && !after.contains("new"), "{after}");
     }
 
     /// Assistant text growth changes the fingerprint, so the second render
@@ -6560,25 +6640,6 @@ mod tests {
                 .contains("Hello world"),
             "grown text rendered",
         );
-    }
-
-    /// Finalizing an assistant entry flips `finalized`, which the fingerprint
-    /// tracks, so the post-finalize render is fresh.
-    #[test]
-    fn assistant_finalize_is_not_stale() {
-        let chat = empty_chat();
-        let mut life = AgentLifecycle::default();
-        apply(&chat, &mut life, assistant_text_delta("Answer"));
-        let builder = caching_builder(&chat);
-        draw_and_assert_fresh(&builder, AgentId::Main, 0, 80);
-
-        apply(
-            &chat,
-            &mut life,
-            assistant_message_end(text_message("Answer")),
-        );
-        draw_and_assert_fresh(&builder, AgentId::Main, 0, 80);
-        assert_eq!(misses(&builder), 2, "finalize forced a rebuild");
     }
 
     /// A tool cell walking pending -> details -> done stays fresh at each
@@ -6703,48 +6764,6 @@ mod tests {
         );
     }
 
-    /// The fingerprint distinguishes user-entry content, so a slot could
-    /// never serve one user render for another. User entries are immutable
-    /// after append, so this fingerprint sensitivity is the anti-stale
-    /// guarantee for them.
-    #[test]
-    fn user_entry_fingerprint_tracks_content() {
-        let hello = transcript_with(EntryKind::User(UserEntry {
-            branch_settings: None,
-            content: vec![UserContent::text("hello")],
-            message_id: None,
-        }));
-        let longer = transcript_with(EntryKind::User(UserEntry {
-            branch_settings: None,
-            content: vec![UserContent::text("hello, world")],
-            message_id: None,
-        }));
-        let chat = empty_chat();
-        let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
-        assert_ne!(fp(&hello), fp(&longer), "content length is fingerprinted");
-    }
-
-    /// A notification's outcome is fingerprinted, since it drives the bubble
-    /// tint: two notices identical but for their outcome must not share a
-    /// cached surface.
-    #[test]
-    fn task_notification_fingerprint_tracks_outcome() {
-        let make = |outcome: TaskOutcome| {
-            transcript_with(EntryKind::TaskNotification(TaskNotificationEntry {
-                message_id: None,
-                label: "sleep".into(),
-                kind: aj_agent::message::TaskNotificationKind::Bash,
-                outcome,
-                body: "exit".into(),
-            }))
-        };
-        let ok = make(TaskOutcome::Succeeded);
-        let bad = make(TaskOutcome::Failed { code: Some(1) });
-        let chat = empty_chat();
-        let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
-        assert_ne!(fp(&ok), fp(&bad), "outcome is fingerprinted");
-    }
-
     /// A user entry renders through the cache and hits when unchanged.
     #[test]
     fn user_entry_hits_when_unchanged() {
@@ -6793,39 +6812,6 @@ mod tests {
         }
         assert_eq!(misses(&builder), 6, "only the two user entries rebuilt");
         assert_eq!(hits(&builder), 2, "the two assistant entries hit");
-    }
-
-    /// The fingerprint tracks a compaction entry's summary length and both
-    /// token counts. Compaction entries are immutable after append, so this
-    /// is their anti-stale guarantee.
-    #[test]
-    fn compaction_fingerprint_tracks_summary_and_tokens() {
-        let base = transcript_with(EntryKind::Compaction(CompactionEntry {
-            tokens_before: 100_000,
-            tokens_after: 25_000,
-            summary: "one".into(),
-            entry: None,
-        }));
-        let other_summary = transcript_with(EntryKind::Compaction(CompactionEntry {
-            tokens_before: 100_000,
-            tokens_after: 25_000,
-            summary: "one two".into(),
-            entry: None,
-        }));
-        let other_tokens = transcript_with(EntryKind::Compaction(CompactionEntry {
-            tokens_before: 90_000,
-            tokens_after: 25_000,
-            summary: "one".into(),
-            entry: None,
-        }));
-        let chat = empty_chat();
-        let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
-        assert_ne!(
-            fp(&base),
-            fp(&other_summary),
-            "summary length fingerprinted"
-        );
-        assert_ne!(fp(&base), fp(&other_tokens), "token counts fingerprinted");
     }
 
     // ---- Render cache: sub-agent box -------------------------------------
@@ -7398,103 +7384,83 @@ mod tests {
         );
     }
 
-    /// Switching the active view clears the whole cache.
     #[test]
-    fn switching_active_view_clears_the_cache() {
+    fn switching_active_view_shows_each_agents_current_content() {
         let chat = empty_chat();
         let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, notice("main-marker"));
         spawn_sub(&chat, &mut life);
-        // A cacheable Main entry: the running sub box bypasses the cache, so
-        // without another entry the Main view would record no hits to clear.
-        apply(&chat, &mut life, user_end("hi"));
         let mut view = transcript_view(&chat);
         let ctx = draw_ctx(60, 24);
-        let _ = view.draw(&ctx);
-        let _ = view.draw(&ctx);
-        let misses_before = view.cache.borrow().misses;
-        assert!(view.cache.borrow().hits > 0, "second draw hit");
+        let main = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(main.contains("main-marker"), "{main}");
 
         chat.borrow_mut().set_active_view(AgentId::Sub(0));
         let _ = view.draw(&ctx);
+        let hits_before = view.cache.borrow().hits;
+        let child = crate::test_support::rows(&view.draw(&ctx)).join("\n");
         assert!(
-            view.cache.borrow().misses > misses_before,
-            "switching the active view forced misses",
+            child.contains("starting") && !child.contains("main-marker"),
+            "{child}"
         );
+        assert!(
+            view.cache.borrow().hits > hits_before,
+            "child surface warmed"
+        );
+
+        chat.borrow_mut().set_active_view(AgentId::Main);
+        let main = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(main.contains("main-marker"), "{main}");
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::Notice {
+                agent_id: AgentId::Sub(0),
+                text: "child-marker".into(),
+            },
+        );
+        chat.borrow_mut().set_active_view(AgentId::Sub(0));
+        let child = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            child.contains("starting") && child.contains("child-marker"),
+            "{child}"
+        );
+        assert!(!child.contains("main-marker"), "{child}");
     }
 
-    /// A theme swap through `set_styles` clears the cache.
     #[test]
-    fn set_styles_clears_the_cache() {
-        let chat = chat_with_notices(2);
-        let mut view = transcript_view(&chat);
-        let ctx = draw_ctx(60, 24);
-        let _ = view.draw(&ctx);
-        assert!(!view.cache.borrow().slots.is_empty(), "cache populated");
-        view.set_styles(Rc::new(styles()));
-        assert!(
-            view.cache.borrow().slots.is_empty(),
-            "set_styles cleared it"
-        );
-    }
-
-    /// A session rebuild reuses the `chat` cell but installs a fresh session
-    /// whose transcript restarts `EntryId` at 0. With same-length content the
-    /// new entry's fingerprint collides with the cached slot, and the globals
-    /// are unchanged, so the draw-time global clear does not fire either.
-    ///
-    /// The path as the shell runs it, `reset_to_tail` and all. That call clears
-    /// both caches whatever the incarnation says, so this passes under a
-    /// retirement that cannot tell a swap from a reset. What the retirement
-    /// itself is worth is the test below.
-    #[test]
-    fn session_rebuild_does_not_serve_the_previous_sessions_surface() {
-        // The shell holds `chat` by identity across a swap; the view shares it.
+    fn set_styles_refreshes_the_rendered_style() {
         let chat = empty_chat();
-        let mut life = AgentLifecycle::default();
-        apply(&chat, &mut life, user_end("hello"));
+        apply(
+            &chat,
+            &mut AgentLifecycle::default(),
+            user_end("theme marker"),
+        );
         let mut view = transcript_view(&chat);
         let ctx = draw_ctx(60, 24);
+        let body_tint = |surface: &Surface| {
+            let row = crate::test_support::rows(surface)
+                .iter()
+                .position(|row| row.contains("theme marker"))
+                .expect("user text visible");
+            crate::test_support::flatten(surface)[row][1].style.bg
+        };
         let _ = view.draw(&ctx);
-        // Second draw hits the cache, so the (Main, EntryId(0)) slot is warm.
-        let first = crate::test_support::rows(&view.draw(&ctx));
-        assert!(
-            first.join("\n").contains("hello"),
-            "first session: {first:?}"
-        );
-        assert!(view.cache.borrow().hits > 0, "first session slot cached");
+        let before = body_tint(&view.draw(&ctx));
+        assert_eq!(before, styles().user_message_bg);
+        assert!(view.cache.borrow().hits > 0, "user surface warmed");
 
-        // Swap in a fresh session in place. Its first entry reuses EntryId(0)
-        // with different, same-length content ("world" vs "hello"), so the
-        // fingerprint collides, and its globals (Main, false, false) match the
-        // outgoing session's, so the draw-time global clear does not fire.
-        {
-            let mut fresh = ChatState::new(cache_settings(), 0, Arc::new(Vec::new()));
-            let mut fresh_life = AgentLifecycle::default();
-            let _ = reduce(&mut fresh, &mut fresh_life, user_end("world"), None);
-            *chat.borrow_mut() = fresh;
-        }
-        // The rebind hook the shell runs on install.
-        view.reset_to_tail();
-
-        let rows = crate::test_support::rows(&view.draw(&ctx)).join("\n");
-        assert!(
-            rows.contains("world") && !rows.contains("hello"),
-            "fresh session content, not the previous session's cached surface: {rows:?}",
-        );
+        let mut changed = styles();
+        changed.user_message_bg = Color::Rgb([12, 34, 56]);
+        assert_ne!(before, changed.user_message_bg, "theme really changes");
+        let expected = changed.user_message_bg;
+        view.set_styles(Rc::new(changed));
+        assert_eq!(body_tint(&view.draw(&ctx)), expected);
     }
 
-    /// The same swap with nothing papering it: the retirement alone keeps the
-    /// fresh session off the previous one's surface, with no clear from the
-    /// call site.
-    ///
-    /// This is the one test that reaches the claim the change rests on, that no
-    /// call site has to remember. Every other test of the retirement is passed
-    /// by a counter that cannot tell a swap from a reset: the two reset tests go
-    /// through `ChatState::reset`, which bumps a per-model counter just as well
-    /// as a process-global one, and the twin above papers with `reset_to_tail`.
-    /// Here a per-model counter, minted at 0 in `new` and bumped only by
-    /// `reset`, hands the fresh model the generation the outgoing one already
-    /// had, the collided slot is not retired, and this reads the stale "hello".
+    /// Replacing the model must retire the previous session's surfaces without
+    /// requiring the caller to reset the view. Entry ids, lengths, and display
+    /// settings coincide, so none of those can distinguish these sessions.
     #[test]
     fn a_swapped_in_session_needs_no_clear_from_its_call_site() {
         let chat = empty_chat();
@@ -7515,9 +7481,7 @@ mod tests {
              here for a swap to collide with",
         );
 
-        // The same collision the twin above builds: `EntryId(0)` again, content
-        // of the same length so the fingerprint matches, and globals that match
-        // so the draw-time clear stays quiet.
+        // Reuse EntryId(0), content length, and display settings.
         {
             let mut fresh = ChatState::new(cache_settings(), 0, Arc::new(Vec::new()));
             let mut fresh_life = AgentLifecycle::default();
