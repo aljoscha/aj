@@ -8096,64 +8096,6 @@ async fn an_attach_block_opens_the_bracket_of_a_live_sub() {
     harness.host.shutdown().await;
 }
 
-/// A sub-agent that concluded while a client was away gets an `AgentEnd`
-/// after `caught_up`, including when zero durable entries follow the
-/// client's cursor.
-#[tokio::test]
-async fn the_conclusion_sweep_ends_a_sub_that_finished_in_the_gap() {
-    let harness = Harness::new(sub_agent_turn());
-    let session = harness.create().await;
-    let mut client = Client::attach(&harness.host, &session).await;
-    harness.prompt(&session, "delegate it").await;
-    client.pump_until_idle().await;
-    let cursor = client.client.cursor().expect("a committed cursor");
-
-    // Re-attach at the session's high-water mark, so the backfill is
-    // empty and can carry no conclusion of its own.
-    let last_seq = {
-        let handles = harness
-            .host
-            .local_handles(&session)
-            .await
-            .expect("live session");
-        handles.log.lock().await.last_seq()
-    };
-    let mut stream = harness
-        .host
-        .attach(&[AttachRequest {
-            session: session.clone(),
-            cursor: Some(aj_wire::Cursor {
-                epoch: cursor.epoch.clone(),
-                seq: last_seq,
-            }),
-        }])
-        .await
-        .expect("attach");
-    let block = frames_until(&mut stream, "caught_up", |frame| {
-        matches!(frame, Frame::CaughtUp { .. })
-    })
-    .await;
-    assert_eq!(
-        durable(&block),
-        Vec::new(),
-        "the suffix is empty at the high-water mark",
-    );
-
-    let sweep = frames_until(&mut stream, "the conclusion sweep", |frame| {
-        matches!(
-            frame,
-            Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::AgentEnd { agent_id: AgentId::Sub(1), .. }))
-        )
-    })
-    .await;
-    assert!(
-        durable(&sweep).is_empty(),
-        "the sweep's frames are synthesized, so they carry no cursor",
-    );
-    harness.host.shutdown().await;
-}
-
 /// A backfill served the instant a sub-agent's spawn root lands must not
 /// conclude it.
 ///

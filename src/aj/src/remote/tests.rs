@@ -48,7 +48,7 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, Context, SimpleStreamOptions, StopReason, StreamOptions,
     ToolCall,
 };
-use aj_session::{ConversationPersistence, ThreadFilter};
+use aj_session::ConversationPersistence;
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedFrame,
     ErrorResponse, Frame, HeadRequest, ModelSelection, PROTOCOL_VERSION, PromptInput,
@@ -1181,25 +1181,6 @@ fn assert_converged_across_a_cut(remote: &Attached, oracle: &Attached, context: 
     assert_convergent_eq(&remote.convergent(), &oracle.convergent(), context);
     assert_no_dangling(&remote.chat);
     assert_no_dangling(&oracle.chat);
-}
-
-/// The transcript rows one scripted tool turn renders: the prompt, the
-/// tool-calling message and its usage, the tool cell, the answer and its
-/// usage.
-const TURN_ROWS: usize = 6;
-
-/// The rows a session holds before its first turn: the context notice its
-/// log records at creation.
-const SESSION_ROWS: usize = 1;
-
-/// How many rows the main transcript holds, as a guard that a comparison is
-/// comparing a whole turn rather than converging on something empty.
-fn main_rows(state: &CanonicalState) -> usize {
-    state
-        .agent(AgentId::Main)
-        .expect("a main transcript")
-        .entries
-        .len()
 }
 
 /// The tools the main transcript's cells name, in order.
@@ -3233,16 +3214,7 @@ async fn a_prompt_drives_a_turn_observed_on_the_stream() {
     remote.settle().await;
 
     let state = remote.canonical();
-    assert_eq!(
-        main_rows(&state),
-        SESSION_ROWS + TURN_ROWS,
-        "the whole turn: {state:?}"
-    );
-    assert_eq!(
-        main_tools(&state),
-        vec!["todo_read".to_string()],
-        "the tool cell is there",
-    );
+    CutScenario::ToolTurn.assert_completed(&state);
     assert!(
         !remote.client.working(),
         "the host reported the turn finished",
@@ -4072,8 +4044,8 @@ async fn a_peer_from_the_outer_global_allow_occurrence_can_connect() {
 /// same state as one attached in process to the same host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_http_client_converges_with_an_in_process_oracle() {
-    for script in [tool_turn(), sub_agent_turn()] {
-        let fixture = Fixture::new(script).await;
+    for scenario in [CutScenario::ToolTurn, CutScenario::SubAgentTurn] {
+        let fixture = Fixture::new(scenario.script()).await;
         let session = fixture.create().await;
         let mut oracle = fixture.oracle(&session).await;
         let mut remote = fixture.remote(&session).await;
@@ -4082,11 +4054,7 @@ async fn an_http_client_converges_with_an_in_process_oracle() {
         oracle.settle().await;
         remote.settle().await;
 
-        assert_eq!(
-            main_rows(&oracle.canonical()),
-            SESSION_ROWS + TURN_ROWS,
-            "the compared state is a whole turn",
-        );
+        scenario.assert_completed(&oracle.canonical());
         assert_converged(&remote, &oracle, "a whole turn over http");
         fixture.shutdown().await;
     }
@@ -4154,18 +4122,7 @@ async fn a_joiner_refetches_the_task_table_after_caught_up() {
         Some(&serde_json::json!(1)),
         "and the persisted details name the task too",
     );
-    assert_canonical_eq(
-        &joiner.canonical(),
-        &oracle.canonical(),
-        "a joiner with a live background task",
-    );
-    assert_no_dangling(&joiner.chat);
-    assert_no_dangling(&oracle.chat);
-    assert_eq!(
-        joiner.canonical().tasks,
-        oracle.canonical().tasks,
-        "including where each task's output will paint",
-    );
+    assert_converged(&joiner, &oracle, "a joiner with a live background task");
     fixture.shutdown().await;
 }
 
@@ -4274,12 +4231,42 @@ impl CutScenario {
         }
     }
 
-    /// The main-transcript rows the oracle holds once the run has settled.
-    fn rows(self) -> usize {
-        match self {
-            Self::ToolTurn | Self::SubAgentTurn => SESSION_ROWS + TURN_ROWS,
-            // Both turns, and the notice row between them.
-            Self::NoticeWhileAway => SESSION_ROWS + 2 * TURN_ROWS + 1,
+    /// Independent expected conversation content keeps two equally broken
+    /// folds from satisfying the convergence comparison.
+    fn assert_completed(self, state: &CanonicalState) {
+        let (answers, tools): (&[&str], &[&str]) = match self {
+            Self::ToolTurn => (&["let me check the list", "nothing on it"], &["todo_read"]),
+            Self::SubAgentTurn => (&["delegating that", "nothing to report"], &[]),
+            Self::NoticeWhileAway => (
+                &[
+                    "let me check the list",
+                    "nothing on it",
+                    "delegating that",
+                    "nothing to report",
+                ],
+                &["todo_read"],
+            ),
+        };
+        assert_eq!(
+            assistant_texts(state),
+            answers,
+            "the completed answers appear in order"
+        );
+        assert_eq!(main_tools(state), tools, "the completed turn's tool cells");
+        assert!(state.running.is_empty(), "no spinner outlives the turn");
+        if matches!(self, Self::SubAgentTurn | Self::NoticeWhileAway) {
+            assert_eq!(sub_box(state, 1), (SubAgentStatus::Done, true));
+            let child = state
+                .agent(AgentId::Sub(1))
+                .expect("the child's transcript");
+            assert!(
+                child.entries.iter().any(|entry| matches!(entry,
+                    CanonicalEntry::Assistant { finalized: true, message, .. }
+                        if message["content"].as_array().is_some_and(|blocks|
+                            blocks.iter().any(|block| block["text"] == "the sub found nothing"))
+                )),
+                "the child retains its completed report"
+            );
         }
     }
 
@@ -4343,11 +4330,7 @@ async fn converges_after_a_cut(scenario: CutScenario, cut: usize) -> CutRun {
     remote.reattach().await;
     remote.settle().await;
 
-    assert_eq!(
-        main_rows(&oracle.canonical()),
-        scenario.rows(),
-        "the compared state is a whole turn",
-    );
+    scenario.assert_completed(&oracle.canonical());
     assert_converged_across_a_cut(&remote, &oracle, &format!("a cut after {folded} frames"));
     let run = CutRun {
         interrupted: interrupted < complete,
@@ -4432,16 +4415,23 @@ async fn sweep(scenario: CutScenario, seed: u64, count: usize) -> CutTally {
         let mut remote = fixture.remote(&session).await;
         fixture.prompt(&session, "do the thing").await;
         let mut count = 0;
+        let mut durable = false;
         remote
             .pump_until("the turn to finish", |frame| {
                 count += 1;
+                durable |= frame.durable_seq().is_some();
                 matches!(frame, Frame::State { working: false, .. })
             })
             .await;
+        assert!(durable, "the calibration observed durable turn history");
+        let first_turn = match scenario {
+            CutScenario::NoticeWhileAway => CutScenario::ToolTurn,
+            other => other,
+        };
+        first_turn.assert_completed(&remote.canonical());
         fixture.shutdown().await;
         count
     };
-    assert!(frames > 5, "a turn is more than a handful of frames");
 
     let mut tally = CutTally {
         runs: 0,
@@ -4514,7 +4504,7 @@ async fn a_cut_between_a_tool_end_and_its_durable_message_converges() {
     remote.reattach().await;
     remote.settle().await;
 
-    assert_eq!(main_rows(&oracle.canonical()), SESSION_ROWS + TURN_ROWS);
+    CutScenario::ToolTurn.assert_completed(&oracle.canonical());
     assert_converged(&remote, &oracle, "a cut on the tool-end boundary");
     fixture.shutdown().await;
 }
@@ -4714,11 +4704,7 @@ async fn frames_from_a_stale_epoch_are_dropped_until_a_reattach() {
     let mut remote = fixture.remote(&session).await;
     fixture.prompt(&session, "one").await;
     remote.settle().await;
-    fixture.prompt(&session, "two").await;
-    remote.settle().await;
-
-    // Branch at the head after the first turn. The entry id comes from the
-    // log, which is where a tree view gets it too.
+    // Capture the first turn's head before another turn extends the branch.
     let target = {
         let handles = fixture
             .host
@@ -4726,16 +4712,10 @@ async fn frames_from_a_stale_epoch_are_dropped_until_a_reattach() {
             .await
             .expect("live session");
         let log = handles.log.lock().await;
-        let head = log.head().cloned().expect("a head");
-        log.linearize(&head, ThreadFilter::USER)
-            .entries()
-            .iter()
-            .rev()
-            .nth(2)
-            .expect("an earlier entry")
-            .id
-            .clone()
+        log.head().cloned().expect("the first turn's head")
     };
+    fixture.prompt(&session, "two").await;
+    remote.settle().await;
 
     fixture
         .client
