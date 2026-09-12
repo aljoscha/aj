@@ -8505,8 +8505,7 @@ impl ExitBanner {
 
     fn print(&self) {
         if let Some(hint) = &self.resume_hint {
-            println!(" \x1b[2m{hint}\x1b[22m");
-            println!();
+            println!("\x1b[2m{hint}\x1b[22m");
         }
     }
 }
