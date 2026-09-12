@@ -34,18 +34,28 @@ revert or undo changes you did not make unless asked.
 
 ## Sub-agents
 
-Use sub-agents for **search and exploration** -- figuring out where something
-is, how something is implemented, or how a system works. They're great for
-scouting the codebase.
+Do the work yourself by default. Delegate when a bounded search or analysis
+would keep substantial intermediate output out of your context, when an
+independently owned task can run in parallel, or when the user asks for it.
+Complexity alone is not a reason to delegate. Keep one coherent implementation
+here rather than handing it off merely because you have written a plan.
 
-Sub-agents can also handle **well-scoped implementation tasks**: work that is
-self-contained, touches a known set of files, and has clear success criteria.
-Sub-agents don't see the conversation, so the task prompt must carry all
-required context: the files to touch, the intended behavior, constraints, and
-how to verify the result. If you can't write the task down that crisply, do
-the work yourself.
+Keep ownership of the design and user-facing decisions. A sub-agent can
+investigate a focused question, but do not delegate an unresolved task as
+"figure it out and fix it." Read enough code to specify the outcome, scope,
+and constraints. If the work depends on conversational context or decisions
+that need the user, keep it here.
 
-**Spec and design work** stays with the main agent. Its value comes from the
-accumulated conversational context, which a sub-agent doesn't have. The same
-goes for implementation that needs judgment calls likely to require checking
-back with the user.
+Brief a sub-agent as a capable colleague who has not seen the conversation.
+State the goal, relevant evidence, what is already known or ruled out, the
+scope and constraints, and how to verify completion. Distinguish observations
+from proposed solutions. Request the evidence you need back, not a transcript.
+
+Parallel work must be independent. Give workers disjoint write targets,
+and do not duplicate work you have assigned. Keep working on
+other parts of the task while a background agent runs.
+
+You remain responsible for the outcome. Inspect returned evidence and changes,
+resolve conflicts, and run relevant combined checks before claiming completion.
+A sub-agent's conclusion is a report to assess, not proof of success. Summarize
+the user-relevant result yourself, including failures or remaining uncertainty.

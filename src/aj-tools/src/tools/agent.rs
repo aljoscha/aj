@@ -39,24 +39,30 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const DESCRIPTION: &str = r#"
-Spawn a sub-agent to perform a specific task like research, analysis, or implementation.
+Give a sub-agent a bounded research, analysis, or implementation task and receive
+its final report. It inherits your model, system instructions, and tools except
+this agent tool, but not your conversation history. It shares your working
+directory and can edit files and run commands. The user can steer it from its
+view, but this tool does not provide a way for you to message it mid-task.
 
-The sub-agent acts as a collaborator or researcher that can:
-- Research where in the code something is implemented
-- Analyze how specific systems work
-- Implement smaller-scope tasks independently
-- Provide detailed analysis and insights
+Use this tool for:
+- A multi-step investigation whose intermediate output would crowd your context.
+- Independently specifiable work that can run alongside your own work, with
+  clear ownership and success criteria.
+- A large, bounded work unit whose result you can assess from a diff or concrete
+  evidence, or a task the user explicitly asks you to delegate.
 
-The sub-agent has access to tools for reading files, searching, and basic file operations but cannot interact with the user directly. It runs a single turn and returns a detailed report.
+Do not use it for a known file read, an exact text search, a localized edit, or
+routine reassurance about your own work. Use direct tools for those. Do not
+hand off an entire coherent implementation merely because it is complex, or
+delegate before you understand what outcome to request.
 
-Use this tool when you need to:
-- Investigate complex code patterns across multiple files
-- Research implementation details before making changes
-- Analyze system architecture or dependencies
-- Implement isolated features or components
-- Get a fresh perspective on code organization
-
-The sub-agent will return a comprehensive report that you can use to inform your next steps.
+Give the worker a self-contained brief: goal, scope, relevant files and evidence,
+constraints, and verification. Say whether it is researching, coding, or
+verifying. Ask for compact but complete results: the outcome, required evidence,
+files changed or inspected, checks run, and blockers. If you need exact quotes,
+numbers, paths, or URLs, request them explicitly. Inspect the report and any
+changes before relying on them.
 
 Set run_in_background: true to keep working while the sub-agent runs: the call
 returns immediately with a task id, and the sub-agent's report is delivered to
@@ -68,10 +74,9 @@ sleeping only delays the report by the length of the sleep.
 Parallel agents share your filesystem. When you launch several agents at once
 (several agent calls in one message, or multiple background agents), they run
 concurrently against the same working directory, with no isolation or locking
-between them. If two agents edit the same files or use the same scratch paths,
-they will clobber each other's work. Only run agents in parallel when their
-tasks are independent. Give each agent its own scratch paths, and keep edits to
-any given file within a single agent, or run those tasks one at a time.
+between them. Only run agents in parallel when their tasks are independent.
+Keep edits to any given file within a single agent, or run those tasks one at
+a time.
 "#;
 
 #[derive(Debug, Clone)]
@@ -79,11 +84,9 @@ pub struct AgentTool;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentInput {
-    /// The task for the sub-agent to perform. Be specific about what needs to
-    /// be done and include context. This should be a clear, detailed prompt
-    /// that describes what the sub-agent should research, analyze, or
-    /// implement. The sub-agent will act as a collaborator or researcher,
-    /// providing insights and implementation details.
+    /// A self-contained assignment with the goal, scope, relevant context,
+    /// constraints, verification, and expected evidence in the final report.
+    /// The sub-agent does not see the parent conversation.
     pub task: String,
 
     /// Optional description of the task that can be displayed to the user while
