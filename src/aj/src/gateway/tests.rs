@@ -5836,8 +5836,6 @@ async fn a_slow_attach_does_not_lose_another_hosts_block() {
     fixture.until_connected("aaa").await;
     fixture.until_connected("zzz").await;
 
-    // The stream request cannot come back until the second host answers its
-    // head, and that wait is the window under test.
     let client = RemoteClient::new(&fixture.server.url()).expect("client");
     let opening = tokio::spawn(async move {
         client
