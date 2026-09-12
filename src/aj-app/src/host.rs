@@ -763,6 +763,7 @@ impl SessionHost {
                 ARCHIVE_CAPABILITY.to_string(),
                 COMPACTION_USAGE_CAPABILITY.to_string(),
                 aj_wire::SESSION_INFO_CAPABILITY.to_string(),
+                aj_wire::SESSION_EXPORT_CAPABILITY.to_string(),
                 aj_wire::SESSION_PREVIEWS_CAPABILITY.to_string(),
                 aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
                 aj_wire::SESSION_ENV_CAPABILITY.to_string(),
@@ -1427,6 +1428,24 @@ impl SessionHost {
         let live = self.live(session).await?;
         let stats = live.core.log.lock().await.stats();
         Ok(stats)
+    }
+
+    /// Render the complete session log as HTML, materializing it if needed.
+    /// This returns content only and never writes an export on the host.
+    pub async fn export_html(&self, session: &str) -> Result<aj_wire::SessionExport, HostError> {
+        let live = self.live(session).await?;
+        let log = Arc::clone(&live.core.log);
+        tokio::task::spawn_blocking(move || {
+            // Rendering holds a consistent log view on the blocking pool. A turn
+            // may wait for this rare manual read, without parking the serving loop
+            // or duplicating the entire log in memory.
+            let log = log.blocking_lock();
+            aj_wire::SessionExport {
+                html: crate::export::render_session_html(&log),
+            }
+        })
+        .await
+        .map_err(|err| HostError::Internal(Box::new(err)))
     }
 
     /// The selected branch's environment overlay, materializing the session if needed.

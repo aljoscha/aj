@@ -512,6 +512,15 @@ code.
   `session_id` is the host-local log identity, not a gateway routing id.
   Clients render the facts and fetch only when the info overlay opens.
   Capability `session_info` (section 5.10).
+- `GET /v1/sessions/{id}/export`: `SessionExport` in `aj-wire`, `{html}`.
+  The host renders the complete log with the ordinary HTML exporter, including
+  all threads and branches and its export redaction and tool-detail resolution.
+  Rendering runs on the blocking pool, not the serving loop. The endpoint writes
+  no host export file. Clients save the returned document to
+  `~/.aj/exports/aj-session-<id>.html` on the client, using the requested session
+  id (including a gateway prefix), and report that local path in the notice.
+  Capability `session_export` (section 5.10). Clients attempt the endpoint
+  without capability gating and explain when the host does not support it.
 - `GET /v1/previews?session=<id>` (repeatable): the session browser's
   `SessionPreviews` in `aj-wire`, `{previews, incomplete}`. Each preview
   carries the full first user text block, message count, creation and
@@ -703,6 +712,7 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `branch_settings` | `head.changes` | hosts |
   | `transcript_settings` | user-message `branch_settings` and `GET /v1/sessions/{id}/env/before/{entry}` | hosts |
   | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
+  | `session_export` | `GET /v1/sessions/{id}/export` | hosts |
   | `session_info` | `GET /v1/sessions/{id}/info` | hosts |
   | `session_previews` | `GET /v1/previews` | hosts and gateways |
   | `prompt_history` | Workspace and All prompt-history reads | hosts and gateways |
@@ -899,7 +909,7 @@ The boundary of what works over the wire is explicit. Supported: prompt,
 steer, cancel, queue withdraw and clear, settings including model switch
 and thinking display, compaction, task kill, the task-output overlay,
 tagging, archiving, environment overlay reads and edits, session account
-reads and selection, the session-info overlay, the tree view and
+reads and selection, the session-info overlay, HTML export, the tree view and
 head switching, and session
 creation and switching. The prompt recall ring holds this run's own
 submissions only. On exit, the client prints the focused session's id and
@@ -907,9 +917,7 @@ an `aj connect <url> <session>` command using the connected endpoint and
 the complete id, including its host prefix through a gateway. URLs with
 userinfo, query parameters, fragments, or control characters are replaced
 by `"$AJ_CONNECT_URL"`, with an instruction to set it to the same connection
-URL. No usage summary is printed. Refused, each with a notice naming why: the
-HTML export (host-local files no endpoint
-serves), and the usage
+URL. No usage summary is printed. Refused, each with a notice naming why: the usage
 overlay and credential management (this client's credential store). An
 unsupported action never silently does nothing.
 

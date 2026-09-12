@@ -3631,22 +3631,7 @@ async fn apply_command_action(
             ActionEffect::Redraw
         }
         CommandAction::ExportHtml => {
-            // Rendering the whole session to HTML (CPU) plus the file write
-            // would park the single drive loop, so `spawn_session_export` runs
-            // them off the loop and delivers the result notice to the export
-            // fill arm. The action just spawns and returns. See that helper for
-            // the log-lock reasoning.
-            let Some(log) = world.local.as_ref().map(|local| Arc::clone(&local.log)) else {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice(
-                        "export the session",
-                        "the log and the written file are the host's, so run the export there",
-                    ),
-                );
-                return ActionEffect::Redraw;
-            };
-            spawn_session_export(&log, world.session(), export_tx);
+            spawn_session_export(&world.control, world.session(), export_tx);
             ActionEffect::None
         }
         CommandAction::OpenThinkingSelector => {
@@ -5289,33 +5274,27 @@ fn spawn_skills_discovery(world: &World, tx: &UnboundedSender<Vec<Skill>>) {
     });
 }
 
-/// Render the session to HTML and write it out off the drive loop, delivering
-/// the result notice back to the host over `tx`.
-///
-/// `render_session_html` walks the whole log (CPU) and the file write is
-/// blocking IO, both of which would park the single drive loop. We run them on
-/// the blocking pool and hold the log lock there for the render, so the UI
-/// stays responsive. A concurrent turn wanting the log briefly waits on the
-/// lock, which is acceptable for a rare manual export, and cheaper than
-/// cloning the whole log. Only the notice string (Send) crosses back.
-fn spawn_session_export(
-    log: &Arc<tokio::sync::Mutex<aj_session::ConversationLog>>,
-    session: &str,
-    tx: &UnboundedSender<String>,
-) {
+/// Fetch host-rendered HTML and save it on this client off the drive loop.
+/// The result notice names the local destination, including over a connection.
+fn spawn_session_export(control: &Control, session: &str, tx: &UnboundedSender<String>) {
     let tx = tx.clone();
-    let log = Arc::clone(log);
-    let session_id = session.to_string();
-    tokio::task::spawn_blocking(move || {
-        // `blocking_lock` is safe here: this closure runs on the blocking
-        // pool, not inside an async context.
-        let html = {
-            let guard = log.blocking_lock();
-            aj_app::export::render_session_html(&guard)
-        };
-        let notice = match write_session_export(&session_id, &html) {
-            Ok(path) => format!("Exported session to {}", aj_conf::display_path(&path)),
-            Err(e) => format!("Export failed: {e}"),
+    let control = control.clone();
+    let session = session.to_string();
+    tokio::spawn(async move {
+        let notice = match control.export_html(&session).await {
+            Ok(export) => match tokio::task::spawn_blocking(move || {
+                write_session_export(&session, &export.html)
+            })
+            .await
+            {
+                Ok(Ok(path)) => format!("Exported session to {}", aj_conf::display_path(&path)),
+                Ok(Err(err)) => format!("Export failed: {err}"),
+                Err(err) => format!("Export failed: {err}"),
+            },
+            Err(err) if err.unknown_endpoint() => {
+                "This host does not support HTML export. Update the host and try again.".to_string()
+            }
+            Err(err) => format!("Export failed: {}", peer_refusal(&err)),
         };
         let _ = tx.send(notice);
     });
@@ -16409,34 +16388,148 @@ mod tests {
         );
     }
 
-    /// `ExportHtml` no longer renders on the loop: the action spawns the
-    /// render + write off the loop and returns immediately, and the resulting
-    /// notice comes back over the channel the drive loop's fill arm folds.
+    /// Full-log export is identical locally, over HTTP, and through the gateway,
+    /// even when a host branch is absent from the client's attached transcript.
     #[tokio::test]
-    async fn export_html_spawns_and_delivers_notice() {
-        let Some(_home) = isolated_test_home() else {
+    async fn export_html_parity_saves_the_full_host_log_on_the_client() {
+        let Some(home) = isolated_test_home() else {
             return;
         };
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let (export_tx, mut export_rx) = unbounded_channel();
-        let (redraw_tx, _redraw_rx) = unbounded_channel();
+        let dir = TempDir::new().expect("host dir");
+        let (mut local_world, local_shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut local_world, "visible branch").await;
+        let log = Arc::clone(&local_world.local.as_ref().unwrap().log);
+        let head = log.lock().await.head().unwrap().to_string();
+        let sentinel = "host-only abandoned branch contents";
+        run_prompt(&mut local_world, sentinel).await;
+        let session = local_world.session().to_string();
+        local_world
+            .control
+            .command(
+                &session,
+                Command::Head {
+                    target: HeadTarget::Entry(head),
+                    changes: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let expected = {
+            let log = log.lock().await;
+            assert!(
+                serde_json::to_string(&log.entries_in_order())
+                    .unwrap()
+                    .contains(sentinel)
+            );
+            aj_app::export::render_session_html(&log)
+        };
+        let host = local_world.control.host().unwrap().clone();
+        assert!(
+            host.hello()
+                .capabilities
+                .iter()
+                .any(|c| c == aj_wire::SESSION_EXPORT_CAPABILITY)
+        );
+        let server = crate::remote::RemoteServer::bind(
+            host.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            crate::remote::IdentityGate::local(),
+        )
+        .await
+        .unwrap();
+        let remote = RemoteHost { host, server };
+        let gateway = RemoteGateway::over(&[&remote]).await;
+        gateway.until_sessions(1).await;
+        let exports = home.join(".aj/exports");
 
-        let effect = apply_command_action(
-            &mut world,
-            &shell,
+        for url in [remote.url(), gateway.url()] {
+            let client_dir = TempDir::new().expect("client dir");
+            let (mut world, shell) = connect_world_and_shell_at(&client_dir, &url, &[]).await;
+            assert!(world.local.is_none());
+            assert_eq!(user_rows(&world), vec!["visible branch"]);
+            let actual = world.control.export_html(world.session()).await.unwrap();
+            assert_eq!(actual.html, expected, "real adapter parity at {url}");
+            assert!(!exports.exists(), "host rendering must not write an export");
+            let (tx, mut rx) = unbounded_channel();
+            let (redraw, _) = unbounded_channel();
+            assert!(matches!(
+                apply_command_action(&mut world, &shell, CommandAction::ExportHtml, &tx, &redraw,)
+                    .await,
+                ActionEffect::None
+            ));
+            let notice = rx.recv().await.unwrap();
+            let path = exports.join(format!("aj-session-{}.html", world.session()));
+            assert_eq!(
+                notice,
+                format!("Exported session to {}", aj_conf::display_path(&path))
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+            assert!(!client_dir.path().join(path.file_name().unwrap()).exists());
+            assert!(!dir.path().join("exports").exists());
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_dir(&exports).unwrap();
+        }
+        let (tx, mut rx) = unbounded_channel();
+        let (redraw, _) = unbounded_channel();
+        apply_command_action(
+            &mut local_world,
+            &local_shell,
             CommandAction::ExportHtml,
-            &export_tx,
-            &redraw_tx,
+            &tx,
+            &redraw,
         )
         .await;
-
-        assert!(matches!(effect, ActionEffect::None));
-        let notice = export_rx.recv().await.expect("export delivered a notice");
-        assert!(
-            notice.starts_with("Exported session to"),
-            "export succeeded: {notice}"
+        let notice = rx.recv().await.unwrap();
+        let path = exports.join(format!("aj-session-{session}.html"));
+        assert_eq!(
+            notice,
+            format!("Exported session to {}", aj_conf::display_path(&path))
         );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+        gateway.shutdown().await;
+        remote.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn export_html_reports_unsupported_host_and_failures_without_writing() {
+        let Some(home) = isolated_test_home() else {
+            return;
+        };
+        let dir = TempDir::new().unwrap();
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let supported = world.control.clone();
+        let (tx, mut rx) = unbounded_channel();
+        let (redraw, _) = unbounded_channel();
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&format!("{}/nowhere", remote.url())).unwrap(),
+        );
+        apply_command_action(&mut world, &shell, CommandAction::ExportHtml, &tx, &redraw).await;
+        let notice = rx.recv().await.unwrap();
+        assert!(
+            notice.contains("This host does not support HTML export")
+                && notice.contains("Update the host"),
+            "{notice}"
+        );
+        spawn_session_export(&supported, "missing", &tx);
+        let notice = rx.recv().await.unwrap();
+        assert!(
+            notice.starts_with("Export failed:") && notice.contains("missing"),
+            "{notice}"
+        );
+        let exports = home.join(".aj/exports");
+        assert!(!exports.exists());
+        std::fs::create_dir_all(exports.parent().unwrap()).unwrap();
+        std::fs::write(&exports, "not a directory").unwrap();
+        world.control = supported;
+        apply_command_action(&mut world, &shell, CommandAction::ExportHtml, &tx, &redraw).await;
+        let notice = rx.recv().await.unwrap();
+        assert!(
+            notice.starts_with("Export failed:") && notice.contains("failed to create"),
+            "{notice}"
+        );
+        assert_eq!(std::fs::read_to_string(exports).unwrap(), "not a directory");
+        remote.shutdown().await;
     }
 
     /// The theme name resolves from config, defaulting to `light` like
@@ -28337,8 +28430,7 @@ mod tests {
     /// A gesture connect mode has no path for folds a notice naming why, rather
     /// than silently doing nothing.
     ///
-    /// Export writes a host-local file and usage reads credentials. Neither
-    /// gesture has a host endpoint here.
+    /// Usage reads this process's credentials rather than the remote host's.
     #[tokio::test]
     async fn connect_mode_refuses_the_gestures_about_this_machine() {
         let dir = TempDir::new().expect("tempdir");
@@ -28347,13 +28439,10 @@ mod tests {
 
         // The reason is pinned, not just the fact of a refusal: each names the
         // host-local thing it cannot reach.
-        for (action, reason) in [
-            (CommandAction::ExportHtml, "run the export there"),
-            (
-                CommandAction::OpenUsageStatus,
-                "this machine's credential store",
-            ),
-        ] {
+        for (action, reason) in [(
+            CommandAction::OpenUsageStatus,
+            "this machine's credential store",
+        )] {
             let before = main_notices(&world).len();
             apply_command(&mut world, &shell, action).await;
             // The harm first, then the notice: what a refusal has to prevent is

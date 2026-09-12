@@ -230,6 +230,17 @@ impl Control {
         }
     }
 
+    /// Export the host's complete log, not the client's attached transcript.
+    pub(crate) async fn export_html(
+        &self,
+        session: &str,
+    ) -> Result<aj_wire::SessionExport, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.export_html(session).await?),
+            Self::Remote(remote) => Ok(remote.client.export_html(session).await?),
+        }
+    }
+
     /// Aggregate facts from the host's log, loading the session if needed.
     pub(crate) async fn session_info(
         &self,

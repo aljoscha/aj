@@ -341,6 +341,13 @@ impl RemoteClient {
         decode(refusal(response).await?).await
     }
 
+    pub(crate) async fn export_html(
+        &self,
+        session: &str,
+    ) -> Result<aj_wire::SessionExport, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/export")).await
+    }
+
     pub(crate) async fn session_info(
         &self,
         session: &str,

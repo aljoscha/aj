@@ -50,6 +50,15 @@ pub const SESSION_ENV_CAPABILITY: &str = "session_env";
 /// The capability for `GET /v1/sessions/{id}/info` session facts.
 pub const SESSION_INFO_CAPABILITY: &str = "session_info";
 
+/// The capability for `GET /v1/sessions/{id}/export` full-session HTML.
+pub const SESSION_EXPORT_CAPABILITY: &str = "session_export";
+
+/// Host-rendered full-session HTML, saved by the requesting client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExport {
+    pub html: String,
+}
+
 /// The capability for `GET /v1/previews?session=…` batched log previews.
 pub const SESSION_PREVIEWS_CAPABILITY: &str = "session_previews";
 

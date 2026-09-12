@@ -199,6 +199,7 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/queue", get(queue).post(queue_command))
         .route("/v1/sessions/{id}/tree", get(tree))
         .route("/v1/sessions/{id}/info", get(session_info))
+        .route("/v1/sessions/{id}/export", get(export_html))
         .route("/v1/sessions/{id}/env", get(environment).post(env_command))
         .route(
             "/v1/sessions/{id}/env/before/{entry}",
@@ -384,6 +385,13 @@ async fn prompt_history(
     Path(session): Path<String>,
 ) -> Result<Response, ApiError> {
     Ok(Json(state.host.prompt_history(Some(&session), None).await?).into_response())
+}
+
+async fn export_html(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(state.host.export_html(&session).await?).into_response())
 }
 
 async fn session_info(
