@@ -1327,8 +1327,7 @@ enum FocusRequest {
     },
 }
 
-/// Whether selection moved to another session, which is what decides if the
-/// outgoing session's usage belongs in the exit banner.
+/// Whether selection moved to another session.
 enum Focus {
     Moved,
     Same,
@@ -7004,7 +7003,7 @@ fn sync_editor_chrome(world: &World, shell: &Rc<RefCell<Shell>>) {
 /// Runs the interactive shell until the user quits.
 ///
 /// Restores the terminal via [`AsyncApp::shutdown`] on the way out,
-/// then prints the usage banner and resume hint to the normal screen.
+/// then prints the resume hint to the normal screen.
 /// The driver's futures are `!Send`, so this must
 /// run on a top-level `block_on` (the `#[tokio::main]` future), not a
 /// spawned task.
@@ -8637,8 +8636,12 @@ struct ExitBanner {
 
 impl ExitBanner {
     async fn collect(world: &World) -> ExitBanner {
+        if let Some(url) = world.control.base_url() {
+            return ExitBanner {
+                resume_hint: Some(format_remote_resume_hint(url, world.session())),
+            };
+        }
         // Offer local resume once there is persisted user-thread state.
-        // Remote sessions need a host-specific command.
         let resume_eligible = match world.local.as_ref() {
             Some(handles) => handles
                 .log
@@ -8659,6 +8662,35 @@ impl ExitBanner {
             println!();
         }
     }
+}
+
+/// Quote the endpoint and opaque session id for a shell, without exposing
+/// credentials in URL userinfo, query parameters, or fragments.
+fn format_remote_resume_hint(url: &str, session: &str) -> String {
+    fn quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    let printable = !url.chars().any(char::is_control)
+        && reqwest::Url::parse(url).is_ok_and(|url| {
+            url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        });
+    let endpoint = if printable {
+        quote(url)
+    } else {
+        "\"$AJ_CONNECT_URL\"".to_string()
+    };
+    let mut hint = format!(
+        "Session: {session} (resume with: aj connect {endpoint} {})",
+        quote(session)
+    );
+    if !printable {
+        hint.push_str("\nSet AJ_CONNECT_URL to the same connection URL.");
+    }
+    hint
 }
 
 #[cfg(test)]
@@ -21183,6 +21215,79 @@ mod tests {
         connect_world_at(dir, &remote.url(), argv).await
     }
 
+    #[test]
+    fn remote_exit_hint_quotes_shell_arguments_and_hides_sensitive_urls() {
+        let url = "https://example.org/a'b/$(echo injected)";
+        let session = "host:session";
+        let hint = format_remote_resume_hint(url, session);
+        let command = hint
+            .split_once(" (resume with: ")
+            .unwrap()
+            .1
+            .strip_suffix(')')
+            .unwrap();
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("aj() {{ printf '%s\\000' \"$@\"; }}; {command}"))
+            .output()
+            .expect("run the hint with a capturing aj function");
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            format!("connect\0{url}\0{session}\0").into_bytes()
+        );
+
+        for url in [
+            "https://user:secret@example.org",
+            "https://example.org?token=secret",
+            "https://example.org#secret",
+            "https://example.org/\x1bsecret",
+        ] {
+            assert_eq!(
+                format_remote_resume_hint(url, session),
+                "Session: host:session (resume with: aj connect \"$AJ_CONNECT_URL\" 'host:session')\nSet AJ_CONNECT_URL to the same connection URL."
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remote_exit_hint_resumes_the_focused_session_directly_and_through_gateway() {
+        let host_dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::at_directory(&host_dir).await;
+        remote.host.create().await.expect("seed a session");
+        let gateway = RemoteGateway::over(&[&remote]).await;
+        gateway.until_sessions(1).await;
+
+        for url in [remote.url(), gateway.url()] {
+            let client_dir = TempDir::new().expect("tempdir");
+            let (mut world, shell) = connect_world_and_shell_at(&client_dir, &url, &[]).await;
+            let initial = world.session().to_string();
+            let (mut app, _writer, _root) = app_over(&shell).await;
+            apply_focus_request(
+                &mut app,
+                &shell,
+                &mut world,
+                FocusRequest::Create { host: None },
+            )
+            .await;
+            settle_pending_transition(&mut app, &shell, &mut world).await;
+            let session = world.session().to_string();
+            assert_ne!(session, initial, "the hint must follow a session switch");
+            assert_eq!(session.contains(':'), url == gateway.url());
+            assert_eq!(
+                ExitBanner::collect(&world).await.resume_hint,
+                Some(format!(
+                    "Session: {session} (resume with: aj connect '{url}' '{session}')"
+                )),
+            );
+            let resumed = connect_world_at(&client_dir, &url, &[&session]).await;
+            assert_eq!(resumed.session(), session);
+            app.shutdown().await;
+        }
+        gateway.shutdown().await;
+        remote.shutdown().await;
+    }
+
     /// The same against any peer's url.
     async fn connect_world_at(dir: &TempDir, url: &str, argv: &[&str]) -> World {
         let mut args = vec!["aj", "connect"];
@@ -22321,8 +22426,8 @@ mod tests {
     /// Resuming the session already focused does nothing at all.
     ///
     /// Not merely "moves nowhere": running the switch body would fold a notice
-    /// for a switch that did not happen, discard an armed branch anchor, reset
-    /// the scroll, and count the session twice in the exit banner.
+    /// for a switch that did not happen, discard an armed branch anchor, and
+    /// reset the scroll.
     #[tokio::test]
     async fn resuming_the_focused_session_changes_nothing() {
         let dir = TempDir::new().expect("tempdir");

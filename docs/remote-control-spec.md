@@ -852,8 +852,12 @@ tagging, archiving, environment overlay reads and edits, session account
 reads and selection, the tree view and
 head switching, and session
 creation and switching. The prompt recall ring holds this run's own
-submissions only. The exit usage banner renders from the client's own
-event-derived accounting. Refused, each with a notice naming why: the
+submissions only. On exit, the client prints the focused session's id and
+an `aj connect <url> <session>` command using the connected endpoint and
+the complete id, including its host prefix through a gateway. URLs with
+userinfo, query parameters, fragments, or control characters are replaced
+by `"$AJ_CONNECT_URL"`, with an instruction to set it to the same connection
+URL. No usage summary is printed. Refused, each with a notice naming why: the
 session-info overlay and HTML export (host-local files no endpoint
 serves), prompt-history search (this client's own store), and the usage
 overlay and credential management (this client's credential store). An
