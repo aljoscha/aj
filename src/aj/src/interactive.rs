@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 use aj_agent::TaskRegistry;
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::tool::TaskId;
-use aj_agent::types::UsageSummary;
 use aj_app::actions::AjAction;
 use aj_app::chat::ChatState;
 use aj_app::cli::args::{
@@ -40,7 +39,7 @@ use aj_app::keybindings::fixed_keys;
 use aj_app::session::{SessionExit, SessionRequest};
 use aj_app::session_setup::{ComposedHost, compose_host};
 use aj_app::settings::{ConfigLayers, ConfigTarget, PersistAction};
-use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_usage_summary};
+use aj_app::shutdown::format_resume_hint;
 use aj_app::theme::{
     ColorMode, Theme, ThemeBg, ThemeColor, ThemeHandle, ThemeWatcherGuard, watch_user_theme,
 };
@@ -7175,10 +7174,7 @@ pub async fn run(args: Args) -> Result<()> {
     // Outer session loop. Each iteration drives one focused session; a
     // new-session, resume or branch request exits `drive` with the matching
     // `SessionExit`, whereupon the focus moves over the same Shell (see
-    // `focus_session`). Quit and fatal errors break out. The usage of each
-    // session the process leaves is snapshotted for the shutdown banner so a
-    // multi-session process itemizes every session, matching `aj`.
-    let mut completed_sessions: Vec<(String, UsageSummary)> = Vec::new();
+    // `focus_session`). Quit and fatal errors break out.
     let run_result: Result<()> = loop {
         // Restore the terminal even when the loop exits with a render error,
         // otherwise the user is left stuck on the alt screen.
@@ -7201,36 +7197,19 @@ pub async fn run(args: Args) -> Result<()> {
             Ok(SessionExit::Branch { target, prompt }) => FocusRequest::Branch { target, prompt },
         };
 
-        // Read the outgoing session's usage before the change and record it
-        // only once the change took: nothing is torn down here (the host
-        // keeps every session it materialized live), so a refused change
-        // leaves the same session focused and its usage still growing.
-        let previous = world.session().to_string();
-        let usage = session_usage(&world, &previous).await;
-        let moved = apply_focus_request(&mut app, &shell, &mut world, request).await;
-        match moved {
-            Focus::Moved => match usage {
-                Some(usage) => completed_sessions.push((previous, usage)),
-                None => {
-                    tracing::warn!("could not read {previous}'s usage for the exit banner");
-                }
-            },
-            // A branch stays in its session, and a refusal never left it, so
-            // the banner keeps counting this session as the live one.
-            Focus::Same => {}
-        }
+        apply_focus_request(&mut app, &shell, &mut world, request).await;
     };
 
     // Restore the terminal before installing forced-exit handlers. Process exit
     // cannot run destructors to leave raw mode or the alternate screen.
     app.shutdown().await;
     let banner = crate::serve::finish_shutdown(async {
-        // Collect usage while sessions still exist, under the same exit budget
-        // as cleanup: a blocked usage read must not prevent the user quitting.
+        // Read resume eligibility while the session log is still available,
+        // under the same exit budget as cleanup.
         if let Some(server) = &server {
             server.stop_accepting();
         }
-        let banner = ExitBanner::collect(&world, completed_sessions).await;
+        let banner = ExitBanner::collect(&world).await;
         if let Some(server) = server {
             let host = world
                 .control
@@ -7246,7 +7225,7 @@ pub async fn run(args: Args) -> Result<()> {
     .await;
 
     // The alt screen wiped the conversation from the terminal, so the
-    // normal screen gets the usage banner and the resume hint.
+    // normal screen gets the resume hint.
     banner.print();
     run_result
 }
@@ -8644,36 +8623,6 @@ async fn drive(
     exit
 }
 
-/// One session's accumulated usage for the exit banner.
-///
-/// The host owns it for a local run (its agents hold the running totals). A
-/// connection has no such read and renders the banner from the accounting its
-/// own fold derived from the event stream, which covers exactly
-/// the frames this client saw.
-async fn session_usage(world: &World, session: &str) -> Option<UsageSummary> {
-    // Asking the host locks the session's agent, and a turn holds that lock
-    // for its whole duration, so a busy session would park this loop until the
-    // turn ended: no paint, no input, not even a cancel. Fall back to the
-    // client's own event-derived accounting, which is what a connection uses
-    // for the same banner. A session with work in flight has no
-    // final usage to report anyway.
-    let (agents, bash) = running_work(world);
-    let busy = agents + bash > 0;
-    match world.control.host() {
-        Some(host) if !busy => match host.usage(session).await {
-            Ok(usage) => usage,
-            Err(err) => {
-                tracing::warn!("could not read {session}'s usage for the exit banner: {err}");
-                None
-            }
-        },
-        // `running_work` answers for the focused session, so the fallback is
-        // only sound for that one. Both callers ask about it.
-        _ if session == world.session() => Some(world.chat.borrow().usage_summary()),
-        _ => None,
-    }
-}
-
 /// Tear down the in-process host, if this run has one.
 async fn shut_down_host(world: &World) {
     if let Some(host) = world.control.host() {
@@ -8681,38 +8630,15 @@ async fn shut_down_host(world: &World) {
     }
 }
 
-/// The end-of-run usage banner and resume hint.
-///
-/// Collected while the host is still up (reading a session's usage needs its
-/// agent) and printed once the alt screen is gone, since the alt screen wiped
-/// the conversation from the terminal.
+/// The active session's resume hint, printed after leaving the alternate screen.
 struct ExitBanner {
-    /// Each session the process left, in the order it left them, with the
-    /// usage read at the moment it lost focus.
-    completed: Vec<(String, UsageSummary)>,
-    /// The session that was focused at the end, and its usage. `None` when
-    /// the host could not answer, which leaves the block out rather than
-    /// printing zeroes.
-    live: Option<(String, UsageSummary)>,
-    /// The `aj continue <id>` hint, present only for a session worth
-    /// resuming.
     resume_hint: Option<String>,
 }
 
 impl ExitBanner {
-    /// Read the banner's data off the host. Call with no turn in flight
-    /// (reading a session's usage locks its agent).
-    ///
-    /// A connection reads neither: its usage comes from this client's own
-    /// event-derived accounting, and the resume hint is left out
-    /// because `aj continue` would resume a session on the *host*, not here.
-    async fn collect(world: &World, completed: Vec<(String, UsageSummary)>) -> ExitBanner {
-        let live = session_usage(world, world.session())
-            .await
-            .map(|usage| (world.session().to_string(), usage));
-        // Only sessions with at least one persisted user-thread leaf are
-        // worth resuming. A fresh session the user quit without typing
-        // anything gets no hint.
+    async fn collect(world: &World) -> ExitBanner {
+        // Offer local resume once there is persisted user-thread state.
+        // Remote sessions need a host-specific command.
         let resume_eligible = match world.local.as_ref() {
             Some(handles) => handles
                 .log
@@ -8723,44 +8649,13 @@ impl ExitBanner {
             None => false,
         };
         ExitBanner {
-            completed,
-            live,
             resume_hint: resume_eligible.then(|| format_resume_hint(world.session())),
         }
     }
 
-    /// Print the banner to stdout, dimmed and indented like `aj`'s shutdown
-    /// banner.
-    ///
-    /// A single-session process prints one bare usage block. When the process
-    /// spanned several sessions (new-session / resume), each session it left
-    /// is itemized first, in order, under a dim `Session: <id>` header, then
-    /// the live one's block, matching `aj`.
     fn print(&self) {
-        fn dim(s: &str) -> String {
-            format!("\x1b[2m{s}\x1b[22m")
-        }
-        fn print_block(header: Option<&str>, summary: &UsageSummary) {
-            println!();
-            if let Some(header) = header {
-                println!(" {}", dim(header));
-            }
-            for line in format_usage_summary(summary).lines() {
-                println!(" {}", dim(line));
-            }
-            println!();
-        }
-
-        for (session_id, summary) in &self.completed {
-            print_block(Some(&format_session_usage_header(session_id)), summary);
-        }
-        if let Some((session_id, summary)) = &self.live {
-            let header =
-                (!self.completed.is_empty()).then(|| format_session_usage_header(session_id));
-            print_block(header.as_deref(), summary);
-        }
         if let Some(hint) = &self.resume_hint {
-            println!(" {}", dim(hint));
+            println!(" \x1b[2m{hint}\x1b[22m");
             println!();
         }
     }
@@ -19091,31 +18986,15 @@ mod tests {
 
     /// The switch path: focusing another session re-attaches over the same
     /// Shell, selecting a session-owned tree so the transcript renders the new
-    /// session's model and the pending box reads the new session's queues. The
-    /// session left behind accumulates its usage for the shutdown banner.
+    /// session's model and the pending box reads the new session's queues.
     #[tokio::test]
-    async fn switch_rebuilds_the_session_and_accumulates_usage() {
+    async fn switch_rebuilds_the_session_and_updates_exit_hint() {
         let dir = TempDir::new().expect("tempdir");
         let beta = create_disk_session(&dir, "beta session prompt").await;
 
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "alpha session prompt").await;
-        let alpha_id = world.session().to_string();
-
-        // Snapshot the outgoing usage, as the outer loop does before it
-        // changes focus.
-        let mut completed: Vec<(String, UsageSummary)> = Vec::new();
-        completed.push((
-            alpha_id.clone(),
-            world
-                .host()
-                .usage(&alpha_id)
-                .await
-                .expect("usage")
-                .expect("a live session"),
-        ));
-
         // Switch to beta over the same Shell.
         let moved = apply_focus_request(
             &mut app,
@@ -19153,17 +19032,13 @@ mod tests {
         );
         world.handles().queues.clear(AgentId::Main);
 
-        // Switch again, this time to a fresh session; usage keeps
-        // accumulating and the new session's transcript is empty.
-        completed.push((
-            world.session().to_string(),
-            world
-                .host()
-                .usage(world.session())
-                .await
-                .expect("usage")
-                .expect("a live session"),
-        ));
+        assert_eq!(
+            ExitBanner::collect(&world).await.resume_hint,
+            Some(format!("Session: {beta} (resume with: aj continue {beta})")),
+        );
+
+        // A fresh session's transcript is empty, but its seeded settings
+        // are persisted and can be resumed.
         let moved = apply_focus_request(
             &mut app,
             &shell,
@@ -19181,20 +19056,13 @@ mod tests {
             "fresh session opens empty: {fresh_rows}"
         );
 
-        // The banner itemizes both completed sessions in order (aj's
-        // accumulation), then the live one.
-        assert_eq!(completed.len(), 2);
-        assert_eq!(completed[0].0, alpha_id);
-        assert_eq!(completed[1].0, beta);
-        // Collecting and formatting the banner over the accumulated list must
-        // not panic, and it itemizes the live session too.
-        let banner = ExitBanner::collect(&world, completed).await;
-        assert_eq!(banner.completed.len(), 2);
+        let fresh = world.session();
         assert_eq!(
-            banner.live.as_ref().map(|(id, _)| id.as_str()),
-            Some(world.session()),
+            ExitBanner::collect(&world).await.resume_hint,
+            Some(format!(
+                "Session: {fresh} (resume with: aj continue {fresh})"
+            )),
         );
-        banner.print();
         shut_down(&world).await;
     }
 
