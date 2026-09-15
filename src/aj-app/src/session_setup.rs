@@ -1092,6 +1092,11 @@ mod tests {
             build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed)
                 .expect("startup run config");
         let oracle = startup.oracle.clone();
+        assert_eq!(
+            oracle.model_key,
+            ("anthropic".into(), "claude-fable-5-1".into())
+        );
+        assert_eq!(oracle.thinking, Some(ThinkingConfig::XHigh));
         let auth = empty_auth(&dir);
         let defaults =
             RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
