@@ -30005,11 +30005,15 @@ mod tests {
             } else {
                 world_and_shell(&host_dir, "streaming-text").await
             };
-            let prompt = format!("{}\nrecallneedle", "a complete prompt ".repeat(15));
+            let prompt = format!("{}\nrecall needle", "a complete prompt ".repeat(15));
             crate::control::history_tests::write_prompts(
                 &host_dir.path().join("sessions"),
                 "history",
-                &[(&prompt, 9000), ("not the pick", 1)],
+                &[
+                    (&prompt, 9000),
+                    ("not the pick\nrecall scattered needle", 1),
+                    ("not the pick either\nr-e-c-a-l-l n-e-e-d-l-e", 2),
+                ],
             );
             if connected {
                 store_holding_a_prompt(&world.persistence, "client-only-history");
@@ -30030,7 +30034,7 @@ mod tests {
                             .then_some(rows)
                     })
                     .await;
-                    writer.write_all(b"recallneedle").unwrap();
+                    writer.write_all(b"\"RECALL needle\"").unwrap();
                     let filtered = poll_for(|| {
                         let rows = top_overlay_rows(&observed).join("\n");
                         (rows.contains("a complete prompt") && !rows.contains("not the pick"))
@@ -30041,7 +30045,7 @@ mod tests {
                     let recalled = poll_for(|| {
                         let text = observed.borrow().view().editor.borrow().text();
                         (!observed.borrow().overlays.borrow().is_open()
-                            && text.contains("recallneedle"))
+                            && text.contains("recall needle"))
                         .then_some(text)
                     })
                     .await;

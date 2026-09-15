@@ -261,6 +261,7 @@ struct SelectState {
     /// The optional narrowing sigil ([`FilterableSelect::set_scope_sigil`]).
     scope_sigil: Option<char>,
     matcher: FuzzyMatcher,
+    literal_search: bool,
     /// Widest `prefix` across all items (0 when none set), the width of the
     /// right-aligned metadata column.
     prefix_width: usize,
@@ -505,6 +506,7 @@ fn rank(state: &mut SelectState, candidates: Vec<usize>) -> Vec<(usize, u32)> {
         query,
         matcher,
         scope_sigil,
+        literal_search,
         ..
     } = state;
     let stripped = scope_sigil.and_then(|sigil| query.trim_start().strip_prefix(sigil));
@@ -514,14 +516,24 @@ fn rank(state: &mut SelectState, candidates: Vec<usize>) -> Vec<(usize, u32)> {
         .into_iter()
         .filter(|&i| !scoped || items[i].scope_key.is_some())
         .map(|i| (i, &items[i]));
+    let entries = entries.map(|(i, item)| {
+        let text = if scoped {
+            item.scope_key.as_deref().unwrap_or("")
+        } else {
+            item.filter_key.as_str()
+        };
+        (i, text)
+    });
+    if *literal_search {
+        let query = crate::text_search::TextQuery::new(query);
+        let mut ranked: Vec<_> = entries
+            .filter_map(|(i, text)| query.score(text).map(|score| (i, score)))
+            .collect();
+        ranked.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+        return ranked;
+    }
     matcher
-        .filter_scored(entries, query, |(_, item)| {
-            if scoped {
-                item.scope_key.as_deref().unwrap_or("")
-            } else {
-                item.filter_key.as_str()
-            }
-        })
+        .filter_scored(entries, query, |(_, text)| *text)
         .into_iter()
         .map(|((i, _), score)| (i, score))
         .collect()
@@ -648,6 +660,7 @@ impl FilterableSelect {
             user_selected: false,
             scope_sigil: None,
             matcher: FuzzyMatcher::new(),
+            literal_search: false,
             prefix_width: 0,
             label_width: 0,
             has_marker: false,
@@ -693,7 +706,9 @@ impl FilterableSelect {
                 let is_append = text.starts_with(&state.query) && text.len() > state.query.len();
                 state.query = text.to_string();
                 state.user_selected = false;
-                if is_append {
+                // Quote delimiters are syntax in literal search. Keep its
+                // edits outside the fuzzy-token monotonicity assumption.
+                if is_append && !state.literal_search {
                     narrow_filter(&mut state, &mut list);
                 } else {
                     full_filter(&mut state, &mut list);
@@ -723,6 +738,18 @@ impl FilterableSelect {
     /// content overlays.
     pub fn set_show_scrollbar(&mut self, show: bool) {
         self.show_scrollbar = show;
+    }
+
+    /// Use case-insensitive literal substrings instead of fuzzy subsequences.
+    /// All whitespace-separated terms must occur, in any order. Double quotes
+    /// group a contiguous phrase, including while the closing quote is absent.
+    /// A contiguous match of the full query's terms ranks first, with source
+    /// order breaking ties. Apostrophes and other punctuation are literal.
+    pub fn set_literal_search(&mut self, enabled: bool) {
+        let mut state = self.state.borrow_mut();
+        state.literal_search = enabled;
+        state.user_selected = false;
+        full_filter(&mut state, &mut self.list.borrow_mut());
     }
 
     /// Reserve label cells by clipping the widest leading metadata fields first.
@@ -1197,6 +1224,102 @@ mod tests {
         assert!(!visible.contains(&"bravo".to_string()));
         // The narrowed set reset the cursor to the top.
         assert_eq!(select.selected().map(|i| i.label), Some(visible[0].clone()));
+    }
+
+    #[test]
+    fn literal_search_edits_and_streamed_rows_keep_phrase_ranking() {
+        let mut select = FilterableSelect::new(
+            items(&["footer then editor", "ed_itor foot_er", "EDITOR footer"]),
+            SelectStyles::default(),
+        );
+        select.set_literal_search(true);
+        for c in "editor footer".chars() {
+            send(&mut select, &typed(c));
+        }
+        assert_eq!(
+            select.visible_labels(),
+            ["EDITOR footer", "footer then editor"]
+        );
+        select.extend_items(items(&[
+            "another editor footer",
+            "footer and editor",
+            "nothing",
+        ]));
+        assert_eq!(
+            select.visible_labels(),
+            [
+                "EDITOR footer",
+                "another editor footer",
+                "footer then editor",
+                "footer and editor"
+            ]
+        );
+
+        for _ in 0.."editor footer".len() {
+            send(&mut select, &key(Key::BACKSPACE, Modifiers::empty()));
+        }
+        assert_eq!(select.visible_labels().len(), 6);
+        for c in "\"editor footer\"".chars() {
+            send(&mut select, &typed(c));
+        }
+        assert_eq!(
+            select.visible_labels(),
+            ["EDITOR footer", "another editor footer"]
+        );
+        select.set_items(items(&[
+            "footer editor",
+            "new editor footer",
+            "editor gap footer",
+        ]));
+        assert_eq!(select.visible_labels(), ["new editor footer"]);
+    }
+
+    #[test]
+    fn literal_search_handles_punctuation_unicode_and_mixed_phrases() {
+        for (query, expected) in [
+            (
+                "",
+                vec![
+                    "ÄPFEL: here's a thought",
+                    "here's a different thought about äpfel",
+                    "not a match",
+                ],
+            ),
+            (
+                "  \"\"  ",
+                vec![
+                    "ÄPFEL: here's a thought",
+                    "here's a different thought about äpfel",
+                    "not a match",
+                ],
+            ),
+            (
+                "äpfel \"here's a thought\"",
+                vec!["ÄPFEL: here's a thought"],
+            ),
+            ("äpfel: thought", vec!["ÄPFEL: here's a thought"]),
+            (
+                "thought ÄPFEL",
+                vec![
+                    "ÄPFEL: here's a thought",
+                    "here's a different thought about äpfel",
+                ],
+            ),
+        ] {
+            let mut select = FilterableSelect::new(
+                items(&[
+                    "ÄPFEL: here's a thought",
+                    "here's a different thought about äpfel",
+                    "not a match",
+                ]),
+                SelectStyles::default(),
+            );
+            select.set_literal_search(true);
+            for c in query.chars() {
+                send(&mut select, &typed(c));
+            }
+            assert_eq!(select.visible_labels(), expected, "query: {query}");
+        }
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod parser;
 pub mod queue;
 pub mod screen;
 pub mod text;
+mod text_search;
 pub mod tty;
 pub mod unicode;
 pub mod vaxis;

@@ -70,6 +70,13 @@ aj continue <id>       # resume a specific session, archived or not
 
 You can also resume a session or start a fresh one from the command palette.
 
+The resume picker and prompt-history search (`Ctrl+R`) match case-insensitive
+literal terms. `editor footer` requires both substrings, in any order, and
+`"editor footer"` requires a contiguous phrase. Contiguous matches rank before
+scattered terms. Resume searches the full opening prompt, tag, session ID, and
+host label. Prompt history searches the full prompt, even beyond its preview.
+Other pickers, including the command palette, use fuzzy matching.
+
 Press `Tab` to focus the transcript and move through earlier user messages.
 Press `b` on a focused message to edit it and continue from that point,
 creating a new branch while preserving the existing conversation. Open

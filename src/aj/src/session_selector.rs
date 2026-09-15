@@ -155,6 +155,7 @@ pub(crate) fn open_session_selector(
         initial,
         handles.chrome.select.clone(),
     )));
+    select.borrow_mut().set_literal_search(true);
     select.borrow().select_matching(|item| {
         ids.borrow().get(&item.filter_key).map(String::as_str) == Some(current.as_str())
     });
@@ -1720,6 +1721,46 @@ mod tests {
             ["refactor the parser", "fix the streaming bug"],
             "unscoped, a label and a prompt are equally good matches",
         );
+    }
+
+    #[test]
+    fn prose_search_requires_literal_terms_and_supports_quoted_phrases() {
+        let previews = vec![
+            preview(
+                "scattered",
+                Some("pondering something I was: here's"),
+                1,
+                Duration::minutes(1),
+            ),
+            preview(
+                "gapped",
+                Some("here's something I was p-o-n-d-e-r-i-n-g"),
+                1,
+                Duration::minutes(2),
+            ),
+            preview(
+                "phrase",
+                Some("Here's something I was pondering"),
+                1,
+                Duration::minutes(3),
+            ),
+        ];
+        assert_eq!(
+            matched(&previews, "here's something I was pondering"),
+            [
+                "Here's something I was pondering",
+                "pondering something I was: here's"
+            ],
+        );
+        for query in [
+            "\"here's something I was pondering",
+            "\"here's something I was pondering\"",
+        ] {
+            assert_eq!(
+                matched(&previews, query),
+                ["Here's something I was pondering"]
+            );
+        }
     }
 
     /// The `#` prefix narrows to the labels: the row whose only `fix` is in

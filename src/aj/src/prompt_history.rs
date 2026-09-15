@@ -14,8 +14,8 @@
 //! fetch for the host.
 //!
 //! Filter key: a row's filter key is the full prompt text, which is both
-//! what the fuzzy filter matches and the value recalled on confirm. The
-//! project label (all-workspaces scope) shows in the description column.
+//! what the literal term/phrase filter matches and the value recalled on confirm.
+//! The project label (all-workspaces scope) shows in the description column.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -199,6 +199,7 @@ pub(crate) fn open_prompt_history(
     let focus = select.borrow().focus_target();
     {
         let mut sel = select.borrow_mut();
+        sel.set_literal_search(true);
         // The history list can run long, so show the vertical scroll bar.
         sel.set_show_scrollbar(true);
         let recall_c = Rc::clone(recall_slot);
