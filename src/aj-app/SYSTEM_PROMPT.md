@@ -34,6 +34,8 @@ revert or undo changes you did not make unless asked.
 
 ## Sub-agents
 
+The guidance in this section applies when the `agent` tool is available.
+
 Do the work yourself by default. Delegate when a bounded search or analysis
 would keep substantial intermediate output out of your context, when an
 independently owned task can run in parallel, or when the user asks for it.
