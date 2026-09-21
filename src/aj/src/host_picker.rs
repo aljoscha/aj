@@ -32,7 +32,7 @@ use std::rc::Rc;
 
 use aj_app::session::SessionRequest;
 use aj_wire::DirectoryHost;
-use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
+use vaxis::vxfw::{FilterableSelect, LabelOverflow, SelectItem, to_widget_ref};
 
 use crate::interactive::OverlayHandles;
 use crate::overlay::{OverlayPlacement, close_all, close_top, subtitle_confirm_close};
@@ -205,13 +205,8 @@ pub(crate) fn open_host_picker(handles: &OverlayHandles, hosts: &[DirectoryHost]
 /// 9.2), so one host sits in the same place in both and a row can be aimed at
 /// from memory.
 ///
-/// The label is whole here, where the strip's header elides one by shape: a row
-/// is built before the overlay has a width, and the width can change under it,
-/// so the only thing that can cut a row to fit is the widget drawing it. That
-/// widget clips the row's tail, which is the wrong end for a path, and a name
-/// long enough to reach the clip therefore reads differently here than in the
-/// header. Cutting to a guessed budget would trade that for cutting names that
-/// would have fitted.
+/// Labels stay whole until draw time. Path-shaped labels retain their tail,
+/// matching the sidebar, while ordinary names retain their beginning.
 fn rows(hosts: &[DirectoryHost]) -> (Vec<SelectItem>, HashMap<String, String>) {
     // The sentinel's filter key is empty, which is both what keeps it out of the
     // map and what makes any query at all drop it from the list.
@@ -226,6 +221,11 @@ fn rows(hosts: &[DirectoryHost]) -> (Vec<SelectItem>, HashMap<String, String>) {
     });
     for host in ordered {
         let label = row_label(host);
+        let overflow = if label.contains('/') {
+            LabelOverflow::KeepEnd
+        } else {
+            LabelOverflow::KeepStart
+        };
         match named(&host.id) {
             Some(id) => {
                 // The id is in the key whether or not it is on screen, which is
@@ -234,7 +234,7 @@ fn rows(hosts: &[DirectoryHost]) -> (Vec<SelectItem>, HashMap<String, String>) {
                     Some(_) => format!("{label} {id}"),
                     None => id.to_string(),
                 };
-                let mut item = SelectItem::new(&label, &key);
+                let mut item = SelectItem::new(&label, &key).with_label_overflow(overflow);
                 if host.unreachable {
                     item = item.with_description("unreachable");
                 }
@@ -243,6 +243,7 @@ fn rows(hosts: &[DirectoryHost]) -> (Vec<SelectItem>, HashMap<String, String>) {
             }
             None => items.push(
                 SelectItem::new(&label, &label)
+                    .with_label_overflow(overflow)
                     .with_description("never reached, nothing to create on yet"),
             ),
         }

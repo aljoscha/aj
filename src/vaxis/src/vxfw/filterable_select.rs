@@ -125,6 +125,15 @@ impl SelectColumn {
     }
 }
 
+/// Which end of a label to omit when the row needs room for its other columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelOverflow {
+    /// Keep the beginning, followed by an ellipsis.
+    KeepStart,
+    /// Keep the end, preceded by an ellipsis.
+    KeepEnd,
+}
+
 /// One selectable row: what the list shows, what the filter matches, and an
 /// optional opaque value the confirming caller can act on.
 ///
@@ -142,6 +151,9 @@ impl SelectColumn {
 pub struct SelectItem {
     /// Row text shown in the list.
     pub label: String,
+    /// Shorten the label to leave room for the other columns. Without this
+    /// opt-in, overflow clips the end of the entire row.
+    pub label_overflow: Option<LabelOverflow>,
     /// Text the fuzzy filter matches and ranks against.
     pub filter_key: String,
     /// Opaque action identity, deliberately separate from rendered and
@@ -177,6 +189,7 @@ impl SelectItem {
     pub fn new(label: impl Into<String>, filter_key: impl Into<String>) -> SelectItem {
         SelectItem {
             label: label.into(),
+            label_overflow: None,
             filter_key: filter_key.into(),
             value: None,
             scope_key: None,
@@ -187,6 +200,13 @@ impl SelectItem {
             columns: Vec::new(),
             strikethrough: false,
         }
+    }
+
+    /// Shortens only the label at draw time, preserving other columns when
+    /// space permits. Does not change the text used for filtering or confirmation.
+    pub fn with_label_overflow(mut self, overflow: LabelOverflow) -> Self {
+        self.label_overflow = Some(overflow);
+        self
     }
 
     /// Adds an opaque action identity independent of display and search text.
@@ -393,6 +413,7 @@ fn build_row(
             ..TextSpan::default()
         });
     }
+    let label_index = spans.len();
     if let Some(shortcut) = &item.shortcut {
         let pad = label_width.saturating_sub(usize::from(crate::gwidth::gwidth(
             &item.label,
@@ -443,8 +464,86 @@ fn build_row(
             ..Style::default()
         };
     }
-    let widget: WidgetRef = Rc::new(RefCell::new(rich));
-    widget
+    if let Some(overflow) = item.label_overflow {
+        Rc::new(RefCell::new(LabelRow {
+            rich,
+            label_index,
+            label: item.label.clone(),
+            padded_width: if item.shortcut.is_some() {
+                label_width
+            } else {
+                0
+            },
+            overflow,
+        }))
+    } else {
+        Rc::new(RefCell::new(rich))
+    }
+}
+
+/// The row keeps the source label because the available width can change
+/// between draws. Only its label span is shortened, never markers or metadata.
+struct LabelRow {
+    rich: RichText,
+    label_index: usize,
+    label: String,
+    padded_width: usize,
+    overflow: LabelOverflow,
+}
+
+impl Widget for LabelRow {
+    fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        let width = usize::from(ctx.max.width.expect("select rows require a bounded width"));
+        let other_width: usize = self
+            .rich
+            .text
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != self.label_index)
+            .map(|(_, span)| usize::from(crate::gwidth::gwidth(&span.text, ctx.width_method)))
+            .sum();
+        // If the other columns cannot fit either, retain an omission marker
+        // for the label and let the row's ordinary overflow clip the remainder.
+        let slot = width.saturating_sub(other_width).max(1).min(width);
+        let gap = if self.padded_width > 0 {
+            LABEL_COLUMN_PADDING
+        } else {
+            0
+        };
+        let budget = slot.saturating_sub(gap).max(1).min(slot);
+        let mut label = match self.overflow {
+            LabelOverflow::KeepStart => {
+                clip_column(&self.label, budget, ctx.width_method).into_owned()
+            }
+            LabelOverflow::KeepEnd => clip_label_start(&self.label, budget, ctx.width_method),
+        };
+        let used = usize::from(crate::gwidth::gwidth(&label, ctx.width_method));
+        label.push_str(&" ".repeat(self.padded_width.min(slot).saturating_sub(used)));
+        self.rich.text[self.label_index].text = label;
+        self.rich.draw(ctx)
+    }
+}
+
+fn clip_label_start(text: &str, width: usize, method: crate::gwidth::Method) -> String {
+    if usize::from(crate::gwidth::gwidth(text, method)) <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let graphemes: Vec<_> = crate::unicode::grapheme_iterator(text).collect();
+    let mut start = text.len();
+    let mut used = 1; // Leading ellipsis.
+    for grapheme in graphemes.iter().rev() {
+        let part = grapheme.bytes(text);
+        let cells = usize::from(crate::gwidth::gwidth(part, method));
+        if used + cells > width {
+            break;
+        }
+        start -= part.len();
+        used += cells;
+    }
+    format!("…{}", &text[start..])
 }
 
 /// Clip metadata without splitting a grapheme or borrowing the label's cells.
@@ -1513,6 +1612,78 @@ mod tests {
     /// The row's graphemes concatenated, for locating a column by its text.
     fn row_text(cells: &[Cell]) -> String {
         cells.iter().map(|c| c.char.grapheme()).collect()
+    }
+
+    #[test]
+    fn label_overflow_keeps_whole_graphemes_and_recomputes_on_resize() {
+        let label = "abcdef/e\u{301}界";
+        let mut select = FilterableSelect::new(
+            vec![SelectItem::new(label, label).with_label_overflow(LabelOverflow::KeepEnd)],
+            SelectStyles::default(),
+        );
+        for (width, expected) in [
+            (4, "…e\u{301}界"),
+            (3, "…界"),
+            (2, "…"),
+            (1, "…"),
+            (10, label),
+            (4, "…e\u{301}界"),
+        ] {
+            let cells = row_cells(&mut select, width, 4).remove(0);
+            // Wide-character continuation cells and unused cells carry blanks.
+            let text: String = cells
+                .iter()
+                .filter(|cell| cell.char.grapheme() != " ")
+                .map(|cell| cell.char.grapheme())
+                .collect();
+            assert_eq!(text, expected, "width {width}");
+        }
+        let mut emoji = FilterableSelect::new(
+            vec![SelectItem::new("long/👩‍💻x", "key").with_label_overflow(LabelOverflow::KeepEnd)],
+            SelectStyles::default(),
+        );
+        let cells = row_cells(&mut emoji, 4, 4).remove(0);
+        assert!(cells.iter().any(|cell| cell.char.grapheme() == "👩‍💻"));
+        assert!(
+            row_text(&row_cells(&mut emoji, 3, 4)[0])
+                .trim_end()
+                .ends_with('x')
+        );
+        assert!(!row_text(&row_cells(&mut emoji, 3, 4)[0]).contains('👩'));
+    }
+
+    #[test]
+    fn label_overflow_preserves_surrounding_columns_and_default_rows() {
+        let item = SelectItem::new("long/path/tail", "key")
+            .with_marker('*')
+            .with_columns(vec![SelectColumn::new("7")])
+            .with_description("down");
+        let mut select = FilterableSelect::new(
+            vec![
+                item.clone().with_label_overflow(LabelOverflow::KeepEnd),
+                item.clone().with_label_overflow(LabelOverflow::KeepStart),
+                item,
+            ],
+            SelectStyles::default(),
+        );
+        let rows = row_cells(&mut select, 17, 6);
+        assert_eq!(row_text(&rows[0]), "* 7  …/tail  down");
+        assert_eq!(row_text(&rows[1]), "* 7  long/…  down");
+        assert_eq!(row_text(&rows[2]), "* 7  long/path/t…");
+
+        let mut shortcut = FilterableSelect::new(
+            vec![
+                SelectItem::new("long/path/tail", "key")
+                    .with_shortcut("Enter")
+                    .with_label_overflow(LabelOverflow::KeepEnd),
+            ],
+            SelectStyles::default(),
+        );
+        assert_eq!(row_text(&row_cells(&mut shortcut, 10, 4)[0]), "…il  Enter");
+        assert_eq!(
+            row_text(&row_cells(&mut shortcut, 21, 4)[0]),
+            "long/path/tail  Enter"
+        );
     }
 
     #[test]

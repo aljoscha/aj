@@ -32513,6 +32513,72 @@ mod tests {
         shut_down(&world).await;
     }
 
+    #[tokio::test]
+    async fn host_picker_retains_path_tails_status_and_identity_across_resize() {
+        let shell = test_shell_with_chat(empty_chat());
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        let path = format!("~/hidden-head/{}/project-tail", "directory/".repeat(5));
+        let ordinary = format!("builder-{}-ordinary-tail", "x".repeat(55));
+        let path_host = aj_wire::DirectoryHost {
+            id: Some("raw-host-id".into()),
+            name: Some(path.clone()),
+            address: None,
+            working_directory: None,
+            unreachable: true,
+        };
+        let hosts = [
+            path_host.clone(),
+            aj_wire::DirectoryHost {
+                id: Some("other-host-id".into()),
+                name: Some(ordinary.clone()),
+                ..path_host
+            },
+        ];
+        let handles = shell.borrow().overlay_handles();
+        open_host_picker(&handles, &hosts);
+        app.post_app_event(UserEvent {
+            name: REFOCUS_OVERLAY_EVENT.to_string(),
+            data: None,
+        });
+        app.render(&root).expect("focus the picker");
+
+        for width in [80, 160, 80] {
+            let painted = painted_rows(&shell, width, 40);
+            let row = painted
+                .iter()
+                .find(|row| row.contains("project-tail"))
+                .unwrap_or_else(|| panic!("missing path tail: {painted:?}"));
+            assert!(row.contains("unreachable"), "{row}");
+            if width == 80 {
+                assert!(row.contains('…') && !row.contains("hidden-head"), "{row}");
+            } else {
+                assert!(row.contains(&path), "{row}");
+            }
+            let row = painted
+                .iter()
+                .find(|row| row.contains("builder-"))
+                .unwrap_or_else(|| panic!("missing ordinary name: {painted:?}"));
+            assert!(row.contains("unreachable"), "{row}");
+            if width == 80 {
+                assert!(row.contains('…') && !row.contains("ordinary-tail"), "{row}");
+            } else {
+                assert!(row.contains(&ordinary), "{row}");
+            }
+        }
+
+        // Search the omitted head, then confirm through the real focus path.
+        for byte in b"hidden-head\r" {
+            writer.write_all(&[*byte]).expect("picker input");
+            let event = tokio::time::timeout(Duration::from_secs(1), app.next_input())
+                .await
+                .expect("input arrives")
+                .expect("input event");
+            app.handle_input(event);
+        }
+        assert!(matches!(handles.session_request.borrow().as_ref(),
+            Some(SessionRequest::New { host: Some(id) }) if id == "raw-host-id"));
+    }
+
     /// The whole gesture through the real loop: the create chord opens the
     /// picker because the answer is ambiguous, a cursor move names a host, and
     /// the confirmed pick is what the loop exits with. Every byte is in the
