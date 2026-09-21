@@ -449,6 +449,150 @@ fn concurrent_config_edits_preserve_disables_and_keep_readers_available() {
         });
 }
 
+/// Explicit model saves pin both keys without turning catalog metadata or
+/// unrelated built-in defaults into user overrides.
+#[test]
+fn user_model_saves_pin_both_keys_and_publish_only_after_success() {
+    const CHILD: &str = "AJ_MODEL_SAVES_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = TempDir::new().unwrap();
+        let thread = std::thread::current();
+        let test = thread.name().expect("libtest names the test thread");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--format=pretty"])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "child failed:\n{}\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            const UNRELATED: &str = "# keep my settings\nauto_compact = false # deliberate\n";
+            let path = Config::config_file_path().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            for (key, api_key, name_key, name) in [
+                ("model", "model_api", "model_name", "claude-opus-5"),
+                (
+                    "oracle_model",
+                    "oracle_model_api",
+                    "oracle_model_name",
+                    "claude-fable-5-1",
+                ),
+            ] {
+                let mut selected = scripted_model_info();
+                selected.provider = "anthropic".into();
+                selected.id = name.into();
+                selected.base_url = "https://catalog.example/v1".into();
+                let alternate = scripted_model_info();
+                let alternate_value = format!("{}/{}", alternate.provider, alternate.id);
+                let harness = Harness::with_catalog(
+                    scripted(Vec::new(), 0, Duration::ZERO),
+                    vec![selected, alternate],
+                );
+                let session = harness.create().await;
+                let edit = aj_wire::ConfigEdit {
+                    key: key.into(),
+                    value: Some(format!("anthropic/{name}")),
+                    persist: PersistAction::User,
+                };
+                let api_line = format!("{api_key} = \"anthropic\"");
+                let name_line = format!("{name_key} = \"{name}\"");
+                let assert_saved = || {
+                    let raw = std::fs::read_to_string(&path).unwrap();
+                    assert!(raw.contains(UNRELATED), "{key}: {raw}");
+                    let (written, diagnostics) = Config::load_layer();
+                    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                    let mut expected = vec!["auto_compact", api_key, name_key];
+                    expected.sort_unstable();
+                    assert_eq!(
+                        written.set_keys().collect::<Vec<_>>(),
+                        expected,
+                        "{key}: only the selected pair may be added"
+                    );
+                    let values =
+                        aj_app::settings::host_values(&written.overlay_onto(&Config::default()));
+                    assert_eq!(values[api_key], "anthropic");
+                    assert_eq!(values[name_key], name);
+                };
+
+                // The in-memory pair already equals the built-in selection.
+                // Each disk fixture must still acquire both explicit keys.
+                for partial in [String::new(), api_line.clone(), name_line.clone()] {
+                    let before = harness.host.config(&session).await.unwrap();
+                    assert_eq!(before.user[api_key], "anthropic");
+                    assert_eq!(before.user[name_key], name);
+                    assert_eq!(before.effective[api_key], "anthropic");
+                    assert_eq!(before.effective[name_key], name);
+                    std::fs::write(&path, format!("{UNRELATED}{partial}\n")).unwrap();
+                    harness
+                        .host
+                        .edit_config(&session, edit.clone())
+                        .await
+                        .unwrap();
+                    assert_saved();
+                }
+
+                harness
+                    .host
+                    .edit_config(
+                        &session,
+                        aj_wire::ConfigEdit {
+                            value: Some(alternate_value),
+                            ..edit.clone()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let before = harness.host.config(&session).await.unwrap();
+                assert_ne!(before.user[api_key], "anthropic");
+                assert_ne!(before.user[name_key], name);
+                let effective_before =
+                    aj_app::settings::schema_values(&harness.config.lock().unwrap());
+                let saved = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(&path, "[invalid TOML").unwrap();
+                assert!(matches!(
+                    harness.host.edit_config(&session, edit.clone()).await,
+                    Err(HostError::Internal(_))
+                ));
+                assert_eq!(
+                    serde_json::to_value(harness.host.config(&session).await.unwrap()).unwrap(),
+                    serde_json::to_value(before).unwrap(),
+                    "{key}: a failed save must not publish a config snapshot"
+                );
+                assert_eq!(
+                    aj_app::settings::schema_values(&harness.config.lock().unwrap()),
+                    effective_before,
+                    "{key}: a failed save must not change effective config"
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "[invalid TOML");
+                std::fs::write(&path, saved).unwrap();
+                harness.host.edit_config(&session, edit).await.unwrap();
+                assert_saved();
+                let after = harness.host.config(&session).await.unwrap();
+                assert_eq!(after.user[api_key], "anthropic");
+                assert_eq!(after.user[name_key], name);
+                assert_eq!(after.effective, after.user);
+                assert_eq!(
+                    aj_app::settings::host_values(&harness.config.lock().unwrap()),
+                    after.user
+                );
+                harness.host.shutdown().await;
+            }
+        });
+}
+
 fn scripted(
     messages: Vec<AssistantMessage>,
     chunk_size: usize,

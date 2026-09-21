@@ -5,8 +5,8 @@
 //!
 //! The binary loads the
 //! [`ModelRegistry`](aj_models::registry::ModelRegistry), picks a
-//! concrete model (either an explicit `(provider, id)` pair or the
-//! provider's preferred default), looks up the matching
+//! concrete `(provider, id)` pair from the effective configuration, looks up
+//! the matching
 //! [`Provider`] impl by the model's `api` string, and installs an
 //! [`ApiKeyResolver`] backed by [`AuthStorage`]. The resulting bundle
 //! is what
@@ -33,14 +33,9 @@ use aj_models::types::{
     ApiKeyResolver, ReasoningSummary, ResolvedApiKey, Speed, StreamOptions, ThinkingDisplay,
     Verbosity,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 use crate::cli::args::Args;
-
-/// Fallback provider id used when neither CLI / env / config supplies
-/// one. Anthropic is the default so existing user setups keep
-/// working without an explicit `MODEL_API=anthropic` env var.
-pub const DEFAULT_PROVIDER_ID: &str = "anthropic";
 
 /// Provider-local account choices shared by this session's inference resolvers.
 ///
@@ -138,29 +133,14 @@ pub async fn validate_account_selection(
     Ok(())
 }
 
-/// Preferred default model per provider, used when the user hasn't
-/// pinned a `model_name`. This is selection *policy* and deliberately
-/// lives here rather than in the catalog: `models.json` is provider
-/// data refreshed by `aj models update`, whereas "which model we reach
-/// for by default" is ours to decide.
-///
-/// A provider absent from this table — or one whose preferred id isn't
-/// in the current catalog — falls back to its first listed entry, so a
-/// catalog refresh that drops or renames the preferred model degrades
-/// gracefully instead of erroring.
-const PREFERRED_DEFAULT_MODELS: &[(&str, &str)] = &[("anthropic", "claude-opus-5")];
-
 /// The model-selection triple after applying CLI > env > config
 /// precedence. [`merge`](ModelSelection::merge) is the single place
 /// that overlay lives. The fields are the post-merge `(api, name,
 /// url)` the registry lookup consumes.
 pub struct ModelSelection {
-    /// Provider id (catalog `provider`, e.g. `"anthropic"`). `None`
-    /// defers to [`DEFAULT_PROVIDER_ID`] via
-    /// [`provider_id`](ModelSelection::provider_id).
+    /// Provider id (catalog `provider`, e.g. `"anthropic"`). Required for resolution.
     pub api: Option<String>,
-    /// Model id within the provider's catalog. `None` picks the
-    /// provider's preferred default.
+    /// Model id within the provider's catalog. Required for resolution.
     pub name: Option<String>,
     /// Base-URL override applied after lookup.
     pub url: Option<String>,
@@ -182,11 +162,11 @@ impl ModelSelection {
         }
     }
 
-    /// Provider id with the [`DEFAULT_PROVIDER_ID`] fallback applied.
-    /// Used both for the registry lookup and as the `--api-key` /
-    /// credential-resolution target.
-    pub fn provider_id(&self) -> &str {
-        self.api.as_deref().unwrap_or(DEFAULT_PROVIDER_ID)
+    /// The selected provider id, without inventing one for an incomplete selection.
+    pub fn provider_id(&self) -> Result<&str> {
+        self.api
+            .as_deref()
+            .context("model provider is not configured")
     }
 }
 
@@ -211,13 +191,8 @@ pub struct ResolvedModel {
 
 /// Build a [`ResolvedModel`] from a merged [`ModelSelection`].
 ///
-/// `selection.provider_id()` is the catalog `provider` value (with
-/// the [`DEFAULT_PROVIDER_ID`] fallback). `selection.name` selects an
-/// entry from the provider's catalog; when [`None`] the helper picks
-/// the provider's preferred default (see [`PREFERRED_DEFAULT_MODELS`]),
-/// falling back to the first listed entry. The registry preserves
-/// insertion order, so the fallback is deterministic given a fixed
-/// catalog.
+/// The provider and model name must both be supplied. An unavailable or
+/// incomplete selection is an error, never a request for another catalog entry.
 ///
 /// `selection.url` replaces `model_info.base_url` after lookup so a
 /// caller can point at a staging proxy or a self-hosted endpoint
@@ -235,7 +210,17 @@ pub fn resolve(
     selection: &ModelSelection,
     speed: Option<Speed>,
 ) -> Result<ResolvedModel> {
-    let mut model_info = pick_model(registry, selection.provider_id(), selection.name.as_deref())?;
+    let provider = selection.provider_id()?;
+    let name = selection
+        .name
+        .as_deref()
+        .context("model name is not configured")?;
+    let mut model_info = registry.get(provider, name).cloned().ok_or_else(|| {
+        anyhow!(
+            "model {provider}/{name} not found in registry; run `aj models update` \
+         or configure the provider and model name together",
+        )
+    })?;
     if let Some(url) = &selection.url {
         validate_model_url(url)?;
         // A custom URL trumps the catalog default, but everything else
@@ -354,56 +339,6 @@ pub(crate) async fn credential_warning(
     }
 }
 
-/// Pick a [`ModelInfo`] for the given `(provider, model)` pair.
-///
-/// Errors with a structured message if the provider is unknown or
-/// the named model isn't in its listing — the caller wraps the
-/// result with extra context (CLI flag, config key) before showing
-/// it to the user.
-fn pick_model(
-    registry: &ModelRegistry,
-    provider_id: &str,
-    model_id: Option<&str>,
-) -> Result<ModelInfo> {
-    match model_id {
-        Some(id) => registry
-            .get(provider_id, id)
-            .cloned()
-            .ok_or_else(|| anyhow!("model {provider_id}/{id} not found in registry")),
-        None => default_model_for(registry.models(provider_id), provider_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("no models listed for provider {provider_id:?}")),
-    }
-}
-
-/// Pick the default model for `provider_id` when the user hasn't named
-/// one.
-///
-/// Prefers the provider's entry in [`PREFERRED_DEFAULT_MODELS`] when
-/// that id is present in the catalog, otherwise falls back to the first
-/// listed model. The registry preserves catalog insertion order, so the
-/// fallback is deterministic given a fixed catalog.
-pub fn default_model_for<'a>(
-    models: impl IntoIterator<Item = &'a ModelInfo>,
-    provider_id: &str,
-) -> Option<&'a ModelInfo> {
-    let preferred = PREFERRED_DEFAULT_MODELS
-        .iter()
-        .find(|(provider, _)| *provider == provider_id)
-        .map(|(_, id)| *id);
-    let mut first = None;
-    for model in models {
-        if model.provider != provider_id {
-            continue;
-        }
-        first.get_or_insert(model);
-        if preferred == Some(model.id.as_str()) {
-            return Some(model);
-        }
-    }
-    first
-}
-
 /// Fan the configured [`ConfigThinkingDisplay`] (if any) out onto
 /// both provider-specific wire fields on [`StreamOptions`]: Anthropic
 /// consumes `thinking_display`, OpenAI Responses consumes
@@ -507,9 +442,6 @@ mod tests {
     }
 
     fn registry(models: Vec<ModelInfo>) -> ModelRegistry {
-        // Build a tiny in-memory registry so we don't reach for the
-        // bundled catalog (which would include unrelated providers
-        // and make the per-provider defaults non-deterministic).
         let catalog = Catalog {
             schema_version: aj_models::registry::CATALOG_SCHEMA_VERSION,
             updated_at: 0,
@@ -624,62 +556,54 @@ mod tests {
     }
 
     #[test]
-    fn pick_model_returns_explicit_match() {
+    fn model_resolution_uses_the_exact_selection_and_endpoint_override() {
+        let (_dir, auth) = auth_storage("model-selection");
         let reg = registry(vec![
-            sample_model("anthropic", "claude-x", "anthropic-messages"),
-            sample_model("anthropic", "claude-y", "anthropic-messages"),
+            sample_model("openai", "decoy", "openai-responses"),
+            sample_model("openai", "chosen-model", "openai-responses"),
         ]);
-        let m = pick_model(&reg, "anthropic", Some("claude-y")).expect("found");
-        assert_eq!(m.id, "claude-y");
+        let selection = ModelSelection {
+            api: Some("openai".into()),
+            name: Some("chosen-model".into()),
+            url: Some("https://proxy.example/v1".into()),
+        };
+        let resolved = resolve(&reg, &auth, &selection, None).expect("resolved model");
+        assert_eq!(resolved.model_info.id, "chosen-model");
+        assert_eq!(resolved.model_info.base_url, "https://proxy.example/v1");
     }
 
     #[test]
-    fn pick_model_falls_back_to_first_listed() {
-        let reg = registry(vec![
-            sample_model("anthropic", "claude-x", "anthropic-messages"),
-            sample_model("anthropic", "claude-y", "anthropic-messages"),
-        ]);
-        let m = pick_model(&reg, "anthropic", None).expect("found");
-        // The preferred default for anthropic isn't in this catalog, so
-        // selection falls back to the first listed entry. Catalog order
-        // is preserved by `from_catalog_with_overrides`, so that's
-        // deterministic.
-        assert_eq!(m.id, "claude-x");
-    }
-
-    #[test]
-    fn pick_model_prefers_provider_default_when_present() {
-        // The preferred default is honored even when it isn't first in
-        // the catalog. "claude-opus-5" is anthropic's entry in
-        // `PREFERRED_DEFAULT_MODELS`.
-        let reg = registry(vec![
-            sample_model("anthropic", "claude-x", "anthropic-messages"),
-            sample_model("anthropic", "claude-opus-5", "anthropic-messages"),
-        ]);
-        let m = pick_model(&reg, "anthropic", None).expect("found");
-        assert_eq!(m.id, "claude-opus-5");
-    }
-
-    #[test]
-    fn pick_model_errors_for_unknown_provider() {
+    fn model_resolution_rejects_incomplete_or_unavailable_selections() {
+        let (_dir, auth) = auth_storage("missing-model");
         let reg = registry(vec![sample_model(
             "anthropic",
-            "claude-x",
+            "decoy",
             "anthropic-messages",
         )]);
-        let err = pick_model(&reg, "no-such", None).expect_err("error");
-        assert!(err.to_string().contains("no models listed"), "{err}");
-    }
-
-    #[test]
-    fn pick_model_errors_for_unknown_model_in_known_provider() {
-        let reg = registry(vec![sample_model(
-            "anthropic",
-            "claude-x",
-            "anthropic-messages",
-        )]);
-        let err = pick_model(&reg, "anthropic", Some("claude-z")).expect_err("error");
-        assert!(err.to_string().contains("not found in registry"), "{err}");
+        for (api, name, expected) in [
+            (None, Some("decoy"), "model provider is not configured"),
+            (Some("anthropic"), None, "model name is not configured"),
+            (Some("anthropic"), Some("missing"), "anthropic/missing"),
+            (Some("no-such"), Some("decoy"), "no-such/decoy"),
+        ] {
+            let selection = ModelSelection {
+                api: api.map(String::from),
+                name: name.map(String::from),
+                url: None,
+            };
+            let error = resolve(&reg, &auth, &selection, None)
+                .err()
+                .expect("no substitute model")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            if api.is_some() && name.is_some() {
+                assert!(
+                    error.contains("aj models update")
+                        && error.contains("provider and model name together"),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -770,20 +694,23 @@ mod tests {
         assert_eq!(sel.name.as_deref(), Some("gpt-x"));
         // No `--model-url` on the CLI, so it falls back to config.
         assert_eq!(sel.url.as_deref(), Some("https://config.example"));
-        assert_eq!(sel.provider_id(), "openai");
+        assert_eq!(sel.provider_id().expect("provider"), "openai");
     }
 
     #[test]
-    fn model_selection_falls_back_to_config_then_default() {
+    fn model_selection_uses_effective_config_when_cli_is_unset() {
         let args = Args::parse_from(["aj"]);
         let config = Config {
             model_name: Some("claude-x".to_string()),
             ..Config::default()
         };
         let sel = ModelSelection::merge(&args, &config);
-        assert!(sel.api.is_none());
+        assert_eq!(sel.api, Config::default().model_api);
         assert_eq!(sel.name.as_deref(), Some("claude-x"));
-        // No provider anywhere falls back to the built-in default.
-        assert_eq!(sel.provider_id(), DEFAULT_PROVIDER_ID);
+        // The configuration supplies the provider, not the resolver.
+        assert_eq!(
+            sel.provider_id().expect("provider"),
+            Config::default().model_api.as_deref().unwrap()
+        );
     }
 }

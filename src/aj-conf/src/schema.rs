@@ -564,11 +564,11 @@ const MAX_SIDEBAR_COLS: u16 = 200;
 /// ```
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Model API backend (e.g., "anthropic", "openai").
+    /// Model API backend. Defaults to `anthropic`.
     pub model_api: Option<String>,
     /// Custom model endpoint URL.
     pub model_url: Option<String>,
-    /// Model name override.
+    /// Model name. Defaults to `claude-opus-5`.
     pub model_name: Option<String>,
     /// Default thinking level applied to every request. Defaults to
     /// `xhigh` when unset.
@@ -590,11 +590,11 @@ pub struct Config {
     /// [`ConfigVerbosity`]. Distinct from `thinking_display`, which
     /// controls the reasoning channel rather than the answer.
     pub verbosity: Option<ConfigVerbosity>,
-    /// Oracle model API backend. Uses its own built-in model defaults when unset.
+    /// Oracle model API backend. Defaults to `anthropic`, independently of Main.
     pub oracle_model_api: Option<String>,
     /// Custom Oracle model endpoint URL.
     pub oracle_model_url: Option<String>,
-    /// Oracle model name override.
+    /// Oracle model name. Defaults to `claude-fable-5-1`.
     pub oracle_model_name: Option<String>,
     /// Oracle thinking level, independent of the main agent.
     pub oracle_thinking: Option<ConfigThinkingLevel>,
@@ -708,9 +708,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model_api: None,
+            model_api: Some("anthropic".into()),
             model_url: None,
-            model_name: None,
+            model_name: Some("claude-opus-5".into()),
             thinking: Some(ConfigThinkingLevel::XHigh),
             thinking_display: Some(ConfigThinkingDisplay::Summarized),
             speed: None,
@@ -1803,9 +1803,15 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert!(config.model_api.is_none());
+        assert_eq!(config.model_api.as_deref(), Some("anthropic"));
         assert!(config.model_url.is_none());
-        assert!(config.model_name.is_none());
+        assert_eq!(config.model_name.as_deref(), Some("claude-opus-5"));
+        assert_eq!(config.oracle_model_api.as_deref(), Some("anthropic"));
+        assert!(config.oracle_model_url.is_none());
+        assert_eq!(
+            config.oracle_model_name.as_deref(),
+            Some("claude-fable-5-1")
+        );
         assert_eq!(config.thinking, Some(ConfigThinkingLevel::XHigh));
         assert_eq!(
             config.thinking_display,
@@ -1923,7 +1929,7 @@ mod tests {
     fn test_parse_config_empty_yields_no_diagnostics() {
         let (config, diagnostics) = parse_config("", Path::new("/tmp/config.toml"));
         assert!(diagnostics.is_empty());
-        assert!(config.model_api.is_none());
+        assert_eq!(config.model_api, Config::default().model_api);
     }
 
     #[test]
@@ -2069,7 +2075,7 @@ model_api = "anthropic"
         let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
 
         // Defaults: nothing from the file applied.
-        assert!(config.model_api.is_none());
+        assert_eq!(config.model_api, Config::default().model_api);
 
         assert_eq!(diagnostics.len(), 1);
         assert!(matches!(

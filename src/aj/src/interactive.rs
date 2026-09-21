@@ -5517,15 +5517,12 @@ fn fill_client_settings(
         &handles.chrome,
         &handles.activity,
         target,
-        SettingsValues::from_values(
-            if target == ConfigTarget::Project {
-                effective
-            } else {
-                user.clone()
-            },
-            &[],
-        ),
-        SettingsValues::from_values(user, &[]),
+        SettingsValues::from_values(if target == ConfigTarget::Project {
+            effective
+        } else {
+            user.clone()
+        }),
+        SettingsValues::from_values(user),
         keys,
         SettingsCatalogs {
             owner,
@@ -5577,15 +5574,12 @@ async fn fill_host_settings(
     };
     list.borrow().load_notice(project_notice.map(String::from));
     let models = Arc::new(host.models);
-    let values = SettingsValues::from_values(
-        if target == ConfigTarget::Project {
-            host.effective
-        } else {
-            host.user.clone()
-        },
-        &models,
-    );
-    let inherited = SettingsValues::from_values(host.user, &models);
+    let values = SettingsValues::from_values(if target == ConfigTarget::Project {
+        host.effective
+    } else {
+        host.user.clone()
+    });
+    let inherited = SettingsValues::from_values(host.user);
     owner.models = Arc::clone(&models);
     let catalogs = SettingsCatalogs {
         owner,
@@ -18606,8 +18600,8 @@ mod tests {
         assert_eq!(settings.model_id, info.id);
         // Session-scoped: no persisted default.
         let layers = world.config_layers.lock().unwrap();
-        assert!(layers.user.model_api.is_none());
-        assert!(layers.user.model_name.is_none());
+        assert_eq!(layers.user.model_api, Config::default().model_api);
+        assert_eq!(layers.user.model_name, Config::default().model_name);
     }
 
     /// The settings window, driven through real dispatch: open it, filter to

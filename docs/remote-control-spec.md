@@ -1006,6 +1006,13 @@ Oracle children use ordinary task cancellation and shutdown ownership.
 A creator sends only stated Oracle choices. The host resolves omitted choices
 from its Oracle defaults and defaults unstated effort against the selected
 Oracle model. Explicit creation and branch choices are validated together.
+Both roles obtain a complete model selection from their effective configuration.
+Changing only a provider or URL leaves the other components unchanged. A connected
+creator sends the complete selection when any model component was stated. With
+none stated, the host uses its own defaults. An unavailable configured model is
+an error, never a request to pick another catalog entry. Attaching to an existing
+session does not validate the client's model defaults against the host catalog.
+
 After creation, each model or inference edit uses the same per-axis application
 path as main. A model edit does not require changing the saved effort first.
 The next inference validates that model/effort combination.
@@ -1021,8 +1028,9 @@ apply to consultations in the next main turn. Main edits never change Oracle's
 choices, and a retained child keeps its own bundle. Session selectors change
 only the current session.
 Settings-window edits also save the chosen default on the host, whether the
-client is local or connected. Endpoint defaults, like main's `model_url`, take
-effect on host restart.
+client is local or connected. Explicit model saves record both provider and name,
+including a selection equal to the built-in default. Endpoint defaults, like
+main's `model_url`, take effect on host restart.
 
 Main and Oracle both require resolvable model defaults. Invalid model or endpoint
 configuration fails startup for either one. Both restore recorded settings over

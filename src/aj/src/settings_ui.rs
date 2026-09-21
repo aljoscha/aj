@@ -1200,39 +1200,28 @@ impl Widget for TextEditOverlay {
 /// The live values a settings window opens with. Strings use the same
 /// canonical vocabulary the host's apply path parses.
 pub(crate) struct SettingsValues {
-    oracle_model_key: (String, String),
-    pub(crate) model_key: (String, String),
+    oracle_model: String,
+    model: String,
     values: std::collections::BTreeMap<String, String>,
 }
 
 impl SettingsValues {
     #[cfg(test)]
-    pub(crate) fn from_config(config: &Config, catalog: &[ModelInfo]) -> Self {
-        Self::from_values(aj_app::settings::schema_values(config), catalog)
+    pub(crate) fn from_config(config: &Config) -> Self {
+        Self::from_values(aj_app::settings::schema_values(config))
     }
 
-    pub(crate) fn from_values(
-        values: std::collections::BTreeMap<String, String>,
-        catalog: &[ModelInfo],
-    ) -> Self {
-        let set = |key: &str| {
-            values
-                .get(key)
-                .filter(|value| value.as_str() != "<unset>")
-                .cloned()
-        };
-        let model_key = |api: &str, name: &str| {
-            let provider = set(api).unwrap_or_else(|| aj_app::model::DEFAULT_PROVIDER_ID.into());
-            let model = set(name).unwrap_or_else(|| {
-                aj_app::model::default_model_for(catalog.iter(), &provider)
-                    .map(|model| model.id.clone())
-                    .unwrap_or_default()
-            });
-            (provider, model)
+    pub(crate) fn from_values(values: std::collections::BTreeMap<String, String>) -> Self {
+        let model = |api: &str, name: &str| {
+            format!(
+                "{}/{}",
+                values.get(api).map(String::as_str).unwrap_or("<unset>"),
+                values.get(name).map(String::as_str).unwrap_or("<unset>")
+            )
         };
         Self {
-            model_key: model_key("model_api", "model_name"),
-            oracle_model_key: model_key("oracle_model_api", "oracle_model_name"),
+            model: model("model_api", "model_name"),
+            oracle_model: model("oracle_model_api", "oracle_model_name"),
             values,
         }
     }
@@ -1291,18 +1280,9 @@ fn row_value_kind(
         raw.clone()
     };
     Some(match name {
-        "oracle_model_api" => (
-            format!(
-                "{}/{}",
-                values.oracle_model_key.0, values.oracle_model_key.1
-            ),
-            RowKind::Submenu,
-        ),
+        "oracle_model_api" => (values.oracle_model.clone(), RowKind::Submenu),
         "oracle_model_name" => return None,
-        "model_api" => (
-            format!("{}/{}", values.model_key.0, values.model_key.1),
-            RowKind::Submenu,
-        ),
+        "model_api" => (values.model.clone(), RowKind::Submenu),
         "model_name" => return None,
         "thinking" | "oracle_thinking" => (value, RowKind::Submenu),
         "thinking_display" | "verbosity" | "oracle_verbosity" => {
@@ -2204,8 +2184,8 @@ mod tests {
             &handles.activity,
             &handles.settings_ui,
             ConfigTarget::User,
-            SettingsValues::from_config(&config, &[]),
-            SettingsValues::from_config(&config, &[]),
+            SettingsValues::from_config(&config),
+            SettingsValues::from_config(&config),
             BTreeSet::new(),
             SettingsCatalogs {
                 owner: crate::interactive::SettingsOwner::new(
@@ -2481,8 +2461,8 @@ mod tests {
     /// guard.
     #[test]
     fn build_setting_rows_covers_every_schema_option() {
-        let values = SettingsValues::from_config(&Config::default(), &[]);
-        let inherited = SettingsValues::from_config(&Config::default(), &[]);
+        let values = SettingsValues::from_config(&Config::default());
+        let inherited = SettingsValues::from_config(&Config::default());
         let rows = build_setting_rows(&values, &inherited, false, &BTreeSet::new());
         for option in Config::OPTIONS {
             // `model_name` folds into the model row (`model_api`).
@@ -2504,25 +2484,45 @@ mod tests {
     #[test]
     fn oracle_settings_show_their_own_defaults_and_standard_controls() {
         use crate::test_support::{draw_ctx, rows};
-        let registry = aj_models::registry::ModelRegistry::load();
-        let catalog: Vec<_> = registry
-            .providers()
+        let defaults = SettingsValues::from_config(&Config::default());
+        assert_eq!(defaults.values["model_name"], "claude-opus-5");
+        assert_eq!(defaults.values["oracle_model_name"], "claude-fable-5-1");
+        let model_rows = build_setting_rows(&defaults, &defaults, false, &BTreeSet::new())
             .into_iter()
-            .flat_map(|p| registry.models(p))
-            .cloned()
+            .filter(|row| row.id == MODEL_SETTING_ID || row.id == "oracle_model")
             .collect();
-        let defaults = SettingsValues::from_config(&Config::default(), &catalog);
-        let configured = SettingsValues::from_config(
-            &Config {
-                model_api: Some("openai".into()),
-                model_name: Some("different-main".into()),
-                thinking: Some(aj_conf::ConfigThinkingLevel::Off),
-                ..Config::default()
-            },
-            &catalog,
+        let mut list = SettingList::new(model_rows, styles(), false);
+        let page = rows(&list.draw(&draw_ctx(100, Some(18)))).join("\n");
+        assert!(page.contains("anthropic/claude-opus-5"), "{page}");
+        assert!(page.contains("anthropic/claude-fable-5-1"), "{page}");
+        let configured = SettingsValues::from_config(&Config {
+            model_api: Some("openai".into()),
+            model_name: Some("different-main".into()),
+            thinking: Some(aj_conf::ConfigThinkingLevel::Off),
+            ..Config::default()
+        });
+        let settings = build_setting_rows(
+            &configured,
+            &defaults,
+            true,
+            &BTreeSet::from(["model_name".into(), "model_api".into()]),
         );
-        assert_eq!(configured.oracle_model_key, defaults.oracle_model_key);
-        let settings = build_setting_rows(&configured, &defaults, false, &BTreeSet::new());
+        assert_eq!(
+            settings
+                .iter()
+                .find(|row| row.id == MODEL_SETTING_ID)
+                .unwrap()
+                .clear_to,
+            "anthropic/claude-opus-5"
+        );
+        assert_eq!(
+            settings
+                .iter()
+                .find(|row| row.id == "oracle_model")
+                .unwrap()
+                .clear_to,
+            "anthropic/claude-fable-5-1"
+        );
         let oracle: Vec<_> = settings
             .into_iter()
             .filter(|row| row.id.starts_with("oracle_"))
@@ -2539,12 +2539,43 @@ mod tests {
         let mut list = SettingList::new(oracle, styles(), false);
         let page = rows(&list.draw(&draw_ctx(100, Some(18)))).join("\n");
         assert!(page.contains("oracle_model"));
-        assert!(page.contains(&format!(
-            "{}/{}",
-            defaults.oracle_model_key.0, defaults.oracle_model_key.1
-        )));
+        assert!(page.contains("anthropic/claude-fable-5-1"), "{page}");
         assert!(!page.contains("Follow main"));
         assert!(!page.contains("inherits the main"));
+    }
+
+    #[test]
+    fn settings_show_the_hosts_values_without_resolving_them() {
+        use crate::test_support::{draw_ctx, rows};
+        let config = Config {
+            model_api: Some("custom-provider".into()),
+            model_name: Some("custom-main".into()),
+            oracle_model_api: Some("another-provider".into()),
+            oracle_model_name: Some("custom-oracle".into()),
+            ..Config::default()
+        };
+        let values = SettingsValues::from_config(&config);
+        let model_rows: Vec<_> = build_setting_rows(&values, &values, false, &BTreeSet::new())
+            .into_iter()
+            .filter(|row| row.id == MODEL_SETTING_ID || row.id == "oracle_model")
+            .collect();
+        assert!(
+            model_rows
+                .iter()
+                .all(|row| matches!(row.kind, RowKind::Submenu))
+        );
+        let mut list = SettingList::new(model_rows, styles(), false);
+        let page = rows(&list.draw(&draw_ctx(100, Some(18)))).join("\n");
+        assert!(page.contains("custom-provider/custom-main"), "{page}");
+        assert!(page.contains("another-provider/custom-oracle"), "{page}");
+
+        let presentation = SettingsValues::from_values(std::collections::BTreeMap::from([(
+            "show_frame_stats".into(),
+            "false".into(),
+        )]));
+        let client_rows = build_setting_rows(&presentation, &presentation, false, &BTreeSet::new());
+        assert_eq!(client_rows.len(), 1);
+        assert_eq!(client_rows[0].id, "show_frame_stats");
     }
 
     /// `from_config` seeds `show_frame_stats` and it surfaces as a bool cycle
@@ -2553,13 +2584,13 @@ mod tests {
     fn show_frame_stats_seeds_and_surfaces_as_a_bool_cycle_row() {
         let mut config = Config::default();
         config.show_frame_stats = true;
-        let values = SettingsValues::from_config(&config, &[]);
+        let values = SettingsValues::from_config(&config);
         assert_eq!(
             values.values["show_frame_stats"], "true",
             "from_config seeds the flag"
         );
 
-        let inherited = SettingsValues::from_config(&Config::default(), &[]);
+        let inherited = SettingsValues::from_config(&Config::default());
         let rows = build_setting_rows(&values, &inherited, false, &BTreeSet::new());
         let row = rows
             .iter()
@@ -2580,8 +2611,8 @@ mod tests {
             sidebar_cols: 40,
             ..Config::default()
         };
-        let values = SettingsValues::from_config(&config, &[]);
-        let inherited = SettingsValues::from_config(&Config::default(), &[]);
+        let values = SettingsValues::from_config(&config);
+        let inherited = SettingsValues::from_config(&Config::default());
         let rows = build_setting_rows(&values, &inherited, false, &BTreeSet::new());
         let row = rows
             .iter()

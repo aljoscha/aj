@@ -280,14 +280,35 @@ impl Stated {
 /// the host defaults itself, against the model it actually runs.
 fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<SessionSettings> {
     let selection = aj_app::model::ModelSelection::merge(args, config);
-    // A model is stated by naming it, and `merge` already answers that: with
-    // none pinned anywhere there is no `(api, name)` pair to send, and "that
-    // provider's default" is not something the wire can express.
-    let model = selection.name.as_ref().map(|name| ModelSelection {
-        api: selection.provider_id().to_string(),
-        url: selection.url.clone(),
-        name: name.clone(),
-    });
+    let model_stated = args.model_api.is_some()
+        || args.model_name.is_some()
+        || args.model_url.is_some()
+        || ["model_api", "model_name", "model_url"]
+            .iter()
+            .any(|key| stated.has(key));
+    let model = selection
+        .api
+        .zip(selection.name)
+        .filter(|_| model_stated)
+        .map(|(api, name)| ModelSelection {
+            api,
+            name,
+            url: selection.url,
+        });
+    let oracle_model = config
+        .oracle_model_api
+        .as_ref()
+        .zip(config.oracle_model_name.as_ref())
+        .filter(|_| {
+            ["oracle_model_api", "oracle_model_name", "oracle_model_url"]
+                .iter()
+                .any(|key| stated.has(key))
+        })
+        .map(|(api, name)| ModelSelection {
+            api: api.clone(),
+            name: name.clone(),
+            url: config.oracle_model_url.clone(),
+        });
     let speed = args
         .speed
         .as_deref()
@@ -301,17 +322,7 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
     let settings = SessionSettings {
         model,
         account: args.account_selection(),
-        oracle_model: config
-            .oracle_model_name
-            .as_ref()
-            .map(|name| ModelSelection {
-                api: config
-                    .oracle_model_api
-                    .clone()
-                    .unwrap_or_else(|| aj_app::model::DEFAULT_PROVIDER_ID.to_string()),
-                name: name.clone(),
-                url: config.oracle_model_url.clone(),
-            }),
+        oracle_model,
         oracle_thinking: stated.has("oracle_thinking").then(|| {
             thinking_config_name(
                 aj_app::model::default_thinking_from_config(config.oracle_thinking).as_ref(),
@@ -669,6 +680,101 @@ mod tests {
             self.host.shutdown().await;
             self.server.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_model_components_travel_for_both_roles_even_when_equal_to_defaults() {
+        let peer = Peer::start().await;
+        let defaults = Config::default();
+
+        let url = peer.server.url();
+        let args = args(&["aj", "connect", &url, "--new"]);
+        let launch = args.connect_launch().expect("connect launch");
+
+        for (api, name, prefix) in [
+            (
+                defaults.model_api.as_deref().unwrap(),
+                defaults.model_name.as_deref().unwrap(),
+                "",
+            ),
+            (
+                defaults.oracle_model_api.as_deref().unwrap(),
+                defaults.oracle_model_name.as_deref().unwrap(),
+                "oracle_",
+            ),
+        ] {
+            for (key, value, project) in [
+                ("model_name", name, false),
+                ("model_api", api, true),
+                ("model_url", "https://proxy.example.test", true),
+            ] {
+                let key = format!("{prefix}{key}");
+                let layer = wrote(&[(&key, value)]);
+                let config = layer.overlay_onto(&defaults);
+                let stated = if project {
+                    Stated::new(ConfigLayer::default(), layer)
+                } else {
+                    Stated::new(layer, ConfigLayer::default())
+                };
+                // The host's scripted catalog cannot serve the client's model.
+                // Silently dropping the explicit selection would make this succeed.
+                let error = bounded(
+                    "the host to validate an explicit model choice",
+                    connect(&args, &config, &stated, &launch),
+                )
+                .await
+                .err()
+                .expect("an explicit unsupported model choice must be refused");
+                assert!(
+                    format!("{error:#}")
+                        .contains(&format!("model {api}/{name} is not in the host catalog")),
+                    "{key}: {error:#}",
+                );
+            }
+        }
+        peer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_client_selections_block_creation_but_not_attachment() {
+        let peer = Peer::start().await;
+        let session = peer.create().await;
+        let url = peer.server.url();
+        for key in ["model_api", "oracle_model_api"] {
+            let layer = wrote(&[(key, "openai")]);
+            let config = layer.overlay_onto(&Config::default());
+            let stated = Stated::new(layer, ConfigLayer::default());
+            for suffix in [vec![], vec![session.as_str()], vec!["--new"]] {
+                let mut argv = vec!["aj", "connect", &url];
+                argv.extend(&suffix);
+                let parsed = args(&argv);
+                let launch = parsed.connect_launch().expect("connect launch");
+                let result = bounded(
+                    "connect with client defaults",
+                    connect(&parsed, &config, &stated, &launch),
+                )
+                .await;
+                if suffix == ["--new"] {
+                    let error = result.err().expect("host rejects the unavailable pair");
+                    let name = if key == "model_api" {
+                        config.model_name.as_deref()
+                    } else {
+                        config.oracle_model_name.as_deref()
+                    }
+                    .unwrap();
+                    assert!(
+                        format!("{error:#}")
+                            .contains(&format!("model openai/{name} is not in the host catalog")),
+                        "{error:#}"
+                    );
+                } else {
+                    let attached = result.expect("attach ignores client model defaults");
+                    assert_eq!(attached.session, session);
+                    assert!(!attached.created);
+                }
+            }
+        }
+        peer.shutdown().await;
     }
 
     #[tokio::test]

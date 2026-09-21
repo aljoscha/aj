@@ -353,6 +353,20 @@ pub fn persist_user(
     effective: &Arc<Mutex<Config>>,
     mutate: impl Fn(&mut Config),
 ) -> Option<String> {
+    update_user(layers, effective, |baseline| {
+        let mut updated = baseline.clone();
+        mutate(&mut updated);
+        updated.persist_changed(baseline)?;
+        Ok(updated)
+    })
+}
+
+/// Serialize an edit and publish its in-memory changes only after saving.
+fn update_user(
+    layers: &Arc<Mutex<ConfigLayers>>,
+    effective: &Arc<Mutex<Config>>,
+    write: impl FnOnce(&Config) -> Result<Config, aj_conf::ConfigError>,
+) -> Option<String> {
     let writes = Arc::clone(&layers.lock().expect("config layers mutex poisoned").writes);
     let _write = writes.lock().expect("config write mutex poisoned");
     let baseline = layers
@@ -360,11 +374,10 @@ pub fn persist_user(
         .expect("config layers mutex poisoned")
         .user
         .clone();
-    let mut updated = baseline.clone();
-    mutate(&mut updated);
-    if let Err(err) = updated.persist_changed(&baseline) {
-        return Some(format!("(couldn't save to config.toml: {err})"));
-    }
+    let updated = match write(&baseline) {
+        Ok(updated) => updated,
+        Err(err) => return Some(format!("(couldn't save to config.toml: {err})")),
+    };
     let mut layers = layers.lock().expect("config layers mutex poisoned");
     layers.user = updated;
     *effective.lock().expect("config mutex poisoned") = layers.effective();
@@ -439,7 +452,7 @@ pub fn persist_setting(
 }
 
 /// The independently configured model whose settings a session edit changes.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelTarget {
     Main,
     Oracle,
@@ -540,14 +553,18 @@ pub fn persist_axis(
             // updates to models.json.
             match persist {
                 PersistAction::None => None,
-                PersistAction::User => persist_user(layers, config, |c| {
-                    if target == ModelTarget::Main {
-                        c.model_api = Some(info.provider.clone());
-                        c.model_name = Some(info.id.clone());
-                    } else {
-                        c.oracle_model_api = Some(info.provider.clone());
-                        c.oracle_model_name = Some(info.id.clone());
-                    }
+                PersistAction::User => update_user(layers, config, |baseline| {
+                    // Saving a model pins the whole pair, even when it equals
+                    // the built-in selection. Other config keys remain untouched.
+                    let mut selected = ConfigLayer::default();
+                    selected
+                        .set_str(target.key("model_api"), &info.provider)
+                        .expect("model provider is a string");
+                    selected
+                        .set_str(target.key("model_name"), &info.id)
+                        .expect("model name is a string");
+                    selected.persist(&ConfigLayer::default(), &Config::config_file_path()?)?;
+                    Ok(selected.overlay_onto(baseline))
                 }),
                 PersistAction::ProjectSet => persist_project(
                     layers,

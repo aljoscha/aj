@@ -420,7 +420,7 @@ pub fn build_initial_run_config(
     let main = if let Some(name) = &args.scripted {
         let scripted = crate::scripted::resolve_or_explain(name)?;
         let key = (
-            selection.provider_id().to_string(),
+            selection.provider_id()?.to_string(),
             scripted.model_info.id.clone(),
         );
         build_model_config(
@@ -1067,8 +1067,37 @@ mod tests {
                 .expect("scripted run config");
         assert_eq!(
             run_config.main.model_key.0,
-            crate::model::DEFAULT_PROVIDER_ID
+            Config::default().model_api.expect("default provider")
         );
+    }
+
+    #[test]
+    fn startup_and_new_sessions_resolve_independent_role_defaults() {
+        let dir = TempDir::new().expect("tempdir");
+        let auth = empty_auth(&dir);
+        let args = Args::parse_from(["aj"]);
+        let config = Config::default();
+        let (startup, restore) = build_initial_run_config(&args, &config, &auth, None, None)
+            .expect("built-in defaults resolve");
+        let defaults = RunConfigDefaults::layered(
+            &args,
+            &config,
+            startup.clone(),
+            None,
+            &auth,
+            restore.as_ref(),
+        );
+        let session = defaults.resolve(&config, &auth).expect("session defaults");
+        for run in [startup, session] {
+            assert_eq!(
+                run.main.model_key,
+                ("anthropic".into(), "claude-opus-5".into())
+            );
+            assert_eq!(
+                run.oracle.model_key,
+                ("anthropic".into(), "claude-fable-5-1".into())
+            );
+        }
     }
 
     #[test]
