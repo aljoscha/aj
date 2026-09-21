@@ -2290,7 +2290,7 @@ impl SessionHost {
         // Projected outside the log lock: a full backfill walks the whole
         // log, and holding the lock would stall the session's next append
         // for the length of it.
-        let backfill = project_suffix(&snapshot, cursor, &live_subs);
+        let mut backfill = project_suffix(&snapshot, cursor, &live_subs);
 
         if !send_block_frame(
             block,
@@ -2309,7 +2309,9 @@ impl SessionHost {
         {
             return false;
         }
-        for tagged in backfill.events {
+        // Await each send before projecting more history. The capacity-one
+        // channel paces both allocation and delivery when a client is slow.
+        for tagged in backfill.by_ref() {
             if !send_block_frame(
                 block,
                 stopped,
@@ -2379,7 +2381,8 @@ impl SessionHost {
         // runs), so no second filter here. Idempotent on re-attach:
         // `mark_running` is a set insert and `reopen_sub_box` leaves a
         // running box alone.
-        for child in &backfill.open_subs {
+        let open_subs = backfill.open_subs();
+        for child in &open_subs {
             if !send_block_frame(
                 block,
                 stopped,
@@ -2426,7 +2429,7 @@ impl SessionHost {
         // above, so the sweep cannot contradict the brackets, and an
         // abandoned branch's runs (which the log names but the projection
         // never mentions) are left alone.
-        for child in backfill.subs.difference(&backfill.open_subs) {
+        for child in backfill.seen_subs().difference(&open_subs) {
             if !send_block_frame(
                 block,
                 stopped,

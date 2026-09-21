@@ -153,22 +153,41 @@ pub struct TaggedEvent {
     pub branch_settings: Option<SessionSettings>,
 }
 
-/// The projected durable suffix of a live log.
-#[derive(Debug, Clone)]
-pub struct Backfill {
-    pub events: Vec<TaggedEvent>,
-    /// Every sub-agent run the walk saw on the projected path, whether its
-    /// bracket was closed or left open.
+/// An incremental projection of a live log's durable suffix.
+///
+/// Borrows the snapshot and buffers events for the current entry, plus closing
+/// brackets at EOF, rather than retaining the whole projected history. Exhaust
+/// the iterator before using its sub-agent sets to conclude the attach block.
+pub struct Backfill<'a> {
+    walk: Replay<'a>,
+}
+
+impl Backfill<'_> {
+    /// Every sub-agent run encountered so far on the projected path, whether
+    /// its bracket was closed or left open. Complete after exhaustion.
     ///
     /// A caller concluding the runs a backfill left unconcluded needs this
     /// rather than the log's full sub-agent set: the latter spans abandoned
     /// branches, whose runs the projection never mentions.
-    pub subs: BTreeSet<usize>,
-    /// The runs whose bracket the projection left open, which is exactly
-    /// the `live_subs` it saw (see [`project_suffix`]). Their real
-    /// `SubAgentEnd` is still coming live, so concluding them is the
-    /// caller's decision, not the projection's.
-    pub open_subs: BTreeSet<usize>,
+    pub fn seen_subs(&self) -> &BTreeSet<usize> {
+        &self.walk.state.seen_subs
+    }
+
+    /// Runs whose brackets are currently open. After exhaustion these are
+    /// exactly the `live_subs` the walk saw (see [`project_suffix`]). Their
+    /// real `SubAgentEnd` is still coming live, so concluding them is the
+    /// caller's decision.
+    pub fn open_subs(&self) -> BTreeSet<usize> {
+        self.walk.state.open_runs.keys().copied().collect()
+    }
+}
+
+impl Iterator for Backfill<'_> {
+    type Item = TaggedEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.walk.next()
+    }
 }
 
 /// Project the events of every entry after `cursor`, for a live log.
@@ -195,20 +214,16 @@ pub struct Backfill {
 /// `CompactionEnd` of a `Compaction` entry, and the `Notice` of a
 /// notice-producing state entry. At most one event per entry is tagged,
 /// which is what makes the client's per-frame cursor advance well-defined.
-pub fn project_suffix(
-    log: &LogSnapshot,
+pub fn project_suffix<'a>(
+    log: &'a LogSnapshot,
     cursor: Option<u64>,
     live_subs: &BTreeSet<usize>,
-) -> Backfill {
+) -> Backfill<'a> {
     // This is the one place that knows `last_seq`, so the out-of-range
     // clamp lives here rather than at every caller.
     let cursor = cursor.filter(|seq| *seq <= log.last_seq());
-    let mut walk = Replay::suffix(log, cursor, live_subs.clone());
-    let events: Vec<TaggedEvent> = walk.by_ref().collect();
     Backfill {
-        events,
-        subs: walk.seen_subs(),
-        open_subs: walk.open_subs(),
+        walk: Replay::suffix(log, cursor, live_subs.clone()),
     }
 }
 
@@ -227,14 +242,11 @@ impl LogSnapshot {
     pub fn project_state_entry(&self, entry: &EntryId) -> Option<AgentEvent> {
         // `live_subs` is irrelevant: it only affects bracketing frames,
         // and those are never tagged with a state entry.
-        project_suffix(self, None, &BTreeSet::new())
-            .events
-            .into_iter()
-            .find_map(|tagged| {
-                let tagged_entry = tagged.entry?;
-                (tagged_entry.id == *entry && matches!(tagged.event, AgentEvent::Notice { .. }))
-                    .then_some(tagged.event)
-            })
+        project_suffix(self, None, &BTreeSet::new()).find_map(|tagged| {
+            let tagged_entry = tagged.entry?;
+            (tagged_entry.id == *entry && matches!(tagged.event, AgentEvent::Notice { .. }))
+                .then_some(tagged.event)
+        })
     }
 }
 
@@ -371,17 +383,6 @@ impl<'a> Replay<'a> {
             live_subs,
             ..Self::with_mode(log, false)
         }
-    }
-
-    /// The sub-agent runs whose bracket is still open, valid once the
-    /// walk is exhausted.
-    fn open_subs(&self) -> BTreeSet<usize> {
-        self.state.open_runs.keys().copied().collect()
-    }
-
-    /// Every sub-agent run the walk entered, valid once it is exhausted.
-    fn seen_subs(&self) -> BTreeSet<usize> {
-        self.state.seen_subs.clone()
     }
 }
 
@@ -591,7 +592,7 @@ struct ReplayState {
     open_runs: BTreeMap<usize, OpenRun>,
     /// Every run the walk has entered, whether still open or already
     /// closed. Only the projected path contributes, which is what a caller
-    /// concluding unconcluded runs needs (see [`Backfill::subs`]).
+    /// concluding unconcluded runs needs (see [`Backfill::seen_subs`]).
     seen_subs: BTreeSet<usize>,
     /// The [`AgentEvent::SubAgentStart`] each sub-agent's run was opened
     /// with, kept after the run closes.
@@ -1411,6 +1412,26 @@ mod tests {
         ToolResultMessage, UserMessage,
     };
     use serde_json::json;
+
+    struct CollectedBackfill {
+        events: Vec<TaggedEvent>,
+        subs: BTreeSet<usize>,
+        open_subs: BTreeSet<usize>,
+    }
+
+    fn collect_suffix(
+        log: &LogSnapshot,
+        cursor: Option<u64>,
+        live_subs: &BTreeSet<usize>,
+    ) -> CollectedBackfill {
+        let mut backfill = project_suffix(log, cursor, live_subs);
+        CollectedBackfill {
+            events: backfill.by_ref().collect(),
+            subs: backfill.seen_subs().clone(),
+            open_subs: backfill.open_subs(),
+        }
+    }
+
     /// A scratch directory for one test's persistence state, removed when the
     /// returned guard drops. Callers must hold the guard for as long as they
     /// use the directory.
@@ -1515,7 +1536,7 @@ mod tests {
                     .into()
                 ))
             );
-            let projection = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+            let projection = collect_suffix(&log.snapshot(), None, &BTreeSet::new());
             let recorded = projection
                 .events
                 .iter()
@@ -1609,7 +1630,7 @@ mod tests {
             .unwrap();
 
         log.set_head(first.id.clone()).unwrap();
-        let selected = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+        let selected = collect_suffix(&log.snapshot(), None, &BTreeSet::new());
         let settings: Vec<_> = selected
             .events
             .iter()
@@ -1640,7 +1661,7 @@ mod tests {
             Some(abandoned.seq),
             Some(checkpoint.seq),
         ] {
-            let projected = project_suffix(&log.snapshot(), cursor, &BTreeSet::new());
+            let projected = collect_suffix(&log.snapshot(), cursor, &BTreeSet::new());
             let baselines: Vec<_> = projected
                 .events
                 .iter()
@@ -1683,7 +1704,7 @@ mod tests {
         let fresh = ConversationView::user(&mut log)
             .add_message(user_msg("from root"))
             .unwrap();
-        let projected = project_suffix(&log.snapshot(), Some(sibling.seq), &BTreeSet::new());
+        let projected = collect_suffix(&log.snapshot(), Some(sibling.seq), &BTreeSet::new());
         let end = projected
             .events
             .iter()
@@ -1815,7 +1836,7 @@ mod tests {
                 other => panic!("the replay does not open with the context notice: {other:?}"),
             }
         };
-        let events = project_suffix(&resumed.snapshot(), None, &BTreeSet::new()).events;
+        let events = collect_suffix(&resumed.snapshot(), None, &BTreeSet::new()).events;
         assert_eq!(
             opening(&events),
             (Some(context_id.clone()), context.notice())
@@ -1846,7 +1867,7 @@ mod tests {
             view.add_message(user_msg("second branch"))
                 .expect("user message");
         }
-        let branched = project_suffix(&resumed.snapshot(), None, &BTreeSet::new()).events;
+        let branched = collect_suffix(&resumed.snapshot(), None, &BTreeSet::new()).events;
         assert_eq!(opening(&branched).0, Some(context_id));
         assert!(
             !branched
@@ -3251,7 +3272,7 @@ mod tests {
                 .map(|(_, text)| text.clone())
                 .collect::<Vec<_>>()
         );
-        let suffix = project_suffix(&snapshot, Some(fork.seq), &BTreeSet::new());
+        let suffix = collect_suffix(&snapshot, Some(fork.seq), &BTreeSet::new());
         let tagged_notices: Vec<_> = suffix
             .events
             .into_iter()
@@ -4789,7 +4810,7 @@ mod tests {
 
     /// The projected event kinds of one entry position, for readable
     /// assertions about what a suffix contains.
-    fn kinds(backfill: &Backfill) -> Vec<(Option<u64>, String)> {
+    fn kinds(backfill: &CollectedBackfill) -> Vec<(Option<u64>, String)> {
         backfill
             .events
             .iter()
@@ -4805,7 +4826,7 @@ mod tests {
 
     /// The wire form of every event in `backfill`, for comparing a
     /// projection against a replay.
-    fn projected_values(backfill: &Backfill) -> Vec<Value> {
+    fn projected_values(backfill: &CollectedBackfill) -> Vec<Value> {
         backfill
             .events
             .iter()
@@ -4819,7 +4840,7 @@ mod tests {
     /// which is what lets the two paths share one state machine.
     fn assert_full_suffix_matches_replay(log: &ConversationLog, label: &str) {
         let replayed: Vec<Value> = replay(log).map(|event| wire(&event)).collect();
-        let backfill = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+        let backfill = collect_suffix(&log.snapshot(), None, &BTreeSet::new());
         assert_eq!(
             projected_values(&backfill),
             replayed,
@@ -4856,7 +4877,7 @@ mod tests {
     fn full_suffix_leaves_a_live_runs_bracket_open() {
         let (_dir, log) = open_sub_log();
         let replayed: Vec<Value> = replay(&log).map(|event| wire(&event)).collect();
-        let backfill = project_suffix(&log.snapshot(), None, &live([1]));
+        let backfill = collect_suffix(&log.snapshot(), None, &live([1]));
 
         // Dead-log replay force-closes the bracket at EOF. A live
         // backfill must not, because the real `SubAgentEnd` for a running
@@ -4878,7 +4899,7 @@ mod tests {
     #[test]
     fn a_live_background_run_keeps_its_bracket_open_across_parent_entries() {
         let (_dir, log) = log_with_background_sub();
-        let backfill = project_suffix(&log.snapshot(), None, &live([1]));
+        let backfill = collect_suffix(&log.snapshot(), None, &live([1]));
 
         assert!(
             !backfill
@@ -4909,7 +4930,7 @@ mod tests {
     #[test]
     fn two_live_background_runs_both_stay_open_with_their_real_starts() {
         let (_dir, log) = log_with_two_background_subs();
-        let backfill = project_suffix(&log.snapshot(), None, &live([1, 2]));
+        let backfill = collect_suffix(&log.snapshot(), None, &live([1, 2]));
 
         assert!(
             !backfill
@@ -4951,7 +4972,7 @@ mod tests {
     #[test]
     fn a_finished_background_run_reopens_with_its_spawn_root_s_start() {
         let (_dir, log) = log_with_two_background_subs();
-        let backfill = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+        let backfill = collect_suffix(&log.snapshot(), None, &BTreeSet::new());
 
         let starts: Vec<(usize, String, bool, AgentSettings)> = backfill
             .events
@@ -4989,7 +5010,7 @@ mod tests {
     #[test]
     fn a_finished_run_is_still_concluded() {
         let (_dir, log) = log_with_foreground_sub();
-        let backfill = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+        let backfill = collect_suffix(&log.snapshot(), None, &BTreeSet::new());
 
         let ends: Vec<(AgentId, String, SubAgentConclusion)> = backfill
             .events
@@ -5023,7 +5044,7 @@ mod tests {
         let (_dir, log) = log_with_two_background_subs();
         // Position 9 is the parent's interleaved turn: both runs opened
         // below it and both continue above it.
-        let backfill = project_suffix(&log.snapshot(), Some(9), &live([1, 2]));
+        let backfill = collect_suffix(&log.snapshot(), Some(9), &live([1, 2]));
 
         let starts: Vec<(usize, String, bool, AgentSettings, Option<u64>)> = backfill
             .events
@@ -5068,8 +5089,8 @@ mod tests {
         let (_dir, log) = open_sub_log();
         let snapshot = log.snapshot();
         assert_eq!(
-            kinds(&project_suffix(&snapshot, Some(0), &live([1]))),
-            kinds(&project_suffix(&snapshot, None, &live([1]))),
+            kinds(&collect_suffix(&snapshot, Some(0), &live([1]))),
+            kinds(&collect_suffix(&snapshot, None, &live([1]))),
         );
     }
 
@@ -5077,7 +5098,7 @@ mod tests {
     fn a_cursor_at_the_last_position_projects_nothing() {
         let (_dir, log) = open_sub_log();
         let snapshot = log.snapshot();
-        let backfill = project_suffix(&snapshot, Some(snapshot.last_seq()), &live([1]));
+        let backfill = collect_suffix(&snapshot, Some(snapshot.last_seq()), &live([1]));
         assert!(
             backfill.events.is_empty(),
             "a caught-up client gets an empty suffix: {:?}",
@@ -5099,10 +5120,10 @@ mod tests {
     fn a_cursor_beyond_the_last_position_projects_the_whole_log() {
         let (_dir, log) = open_sub_log();
         let snapshot = log.snapshot();
-        let full = kinds(&project_suffix(&snapshot, None, &live([1])));
+        let full = kinds(&collect_suffix(&snapshot, None, &live([1])));
         for cursor in [snapshot.last_seq() + 1, u64::MAX] {
             assert_eq!(
-                kinds(&project_suffix(&snapshot, Some(cursor), &live([1]))),
+                kinds(&collect_suffix(&snapshot, Some(cursor), &live([1]))),
                 full,
                 "cursor {cursor} must fall back to a full backfill"
             );
@@ -5116,7 +5137,7 @@ mod tests {
         let log = ConversationLog::create(&persistence).expect("create log");
         let snapshot = log.snapshot();
         for cursor in [None, Some(0), Some(1), Some(u64::MAX)] {
-            let backfill = project_suffix(&snapshot, cursor, &BTreeSet::new());
+            let backfill = collect_suffix(&snapshot, cursor, &BTreeSet::new());
             assert!(backfill.events.is_empty(), "cursor {cursor:?}");
             assert!(backfill.open_subs.is_empty(), "cursor {cursor:?}");
         }
@@ -5127,7 +5148,7 @@ mod tests {
         let (_dir, log) = open_sub_log();
         // Cursor at the assistant message that carries the tool call, so
         // its tool_call map entry and its usage are below the cursor.
-        let backfill = project_suffix(&log.snapshot(), Some(4), &live([1]));
+        let backfill = collect_suffix(&log.snapshot(), Some(4), &live([1]));
 
         assert_eq!(
             kinds(&backfill),
@@ -5192,7 +5213,7 @@ mod tests {
         let (_dir, log) = open_sub_log();
         // Cursor inside the sub's run: its spawn root (9) and first
         // message (10) are below the cursor, its assistant turn is not.
-        let backfill = project_suffix(&log.snapshot(), Some(10), &live([1]));
+        let backfill = collect_suffix(&log.snapshot(), Some(10), &live([1]));
 
         let first = backfill.events.first().expect("suffix is not empty");
         match &first.event {
@@ -5235,7 +5256,7 @@ mod tests {
         let (_dir, log) = open_sub_log();
         // The spawn root sits exactly at the cursor, so it is dropped and
         // the run is open at the boundary just the same.
-        let backfill = project_suffix(&log.snapshot(), Some(9), &live([1]));
+        let backfill = collect_suffix(&log.snapshot(), Some(9), &live([1]));
         assert_eq!(
             kinds(&backfill),
             vec![
@@ -5257,7 +5278,7 @@ mod tests {
         let (_dir, log) = log_with_legacy_sub();
         // Position 4 is the run's first entry (its task message), which
         // is also where the legacy fallback opened the bracket.
-        let backfill = project_suffix(&log.snapshot(), Some(4), &live([1]));
+        let backfill = collect_suffix(&log.snapshot(), Some(4), &live([1]));
 
         assert_eq!(
             kinds(&backfill),
@@ -5368,7 +5389,7 @@ mod tests {
             live([1, 2]),
             "the log names both runs, on either branch",
         );
-        let backfill = project_suffix(&snapshot, None, &BTreeSet::new());
+        let backfill = collect_suffix(&snapshot, None, &BTreeSet::new());
         assert_eq!(
             backfill.subs,
             live([1]),
@@ -5377,7 +5398,7 @@ mod tests {
         assert!(backfill.open_subs.is_empty(), "no run was said to be live");
 
         // A live run is reported too, and stays open.
-        let backfill = project_suffix(&snapshot, None, &live([1]));
+        let backfill = collect_suffix(&snapshot, None, &live([1]));
         assert_eq!(backfill.subs, live([1]));
         assert_eq!(backfill.open_subs, live([1]));
     }
@@ -5389,7 +5410,7 @@ mod tests {
         // entry's durable frame and must be emitted with its position: a
         // client whose cursor stops short of the spawn would otherwise
         // never learn the sub exists.
-        let backfill = project_suffix(&log.snapshot(), Some(8), &live([1]));
+        let backfill = collect_suffix(&log.snapshot(), Some(8), &live([1]));
         let first = backfill.events.first().expect("suffix is not empty");
         assert!(matches!(first.event, AgentEvent::SubAgentStart { .. }));
         assert_eq!(
@@ -5402,7 +5423,7 @@ mod tests {
     #[test]
     fn a_sub_thread_settings_change_projects_a_tagged_notice_in_place() {
         let (_dir, log) = log_with_sub_settings_change();
-        let backfill = project_suffix(&log.snapshot(), None, &live([1]));
+        let backfill = collect_suffix(&log.snapshot(), None, &live([1]));
 
         assert_eq!(
             kinds(&backfill),
@@ -5460,7 +5481,7 @@ mod tests {
         let projected = snapshot
             .project_state_entry(&entry_at(6))
             .expect("a mid-session settings entry projects a notice");
-        let from_backfill = project_suffix(&snapshot, Some(5), &live([1]))
+        let from_backfill = collect_suffix(&snapshot, Some(5), &live([1]))
             .events
             .into_iter()
             .find(|tagged| tagged.entry.as_ref().is_some_and(|entry| entry.seq == 6))
@@ -5494,7 +5515,7 @@ mod tests {
     fn full_suffix_tags_exactly_the_durable_events() {
         let (_dir, log) = open_sub_log();
         let snapshot = log.snapshot();
-        let backfill = project_suffix(&snapshot, None, &live([1]));
+        let backfill = collect_suffix(&snapshot, None, &live([1]));
 
         assert_eq!(
             kinds(&backfill),
@@ -5527,7 +5548,7 @@ mod tests {
 
     /// Every tag names its own entry, and no entry carries two: that is
     /// what makes a client's per-frame cursor advance well-defined.
-    fn assert_tags_name_their_own_entry(snapshot: &LogSnapshot, backfill: &Backfill) {
+    fn assert_tags_name_their_own_entry(snapshot: &LogSnapshot, backfill: &CollectedBackfill) {
         let mut seen: Vec<u64> = Vec::new();
         for projected in &backfill.events {
             let Some(entry) = &projected.entry else {
@@ -5560,7 +5581,7 @@ mod tests {
     fn a_tool_result_batch_tags_each_result_entry_once() {
         let (_dir, log) = tool_batch_log();
         let snapshot = log.snapshot();
-        let backfill = project_suffix(&snapshot, None, &BTreeSet::new());
+        let backfill = collect_suffix(&snapshot, None, &BTreeSet::new());
 
         assert_eq!(
             kinds(&backfill),
@@ -5590,7 +5611,7 @@ mod tests {
     #[test]
     fn seed_entries_leave_a_gap_before_the_first_tagged_position() {
         let (_dir, log) = open_sub_log();
-        let backfill = project_suffix(&log.snapshot(), None, &live([1]));
+        let backfill = collect_suffix(&log.snapshot(), None, &live([1]));
         let first_tagged = backfill
             .events
             .iter()
@@ -5609,7 +5630,7 @@ mod tests {
     fn an_abandoned_branch_leaves_an_interior_gap_in_the_tagged_positions() {
         let (_dir, log) = log_with_abandoned_sibling_branch();
         let snapshot = log.snapshot();
-        let backfill = project_suffix(&snapshot, None, &BTreeSet::new());
+        let backfill = collect_suffix(&snapshot, None, &BTreeSet::new());
 
         let tagged: Vec<u64> = backfill
             .events

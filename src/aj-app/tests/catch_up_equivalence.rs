@@ -80,14 +80,14 @@ impl Client {
         // The projection leaves open exactly the brackets of the runs the
         // host knows are still live. This attach is served against a
         // finished log, so the host knows of none.
-        let backfill = project_suffix(log, cursor, &BTreeSet::new());
+        let mut backfill = project_suffix(log, cursor, &BTreeSet::new());
         // The block's opening `state` carries the `working` seed, which no
         // projected event can carry: a bracket whose `AgentEnd` fell into
         // the disconnected window would otherwise leave a spinner running
         // forever. This host is idle, the turn having finished.
         self.apply(state_frame(epoch, log.last_seq(), false));
-        for tagged in &backfill.events {
-            self.apply(event_frame(epoch, tagged));
+        for tagged in backfill.by_ref() {
+            self.apply(event_frame(epoch, &tagged));
         }
         self.apply(caught_up_frame(epoch, log.last_seq()));
         // After `caught_up` the host concludes every sub-agent it knows to
@@ -95,7 +95,7 @@ impl Client {
         // into the disconnected window with no durable entry behind it. It
         // sweeps the runs the projection walked, not the log's full set,
         // which is what keeps an abandoned branch's runs out of it.
-        for child in backfill.subs.difference(&backfill.open_subs) {
+        for child in backfill.seen_subs().difference(&backfill.open_subs()) {
             self.apply(agent_end_frame(epoch, AgentId::Sub(*child)));
         }
     }
@@ -567,21 +567,21 @@ async fn reapplying_the_whole_projected_suffix_changes_nothing() {
         let mut life = AgentLifecycle::default();
         // What a client attached at creation folded: the seeded log's block,
         // then the turn live.
-        for tagged in &project_suffix(seeded, None, &BTreeSet::new()).events {
-            fold(&mut chat, &mut life, tagged);
+        for tagged in project_suffix(seeded, None, &BTreeSet::new()) {
+            fold(&mut chat, &mut life, &tagged);
         }
         for tagged in frames {
             fold(&mut chat, &mut life, tagged);
         }
         let before = CanonicalState::of_reduced(&chat, &life);
-        let backfill = project_suffix(log, None, &BTreeSet::new());
+        let mut backfill = project_suffix(log, None, &BTreeSet::new()).peekable();
         assert!(
-            !backfill.events.is_empty(),
+            backfill.peek().is_some(),
             "the projection emits events to re-apply",
         );
 
-        for tagged in &backfill.events {
-            fold(&mut chat, &mut life, tagged);
+        for tagged in backfill {
+            fold(&mut chat, &mut life, &tagged);
         }
 
         assert_canonical_eq(

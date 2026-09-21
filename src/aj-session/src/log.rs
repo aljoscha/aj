@@ -3310,8 +3310,6 @@ mod tests {
             None,
             &std::collections::BTreeSet::new(),
         )
-        .events
-        .into_iter()
         .filter_map(|tagged| match tagged.event {
             aj_agent::events::AgentEvent::MessageEnd { .. } => {
                 Some(tagged.entry.expect("a MessageEnd is durable").id)

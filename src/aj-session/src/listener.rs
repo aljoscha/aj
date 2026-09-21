@@ -1297,7 +1297,8 @@ mod tests {
             )
             .unwrap();
             let live = drained(&mut rx);
-            let replayed = project_suffix(&resumed.snapshot(), None, &BTreeSet::new()).events;
+            let replayed: Vec<_> =
+                project_suffix(&resumed.snapshot(), None, &BTreeSet::new()).collect();
             for events in [&live, &replayed] {
                 let mut baselines = Vec::new();
                 for tagged in events {
