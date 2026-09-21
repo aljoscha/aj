@@ -1189,10 +1189,16 @@ The current-session marker is independent of the keyboard selection highlight.
 Archived rows strike through all their text without adding a column or changing
 their colors and selection highlight.
 
+A reachable row reported as `locked` shows `L` for a session in use by another
+process, with `in use` in the state column. The compact indication remains
+recognizable when metadata is clipped. It does not replace the current-session
+marker or prevent selection and attachment attempts, even after a locked refusal.
+
 ### 8.2 The sidebar
 
 A persistent sidebar lists the directory's sessions grouped by host,
-with glyphs for working, unseen output, and unreachable. Rows carry no
+with glyphs for working, unseen output, in use elsewhere (`L`), and unreachable.
+Unreachable takes precedence over a stale lock indication. Rows carry no
 preview text: nothing in the directory contract reads log content per
 row. The promises the host relies on:
 

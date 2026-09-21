@@ -107,6 +107,9 @@ pub(crate) fn min_cols_with_sidebar(cols: u16) -> u16 {
 /// The focused row's marker, in the column left of the status glyph.
 pub(crate) const FOCUS_MARKER: &str = "▌";
 
+/// A writer other than the publishing host holds this session's lock.
+pub(crate) const LOCKED_MARKER: &str = "L";
+
 /// The glyph a folded group's trailing line wears, pointing right at the count
 /// that stands in for the rows the cap holds back.
 const FOLDED_MARKER: &str = "▸";
@@ -157,6 +160,8 @@ const ID_TAG_GAP: usize = 1;
 pub(crate) enum RowStatus {
     /// The peer cannot reach the host this session lives on.
     Unreachable,
+    /// Another writer holds the session's lock.
+    Locked,
     /// A turn is running.
     Working,
     /// Idle, and it has produced output since the user last looked at it.
@@ -170,12 +175,15 @@ impl RowStatus {
     ///
     /// The order is the precedence: unreachable first because it says the peer
     /// cannot answer for this session at all, so `working` and the activity
-    /// stamp behind `unseen` are both stale rather than wrong. Working next
-    /// because it is the live fact. Unseen is what remains once a session
-    /// stops, which is why it cannot outrank working.
+    /// stamp behind `unseen` are both stale rather than wrong. A rival lock
+    /// takes priority over activity because attachment would be refused.
+    /// Working next because it is the live fact. Unseen is what remains once
+    /// a session stops, which is why it cannot outrank working.
     pub(crate) fn of(row: &SessionSummary, unseen: bool) -> Self {
         if row.unreachable {
             RowStatus::Unreachable
+        } else if row.locked {
+            RowStatus::Locked
         } else if row.working {
             RowStatus::Working
         } else if unseen {
@@ -192,6 +200,7 @@ impl RowStatus {
     fn glyph(self) -> &'static str {
         match self {
             RowStatus::Unreachable => "!",
+            RowStatus::Locked => LOCKED_MARKER,
             RowStatus::Working => "*",
             RowStatus::Unseen => "•",
             RowStatus::Idle => " ",
@@ -1446,6 +1455,7 @@ impl SessionSidebar {
     fn glyph_style(&self, status: RowStatus) -> Style {
         match status {
             RowStatus::Unreachable => self.styles.error,
+            RowStatus::Locked => self.styles.warning,
             RowStatus::Working => self.styles.success,
             RowStatus::Unseen => self.styles.warning,
             RowStatus::Idle => self.styles.dim,
@@ -1753,7 +1763,7 @@ mod tests {
         }
     }
 
-    /// The precedence between the four statuses, which no timing-dependent test
+    /// The precedence between activity statuses, which no timing-dependent test
     /// can pin: unreachable outranks everything because it says the rest of the
     /// row is stale, working outranks unseen because unseen is what remains once
     /// a session stops.
@@ -3849,6 +3859,31 @@ mod tests {
             .iter()
             .map(|row| row.iter().map(|cell| cell.char.grapheme()).collect())
             .collect()
+    }
+
+    #[test]
+    fn a_locked_directory_row_keeps_its_marker_beside_focus_and_clipped_labels() {
+        for (locked, unreachable, glyph) in
+            [(true, false, "L"), (false, false, " "), (true, true, "!")]
+        {
+            for focused in ["session-1", "other"] {
+                let summaries = [SessionSummary {
+                    locked,
+                    tag: Some("a-long-session-label-that-will-be-clipped".to_string()),
+                    ..summary(false, unreachable)
+                }];
+                let rows = rows_for_display(&summaries, focused, |_| false, |_| false, false);
+                let lines = painted(rows, vec![], 3);
+                let line = &lines[0];
+                let focus = if focused == "session-1" {
+                    FOCUS_MARKER
+                } else {
+                    " "
+                };
+                assert!(line.starts_with(&format!("{focus}{glyph} ")), "{line}");
+                assert!(line.contains('…'), "the label is clipped: {line}");
+            }
+        }
     }
 
     /// The strip draws the width it carries, and the label field is what the

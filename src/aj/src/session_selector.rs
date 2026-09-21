@@ -43,7 +43,9 @@ use crate::overlay::{
     OverlayPlacement, OverlayStack, close_all, close_key_label, close_top, confirm_key_label,
 };
 use crate::settings_ui::push_window;
-use crate::sidebar::{FOCUS_MARKER, host_label, session_label, session_label_source};
+use crate::sidebar::{
+    FOCUS_MARKER, LOCKED_MARKER, host_label, session_label, session_label_source,
+};
 use crate::text::one_line;
 
 /// Maximum length of an id-derived fallback label.
@@ -397,13 +399,15 @@ fn build_item(
     decorate_row(item, tag, row.id == current)
 }
 
-/// The row's textual state. Unreachable and working keep the
+/// The row's textual state. Unreachable, locked, and working keep the
 /// sidebar's priority, then this surface distinguishes a live session from a
 /// cold idle one. The sidebar's remaining state is unseen output instead, so
 /// its [`crate::sidebar::RowStatus`] is not this formatter's vocabulary.
 fn session_state(row: &SessionSummary) -> &'static str {
     if row.unreachable {
         "unreachable"
+    } else if row.locked {
+        "in use"
     } else if row.working {
         "working"
     } else if row.live {
@@ -422,6 +426,14 @@ fn session_columns(
     // Empty host fields reserve no space when every row is local or direct,
     // but keep metadata aligned if a directory row has no host label.
     let mut columns = vec![
+        // A one-cell field survives metadata clipping independently of the
+        // explanatory state text. Focus keeps its own marker gutter.
+        SelectColumn::new(if row.locked && !row.unreachable {
+            LOCKED_MARKER
+        } else {
+            ""
+        })
+        .with_gap_after(1),
         SelectColumn::new(host.unwrap_or("")),
         SelectColumn::new(session_state(row)),
     ];
@@ -558,6 +570,105 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
+
+    #[test]
+    fn locked_rows_stay_recognizable_and_selectable_when_metadata_is_clipped() {
+        use vaxis::key::Key;
+        use vaxis::vxfw::Phase;
+
+        for (locked, unreachable) in [(true, false), (false, false), (true, true)] {
+            for host in [None, Some("long-host-name")] {
+                let handles = OverlayHandles::for_tests();
+                let rows = [
+                    SessionSummary {
+                        locked,
+                        unreachable,
+                        ..directory_row(
+                            "current",
+                            Some("long-session-tag"),
+                            host,
+                            Duration::hours(2),
+                        )
+                    },
+                    directory_row("other", None, host, Duration::hours(1)),
+                ];
+                open_session_selector(&handles, "current".to_string(), &rows, &[]);
+                let scan = handles.session_scan.borrow_mut().take().expect("scan");
+                let window = Rc::clone(&handles.stack.borrow().top().expect("open").widget);
+                for previews in [false, true] {
+                    if previews {
+                        extend_session_scan(
+                            &scan,
+                            &[
+                                preview(
+                                    "current",
+                                    Some("recognize this session and its long prompt"),
+                                    123456,
+                                    Duration::hours(2),
+                                ),
+                                preview(
+                                    "other",
+                                    Some("another session prompt"),
+                                    1,
+                                    Duration::hours(1),
+                                ),
+                            ],
+                            Utc::now(),
+                        );
+                    }
+                    for width in [160, 80, 60, 48, 40, 160] {
+                        let (_, size) = OverlayPlacement::Large
+                            .resolve(vaxis::vxfw::Size { width, height: 24 });
+                        let surface = window.borrow_mut().draw(&crate::test_support::draw_ctx(
+                            size.width,
+                            Some(size.height),
+                        ));
+                        let lines = crate::test_support::rows(&surface);
+                        let current = lines
+                            .iter()
+                            .find(|line| line.contains(FOCUS_MARKER))
+                            .expect("focus remains visible");
+                        assert_eq!(
+                            current.contains("L"),
+                            locked && !unreachable,
+                            "width={width}: {current}"
+                        );
+                        assert_eq!(
+                            lines.iter().filter(|line| line.contains("L")).count(),
+                            usize::from(locked && !unreachable),
+                            "only the locked row is marked: {lines:?}"
+                        );
+                        if previews {
+                            assert!(current.contains("recognize"), "width={width}: {current}");
+                        }
+                        if width == 160 {
+                            let state = if unreachable {
+                                "unreachable"
+                            } else if locked {
+                                "in use"
+                            } else {
+                                "idle"
+                            };
+                            assert!(current.contains(state), "{current}");
+                        }
+                    }
+                }
+                let mut ctx = EventContext::new();
+                ctx.phase = Phase::Capturing;
+                scan.select.borrow_mut().capture_event(
+                    &mut ctx,
+                    &Event::KeyPress(Key {
+                        codepoint: Key::ENTER,
+                        ..Key::default()
+                    }),
+                );
+                assert!(
+                    matches!(handles.session_request.borrow().as_ref(), Some(SessionRequest::Resume(id)) if id == "current")
+                );
+                assert!(!handles.stack.borrow().is_open());
+            }
+        }
+    }
 
     fn preview(
         session_id: &str,
