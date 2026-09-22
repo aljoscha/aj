@@ -187,8 +187,6 @@ pub struct SessionClient {
     /// next block replaces that cache and restores this exact local error ahead
     /// of the new authoritative backfill.
     refusal_error: Option<String>,
-    /// A one-shot frontend signal for each forced projection replacement.
-    forced_replacement_opened: bool,
     /// Refused, and nothing is asking again yet, carrying the reason so the
     /// directory knows which edge re-asks.
     ///
@@ -222,7 +220,6 @@ impl SessionClient {
             needs_reattach: false,
             forward_reset: None,
             refusal_error: None,
-            forced_replacement_opened: false,
             withheld: None,
         }
     }
@@ -633,15 +630,6 @@ impl SessionClient {
         rows.warning = Some(warning);
     }
 
-    /// Take the signal that a forced projection replacement opened.
-    ///
-    /// A frontend uses this to retire terminal image ids from the projection
-    /// that [`ChatState::reset`] discarded. Each forced opening raises the
-    /// signal again, including a retry after an interrupted block.
-    pub fn take_forced_replacement_opened(&mut self) -> bool {
-        std::mem::take(&mut self.forced_replacement_opened)
-    }
-
     /// Where this client stands on an attach block.
     ///
     /// This is what a caller folding a block waits on, and it is the client's
@@ -761,7 +749,6 @@ impl SessionClient {
             self.committed = None;
             self.applied = None;
             self.refusal_error = None;
-            self.forced_replacement_opened = true;
             // These rows explain the action that caused the replacement. They
             // are local rather than durable, so a reset has to put them back
             // before replay starts or an interrupted retry would erase them.
@@ -774,7 +761,6 @@ impl SessionClient {
             chat.reset(&mut self.lifecycle);
             self.committed = None;
             self.applied = None;
-            self.forced_replacement_opened = true;
             let _ = reduce(
                 chat,
                 &mut self.lifecycle,
@@ -1392,11 +1378,6 @@ mod tests {
         client.owe_reattach();
         client.expect_attach();
         let _ = client.apply(&mut chat, state(HEAD_EPOCH, false));
-        assert!(client.take_forced_replacement_opened());
-        assert!(
-            !client.take_forced_replacement_opened(),
-            "the frontend signal is one-shot per opening",
-        );
         assert_eq!(notices(&chat), Vec::<String>::new());
         assert_eq!(errors(&chat), vec![PEER_ERROR]);
         assert_eq!(notices_at(&chat, NoticeLevel::Warning), vec![WARNING]);
@@ -1418,10 +1399,6 @@ mod tests {
 
         client.expect_attach();
         let _ = client.apply(&mut chat, state(HEAD_EPOCH, false));
-        assert!(
-            client.take_forced_replacement_opened(),
-            "an interrupted replacement raises a fresh retirement signal",
-        );
         assert_eq!(
             notice_rows(&chat),
             vec![
@@ -1455,12 +1432,10 @@ mod tests {
         );
 
         // CaughtUp discharges the forward reset and its retained rows. A later
-        // ordinary epoch replacement must neither restore them nor raise the
-        // forced-replacement signal.
+        // ordinary epoch replacement must not restore them.
         client.expect_attach();
         let _ = client.apply(&mut chat, state("later-epoch", false));
         assert_eq!(notice_rows(&chat), Vec::new());
-        assert!(!client.take_forced_replacement_opened());
     }
 
     /// A refusal leaves last-known chat visible, but clears the epoch. The next
@@ -1482,10 +1457,6 @@ mod tests {
         client.owe_reattach();
         client.expect_attach();
         let _ = client.apply(&mut chat, state("new-branch", false));
-        assert!(
-            client.take_forced_replacement_opened(),
-            "the frontend was not told to retire stale projection artifacts",
-        );
         let _ = client.apply(
             &mut chat,
             durable("new-branch", 1, "new-branch", notice("new branch only")),

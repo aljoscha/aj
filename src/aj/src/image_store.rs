@@ -5,11 +5,10 @@
 //! transcript builder. The builder records the `(AgentId, EntryId)` of any
 //! visible image it wants to draw but has not transmitted yet in the pending
 //! set. After a frame the host drains that set, transmits the bytes, and
-//! records the returned id in `transmitted`. A recorded id is kept for the
-//! session's lifetime, even after its entry scrolls off screen, so scrolling
-//! back never re-transmits. Ids are freed and the collections cleared on a
-//! session switch, since transmitted ids belong to one session's terminal
-//! graphics memory.
+//! records the returned id in `transmitted`. A recorded id is kept even after
+//! its entry scrolls off screen, so scrolling back never re-transmits. The UI
+//! frees ids and clears the collections when leaving a session or before
+//! drawing a replaced model, whose entry ids may reuse the old model's keys.
 
 use std::collections::{HashMap, HashSet};
 
@@ -61,9 +60,8 @@ impl ImageRender {
 /// Maps tool-result-image entries to transmitted kitty-graphics ids, with a
 /// pending set for images the builder wants but has not transmitted yet.
 ///
-/// Keyed by `(AgentId, EntryId)` to match the transcript render cache's key,
-/// so the two stay aligned. Per session: [`drain_ids`](ImageStore::drain_ids)
-/// clears both collections on a switch.
+/// Keyed by `(AgentId, EntryId)`. The owner must call
+/// [`drain_ids`](ImageStore::drain_ids) before drawing a replaced model.
 #[derive(Default)]
 pub(crate) struct ImageStore {
     /// Entries whose bytes are transmitted, mapped to their terminal id.
@@ -104,15 +102,15 @@ impl ImageStore {
         self.failed.contains(&(agent, entry))
     }
 
-    /// Mark `(agent, entry)`'s transmit as given up. Terminal for the session:
+    /// Mark `(agent, entry)`'s transmit as given up. Terminal for this model:
     /// the builder stops recording it pending, so the host stops re-attempting
     /// it every frame, and the cell falls back to text.
     pub(crate) fn mark_failed(&mut self, agent: AgentId, entry: EntryId) {
         self.failed.insert((agent, entry));
     }
 
-    /// Return every transmitted id and clear both collections, for freeing the
-    /// outgoing session's terminal graphics memory on a session switch.
+    /// Return every transmitted id and clear all lookup state. The caller frees
+    /// the returned ids from terminal graphics memory.
     pub(crate) fn drain_ids(&mut self) -> Vec<u32> {
         let ids = self.transmitted.values().copied().collect();
         self.transmitted.clear();

@@ -5988,6 +5988,7 @@ struct SessionView {
     selection_copied: Rc<Cell<Option<SelectionCopied>>>,
     submitted: Rc<RefCell<Option<String>>>,
     image_store: Rc<RefCell<ImageStore>>,
+    image_generation: Cell<u64>,
     autocomplete_rx: RefCell<UnboundedReceiver<AutocompleteDelivery>>,
 }
 
@@ -6018,6 +6019,7 @@ impl SessionView {
         let branch_anchor = Rc::new(RefCell::new(None));
         let selection_copied = Rc::new(Cell::new(None));
         let image_store = Rc::new(RefCell::new(ImageStore::default()));
+        let image_generation = Cell::new(chat.borrow().generation());
         let t = theme.read();
         let styles = Rc::new(TranscriptStyles::from_theme(&t, TerminalCaps::default()));
         let transcript = Rc::new(RefCell::new(TranscriptView::new(
@@ -6085,6 +6087,7 @@ impl SessionView {
             selection_copied,
             submitted,
             image_store,
+            image_generation,
             autocomplete_rx: RefCell::new(autocomplete_rx),
         }
     }
@@ -8158,10 +8161,12 @@ async fn drive(
             app.request_redraw();
         }
         sync_sidebar(world, shell);
-        // An accepted-Head recovery replaced the projection off the frame arm.
-        // Retire terminal image ids before that epoch draws, since entry ids
-        // restart under the authoritative branch.
-        if world.client_mut().take_forced_replacement_opened() {
+        // Entry ids restart when the model is replaced. Clear image lookups
+        // and terminal allocations before painting, while the terminal handle
+        // is available. Widget reconciliation has its own generation because
+        // layout or input may already have consumed that change.
+        let generation = world.chat.borrow().generation();
+        if view.image_generation.replace(generation) != generation {
             free_session_images(app, shell);
             app.request_redraw();
         }
@@ -18107,6 +18112,7 @@ mod tests {
     async fn graphics_world_shell_app(
         dir: &TempDir,
         demo: &str,
+        tty: Box<dyn vaxis::tty::Tty>,
     ) -> (AsyncApp, PipeWriter, World, Rc<RefCell<Shell>>, WidgetRef) {
         let world = scripted_world(dir, demo).await;
         let (reader, mut writer) = std::io::pipe().expect("pipe");
@@ -18123,7 +18129,7 @@ mod tests {
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
         let mut vx = Vaxis::new(VaxisOptions::default());
         vx.caps.kitty_graphics = true;
-        let mut app = AsyncApp::new(vx, Box::new(TestTty::new()), reader.into());
+        let mut app = AsyncApp::new(vx, tty, reader.into());
         app.init(Rc::clone(&root), Options::default())
             .await
             .expect("init");
@@ -18144,7 +18150,7 @@ mod tests {
     async fn drive_loop_transmits_visible_image() {
         let dir = TempDir::new().expect("tempdir");
         let (mut app, mut writer, mut world, shell, root) =
-            graphics_world_shell_app(&dir, "streaming-text").await;
+            graphics_world_shell_app(&dir, "streaming-text", Box::new(TestTty::new())).await;
         let entry_id = seed_image_entry(&world.chat);
 
         let mut theme_watch = inert_theme_watch();
@@ -18179,6 +18185,153 @@ mod tests {
         );
         // Keep `world` alive so its chat outlives the shell's borrows above.
         world.chat.borrow();
+    }
+
+    #[tokio::test]
+    async fn epoch_replacement_releases_images_and_retries_failed_entries() {
+        struct CapturedTty {
+            inner: TestTty,
+            output: Rc<RefCell<Vec<u8>>>,
+        }
+
+        impl Write for CapturedTty {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.output.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl vaxis::tty::Tty for CapturedTty {
+            fn writer(&mut self) -> &mut dyn Write {
+                self
+            }
+
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.inner.read(buf)
+            }
+
+            fn get_winsize(&self) -> std::io::Result<vaxis::Winsize> {
+                self.inner.get_winsize()
+            }
+
+            fn notify_winsize(
+                &self,
+                handler: vaxis::tty::ResizeHandler,
+            ) -> std::io::Result<vaxis::tty::HandlerId> {
+                self.inner.notify_winsize(handler)
+            }
+
+            fn remove_winsize(&self, id: vaxis::tty::HandlerId) {
+                self.inner.remove_winsize(id);
+            }
+        }
+
+        for corrupt in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let output = Rc::new(RefCell::new(Vec::new()));
+            let (mut app, writer, mut world, shell, root) = graphics_world_shell_app(
+                &dir,
+                "streaming-text",
+                Box::new(CapturedTty {
+                    inner: TestTty::new(),
+                    output: Rc::clone(&output),
+                }),
+            )
+            .await;
+            drop(writer);
+            let store = Rc::clone(&shell.borrow().view().image_store);
+            let mut original_entry = None;
+            let mut original_image = None;
+
+            for (step, epoch) in ["image-epoch", "image-epoch", "replacement-epoch"]
+                .into_iter()
+                .enumerate()
+            {
+                let generation = world.chat.borrow().generation();
+                world.client_mut().expect_attach();
+                let _ = world
+                    .directory
+                    .apply(serde_json::from_str(&block_opening(world.session(), epoch)).unwrap());
+                let _ = world
+                    .directory
+                    .apply(serde_json::from_str(&block_end(world.session(), epoch, 0)).unwrap());
+                assert_eq!(world.chat.borrow().generation() == generation, step == 1);
+                let entry = if step == 1 {
+                    original_entry.unwrap()
+                } else {
+                    seed_image_entry_with(
+                        &world.chat,
+                        if step == 0 && corrupt {
+                            "YmFk"
+                        } else {
+                            PNG_2X2_B64
+                        },
+                    )
+                };
+                if step == 0 {
+                    original_entry = Some(entry);
+                } else {
+                    assert_eq!(Some(entry), original_entry, "entry ids must collide");
+                }
+
+                // Widget layout can notice a replacement before the driver.
+                // Terminal cleanup must not depend on consuming its signal.
+                shell
+                    .borrow()
+                    .view()
+                    .transcript
+                    .borrow_mut()
+                    .reconcile_model();
+                output.borrow_mut().clear();
+                // The first paint transmits, the second places the image. EOF
+                // exits each drive invocation after its pre-input paint.
+                for _ in 0..2 {
+                    app.request_redraw();
+                    let exit = drive(
+                        &mut app,
+                        &root,
+                        &shell,
+                        &mut world,
+                        &mut inert_theme_watch(),
+                        &mut None,
+                    )
+                    .await
+                    .expect("drive");
+                    assert!(matches!(exit, SessionExit::Quit));
+                }
+                let image = store.borrow().get(AgentId::Main, entry);
+                let failed = store.borrow().is_failed(AgentId::Main, entry);
+                let bytes = output.borrow();
+                let terminal = String::from_utf8_lossy(&bytes);
+                if step == 0 {
+                    assert_eq!(failed, corrupt);
+                    assert_eq!(image.is_some(), !corrupt);
+                    original_image = image;
+                } else if step == 1 {
+                    assert_eq!(image, original_image, "same-epoch rejoin reuses images");
+                    assert_eq!(failed, corrupt);
+                    assert!(!terminal.contains("\x1b_Ga=d,d=I,"));
+                } else {
+                    assert!(!failed, "a replacement must not inherit a decode failure");
+                    let image = image.expect("the replacement image transmitted");
+                    assert_ne!(Some(image), original_image, "the old image was reused");
+                    assert!(terminal.contains(&format!("\x1b_Ga=p,i={image},")));
+                    if let Some(old) = original_image {
+                        assert_eq!(
+                            terminal.matches(&format!("\x1b_Ga=d,d=I,i={old};")).count(),
+                            1,
+                            "release the old terminal image once",
+                        );
+                        assert!(!terminal.contains(&format!("\x1b_Ga=p,i={old},")));
+                    }
+                }
+            }
+            world.host().shutdown().await;
+        }
     }
 
     /// `image_entry_bytes` decodes the first image in a tool entry, and yields
