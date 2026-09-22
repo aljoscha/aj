@@ -1161,9 +1161,12 @@ or switching scope starts a user-paced read off the input and render loops.
 Local and HTTP scans publish coalesced provisional snapshots as files are read,
 ending with a complete bounded list or partial results with named failures.
 The overlay remains interactive while loading. Search covers the full prompt,
-and selection recalls into the editor without submitting. Background snapshots
-retain the selected prompt and its screen row while it survives. If the selection
-is offscreen, they retain the top visible prompt instead. Removed anchors fall
+and selection recalls into the editor without submitting. While the query is empty
+and the user has not edited, navigated, or scrolled, background snapshots select
+the youngest prompt at the top. After interaction, they retain the selected
+prompt and its screen row while it survives. Clearing the query does not re-enable
+automatic following. Replacing the scope starts a fresh list with the query retained.
+If the selection is offscreen, they retain the top visible prompt instead. Removed anchors fall
 back to the nearest remaining rank. Changing the query selects the best match
 again. Updates paint at most ten times per second, skipping unchanged
 snapshots without delaying the first results.

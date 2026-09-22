@@ -20355,8 +20355,11 @@ mod tests {
             host: "unavailable".to_string(),
             message: "read failed".to_string(),
         });
+        let mut untouched = history_value(&["early-newest"]);
+        untouched.prompts.extend(initial.prompts.clone());
+        untouched.incomplete = initial.incomplete.clone();
         let mut later = history_value(&["newest-arrival"]);
-        later.prompts.extend(initial.prompts.clone());
+        later.prompts.extend(untouched.prompts.clone());
         later.incomplete = initial.incomplete.clone();
         let observed = Rc::clone(&shell);
         let (exit, recalled) = drive_until(&mut world, &shell, move |mut writer| async move {
@@ -20376,7 +20379,19 @@ mod tests {
             })
             .await
             .expect("first snapshot visible");
-            for _ in 0..5 {
+            peer.chunks
+                .send(history_event("snapshot", &untouched))
+                .await
+                .unwrap();
+            poll_for(|| {
+                top_overlay_rows(&observed)
+                    .iter()
+                    .any(|row| row.contains("early-newest"))
+                    .then_some(())
+            })
+            .await
+            .expect("untouched history follows the newest arrival");
+            for _ in 0..6 {
                 writer.write_all(b"\x1b[B").unwrap();
             }
             let (before, row) = poll_for(|| {

@@ -276,6 +276,9 @@ struct SelectState {
     visible: Vec<(usize, u32)>,
     /// The current filter text, mirrored from the filter field on change.
     query: String,
+    /// Background snapshots may follow the first result only before the user
+    /// edits, navigates, or scrolls. Clearing a query does not undo interaction.
+    interacted: bool,
     /// The optional narrowing sigil ([`FilterableSelect::set_scope_sigil`]).
     scope_sigil: Option<char>,
     matcher: FuzzyMatcher,
@@ -780,6 +783,7 @@ impl FilterableSelect {
             visible: Vec::new(),
             items,
             query: String::new(),
+            interacted: false,
             scope_sigil: None,
             matcher: FuzzyMatcher::new(),
             literal_search: false,
@@ -827,6 +831,7 @@ impl FilterableSelect {
                 // mid-string change) may add matches, so rescore everything.
                 let is_append = text.starts_with(&state.query) && text.len() > state.query.len();
                 state.query = text.to_string();
+                state.interacted = true;
                 // Quote delimiters are syntax in literal search. Keep its
                 // edits outside the fuzzy-token monotonicity assumption.
                 if is_append && !state.literal_search {
@@ -917,12 +922,15 @@ impl FilterableSelect {
     pub fn set_items(&self, items: Vec<SelectItem>) {
         let mut state = self.state.borrow_mut();
         state.items = items;
+        state.interacted = false;
         full_filter(&mut state, &mut self.list.borrow_mut());
     }
 
-    /// Replace a ranked snapshot, retaining the selected row and its screen
-    /// position while it survives. When the selection is offscreen, retain the
-    /// top visible row instead. Removed anchors fall back to the nearest rank.
+    /// Replace a ranked snapshot. An untouched, empty query follows the first
+    /// result. After editing, navigation, or scrolling, retain the selected row
+    /// and its screen position while it survives. When the selection is offscreen,
+    /// retain the top visible row instead. Removed anchors fall back to the
+    /// nearest rank.
     /// Callers must supply unique, stable filter keys. Query edits and
     /// `set_items` explicitly reset selection to the best result.
     pub fn set_ranked_items(&self, items: Vec<SelectItem>) {
@@ -931,6 +939,11 @@ impl FilterableSelect {
             return;
         }
         let mut list = self.list.borrow_mut();
+        if !state.interacted && state.query.is_empty() {
+            state.items = items;
+            full_filter(&mut state, &mut list);
+            return;
+        }
         let key_at = |pos: u32| {
             state
                 .visible
@@ -1026,6 +1039,7 @@ impl FilterableSelect {
                 .position(|&(i, _)| pred(&state.items[i]))
         };
         if let Some(pos) = pos {
+            self.state.borrow_mut().interacted = true;
             self.list
                 .borrow_mut()
                 .jump_to_item(u32::try_from(pos).expect("pos fits u32"));
@@ -1207,6 +1221,14 @@ impl Widget for FilterableSelect {
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        if let Event::Mouse(mouse) = event
+            && matches!(
+                mouse.button,
+                crate::mouse::Button::WheelUp | crate::mouse::Button::WheelDown
+            )
+        {
+            self.state.borrow_mut().interacted = true;
+        }
         // Focus sits on the filter field, so the selector chords are
         // intercepted here in the capturing phase, before the field's
         // at-target handling (Enter would otherwise clear the field, and
@@ -1237,11 +1259,13 @@ impl Widget for FilterableSelect {
         if key.matches(Key::DOWN, Modifiers::empty())
             || key.matches(u32::from('n'), Modifiers::CTRL)
         {
+            self.state.borrow_mut().interacted = true;
             self.list.borrow_mut().next_item(ctx);
             return;
         }
         if key.matches(Key::UP, Modifiers::empty()) || key.matches(u32::from('p'), Modifiers::CTRL)
         {
+            self.state.borrow_mut().interacted = true;
             self.list.borrow_mut().prev_item(ctx);
         }
     }
@@ -2089,10 +2113,12 @@ mod tests {
     }
 
     #[test]
-    fn ranked_snapshots_retain_selection_and_query_edits_choose_best() {
+    fn ranked_snapshots_follow_the_top_until_interaction() {
         let mut select = FilterableSelect::new(items(&["old"]), SelectStyles::default());
         select.set_ranked_items(items(&["new", "old"]));
-        assert_eq!(select.selected().unwrap().filter_key, "old");
+        assert_eq!(select.selected().unwrap().filter_key, "new");
+        assert_eq!(select.list.borrow().scroll_top(), 0);
+        // An explicit choice to remain at the top still stops following.
         send(&mut select, &key(Key::UP, Modifiers::empty()));
         select.set_ranked_items(items(&["newest", "new", "old"]));
         assert_eq!(select.selected().unwrap().filter_key, "new");
@@ -2106,6 +2132,57 @@ mod tests {
         assert!(select.selected().is_none());
         select.set_ranked_items(items(&["only"]));
         assert_eq!(select.selected().unwrap().filter_key, "only");
+    }
+
+    #[test]
+    fn query_edits_stop_following_even_without_navigation_and_after_clearing() {
+        let mut select = FilterableSelect::new(items(&["old"]), SelectStyles::default());
+        send(&mut select, &typed('o'));
+        select.set_ranked_items(items(&["other", "old"]));
+        assert_eq!(select.selected().unwrap().filter_key, "old");
+        send(&mut select, &key(Key::BACKSPACE, Modifiers::empty()));
+        assert!(select.query().is_empty());
+        select.set_ranked_items(items(&["newest", "other", "old"]));
+        assert_eq!(select.selected().unwrap().filter_key, "other");
+
+        // Replacing the source starts fresh, unlike another background snapshot.
+        select.set_items(items(&["old"]));
+        select.set_ranked_items(items(&["new", "old"]));
+        assert_eq!(select.selected().unwrap().filter_key, "new");
+        select.select_matching(|item| item.filter_key == "old");
+        select.set_ranked_items(items(&["newest", "new", "old"]));
+        assert_eq!(select.selected().unwrap().filter_key, "old");
+    }
+
+    #[test]
+    fn scrolling_without_selection_stops_following_and_keeps_queued_motion() {
+        let mut select = FilterableSelect::new(
+            items(&["a", "b", "c", "d", "e", "f"]),
+            SelectStyles::default(),
+        );
+        let ctx = draw_ctx(30, 5);
+        select.draw(&ctx);
+        let wheel = Event::Mouse(crate::mouse::Mouse {
+            col: 3,
+            row: 3,
+            xoffset: 0,
+            yoffset: 0,
+            button: crate::mouse::Button::WheelDown,
+            mods: crate::mouse::Modifiers::default(),
+            kind: crate::mouse::Type::Press,
+        });
+        let mut event_ctx = EventContext::new();
+        select.capture_event(&mut event_ctx, &wheel);
+        select
+            .list
+            .borrow_mut()
+            .handle_event(&mut event_ctx, &wheel);
+        // The snapshot arrives before the queued wheel movement is drawn.
+        select.set_ranked_items(items(&["new", "a", "b", "c", "d", "e", "f"]));
+        select.draw(&ctx);
+        assert_eq!(select.selected().unwrap().filter_key, "a");
+        let top = usize::try_from(select.list.borrow().scroll_top()).unwrap();
+        assert_eq!(select.visible_labels()[top], "b");
     }
 
     #[test]
