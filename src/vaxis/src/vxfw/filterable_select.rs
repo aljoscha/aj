@@ -15,7 +15,9 @@
 //! ancestor on the focus path, so it intercepts the selector chords in its
 //! capturing phase before the field sees them: Escape cancels, Enter (or
 //! Ctrl+J) confirms, and Up/Down/Ctrl+P/Ctrl+N are forwarded to the list's
-//! cursor. Everything else falls through to the field at-target.
+//! cursor. Home/End select the first/last filtered row, and PageUp/PageDown
+//! move by the visible list height without wrapping. Ctrl+A/Ctrl+E still move
+//! within the query. Everything else falls through to the field at-target.
 //!
 //! # Selection band
 //!
@@ -37,8 +39,8 @@ use crate::fuzzy::FuzzyMatcher;
 use crate::key::{Key, Modifiers};
 use crate::vxfw::{
     Builder, DrawContext, Event, EventContext, ListView, MaxSize, PromptInput, RelativePoint,
-    RichText, ScrollBars, Size, Source, SubSurface, Surface, TextAlign, TextSpan, Widget,
-    WidgetRef, WidthBasis,
+    RichText, ScrollBars, ScrollableView, Size, Source, SubSurface, Surface, TextAlign, TextSpan,
+    Widget, WidgetRef, WidthBasis,
 };
 
 /// The marker drawn before a filter overlay's query input, so the input reads
@@ -1278,8 +1280,8 @@ impl Widget for FilterableSelect {
         }
         // Focus sits on the filter field, so the selector chords are
         // intercepted here in the capturing phase, before the field's
-        // at-target handling (Enter would otherwise clear the field, and
-        // the field has no Escape or Up/Down bindings to shadow).
+        // at-target handling. Home/End navigate the list rather than moving
+        // within the query, whose start/end motions remain on Ctrl+A/Ctrl+E.
         let Event::KeyPress(key) = event else {
             return;
         };
@@ -1314,6 +1316,40 @@ impl Widget for FilterableSelect {
         {
             self.state.borrow_mut().interacted = true;
             self.list.borrow_mut().prev_item(ctx);
+            return;
+        }
+        if let Some(navigation) = [Key::HOME, Key::END, Key::PAGE_UP, Key::PAGE_DOWN]
+            .into_iter()
+            .find(|code| key.matches(*code, Modifiers::empty()))
+        {
+            let mut state = self.state.borrow_mut();
+            state.interacted = true;
+            let last = u32::try_from(state.visible.len())
+                .expect("row count fits u32")
+                .saturating_sub(1);
+            let mut list = self.list.borrow_mut();
+            match navigation {
+                Key::HOME => list.jump_to_item(0),
+                Key::END => list.jump_to_item(last),
+                _ => {
+                    // Picker rows are one line tall. Move both selection and
+                    // viewport by a page so the highlight keeps its screen row
+                    // except where the list bounds require clamping.
+                    let page = u32::from(list.viewport_height().unwrap_or(1).max(1));
+                    let advance = |index: u32| {
+                        if navigation == Key::PAGE_DOWN {
+                            index.saturating_add(page).min(last)
+                        } else {
+                            index.saturating_sub(page)
+                        }
+                    };
+                    list.cursor = advance(list.cursor);
+                    let top = advance(list.scroll_top());
+                    list.set_scroll_top(top);
+                    list.ensure_scroll();
+                }
+            }
+            ctx.consume_and_redraw();
         }
     }
 

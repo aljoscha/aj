@@ -14,7 +14,7 @@ use vaxis::vxfw::{
     to_widget_ref,
 };
 
-struct PickerRoot(Rc<RefCell<FilterableSelect>>);
+struct PickerRoot(Rc<RefCell<FilterableSelect>>, u16);
 
 impl Widget for PickerRoot {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
@@ -27,7 +27,7 @@ impl Widget for PickerRoot {
                     Size::default(),
                     MaxSize {
                         width: Some(24),
-                        height: Some(7),
+                        height: Some(self.1),
                     },
                 ),
             ),
@@ -57,6 +57,10 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_height(7).await
+    }
+
+    async fn with_height(height: u16) -> Self {
         let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
         nix::unistd::write(&write_fd, b"\x1b[?c").unwrap();
         let select = Rc::new(RefCell::new(FilterableSelect::new(
@@ -70,7 +74,10 @@ impl Harness {
         select.borrow_mut().on_confirm = Some(Box::new(move |_, item| {
             results.borrow_mut().push(item.filter_key.clone());
         }));
-        let root = to_widget_ref(Rc::new(RefCell::new(PickerRoot(Rc::clone(&select)))));
+        let root = to_widget_ref(Rc::new(RefCell::new(PickerRoot(
+            Rc::clone(&select),
+            height,
+        ))));
         let mut app = AsyncApp::new(
             Vaxis::new(VaxisOptions::default()),
             Box::new(TestTty::new()),
@@ -192,4 +199,107 @@ async fn clicks_ignore_rows_replaced_since_the_last_paint() {
     h.draw();
     h.click(6, 8);
     assert_eq!(h.selected(), "y");
+}
+
+#[tokio::test]
+async fn paging_uses_the_visible_height_and_preserves_the_highlights_screen_row() {
+    for height in [5, 7, 11] {
+        let mut h = Harness::with_height(height).await;
+        h.click(6, 8); // Second visible row.
+        for (key, expected) in [
+            (Key::PAGE_DOWN, format!("row{:02}", height - 1)),
+            (Key::PAGE_UP, "row01".to_string()),
+        ] {
+            h.key(key, Modifiers::empty(), None);
+            assert_eq!(h.selected(), expected);
+            h.click(6, 8);
+            assert_eq!(
+                h.selected(),
+                expected,
+                "the page kept the highlight on its screen row"
+            );
+        }
+        h.key(Key::END, Modifiers::empty(), None);
+        assert_eq!(h.selected(), "row19");
+        h.click(i16::try_from(height + 2).unwrap(), 8);
+        assert_eq!(
+            h.selected(),
+            "row19",
+            "End reveals the last row at the viewport bottom"
+        );
+        h.key(Key::HOME, Modifiers::empty(), None);
+        assert_eq!(h.selected(), "row00");
+        h.click(5, 8);
+        assert_eq!(
+            h.selected(),
+            "row00",
+            "Home reveals the first row at the viewport top"
+        );
+        assert!(h.confirmed.borrow().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn navigation_uses_filtered_order_and_clamps_without_wrapping_or_editing_the_query() {
+    let mut h = Harness::new().await;
+    h.key(u32::from('1'), Modifiers::empty(), Some("1"));
+    for (key, expected) in [
+        (Key::END, "row19"),
+        (Key::HOME, "row01"),
+        (Key::PAGE_DOWN, "row14"),
+        (Key::PAGE_DOWN, "row19"),
+        (Key::PAGE_DOWN, "row19"),
+        (Key::PAGE_UP, "row14"),
+        (Key::PAGE_UP, "row01"),
+        (Key::PAGE_UP, "row01"),
+    ] {
+        h.key(key, Modifiers::empty(), None);
+        assert_eq!(h.selected(), expected);
+        assert_eq!(h.select.borrow().query(), "1");
+    }
+    h.key(u32::from('x'), Modifiers::empty(), Some("x"));
+    for key in [Key::HOME, Key::END, Key::PAGE_UP, Key::PAGE_DOWN] {
+        h.key(key, Modifiers::empty(), None);
+        assert!(h.select.borrow().selected().is_none());
+        assert_eq!(h.select.borrow().query(), "1x");
+    }
+    assert!(h.confirmed.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn navigation_stops_background_following_even_at_a_boundary() {
+    for key in [Key::HOME, Key::END, Key::PAGE_UP, Key::PAGE_DOWN] {
+        let mut h = Harness::new().await;
+        h.key(key, Modifiers::empty(), None);
+        let selected = h.selected();
+        let mut incoming = vec![SelectItem::new("newest", "newest")];
+        incoming.extend(rows());
+        h.select.borrow().set_ranked_items(incoming);
+        h.draw();
+        assert_eq!(h.selected(), selected);
+    }
+}
+
+#[tokio::test]
+async fn home_and_end_navigate_the_list_while_ctrl_a_and_e_edit_the_query() {
+    let mut h = Harness::new().await;
+    h.key(u32::from('1'), Modifiers::empty(), Some("1"));
+    h.key(Key::HOME, Modifiers::empty(), None);
+    h.key(u32::from('0'), Modifiers::empty(), Some("0"));
+    assert_eq!(
+        h.select.borrow().query(),
+        "10",
+        "Home did not move the text cursor"
+    );
+    h.key(u32::from('a'), Modifiers::CTRL, None);
+    h.key(Key::END, Modifiers::empty(), None);
+    h.key(u32::from('x'), Modifiers::empty(), Some("x"));
+    assert_eq!(
+        h.select.borrow().query(),
+        "x10",
+        "End did not move the text cursor"
+    );
+    h.key(u32::from('e'), Modifiers::CTRL, None);
+    h.key(u32::from('y'), Modifiers::empty(), Some("y"));
+    assert_eq!(h.select.borrow().query(), "x10y");
 }
