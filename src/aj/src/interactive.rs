@@ -25185,7 +25185,7 @@ mod tests {
         app.handle_input(left_mouse_at(new_row, separator, Type::Press));
         // Cross both panes and both size limits. Every repaint changes the hit
         // tree, so retaining the gesture cannot depend on the initial target.
-        for (col, width) in [(39, 40), (79, 60), (0, aj_conf::MIN_SIDEBAR_COLS), (34, 35)] {
+        for (col, width) in [(39, 40), (79, 50), (0, aj_conf::MIN_SIDEBAR_COLS), (34, 35)] {
             app.handle_input(left_mouse_at(3, col, Type::Drag));
             sync_sidebar(&world, &shell);
             app.render(&root).expect("drag");

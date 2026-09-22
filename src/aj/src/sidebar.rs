@@ -90,7 +90,7 @@ pub(crate) const SIDEBAR_COLS: u16 = aj_conf::DEFAULT_SIDEBAR_COLS;
 
 /// Columns a transcript needs beside the strip to be worth reading: about a
 /// short line of prose.
-const MIN_TRANSCRIPT_COLS: u16 = 20;
+const MIN_TRANSCRIPT_COLS: u16 = 30;
 
 /// Terminal width below which the strip holds itself back.
 ///

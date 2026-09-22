@@ -528,9 +528,9 @@ fn toml_value_to_item(value: &toml::Value) -> toml_edit::Item {
 /// wants.
 pub const DEFAULT_SIDEBAR_COLS: u16 = 28;
 
-/// Columns below which the strip would be chrome with no label beside
-/// it: five go to the chrome whatever the width.
-pub const MIN_SIDEBAR_COLS: u16 = 7;
+/// Minimum sidebar width, leaving seven label columns beside its five
+/// columns of chrome.
+pub const MIN_SIDEBAR_COLS: u16 = 12;
 
 /// Columns above which a strip is not a strip.
 ///
@@ -1047,7 +1047,7 @@ impl Config {
         },
         ConfigOption {
             name: "sidebar_cols",
-            description: "Columns the session sidebar takes when shown (7–200).",
+            description: "Columns the session sidebar takes when shown (12–200).",
             kind: ValueKind::Number,
             apply_toml_fn: |v, c| {
                 // Accept a TOML integer or float (so both `28` and
@@ -2368,7 +2368,7 @@ keybindings = "nope"
     }
 
     /// The strip's width is a config value with a floor and a ceiling: below
-    /// the floor the columns are all chrome, above the ceiling the strip is
+    /// the floor the labels are too cramped, above the ceiling the strip is
     /// no strip and, worse, would silently never show.
     #[test]
     fn sidebar_cols_parses_and_holds_its_range() {
@@ -2393,7 +2393,7 @@ keybindings = "nope"
 
         // Both ends of the range are refused, and so is a negative count,
         // which `u16` cannot even hold.
-        for refused in [0, 6, 201, -1, i64::from(u16::MAX) + 1] {
+        for refused in [0, 11, 201, -1, i64::from(u16::MAX) + 1] {
             let mut config = Config::default();
             let Err(err) = opt.apply_toml(toml::Value::Integer(refused), &mut config) else {
                 panic!("{refused} columns was accepted");
@@ -2407,6 +2407,10 @@ keybindings = "nope"
                 "a refused width was written anyway",
             );
         }
+
+        opt.apply_toml(toml::Value::Integer(12), &mut config)
+            .expect("the minimum width is accepted");
+        assert_eq!(config.sidebar_cols, 12);
 
         // A width that is not a number at all is refused rather than read
         // for its digits.
