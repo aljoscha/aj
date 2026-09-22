@@ -349,7 +349,15 @@ impl Control {
     ) -> Result<aj_wire::PromptHistory, ControlError> {
         match self {
             Self::Local(local) => Ok(local.host.prompt_history(session, updates).await?),
-            Self::Remote(remote) => Ok(remote.client.prompt_history(session).await?),
+            Self::Remote(remote) => Ok(match updates {
+                Some(updates) => {
+                    remote
+                        .client
+                        .stream_prompt_history(session, updates)
+                        .await?
+                }
+                None => remote.client.prompt_history(session).await?,
+            }),
         }
     }
 
@@ -987,6 +995,16 @@ pub(crate) mod history_tests {
                 .await
                 .unwrap();
             assert_eq!(left, right);
+            for control in [&local, &remote] {
+                let (updates, _rx) = tokio::sync::watch::channel(aj_wire::PromptHistory::default());
+                let streamed = bounded(
+                    "streamed history",
+                    control.prompt_history(session, Some(updates)),
+                )
+                .await
+                .unwrap();
+                assert_eq!(streamed, right);
+            }
             assert!(right.incomplete.is_empty());
             if session.is_some() {
                 assert_eq!(

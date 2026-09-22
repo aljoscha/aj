@@ -934,7 +934,7 @@ impl FilterableSelect {
         let key_at = |pos: u32| {
             state
                 .visible
-                .get(pos as usize)
+                .get(usize::try_from(pos).expect("position fits usize"))
                 .map(|&(i, _)| state.items[i].filter_key.clone())
         };
         let selected = key_at(list.cursor);
@@ -982,8 +982,8 @@ impl FilterableSelect {
     /// row it was on and the scroll where it was. Used when a row's text
     /// arrives after the list is on screen: the row set is unchanged, so
     /// nothing the user is looking at should move. Under a live query the
-    /// changed row can move in the ranking, and the highlight follows its
-    /// row, scrolling only if that row left the viewport. Out-of-range
+    /// changed row can move in the ranking, and a visible highlight retains
+    /// its screen row whenever the list bounds allow it. Out-of-range
     /// indices are ignored.
     pub fn update_item(&self, index: usize, item: SelectItem) {
         let mut state = self.state.borrow_mut();
@@ -991,10 +991,13 @@ impl FilterableSelect {
             return;
         }
         let mut list = self.list.borrow_mut();
-        let highlighted = state.visible.get(list.cursor as usize).map(|&(i, _)| i);
+        let highlighted = state
+            .visible
+            .get(usize::try_from(list.cursor).expect("cursor fits usize"))
+            .map(|&(i, _)| i);
         let top = state
             .visible
-            .get(list.scroll_top() as usize)
+            .get(usize::try_from(list.scroll_top()).expect("top fits usize"))
             .map(|&(i, _)| i);
         state.items[index] = item;
         let all = (0..state.items.len()).collect();
@@ -2134,7 +2137,9 @@ mod tests {
         // Wheel input can leave the keyboard selection outside the viewport.
         select.list.borrow_mut().scroll_lines(15);
         select.draw(&ctx);
-        let top = select.visible_labels()[select.list.borrow().scroll_top() as usize].clone();
+        let top = select.visible_labels()
+            [usize::try_from(select.list.borrow().scroll_top()).expect("top fits usize")]
+        .clone();
         assert!(select.list.borrow().cursor < select.list.borrow().scroll_top());
         // Another wheel event is queued but has not drawn when the batch lands.
         select.list.borrow_mut().scroll_lines(2);
@@ -2142,7 +2147,7 @@ mod tests {
         incoming.extend(rows());
         select.set_ranked_items(incoming);
         select.draw(&ctx);
-        let new_top = select.list.borrow().scroll_top() as usize;
+        let new_top = usize::try_from(select.list.borrow().scroll_top()).expect("top fits usize");
         assert_eq!(select.visible_labels()[new_top - 2], top);
         assert_eq!(select.selected().unwrap().filter_key, "row20");
 

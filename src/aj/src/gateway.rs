@@ -317,6 +317,7 @@ impl Gateway {
             protocol: PROTOCOL_VERSION,
             capabilities: vec![
                 aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
+                aj_wire::PROMPT_HISTORY_STREAM_CAPABILITY.to_string(),
                 aj_wire::SESSION_PREVIEWS_CAPABILITY.to_string(),
             ],
             app_version: env!("CARGO_PKG_VERSION").to_string(),

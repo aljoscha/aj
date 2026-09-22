@@ -887,6 +887,7 @@ impl SessionHost {
                 aj_wire::PROVIDER_USAGE_RESET_CAPABILITY.to_string(),
                 aj_wire::SESSION_PREVIEWS_CAPABILITY.to_string(),
                 aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
+                aj_wire::PROMPT_HISTORY_STREAM_CAPABILITY.to_string(),
                 aj_wire::SESSION_ENV_CAPABILITY.to_string(),
                 aj_wire::SESSION_ACCOUNTS_CAPABILITY.to_string(),
                 aj_wire::CREDENTIALS_CAPABILITY.to_string(),
@@ -1474,7 +1475,7 @@ impl SessionHost {
 
     /// Read submitted prompts without materializing sessions. `Some(session)`
     /// selects its workspace, `None` selects every workspace in this host's
-    /// sessions store. Optional snapshots let a local reader paint during the
+    /// sessions store. Optional snapshots let a reader paint during the
     /// scan. Dropping the future cancels the blocking reader.
     pub async fn prompt_history(
         &self,

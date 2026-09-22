@@ -19,6 +19,7 @@
 #![allow(dead_code)]
 
 mod client;
+pub(crate) mod history;
 mod identity;
 mod server;
 

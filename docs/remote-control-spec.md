@@ -663,6 +663,19 @@ side's limitation. Neither side's values fall back to the other's.
   A gateway keeps healthy results when another host fails or lacks the endpoint
   and names failures in `incomplete`. Reads do not materialize sessions or alter
   their state. Capability `prompt_history` (section 5.10).
+- `GET /v1/sessions/{id}/prompt-history/stream` and
+  `GET /v1/prompt-history/stream`: finite SSE reads with the same scope and
+  ranking as the JSON resources. Named `snapshot` events carry complete
+  replacement `PromptHistory` values, coalesced as files finish scanning.
+  A terminal `complete` event carries the final value, even when empty or
+  unchanged. A terminal `error` event carries `{code, message}` and leaves
+  earlier results available. EOF without either terminal event is a failed
+  read. There is no reconnect or replay. Dropping the body cancels the read.
+  Gateways forward Workspace bodies without buffering. All-scope reads merge
+  each host's latest snapshot as it arrives, ordered by host label and identity
+  to break equal-time ties independently of arrival order. Slow hosts do not
+  block healthy results. Failed or timed-out hosts retain their last available
+  prompts and contribute a named failure. Capability `prompt_history_stream`.
 - `GET /v1/sessions/{id}/env`: a JSON object mapping strings to strings,
   the full environment map selected by the active branch. Values are
   unredacted on the trusted control port. Export-only redaction does not
@@ -823,6 +836,7 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `session_info` | `GET /v1/sessions/{id}/info` | hosts |
   | `session_previews` | `GET /v1/previews` | hosts and gateways |
   | `prompt_history` | Workspace and All prompt-history reads | hosts and gateways |
+  | `prompt_history_stream` | finite SSE Workspace and All prompt-history reads | hosts and gateways |
   | `credentials` | `GET` and `POST /v1/sessions/{id}/credentials` (section 5.12) | hosts |
   | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
   | `host_config` | `GET` and `POST /v1/sessions/{id}/config`, `GET /v1/sessions/{id}/models`, and `settings.persist` | hosts |
@@ -1144,14 +1158,14 @@ automatically.
 
 Prompt-history search uses Control in local, direct, and gateway modes. Opening
 or switching scope starts a user-paced read off the input and render loops.
-Local scans publish coalesced provisional snapshots as files are read. HTTP
-reads return a complete bounded list or partial results with named failures.
+Local and HTTP scans publish coalesced provisional snapshots as files are read,
+ending with a complete bounded list or partial results with named failures.
 The overlay remains interactive while loading. Search covers the full prompt,
 and selection recalls into the editor without submitting. Background snapshots
 retain the selected prompt and its screen row while it survives. If the selection
 is offscreen, they retain the top visible prompt instead. Removed anchors fall
 back to the nearest remaining rank. Changing the query selects the best match
-again. Local updates paint at most ten times per second, skipping unchanged
+again. Updates paint at most ten times per second, skipping unchanged
 snapshots without delaying the first results.
 Closing or changing scope cancels the outstanding client read. No history cache
 or journal is persisted, and no history read belongs to directory or sidebar polling.

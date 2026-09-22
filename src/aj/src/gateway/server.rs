@@ -186,6 +186,7 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/hosts/{id}", delete(withdraw))
         .route("/v1/sessions", get(sessions).post(create_session))
         .route("/v1/prompt-history", get(prompt_history))
+        .route("/v1/prompt-history/stream", get(prompt_history_stream))
         .route("/v1/previews", get(session_previews))
         // Everything about one session goes to the host that owns it, whether or
         // not this build knows the route. `{id}` on its own is here for the same
@@ -282,13 +283,27 @@ async fn session_previews(
 }
 
 async fn prompt_history(State(state): State<Arc<ServerState>>) -> Json<aj_wire::PromptHistory> {
+    Json(read_prompt_history(state, None).await)
+}
+
+async fn prompt_history_stream(State(state): State<Arc<ServerState>>) -> Response {
+    crate::remote::history::response(crate::remote::history::snapshots(
+        move |updates| async move { Ok(read_prompt_history(state, Some(updates)).await) },
+    ))
+}
+
+async fn read_prompt_history(
+    state: Arc<ServerState>,
+    updates: Option<tokio::sync::watch::Sender<aj_wire::PromptHistory>>,
+) -> aj_wire::PromptHistory {
     use futures::StreamExt;
-    let hosts = state.gateway.hosts().hosts;
-    let concurrency = hosts.len().max(1);
     let directory = state.gateway.sessions();
-    let mut reads = futures::stream::iter(hosts)
+    let mut hosts = state
+        .gateway
+        .hosts()
+        .hosts
+        .into_iter()
         .map(|host| {
-            let timeout = state.gateway.tuning().upstream_timeout;
             let label = directory
                 .hosts
                 .iter()
@@ -296,8 +311,18 @@ async fn prompt_history(State(state): State<Arc<ServerState>>) -> Json<aj_wire::
                 .and_then(|row| row.name.clone())
                 .or_else(|| host.id.clone())
                 .unwrap_or_else(|| crate::remote::endpoint_label(&host.address));
-            // Enrollment alone is not authority to dial. Use the same adopted,
-            // connected target selection as other host-directed operations.
+            (label, host)
+        })
+        .collect::<Vec<_>>();
+    // Snapshot replacement must not make equal-time attribution depend on which
+    // host answered first. Identity also breaks ties between identical labels.
+    hosts.sort_by(|(a, ah), (b, bh)| (a, &ah.id).cmp(&(b, &bh.id)));
+    let mut latest = vec![aj_wire::PromptHistory::default(); hosts.len()];
+    let streams = hosts
+        .into_iter()
+        .enumerate()
+        .map(|(index, (label, host))| {
+            let timeout = state.gateway.tuning().upstream_timeout;
             let target = host
                 .id
                 .as_deref()
@@ -308,12 +333,18 @@ async fn prompt_history(State(state): State<Arc<ServerState>>) -> Json<aj_wire::
                         .create_target(Some(id))
                         .map_err(|error| error.to_string())
                 });
-            async move {
+            let streaming = updates.is_some();
+            crate::remote::history::snapshots(move |updates| async move {
                 let result = async {
                     let target = target?;
                     let client = crate::remote::RemoteClient::new(target.address.url())
                         .map_err(|e| e.to_string())?;
-                    client.prompt_history(None).await.map_err(|e| {
+                    let result = if streaming {
+                        client.stream_prompt_history(None, updates).await
+                    } else {
+                        client.prompt_history(None).await
+                    };
+                    result.map_err(|e| {
                         if e.code() == Some("unknown_endpoint") {
                             "prompt history is not supported by this host".to_string()
                         } else {
@@ -321,28 +352,46 @@ async fn prompt_history(State(state): State<Arc<ServerState>>) -> Json<aj_wire::
                         }
                     })
                 };
-                let result = tokio::time::timeout(timeout, result)
+                tokio::time::timeout(timeout, result)
                     .await
-                    .unwrap_or_else(|_| Err("prompt history read timed out".to_string()));
-                (label, result)
-            }
+                    .unwrap_or_else(|_| Err("prompt history read timed out".to_string()))
+                    .map_err(|message| aj_wire::ErrorResponse {
+                        code: "history_read".to_string(),
+                        message,
+                    })
+            })
+            .map(move |result| (index, label.clone(), result))
+            .boxed()
         })
-        .buffer_unordered(concurrency)
-        .collect::<Vec<_>>()
-        .await;
-    // Merge in host-label order, so equal timestamps across hosts resolve the
-    // same way whichever host answered first.
-    reads.sort_by(|a, b| a.0.cmp(&b.0));
+        .collect::<Vec<_>>();
+    let mut reads = futures::stream::select_all(streams);
     let mut merged = aj_wire::PromptHistory::default();
-    for (host, result) in reads {
+    while let Some((index, host, result)) = reads.next().await {
         match result {
-            Ok(history) => aj_app::prompt_history::merge(&mut merged, history),
-            Err(message) => merged
-                .incomplete
-                .push(aj_wire::HostFailure { host, message }),
+            Ok((history, _)) => latest[index] = history,
+            Err((mut history, error)) => {
+                history.incomplete.push(aj_wire::HostFailure {
+                    host,
+                    message: error.message,
+                });
+                latest[index] = history;
+            }
+        }
+        merged = aj_wire::PromptHistory::default();
+        for history in &latest {
+            aj_app::prompt_history::merge(&mut merged, history.clone());
+        }
+        if let Some(updates) = &updates {
+            updates.send_if_modified(|current| {
+                if *current == merged {
+                    return false;
+                }
+                *current = merged.clone();
+                true
+            });
         }
     }
-    Json(merged)
+    merged
 }
 
 /// Reject a peer the gate does not accept, before the request is routed.
@@ -638,7 +687,7 @@ async fn forward(
     let method = request.method().clone();
     let content_type = forwarded_content_type(&request);
     let body = read_body(request).await?;
-    let mut answer = send(
+    let response = send_head(
         state.gateway.http(),
         Upstream {
             method,
@@ -649,6 +698,30 @@ async fn forward(
         &route.address,
     )
     .await?;
+    // Successful streams belong to the response body. Buffering here would
+    // hide progress and keep upstream work alive after the client closes.
+    if response.status().is_success()
+        && response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(';').next() == Some("text/event-stream"))
+    {
+        use futures::StreamExt;
+        let status = response.status();
+        let content_type = response.headers()[header::CONTENT_TYPE].clone();
+        let mut answer = Response::new(AxumBody::from_stream(
+            response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(reqwest::Error::without_url)),
+        ));
+        *answer.status_mut() = status;
+        answer
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, content_type);
+        return Ok(answer);
+    }
+    let mut answer = read_answer(response, &route.address).await?;
     // A refusal the host wrote names its session in the host's own vocabulary,
     // which no client of this gateway can address.
     if !answer.status.is_success()
@@ -796,6 +869,14 @@ async fn send(
     upstream: Upstream,
     address: &HostAddress,
 ) -> Result<Answer, ApiError> {
+    read_answer(send_head(http, upstream, address).await?, address).await
+}
+
+async fn send_head(
+    http: &reqwest::Client,
+    upstream: Upstream,
+    address: &HostAddress,
+) -> Result<reqwest::Response, ApiError> {
     let Upstream {
         method,
         url,
@@ -815,6 +896,13 @@ async fn send(
             ));
         }
     };
+    Ok(response)
+}
+
+async fn read_answer(
+    response: reqwest::Response,
+    address: &HostAddress,
+) -> Result<Answer, ApiError> {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let body = match response.bytes().await {

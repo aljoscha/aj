@@ -7,8 +7,8 @@
 //! first). Esc cancels.
 //!
 //! The scan is off the drive loop: the overlay opens showing a loading
-//! placeholder. Local scans publish provisional ranked snapshots while remote
-//! reads return through Control, without blocking input or drawing. The
+//! placeholder. Local and remote scans publish provisional ranked snapshots
+//! through Control, without blocking input or drawing. The
 //! overlay-local `Ctrl+T` ([`ACTION_HISTORY_TOGGLE_SCOPE`]) flips the
 //! scope between the current workspace and all workspaces, re-parking a
 //! fetch for the host.

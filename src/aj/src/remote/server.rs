@@ -190,6 +190,11 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions", get(sessions).post(create_session))
         .route("/v1/prompt-history", get(all_prompt_history))
         .route("/v1/sessions/{id}/prompt-history", get(prompt_history))
+        .route("/v1/prompt-history/stream", get(all_prompt_history_stream))
+        .route(
+            "/v1/sessions/{id}/prompt-history/stream",
+            get(prompt_history_stream),
+        )
         .route("/v1/sessions/{id}/tasks", get(tasks))
         .route("/v1/sessions/{id}/tasks/{task_id}", get(task))
         .route("/v1/sessions/{id}/tasks/{task_id}/kill", post(kill_task))
@@ -384,6 +389,30 @@ async fn session_previews(
 
 async fn all_prompt_history(State(state): State<Arc<ServerState>>) -> Result<Response, ApiError> {
     Ok(Json(state.host.prompt_history(None, None).await?).into_response())
+}
+
+async fn all_prompt_history_stream(State(state): State<Arc<ServerState>>) -> Response {
+    history_stream(state, None)
+}
+
+async fn prompt_history_stream(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+) -> Response {
+    history_stream(state, Some(session))
+}
+
+fn history_stream(state: Arc<ServerState>, session: Option<String>) -> Response {
+    super::history::response(super::history::snapshots(move |updates| async move {
+        state
+            .host
+            .prompt_history(session.as_deref(), Some(updates))
+            .await
+            .map_err(|err| ErrorResponse {
+                code: err.code().to_string(),
+                message: err.to_string(),
+            })
+    }))
 }
 
 async fn prompt_history(

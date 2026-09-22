@@ -35,8 +35,8 @@ use tempfile::TempDir;
 use super::*;
 use crate::gateway::naming::SessionAddress;
 use crate::remote::tests::{
-    FakeWhois, HostHandles, addr, bounded, canned_server, counted_protocol_peer, scripted,
-    scripted_host,
+    FakeWhois, HostHandles, addr, bounded, canned_server, counted_protocol_peer, history_event,
+    history_peer, history_update, history_value, scripted, scripted_host,
 };
 use crate::remote::{IdentityGate, RemoteClient, RemoteCommand, RemoteEvents, RemoteServer};
 
@@ -2682,6 +2682,244 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
     assert_eq!(remembered_requests.load(Ordering::SeqCst), 0);
     remembered.shutdown().await;
     remembered_server.abort();
+}
+
+#[tokio::test]
+async fn prompt_history_stream_workspace_forwards_without_buffering_and_cancels_upstream() {
+    for cancel in [false, true] {
+        let mut peer = history_peer("owner", "owner").await;
+        let fixture = Fixture::over(
+            TempDir::new().unwrap(),
+            vec![HostAddress::parse(&peer.url).unwrap()],
+        )
+        .await;
+        fixture.row("owner:workspace").await;
+        let client = fixture.client.clone();
+        let (updates, mut observed) = tokio::sync::watch::channel(Default::default());
+        let read = tokio::spawn(async move {
+            client
+                .stream_prompt_history(Some("owner:workspace"), updates)
+                .await
+        });
+        assert_eq!(
+            bounded("workspace history request", peer.requests.recv())
+                .await
+                .unwrap(),
+            "/v1/sessions/workspace/prompt-history/stream"
+        );
+        let partial = history_value(&["workspace early"]);
+        peer.chunks
+            .send(history_event("snapshot", &partial))
+            .await
+            .unwrap();
+        history_update(&mut observed, |value| value == &partial).await;
+        assert!(
+            !read.is_finished(),
+            "the upstream body is explicitly blocked"
+        );
+        if cancel {
+            read.abort();
+            assert!(
+                bounded("cancel workspace history", read)
+                    .await
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+        } else {
+            let complete = history_value(&["workspace final", "workspace early"]);
+            peer.chunks
+                .send(history_event("complete", &complete))
+                .await
+                .unwrap();
+            assert_eq!(
+                bounded("workspace completion", read)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                complete
+            );
+        }
+        bounded("workspace upstream body dropped", peer.chunks.closed()).await;
+        fixture.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn prompt_history_stream_all_merges_latest_snapshots_in_label_then_id_order() {
+    // Enrollment, snapshot arrival, and completion order all oppose merge order.
+    let mut z = history_peer("first-id", "zulu").await;
+    let mut b = history_peer("b", "alpha").await;
+    let mut a = history_peer("a", "alpha").await;
+    let fixture = Fixture::over(
+        TempDir::new().unwrap(),
+        [&z, &b, &a]
+            .iter()
+            .map(|peer| HostAddress::parse(&peer.url).unwrap())
+            .collect(),
+    )
+    .await;
+    for id in ["first-id", "b", "a"] {
+        fixture.until_connected(id).await;
+    }
+    let client = fixture.client.clone();
+    let (updates, mut observed) = tokio::sync::watch::channel(Default::default());
+    let read = tokio::spawn(async move { client.stream_prompt_history(None, updates).await });
+    for peer in [&mut z, &mut b, &mut a] {
+        assert_eq!(
+            bounded("all hosts queried concurrently", peer.requests.recv())
+                .await
+                .unwrap(),
+            "/v1/prompt-history/stream"
+        );
+    }
+    let obsolete = history_value(&["obsolete"]);
+    z.chunks
+        .send(history_event("snapshot", &obsolete))
+        .await
+        .unwrap();
+    history_update(&mut observed, |value| value.prompts == obsolete.prompts).await;
+    assert!(!read.is_finished(), "two hosts have sent no body at all");
+    let z_value = history_value(&["z"]);
+    z.chunks
+        .send(history_event("complete", &z_value))
+        .await
+        .unwrap();
+    history_update(&mut observed, |value| value.prompts == z_value.prompts).await;
+    let b_value = history_value(&["b"]);
+    b.chunks
+        .send(history_event("complete", &b_value))
+        .await
+        .unwrap();
+    history_update(&mut observed, |value| {
+        value.prompts == history_value(&["b", "z"]).prompts
+    })
+    .await;
+    a.chunks
+        .send(history_event("complete", &history_value(&["a"])))
+        .await
+        .unwrap();
+    let complete = bounded("all history completion", read)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(complete, history_value(&["a", "b", "z"]));
+    assert_eq!(*observed.borrow(), complete);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompt_history_stream_all_retains_failed_and_timed_out_host_snapshots() {
+    let mut failed = history_peer("failed-id", "broken").await;
+    let mut stalled = history_peer("stalled-id", "slow").await;
+    let fixture = Fixture::tuned(
+        TempDir::new().unwrap(),
+        [&failed, &stalled]
+            .iter()
+            .map(|peer| HostAddress::parse(&peer.url).unwrap())
+            .collect(),
+        Tuning {
+            upstream_timeout: Duration::from_secs(3),
+            ..tuning()
+        },
+    )
+    .await;
+    for id in ["failed-id", "stalled-id"] {
+        fixture.until_connected(id).await;
+    }
+    let client = fixture.client.clone();
+    let (updates, mut observed) = tokio::sync::watch::channel(Default::default());
+    let read = tokio::spawn(async move { client.stream_prompt_history(None, updates).await });
+    for peer in [&mut failed, &mut stalled] {
+        bounded("history request", peer.requests.recv())
+            .await
+            .unwrap();
+    }
+    failed
+        .chunks
+        .send(history_event(
+            "snapshot",
+            &history_value(&["failed partial"]),
+        ))
+        .await
+        .unwrap();
+    stalled
+        .chunks
+        .send(history_event(
+            "snapshot",
+            &history_value(&["stalled partial"]),
+        ))
+        .await
+        .unwrap();
+    let expected = history_value(&["failed partial", "stalled partial"]);
+    history_update(&mut observed, |value| value.prompts == expected.prompts).await;
+    failed
+        .chunks
+        .send(history_event(
+            "error",
+            &serde_json::json!({
+                "code": "history_failed", "message": "scripted failure"
+            }),
+        ))
+        .await
+        .unwrap();
+    let complete = bounded("partial all history completion", read)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(complete.prompts, expected.prompts);
+    assert_eq!(complete.incomplete.len(), 2);
+    assert!(complete.incomplete.iter().any(|failure|
+        failure.host == "broken" && failure.message.contains("scripted failure")));
+    assert!(
+        complete
+            .incomplete
+            .iter()
+            .any(|failure| failure.host == "slow" && failure.message.contains("timed out"))
+    );
+    assert_eq!(*observed.borrow(), complete);
+    bounded("timeout releases upstream", stalled.chunks.closed()).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompt_history_stream_all_cancellation_releases_every_upstream() {
+    let mut a = history_peer("a", "a").await;
+    let mut b = history_peer("b", "b").await;
+    let fixture = Fixture::over(
+        TempDir::new().unwrap(),
+        [&a, &b]
+            .iter()
+            .map(|peer| HostAddress::parse(&peer.url).unwrap())
+            .collect(),
+    )
+    .await;
+    for id in ["a", "b"] {
+        fixture.until_connected(id).await;
+    }
+    let client = fixture.client.clone();
+    let (updates, mut observed) = tokio::sync::watch::channel(Default::default());
+    let read = tokio::spawn(async move { client.stream_prompt_history(None, updates).await });
+    for peer in [&mut a, &mut b] {
+        bounded("upstream history request", peer.requests.recv())
+            .await
+            .unwrap();
+    }
+    a.chunks
+        .send(history_event("snapshot", &history_value(&["early"])))
+        .await
+        .unwrap();
+    history_update(&mut observed, |value| !value.prompts.is_empty()).await;
+    read.abort();
+    assert!(
+        bounded("cancel all history", read)
+            .await
+            .unwrap_err()
+            .is_cancelled()
+    );
+    for peer in [&a, &b] {
+        bounded("cancelled fanout releases upstream", peer.chunks.closed()).await;
+    }
+    fixture.shutdown().await;
 }
 
 /// A host reporting an id this gateway cannot namespace with is refused where it

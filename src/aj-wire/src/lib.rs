@@ -40,7 +40,8 @@ pub use session_info::{SessionInfo, UsageBucket};
 
 mod prompt_history;
 pub use prompt_history::{
-    HistoryPrompt, PROMPT_HISTORY_CAPABILITY, PROMPT_HISTORY_LIMIT, PromptHistory,
+    HistoryPrompt, PROMPT_HISTORY_CAPABILITY, PROMPT_HISTORY_LIMIT,
+    PROMPT_HISTORY_STREAM_CAPABILITY, PromptHistory,
 };
 
 /// The current remote-control protocol version.

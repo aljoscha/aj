@@ -386,6 +386,60 @@ impl RemoteClient {
         self.get(&format!("/v1/sessions/{session}/export")).await
     }
 
+    /// Publish replacement snapshots until the host explicitly completes the
+    /// read. Dropping this future closes the response body and its upstream work.
+    pub(crate) async fn stream_prompt_history(
+        &self,
+        session: Option<&str>,
+        updates: tokio::sync::watch::Sender<aj_wire::PromptHistory>,
+    ) -> Result<aj_wire::PromptHistory, RemoteError> {
+        let path = match session {
+            Some(session) => format!("/v1/sessions/{session}/prompt-history/stream"),
+            None => "/v1/prompt-history/stream".to_string(),
+        };
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .timeout(REQUEST_TIMEOUT * 2)
+            .send()
+            .await?;
+        let mut events = refusal(response).await?.bytes_stream().eventsource();
+        while let Some(event) = events.next().await {
+            let event = event.map_err(|error| match error {
+                EventStreamError::Transport(error) => RemoteError::from(error),
+                error => RemoteError::Stream(error.to_string()),
+            })?;
+            match event.event.as_str() {
+                "snapshot" | "complete" => {
+                    let history: aj_wire::PromptHistory =
+                        serde_json::from_str(&event.data).map_err(RemoteError::Decode)?;
+                    updates.send_if_modified(|current| {
+                        if *current == history {
+                            return false;
+                        }
+                        *current = history.clone();
+                        true
+                    });
+                    if event.event == "complete" {
+                        return Ok(history);
+                    }
+                }
+                "error" => {
+                    let error: aj_wire::ErrorResponse =
+                        serde_json::from_str(&event.data).map_err(RemoteError::Decode)?;
+                    return Err(RemoteError::Stream(format!(
+                        "{}: {}",
+                        error.code, error.message
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Err(RemoteError::Stream(
+            "prompt history ended before completion".to_string(),
+        ))
+    }
+
     pub(crate) async fn provider_usage(
         &self,
         session: &str,

@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const PROMPT_HISTORY_CAPABILITY: &str = "prompt_history";
+pub const PROMPT_HISTORY_STREAM_CAPABILITY: &str = "prompt_history_stream";
 pub const PROMPT_HISTORY_LIMIT: usize = 2000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

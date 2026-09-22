@@ -3470,6 +3470,271 @@ async fn opening_a_stream_against_a_mute_host_is_abandoned() {
 // Client decode rules the real host cannot produce
 // ---------------------------------------------------------------------------
 
+/// A one-read history peer. The channel gates every body chunk, including EOF.
+/// `closed()` observes the HTTP body being dropped, not a server task stopping.
+pub(crate) struct HistoryPeer {
+    pub url: String,
+    pub chunks: tokio::sync::mpsc::Sender<String>,
+    pub requests: tokio::sync::mpsc::Receiver<String>,
+    serving: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HistoryPeer {
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+pub(crate) async fn history_peer(id: &str, name: &str) -> HistoryPeer {
+    use axum::routing::get;
+    use futures::StreamExt;
+
+    let hello = serde_json::json!({
+        "protocol": PROTOCOL_VERSION, "app_version": "0", "host_id": id,
+        "name": name, "capabilities": [aj_wire::PROMPT_HISTORY_CAPABILITY],
+    });
+    let (chunks, receiver) = tokio::sync::mpsc::channel::<String>(8);
+    let receiver = Arc::new(StdMutex::new(Some(receiver)));
+    let (requested, requests) = tokio::sync::mpsc::channel(8);
+    let history = get(move |uri: axum::http::Uri| {
+        let receiver = receiver.lock().unwrap().take().expect("one history read");
+        let requested = requested.clone();
+        async move {
+            requested.send(uri.path().to_string()).await.unwrap();
+            let body = futures::stream::unfold(receiver, |mut receiver| async move {
+                receiver
+                    .recv()
+                    .await
+                    .map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), receiver))
+            });
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from_stream(body))
+                .unwrap()
+        }
+    });
+    let app = axum::Router::new()
+        .route(
+            "/v1/hello",
+            get(move || {
+                let hello = hello.clone();
+                async move { axum::Json(hello) }
+            }),
+        )
+        .route(
+            "/v1/events",
+            get(|| async {
+                axum::response::sse::Sse::new(
+                    futures::stream::iter([Ok::<_, std::convert::Infallible>(
+                        axum::response::sse::Event::default().data(
+                            serde_json::json!({"kind": "list", "sessions": [{
+                                "id": "workspace", "live": true, "working": false,
+                                "queued": {"steering": 0, "follow_up": 0}, "tasks": 0,
+                                "last_activity": "2026-01-01T00:00:00Z"
+                            }]})
+                            .to_string(),
+                        ),
+                    )])
+                    .chain(futures::stream::pending()),
+                )
+            }),
+        )
+        .route("/v1/prompt-history/stream", history.clone())
+        .route("/v1/sessions/{id}/prompt-history/stream", history);
+    let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+        .await
+        .unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let serving = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    HistoryPeer {
+        url,
+        chunks,
+        requests,
+        serving,
+    }
+}
+
+pub(crate) fn history_value(texts: &[&str]) -> aj_wire::PromptHistory {
+    aj_wire::PromptHistory {
+        prompts: texts
+            .iter()
+            .map(|text| aj_wire::HistoryPrompt {
+                text: (*text).into(),
+                project: None,
+                timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
+            })
+            .collect(),
+        incomplete: Vec::new(),
+    }
+}
+
+pub(crate) fn history_event(event: &str, value: &impl serde::Serialize) -> String {
+    format!(
+        "event: {event}\ndata: {}\n\n",
+        serde_json::to_string(value).unwrap()
+    )
+}
+
+pub(crate) async fn history_update(
+    updates: &mut tokio::sync::watch::Receiver<aj_wire::PromptHistory>,
+    predicate: impl Fn(&aj_wire::PromptHistory) -> bool,
+) -> aj_wire::PromptHistory {
+    bounded("a history snapshot", async {
+        loop {
+            let value = updates.borrow_and_update().clone();
+            if predicate(&value) {
+                return value;
+            }
+            updates
+                .changed()
+                .await
+                .expect("history ended before the expected snapshot");
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn prompt_history_stream_delivers_before_completion_and_stops_at_complete() {
+    for session in [None, Some("workspace")] {
+        let mut peer = history_peer("host", "host").await;
+        let client = RemoteClient::new(&peer.url).unwrap();
+        let (updates, mut observed) = tokio::sync::watch::channel(Default::default());
+        let read =
+            tokio::spawn(async move { client.stream_prompt_history(session, updates).await });
+        let path = bounded("history request", peer.requests.recv())
+            .await
+            .unwrap();
+        assert_eq!(
+            path,
+            match session {
+                None => "/v1/prompt-history/stream",
+                Some(_) => "/v1/sessions/workspace/prompt-history/stream",
+            }
+        );
+        let partial = history_value(&["early"]);
+        // Split a frame across body chunks so HTTP chunk boundaries cannot act as delimiters.
+        let event = history_event("snapshot", &partial);
+        let (first, rest) = event.split_at(event.len() / 2);
+        peer.chunks.send(first.to_string()).await.unwrap();
+        peer.chunks.send(rest.to_string()).await.unwrap();
+        history_update(&mut observed, |value| value == &partial).await;
+        assert!(!read.is_finished(), "a snapshot is not completion");
+        let complete = history_value(&["late", "early"]);
+        peer.chunks
+            .send(history_event("complete", &complete))
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded("terminal history", read).await.unwrap().unwrap(),
+            complete
+        );
+        assert_eq!(*observed.borrow(), complete);
+        // The producer is still open. Completion must not wait for transport EOF.
+        bounded("completed read releases its body", peer.chunks.closed()).await;
+    }
+}
+
+#[tokio::test]
+async fn prompt_history_stream_failure_preserves_provisional_snapshot() {
+    for terminal in ["eof", "truncated", "error"] {
+        let mut peer = history_peer("host", "host").await;
+        let client = RemoteClient::new(&peer.url).unwrap();
+        let (updates, mut observed) = tokio::sync::watch::channel(Default::default());
+        let read = tokio::spawn(async move { client.stream_prompt_history(None, updates).await });
+        bounded("history request", peer.requests.recv())
+            .await
+            .unwrap();
+        let partial = history_value(&["keep me"]);
+        peer.chunks
+            .send(history_event("snapshot", &partial))
+            .await
+            .unwrap();
+        history_update(&mut observed, |value| value == &partial).await;
+        if terminal == "error" {
+            peer.chunks
+                .send(history_event(
+                    "error",
+                    &serde_json::json!({
+                        "code": "history_failed", "message": "scripted read failure"
+                    }),
+                ))
+                .await
+                .unwrap();
+        } else {
+            // An incomplete final SSE frame cannot stand in for `complete`.
+            if terminal == "truncated" {
+                peer.chunks
+                    .send("event: complete\ndata: {".into())
+                    .await
+                    .unwrap();
+            }
+            let (replacement, _) = tokio::sync::mpsc::channel(1);
+            drop(std::mem::replace(&mut peer.chunks, replacement));
+        }
+        let error = bounded("failed history", read)
+            .await
+            .unwrap()
+            .expect_err("no completion");
+        if terminal == "error" {
+            assert!(error.to_string().contains("scripted read failure"));
+        }
+        assert_eq!(*observed.borrow(), partial);
+    }
+}
+
+#[tokio::test]
+async fn prompt_history_stream_cancellation_closes_the_http_body() {
+    let mut peer = history_peer("host", "host").await;
+    let client = RemoteClient::new(&peer.url).unwrap();
+    let (updates, mut observed) = tokio::sync::watch::channel(Default::default());
+    let read = tokio::spawn(async move { client.stream_prompt_history(None, updates).await });
+    bounded("history request", peer.requests.recv())
+        .await
+        .unwrap();
+    let partial = history_value(&["early"]);
+    peer.chunks
+        .send(history_event("snapshot", &partial))
+        .await
+        .unwrap();
+    history_update(&mut observed, |value| value == &partial).await;
+    read.abort();
+    assert!(
+        bounded("cancelled read", read)
+            .await
+            .unwrap_err()
+            .is_cancelled()
+    );
+    bounded("cancelled read releases its body", peer.chunks.closed()).await;
+}
+
+#[tokio::test]
+async fn prompt_history_stream_completes_empty_reads_and_reports_host_errors() {
+    let fixture = Fixture::new(vec![]).await;
+    let session = fixture.create().await;
+    for scope in [None, Some(session.as_str())] {
+        let (updates, _) = tokio::sync::watch::channel(Default::default());
+        let result = bounded(
+            "empty history completion",
+            fixture.client.stream_prompt_history(scope, updates),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, aj_wire::PromptHistory::default());
+    }
+    let (updates, _) = tokio::sync::watch::channel(Default::default());
+    let error = bounded(
+        "unknown session",
+        fixture
+            .client
+            .stream_prompt_history(Some("missing"), updates),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("unknown_session"));
+    fixture.shutdown().await;
+}
+
 /// A stand-in server that answers canned bodies: a frame kind this build
 /// does not know, a malformed known frame, a protocol from the future.
 pub(crate) async fn canned_server(

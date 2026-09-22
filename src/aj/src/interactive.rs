@@ -5337,11 +5337,13 @@ fn spawn_shell_overlay_fetch(
 }
 
 /// Read history through Control off the drive loop. A watch channel coalesces
-/// provisional local snapshots. Closing the overlay or changing scope drops
+/// provisional snapshots. Closing the overlay or changing scope drops
 /// the read future and cooperatively cancels its blocking scanner.
 fn spawn_history_scan(world: &World, fetch: HistoryFetch) -> HistoryFill {
     let control = world.control.clone();
     let session = world.session().to_string();
+    let completion_subtitle = fetch.subtitle.borrow().clone();
+    *fetch.subtitle.borrow_mut() = format!("Loading…  •  {completion_subtitle}");
     let (tx, rx) = tokio::sync::watch::channel(aj_wire::PromptHistory::default());
     let cancel = fetch.cancel.clone();
     tokio::spawn(async move {
@@ -5352,15 +5354,16 @@ fn spawn_history_scan(world: &World, fetch: HistoryFetch) -> HistoryFill {
             result = control.prompt_history(session, Some(tx.clone())) => {
                 let history = match result {
                     Ok(history) => history,
-                    Err(err) => aj_wire::PromptHistory {
-                        prompts: tx.borrow().prompts.clone(),
-                        incomplete: vec![aj_wire::HostFailure {
+                    Err(err) => {
+                        let mut history = tx.borrow().clone();
+                        history.incomplete.push(aj_wire::HostFailure {
                             host: control.base_url().map(crate::remote::endpoint_label)
                                 .unwrap_or_else(|| "local host".to_string()),
                             message: if err.unknown_endpoint() {
                                 "prompt history is not supported by this host".to_string()
                             } else { err.to_string() },
-                        }],
+                        });
+                        history
                     },
                 };
                 // Even an empty scan must replace the loading placeholder.
@@ -5371,6 +5374,8 @@ fn spawn_history_scan(world: &World, fetch: HistoryFetch) -> HistoryFill {
     HistoryFill {
         select: fetch.select,
         subtitle: fetch.subtitle,
+        completion_subtitle,
+        reported_failures: Vec::new(),
         rx,
         next_update: tokio::time::Instant::now(),
     }
@@ -5383,7 +5388,10 @@ async fn recv_history(fill: Option<&mut HistoryFill>) -> Option<aj_wire::PromptH
             // this future to handle input. The watch retains the newest result
             // throughout the wait, including the final result on channel close.
             tokio::time::sleep_until(fill.next_update).await;
-            fill.rx.changed().await.ok()?;
+            if fill.rx.changed().await.is_err() {
+                *fill.subtitle.borrow_mut() = fill.completion_subtitle.clone();
+                return None;
+            }
             fill.next_update = tokio::time::Instant::now() + Duration::from_millis(100);
             Some(fill.rx.borrow_and_update().clone())
         }
@@ -5777,6 +5785,8 @@ async fn recv_scan<T>(rx: Option<&mut UnboundedReceiver<T>>) -> Option<T> {
 struct HistoryFill {
     select: Rc<RefCell<FilterableSelect>>,
     subtitle: Rc<RefCell<String>>,
+    completion_subtitle: String,
+    reported_failures: Vec<aj_wire::HostFailure>,
     rx: tokio::sync::watch::Receiver<aj_wire::PromptHistory>,
     next_update: tokio::time::Instant,
 }
@@ -8645,17 +8655,23 @@ async fn drive(
             // newer prompts. The watch channel keeps only the latest snapshot.
             maybe_history = recv_history(pending_history.as_mut()) => {
                 if let Some(history) = maybe_history {
-                    if let Some(fill) = &pending_history {
+                    if let Some(fill) = &mut pending_history {
                         let entries = history.prompts.into_iter().map(|p| PromptEntry {
                             text: p.text, project: p.project,
                         }).collect::<Vec<_>>();
                         let select = fill.select.borrow();
                         select.set_ranked_items(crate::prompt_history::build_items(&entries));
                         if !history.incomplete.is_empty() {
-                            *fill.subtitle.borrow_mut() = format!("Incomplete history: {}", history.incomplete.iter()
+                            fill.completion_subtitle = format!("Incomplete history: {}", history.incomplete.iter()
                                 .map(|f| f.host.as_str()).collect::<Vec<_>>().join(", "));
-                            fold_notice(world, &format!("Incomplete prompt history: {}", history.incomplete.iter()
-                                .map(|f| format!("{}: {}", f.host, f.message)).collect::<Vec<_>>().join(" | ")));
+                            *fill.subtitle.borrow_mut() = format!("Loading…  •  {}", fill.completion_subtitle);
+                            let new_failures = history.incomplete.iter()
+                                .filter(|f| !fill.reported_failures.contains(f)).cloned().collect::<Vec<_>>();
+                            if !new_failures.is_empty() {
+                                fold_notice(world, &format!("Incomplete prompt history: {}", new_failures.iter()
+                                    .map(|f| format!("{}: {}", f.host, f.message)).collect::<Vec<_>>().join(" | ")));
+                                fill.reported_failures.extend(new_failures);
+                            }
                         }
                     }
                 } else {
@@ -20195,6 +20211,8 @@ mod tests {
                 vaxis::vxfw::SelectStyles::default(),
             ))),
             subtitle: Rc::new(RefCell::new(String::new())),
+            completion_subtitle: String::new(),
+            reported_failures: Vec::new(),
             rx,
             next_update: tokio::time::Instant::now(),
         };
@@ -20247,7 +20265,7 @@ mod tests {
         let (started, mut requests) = unbounded_channel();
         let router = Router::new()
             .route(
-                "/v1/sessions/{id}/prompt-history",
+                "/v1/sessions/{id}/prompt-history/stream",
                 get(move || {
                     let started = started.clone();
                     async move {
@@ -20257,7 +20275,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v1/prompt-history",
+                "/v1/prompt-history/stream",
                 get(|| async {
                     (
                         axum::http::StatusCode::NOT_FOUND,
@@ -20319,6 +20337,109 @@ mod tests {
         shut_down(&world).await;
         serving.abort();
         let _ = serving.await;
+    }
+
+    #[tokio::test]
+    async fn prompt_history_stream_keeps_the_drawn_view_and_recalled_selection() {
+        use crate::remote::tests::{history_event, history_peer, history_value};
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let local = world.control.clone();
+        let mut peer = history_peer("history", "history").await;
+        world.control = Control::remote(crate::remote::RemoteClient::new(&peer.url).unwrap());
+        let keys = (0..50)
+            .map(|i| format!("prompt-{i:02}"))
+            .collect::<Vec<_>>();
+        let mut initial = history_value(&keys.iter().map(String::as_str).collect::<Vec<_>>());
+        initial.incomplete.push(aj_wire::HostFailure {
+            host: "unavailable".to_string(),
+            message: "read failed".to_string(),
+        });
+        let mut later = history_value(&["newest-arrival"]);
+        later.prompts.extend(initial.prompts.clone());
+        later.incomplete = initial.incomplete.clone();
+        let observed = Rc::clone(&shell);
+        let (exit, recalled) = drive_until(&mut world, &shell, move |mut writer| async move {
+            writer.write_all(b"\x12").unwrap();
+            crate::remote::tests::bounded("history opened", peer.requests.recv())
+                .await
+                .unwrap();
+            peer.chunks
+                .send(history_event("snapshot", &initial))
+                .await
+                .unwrap();
+            poll_for(|| {
+                let rows = top_overlay_rows(&observed);
+                rows.iter()
+                    .any(|row| row.contains("prompt-00"))
+                    .then_some(())
+            })
+            .await
+            .expect("first snapshot visible");
+            for _ in 0..5 {
+                writer.write_all(b"\x1b[B").unwrap();
+            }
+            let (before, row) = poll_for(|| {
+                let (top, selected_bg) = {
+                    let shell = observed.borrow();
+                    let top = Rc::clone(&shell.overlays.borrow().top().unwrap().widget);
+                    (top, shell.overlay_handles().chrome.select.selected_bg)
+                };
+                let surface = top.borrow_mut().draw(&full_draw_ctx());
+                let rows = crate::test_support::rows(&surface);
+                let row = rows.iter().position(|row| row.contains("prompt-05"))?;
+                let cells = crate::test_support::flatten(&surface);
+                cells[row]
+                    .iter()
+                    .any(|cell| cell.style.bg == selected_bg)
+                    .then_some((rows, row))
+            })
+            .await
+            .expect("navigation selected the fifth prompt");
+            peer.chunks
+                .send(history_event("snapshot", &later))
+                .await
+                .unwrap();
+            // Completion is distinct from the last snapshot, including when its
+            // contents are identical. The loading indicator must disappear.
+            peer.chunks
+                .send(history_event("complete", &later))
+                .await
+                .unwrap();
+            let after = poll_for(|| {
+                let rows = top_overlay_rows(&observed);
+                (!rows.join("\n").contains("Loading")
+                    && rows.iter().any(|row| row.contains("prompt-05")))
+                .then_some(rows)
+            })
+            .await
+            .expect("completed history visible");
+            assert!(
+                after[row].contains("prompt-05"),
+                "viewport moved: {before:?} -> {after:?}"
+            );
+            writer.write_all(b"\r").unwrap();
+            let recalled = poll_for(|| {
+                (!observed.borrow().overlays.borrow().is_open())
+                    .then(|| observed.borrow().view().editor.borrow().text())
+            })
+            .await
+            .expect("prompt recalled");
+            drop(writer);
+            recalled
+        })
+        .await;
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert_eq!(recalled, "prompt-05");
+        assert_eq!(
+            main_notices(&world)
+                .iter()
+                .filter(|notice| notice.contains("Incomplete prompt history"))
+                .count(),
+            1
+        );
+        world.control = local;
+        shut_down(&world).await;
     }
 
     // ---- Session selector, new session, rebuild loop (8D-3b-i) ----
