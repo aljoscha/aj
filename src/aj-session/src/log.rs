@@ -921,10 +921,14 @@ impl Conversation {
 /// the copy it owns. Taking a snapshot under the log lock and answering
 /// an expensive read from it (a full projection, say) is what keeps that
 /// read from stalling the session's next append.
+///
+/// Entries are immutable once published and shared between snapshots. Each
+/// snapshot owns its index, append order and head, so appends and branch changes
+/// cannot change an existing view. Cloning copies metadata, not log payloads.
 #[derive(Debug, Clone)]
 pub struct LogSnapshot {
     session_id: String,
-    entries: HashMap<EntryId, ConversationEntry>,
+    entries: HashMap<EntryId, Arc<ConversationEntry>>,
     /// Insertion order: ids in the order they were appended. The index of
     /// an id here, plus one, is the entry's [`EntryRef::seq`].
     order: Vec<EntryId>,
@@ -1033,7 +1037,7 @@ impl LogSnapshot {
                 break;
             };
             if filter.matches(entry) {
-                out.push(entry.clone());
+                out.push(entry.as_ref().clone());
             }
             cursor = entry.parent_id.clone();
         }
@@ -1146,21 +1150,18 @@ impl LogSnapshot {
     /// An order slot whose map entry is missing is treated the same as an
     /// out-of-bounds index. Append-order scans must advance past either case.
     pub(crate) fn entry_in_append_order(&self, index: usize) -> Option<&ConversationEntry> {
-        self.order.get(index).and_then(|id| self.entries.get(id))
+        self.order.get(index).and_then(|id| self.get(id))
     }
 
     /// Look up an entry by id. Used by path-aware replay to walk
     /// parent pointers from the head.
     pub(crate) fn get(&self, id: &EntryId) -> Option<&ConversationEntry> {
-        self.entries.get(id)
+        self.entries.get(id).map(AsRef::as_ref)
     }
 
     /// Returns all entries in the order they were appended.
     pub fn entries_in_order(&self) -> Vec<&ConversationEntry> {
-        self.order
-            .iter()
-            .filter_map(|id| self.entries.get(id))
-            .collect()
+        self.order.iter().filter_map(|id| self.get(id)).collect()
     }
 
     /// The persisted system prompt for this session, if one was recorded
@@ -1250,6 +1251,7 @@ impl LogSnapshot {
         self.entries
             .values()
             .find(|e| matches!(e.entry, ConversationEntryKind::SystemPrompt { .. }))
+            .map(AsRef::as_ref)
     }
 }
 
@@ -1552,7 +1554,10 @@ impl ConversationLog {
         let mut log = Self {
             core: LogSnapshot {
                 session_id: session_id.to_string(),
-                entries,
+                entries: entries
+                    .into_iter()
+                    .map(|(id, entry)| (id, Arc::new(entry)))
+                    .collect(),
                 order,
                 head: None,
             },
@@ -1730,7 +1735,7 @@ impl ConversationLog {
         }
 
         self.core.order.push(id.clone());
-        self.core.entries.insert(id.clone(), record);
+        self.core.entries.insert(id.clone(), Arc::new(record));
         // Advance the explicit head on every user-thread append, once
         // the entry is committed to the in-memory maps. This single
         // point covers every user-thread writer (messages via the
@@ -5827,79 +5832,109 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_answers_reads_like_the_log_and_ignores_later_appends() {
-        let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
-        log.set_system_prompt("p".to_string())
-            .expect("system prompt");
-        let user = {
-            let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("user message")
-        };
-        let assistant = {
-            let mut view = ConversationView::user(&mut log);
-            view.add_message(assistant_text("ho"))
-                .expect("assistant message")
-        };
-        log.append_subagent_spawn(
-            1,
-            assistant.id.clone(),
-            "task",
-            "agent",
-            false,
-            &spawn_settings(),
-        )
-        .expect("spawn root");
+    fn snapshots_preserve_their_view_across_writes_and_owner_drop() {
+        for resumed in [false, true] {
+            let dir = fresh_sessions_dir();
+            let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("p".to_string())
+                .expect("system prompt");
+            let user = {
+                let mut view = ConversationView::user(&mut log);
+                view.add_message(user_text("hi")).expect("user message")
+            };
+            let assistant = {
+                let mut view = ConversationView::user(&mut log);
+                view.add_message(assistant_text("ho"))
+                    .expect("assistant message")
+            };
+            log.append_subagent_spawn(
+                1,
+                assistant.id.clone(),
+                "task",
+                "agent",
+                false,
+                &spawn_settings(),
+            )
+            .expect("spawn root");
 
-        let snapshot = log.snapshot();
-        let ids = |conv: &Conversation| -> Vec<EntryId> {
-            conv.entries().iter().map(|e| e.id.clone()).collect()
-        };
-        assert_eq!(snapshot.session_id(), log.session_id());
-        assert_eq!(snapshot.len(), log.len());
-        assert_eq!(snapshot.last_seq(), log.last_seq());
-        assert_eq!(snapshot.head(), log.head());
-        assert_eq!(
-            snapshot.latest_leaf(ThreadFilter::USER),
-            log.latest_leaf(ThreadFilter::USER)
-        );
-        assert_eq!(
-            snapshot.latest_leaf(ThreadFilter::subagent(1)),
-            log.latest_leaf(ThreadFilter::subagent(1))
-        );
-        assert_eq!(
-            ids(&snapshot.linearize(&assistant.id, ThreadFilter::USER)),
-            ids(&log.linearize(&assistant.id, ThreadFilter::USER))
-        );
-        for index in 0..=log.len() {
+            if resumed {
+                log.flush_pending().expect("flush fixture");
+                let session_id = log.session_id().to_string();
+                drop(log);
+                log = ConversationLog::resume(&persistence, &session_id).expect("resume fixture");
+            }
+            let snapshot = log.snapshot();
+            let original =
+                serde_json::to_vec(&snapshot.entries_in_order()).expect("snapshot contents");
+            let ids = |conv: &Conversation| -> Vec<EntryId> {
+                conv.entries().iter().map(|e| e.id.clone()).collect()
+            };
+            assert_eq!(snapshot.session_id(), log.session_id());
+            assert_eq!(snapshot.len(), log.len());
+            assert_eq!(snapshot.last_seq(), log.last_seq());
+            assert_eq!(snapshot.head(), log.head());
             assert_eq!(
-                snapshot.entry_in_append_order(index).map(|e| &e.id),
-                log.core().entry_in_append_order(index).map(|e| &e.id),
-                "append-order slot {index} differs"
+                snapshot.latest_leaf(ThreadFilter::USER),
+                log.latest_leaf(ThreadFilter::USER)
+            );
+            assert_eq!(
+                snapshot.latest_leaf(ThreadFilter::subagent(1)),
+                log.latest_leaf(ThreadFilter::subagent(1))
+            );
+            assert_eq!(
+                ids(&snapshot.linearize(&assistant.id, ThreadFilter::USER)),
+                ids(&log.linearize(&assistant.id, ThreadFilter::USER))
+            );
+            for index in 0..=log.len() {
+                assert_eq!(
+                    snapshot.entry_in_append_order(index).map(|e| &e.id),
+                    log.core().entry_in_append_order(index).map(|e| &e.id),
+                    "append-order slot {index} differs"
+                );
+            }
+
+            // The snapshot is a value: appends to the log after it was taken
+            // are invisible to it, which is what lets a projection run
+            // outside the log lock.
+            let later = {
+                let mut view = ConversationView::user(&mut log);
+                view.add_message(user_text("later")).expect("later message")
+            };
+            assert_eq!(snapshot.last_seq(), 4);
+            assert_eq!(log.last_seq(), 5);
+            assert!(snapshot.entry_in_append_order(4).is_none());
+            assert_eq!(snapshot.head(), Some(&assistant.id));
+            assert_eq!(log.head(), Some(&later.id));
+            assert!(
+                !ids(&log.linearize(&later.id, ThreadFilter::USER)).is_empty(),
+                "the live log still linearizes its new head"
+            );
+            assert_eq!(
+                ids(&snapshot.linearize(&assistant.id, ThreadFilter::USER)),
+                vec![user.id.clone(), assistant.id.clone()],
+            );
+            log.set_head(user.id.clone()).expect("select branch point");
+            let branch = ConversationView::user(&mut log)
+                .add_message(assistant_text("another branch"))
+                .expect("branch message");
+            assert_eq!(log.head(), Some(&branch.id));
+            let detached = snapshot.clone();
+            drop(snapshot);
+            drop(log);
+            assert_eq!(detached.head(), Some(&assistant.id));
+            assert!(!detached.contains(&later.id));
+            assert!(!detached.contains(&branch.id));
+            assert_eq!(
+                serde_json::to_vec(&detached.entries_in_order()).expect("detached contents"),
+                original,
+                "snapshot contents outlive both the writer and the snapshot they were cloned from",
+            );
+            assert_eq!(
+                ids(&detached.linearize(&assistant.id, ThreadFilter::USER)),
+                vec![user.id, assistant.id],
             );
         }
-
-        // The snapshot is a value: appends to the log after it was taken
-        // are invisible to it, which is what lets a projection run
-        // outside the log lock.
-        let later = {
-            let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("later")).expect("later message")
-        };
-        assert_eq!(snapshot.last_seq(), 4);
-        assert_eq!(log.last_seq(), 5);
-        assert!(snapshot.entry_in_append_order(4).is_none());
-        assert_eq!(snapshot.head(), Some(&assistant.id));
-        assert_eq!(log.head(), Some(&later.id));
-        assert!(
-            !ids(&log.linearize(&later.id, ThreadFilter::USER)).is_empty(),
-            "the live log still linearizes its new head"
-        );
-        assert_eq!(
-            ids(&snapshot.linearize(&assistant.id, ThreadFilter::USER)),
-            vec![user.id.clone(), assistant.id.clone()],
-        );
     }
 
     #[test]
