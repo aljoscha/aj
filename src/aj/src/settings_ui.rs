@@ -36,7 +36,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use aj_agent::events::AgentId;
@@ -52,8 +52,8 @@ use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     Builder, DrawContext, Event, EventContext, FILTER_MARKER, FilterableSelect, ListView, MaxSize,
     OverlayWindow, PromptInput, RelativePoint, RichText, ScrollBars, SelectItem, SelectStyles,
-    Size, Source, SubSurface, Surface, TextField, TextSpan, Widget, WidgetRef, WidthBasis,
-    draw_widget, to_widget_ref,
+    SelectableRow, Size, Source, SubSurface, Surface, TextField, TextSpan, Widget, WidgetRef,
+    WidthBasis, draw_widget, to_widget_ref,
 };
 
 use crate::keymap::action_matches;
@@ -430,6 +430,7 @@ struct SettingListState {
 struct SettingRowBuilder {
     state: Rc<RefCell<SettingListState>>,
     styles: Rc<RefCell<SelectStyles>>,
+    list: Weak<RefCell<ListView>>,
 }
 
 impl Builder for SettingRowBuilder {
@@ -437,12 +438,30 @@ impl Builder for SettingRowBuilder {
         let state = self.state.borrow();
         let &row_idx = state.visible.get(idx)?;
         let styles = self.styles.borrow();
-        Some(build_setting_row(
+        let content = build_setting_row(
             &state.rows[row_idx],
             idx == cursor,
             state.label_width,
             &styles,
-        ))
+        );
+        let id = state.rows[row_idx].id.clone();
+        let state = Rc::clone(&self.state);
+        let list = Weak::clone(&self.list);
+        Some(Rc::new(RefCell::new(SelectableRow::new(
+            content,
+            move || {
+                let Some(list) = list.upgrade() else {
+                    return false;
+                };
+                let state = state.borrow();
+                let Some(position) = state.visible.iter().position(|&i| state.rows[i].id == id)
+                else {
+                    return false;
+                };
+                list.borrow_mut().cursor = u32::try_from(position).expect("position fits u32");
+                true
+            },
+        ))))
     }
 }
 
@@ -616,10 +635,7 @@ impl SettingList {
             label_width,
         }));
         let styles = Rc::new(RefCell::new(styles));
-        let mut list_view = ListView::new(Source::Builder(Box::new(SettingRowBuilder {
-            state: Rc::clone(&state),
-            styles: Rc::clone(&styles),
-        })));
+        let mut list_view = ListView::new(Source::default());
         list_view.draw_cursor = false;
         // Wrap the list in scroll bars for the vertical thumb. The bars own the
         // list behind their shared `view` handle, which we keep a clone of for
@@ -627,6 +643,11 @@ impl SettingList {
         let bars = ScrollBars::new(list_view);
         bars.borrow_mut().draw_horizontal_scrollbar = false;
         let list = Rc::clone(&bars.borrow().view);
+        list.borrow_mut().children = Source::Builder(Box::new(SettingRowBuilder {
+            state: Rc::clone(&state),
+            styles: Rc::clone(&styles),
+            list: Rc::downgrade(&list),
+        }));
         apply_setting_filter(&mut state.borrow_mut(), &mut list.borrow_mut());
         let prompt = PromptInput::new(FILTER_MARKER, styles.borrow().marker);
         {
@@ -1092,16 +1113,7 @@ impl Widget for SettingList {
             ctx.consume_and_redraw();
             return;
         }
-        if key.matches(Key::DOWN, Modifiers::empty())
-            || key.matches(u32::from('n'), Modifiers::CTRL)
-        {
-            self.list.borrow_mut().next_item(ctx);
-            return;
-        }
-        if key.matches(Key::UP, Modifiers::empty()) || key.matches(u32::from('p'), Modifiers::CTRL)
-        {
-            self.list.borrow_mut().prev_item(ctx);
-        }
+        self.list.borrow_mut().navigate_single_line(ctx, key);
     }
 
     fn wants_events(&self) -> bool {
@@ -2076,6 +2088,96 @@ mod tests {
             kind: RowKind::Cycle(vec!["true".to_string(), "false".to_string()]),
             inherited: false,
             clear_to: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_navigation_and_clicks_select_without_editing_and_keep_filter_focus() {
+        for height in [9, 15] {
+            let rows = (0..40)
+                .map(|i| {
+                    let mut row = cycle_row(&format!("row{i:02}"), "true");
+                    row.description = "Details about the selected setting".into();
+                    row
+                })
+                .collect();
+            let list = Rc::new(RefCell::new(SettingList::new(rows, styles(), false)));
+            let changes = Rc::new(RefCell::new(Vec::new()));
+            let sink = Rc::clone(&changes);
+            list.borrow_mut().on_change = Some(Box::new(move |_, id, value| {
+                sink.borrow_mut().push((id.to_string(), value.to_string()));
+            }));
+            let focus = list.borrow().focus_target();
+            let (mut app, root, _input) = crate::test_support::widget_app(
+                to_widget_ref(Rc::clone(&list)),
+                focus,
+                Size { width: 50, height },
+            )
+            .await;
+            let context = crate::test_support::draw_ctx(50, Some(height));
+            let page = crate::test_support::rows(&list.borrow_mut().draw(&context))
+                .iter()
+                .filter(|line| line.starts_with("row"))
+                .count();
+            assert!(page > 1 && page < 40);
+            app.handle_input(key(Key::PAGE_DOWN, Modifiers::empty()));
+            app.render(&root).unwrap();
+            assert_eq!(
+                list.borrow().selected().unwrap().id,
+                format!("row{page:02}")
+            );
+            let click = |row, col| {
+                Event::Mouse(vaxis::mouse::Mouse {
+                    row,
+                    col,
+                    xoffset: 0,
+                    yoffset: 0,
+                    mods: Default::default(),
+                    button: vaxis::mouse::Button::Left,
+                    kind: vaxis::mouse::Type::Press,
+                })
+            };
+            app.handle_input(click(3, 30));
+            assert_eq!(
+                list.borrow().selected().unwrap().id,
+                format!("row{:02}", page + 1)
+            );
+            assert!(
+                changes.borrow().is_empty(),
+                "clicks must not toggle a setting"
+            );
+            assert_eq!(list.borrow().selected().unwrap().value, "true");
+            app.handle_input(enter());
+            assert_eq!(
+                &*changes.borrow(),
+                &[(format!("row{:02}", page + 1), "false".into())]
+            );
+            for (code, id) in [(Key::END, "row39"), (Key::HOME, "row00")] {
+                app.handle_input(key(code, Modifiers::empty()));
+                app.render(&root).unwrap();
+                assert_eq!(list.borrow().selected().unwrap().id, id);
+            }
+            for c in "row17".chars() {
+                app.handle_input(Event::KeyPress(Key {
+                    codepoint: u32::from(c),
+                    text: Some(c.to_string().into()),
+                    ..Key::default()
+                }));
+            }
+            app.render(&root).unwrap();
+            assert_eq!(
+                list.borrow().selected().unwrap().id,
+                "row17",
+                "typing still filters after clicking"
+            );
+            app.handle_input(click(4, 4)); // Empty space below the sole result.
+            app.handle_input(click(2, 49)); // Scrollbar column.
+            assert_eq!(changes.borrow().len(), 1);
+            app.handle_input(enter());
+            assert_eq!(
+                changes.borrow().last().unwrap(),
+                &("row17".into(), "false".into())
+            );
         }
     }
 

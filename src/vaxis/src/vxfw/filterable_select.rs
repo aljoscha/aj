@@ -39,7 +39,7 @@ use crate::fuzzy::FuzzyMatcher;
 use crate::key::{Key, Modifiers};
 use crate::vxfw::{
     Builder, DrawContext, Event, EventContext, ListView, MaxSize, PromptInput, RelativePoint,
-    RichText, ScrollBars, ScrollableView, Size, Source, SubSurface, Surface, TextAlign, TextSpan,
+    RichText, ScrollBars, SelectableRow, Size, Source, SubSurface, Surface, TextAlign, TextSpan,
     Widget, WidgetRef, WidthBasis,
 };
 
@@ -322,56 +322,28 @@ impl Builder for RowBuilder {
         let state = self.state.borrow();
         let &(item_idx, _) = state.visible.get(idx)?;
         let styles = self.styles.borrow();
-        Some(Rc::new(RefCell::new(SelectRow {
-            content: build_row(&state.items[item_idx], idx == cursor, &styles, &state),
-            index: item_idx,
-            key: state.items[item_idx].filter_key.clone(),
-            state: Rc::clone(&self.state),
-            list: Weak::clone(&self.list),
-        })))
-    }
-}
-
-/// Row-local hit-testing excludes the filter, blank space, and scrollbar.
-/// The weak list reference avoids a cycle through the list's row builder.
-struct SelectRow {
-    content: WidgetRef,
-    index: usize,
-    key: String,
-    state: Rc<RefCell<SelectState>>,
-    list: Weak<RefCell<ListView>>,
-}
-
-impl Widget for SelectRow {
-    fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        self.content.borrow_mut().draw(ctx)
-    }
-
-    fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
-        let Event::Mouse(mouse) = event else { return };
-        if mouse.button != crate::mouse::Button::Left || mouse.kind != crate::mouse::Type::Press {
-            return;
-        }
-        let Some(list) = self.list.upgrade() else {
-            return;
-        };
-        let mut state = self.state.borrow_mut();
-        // An update may replace or filter out the painted row before the next
-        // frame. Ignore a stale hit rather than selecting a different item.
-        let Some(position) = state.visible.iter().position(|&(index, _)| {
-            index == self.index && state.items[index].filter_key == self.key
-        }) else {
-            return;
-        };
-        state.interacted = true;
-        list.borrow_mut().cursor = u32::try_from(position).expect("position fits u32");
-        // A click selects only. Keeping focus on the filter lets typing continue,
-        // and leaving scroll alone keeps the clicked row under the pointer.
-        ctx.consume_and_redraw();
-    }
-
-    fn wants_events(&self) -> bool {
-        true
+        let content = build_row(&state.items[item_idx], idx == cursor, &styles, &state);
+        let key = state.items[item_idx].filter_key.clone();
+        let state = Rc::clone(&self.state);
+        let list = Weak::clone(&self.list);
+        Some(Rc::new(RefCell::new(SelectableRow::new(
+            content,
+            move || {
+                let Some(list) = list.upgrade() else {
+                    return false;
+                };
+                let mut state = state.borrow_mut();
+                // Reject a painted row replaced or filtered out before this press.
+                let Some(position) = state.visible.iter().position(|&(index, _)| {
+                    index == item_idx && state.items[index].filter_key == key
+                }) else {
+                    return false;
+                };
+                state.interacted = true;
+                list.borrow_mut().cursor = u32::try_from(position).expect("position fits u32");
+                true
+            },
+        ))))
     }
 }
 
@@ -1305,51 +1277,8 @@ impl Widget for FilterableSelect {
             ctx.consume_and_redraw();
             return;
         }
-        if key.matches(Key::DOWN, Modifiers::empty())
-            || key.matches(u32::from('n'), Modifiers::CTRL)
-        {
+        if self.list.borrow_mut().navigate_single_line(ctx, key) {
             self.state.borrow_mut().interacted = true;
-            self.list.borrow_mut().next_item(ctx);
-            return;
-        }
-        if key.matches(Key::UP, Modifiers::empty()) || key.matches(u32::from('p'), Modifiers::CTRL)
-        {
-            self.state.borrow_mut().interacted = true;
-            self.list.borrow_mut().prev_item(ctx);
-            return;
-        }
-        if let Some(navigation) = [Key::HOME, Key::END, Key::PAGE_UP, Key::PAGE_DOWN]
-            .into_iter()
-            .find(|code| key.matches(*code, Modifiers::empty()))
-        {
-            let mut state = self.state.borrow_mut();
-            state.interacted = true;
-            let last = u32::try_from(state.visible.len())
-                .expect("row count fits u32")
-                .saturating_sub(1);
-            let mut list = self.list.borrow_mut();
-            match navigation {
-                Key::HOME => list.jump_to_item(0),
-                Key::END => list.jump_to_item(last),
-                _ => {
-                    // Picker rows are one line tall. Move both selection and
-                    // viewport by a page so the highlight keeps its screen row
-                    // except where the list bounds require clamping.
-                    let page = u32::from(list.viewport_height().unwrap_or(1).max(1));
-                    let advance = |index: u32| {
-                        if navigation == Key::PAGE_DOWN {
-                            index.saturating_add(page).min(last)
-                        } else {
-                            index.saturating_sub(page)
-                        }
-                    };
-                    list.cursor = advance(list.cursor);
-                    let top = advance(list.scroll_top());
-                    list.set_scroll_top(top);
-                    list.ensure_scroll();
-                }
-            }
-            ctx.consume_and_redraw();
         }
     }
 

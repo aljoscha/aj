@@ -487,6 +487,54 @@ impl ListView {
         ctx.consume_and_redraw();
     }
 
+    /// Handle selection navigation for a list of single-line rows with a known
+    /// item count. Returns whether the key was consumed. Up/Down and Ctrl+P/N
+    /// move one row, Home/End select the bounds, and PageUp/Down move selection
+    /// and viewport by the measured height without wrapping. Before drawing,
+    /// a page moves one row. Other keys, including Ctrl+A/E, are untouched.
+    pub fn navigate_single_line(&mut self, ctx: &mut EventContext, key: &Key) -> bool {
+        if key.matches(Key::DOWN, Modifiers::empty())
+            || key.matches(u32::from('n'), Modifiers::CTRL)
+        {
+            self.next_item(ctx);
+        } else if key.matches(Key::UP, Modifiers::empty())
+            || key.matches(u32::from('p'), Modifiers::CTRL)
+        {
+            self.prev_item(ctx);
+        } else if let Some(navigation) = [Key::HOME, Key::END, Key::PAGE_UP, Key::PAGE_DOWN]
+            .into_iter()
+            .find(|code| key.matches(*code, Modifiers::empty()))
+        {
+            let last = self
+                .known_item_count()
+                .expect("selection requires a known item count")
+                .saturating_sub(1);
+            match navigation {
+                Key::HOME => self.jump_to_item(0),
+                Key::END => self.jump_to_item(last),
+                _ => {
+                    // Move both indices so the highlight keeps its screen row
+                    // except where the list bounds require clamping.
+                    let page = u32::from(self.viewport_height().unwrap_or(1).max(1));
+                    let advance = |index: u32| {
+                        if navigation == Key::PAGE_DOWN {
+                            index.saturating_add(page).min(last)
+                        } else {
+                            index.saturating_sub(page)
+                        }
+                    };
+                    self.cursor = advance(self.cursor);
+                    self.set_scroll_top(advance(self.scroll_top()));
+                    self.ensure_scroll();
+                }
+            }
+            ctx.consume_and_redraw();
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// Anchors the viewport so the cursored item is visible on the next draw.
     ///
     /// Call only after the cursor moved or to force the cursor into view. If the

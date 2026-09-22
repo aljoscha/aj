@@ -1100,6 +1100,14 @@ Gateways forward the map to the owning host without interpreting it.
 
 ## 8. Client TUI
 
+Settings, skills, tool/skill toggles, and session environment lists share picker
+navigation: Home/End select the first/last filtered row, PageUp/PageDown move by
+the visible list height, and Up/Down move one row. A left click only selects.
+Enter performs the row's edit or opens its submenu. Navigation remains available
+while a save is pending, without bypassing the edit guard. Keyboard focus stays
+in search, with Ctrl+A/Ctrl+E moving within the query. Description panels, blank
+list space, and scrollbars do not select or edit settings.
+
 ### 8.1 Connect mode
 
 `aj connect <url>` runs the TUI against a remote server. Queue state is
