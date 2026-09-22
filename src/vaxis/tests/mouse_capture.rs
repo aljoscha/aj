@@ -37,7 +37,7 @@ impl Widget for Pane {
         match event {
             Event::Mouse(mouse) => {
                 self.received.push(Received::Mouse(*mouse));
-                if self.captures && mouse.kind == Type::Press && mouse.button == Button::Left {
+                if self.captures && mouse.kind == Type::Press {
                     ctx.capture_mouse();
                 }
             }
@@ -226,6 +226,48 @@ async fn capture_routes_outside_owner_until_release_then_restores_hit_testing() 
         [received(Type::Press, 1, 1), received(Type::Release, 1, 1)]
     );
     assert_eq!(h.owner.borrow().received.len(), 5);
+    h.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn wheel_input_keeps_hit_testing_without_replacing_capture() {
+    let mut h = Harness::new().await;
+    h.mouse(Type::Press, 3, 5);
+    // Even a widget requesting capture for every press cannot own a wheel tick.
+    h.sibling.borrow_mut().captures = true;
+    for button in [
+        Button::WheelUp,
+        Button::WheelDown,
+        Button::WheelLeft,
+        Button::WheelRight,
+    ] {
+        h.app.handle_input(Event::Mouse(Mouse {
+            button,
+            ..mouse(Type::Press, 3, 17)
+        }));
+        assert_eq!(
+            h.sibling.borrow().received.last(),
+            Some(&Received::Mouse(Mouse {
+                button,
+                ..mouse(Type::Press, 1, 1)
+            }))
+        );
+    }
+    h.mouse(Type::Drag, 3, 17);
+    h.mouse(Type::Release, 3, 17);
+    assert_eq!(
+        h.owner.borrow().received,
+        [
+            received(Type::Press, 1, 1),
+            received(Type::Drag, 1, 13),
+            received(Type::Release, 1, 13)
+        ]
+    );
+    assert_eq!(
+        h.sibling.borrow().received.len(),
+        4,
+        "only the wheel ticks reach the sibling"
+    );
     h.app.shutdown().await;
 }
 

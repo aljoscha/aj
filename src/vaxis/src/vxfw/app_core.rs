@@ -418,7 +418,9 @@ impl MouseHandler {
         mouse: Mouse,
     ) {
         self.mouse = Some(mouse);
-        if mouse.kind == Type::Press || (mouse.kind == Type::Motion && mouse.button == Button::None)
+        let wheel = mouse.button.is_wheel();
+        if (mouse.kind == Type::Press && !wheel)
+            || (mouse.kind == Type::Motion && mouse.button == Button::None)
         {
             self.cancel_capture(core, ctx);
             self.cancelled_capture = false;
@@ -432,13 +434,17 @@ impl MouseHandler {
         diff_hit_lists(&self.last_hit_list, &hits, core, ctx);
         self.last_hit_list = hits.clone();
 
-        if self.cancelled_capture && matches!(mouse.kind, Type::Drag | Type::Release) {
+        if self.cancelled_capture && !wheel && matches!(mouse.kind, Type::Drag | Type::Release) {
             if mouse.kind == Type::Release {
                 self.cancelled_capture = false;
             }
             return;
         }
-        if let Some((owner, button)) = &self.capture {
+        // Wheel input follows normal hit-testing without changing a held
+        // button's owner. A wheel tick is encoded as Press but starts no drag.
+        if let Some((owner, button)) = &self.capture
+            && !wheel
+        {
             let mut path = Vec::new();
             let mut captured_mouse = mouse;
             // X10 releases name no button. Capture supplies its owner.
@@ -508,7 +514,10 @@ impl MouseHandler {
     }
 
     fn take_capture_request(&mut self, ctx: &mut EventContext, widget: &WidgetRef, mouse: Mouse) {
-        if std::mem::take(&mut ctx.capture_mouse) && mouse.kind == Type::Press {
+        if std::mem::take(&mut ctx.capture_mouse)
+            && mouse.kind == Type::Press
+            && !mouse.button.is_wheel()
+        {
             self.capture = Some((Rc::clone(widget), mouse.button));
         }
     }

@@ -25175,6 +25175,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wheel_scroll_keeps_selection_editable_and_copies_on_release() {
+        use vaxis::mouse::Type;
+
+        for wheel_col in [8, 79] {
+            let chat = empty_chat();
+            fold_lines(&chat, 80);
+            let (mut app, _writer, shell, root) = init_app_with_chat(chat).await;
+            let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+            let row = rows
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, line)| line.contains("line-"))
+                .map(|(row, _)| row)
+                .unwrap();
+            let col = rows[row].find("line-").unwrap();
+            let col = i16::try_from(rows[row][..col].chars().count()).unwrap();
+            let row = i16::try_from(row).unwrap();
+            app.handle_input(left_mouse_at(row, col, Type::Press));
+            app.handle_input(left_mouse_at(row, col + 4, Type::Drag));
+            assert!(shell.borrow().view().transcript.borrow().has_selection());
+            app.render(&root).unwrap();
+            app.handle_input(wheel_up_at(row, wheel_col));
+            app.render(&root).unwrap();
+            assert!(
+                !shell.borrow().view().transcript.borrow().is_at_bottom(),
+                "the wheel still scrolls, including over the scrollbar"
+            );
+
+            let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+            let end_row = rows
+                .iter()
+                .rposition(|line| line.contains("line-"))
+                .unwrap();
+            let end_row = i16::try_from(end_row).unwrap();
+            app.handle_input(left_mouse_at(end_row, col + 8, Type::Drag));
+            app.handle_input(left_mouse_at(end_row, col + 8, Type::Release));
+            let copied = shell
+                .borrow()
+                .view()
+                .selection_copied
+                .get()
+                .expect("release after scrolling copies the selection");
+            assert!(
+                copied.chars > 4,
+                "continued dragging extended the initial four-character range"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn selection_drag_capture_crosses_sidebar_and_viewport_edges() {
         use vaxis::mouse::Type;
 

@@ -2923,8 +2923,10 @@ impl TranscriptView {
             }
             return;
         }
-        if matches!(m.button, mouse::Button::WheelUp | mouse::Button::WheelDown) {
-            // A wheel tick is a manual scroll, so it supersedes any glide.
+        if m.button.is_wheel() {
+            // Scrolling interrupts a plain click, not a held selection.
+            self.agent_click = None;
+            self.last_click = None;
             self.cancel_scroll_anim();
         }
         if m.button == mouse::Button::WheelUp {
@@ -3601,7 +3603,9 @@ impl Widget for TranscriptView {
         self.reconcile_model();
         match event {
             Event::Mouse(m) => {
-                if !matches!(m.button, mouse::Button::Left | mouse::Button::None) {
+                if !matches!(m.button, mouse::Button::Left | mouse::Button::None)
+                    && !m.button.is_wheel()
+                {
                     self.cancel_selection_gesture();
                 }
                 self.observe_mouse(ctx, event, m);
@@ -8063,40 +8067,61 @@ mod tests {
         )
         .expect("row fits");
 
-        let mut ec = EventContext::new();
-        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
-        view.handle_event(&mut ec, &Event::MouseLeave);
-        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Release));
+        view.handle_event(&mut EventContext::new(), &mouse(5, row, mouse::Type::Press));
+        view.handle_event(&mut EventContext::new(), &Event::MouseLeave);
+        view.handle_event(
+            &mut EventContext::new(),
+            &mouse(5, row, mouse::Type::Release),
+        );
         assert_eq!(observed.get(), None, "MouseLeave cancels the click");
 
-        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
+        view.handle_event(&mut EventContext::new(), &mouse(5, row, mouse::Type::Press));
         view.reset_to_tail();
         assert_eq!(
             view.subagent_at_point(row, 5),
             None,
             "reset drops stale rendered geometry",
         );
-        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Release));
+        view.handle_event(
+            &mut EventContext::new(),
+            &mouse(5, row, mouse::Type::Release),
+        );
         assert_eq!(observed.get(), None, "reset cancels the click");
 
         let _ = view.draw(&ctx);
-        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
-        view.capture_event(&mut ec, &mouse(6, row, mouse::Type::Drag));
+        view.handle_event(&mut EventContext::new(), &mouse(5, row, mouse::Type::Press));
+        view.capture_event(&mut EventContext::new(), &mouse(6, row, mouse::Type::Drag));
         assert_eq!(
             view.agent_click, None,
             "capture-phase drag cancels the click"
         );
-        view.handle_event(&mut ec, &mouse(6, row, mouse::Type::Release));
+        view.handle_event(
+            &mut EventContext::new(),
+            &mouse(6, row, mouse::Type::Release),
+        );
         assert_eq!(observed.get(), None, "drag does not navigate");
 
-        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
+        view.reset_to_tail();
+        let _ = view.draw(&ctx);
+        view.handle_event(&mut EventContext::new(), &mouse(5, row, mouse::Type::Press));
+        assert!(
+            view.agent_click.is_some(),
+            "a plain click is armed before scrolling"
+        );
         let mut wheel = match mouse(5, row, mouse::Type::Press) {
             Event::Mouse(mouse) => mouse,
             _ => unreachable!(),
         };
         wheel.button = mouse::Button::WheelUp;
-        view.handle_event(&mut ec, &Event::Mouse(wheel));
-        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Release));
+        view.handle_event(&mut EventContext::new(), &Event::Mouse(wheel));
+        assert!(
+            view.selection_origin.is_some(),
+            "scrolling preserves the held gesture"
+        );
+        view.handle_event(
+            &mut EventContext::new(),
+            &mouse(5, row, mouse::Type::Release),
+        );
         assert_eq!(observed.get(), None, "wheel input cancels the click");
     }
 

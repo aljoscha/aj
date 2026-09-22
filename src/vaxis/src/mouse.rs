@@ -69,6 +69,16 @@ pub enum Button {
     Button11 = 131,
 }
 
+impl Button {
+    /// Wheel directions are scroll impulses, not held mouse buttons.
+    pub const fn is_wheel(self) -> bool {
+        matches!(
+            self,
+            Self::WheelUp | Self::WheelDown | Self::WheelLeft | Self::WheelRight
+        )
+    }
+}
+
 /// Error from converting a raw byte to a [`Button`]: the value is not a known
 /// button code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

@@ -376,7 +376,8 @@ impl EventContext {
 
     /// Own the current button press and its drag/release, even outside this
     /// widget or the viewport. Coordinates remain widget-local and may be
-    /// negative. Only a press can acquire capture. Window focus loss, a focus
+    /// negative. Only a non-wheel press can acquire capture. Wheel input keeps
+    /// normal hit-testing without changing capture. Window focus loss, a focus
     /// request outside the owner's subtree, removal from layout, or a new
     /// press/buttonless motion cancels it with [`Event::MouseCaptureLost`].
     /// Hover enter/leave still follows the pointer.
