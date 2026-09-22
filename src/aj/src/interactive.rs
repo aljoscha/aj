@@ -6733,6 +6733,9 @@ impl Shell {
                 let was_dragging = self.sidebar_dragging;
                 if mouse.kind == Type::Press && mouse.button == Button::Left {
                     self.sidebar_dragging = on_separator;
+                    if on_separator {
+                        ctx.capture_mouse();
+                    }
                 }
                 if self.sidebar_dragging
                     && mouse.button == Button::Left
@@ -6747,13 +6750,18 @@ impl Shell {
                     // outside the terminal and could not be reported.
                     self.sidebar_dragging = false;
                 }
-                sidebar.separator_active =
-                    self.sidebar_dragging || i32::from(mouse.col) == i32::from(sidebar.cols()) - 1;
-                if on_separator || was_dragging || self.sidebar_dragging {
+                sidebar.separator_active = self.sidebar_dragging
+                    || ((was_dragging || !matches!(mouse.kind, Type::Drag | Type::Release))
+                        && i32::from(mouse.col) == i32::from(sidebar.cols()) - 1);
+                if (on_separator && !matches!(mouse.kind, Type::Drag | Type::Release))
+                    || was_dragging
+                    || self.sidebar_dragging
+                {
                     ctx.consume_event();
                 }
             }
-            Event::Mouse(_) | Event::MouseLeave | Event::FocusOut => {
+            Event::MouseLeave if self.sidebar_dragging => {}
+            Event::Mouse(_) | Event::MouseLeave | Event::FocusOut | Event::MouseCaptureLost => {
                 self.sidebar_dragging = false;
                 sidebar.separator_active = false;
             }
@@ -7242,7 +7250,11 @@ impl Widget for Shell {
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
-        if matches!(event, Event::MouseLeave | Event::FocusOut) {
+        if matches!(
+            event,
+            Event::MouseLeave | Event::FocusOut | Event::MouseCaptureLost
+        ) || matches!(event, Event::Mouse(_)) && ctx.phase == vaxis::vxfw::Phase::AtTarget
+        {
             self.resize_sidebar(ctx, event);
         }
         if let Event::Init = event {
@@ -9627,6 +9639,7 @@ mod tests {
             .transcript
             .borrow_mut()
             .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Press));
+        let mut ctx = EventContext::new();
         shell
             .borrow()
             .view()
@@ -9639,12 +9652,14 @@ mod tests {
             Some(AgentPickerOutcome::Observe(AgentId::Sub(7))),
         );
 
+        let mut ctx = EventContext::new();
         shell
             .borrow()
             .view()
             .transcript
             .borrow_mut()
             .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Press));
+        let mut ctx = EventContext::new();
         shell.borrow_mut().capture_event(
             &mut ctx,
             &Event::KeyPress(Key {
@@ -9652,6 +9667,7 @@ mod tests {
                 ..Key::default()
             }),
         );
+        let mut ctx = EventContext::new();
         shell
             .borrow()
             .view()
@@ -25159,6 +25175,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selection_drag_capture_crosses_sidebar_and_viewport_edges() {
+        use vaxis::mouse::Type;
+
+        let chat = empty_chat();
+        fold_lines(&chat, 80);
+        let (mut app, _writer, shell, root) = init_app_with_chat(chat).await;
+        pin_sidebar_open(&shell);
+        app.render(&root).unwrap();
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+        // The header owns the first screen row. Press visible content below it.
+        let row = rows
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, line)| line.contains("line-"))
+            .map(|(row, _)| row)
+            .unwrap();
+        let col = rows[row].find("line-").unwrap();
+        let col = i16::try_from(rows[row][..col].chars().count()).unwrap();
+        let row = i16::try_from(row).unwrap();
+        let before = rows
+            .iter()
+            .find(|line| line.contains("line-"))
+            .unwrap()
+            .clone();
+        app.handle_input(left_mouse_at(row, col, Type::Press));
+        assert!(
+            shell.borrow().view().transcript.borrow().has_selection(),
+            "the press lands on selectable transcript text"
+        );
+        app.handle_input(left_mouse_at(row + 2, col + 4, Type::Drag));
+        app.handle_input(left_mouse_at(row + 3, 0, Type::Drag));
+        app.render(&root).unwrap();
+        app.handle_input(left_mouse_at(-10, 0, Type::Drag));
+        app.render(&root).unwrap();
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+        assert_ne!(
+            rows.iter().find(|line| line.contains("line-")).unwrap(),
+            &before,
+            "dragging above the viewport scrolls toward earlier text"
+        );
+        app.handle_input(left_mouse_at(-10, 0, Type::Release));
+        assert!(
+            shell.borrow().view().selection_copied.get().is_some(),
+            "release outside completes and copies the owned selection"
+        );
+        assert!(shell.borrow().take_session_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn scrollbar_drag_capture_crosses_sidebar_and_viewport_edges() {
+        use vaxis::mouse::Type;
+
+        let chat = empty_chat();
+        fold_lines(&chat, 80);
+        let (mut app, _writer, shell, root) = init_app_with_chat(chat).await;
+        pin_sidebar_open(&shell);
+        app.render(&root).unwrap();
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+        let thumb = rows
+            .iter()
+            .position(|line| line.chars().nth(79) == Some('▐'))
+            .expect("a visible transcript thumb at the right edge");
+        app.handle_input(left_mouse_at(
+            i16::try_from(thumb).unwrap(),
+            79,
+            Type::Press,
+        ));
+        app.handle_input(left_mouse_at(3, 0, Type::Drag));
+        app.render(&root).unwrap();
+        app.handle_input(left_mouse_at(-10, 0, Type::Drag));
+        app.render(&root).unwrap();
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+        assert!(
+            rows.iter().any(|line| line.contains("line-000")),
+            "top: {rows:?}"
+        );
+        app.handle_input(left_mouse_at(60, 90, Type::Drag));
+        app.render(&root).unwrap();
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+        assert!(
+            rows.iter().any(|line| line.contains("line-079")),
+            "bottom: {rows:?}"
+        );
+        app.handle_input(left_mouse_at(60, 90, Type::Release));
+        app.handle_input(left_mouse_at(-10, 0, Type::Drag));
+        app.render(&root).unwrap();
+        assert!(
+            flatten(&shell.borrow_mut().draw(&full_draw_ctx()))
+                .iter()
+                .any(|line| line.contains("line-079")),
+            "release ends scrolling"
+        );
+        assert!(!shell.borrow().view().transcript.borrow().has_selection());
+        assert!(shell.borrow().take_session_request().is_none());
+    }
+
+    #[tokio::test]
     async fn sidebar_drag_resizes_without_selecting_or_saving() {
         use vaxis::mouse::{Shape, Type};
 
@@ -25185,7 +25299,12 @@ mod tests {
         app.handle_input(left_mouse_at(new_row, separator, Type::Press));
         // Cross both panes and both size limits. Every repaint changes the hit
         // tree, so retaining the gesture cannot depend on the initial target.
-        for (col, width) in [(39, 40), (79, 50), (0, aj_conf::MIN_SIDEBAR_COLS), (34, 35)] {
+        for (col, width) in [
+            (39, 40),
+            (90, 50),
+            (-10, aj_conf::MIN_SIDEBAR_COLS),
+            (34, 35),
+        ] {
             app.handle_input(left_mouse_at(3, col, Type::Drag));
             sync_sidebar(&world, &shell);
             app.render(&root).expect("drag");

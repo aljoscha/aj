@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::cell::CursorShape;
 use crate::error::Error;
 use crate::key::Key;
-use crate::mouse::Mouse;
+use crate::mouse::{Button, Mouse, Type};
 use crate::tty::Tty;
 use crate::vaxis::Vaxis;
 use crate::vxfw::render_debug;
@@ -334,6 +334,7 @@ fn compute_frame_stats(frames: &VecDeque<FrameRecord>) -> FrameStats {
 /// capturing phase. Leaves the per-frame `redraw` latch untouched.
 pub(crate) fn reset_event_state(ctx: &mut EventContext) {
     ctx.consume_event = false;
+    ctx.capture_mouse = false;
     ctx.phase = Phase::Capturing;
 }
 
@@ -386,6 +387,9 @@ pub(crate) struct MouseHandler {
     pub(crate) last_frame: Surface,
     pub(crate) last_hit_list: Vec<HitResult>,
     pub(crate) mouse: Option<Mouse>,
+    capture: Option<(WidgetRef, Button)>,
+    /// A cancelled gesture's remaining drag/release must not reach a new owner.
+    cancelled_capture: bool,
 }
 
 impl MouseHandler {
@@ -400,12 +404,13 @@ impl MouseHandler {
             },
             last_hit_list: Vec::new(),
             mouse: None,
+            capture: None,
+            cancelled_capture: false,
         }
     }
 
-    /// Dispatches a mouse event: hit-test the last frame, diff for enter/leave,
-    /// then walk capture (root to target-exclusive), target, and bubble
-    /// (target-exclusive back to root), stopping on consume.
+    /// Hit-test for hover, then dispatch along the captured owner's ancestry
+    /// or the hit path. Walk capture, target and bubble, stopping on consume.
     pub(crate) fn handle_mouse(
         &mut self,
         core: &mut AppCore,
@@ -413,6 +418,11 @@ impl MouseHandler {
         mouse: Mouse,
     ) {
         self.mouse = Some(mouse);
+        if mouse.kind == Type::Press || (mouse.kind == Type::Motion && mouse.button == Button::None)
+        {
+            self.cancel_capture(core, ctx);
+            self.cancelled_capture = false;
+        }
 
         let mut hits: Vec<HitResult> = Vec::new();
         if let Some(point) = surface_point(&self.last_frame, mouse) {
@@ -422,15 +432,54 @@ impl MouseHandler {
         diff_hit_lists(&self.last_hit_list, &hits, core, ctx);
         self.last_hit_list = hits.clone();
 
+        if self.cancelled_capture && matches!(mouse.kind, Type::Drag | Type::Release) {
+            if mouse.kind == Type::Release {
+                self.cancelled_capture = false;
+            }
+            return;
+        }
+        if let Some((owner, button)) = &self.capture {
+            let mut path = Vec::new();
+            let mut captured_mouse = mouse;
+            // X10 releases name no button. Capture supplies its owner.
+            if mouse.kind == Type::Release && mouse.button == Button::None {
+                captured_mouse.button = *button;
+            }
+            if captured_mouse.button != *button
+                || !mouse_path(&self.last_frame, owner, captured_mouse, &mut path)
+            {
+                self.cancel_capture(core, ctx);
+                return;
+            }
+            self.dispatch_path(core, ctx, captured_mouse, path);
+            if mouse.kind == Type::Release {
+                self.capture = None;
+            }
+            return;
+        }
+        let path = hits
+            .into_iter()
+            .map(|hit| (hit.widget, local_mouse_event(mouse, hit.local)))
+            .collect();
+        self.dispatch_path(core, ctx, mouse, path);
+    }
+
+    fn dispatch_path(
+        &mut self,
+        core: &mut AppCore,
+        ctx: &mut EventContext,
+        mouse: Mouse,
+        mut path: Vec<(WidgetRef, Event)>,
+    ) {
         // The deepest hit is the target; the rest are ancestors root-first.
-        let Some(target) = hits.pop() else {
+        let Some((target, event)) = path.pop() else {
             return;
         };
 
         ctx.phase = Phase::Capturing;
-        for item in &hits {
-            let event = local_mouse_event(mouse, item.local);
-            dispatch_capture(&item.widget, ctx, &event);
+        for (widget, event) in &path {
+            dispatch_capture(widget, ctx, event);
+            self.take_capture_request(ctx, widget, mouse);
             core.handle_command(&mut ctx.cmds);
             if ctx.consume_event {
                 return;
@@ -439,8 +488,8 @@ impl MouseHandler {
 
         ctx.phase = Phase::AtTarget;
         {
-            let event = local_mouse_event(mouse, target.local);
-            dispatch_event(&target.widget, ctx, &event);
+            dispatch_event(&target, ctx, &event);
+            self.take_capture_request(ctx, &target, mouse);
             core.handle_command(&mut ctx.cmds);
             if ctx.consume_event {
                 return;
@@ -448,12 +497,50 @@ impl MouseHandler {
         }
 
         ctx.phase = Phase::Bubbling;
-        while let Some(item) = hits.pop() {
-            let event = local_mouse_event(mouse, item.local);
-            dispatch_event(&item.widget, ctx, &event);
+        while let Some((widget, event)) = path.pop() {
+            dispatch_event(&widget, ctx, &event);
+            self.take_capture_request(ctx, &widget, mouse);
             core.handle_command(&mut ctx.cmds);
             if ctx.consume_event {
                 return;
+            }
+        }
+    }
+
+    fn take_capture_request(&mut self, ctx: &mut EventContext, widget: &WidgetRef, mouse: Mouse) {
+        if std::mem::take(&mut ctx.capture_mouse) && mouse.kind == Type::Press {
+            self.capture = Some((Rc::clone(widget), mouse.button));
+        }
+    }
+
+    pub(crate) fn cancel_capture(&mut self, core: &mut AppCore, ctx: &mut EventContext) {
+        if let Some((owner, _)) = self.capture.take() {
+            self.cancelled_capture = true;
+            let phase = ctx.phase;
+            let consumed = ctx.consume_event;
+            ctx.phase = Phase::AtTarget;
+            dispatch_event(&owner, ctx, &Event::MouseCaptureLost);
+            core.handle_command(&mut ctx.cmds);
+            ctx.phase = phase;
+            ctx.consume_event = consumed;
+            ctx.capture_mouse = false;
+        }
+    }
+
+    /// A focus request outside the captured subtree (for example an opening
+    /// modal) interrupts the gesture. Focusing its owner or content does not.
+    pub(crate) fn focus_changed(
+        &mut self,
+        core: &mut AppCore,
+        ctx: &mut EventContext,
+        focused: &WidgetRef,
+    ) {
+        if let (Some((owner, _)), Some(mouse)) = (&self.capture, self.mouse) {
+            let mut path = Vec::new();
+            if !mouse_path(&self.last_frame, focused, mouse, &mut path)
+                || !path.iter().any(|(widget, _)| widget_eq(widget, owner))
+            {
+                self.cancel_capture(core, ctx);
             }
         }
     }
@@ -469,6 +556,11 @@ impl MouseHandler {
         let Some(mouse) = self.mouse else {
             return;
         };
+        if let Some((owner, _)) = &self.capture {
+            if !mouse_path(surface, owner, mouse, &mut Vec::new()) {
+                self.cancel_capture(core, ctx);
+            }
+        }
         let mut hits: Vec<HitResult> = Vec::new();
         if let Some(point) = surface_point(surface, mouse) {
             surface.hit_test(point, &mut hits);
@@ -477,14 +569,59 @@ impl MouseHandler {
         self.last_hit_list = hits;
     }
 
-    /// Sends [`Event::MouseLeave`] to every widget in the last hit list, used
-    /// when the window loses focus.
-    pub(crate) fn mouse_exit(&self, core: &mut AppCore, ctx: &mut EventContext) {
+    /// Cancel capture and clear hover when the terminal window loses focus.
+    pub(crate) fn mouse_exit(&mut self, core: &mut AppCore, ctx: &mut EventContext) {
+        self.cancel_capture(core, ctx);
         for item in &self.last_hit_list {
             dispatch_event(&item.widget, ctx, &Event::MouseLeave);
             core.handle_command(&mut ctx.cmds);
         }
+        self.last_hit_list.clear();
+        self.mouse = None;
     }
+}
+
+/// Locate the captured owner's ancestry in the current layout, independently
+/// of hit-testing. Each widget receives signed coordinates relative to its own
+/// origin, so crossing a pane or viewport boundary does not end the gesture.
+fn mouse_path(
+    surface: &Surface,
+    owner: &WidgetRef,
+    mouse: Mouse,
+    path: &mut Vec<(WidgetRef, Event)>,
+) -> bool {
+    if surface.size.width == 0 || surface.size.height == 0 {
+        return false;
+    }
+    let start = path.len();
+    if let Some(widget) = &surface.widget {
+        if widget.borrow().wants_events() {
+            path.push((Rc::clone(widget), Event::Mouse(mouse)));
+            if widget_eq(widget, owner) {
+                return true;
+            }
+        }
+    }
+    for child in &surface.children {
+        let coordinate = |value: i16, origin: i32| {
+            i16::try_from(
+                i32::from(value)
+                    .saturating_sub(origin)
+                    .clamp(i32::from(i16::MIN), i32::from(i16::MAX)),
+            )
+            .expect("clamped mouse coordinate")
+        };
+        let local = Mouse {
+            row: coordinate(mouse.row, child.origin.row),
+            col: coordinate(mouse.col, child.origin.col),
+            ..mouse
+        };
+        if mouse_path(&child.surface, owner, local, path) {
+            return true;
+        }
+    }
+    path.truncate(start);
+    false
 }
 
 /// Translates a mouse report into a surface-local [`Point`], or `None` if it

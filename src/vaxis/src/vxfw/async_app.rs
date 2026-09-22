@@ -74,6 +74,7 @@ fn apply_pending_focus(core: &mut AppCore, ctx: &mut EventContext, running: &mut
     let Some(widget) = core.wants_focus.take() else {
         return;
     };
+    running.mouse.focus_changed(core, ctx, &widget);
     running.focus.focus_widget(ctx, widget);
     core.handle_command(&mut ctx.cmds);
     let root = Rc::clone(&running.focus.root);
@@ -343,6 +344,9 @@ impl AsyncApp {
             .mouse
             .update_mouse(&mut self.core, &surface, &mut self.ctx);
         if let Some(widget) = self.core.wants_focus.take() {
+            running
+                .mouse
+                .focus_changed(&mut self.core, &mut self.ctx, &widget);
             running.focus.focus_widget(&mut self.ctx, widget);
             self.core.handle_command(&mut self.ctx.cmds);
         }

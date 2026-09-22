@@ -2047,11 +2047,10 @@ impl TranscriptView {
     pub(crate) fn suspend(&mut self) {
         self.cancel_scroll_anim();
         self.cancel_selection_gesture();
-        // Only the vertical bar is enabled. MouseLeave cancels its thumb drag
-        // without synthesizing a release that might copy the selection.
+        // Cancellation never synthesizes a release that might copy text.
         self.bars
             .borrow_mut()
-            .handle_event(&mut EventContext::new(), &Event::MouseLeave);
+            .handle_event(&mut EventContext::new(), &Event::MouseCaptureLost);
         *self.cache.borrow_mut() = EntryRenderCache::new();
         self.entry_text = EntryTextCache::new();
         self.agent_hit_rows = Vec::new();
@@ -3212,6 +3211,7 @@ impl TranscriptView {
                 self.selection = Some(selection);
                 self.selection_origin = Some(selection);
                 self.follow_tail = false;
+                ctx.capture_mouse();
                 ctx.redraw = true;
             }
             mouse::Type::Drag => {
@@ -3629,6 +3629,11 @@ impl Widget for TranscriptView {
                 self.list.borrow_mut().handle_event(ctx, event);
             }
             Event::MouseLeave => {
+                self.agent_click = None;
+                self.last_click = None;
+                self.bars.borrow_mut().handle_event(ctx, event);
+            }
+            Event::MouseCaptureLost => {
                 self.cancel_selection_gesture();
                 self.bars.borrow_mut().handle_event(ctx, event);
             }
@@ -8151,6 +8156,7 @@ mod tests {
         // the `o` in "row 1" selects the complete regular-character run.
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Press));
+        let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Release));
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Press));
@@ -8162,6 +8168,7 @@ mod tests {
 
         // Dragging onto the digit snaps the moving edge to that whole run and
         // retains the whitespace between the two words.
+        let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(5, 2, mouse::Type::Drag));
         let selection = view.selection.expect("word drag kept a selection");
         assert_eq!(
@@ -8189,6 +8196,7 @@ mod tests {
         for _ in 0..2 {
             let mut ec = EventContext::new();
             view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Press));
+            let mut ec = EventContext::new();
             view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Release));
         }
         let mut ec = EventContext::new();
@@ -8205,6 +8213,7 @@ mod tests {
             "line selection reaches the right edge",
         );
 
+        let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Release));
         let copied = ec.cmds.iter().find_map(|cmd| match cmd {
             vaxis::vxfw::Command::CopyToClipboard(text) => Some(text.as_str()),

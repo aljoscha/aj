@@ -1,11 +1,10 @@
 //! [`ScrollBars`]: wraps a scrollable view and draws draggable scroll bars.
 //!
 //! The wrapped view is anything implementing [`ScrollableView`], by default a
-//! [`ScrollView`]. This is the only widget that overrides
-//! [`capture_event`](Widget::capture_event): while a thumb is being dragged it
-//! intercepts the drag and release in the capturing phase, before they reach
-//! the inner content, and translates the thumb position into a scroll position
-//! via the view's [`ScrollableView`] scroll accessors.
+//! [`ScrollView`]. A thumb press captures the mouse, retaining drag and release
+//! beyond the viewport. The bars handle these at the target or intercept them
+//! in [`capture_event`](Widget::capture_event) before they reach inner content,
+//! translating the thumb position through the view's scroll accessors.
 //!
 //! # Identity and event routing
 //!
@@ -497,7 +496,7 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
                 if let Some(total) = content_extent.filter(|&t| t > 0) {
                     let total_f = num::u32_to_f32(total);
                     let target_line_f = (new_thumb_top_f * total_f / widget_height_f).round();
-                    let target_line = num::f32_to_u32(target_line_f);
+                    let target_line = num::f32_to_u32(target_line_f).min(total - 1);
                     let idx = self.view.borrow().item_at_line(target_line);
                     if let Some(idx) = idx {
                         self.view.borrow_mut().set_scroll_top(idx);
@@ -552,6 +551,14 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        // Captured events can target the bars themselves, rather than passing
+        // through their capturing phase on the way to the content.
+        if matches!(event, Event::Mouse(_)) {
+            self.capture_event(ctx, event);
+            if ctx.consume_event {
+                return;
+            }
+        }
         match event {
             Event::Mouse(mouse) => {
                 let mouse_col: u16 = if mouse.col < 0 {
@@ -585,7 +592,7 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
                         u32::from(mouse_row).saturating_sub(self.vertical_thumb_top_row),
                     )
                     .unwrap_or(u8::MAX);
-                    return ctx.consume_event();
+                    return ctx.capture_mouse();
                 }
 
                 // Horizontal thumb hover.
@@ -608,10 +615,21 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
                         u32::from(mouse_col).saturating_sub(self.horizontal_thumb_start_col),
                     )
                     .unwrap_or(u8::MAX);
-                    ctx.consume_event();
+                    ctx.capture_mouse();
                 }
             }
-            Event::MouseLeave => self.is_dragging_vertical_thumb = false,
+            Event::MouseCaptureLost => {
+                self.is_dragging_vertical_thumb = false;
+                self.is_dragging_horizontal_thumb = false;
+                self.is_hovering_vertical_thumb = false;
+                self.is_hovering_horizontal_thumb = false;
+                ctx.redraw = true;
+            }
+            Event::MouseLeave => {
+                ctx.redraw |= self.is_hovering_vertical_thumb || self.is_hovering_horizontal_thumb;
+                self.is_hovering_vertical_thumb = false;
+                self.is_hovering_horizontal_thumb = false;
+            }
             _ => {}
         }
     }

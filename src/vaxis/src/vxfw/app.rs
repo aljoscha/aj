@@ -212,6 +212,7 @@ impl App {
 
             // Handle a focus change before we lay out.
             if let Some(widget) = self.core.wants_focus.take() {
+                mouse_handler.focus_changed(&mut self.core, &mut ctx, &widget);
                 focus_handler.focus_widget(&mut ctx, widget);
                 self.core.handle_command(&mut ctx.cmds);
             }
@@ -230,6 +231,7 @@ impl App {
             // state and request another redraw.
             mouse_handler.update_mouse(&mut self.core, &surface, &mut ctx);
             if let Some(widget) = self.core.wants_focus.take() {
+                mouse_handler.focus_changed(&mut self.core, &mut ctx, &widget);
                 focus_handler.focus_widget(&mut ctx, widget);
                 self.core.handle_command(&mut ctx.cmds);
             }

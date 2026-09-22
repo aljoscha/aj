@@ -32,6 +32,11 @@
 //! [`EventContext::consume_event`]. The App drives the walk (see the `app`
 //! module) and resets the per-event state (`consume_event` and `phase`) between
 //! events, while the `redraw` latch persists across the whole frame.
+//!
+//! A widget accepting a button press can call [`EventContext::capture_mouse`].
+//! Its drag and release then follow that widget's ancestry rather than the
+//! pointer's hit path, retaining signed local coordinates outside the widget.
+//! Hover enter/leave notifications remain independent of gesture ownership.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -225,6 +230,9 @@ pub enum Event {
     MouseLeave,
     /// The mouse entered the widget.
     MouseEnter,
+    /// An owned mouse gesture was cancelled, without a release. The widget
+    /// should discard drag state without performing its release action.
+    MouseCaptureLost,
 }
 
 /// A custom application event.
@@ -328,6 +336,7 @@ pub struct EventContext {
     pub redraw: bool,
     /// Quit the application.
     pub quit: bool,
+    pub(crate) capture_mouse: bool,
 }
 
 impl EventContext {
@@ -340,6 +349,7 @@ impl EventContext {
             consume_event: false,
             redraw: false,
             quit: false,
+            capture_mouse: false,
         }
     }
 
@@ -362,6 +372,17 @@ impl EventContext {
     /// Marks the event consumed without requesting a redraw.
     pub fn consume_event(&mut self) {
         self.consume_event = true;
+    }
+
+    /// Own the current button press and its drag/release, even outside this
+    /// widget or the viewport. Coordinates remain widget-local and may be
+    /// negative. Only a press can acquire capture. Window focus loss, a focus
+    /// request outside the owner's subtree, removal from layout, or a new
+    /// press/buttonless motion cancels it with [`Event::MouseCaptureLost`].
+    /// Hover enter/leave still follows the pointer.
+    pub fn capture_mouse(&mut self) {
+        self.capture_mouse = true;
+        self.consume_event();
     }
 
     /// Requests a mouse-shape change (implies a redraw).
