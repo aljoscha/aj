@@ -1603,106 +1603,57 @@ fn set_unix_file_permissions(
 /// under a second.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// If a `.lock` directory exists but its mtime is older than this,
-/// assume the holder crashed without cleaning up and steal the lock.
-const STALE_LOCK_AGE: Duration = Duration::from_secs(60);
-
 /// Initial backoff between lock-acquisition retries. Doubles on each
 /// attempt up to `MAX_BACKOFF`.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_BACKOFF: Duration = Duration::from_millis(500);
 
-/// Sidecar lock for `auth.json`, implemented as an empty directory
-/// next to the file. `mkdir` is atomic on every supported OS, so
-/// `create_dir`'s `AlreadyExists` error is the natural "already
-/// locked" signal.
-///
-/// On `Drop` we best-effort `rmdir`; if the process aborts before
-/// `Drop` runs, the next acquirer detects the stale lock via mtime
-/// and steals it.
+/// Exclusive OS lock on a persistent sidecar file. Closing the handle releases
+/// it, including when the process dies. Never unlink the sidecar: replacing its
+/// inode would let another writer lock a different file while a holder is live.
 struct FileLock {
-    path: PathBuf,
+    _file: std::fs::File,
 }
 
 impl FileLock {
-    /// Try once, for a read that must not wait behind another auth operation.
-    /// A held lock answers `Ok(None)`; other I/O failures keep their exact
-    /// error. Unlike [`Self::acquire`], this deliberately does not steal a
-    /// stale lock: deciding staleness and racing a replacement is work an
-    /// advisory check can skip.
+    /// Try once without waiting behind another auth operation.
     fn try_acquire(target_path: &Path) -> Result<Option<Self>, AuthError> {
-        let lock_path = lock_path_for(target_path);
+        // Harden the parent before creating any filesystem state.
         prepare_auth_parent(target_path)?;
-        match create_lock_dir(&lock_path) {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(lock_path_for(target_path))?;
+        match file.try_lock() {
             Ok(()) => {
-                let lock = Self { path: lock_path };
+                let lock = Self { _file: file };
                 make_existing_auth_file_private(target_path)?;
                 Ok(Some(lock))
             }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-            Err(err) => Err(AuthError::Io(err)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(AuthError::Io(error)),
         }
     }
 
-    /// Acquire the lock, retrying with exponential backoff up to
-    /// [`LOCK_TIMEOUT`]. Returns [`AuthError::LockTimeout`] if a
-    /// sibling holds the lock the whole time (and isn't stale).
+    /// Retry with async backoff until [`LOCK_TIMEOUT`], then report contention.
+    /// A live holder is never displaced, regardless of age.
     async fn acquire(target_path: &Path) -> Result<Self, AuthError> {
-        let lock_path = lock_path_for(target_path);
-
-        // The lock is the first filesystem object an auth operation creates.
-        // Harden its parent before creating it so the lock path cannot open a
-        // process-default-permission window ahead of the credential write.
-        prepare_auth_parent(target_path)?;
-
         let start = std::time::Instant::now();
         let mut backoff = INITIAL_BACKOFF;
         loop {
-            match create_lock_dir(&lock_path) {
-                Ok(()) => {
-                    let lock = Self { path: lock_path };
-                    make_existing_auth_file_private(target_path)?;
-                    return Ok(lock);
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if try_steal_stale_lock(&lock_path, STALE_LOCK_AGE) {
-                        // Try again immediately after stealing; if a
-                        // racing acquirer beat us we'll re-enter the
-                        // backoff path on the next iteration.
-                        continue;
-                    }
-                    if start.elapsed() > LOCK_TIMEOUT {
-                        return Err(AuthError::LockTimeout);
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                }
-                Err(e) => return Err(AuthError::Io(e)),
+            if let Some(lock) = Self::try_acquire(target_path)? {
+                return Ok(lock);
             }
+            if start.elapsed() > LOCK_TIMEOUT {
+                return Err(AuthError::LockTimeout);
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
         }
-    }
-}
-
-/// Create a lock directory that is private from its first observable mode.
-fn create_lock_dir(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-
-        std::fs::DirBuilder::new().mode(0o700).create(path)
-    }
-
-    #[cfg(not(unix))]
-    std::fs::create_dir(path)
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        // Best-effort cleanup. Use sync `std::fs` because `Drop`
-        // can't `.await`. The lock path is a directory we created
-        // ourselves, so `remove_dir` succeeds unless something has
-        // already torn it down — fine to ignore that case.
-        let _ = std::fs::remove_dir(&self.path);
     }
 }
 
@@ -1714,30 +1665,6 @@ fn lock_path_for(file_path: &Path) -> PathBuf {
         None => "auth.lock".to_string(),
     };
     parent.join(name)
-}
-
-/// If the lock directory exists and looks abandoned, try to remove
-/// it. Returns `true` only when we actually removed something so the
-/// caller can retry. Any I/O error is swallowed — worst case we just
-/// loop and time out.
-///
-/// `max_age` is the threshold past which a lock is considered stale.
-/// Pulled out as a parameter so tests can drive the steal path with
-/// a tiny age without sleeping out the full production threshold.
-fn try_steal_stale_lock(lock_path: &Path, max_age: Duration) -> bool {
-    let Ok(meta) = std::fs::metadata(lock_path) else {
-        return false;
-    };
-    let Ok(modified) = meta.modified() else {
-        return false;
-    };
-    let Ok(age) = modified.elapsed() else {
-        return false;
-    };
-    if age <= max_age {
-        return false;
-    }
-    std::fs::remove_dir(lock_path).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2732,6 +2659,151 @@ mod tests {
         assert_eq!(listed, expected);
     }
 
+    /// Subprocess entry point for a refresh paused inside the provider call.
+    #[test]
+    fn auth_refresh_process() {
+        let Some(path) = std::env::var_os("AJ_TEST_AUTH_REFRESH_PATH") else {
+            return;
+        };
+        struct PausedRefresh(PathBuf);
+        #[async_trait]
+        impl OAuthProvider for PausedRefresh {
+            fn id(&self) -> &str {
+                "stub"
+            }
+            fn name(&self) -> &str {
+                "Stub"
+            }
+            async fn login(&self, _: &dyn OAuthCallbacks) -> Result<OAuthCredentials, OAuthError> {
+                unreachable!()
+            }
+            async fn refresh_token(
+                &self,
+                _: &OAuthCredentials,
+            ) -> Result<OAuthCredentials, OAuthError> {
+                std::fs::write(self.0.with_extension("ready"), b"ready").unwrap();
+                let mut line = String::new();
+                assert!(std::io::stdin().read_line(&mut line).unwrap() > 0);
+                Ok(OAuthCredentials::new("fresh-r", "fresh-a", i64::MAX))
+            }
+        }
+        let path = PathBuf::from(path);
+        let provider: Arc<dyn OAuthProvider> = Arc::new(PausedRefresh(path.clone()));
+        let providers = HashMap::from([("stub".into(), provider)]);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let storage = AuthStorage::with_providers(path, providers);
+                assert_eq!(
+                    storage
+                        .get_api_key("stub", None)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .key,
+                    "fresh-a"
+                );
+            });
+    }
+
+    #[tokio::test]
+    async fn refresh_excludes_other_process_writes_until_completion_or_death() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        for crash in [false, true] {
+            let (_dir, path) = scratch_path("process-refresh");
+            let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+            storage
+                .insert_bare(
+                    "stub",
+                    AuthCredential::OAuth(OAuthCredentials::new("old-r", "old-a", 1)),
+                )
+                .await
+                .unwrap();
+            let mut child = Child(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "auth::tests::auth_refresh_process",
+                        "--nocapture",
+                    ])
+                    .env("AJ_TEST_AUTH_REFRESH_PATH", &path)
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !path.with_extension("ready").exists() {
+                    assert!(
+                        child.0.try_wait().unwrap().is_none(),
+                        "refresh child exited"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("child must enter the refresh with its lock held");
+
+            // Age cannot establish abandonment: the holder is still refreshing.
+            std::fs::File::open(lock_path_for(&path))
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+                .unwrap();
+            assert_eq!(storage.try_has_auth("stub").await.unwrap(), None);
+            let insert = storage.insert_account("stub", "work", api_key("work-key"));
+            tokio::pin!(insert);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut insert)
+                    .await
+                    .is_err(),
+                "an old but live refresh lock must exclude an account write"
+            );
+
+            if crash {
+                child.0.kill().unwrap();
+            } else {
+                child
+                    .0
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"finish\n")
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(status) = child.0.try_wait().unwrap() {
+                        assert_eq!(status.success(), !crash);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("refresh child must exit");
+            tokio::time::timeout(Duration::from_secs(2), &mut insert)
+                .await
+                .expect("completion or death must release the lock")
+                .unwrap();
+            assert!(matches!(
+                storage.get_account("stub", "").await.unwrap(),
+                Some(AuthCredential::OAuth(c)) if c.access == if crash { "old-a" } else { "fresh-a" }
+            ));
+            assert!(matches!(
+                storage.get_account("stub", "work").await.unwrap(),
+                Some(AuthCredential::ApiKey { key }) if key == "work-key"
+            ));
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn first_write_creates_a_private_parent_and_file() {
@@ -2765,12 +2837,12 @@ mod tests {
 
         let lock = FileLock::acquire(&path).await.expect("acquire auth lock");
         assert_eq!(mode(&parent), 0o700);
-        assert_eq!(mode(&lock_path), 0o700);
+        assert_eq!(mode(&lock_path), 0o600);
         assert!(!path.exists(), "lock acquisition created the auth file");
         drop(lock);
         assert!(
-            !lock_path.exists(),
-            "lock guard did not release its directory"
+            FileLock::try_acquire(&path).unwrap().is_some(),
+            "lock guard did not release exclusive access"
         );
     }
 
@@ -2919,7 +2991,10 @@ mod tests {
             previous
         );
         assert!(
-            !lock_path_for(&path).exists(),
+            std::fs::File::open(lock_path_for(&path))
+                .unwrap()
+                .try_lock()
+                .is_ok(),
             "symlink rejection leaked the acquired lock"
         );
     }
@@ -3015,11 +3090,14 @@ mod tests {
             if existing {
                 assert_eq!(stored["existing"]["key"], "old-secret");
             }
-            let entries = std::fs::read_dir(&parent)
+            let mut entries = std::fs::read_dir(&parent)
                 .expect("list final auth parent")
                 .map(|entry| entry.expect("read final auth entry").path())
                 .collect::<Vec<_>>();
-            assert_eq!(entries, [path], "successful write left residue");
+            entries.sort();
+            let mut expected = vec![path.clone(), lock_path_for(&path)];
+            expected.sort();
+            assert_eq!(entries, expected, "successful write left residue");
         }
     }
 
@@ -3100,10 +3178,15 @@ mod tests {
                     "{site:?}: the failed write changed the prior store"
                 ),
             }
-            assert!(
-                !lock_path_for(&path).exists(),
-                "{site:?}: the failure leaked the acquired lock"
-            );
+            if lock_path_for(&path).exists() {
+                assert!(
+                    std::fs::File::open(lock_path_for(&path))
+                        .unwrap()
+                        .try_lock()
+                        .is_ok(),
+                    "{site:?}: the failure leaked the acquired lock"
+                );
+            }
             if parent.exists() {
                 let residue: Vec<_> = std::fs::read_dir(&parent)
                     .expect("list auth parent")
@@ -3111,7 +3194,7 @@ mod tests {
                     .expect("read auth parent entries")
                     .into_iter()
                     .map(|entry| entry.path())
-                    .filter(|entry| entry != &path)
+                    .filter(|entry| entry != &path && entry != &lock_path_for(&path))
                     .collect();
                 assert!(residue.is_empty(), "{site:?} left residue: {residue:?}");
             }
@@ -3201,8 +3284,11 @@ mod tests {
             .expect("list auth parent")
             .collect::<Result<Vec<_>, _>>()
             .expect("read auth parent entries");
-        assert_eq!(entries.len(), 1, "the failed write left a temp file");
-        assert_eq!(entries[0].path(), path);
+        let mut paths: Vec<_> = entries.into_iter().map(|entry| entry.path()).collect();
+        paths.sort();
+        let mut expected = vec![path.clone(), lock_path_for(&path)];
+        expected.sort();
+        assert_eq!(paths, expected, "the failed write left a temp file");
 
         drop(guard);
         storage
@@ -3275,8 +3361,11 @@ mod tests {
             .expect("list auth parent")
             .collect::<Result<Vec<_>, _>>()
             .expect("read auth parent entries");
-        assert_eq!(entries.len(), 1, "the failed write left a temp file");
-        assert_eq!(entries[0].path(), path);
+        let mut paths: Vec<_> = entries.into_iter().map(|entry| entry.path()).collect();
+        paths.sort();
+        let mut expected = vec![path.clone(), lock_path_for(&path)];
+        expected.sort();
+        assert_eq!(paths, expected, "the failed write left a temp file");
 
         drop(guard);
         storage
@@ -3288,39 +3377,6 @@ mod tests {
             )
             .await
             .expect("write succeeds without the fault");
-    }
-
-    /// `try_steal_stale_lock` should leave fresh locks alone but
-    /// remove ones whose mtime is older than the supplied threshold.
-    /// Drives the helper directly with a near-zero `max_age` so the
-    /// test doesn't have to wait for the production
-    /// [`STALE_LOCK_AGE`] to elapse.
-    #[tokio::test]
-    async fn stale_lock_is_stealable() {
-        let (_dir, path) = scratch_path("stale");
-        let lock_path = lock_path_for(&path);
-
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::create_dir(&lock_path).unwrap();
-
-        // Just-created lock: way younger than 60 s, must not be
-        // stolen.
-        assert!(
-            !try_steal_stale_lock(&lock_path, STALE_LOCK_AGE),
-            "fresh lock must not be stolen"
-        );
-
-        // Wait long enough that a 1 ms threshold considers the lock
-        // stale, then confirm the helper steals it.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(
-            try_steal_stale_lock(&lock_path, Duration::from_millis(1)),
-            "lock past max_age must be stolen"
-        );
-        assert!(
-            !lock_path.exists(),
-            "stolen lock directory should be removed"
-        );
     }
 
     // -----------------------------------------------------------------
@@ -4728,9 +4784,7 @@ mod tests {
     #[tokio::test]
     async fn try_has_auth_omits_an_answer_while_the_file_is_locked() {
         let (_dir, path) = scratch_path("try-has-auth-locked");
-        prepare_auth_parent(&path).unwrap();
-        let lock_path = lock_path_for(&path);
-        create_lock_dir(&lock_path).unwrap();
+        let lock = FileLock::acquire(&path).await.unwrap();
         let storage = AuthStorage::new(path);
 
         assert_eq!(storage.try_has_auth("prov-x").await.unwrap(), None);
@@ -4739,6 +4793,6 @@ mod tests {
             .await;
         assert_eq!(storage.try_has_auth("prov-x").await.unwrap(), Some(true));
 
-        std::fs::remove_dir(lock_path).unwrap();
+        drop(lock);
     }
 }
