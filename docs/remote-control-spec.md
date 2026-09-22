@@ -1160,9 +1160,11 @@ Prompt-history search uses Control in local, direct, and gateway modes. Opening
 or switching scope starts a user-paced read off the input and render loops.
 Local and HTTP scans publish coalesced provisional snapshots as files are read,
 ending with a complete bounded list or partial results with named failures.
-The overlay remains interactive while loading. Search covers the full prompt,
-and selection recalls into the editor without submitting. While the query is empty
-and the user has not edited, navigated, or scrolled, background snapshots select
+The overlay remains interactive while loading. Search covers the full prompt.
+A left click selects a row without closing the overlay or moving keyboard focus
+from search. Enter recalls the selection into the editor without submitting.
+While the query is empty
+and the user has not edited, selected a row, or scrolled, background snapshots select
 the youngest prompt at the top. After interaction, they retain the selected
 prompt and its screen row while it survives. Clearing the query does not re-enable
 automatic following. Replacing the scope starts a fresh list with the query retained.
@@ -1193,6 +1195,9 @@ them with previews from their owning hosts, read in small batches in
 directory order so the top of the list fills first and the rest keeps landing
 behind it. An arriving preview fills in its own row and leaves the highlight
 and the scroll where the user put them.
+A left click selects a row without resuming it or moving keyboard focus from
+search. Enter confirms the selected session. Blank space and the scrollbar do
+not select rows.
 It reads the complete list, including archived sessions, so prompt-text search
 does not depend on which rows have been visible. Search covers the full first user text block even when
 the displayed preview is truncated, plus tags, ids, and host labels. Loading

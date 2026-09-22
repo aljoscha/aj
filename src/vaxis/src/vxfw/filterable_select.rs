@@ -30,7 +30,7 @@
 //! owns no result state.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::cell::{Cell, Character, Color, Style};
 use crate::fuzzy::FuzzyMatcher;
@@ -312,6 +312,7 @@ const LABEL_COLUMN_PADDING: usize = 2;
 struct RowBuilder {
     state: Rc<RefCell<SelectState>>,
     styles: Rc<RefCell<SelectStyles>>,
+    list: Weak<RefCell<ListView>>,
 }
 
 impl Builder for RowBuilder {
@@ -319,12 +320,56 @@ impl Builder for RowBuilder {
         let state = self.state.borrow();
         let &(item_idx, _) = state.visible.get(idx)?;
         let styles = self.styles.borrow();
-        Some(build_row(
-            &state.items[item_idx],
-            idx == cursor,
-            &styles,
-            &state,
-        ))
+        Some(Rc::new(RefCell::new(SelectRow {
+            content: build_row(&state.items[item_idx], idx == cursor, &styles, &state),
+            index: item_idx,
+            key: state.items[item_idx].filter_key.clone(),
+            state: Rc::clone(&self.state),
+            list: Weak::clone(&self.list),
+        })))
+    }
+}
+
+/// Row-local hit-testing excludes the filter, blank space, and scrollbar.
+/// The weak list reference avoids a cycle through the list's row builder.
+struct SelectRow {
+    content: WidgetRef,
+    index: usize,
+    key: String,
+    state: Rc<RefCell<SelectState>>,
+    list: Weak<RefCell<ListView>>,
+}
+
+impl Widget for SelectRow {
+    fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        self.content.borrow_mut().draw(ctx)
+    }
+
+    fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        let Event::Mouse(mouse) = event else { return };
+        if mouse.button != crate::mouse::Button::Left || mouse.kind != crate::mouse::Type::Press {
+            return;
+        }
+        let Some(list) = self.list.upgrade() else {
+            return;
+        };
+        let mut state = self.state.borrow_mut();
+        // An update may replace or filter out the painted row before the next
+        // frame. Ignore a stale hit rather than selecting a different item.
+        let Some(position) = state.visible.iter().position(|&(index, _)| {
+            index == self.index && state.items[index].filter_key == self.key
+        }) else {
+            return;
+        };
+        state.interacted = true;
+        list.borrow_mut().cursor = u32::try_from(position).expect("position fits u32");
+        // A click selects only. Keeping focus on the filter lets typing continue,
+        // and leaving scroll alone keeps the clicked row under the pointer.
+        ctx.consume_and_redraw();
+    }
+
+    fn wants_events(&self) -> bool {
+        true
     }
 }
 
@@ -795,10 +840,7 @@ impl FilterableSelect {
         };
         let state = Rc::new(RefCell::new(initial));
         let styles = Rc::new(RefCell::new(styles));
-        let mut list_view = ListView::new(Source::Builder(Box::new(RowBuilder {
-            state: Rc::clone(&state),
-            styles: Rc::clone(&styles),
-        })));
+        let mut list_view = ListView::new(Source::default());
         // The band replaces the arrow gutter, so the list draws no cursor
         // indicator of its own.
         list_view.draw_cursor = false;
@@ -812,6 +854,11 @@ impl FilterableSelect {
         bars.borrow_mut().draw_horizontal_scrollbar = false;
         bars.borrow_mut().draw_vertical_scrollbar = false;
         let list = Rc::clone(&bars.borrow().view);
+        list.borrow_mut().children = Source::Builder(Box::new(RowBuilder {
+            state: Rc::clone(&state),
+            styles: Rc::clone(&styles),
+            list: Rc::downgrade(&list),
+        }));
         full_filter(&mut state.borrow_mut(), &mut list.borrow_mut());
 
         let prompt = PromptInput::new(FILTER_MARKER, styles.borrow().marker);

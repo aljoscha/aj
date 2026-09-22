@@ -20391,9 +20391,22 @@ mod tests {
             })
             .await
             .expect("untouched history follows the newest arrival");
-            for _ in 0..6 {
-                writer.write_all(b"\x1b[B").unwrap();
-            }
+            let rows = flatten(&observed.borrow_mut().draw(&full_draw_ctx()));
+            let (row, line) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, line)| line.contains("prompt-05"))
+                .expect("clickable prompt");
+            let col = line[..line.find("prompt-05").unwrap()].chars().count();
+            write!(
+                writer,
+                "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+                col + 1,
+                row + 1,
+                col + 1,
+                row + 1
+            )
+            .unwrap();
             let (before, row) = poll_for(|| {
                 let (top, selected_bg) = {
                     let shell = observed.borrow();
@@ -20410,7 +20423,7 @@ mod tests {
                     .then_some((rows, row))
             })
             .await
-            .expect("navigation selected the fifth prompt");
+            .expect("click selected the chosen prompt without closing the overlay");
             peer.chunks
                 .send(history_event("snapshot", &later))
                 .await
