@@ -1200,6 +1200,12 @@ the same context overlap as read-only content overlays. Provider, confirmation,
 and retry menus use picker navigation and select-only clicks. Clicking never
 spends a credit or retries a reset. Enter performs the selected menu action.
 
+Task output follows new output on open. Keyboard arrows scroll document lines,
+and PageUp/PageDown use the visible body height with the read-only page overlap.
+Keyboard scrolling or Home pauses following without discarding the reading
+position when more output arrives. End immediately reveals the latest output
+and resumes following.
+
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer.
 

@@ -36,10 +36,6 @@ use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_key_la
 use crate::settings_ui::push_window;
 use crate::transcript::faint;
 
-/// PgUp/PgDn step, in rows. A fixed jump rather than a viewport-derived
-/// one keeps the widget from needing to know its drawn height.
-const PAGE_STEP: usize = 10;
-
 /// Rows the fixed header takes above the scrollable body: the command
 /// line, the status line, and a blank separator.
 const HEADER_ROWS: u16 = 3;
@@ -68,8 +64,8 @@ pub(crate) struct TaskOutputView {
     status: TaskStatus,
     total_bytes: u64,
     /// Stick to the bottom as new output arrives (tail behavior). Set on
-    /// open and re-enabled by jump-to-bottom. Any manual scroll up clears
-    /// it.
+    /// open and re-enabled by jump-to-bottom. Manual keyboard scrolling
+    /// clears it.
     follow: bool,
     text_style: Style,
     dim_style: Style,
@@ -144,8 +140,8 @@ impl TaskOutputView {
     }
 
     /// Rebuild the body rows from `text`. Following pins to the bottom;
-    /// otherwise the cursor is only clamped so a shrinking buffer can't leave
-    /// it out of range.
+    /// otherwise preserve the reading position, clamping it if the buffer
+    /// shrinks past it. The hidden cursor does not track document scrolling.
     fn set_body(&self, text: &str) {
         let lines = to_lines(text);
         let count = u32::try_from(lines.len()).unwrap_or(u32::MAX);
@@ -155,10 +151,10 @@ impl TaskOutputView {
             list.children = Source::Slice(self.row_widgets(&lines));
         }
         if self.follow {
-            self.list.borrow_mut().jump_to_item(count.saturating_sub(1));
+            self.list.borrow_mut().scroll_to_bottom();
         } else {
             let mut list = self.list.borrow_mut();
-            if list.cursor >= count {
+            if list.scroll_top() >= count {
                 list.jump_to_item(count.saturating_sub(1));
             }
         }
@@ -187,18 +183,9 @@ impl TaskOutputView {
         )
     }
 
-    fn scroll_up(&mut self, ctx: &mut EventContext, rows: usize) {
+    fn scroll_lines(&mut self, rows: i32) {
         self.follow = false;
-        for _ in 0..rows {
-            self.list.borrow_mut().prev_item(ctx);
-        }
-    }
-
-    fn scroll_down(&mut self, ctx: &mut EventContext, rows: usize) {
-        self.follow = false;
-        for _ in 0..rows {
-            self.list.borrow_mut().next_item(ctx);
-        }
+        self.list.borrow_mut().scroll_lines(rows);
     }
 
     fn header_row(&self, ctx: &DrawContext, row: u16, text: String, style: Style) -> SubSurface {
@@ -303,18 +290,20 @@ impl Widget for TaskOutputView {
             || key.matches(u32::from('k'), Modifiers::empty())
             || key.matches(u32::from('p'), Modifiers::CTRL)
         {
-            self.scroll_up(ctx, 1);
+            self.scroll_lines(-1);
         } else if key.matches(Key::DOWN, Modifiers::empty())
             || key.matches(u32::from('j'), Modifiers::empty())
             || key.matches(u32::from('n'), Modifiers::CTRL)
         {
-            self.scroll_down(ctx, 1);
+            self.scroll_lines(1);
         } else if key.matches(Key::PAGE_UP, Modifiers::empty()) {
-            self.scroll_up(ctx, PAGE_STEP);
+            let page = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
+            self.scroll_lines(-page);
         } else if key.matches(Key::PAGE_DOWN, Modifiers::empty())
             || key.matches(u32::from(' '), Modifiers::empty())
         {
-            self.scroll_down(ctx, PAGE_STEP);
+            let page = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
+            self.scroll_lines(page);
         } else if key.matches(Key::HOME, Modifiers::empty())
             || key.matches(u32::from('g'), Modifiers::empty())
         {
@@ -324,6 +313,7 @@ impl Widget for TaskOutputView {
             || key.matches(u32::from('G'), Modifiers::empty())
         {
             self.follow = true;
+            self.list.borrow_mut().scroll_to_bottom();
         }
         // Read-only: swallow every key so none reaches the base layout.
         ctx.consume_and_redraw();
@@ -550,6 +540,149 @@ mod tests {
 
     fn local_backing(registry: TaskRegistry) -> TaskBacking {
         TaskBacking::Local(registry, Rc::new(RefCell::new(None)))
+    }
+
+    fn press(view: &mut TaskOutputView, codepoint: u32, mods: Modifiers) {
+        let mut ctx = EventContext::new();
+        ctx.phase = Phase::Capturing;
+        view.capture_event(
+            &mut ctx,
+            &Event::KeyPress(Key {
+                codepoint,
+                mods,
+                ..Key::default()
+            }),
+        );
+        assert!(ctx.consume_event);
+    }
+
+    fn remote_view() -> TaskOutputView {
+        TaskOutputView::new(
+            TaskBacking::Remote(Rc::new(RefCell::new(None))),
+            7,
+            "echo hi".to_string(),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+        )
+    }
+
+    fn output_through(view: &mut TaskOutputView, last: u32) {
+        let stdout_tail: String = (1..=last).map(|n| format!("line{n}\n")).collect();
+        view.apply_details(TaskDetails {
+            id: view.task(),
+            status: TaskStatus::Running,
+            stdout_total_bytes: u64::try_from(stdout_tail.len()).unwrap(),
+            stdout_tail,
+            stderr_tail: String::new(),
+            stderr_total_bytes: 0,
+            report: None,
+        });
+    }
+
+    fn assert_body(
+        view: &mut TaskOutputView,
+        height: u16,
+        expected: impl IntoIterator<Item = u32>,
+    ) {
+        let surface = view.draw(&draw_ctx(40, height + HEADER_ROWS));
+        // Read only the text columns, excluding the scrollbar at the right edge.
+        let rows: Vec<String> = crate::test_support::flatten(&surface)
+            .iter()
+            .skip(usize::from(HEADER_ROWS))
+            .map(|row| {
+                row.iter()
+                    .take(39)
+                    .map(|cell| cell.char.grapheme())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|row| !row.is_empty())
+            .collect();
+        let expected: Vec<String> = expected.into_iter().map(|n| format!("line{n}")).collect();
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn keyboard_scrolls_drawn_rows_by_lines_and_viewport_pages() {
+        let mut view = remote_view();
+        output_through(&mut view, 100);
+        // Reuse the view to cover paging after a resize as well as tiny bodies.
+        for height in [5, 16, 2, 1] {
+            press(&mut view, Key::HOME, Modifiers::empty());
+            assert_body(&mut view, height, 1..=u32::from(height));
+            let page = u32::try_from(crate::scroll::page_scroll_lines(Some(height))).unwrap();
+            for key in [Key::PAGE_DOWN, u32::from(' ')] {
+                press(&mut view, key, Modifiers::empty());
+                assert_body(&mut view, height, 1 + page..=u32::from(height) + page);
+                press(&mut view, Key::PAGE_UP, Modifiers::empty());
+                assert_body(&mut view, height, 1..=u32::from(height));
+            }
+            for (down, up, mods) in [
+                (Key::DOWN, Key::UP, Modifiers::empty()),
+                (u32::from('j'), u32::from('k'), Modifiers::empty()),
+                (u32::from('n'), u32::from('p'), Modifiers::CTRL),
+            ] {
+                press(&mut view, down, mods);
+                assert_body(&mut view, height, 2..=u32::from(height) + 1);
+                press(&mut view, up, mods);
+                assert_body(&mut view, height, 1..=u32::from(height));
+            }
+        }
+    }
+
+    #[test]
+    fn appended_output_follows_until_keyboard_navigation_and_end_resumes() {
+        for (key, mods, first) in [
+            (Key::UP, Modifiers::empty(), 15),
+            (Key::DOWN, Modifiers::empty(), 16),
+            (Key::PAGE_UP, Modifiers::empty(), 13),
+            (Key::PAGE_DOWN, Modifiers::empty(), 16),
+            (Key::HOME, Modifiers::empty(), 1),
+            (u32::from('g'), Modifiers::empty(), 1),
+        ] {
+            let mut view = remote_view();
+            output_through(&mut view, 10);
+            assert_body(&mut view, 5, 6..=10);
+            output_through(&mut view, 20);
+            assert_body(&mut view, 5, 16..=20);
+            press(&mut view, key, mods);
+            assert_body(&mut view, 5, first..=first + 4);
+            output_through(&mut view, 30);
+            assert_body(&mut view, 5, first..=first + 4);
+            for end in [Key::END, u32::from('G')] {
+                press(&mut view, Key::HOME, Modifiers::empty());
+                assert_body(&mut view, 5, 1..=5);
+                press(&mut view, end, Modifiers::empty());
+                // End must reveal existing output without waiting for a snapshot.
+                assert_body(&mut view, 5, 26..=30);
+            }
+            output_through(&mut view, 40);
+            assert_body(&mut view, 5, 36..=40);
+        }
+    }
+
+    #[test]
+    fn shrinking_output_preserves_or_clamps_the_reading_position() {
+        let mut view = remote_view();
+        output_through(&mut view, 100);
+        assert_body(&mut view, 5, 96..=100);
+        for _ in 0..3 {
+            press(&mut view, Key::PAGE_UP, Modifiers::empty());
+            view.draw(&draw_ctx(40, 5 + HEADER_ROWS));
+        }
+        assert_body(&mut view, 5, 87..=91);
+        output_through(&mut view, 95);
+        assert_body(&mut view, 5, 87..=91);
+        output_through(&mut view, 20);
+        assert_body(&mut view, 5, 16..=20);
+        output_through(&mut view, 2);
+        assert_body(&mut view, 5, 1..=2);
+        output_through(&mut view, 0);
+        assert_body(&mut view, 5, []);
+        output_through(&mut view, 10);
+        assert_body(&mut view, 5, 1..=5);
     }
 
     #[test]
