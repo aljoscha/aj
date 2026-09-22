@@ -1230,7 +1230,7 @@ row. The promises the host relies on:
   always an explicit direction, and records an accepted answer ahead of
   the peer's next `list`. A peer that does not serve the route leaves a
   notice, read off the command's `unknown_endpoint` error.
-- **Every new interaction is an `AjAction`** on the existing keybinding
+- **Session and sidebar commands are `AjAction`s** on the existing keybinding
   system (sidebar toggle and focus, session switching, remote creation,
   tagging, archiving and the reveal, folding a host's rows), with a
   default chord and user overrides. Pointer gestures dispatch the same
@@ -1240,6 +1240,12 @@ A host's group header reads the host's name (section 5.1), else its id,
 else its address, and the create-flow host selector labels hosts the
 same way. Rows show the session's tag where one is set, else an
 id-derived label.
+
+The sidebar's separator becomes a heavy line with a horizontal resize cursor
+on hover and during a drag. Dragging adjusts this client's width without saving
+it or sending a command to the host. An explicit sidebar-width setting takes
+precedence over the dragged width. The gesture reserves space for the transcript
+and does not select text or activate session rows.
 
 ## 9. Testing
 

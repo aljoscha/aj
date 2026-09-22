@@ -530,7 +530,7 @@ pub const DEFAULT_SIDEBAR_COLS: u16 = 28;
 
 /// Columns below which the strip would be chrome with no label beside
 /// it: five go to the chrome whatever the width.
-const MIN_SIDEBAR_COLS: u16 = 7;
+pub const MIN_SIDEBAR_COLS: u16 = 7;
 
 /// Columns above which a strip is not a strip.
 ///
@@ -538,7 +538,7 @@ const MIN_SIDEBAR_COLS: u16 = 7;
 /// no terminal is wide enough to show, and the user is told nothing:
 /// the strip holds itself back and looks disabled. Refusing it names
 /// the mistake instead.
-const MAX_SIDEBAR_COLS: u16 = 200;
+pub const MAX_SIDEBAR_COLS: u16 = 200;
 
 /// Application configuration loaded from `~/.aj/config.toml`.
 ///

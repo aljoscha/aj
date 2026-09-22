@@ -20,8 +20,8 @@ pub use env::{
 pub use paths::{display_path, display_path_with_home, home_dir};
 pub use schema::{
     Config, ConfigDiagnostic, ConfigError, ConfigLayer, ConfigOption, ConfigSpeed,
-    ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity, DEFAULT_SIDEBAR_COLS, Severity,
-    ValueKind,
+    ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity, DEFAULT_SIDEBAR_COLS,
+    MAX_SIDEBAR_COLS, MIN_SIDEBAR_COLS, Severity, ValueKind,
 };
 
 /// Unique temp directory for tests that need real filesystem scratch

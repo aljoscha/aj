@@ -5116,6 +5116,10 @@ fn presentation_save(
                 if on { "shown" } else { "hidden" }
             )
         }
+        "sidebar_cols" => {
+            shell.borrow().sidebar.borrow_mut().clear_dragged_cols();
+            format!("sidebar_cols set to {value}.")
+        }
         _ => format!("{id} set to {value}."),
     };
     let layers = Arc::clone(&world.config_layers);
@@ -6119,6 +6123,10 @@ struct Shell {
     /// time. Also owns whether the strip is shown at all, which the toggle
     /// action flips.
     sidebar: Rc<RefCell<SidebarState>>,
+    /// The split gesture belongs to the layout, not either pane: it must keep
+    /// consuming drags and release after the pointer crosses the separator.
+    sidebar_dragging: bool,
+    terminal_cols: u16,
     /// The toast-stack widget, drawn bottom-right every frame: stacked above
     /// the quit hint when no modal is open, floated over the scrim/overlay
     /// (z 3) otherwise. Reads the `toasts` stack below. Plain `RefCell` like
@@ -6597,6 +6605,8 @@ impl Shell {
             tag_edit,
             terminal_caps: Cell::new(TerminalCaps::default()),
             width_method: Cell::new(vaxis::gwidth::Method::Unicode),
+            sidebar_dragging: false,
+            terminal_cols: 0,
         };
         shell.wire_view(&view);
         shell
@@ -6686,6 +6696,52 @@ impl Shell {
     fn sidebar_cols(&self) -> u16 {
         let sidebar = self.sidebar.borrow();
         if sidebar.shown() { sidebar.cols() } else { 0 }
+    }
+
+    fn resize_sidebar(&mut self, ctx: &mut EventContext, event: &Event) {
+        use vaxis::mouse::{Button, Shape, Type};
+
+        let mut sidebar = self.sidebar.borrow_mut();
+        let was_active = sidebar.separator_active;
+        match event {
+            Event::Mouse(mouse) if sidebar.shown() && !self.overlays.borrow().is_open() => {
+                let on_separator = i32::from(mouse.col) == i32::from(sidebar.cols()) - 1;
+                let was_dragging = self.sidebar_dragging;
+                if mouse.kind == Type::Press && mouse.button == Button::Left {
+                    self.sidebar_dragging = on_separator;
+                }
+                if self.sidebar_dragging
+                    && mouse.button == Button::Left
+                    && matches!(mouse.kind, Type::Drag | Type::Release)
+                {
+                    let cols = u16::try_from(mouse.col).unwrap_or(0).saturating_add(1);
+                    sidebar.resize(cols, self.terminal_cols);
+                    ctx.redraw = true;
+                }
+                if mouse.kind == Type::Release || mouse.kind == Type::Motion {
+                    // A buttonless motion also ends a drag whose release happened
+                    // outside the terminal and could not be reported.
+                    self.sidebar_dragging = false;
+                }
+                sidebar.separator_active =
+                    self.sidebar_dragging || i32::from(mouse.col) == i32::from(sidebar.cols()) - 1;
+                if on_separator || was_dragging || self.sidebar_dragging {
+                    ctx.consume_event();
+                }
+            }
+            Event::Mouse(_) | Event::MouseLeave | Event::FocusOut => {
+                self.sidebar_dragging = false;
+                sidebar.separator_active = false;
+            }
+            _ => return,
+        }
+        if sidebar.separator_active || was_active {
+            ctx.set_mouse_shape(if sidebar.separator_active {
+                Shape::EwResize
+            } else {
+                Shape::Default
+            });
+        }
     }
 
     /// Hold the strip back on a terminal with no width to spare.
@@ -6907,6 +6963,12 @@ impl Widget for Shell {
         self.set_editor_row_cap(usize::from(ctx.max.size().height));
         // Same reason, for the sidebar: only the Shell learns the terminal
         // width, because a flex row measures the strip under an unbounded one.
+        self.terminal_cols = ctx.max.size().width;
+        if self.sidebar_dragging {
+            let mut sidebar = self.sidebar.borrow_mut();
+            let cols = sidebar.cols();
+            sidebar.resize(cols, self.terminal_cols);
+        }
         self.suppress_sidebar_if_too_narrow(ctx.max.size().width);
 
         let mut inner = draw_widget(&to_widget_ref(Rc::clone(&self.keymap)), ctx);
@@ -7099,6 +7161,10 @@ impl Widget for Shell {
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        self.resize_sidebar(ctx, event);
+        if ctx.consume_event {
+            return;
+        }
         let view = self.view();
         if view.transcript.borrow_mut().reconcile_model() {
             ctx.request_focus(to_widget_ref(Rc::clone(&view.editor)));
@@ -7152,6 +7218,9 @@ impl Widget for Shell {
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        if matches!(event, Event::MouseLeave | Event::FocusOut) {
+            self.resize_sidebar(ctx, event);
+        }
         if let Event::Init = event {
             ctx.request_focus(to_widget_ref(Rc::clone(&self.view().editor)));
             // `Init` dispatch drains the ctx command queue before the first
@@ -25044,6 +25113,98 @@ mod tests {
     /// room for the default has none for this one.
     const CONFIGURED_COLS: u16 = 40;
 
+    fn assert_separator(shell: &Rc<RefCell<Shell>>, cols: u16, glyph: char) {
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+        assert!(
+            rows.iter()
+                .all(|row| row.chars().nth(usize::from(cols - 1)) == Some(glyph)),
+            "the separator must span the full height at column {cols}: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sidebar_drag_resizes_without_selecting_or_saving() {
+        use vaxis::mouse::{Shape, Type};
+
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, _writer, world, shell, root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        fold_lines(&world.chat, 80);
+        pin_sidebar_open(&shell);
+        sync_sidebar(&world, &shell);
+        app.render(&root).expect("render");
+        assert_separator(&shell, SIDEBAR_COLS, '│');
+
+        let new_row = flatten(&shell.borrow_mut().draw(&full_draw_ctx()))
+            .iter()
+            .position(|line| line.contains("+ new"))
+            .expect("a clickable new-session row");
+        let new_row = i16::try_from(new_row).unwrap();
+        let separator = i16::try_from(SIDEBAR_COLS - 1).unwrap();
+        app.handle_input(motion_at(new_row, separator));
+        assert_eq!(app.vaxis().screen.borrow().mouse_shape, Shape::EwResize);
+        app.render(&root).expect("hover");
+        assert_separator(&shell, SIDEBAR_COLS, '┃');
+
+        app.handle_input(left_mouse_at(new_row, separator, Type::Press));
+        // Cross both panes and both size limits. Every repaint changes the hit
+        // tree, so retaining the gesture cannot depend on the initial target.
+        for (col, width) in [(39, 40), (79, 60), (0, aj_conf::MIN_SIDEBAR_COLS), (34, 35)] {
+            app.handle_input(left_mouse_at(3, col, Type::Drag));
+            sync_sidebar(&world, &shell);
+            app.render(&root).expect("drag");
+            assert_separator(&shell, width, '┃');
+        }
+        app.handle_input(left_mouse_at(3, 34, Type::Release));
+        app.handle_input(motion_at(3, 50));
+        app.render(&root).expect("release");
+        assert_separator(&shell, 35, '│');
+        assert_eq!(app.vaxis().screen.borrow().mouse_shape, Shape::Default);
+        assert!(shell.borrow().take_session_request().is_none());
+        let transcript = Rc::clone(&shell.borrow().view().transcript);
+        assert!(!transcript.borrow().has_selection());
+        assert_eq!(world.config.lock().unwrap().sidebar_cols, SIDEBAR_COLS);
+        assert_eq!(
+            world.config_layers.lock().unwrap().effective().sidebar_cols,
+            SIDEBAR_COLS
+        );
+
+        // Selection still works when a press actually starts in the transcript.
+        app.handle_input(left_mouse_at(3, 40, Type::Press));
+        app.handle_input(left_mouse_at(4, 50, Type::Drag));
+        assert!(transcript.borrow().has_selection());
+        assert_separator(&shell, 35, '│');
+        app.handle_input(left_mouse_at(4, 50, Type::Release));
+        app.handle_input(left_mouse_at(new_row, 3, Type::Press));
+        assert!(shell.borrow().take_session_request().is_some());
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn sidebar_drag_ends_on_focus_loss_and_respects_overlays() {
+        use vaxis::mouse::Type;
+
+        let (mut app, mut writer, shell, root) = init_app().await;
+        pin_sidebar_open(&shell);
+        app.render(&root).expect("render");
+        let separator = i16::try_from(SIDEBAR_COLS - 1).unwrap();
+        app.handle_input(left_mouse_at(3, separator, Type::Press));
+        app.handle_input(Event::FocusOut);
+        app.handle_input(Event::FocusIn);
+        app.handle_input(left_mouse_at(3, 39, Type::Drag));
+        app.render(&root).expect("focus restored");
+        assert_separator(&shell, SIDEBAR_COLS, '│');
+
+        // An overlay owns clicks even where its scrim covers the separator.
+        press(&mut app, &mut writer, b"\x0f").await;
+        assert!(shell.borrow().overlays.borrow().is_open());
+        app.render(&root).expect("overlay");
+        app.handle_input(left_mouse_at(3, separator, Type::Press));
+        app.handle_input(left_mouse_at(3, 39, Type::Drag));
+        app.handle_input(left_mouse_at(3, 39, Type::Release));
+        assert_eq!(shell.borrow().sidebar_cols(), SIDEBAR_COLS);
+    }
+
     /// The configured width is the width the composed frame draws, and the
     /// threshold the strip yields at moves with it.
     ///
@@ -25113,7 +25274,7 @@ mod tests {
             project: aj_conf::ConfigLayer::default(),
             project_path: Some(project_path.clone()),
         };
-        let (world, shell, _app, _writer, _root) =
+        let (world, shell, mut app, _writer, root) =
             world_shell_app(&dir, "streaming-text", layers).await;
         shell.borrow().sidebar.borrow_mut().visible = true;
         shell.borrow().sidebar.borrow_mut().toggled = true;
@@ -25143,6 +25304,28 @@ mod tests {
             CONFIGURED_COLS,
             "the strip is still the width it was before the setting changed",
         );
+
+        let saved = std::fs::read(&project_path).expect("saved width");
+        app.render(&root).expect("configured width");
+        app.handle_input(left_mouse_at(3, 39, vaxis::mouse::Type::Press));
+        app.handle_input(left_mouse_at(3, 34, vaxis::mouse::Type::Drag));
+        app.handle_input(left_mouse_at(3, 34, vaxis::mouse::Type::Release));
+        sync_sidebar(&world, &shell);
+        assert_eq!(sidebar_width(&shell), 35);
+        assert_eq!(std::fs::read(&project_path).unwrap(), saved);
+
+        // Explicitly choosing the same saved value must also replace a drag.
+        apply_setting_change(
+            &world,
+            &shell,
+            &mut inert_theme_watch(),
+            PersistAction::ProjectSet,
+            "sidebar_cols",
+            &CONFIGURED_COLS.to_string(),
+        )
+        .await;
+        sync_sidebar(&world, &shell);
+        assert_eq!(sidebar_width(&shell), CONFIGURED_COLS);
 
         // A width the strip cannot draw is refused, and refused before it
         // reaches the running session.

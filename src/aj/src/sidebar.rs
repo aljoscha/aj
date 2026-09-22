@@ -402,6 +402,9 @@ pub(crate) struct SidebarState {
     /// The configured width, once the drive loop has read it out of the
     /// config. `None` until then, and in any test that does not set one.
     configured_cols: Option<u16>,
+    /// Client-local geometry from dragging, superseded by an explicit setting.
+    dragged_cols: Option<u16>,
+    pub(crate) separator_active: bool,
     /// Rows in display order (see [`rows_for_display`]).
     pub(crate) rows: Vec<SidebarRow>,
     /// The hosts the peer named alongside its rows, empty against a plain host.
@@ -450,13 +453,32 @@ impl SidebarState {
     /// [`SIDEBAR_COLS`] until the loop has read the setting, so a strip
     /// nobody configured is the strip the app ships.
     pub(crate) fn cols(&self) -> u16 {
-        self.configured_cols.unwrap_or(SIDEBAR_COLS)
+        self.dragged_cols
+            .or(self.configured_cols)
+            .unwrap_or(SIDEBAR_COLS)
     }
 
     /// Take the configured width, which the drive loop reads off the live
     /// config once per iteration ([`crate::interactive::sync_sidebar`]).
     pub(crate) fn set_cols(&mut self, cols: u16) {
+        if self.configured_cols != Some(cols) {
+            self.clear_dragged_cols();
+        }
         self.configured_cols = Some(cols);
+    }
+
+    pub(crate) fn clear_dragged_cols(&mut self) {
+        self.dragged_cols = None;
+    }
+
+    /// Resize without changing the saved preference or starving the transcript.
+    pub(crate) fn resize(&mut self, cols: u16, terminal_cols: u16) {
+        let max = terminal_cols
+            .saturating_sub(MIN_TRANSCRIPT_COLS)
+            .min(aj_conf::MAX_SIDEBAR_COLS);
+        if max >= aj_conf::MIN_SIDEBAR_COLS {
+            self.dragged_cols = Some(cols.clamp(aj_conf::MIN_SIDEBAR_COLS, max));
+        }
     }
 
     /// The wheel's anchor, if it still applies.
@@ -1536,7 +1558,7 @@ impl SessionSidebar {
             span(glyph, tint(glyph_style)),
             span(&format!(" {label}"), tint(label_style)),
             span(" ", tint(dim)),
-            span(SEPARATOR, dim),
+            span(self.separator(), dim),
         ]
     }
 
@@ -1544,7 +1566,15 @@ impl SessionSidebar {
     /// the strip's full height so the transcript's edge is one unbroken rule.
     fn blank_spans(&self, width: u16) -> Vec<TextSpan> {
         let pad = " ".repeat(usize::from(width) - 1);
-        vec![span(&format!("{pad}{SEPARATOR}"), self.styles.dim)]
+        vec![span(&format!("{pad}{}", self.separator()), self.styles.dim)]
+    }
+
+    fn separator(&self) -> &'static str {
+        if self.state.borrow().separator_active {
+            "┃"
+        } else {
+            SEPARATOR
+        }
     }
 }
 
@@ -1610,7 +1640,12 @@ impl Widget for SessionSidebar {
         // The rows can move under a pointer that has not, so the band is
         // re-resolved against the fresh layout rather than left marking
         // whatever used to be on that line.
-        self.set_hover(self.hover);
+        let hover = if self.state.borrow().separator_active {
+            None
+        } else {
+            self.hover
+        };
+        self.set_hover(hover);
         let state = self.state.borrow();
         let hover = self.hover.map(usize::from);
         let blanks = usize::from(ctx.max.height.unwrap_or(0)).saturating_sub(lines.len());
