@@ -184,7 +184,6 @@ impl Widget for ContentOverlay {
             return;
         };
         let empty = Modifiers::empty();
-        let ctrl = Modifiers::CTRL;
         // Esc and Enter both close: a read-only view has nothing to
         // confirm, so Enter is just a second "dismiss" key (matching
         // `aj`'s read-only overlays).
@@ -195,28 +194,7 @@ impl Widget for ContentOverlay {
             ctx.consume_and_redraw();
             return;
         }
-        // Document scroll by line: `scroll_lines` moves the viewport
-        // immediately and clamps at both ends, unlike cursor-item nav, which
-        // only shifts the viewport once the hidden cursor leaves it (so the
-        // first viewport-worth of presses looked dead).
-        // Read the viewport under a short immutable borrow that drops at the
-        // end of the statement, before the `borrow_mut` calls below.
-        let page = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
-        if key.matches(Key::DOWN, empty) || key.matches(u32::from('n'), ctrl) {
-            self.list.borrow_mut().scroll_lines(1);
-        } else if key.matches(Key::UP, empty) || key.matches(u32::from('p'), ctrl) {
-            self.list.borrow_mut().scroll_lines(-1);
-        } else if key.matches(Key::PAGE_DOWN, empty) {
-            self.list.borrow_mut().scroll_lines(page);
-        } else if key.matches(Key::PAGE_UP, empty) {
-            self.list.borrow_mut().scroll_lines(-page);
-        } else if key.matches(Key::HOME, empty) {
-            // Pin the scroll to the very first line, matching the transcript's
-            // editor-mode Home.
-            self.list.borrow_mut().jump_to_item(0);
-        } else if key.matches(Key::END, empty) {
-            self.list.borrow_mut().scroll_to_bottom();
-        }
+        crate::scroll::scroll_document(&mut self.list.borrow_mut(), key);
         // Read-only: swallow every key so none reaches the base layout.
         ctx.consume_and_redraw();
     }

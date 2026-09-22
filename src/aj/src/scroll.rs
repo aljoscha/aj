@@ -7,7 +7,32 @@
 //! gentler half-page step ([`half_page_scroll_lines`]).
 
 use vaxis::cell::{Cell, Character, Style};
+use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{ListView, ScrollBars};
+
+/// Scroll a read-only document without moving a hidden selection cursor.
+/// Returns whether the key names a scroll gesture. Closing and any document
+/// actions remain with the overlay, as does consuming unrelated keys.
+pub(crate) fn scroll_document(list: &mut ListView, key: &Key) -> bool {
+    let empty = Modifiers::empty();
+    let ctrl = Modifiers::CTRL;
+    if key.matches(Key::DOWN, empty) || key.matches(u32::from('n'), ctrl) {
+        list.scroll_lines(1);
+    } else if key.matches(Key::UP, empty) || key.matches(u32::from('p'), ctrl) {
+        list.scroll_lines(-1);
+    } else if key.matches(Key::PAGE_DOWN, empty) {
+        list.scroll_lines(page_scroll_lines(list.viewport_height()));
+    } else if key.matches(Key::PAGE_UP, empty) {
+        list.scroll_lines(-page_scroll_lines(list.viewport_height()));
+    } else if key.matches(Key::HOME, empty) {
+        list.jump_to_item(0);
+    } else if key.matches(Key::END, empty) {
+        list.scroll_to_bottom();
+    } else {
+        return false;
+    }
+    true
+}
 
 /// Rows kept in common between two page-scroll steps, so a reader keeps a
 /// little context across a page turn rather than jumping a full viewport.

@@ -27,7 +27,7 @@
 //! guarantees runs.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use aj_app::keybindings::{ACTION_USAGE_RESET, action_shortcut};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome};
@@ -39,8 +39,8 @@ use vaxis::cell::{Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     Builder, DrawContext, Event, EventContext, ListView, MaxSize, RelativePoint, RichText,
-    ScrollBars, SelectStyles, Size, Source, SubSurface, Surface, Widget, WidgetRef, WidthBasis,
-    to_widget_ref,
+    ScrollBars, SelectStyles, SelectableRow, Size, Source, SubSurface, Surface, Widget, WidgetRef,
+    WidthBasis, to_widget_ref,
 };
 
 use crate::content_overlay::{ContentStyles, Row, plain, usage_rows};
@@ -155,7 +155,7 @@ pub(crate) struct UsageOverlay {
     /// Rows of the current interactive menu phase, empty in read-only
     /// phases. The list cursor indexes into this to resolve the confirmed
     /// row's `value`.
-    menu_items: Vec<MenuItem>,
+    menu_items: Rc<Vec<MenuItem>>,
     /// The row list, shared with `bars` (which draws it). Rebuilt on every
     /// phase change to match the phase.
     list: Rc<RefCell<ListView>>,
@@ -219,7 +219,7 @@ impl UsageOverlay {
             statuses_rx: None,
             fetch_error: None,
             consume_rx: None,
-            menu_items: Vec::new(),
+            menu_items: Rc::new(Vec::new()),
             list,
             bars,
             styles,
@@ -519,12 +519,13 @@ impl UsageOverlay {
             Phase::SelectProvider | Phase::Confirm { .. } | Phase::Failed { .. }
         );
 
-        self.menu_items = menu_items;
+        self.menu_items = Rc::new(menu_items);
         let (source, count) = if interactive {
             (
                 Source::Builder(Box::new(MenuRowBuilder {
-                    items: self.menu_items.clone(),
+                    items: Rc::clone(&self.menu_items),
                     styles: self.chrome_select.clone(),
+                    list: Rc::downgrade(&self.list),
                 })),
                 self.menu_items.len(),
             )
@@ -586,9 +587,10 @@ impl UsageOverlay {
             || key.matches(Key::ENTER, Modifiers::empty())
         {
             (self.on_close)(ctx);
+        } else {
+            crate::scroll::scroll_document(&mut self.list.borrow_mut(), key);
         }
-        // Every other key is swallowed: the page is read-only (the wheel
-        // still scrolls the body through the list underneath).
+        // The document owns input even when it does not use the key.
         ctx.consume_and_redraw();
     }
 
@@ -658,13 +660,8 @@ impl UsageOverlay {
         ctx.consume_and_redraw();
     }
 
-    /// Move the menu cursor for Up/Down; other keys are no-ops here.
     fn move_menu_cursor(&self, ctx: &mut EventContext, key: &Key) {
-        if key.matches(Key::DOWN, Modifiers::empty()) {
-            self.list.borrow_mut().next_item(ctx);
-        } else if key.matches(Key::UP, Modifiers::empty()) {
-            self.list.borrow_mut().prev_item(ctx);
-        }
+        self.list.borrow_mut().navigate_single_line(ctx, key);
     }
 
     #[cfg(test)]
@@ -735,8 +732,7 @@ impl Widget for UsageOverlay {
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
         let Event::KeyPress(key) = event else {
-            // Mouse events fall through to the list (wheel scroll); no
-            // consume here.
+            // Mouse events use row and scrollbar hit-testing.
             return;
         };
         match self.phase_kind() {
@@ -860,14 +856,32 @@ fn provider_items(targets: &[RateLimitResetTarget], overlay: &UsageOverlay) -> V
 /// with the selection band. Mirrors the pick-list band: the full inner
 /// width fills with `selected_bg` and the text spans sit on the band.
 struct MenuRowBuilder {
-    items: Vec<MenuItem>,
+    items: Rc<Vec<MenuItem>>,
     styles: SelectStyles,
+    list: Weak<RefCell<ListView>>,
 }
 
 impl Builder for MenuRowBuilder {
     fn item_at_idx(&self, idx: usize, cursor: usize) -> Option<WidgetRef> {
         let item = self.items.get(idx)?;
-        Some(build_banded_row(item, idx == cursor, &self.styles))
+        let content = build_banded_row(item, idx == cursor, &self.styles);
+        let items = Rc::downgrade(&self.items);
+        let list = Weak::clone(&self.list);
+        Some(Rc::new(RefCell::new(SelectableRow::new(
+            content,
+            move || {
+                // Only the current menu owns this snapshot. A phase change drops it,
+                // so clicks on a previously painted menu cannot select a new action.
+                let Some(_items) = items.upgrade() else {
+                    return false;
+                };
+                let Some(list) = list.upgrade() else {
+                    return false;
+                };
+                list.borrow_mut().cursor = u32::try_from(idx).expect("menu index fits u32");
+                true
+            },
+        ))))
     }
 }
 
@@ -1180,6 +1194,165 @@ mod tests {
             mods,
             ..Key::default()
         })
+    }
+
+    #[test]
+    fn usage_display_scrolls_as_a_document_through_real_key_dispatch() {
+        let statuses = (0..16)
+            .map(|i| {
+                usage_status_for_account("openai-codex", Some(&format!("account-{i:02}")), None)
+            })
+            .collect();
+        let (overlay, closed) = overlay_with(statuses, vec![]);
+        runtime_handle().block_on(async {
+            let overlay = Rc::new(RefCell::new(overlay));
+            let widget = to_widget_ref(Rc::clone(&overlay));
+            let (mut app, root, _input) = crate::test_support::widget_app(
+                Rc::clone(&widget),
+                widget,
+                Size {
+                    width: 70,
+                    height: 7,
+                },
+            )
+            .await;
+            let rendered = || {
+                let surface = overlay
+                    .borrow_mut()
+                    .draw(&crate::test_support::draw_ctx(70, Some(7)));
+                crate::test_support::flatten(&surface)
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .take(69)
+                            .map(|cell| cell.char.grapheme())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let first = rendered();
+            app.handle_input(key(Key::DOWN, Modifiers::empty()));
+            app.render(&root).unwrap();
+            assert_eq!(&rendered()[..6], &first[1..]);
+            app.handle_input(key(Key::HOME, Modifiers::empty()));
+            app.render(&root).unwrap();
+            app.handle_input(key(Key::PAGE_DOWN, Modifiers::empty()));
+            app.render(&root).unwrap();
+            assert_eq!(
+                &rendered()[..2],
+                &first[5..],
+                "page retains two context lines"
+            );
+            assert_ne!(rendered(), first);
+            app.handle_input(key(Key::PAGE_UP, Modifiers::empty()));
+            app.render(&root).unwrap();
+            assert_eq!(rendered(), first);
+            app.handle_input(key(Key::END, Modifiers::empty()));
+            app.render(&root).unwrap();
+            assert!(rendered().join("\n").contains("account-15"));
+            app.handle_input(key(Key::HOME, Modifiers::empty()));
+            app.render(&root).unwrap();
+            assert_eq!(rendered(), first);
+            assert!(!*closed.borrow());
+        });
+    }
+
+    #[test]
+    fn usage_menu_clicks_and_navigation_require_enter_before_spending_a_credit() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let source: Arc<dyn RateLimitResetSource> = Arc::new(FakeResetSource {
+            provider_id: "openai-codex".into(),
+            outcome: Ok(ResetOutcome::Reset),
+            keys: Arc::clone(&keys),
+            targets: Arc::clone(&targets),
+            target_changed: false,
+        });
+        let statuses = (0..20)
+            .map(|i| {
+                usage_status_for_account("openai-codex", Some(&format!("account-{i:02}")), Some(2))
+            })
+            .collect();
+        let (overlay, _) = overlay_with(statuses, vec![source]);
+        runtime_handle().block_on(async {
+            let overlay = Rc::new(RefCell::new(overlay));
+            let widget = to_widget_ref(Rc::clone(&overlay));
+            let (mut app, root, _input) = crate::test_support::widget_app(
+                Rc::clone(&widget),
+                widget,
+                Size {
+                    width: 70,
+                    height: 7,
+                },
+            )
+            .await;
+            let click = |row| {
+                Event::Mouse(vaxis::mouse::Mouse {
+                    row,
+                    col: 3,
+                    xoffset: 0,
+                    yoffset: 0,
+                    mods: Default::default(),
+                    button: vaxis::mouse::Button::Left,
+                    kind: vaxis::mouse::Type::Press,
+                })
+            };
+            app.handle_input(key(u32::from('r'), Modifiers::empty()));
+            app.render(&root).unwrap();
+            for (code, account) in [
+                (Key::END, "account-19"),
+                (Key::HOME, "account-00"),
+                (Key::PAGE_DOWN, "account-07"),
+            ] {
+                app.handle_input(key(code, Modifiers::empty()));
+                app.render(&root).unwrap();
+                assert_eq!(
+                    overlay.borrow().selected_target().unwrap().account(),
+                    Some(account)
+                );
+            }
+            app.handle_input(click(1));
+            assert_eq!(
+                overlay.borrow().selected_target().unwrap().account(),
+                Some("account-08")
+            );
+            assert!(matches!(overlay.borrow().phase, Phase::SelectProvider));
+            assert!(keys.lock().unwrap().is_empty());
+            app.handle_input(key(Key::ENTER, Modifiers::empty()));
+            app.render(&root).unwrap();
+            app.handle_input(click(1));
+            assert_eq!(overlay.borrow().selected_value().as_deref(), Some("cancel"));
+            app.handle_input(click(0));
+            assert_eq!(
+                overlay.borrow().selected_value().as_deref(),
+                Some("confirm")
+            );
+            assert!(
+                keys.lock().unwrap().is_empty(),
+                "clicking confirm only selects it"
+            );
+            app.handle_input(key(Key::ENTER, Modifiers::empty()));
+            // A queued press still targets the painted confirm menu, not the
+            // consuming phase that has replaced its source but not yet painted.
+            app.handle_input(click(1));
+            assert_eq!(overlay.borrow().list.borrow().cursor, 0);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    app.render(&root).unwrap();
+                    if matches!(overlay.borrow().phase, Phase::Done { .. }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reset finishes");
+            assert_eq!(keys.lock().unwrap().len(), 1);
+            assert_eq!(
+                &*targets.lock().unwrap(),
+                &[target("openai-codex", Some("account-08"))]
+            );
+        });
     }
 
     fn send(overlay: &mut UsageOverlay, event: &Event) {

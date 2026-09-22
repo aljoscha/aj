@@ -1195,6 +1195,10 @@ account, and retains its target and idempotency key on retry. Completion offers
 a user-paced refresh against the same captured address, even if focus changes.
 It attempts both endpoints without capability pre-gating and renders a clear
 notice on `unknown_endpoint`, with no fallback to client credentials.
+The report supports line scrolling, Home/End, and viewport-sized pages with
+the same context overlap as read-only content overlays. Provider, confirmation,
+and retry menus use picker navigation and select-only clicks. Clicking never
+spends a credit or retries a reset. Enter performs the selected menu action.
 
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer.
