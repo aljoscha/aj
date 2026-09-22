@@ -599,6 +599,13 @@ impl ListView {
         self.scroll.top
     }
 
+    /// Remap the top item's index after a row-set update without discarding
+    /// queued wheel input or a pending keyboard reveal. The item at the new
+    /// index must have the same line geometry as the old anchor.
+    pub(crate) fn reanchor(&mut self, top: u32) {
+        self.scroll.top = top;
+    }
+
     /// Lines of the top item scrolled above the viewport edge as of the last
     /// completed draw.
     ///

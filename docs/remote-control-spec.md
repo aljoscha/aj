@@ -1147,9 +1147,12 @@ or switching scope starts a user-paced read off the input and render loops.
 Local scans publish coalesced provisional snapshots as files are read. HTTP
 reads return a complete bounded list or partial results with named failures.
 The overlay remains interactive while loading. Search covers the full prompt,
-and selection recalls into the editor without submitting. Provisional snapshots
-select the best-ranked result until the user navigates, then retain that prompt
-across updates. Changing the query starts best-match selection again.
+and selection recalls into the editor without submitting. Background snapshots
+retain the selected prompt and its screen row while it survives. If the selection
+is offscreen, they retain the top visible prompt instead. Removed anchors fall
+back to the nearest remaining rank. Changing the query selects the best match
+again. Local updates paint at most ten times per second, skipping unchanged
+snapshots without delaying the first results.
 Closing or changing scope cancels the outstanding client read. No history cache
 or journal is persisted, and no history read belongs to directory or sidebar polling.
 Unsupported endpoints produce a notice rather than a capability pre-gate.

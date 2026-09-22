@@ -276,8 +276,6 @@ struct SelectState {
     visible: Vec<(usize, u32)>,
     /// The current filter text, mirrored from the filter field on change.
     query: String,
-    /// Navigation chooses a row, unlike an automatically ranked first result.
-    user_selected: bool,
     /// The optional narrowing sigil ([`FilterableSelect::set_scope_sigil`]).
     scope_sigil: Option<char>,
     matcher: FuzzyMatcher,
@@ -585,6 +583,32 @@ fn full_filter(state: &mut SelectState, list: &mut ListView) {
     list.jump_to_item(0);
 }
 
+/// Select rows are one line tall. Preserve a visible selection's screen row,
+/// or the reading anchor if the user scrolled the selection out of view. Only
+/// the indices move, so input queued since the last draw is still applied.
+fn retain_position(list: &mut ListView, count: usize, selected: Option<usize>, top: Option<usize>) {
+    let count = u32::try_from(count).expect("row count fits u32");
+    let old_top = list.scroll_top();
+    let screen_row = list
+        .cursor
+        .checked_sub(old_top)
+        .filter(|&row| row < u32::from(list.viewport_height().unwrap_or(0)));
+    let cursor = selected
+        .map(|pos| u32::try_from(pos).expect("pos fits u32"))
+        .unwrap_or(list.cursor)
+        .min(count.saturating_sub(1));
+    let top = match (selected, screen_row) {
+        (Some(_), Some(row)) => cursor.saturating_sub(row),
+        _ => top
+            .map(|pos| u32::try_from(pos).expect("pos fits u32"))
+            .unwrap_or(old_top)
+            .min(count.saturating_sub(1)),
+    };
+    list.item_count = Some(count);
+    list.cursor = cursor;
+    list.reanchor(top);
+}
+
 /// Rank `candidates`, indices into `items` in ascending order, against the
 /// live query. Best-first, ties broken by index.
 ///
@@ -756,7 +780,6 @@ impl FilterableSelect {
             visible: Vec::new(),
             items,
             query: String::new(),
-            user_selected: false,
             scope_sigil: None,
             matcher: FuzzyMatcher::new(),
             literal_search: false,
@@ -804,7 +827,6 @@ impl FilterableSelect {
                 // mid-string change) may add matches, so rescore everything.
                 let is_append = text.starts_with(&state.query) && text.len() > state.query.len();
                 state.query = text.to_string();
-                state.user_selected = false;
                 // Quote delimiters are syntax in literal search. Keep its
                 // edits outside the fuzzy-token monotonicity assumption.
                 if is_append && !state.literal_search {
@@ -847,7 +869,6 @@ impl FilterableSelect {
     pub fn set_literal_search(&mut self, enabled: bool) {
         let mut state = self.state.borrow_mut();
         state.literal_search = enabled;
-        state.user_selected = false;
         full_filter(&mut state, &mut self.list.borrow_mut());
     }
 
@@ -896,26 +917,45 @@ impl FilterableSelect {
     pub fn set_items(&self, items: Vec<SelectItem>) {
         let mut state = self.state.borrow_mut();
         state.items = items;
-        state.user_selected = false;
         full_filter(&mut state, &mut self.list.borrow_mut());
     }
 
-    /// Replace a ranked snapshot, following the best result until the user
-    /// navigates. A navigated row keeps its identity across later snapshots.
-    /// Callers must supply unique, stable filter keys. Editing the query or
-    /// replacing the source with `set_items` returns to automatic selection.
+    /// Replace a ranked snapshot, retaining the selected row and its screen
+    /// position while it survives. When the selection is offscreen, retain the
+    /// top visible row instead. Removed anchors fall back to the nearest rank.
+    /// Callers must supply unique, stable filter keys. Query edits and
+    /// `set_items` explicitly reset selection to the best result.
     pub fn set_ranked_items(&self, items: Vec<SelectItem>) {
-        let selected = self
-            .state
-            .borrow()
-            .user_selected
-            .then(|| self.selected())
-            .flatten();
-        self.set_items(items);
-        if let Some(selected) = selected {
-            let retained = self.select_matching(|item| item.filter_key == selected.filter_key);
-            self.state.borrow_mut().user_selected = retained;
+        let mut state = self.state.borrow_mut();
+        if state.items == items {
+            return;
         }
+        let mut list = self.list.borrow_mut();
+        let key_at = |pos: u32| {
+            state
+                .visible
+                .get(pos as usize)
+                .map(|&(i, _)| state.items[i].filter_key.clone())
+        };
+        let selected = key_at(list.cursor);
+        let top = key_at(list.scroll_top());
+        state.items = items;
+        let all = (0..state.items.len()).collect();
+        state.visible = rank(&mut state, all);
+        let position = |key: Option<String>| {
+            key.and_then(|key| {
+                state
+                    .visible
+                    .iter()
+                    .position(|&(i, _)| state.items[i].filter_key == key)
+            })
+        };
+        retain_position(
+            &mut list,
+            state.visible.len(),
+            position(selected),
+            position(top),
+        );
     }
 
     /// Append `items` to the row set and re-apply the active filter,
@@ -951,26 +991,23 @@ impl FilterableSelect {
             return;
         }
         let mut list = self.list.borrow_mut();
-        let highlighted = state
+        let highlighted = state.visible.get(list.cursor as usize).map(|&(i, _)| i);
+        let top = state
             .visible
-            .get(usize::try_from(list.cursor).expect("cursor fits usize"))
+            .get(list.scroll_top() as usize)
             .map(|&(i, _)| i);
         state.items[index] = item;
         let all = (0..state.items.len()).collect();
         state.visible = rank(&mut state, all);
-        let count = u32::try_from(state.visible.len()).expect("row count fits u32");
-        list.item_count = Some(count);
-        let position = highlighted.and_then(|i| state.visible.iter().position(|&(j, _)| j == i));
-        match position {
-            Some(pos) => {
-                let pos = u32::try_from(pos).expect("pos fits u32");
-                if pos != list.cursor {
-                    list.cursor = pos;
-                    list.ensure_scroll();
-                }
-            }
-            None => list.cursor = list.cursor.min(count.saturating_sub(1)),
-        }
+        let position = |index: Option<usize>| {
+            index.and_then(|i| state.visible.iter().position(|&(j, _)| j == i))
+        };
+        retain_position(
+            &mut list,
+            state.visible.len(),
+            position(highlighted),
+            position(top),
+        );
     }
 
     /// Move the cursor onto the first visible item matching `pred`, used to
@@ -1197,13 +1234,11 @@ impl Widget for FilterableSelect {
         if key.matches(Key::DOWN, Modifiers::empty())
             || key.matches(u32::from('n'), Modifiers::CTRL)
         {
-            self.state.borrow_mut().user_selected = true;
             self.list.borrow_mut().next_item(ctx);
             return;
         }
         if key.matches(Key::UP, Modifiers::empty()) || key.matches(u32::from('p'), Modifiers::CTRL)
         {
-            self.state.borrow_mut().user_selected = true;
             self.list.borrow_mut().prev_item(ctx);
         }
     }
@@ -2051,31 +2086,75 @@ mod tests {
     }
 
     #[test]
-    fn ranked_snapshots_follow_the_best_result_until_the_user_navigates() {
+    fn ranked_snapshots_retain_selection_and_query_edits_choose_best() {
         let mut select = FilterableSelect::new(items(&["old"]), SelectStyles::default());
         select.set_ranked_items(items(&["new", "old"]));
-        assert_eq!(select.selected().unwrap().filter_key, "new");
-
-        // Even a deliberate move back to the first row is a choice to retain.
-        send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(select.selected().unwrap().filter_key, "old");
         send(&mut select, &key(Key::UP, Modifiers::empty()));
-        for snapshot in [
-            vec!["newest", "new", "old"],
-            vec!["fresh", "newest", "new", "old"],
-        ] {
-            select.set_ranked_items(items(&snapshot));
-            assert_eq!(select.selected().unwrap().filter_key, "new");
-        }
-
-        // A new query asks for the best match again, not the old row identity.
+        select.set_ranked_items(items(&["newest", "new", "old"]));
+        assert_eq!(select.selected().unwrap().filter_key, "new");
         send(&mut select, &typed('o'));
+        assert_eq!(select.selected().unwrap().filter_key, "old");
         select.set_ranked_items(items(&["o", "old"]));
-        assert_eq!(select.selected().unwrap().filter_key, "o");
-        send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(select.selected().unwrap().filter_key, "old");
         select.set_ranked_items(items(&["other"]));
         assert_eq!(select.selected().unwrap().filter_key, "other");
-        select.set_ranked_items(items(&["o", "other"]));
-        assert_eq!(select.selected().unwrap().filter_key, "o");
+        select.set_ranked_items(vec![]);
+        assert!(select.selected().is_none());
+        select.set_ranked_items(items(&["only"]));
+        assert_eq!(select.selected().unwrap().filter_key, "only");
+    }
+
+    #[test]
+    fn ranked_snapshots_anchor_the_drawn_selection_or_offscreen_reading_position() {
+        let rows = || {
+            (0..60)
+                .map(|i| SelectItem::new(format!("row{i:02}"), format!("row{i:02}")))
+                .collect()
+        };
+        let mut select = FilterableSelect::new(rows(), SelectStyles::default());
+        let ctx = draw_ctx(30, 10);
+        select.draw(&ctx);
+        for _ in 0..20 {
+            send(&mut select, &key(Key::DOWN, Modifiers::empty()));
+            select.draw(&ctx);
+        }
+        let screen_row = select.list.borrow().cursor - select.list.borrow().scroll_top();
+        assert!(screen_row > 0, "fixture has the selection below the top");
+        let mut incoming = items(&["new0", "new1"]);
+        incoming.extend(rows());
+        select.set_ranked_items(incoming);
+        select.draw(&ctx);
+        assert_eq!(select.selected().unwrap().filter_key, "row20");
+        assert_eq!(
+            select.list.borrow().cursor - select.list.borrow().scroll_top(),
+            screen_row
+        );
+
+        // Wheel input can leave the keyboard selection outside the viewport.
+        select.list.borrow_mut().scroll_lines(15);
+        select.draw(&ctx);
+        let top = select.visible_labels()[select.list.borrow().scroll_top() as usize].clone();
+        assert!(select.list.borrow().cursor < select.list.borrow().scroll_top());
+        // Another wheel event is queued but has not drawn when the batch lands.
+        select.list.borrow_mut().scroll_lines(2);
+        let mut incoming = items(&["newest", "new0", "new1"]);
+        incoming.extend(rows());
+        select.set_ranked_items(incoming);
+        select.draw(&ctx);
+        let new_top = select.list.borrow().scroll_top() as usize;
+        assert_eq!(select.visible_labels()[new_top - 2], top);
+        assert_eq!(select.selected().unwrap().filter_key, "row20");
+
+        // Eviction clamps both anchors, and an identical snapshot does not
+        // consume a navigation event still waiting for a draw.
+        select.set_ranked_items(items(&["last0", "last1"]));
+        select.draw(&ctx);
+        assert_eq!(select.selected().unwrap().filter_key, "last1");
+        send(&mut select, &key(Key::UP, Modifiers::empty()));
+        select.set_ranked_items(items(&["last0", "last1"]));
+        select.draw(&ctx);
+        assert_eq!(select.selected().unwrap().filter_key, "last0");
     }
 
     // --- Parity between the incremental paths and a full rescore. ---

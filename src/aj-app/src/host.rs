@@ -1530,7 +1530,13 @@ impl SessionHost {
                         .map(crate::prompt_history::to_wire)
                         .collect();
                     if let Some(updates) = &updates {
-                        updates.send_replace(history.clone());
+                        updates.send_if_modified(|current| {
+                            if *current == history {
+                                return false;
+                            }
+                            *current = history.clone();
+                            true
+                        });
                     }
                 },
             ) {

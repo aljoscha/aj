@@ -5363,6 +5363,7 @@ fn spawn_history_scan(world: &World, fetch: HistoryFetch) -> HistoryFill {
                         }],
                     },
                 };
+                // Even an empty scan must replace the loading placeholder.
                 tx.send_replace(history);
             }
         }
@@ -5371,17 +5372,21 @@ fn spawn_history_scan(world: &World, fetch: HistoryFetch) -> HistoryFill {
         select: fetch.select,
         subtitle: fetch.subtitle,
         rx,
+        next_update: tokio::time::Instant::now(),
     }
 }
 
 async fn recv_history(fill: Option<&mut HistoryFill>) -> Option<aj_wire::PromptHistory> {
     match fill {
-        Some(fill) => fill
-            .rx
-            .changed()
-            .await
-            .ok()
-            .map(|()| fill.rx.borrow_and_update().clone()),
+        Some(fill) => {
+            // Wait before marking a snapshot seen: the drive loop may cancel
+            // this future to handle input. The watch retains the newest result
+            // throughout the wait, including the final result on channel close.
+            tokio::time::sleep_until(fill.next_update).await;
+            fill.rx.changed().await.ok()?;
+            fill.next_update = tokio::time::Instant::now() + Duration::from_millis(100);
+            Some(fill.rx.borrow_and_update().clone())
+        }
         None => std::future::pending().await,
     }
 }
@@ -5773,6 +5778,7 @@ struct HistoryFill {
     select: Rc<RefCell<FilterableSelect>>,
     subtitle: Rc<RefCell<String>>,
     rx: tokio::sync::watch::Receiver<aj_wire::PromptHistory>,
+    next_update: tokio::time::Instant,
 }
 
 /// The in-flight session-preview scan the drive loop streams into. Holds
@@ -20178,6 +20184,56 @@ mod tests {
             .take_history_fetch()
             .expect("toggle parked a scan");
         assert_eq!(fetch.scope, HistoryScope::All);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn history_fill_coalesces_without_losing_results_when_input_interrupts() {
+        let (tx, rx) = tokio::sync::watch::channel(aj_wire::PromptHistory::default());
+        let mut fill = HistoryFill {
+            select: Rc::new(RefCell::new(FilterableSelect::new(
+                vec![],
+                vaxis::vxfw::SelectStyles::default(),
+            ))),
+            subtitle: Rc::new(RefCell::new(String::new())),
+            rx,
+            next_update: tokio::time::Instant::now(),
+        };
+        let snapshot = |text: &str| aj_wire::PromptHistory {
+            prompts: vec![aj_wire::HistoryPrompt {
+                text: text.to_string(),
+                project: None,
+                timestamp: Utc::now(),
+            }],
+            incomplete: vec![],
+        };
+        tx.send_replace(snapshot("first"));
+        let before = tokio::time::Instant::now();
+        assert_eq!(
+            recv_history(Some(&mut fill)).await.unwrap().prompts[0].text,
+            "first"
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "first results are immediate"
+        );
+        tx.send_replace(snapshot("intermediate"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), recv_history(Some(&mut fill)))
+                .await
+                .is_err()
+        );
+        tx.send_replace(snapshot("final"));
+        drop(tx);
+        assert_eq!(
+            recv_history(Some(&mut fill)).await.unwrap().prompts[0].text,
+            "final"
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            Duration::from_millis(100)
+        );
+        assert!(recv_history(Some(&mut fill)).await.is_none());
     }
 
     /// An in-flight HTTP read must not hold input or survive a scope change or
