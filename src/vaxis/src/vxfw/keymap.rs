@@ -317,6 +317,12 @@ impl<A: Clone + 'static, C: 'static> KeymapController<A, C> {
         self.in_flight.as_ref().map(|s| s.pressed.as_slice())
     }
 
+    /// Replace the content without replacing the controller's identity or
+    /// key-sequence state. The caller requests layout/redraw as needed.
+    pub fn set_child(&mut self, child: WidgetRef) {
+        self.child = child;
+    }
+
     /// The controller's own `WidgetRef`, used to target self-scheduled ticks.
     fn widget(&self) -> WidgetRef {
         self.me

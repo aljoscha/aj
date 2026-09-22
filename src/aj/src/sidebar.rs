@@ -90,16 +90,12 @@ pub(crate) const SIDEBAR_COLS: u16 = aj_conf::DEFAULT_SIDEBAR_COLS;
 
 /// Columns a transcript needs beside the strip to be worth reading: about a
 /// short line of prose.
-const MIN_TRANSCRIPT_COLS: u16 = 30;
+pub(crate) const MIN_TRANSCRIPT_COLS: u16 = 30;
 
 /// Terminal width below which the strip holds itself back.
 ///
-/// The strip is inflexible, so under this it would leave the transcript
-/// beside it too little to read. A function of the strip's own width rather
-/// than a constant: a configured strip wide enough to swallow an 80-column
-/// terminal has to suppress itself there, and `FlexRow` hands the flexible
-/// child `max.width - first_pass_width`, so the transcript would otherwise
-/// get zero columns.
+/// The preferred sidebar width includes its divider. Hiding it below this
+/// threshold preserves both that preference and usable transcript space.
 pub(crate) fn min_cols_with_sidebar(cols: u16) -> u16 {
     cols.saturating_add(MIN_TRANSCRIPT_COLS)
 }
@@ -132,17 +128,13 @@ const UNFOLDED_MARKER: &str = "▴";
 /// design that has not been made.
 const GROUP_CAP: usize = 5;
 
-/// The rule between the strip and the transcript, drawn on every line of the
-/// strip's height so the transcript's edge is one unbroken line.
-const SEPARATOR: &str = "│";
-
 /// What an unreachable host's header sets into its rule.
 const UNREACHABLE_MARK: &str = " ! ─";
 
 /// Columns a label may occupy: everything but the marker, the glyph, their
-/// separating space, and the pad and rule on the right.
+/// separating space, and the pad on the right. The split owns its divider.
 fn label_cols(width: u16) -> usize {
-    usize::from(width.saturating_sub(5))
+    usize::from(width.saturating_sub(4))
 }
 
 /// Columns the id-derived label takes where a tag shares the field: the width
@@ -397,14 +389,8 @@ pub(crate) struct SidebarState {
     /// default that otherwise follows the row count.
     pub(crate) toggled: bool,
     /// Whether the terminal is too narrow to spare the columns, resolved per
-    /// frame by the shell, which is the only place the width is known.
+    /// frame by the application's visibility policy.
     pub(crate) too_narrow: bool,
-    /// The configured width, once the drive loop has read it out of the
-    /// config. `None` until then, and in any test that does not set one.
-    configured_cols: Option<u16>,
-    /// Client-local geometry from dragging, superseded by an explicit setting.
-    dragged_cols: Option<u16>,
-    pub(crate) separator_active: bool,
     /// Rows in display order (see [`rows_for_display`]).
     pub(crate) rows: Vec<SidebarRow>,
     /// The hosts the peer named alongside its rows, empty against a plain host.
@@ -446,39 +432,6 @@ impl SidebarState {
     /// Whether the strip is drawn: wanted, and the terminal can spare it.
     pub(crate) fn shown(&self) -> bool {
         self.visible && !self.too_narrow
-    }
-
-    /// Columns the strip draws in.
-    ///
-    /// [`SIDEBAR_COLS`] until the loop has read the setting, so a strip
-    /// nobody configured is the strip the app ships.
-    pub(crate) fn cols(&self) -> u16 {
-        self.dragged_cols
-            .or(self.configured_cols)
-            .unwrap_or(SIDEBAR_COLS)
-    }
-
-    /// Take the configured width, which the drive loop reads off the live
-    /// config once per iteration ([`crate::interactive::sync_sidebar`]).
-    pub(crate) fn set_cols(&mut self, cols: u16) {
-        if self.configured_cols != Some(cols) {
-            self.clear_dragged_cols();
-        }
-        self.configured_cols = Some(cols);
-    }
-
-    pub(crate) fn clear_dragged_cols(&mut self) {
-        self.dragged_cols = None;
-    }
-
-    /// Resize without changing the saved preference or starving the transcript.
-    pub(crate) fn resize(&mut self, cols: u16, terminal_cols: u16) {
-        let max = terminal_cols
-            .saturating_sub(MIN_TRANSCRIPT_COLS)
-            .min(aj_conf::MAX_SIDEBAR_COLS);
-        if max >= aj_conf::MIN_SIDEBAR_COLS {
-            self.dragged_cols = Some(cols.clamp(aj_conf::MIN_SIDEBAR_COLS, max));
-        }
     }
 
     /// The wheel's anchor, if it still applies.
@@ -1295,8 +1248,7 @@ fn elide_host_name(name: &str, cols: usize) -> String {
 /// `text` in a field of exactly `cols` display columns, elided if it is too
 /// wide and padded with spaces if it is too narrow.
 ///
-/// Every line is built from these, which is what keeps the separator in its
-/// column whatever a tag or a host is named.
+/// Every row fits its allocated columns whatever a tag or host is named.
 fn field(text: &str, cols: usize) -> String {
     let mut out = elide_to_cols(text, cols);
     out.push_str(&" ".repeat(cols.saturating_sub(width_of(&out))));
@@ -1485,7 +1437,7 @@ impl SessionSidebar {
     }
 
     /// One line's spans: the focus marker, the status glyph, the label field,
-    /// then the pad and the separator. Every line has this shape, so a column
+    /// then the pad. Every line has this shape, so a column
     /// means the same thing on all of them.
     fn line_spans(
         &self,
@@ -1537,8 +1489,7 @@ impl SessionSidebar {
             ),
             StripLine::New => (" ", "+", dim, field("new", cols), dim),
         };
-        // The band reaches the pad and stops short of the separator, which
-        // belongs to the rule down the strip's edge rather than to any row.
+        // The band covers the whole row, including its trailing pad.
         let tint = |style: Style| {
             if hovered {
                 Style {
@@ -1558,23 +1509,12 @@ impl SessionSidebar {
             span(glyph, tint(glyph_style)),
             span(&format!(" {label}"), tint(label_style)),
             span(" ", tint(dim)),
-            span(self.separator(), dim),
         ]
     }
 
-    /// A line below the last drawn one: nothing but the separator, which runs
-    /// the strip's full height so the transcript's edge is one unbroken rule.
+    /// Fill the pane below its last row without extending the hover band.
     fn blank_spans(&self, width: u16) -> Vec<TextSpan> {
-        let pad = " ".repeat(usize::from(width) - 1);
-        vec![span(&format!("{pad}{}", self.separator()), self.styles.dim)]
-    }
-
-    fn separator(&self) -> &'static str {
-        if self.state.borrow().separator_active {
-            "┃"
-        } else {
-            SEPARATOR
-        }
+        vec![span(&" ".repeat(usize::from(width)), self.styles.dim)]
     }
 }
 
@@ -1609,11 +1549,7 @@ fn span(text: &str, style: Style) -> TextSpan {
 
 impl Widget for SessionSidebar {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        // A flex row measures its inflexible children under an unbounded width,
-        // so the width has to come from this widget rather than the context:
-        // that measurement is exactly the question "how wide are you".
-        let cols = self.state.borrow().cols();
-        let width = ctx.max.width.map_or(cols, |max| max.min(cols));
+        let width = ctx.max.width.unwrap_or(ctx.min.width);
         if !self.state.borrow().shown() || width == 0 {
             // Nothing is drawn, so nothing is there to gesture at either.
             self.gestures.clear();
@@ -1640,12 +1576,7 @@ impl Widget for SessionSidebar {
         // The rows can move under a pointer that has not, so the band is
         // re-resolved against the fresh layout rather than left marking
         // whatever used to be on that line.
-        let hover = if self.state.borrow().separator_active {
-            None
-        } else {
-            self.hover
-        };
-        self.set_hover(hover);
+        self.set_hover(self.hover);
         let state = self.state.borrow();
         let hover = self.hover.map(usize::from);
         let blanks = usize::from(ctx.max.height.unwrap_or(0)).saturating_sub(lines.len());
@@ -3437,36 +3368,22 @@ mod tests {
     /// The minted id every layout test reads its time of day out of.
     const MINTED: &str = "2026-08-06-19-07-19-368";
 
-    /// The width the paint goldens below are written at, carried by the
-    /// strip's own state.
-    ///
-    /// Deliberately not the shipped default: these goldens are about what the
-    /// strip's columns say at a width it was told to take, and a literal that
-    /// followed the default would have to be re-padded whenever taste moved
-    /// it. What the default paints is pinned in the composed shell's tests,
-    /// which draw the real layout.
+    /// Total sidebar width in the paint cases, including the split's divider.
+    /// Kept independent of the default so label/elision cases keep their budget.
     const PAINT_COLS: u16 = 24;
 
-    /// A draw context with no width at all, which is what a flex row hands an
-    /// inflexible child while it measures how wide that child wants to be.
-    fn measure_ctx(height: u16) -> DrawContext {
-        DrawContext {
-            max: MaxSize {
-                width: None,
-                height: Some(height),
-            },
-            ..paint_ctx(height)
-        }
+    fn paint_ctx(height: u16) -> DrawContext {
+        crate::test_support::draw_ctx(PAINT_COLS - 1, Some(height))
     }
 
-    /// A draw context roomier than the strip.
-    ///
-    /// So the paint reads the width the strip carries rather than the one it
-    /// was handed: the composed layout measures an inflexible child under an
-    /// unbounded width, and a context that exactly fit would paint the same
-    /// whether or not the strip knows how wide it is.
-    fn paint_ctx(height: u16) -> DrawContext {
-        crate::test_support::draw_ctx(PAINT_COLS * 2, Some(height))
+    fn split_strip(strip: SessionSidebar, cols: u16) -> vaxis::vxfw::SplitView {
+        let mut split = vaxis::vxfw::SplitView::new(
+            Rc::new(RefCell::new(strip)),
+            Rc::new(RefCell::new(vaxis::vxfw::Text::new(""))),
+            cols.saturating_sub(1),
+        );
+        split.style = styles().dim;
+        split
     }
 
     /// The time column holds one width and one place on every row: a tag
@@ -3732,7 +3649,7 @@ mod tests {
     /// stale the first time taste moves the default.
     #[test]
     fn a_deep_clone_loses_its_head_at_the_default_field_too() {
-        let cols = label_cols(SIDEBAR_COLS);
+        let cols = label_cols(SIDEBAR_COLS - 1);
         let deep = "~/work/umber/materialize/src";
         assert!(
             width_of(deep) > cols,
@@ -3871,24 +3788,23 @@ mod tests {
             hosts,
             ..SidebarState::default()
         }));
-        state.borrow_mut().set_cols(PAINT_COLS);
         let mut strip = SessionSidebar::new(state, styles(), HOVER_BG);
         strip.draw(&paint_ctx(height));
         strip
     }
 
-    /// The strip's painted cells at its own width.
+    /// The sidebar and divider's painted cells at the test layout width.
     fn painted_cells(
         rows: Vec<SidebarRow>,
         hosts: Vec<DirectoryHost>,
         height: u16,
     ) -> Vec<Vec<vaxis::cell::Cell>> {
-        let mut strip = strip(rows, hosts, height);
-        let surface = strip.draw(&paint_ctx(height));
+        let mut split = split_strip(strip(rows, hosts, height), PAINT_COLS);
+        let surface = split.draw(&crate::test_support::draw_ctx(PAINT_COLS, Some(height)));
         crate::test_support::flatten(&surface)
     }
 
-    /// The strip's painted lines at its own width.
+    /// The sidebar and divider's painted lines at the test layout width.
     fn painted(rows: Vec<SidebarRow>, hosts: Vec<DirectoryHost>, height: u16) -> Vec<String> {
         painted_cells(rows, hosts, height)
             .iter()
@@ -3921,16 +3837,9 @@ mod tests {
         }
     }
 
-    /// The strip draws the width it carries, and the label field is what the
-    /// extra columns go to.
-    ///
-    /// Measured under a context with no width at all, which is the question a
-    /// flex row asks an inflexible child: answer it from the context and the
-    /// strip is as wide as the terminal. A tag long enough to elide at the
-    /// default and not at the wider width is what tells a strip whose field
-    /// grew from one that padded its way out to the same size.
+    /// Extra layout width goes to the label rather than only padding the pane.
     #[test]
-    fn the_strip_draws_the_width_it_carries() {
+    fn wider_layout_gives_labels_more_room() {
         // Sixteen columns of tag: past the fourteen the default field leaves
         // one, inside the twenty-six a strip twelve columns wider leaves it.
         let tag = "rewrite-the-auth";
@@ -3939,11 +3848,11 @@ mod tests {
             rows: vec![row(MINTED).tag(tag).focused().build()],
             ..SidebarState::default()
         }));
-        let mut strip = SessionSidebar::new(Rc::clone(&state), styles(), HOVER_BG);
+        let mut split = split_strip(SessionSidebar::new(state, styles(), HOVER_BG), SIDEBAR_COLS);
         // The row itself, out of a strip tall enough to hold it and the create
         // line under it.
-        let line = |strip: &mut SessionSidebar| -> String {
-            let surface = strip.draw(&measure_ctx(2));
+        let line = |split: &mut vaxis::vxfw::SplitView| -> String {
+            let surface = split.draw(&crate::test_support::draw_ctx(split.width() + 1, Some(2)));
             crate::test_support::flatten(&surface)
                 .iter()
                 .map(|row| row.iter().map(|cell| cell.char.grapheme()).collect())
@@ -3951,26 +3860,26 @@ mod tests {
                 .expect("the focused row is painted")
         };
 
-        let shipped = line(&mut strip);
+        let shipped = line(&mut split);
         assert_eq!(
             width_of(&shipped),
             usize::from(SIDEBAR_COLS),
             "an unconfigured strip is the strip the app ships: {shipped:?}",
         );
         assert!(
-            shipped.ends_with(SEPARATOR) && shipped.contains('\u{2026}'),
+            shipped.ends_with('│') && shipped.contains('\u{2026}'),
             "the rule closes the strip and the tag elides in it: {shipped:?}",
         );
 
-        state.borrow_mut().set_cols(SIDEBAR_COLS + 12);
-        let wider = line(&mut strip);
+        split.set_width(SIDEBAR_COLS + 12 - 1);
+        let wider = line(&mut split);
         assert_eq!(
             width_of(&wider),
             usize::from(SIDEBAR_COLS) + 12,
             "the configured width is the drawn width: {wider:?}",
         );
         assert!(
-            wider.ends_with(SEPARATOR) && wider.contains(tag),
+            wider.ends_with('│') && wider.contains(tag),
             "and the columns went to the field, which now holds the whole \
              tag: {wider:?}",
         );

@@ -942,17 +942,14 @@ mod tests {
         assert!(widget_eq(&hits[1].widget, &high));
     }
 
-    /// Convention enforcer (the reframed upstream "all widgets have a doctest"
-    /// meta-test). Walks `src/vxfw/` and asserts every widget module file
-    /// carries a `#[test]` whose name matches the module file stem (its
-    /// "doctest"). The framework core (`vxfw.rs`) and the runtime modules
-    /// (the app, engine, and event plumbing files in the excludes list below)
-    /// are excluded. This is a lightweight string scan, not an AST
-    /// parse: it only proves the test exists, which is enough to fail CI early
-    /// when a widget lands without one. It passes vacuously until widgets land.
+    /// Each widget has a named module test or a dedicated integration-test
+    /// target. This checks test presence, not the strength of its assertions.
+    /// Runtime modules have their own tests and are excluded from this widget
+    /// convention.
     #[test]
-    fn all_widgets_have_a_doctest() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vxfw");
+    fn all_widgets_have_tests() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = root.join("src/vxfw");
         let excludes = ["app", "app_core", "async_app", "loop_event", "render_debug"];
         let entries = std::fs::read_dir(&dir).expect("read src/vxfw");
         for entry in entries {
@@ -969,9 +966,14 @@ mod tests {
             }
             let data = std::fs::read_to_string(&path).expect("read widget module");
             let needle = format!("fn {stem}(");
+            let integration = root.join("tests").join(format!("{stem}.rs"));
+            let has_integration_tests = integration.is_file() && {
+                let tests = std::fs::read_to_string(integration).expect("read integration tests");
+                tests.contains("#[test]") || tests.contains("#[tokio::test]")
+            };
             assert!(
-                data.contains(&needle),
-                "widget module `{stem}` has no doctest named `{stem}`"
+                data.contains(&needle) || has_integration_tests,
+                "widget module `{stem}` has neither a named module test nor an integration-test target"
             );
         }
     }

@@ -69,8 +69,8 @@ use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
     AsyncApp, AutocompleteDelivery, DrawContext, EditorTheme, Event, EventContext,
-    FilterableSelect, FlexColumn, FlexItem, FlexRow, FrameStats, KeymapController, ListView,
-    MaxSize, Options, PopupStyle, RelativePoint, Size, SubSurface, Surface, Text, TextArea,
+    FilterableSelect, FlexColumn, FlexItem, FrameStats, KeymapController, ListView, MaxSize,
+    Options, PopupStyle, RelativePoint, Size, SplitView, SubSurface, Surface, Text, TextArea,
     UserEvent, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
@@ -103,11 +103,12 @@ use crate::settings_ui::{
     SkillsFetch, SkillsFill, build_skill_rows, fill_model, fill_settings, fill_thinking,
     open_selector_loading, open_settings_loading, open_skills, skills_placeholder_row,
 };
-#[cfg(test)]
-use crate::sidebar::{RowStatus, SIDEBAR_COLS, SidebarRow};
 use crate::sidebar::{
-    SessionSidebar, SidebarState, StripGesture, min_cols_with_sidebar, step_session,
+    MIN_TRANSCRIPT_COLS, SIDEBAR_COLS, SessionSidebar, SidebarState, StripGesture,
+    min_cols_with_sidebar, step_session,
 };
+#[cfg(test)]
+use crate::sidebar::{RowStatus, SidebarRow};
 use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{Connection, STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::{TaskBacking, TaskOutputView, open_task_output};
@@ -3201,6 +3202,16 @@ fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
         .lock()
         .expect("config mutex poisoned")
         .sidebar_cols;
+    {
+        let mut shell = shell.borrow_mut();
+        if shell.sidebar_configured_cols != cols {
+            shell
+                .sidebar_split
+                .borrow_mut()
+                .set_width(cols.saturating_sub(1));
+            shell.sidebar_configured_cols = cols;
+        }
+    }
     let rows = crate::sidebar::rows_for_display(
         world.directory.rows(),
         world.session(),
@@ -3210,7 +3221,6 @@ fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
     );
     let sidebar = Rc::clone(&shell.borrow().sidebar);
     let mut state = sidebar.borrow_mut();
-    state.set_cols(cols);
     // Showing itself once the peer offers a choice is the default, and an
     // explicit toggle outranks it for the rest of the process.
     if !state.toggled {
@@ -5129,7 +5139,11 @@ fn presentation_save(
             )
         }
         "sidebar_cols" => {
-            shell.borrow().sidebar.borrow_mut().clear_dragged_cols();
+            let shell = shell.borrow();
+            shell
+                .sidebar_split
+                .borrow_mut()
+                .set_width(shell.sidebar_configured_cols.saturating_sub(1));
             format!("sidebar_cols set to {value}.")
         }
         _ => format!("{id} set to {value}."),
@@ -6149,10 +6163,10 @@ struct Shell {
     /// time. Also owns whether the strip is shown at all, which the toggle
     /// action flips.
     sidebar: Rc<RefCell<SidebarState>>,
-    /// The split gesture belongs to the layout, not either pane: it must keep
-    /// consuming drags and release after the pointer crosses the separator.
-    sidebar_dragging: bool,
-    terminal_cols: u16,
+    sidebar_split: Rc<RefCell<SplitView>>,
+    /// Last applied preference, including the divider. Routine directory
+    /// refreshes leave the split's client-local dragged width alone.
+    sidebar_configured_cols: u16,
     /// The toast-stack widget, drawn bottom-right every frame: stacked above
     /// the quit hint when no modal is open, floated over the scrim/overlay
     /// (z 3) otherwise. Reads the `toasts` stack below. Plain `RefCell` like
@@ -6323,9 +6337,8 @@ impl Shell {
         // The strip runs the full height beside the column, not beside the chat
         // alone: it is about the connection rather than the transcript, and a
         // strip that stopped at the editor would leave the session list looking
-        // like part of the conversation. `flex == 0` gives it its own fixed
-        // width and the column everything left (see `SIDEBAR_COLS`), and it
-        // draws nothing at all while hidden, so plain local use pays no width.
+        // like part of the conversation. The split owns the divider and the
+        // geometry. Hidden layouts give the whole viewport to the session.
         let sidebar = Rc::new(RefCell::new(SidebarState::default()));
         let sidebar_strip = Rc::new(RefCell::new(SessionSidebar::new(
             Rc::clone(&sidebar),
@@ -6335,12 +6348,17 @@ impl Shell {
             // reads the same everywhere in the app.
             chrome.borrow().select.selected_bg,
         )));
-        let layout: WidgetRef = Rc::new(RefCell::new(FlexRow {
-            children: vec![
-                FlexItem::init(to_widget_ref(Rc::clone(&sidebar_strip)), 0),
-                FlexItem::init(to_widget_ref(Rc::clone(&views)), 1),
-            ],
-        }));
+        let mut split = SplitView::new(
+            to_widget_ref(Rc::clone(&sidebar_strip)),
+            to_widget_ref(Rc::clone(&views)),
+            SIDEBAR_COLS - 1,
+        );
+        split.min_width = aj_conf::MIN_SIDEBAR_COLS - 1;
+        split.max_width = Some(aj_conf::MAX_SIDEBAR_COLS - 1);
+        split.min_other_width = MIN_TRANSCRIPT_COLS;
+        split.style = styles.dim;
+        let sidebar_split = Rc::new(RefCell::new(split));
+        let layout = to_widget_ref(Rc::clone(&sidebar_split));
 
         let overlays = Rc::new(RefCell::new(OverlayStack::default()));
         let command_slot: Rc<RefCell<Option<CommandAction>>> = Rc::new(RefCell::new(None));
@@ -6600,6 +6618,8 @@ impl Shell {
             keymap,
             keymap_ctx,
             sidebar,
+            sidebar_split,
+            sidebar_configured_cols: SIDEBAR_COLS,
             quit_hint,
             quit_hint_warning,
             frame_stats_box,
@@ -6632,8 +6652,6 @@ impl Shell {
             tag_edit,
             terminal_caps: Cell::new(TerminalCaps::default()),
             width_method: Cell::new(vaxis::gwidth::Method::Unicode),
-            sidebar_dragging: false,
-            terminal_cols: 0,
         };
         shell.wire_view(&view);
         shell
@@ -6714,83 +6732,34 @@ impl Shell {
         self.tag_edit.borrow_mut().take()
     }
 
-    /// The shared handles the drive loop needs to open an overlay: the stack
-    /// it pushes onto, the editor (focus fallback), a live chrome snapshot,
-    /// the parked-request slots, and the busy flag plus toast stack the
-    /// session-changing confirms read and raise into.
     /// Columns the sidebar takes from the left of the base column, which
     /// anything floated over that column has to clear.
     fn sidebar_cols(&self) -> u16 {
-        let sidebar = self.sidebar.borrow();
-        if sidebar.shown() { sidebar.cols() } else { 0 }
-    }
-
-    fn resize_sidebar(&mut self, ctx: &mut EventContext, event: &Event) {
-        use vaxis::mouse::{Button, Shape, Type};
-
-        let mut sidebar = self.sidebar.borrow_mut();
-        let was_active = sidebar.separator_active;
-        match event {
-            Event::Mouse(mouse) if sidebar.shown() && !self.overlays.borrow().is_open() => {
-                let on_separator = i32::from(mouse.col) == i32::from(sidebar.cols()) - 1;
-                let was_dragging = self.sidebar_dragging;
-                if mouse.kind == Type::Press && mouse.button == Button::Left {
-                    self.sidebar_dragging = on_separator;
-                    if on_separator {
-                        ctx.capture_mouse();
-                    }
-                }
-                if self.sidebar_dragging
-                    && mouse.button == Button::Left
-                    && matches!(mouse.kind, Type::Drag | Type::Release)
-                {
-                    let cols = u16::try_from(mouse.col).unwrap_or(0).saturating_add(1);
-                    sidebar.resize(cols, self.terminal_cols);
-                    ctx.redraw = true;
-                }
-                if mouse.kind == Type::Release || mouse.kind == Type::Motion {
-                    // A buttonless motion also ends a drag whose release happened
-                    // outside the terminal and could not be reported.
-                    self.sidebar_dragging = false;
-                }
-                sidebar.separator_active = self.sidebar_dragging
-                    || ((was_dragging || !matches!(mouse.kind, Type::Drag | Type::Release))
-                        && i32::from(mouse.col) == i32::from(sidebar.cols()) - 1);
-                if (on_separator && !matches!(mouse.kind, Type::Drag | Type::Release))
-                    || was_dragging
-                    || self.sidebar_dragging
-                {
-                    ctx.consume_event();
-                }
-            }
-            Event::MouseLeave if self.sidebar_dragging => {}
-            Event::Mouse(_) | Event::MouseLeave | Event::FocusOut | Event::MouseCaptureLost => {
-                self.sidebar_dragging = false;
-                sidebar.separator_active = false;
-            }
-            _ => return,
-        }
-        if sidebar.separator_active || was_active {
-            ctx.set_mouse_shape(if sidebar.separator_active {
-                Shape::EwResize
-            } else {
-                Shape::Default
-            });
+        if self.sidebar.borrow().shown() {
+            self.sidebar_split.borrow().width().saturating_add(1)
+        } else {
+            0
         }
     }
 
     /// Hold the strip back on a terminal with no width to spare.
     ///
-    /// The strip is inflexible, so on a narrow terminal it would take its full
-    /// width off a transcript that has none to give and leave the column
-    /// nothing. Kept apart from `visible` so the user's ask survives a resize
-    /// and comes back when the width does.
+    /// Preserve the requested width while hidden. During a resize gesture the
+    /// split can shrink to its minimum instead, provided both panes still fit.
     fn suppress_sidebar_if_too_narrow(&self, terminal_cols: u16) {
-        let mut sidebar = self.sidebar.borrow_mut();
-        let too_narrow = terminal_cols < min_cols_with_sidebar(sidebar.cols());
-        sidebar.too_narrow = too_narrow;
+        let split = self.sidebar_split.borrow();
+        let cols = if split.is_dragging() {
+            aj_conf::MIN_SIDEBAR_COLS
+        } else {
+            split.width().saturating_add(1)
+        };
+        self.sidebar.borrow_mut().too_narrow = terminal_cols < min_cols_with_sidebar(cols);
     }
 
+    /// The shared handles the drive loop needs to open an overlay: the stack
+    /// it pushes onto, the editor (focus fallback), a live chrome snapshot,
+    /// the parked-request slots, and the busy flag plus toast stack the
+    /// session-changing confirms read and raise into.
     fn overlay_handles(&self) -> OverlayHandles {
         OverlayHandles {
             stack: Rc::clone(&self.overlays),
@@ -6996,15 +6965,13 @@ impl Widget for Shell {
         // means the editor grows against the current frame, and the first
         // painted frame is already correct.
         self.set_editor_row_cap(usize::from(ctx.max.size().height));
-        // Same reason, for the sidebar: only the Shell learns the terminal
-        // width, because a flex row measures the strip under an unbounded one.
-        self.terminal_cols = ctx.max.size().width;
-        if self.sidebar_dragging {
-            let mut sidebar = self.sidebar.borrow_mut();
-            let cols = sidebar.cols();
-            sidebar.resize(cols, self.terminal_cols);
-        }
         self.suppress_sidebar_if_too_narrow(ctx.max.size().width);
+        let content = if self.sidebar.borrow().shown() {
+            to_widget_ref(Rc::clone(&self.sidebar_split))
+        } else {
+            to_widget_ref(Rc::clone(&self.views))
+        };
+        self.keymap.borrow_mut().set_child(content);
 
         let mut inner = draw_widget(&to_widget_ref(Rc::clone(&self.keymap)), ctx);
 
@@ -7196,10 +7163,6 @@ impl Widget for Shell {
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
-        self.resize_sidebar(ctx, event);
-        if ctx.consume_event {
-            return;
-        }
         let view = self.view();
         if view.transcript.borrow_mut().reconcile_model() {
             ctx.request_focus(to_widget_ref(Rc::clone(&view.editor)));
@@ -7253,13 +7216,6 @@ impl Widget for Shell {
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
-        if matches!(
-            event,
-            Event::MouseLeave | Event::FocusOut | Event::MouseCaptureLost
-        ) || matches!(event, Event::Mouse(_)) && ctx.phase == vaxis::vxfw::Phase::AtTarget
-        {
-            self.resize_sidebar(ctx, event);
-        }
         if let Event::Init = event {
             ctx.request_focus(to_widget_ref(Rc::clone(&self.view().editor)));
             // `Init` dispatch drains the ctx command queue before the first
