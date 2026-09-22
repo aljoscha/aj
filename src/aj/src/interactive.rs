@@ -58,6 +58,7 @@ use aj_wire::{
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chrono::Utc;
+use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
@@ -5041,6 +5042,17 @@ async fn apply_host_setting_change(
     }
 }
 
+type PresentationSave =
+    futures::future::Shared<futures::future::LocalBoxFuture<'static, Option<String>>>;
+
+/// Finish accepted client writes without waiting for unrelated overlay reads.
+async fn finish_presentation_saves(shell: &Rc<RefCell<Shell>>) {
+    let save = shell.borrow_mut().presentation_save_tail.take();
+    if let Some(save) = save {
+        save.await;
+    }
+}
+
 /// Apply the rendering effect immediately and prepare persistence off the input
 /// loop. Local hosts share these layers, so even a presentation save can wait
 /// behind another client's config write.
@@ -5124,7 +5136,14 @@ fn presentation_save(
     };
     let layers = Arc::clone(&world.config_layers);
     let config = Arc::clone(&world.config);
-    Ok(Box::pin(async move {
+    // Chain writes in input order, independent of blocking-pool scheduling.
+    // The shell retains the shared tail so shutdown can finish accepted writes
+    // even after the drive loop stops polling overlay notifications.
+    let previous = shell.borrow_mut().presentation_save_tail.take();
+    let save = async move {
+        if let Some(previous) = previous {
+            previous.await;
+        }
         let saved = tokio::task::spawn_blocking(move || {
             aj_app::settings::persist_setting(&layers, &config, persist, &id, Some(&value), |c| {
                 option
@@ -5139,7 +5158,11 @@ fn presentation_save(
         };
         owner.finish_save(error.is_none());
         Some(join_notice(notice, error))
-    }))
+    }
+    .boxed_local()
+    .shared();
+    shell.borrow_mut().presentation_save_tail = Some(save.clone());
+    Ok(Box::pin(save))
 }
 
 fn start_setting_change(
@@ -6222,6 +6245,8 @@ struct Shell {
     /// show before writing, so a late reply cannot land on a reopened window
     /// and closing a window is all it takes to discard its read.
     fills: Vec<futures::future::LocalBoxFuture<'static, ()>>,
+    /// Last queued client presentation write, retained through shutdown.
+    presentation_save_tail: Option<PresentationSave>,
     /// A credential write belongs to the shell, not the selected session.
     credential_change: Option<CredentialChange>,
     /// Where the session-tag editor parks a confirmed label, read by the drive
@@ -6419,11 +6444,9 @@ impl Shell {
                         );
                     }
                     AjAction::ThinkingToggle => {
-                        // Matches aj's `aj.thinking.toggle` handler: flip the
-                        // visibility flag, no notice (the transcript shows the new
-                        // state).
                         let mut chat = chat.borrow_mut();
                         chat.show_thinking_block = !chat.show_thinking_block;
+                        *action_slot.borrow_mut() = Some(AjAction::ThinkingToggle);
                         ctx.redraw = true;
                     }
                     AjAction::ToolsExpand => {
@@ -6601,6 +6624,7 @@ impl Shell {
             session_request,
             auth_request,
             fills: Vec::new(),
+            presentation_save_tail: None,
             credential_change: None,
             tag_edit,
             terminal_caps: Cell::new(TerminalCaps::default()),
@@ -7542,6 +7566,7 @@ pub async fn run(args: Args) -> Result<()> {
         if let Some(server) = &server {
             server.stop_accepting();
         }
+        finish_presentation_saves(&shell).await;
         let banner = ExitBanner::collect(&world).await;
         if let Some(server) = server {
             let host = world
@@ -8332,10 +8357,21 @@ async fn drive(
                         // Bind the take out of the borrow first: the action
                         // handlers await on the host.
                         let host_action = shell.borrow().take_host_action();
-                        if let Some(action) = host_action
-                            && handle_host_action(world, shell, action).await
-                        {
-                            app.request_redraw();
+                        if let Some(action) = host_action {
+                            if action == AjAction::ThinkingToggle {
+                                let value = world.chat.borrow().show_thinking_block.to_string();
+                                start_setting_change(
+                                    world,
+                                    shell,
+                                    theme_watch,
+                                    SettingsOwner::capture(world, shell, Arc::clone(&world.catalog)),
+                                    PersistAction::User,
+                                    "show_thinking_block".into(),
+                                    value,
+                                );
+                            } else if handle_host_action(world, shell, action).await {
+                                app.request_redraw();
+                            }
                         }
                         // A palette-confirmed command the host owns
                         // (compact, export, or a config-editing overlay to
