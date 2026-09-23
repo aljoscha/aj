@@ -18874,7 +18874,7 @@ mod tests {
                 "--model-api",
                 "openai-codex",
                 "--model-name",
-                "gpt-5.2",
+                "gpt-5.5",
             ],
         )
         .await

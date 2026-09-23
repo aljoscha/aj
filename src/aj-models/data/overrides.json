@@ -9,6 +9,26 @@
         "supports_verbosity": true
       },
       "reason": "models.dev does not carry verbosity capability; OpenAI Codex advertises it for GPT-6 Astra"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-6-sol"
+      },
+      "patch": {
+        "supports_verbosity": true
+      },
+      "reason": "models.dev does not carry verbosity capability; OpenAI Codex advertises it for GPT-6 Sol"
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-6-luna"
+      },
+      "patch": {
+        "supports_verbosity": true
+      },
+      "reason": "models.dev does not carry verbosity capability; OpenAI Codex advertises it for GPT-6 Luna"
     }
   ]
 }

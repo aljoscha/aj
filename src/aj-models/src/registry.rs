@@ -34,11 +34,12 @@ const OVERRIDES_JSON: &str = include_str!("../data/overrides.json");
 /// authoritative: refresh appends these entries to every fresh cache
 /// (defensively filtering any upstream re-emission first), and load
 /// splices them in so users on a stale cache or an older bundled seed
-/// still see Codex models. Limits, pricing, and reasoning controls are
-/// hand-curated from the Codex CLI's own model catalog (the ChatGPT
-/// backend advertises no `none`/`minimal` effort, so those rungs are
-/// intentionally absent), not from models.dev whose API entries carry a
-/// different effort vocabulary.
+/// still see Codex models. Visible models and reasoning controls follow
+/// Codex CLI rust-v0.156.1's `codex-rs/models-manager/models.json`.
+/// The CLI's `ultra` is a multi-agent mode that resolves to an ordinary
+/// effort before inference, not a wire effort. It and the unsupported
+/// `none`/`minimal` efforts are intentionally absent. Capacity and pricing
+/// follow matching models.dev API entries, not the CLI's compaction caps.
 const CODEX_SEED_JSON: &str = include_str!("../data/codex.json");
 
 /// Provider id used to key Codex catalog entries. Exposed so the
@@ -1479,7 +1480,8 @@ mod tests {
         let ids: std::collections::HashSet<&str> = seed.iter().map(|m| m.id.as_str()).collect();
         let expected: std::collections::HashSet<&str> = [
             "gpt-6-astra",
-            "gpt-5.2",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.5",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -1492,33 +1494,17 @@ mod tests {
         // Catalog context windows describe model capacity rather than the
         // lower compaction caps exposed by the Codex client.
         for m in &seed {
-            let expected = if m.id == "gpt-5.2" {
-                400_000
-            } else {
-                1_050_000
-            };
-            assert_eq!(m.context_window, expected, "context_window for {}", m.id);
+            assert_eq!(m.context_window, 1_050_000, "context_window for {}", m.id);
         }
 
-        // Every model after gpt-5.2 carries a context tier that fires above
-        // 272k input tokens. gpt-5.2 remains flat-rate.
+        // Every listed model carries a context tier above 272k input tokens.
         for m in &seed {
-            match m.id.as_str() {
-                "gpt-6-astra" | "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => {
-                    assert_eq!(
-                        m.cost.tiers.len(),
-                        1,
-                        "{} must have exactly one context tier",
-                        m.id
-                    );
-                    assert_eq!(
-                        m.cost.tiers[0].input_tokens_above, 272_000,
-                        "{} tier threshold",
-                        m.id
-                    );
-                }
-                _ => assert!(m.cost.tiers.is_empty(), "{} must have no tiers", m.id),
-            }
+            assert_eq!(m.cost.tiers.len(), 1, "{} context tier count", m.id);
+            assert_eq!(
+                m.cost.tiers[0].input_tokens_above, 272_000,
+                "{} tier threshold",
+                m.id
+            );
         }
     }
 
