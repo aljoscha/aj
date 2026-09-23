@@ -1,6 +1,6 @@
-//! The transient toast stack: small, non-interactive corner boxes that report
+//! The transient toast stack: small corner boxes that report
 //! short-lived facts (a select-to-copy landing, a busy refusal) bottom-right
-//! and clear themselves when they expire.
+//! and clear themselves when they expire or are right-clicked.
 //!
 //! All toasts share one stack, so several can be live at once: they render
 //! stacked vertically in the same bottom-right spot whether or not a modal
@@ -10,13 +10,13 @@
 //! ([`prune_expired`]), and requests the clearing repaint, so every toast
 //! vanishes exactly on time even while others stay live.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use aj_app::keybindings::{ACTION_AGENT_PICKER, action_shortcut, fixed_keys};
-use vaxis::gwidth;
-use vaxis::vxfw::{DrawContext, Size, Surface};
+use vaxis::vxfw::{DrawContext, Event, EventContext, Size, Surface, Widget};
+use vaxis::{gwidth, mouse};
 
 use crate::corner_box::{CornerBoxBody, corner_box, span};
 use crate::overlay::OverlayChrome;
@@ -109,12 +109,13 @@ pub(crate) struct Toast {
     rows: Vec<Vec<ToastSpan>>,
     raised_at: Instant,
     duration: Duration,
+    dismissed: Rc<Cell<bool>>,
 }
 
 impl Toast {
-    /// Whether this toast is still within its display window.
+    /// Whether this toast is undismissed and still within its display window.
     pub(crate) fn is_live(&self) -> bool {
-        self.raised_at.elapsed() < self.duration
+        !self.dismissed.get() && self.raised_at.elapsed() < self.duration
     }
 
     /// When this toast expires, for the drive loop's wake scheduling.
@@ -178,11 +179,12 @@ fn push_or_refresh(stack: &ToastStack, rows: Vec<Vec<ToastSpan>>, duration: Dura
         rows,
         raised_at: Instant::now(),
         duration,
+        dismissed: Rc::new(Cell::new(false)),
     });
 }
 
-/// Drop every expired toast. Returns whether anything was dropped, so the
-/// drive loop can request the clearing repaint exactly when one is needed.
+/// Drop every expired or dismissed toast. Returns whether anything was dropped,
+/// so the drive loop can request the clearing repaint exactly when needed.
 pub(crate) fn prune_expired(stack: &ToastStack) -> bool {
     let mut toasts = stack.borrow_mut();
     let before = toasts.len();
@@ -288,7 +290,8 @@ impl Toasts {
     /// `avail` bounds the whole stack. Each drawn toast consumes its height
     /// from the budget, and a toast that doesn't fit the remaining room is
     /// skipped for this frame (its expiry, or a resize, frees the room).
-    /// The surfaces are non-interactive; the caller anchors them.
+    /// The surfaces accept right-click dismissal without taking focus.
+    /// The caller anchors them.
     pub(crate) fn draw_stack(&self, ctx: &DrawContext, avail: Size) -> Vec<Surface> {
         let chrome = self.chrome.borrow();
         let mut remaining = avail.height;
@@ -311,7 +314,7 @@ impl Toasts {
                 }
                 content_width = content_width.max(row_width);
             }
-            let Some(surf) = corner_box(
+            let Some(mut surf) = corner_box(
                 ctx,
                 &chrome,
                 Size {
@@ -327,10 +330,40 @@ impl Toasts {
             ) else {
                 continue;
             };
+            surf.widget = Some(Rc::new(RefCell::new(ToastDismiss {
+                dismissed: Rc::clone(&toast.dismissed),
+            })));
             remaining = remaining.saturating_sub(surf.size.height);
             out.push(surf);
         }
         out
+    }
+}
+
+/// Each painted target keeps its own dismissal flag, so expiry or replacement
+/// between paint and input cannot dismiss a different toast.
+struct ToastDismiss {
+    dismissed: Rc<Cell<bool>>,
+}
+
+impl Widget for ToastDismiss {
+    fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        Surface::with_size(ctx.max.size())
+    }
+
+    fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        if let Event::Mouse(m) = event
+            && m.button == mouse::Button::Right
+            && m.kind == mouse::Type::Press
+        {
+            self.dismissed.set(true);
+            ctx.redraw = true;
+            ctx.consume_event();
+        }
+    }
+
+    fn wants_events(&self) -> bool {
+        true
     }
 }
 
@@ -447,17 +480,36 @@ mod tests {
         assert!(!body.contains("characters"), "singular noun: {body:?}");
     }
 
-    /// The boxes' surfaces carry no widget identity, so they never join the
-    /// focus path.
+    /// A painted target cannot dismiss an identical replacement after expiry.
     #[test]
-    fn box_surfaces_are_non_interactive() {
+    fn stale_dismissal_does_not_hide_a_replacement() {
         let stack = empty_stack();
         show_toast(&stack, "hi");
-        push_copy_toast(&stack, 3);
         let toasts = widget_over(&stack);
-        for surf in toasts.draw_stack(&draw_ctx(200, Some(50)), roomy()) {
-            assert!(surf.widget.is_none(), "the boxes must be non-interactive");
-        }
+        let target = toasts
+            .draw_stack(&draw_ctx(200, Some(50)), roomy())
+            .remove(0)
+            .widget
+            .unwrap();
+        backdate_last(&stack, NOTICE_TOAST_DURATION);
+        assert!(prune_expired(&stack));
+        show_toast(&stack, "hi");
+        let mut ctx = EventContext::new();
+        target.borrow_mut().handle_event(
+            &mut ctx,
+            &Event::Mouse(mouse::Mouse {
+                button: mouse::Button::Right,
+                kind: mouse::Type::Press,
+                row: 0,
+                col: 0,
+                xoffset: 0,
+                yoffset: 0,
+                mods: mouse::Modifiers::empty(),
+            }),
+        );
+        assert!(ctx.redraw);
+        assert!(ctx.cmds.is_empty(), "dismissal does not request focus");
+        assert_eq!(toast_texts(&stack), ["hi"]);
     }
 
     /// A toast declines when the terminal can't fit the frame plus content,

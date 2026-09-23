@@ -7653,14 +7653,17 @@ fn frame_budget_elapsed(last_render: Option<Instant>, interval: Duration) -> boo
     last_render.is_none_or(|t| t.elapsed() >= interval)
 }
 
-/// Adds a transparent event target over `surface` without changing its paint.
+/// Adds mouse blocking without changing the surface's paint or mouse actions.
 fn block_mouse(mut surface: Surface, transcript: &Rc<RefCell<TranscriptView>>) -> Surface {
     let transcript = Rc::downgrade(transcript);
-    let blocker = MouseBlocker::new(Box::new(move || {
-        if let Some(transcript) = transcript.upgrade() {
-            transcript.borrow_mut().cancel_agent_click();
-        }
-    }));
+    let blocker = MouseBlocker::new(
+        Box::new(move || {
+            if let Some(transcript) = transcript.upgrade() {
+                transcript.borrow_mut().cancel_agent_click();
+            }
+        }),
+        surface.widget.take(),
+    );
     surface.widget = Some(Rc::new(RefCell::new(blocker)));
     surface
 }
@@ -12623,6 +12626,85 @@ mod tests {
             row_of("older toast message") > row_of("newer toast message"),
             "the oldest toast sits closest to the bottom: {rows:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn right_click_dismisses_only_the_pointed_toast() {
+        use crate::toasts::{earliest_toast_deadline, prune_expired};
+        use vaxis::mouse::{Button, Type};
+
+        for modal in [false, true] {
+            for border in [false, true] {
+                let (mut app, mut writer, shell, root) = init_app().await;
+                if modal {
+                    writer.write_all(&[0x0f]).expect("open palette");
+                    let event = app.next_input().await.expect("input");
+                    app.handle_input(event);
+                    assert!(shell.borrow().overlays.borrow().is_open());
+                }
+                shell.borrow().show_toast("keep this toast");
+                shell.borrow().show_toast("dismiss this toast");
+                let deadline = earliest_toast_deadline(&shell.borrow().toasts);
+                app.render(&root).expect("render");
+                let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx()));
+                let row = painted
+                    .iter()
+                    .position(|line| line.contains("dismiss this toast"))
+                    .expect("target toast is painted");
+                assert!(painted.iter().any(|line| line.contains("keep this toast")));
+                let col = painted[row]
+                    .find("dismiss this toast")
+                    .expect("body column");
+                let (row, col) = if border { (row - 1, 79) } else { (row, col) };
+                let mouse = |button, kind| {
+                    Event::Mouse(vaxis::mouse::Mouse {
+                        row: row.try_into().unwrap(),
+                        col: col.try_into().unwrap(),
+                        button,
+                        kind,
+                        xoffset: 0,
+                        yoffset: 0,
+                        mods: vaxis::mouse::Modifiers::empty(),
+                    })
+                };
+                for (button, kind) in [
+                    (Button::Left, Type::Press),
+                    (Button::Left, Type::Release),
+                    (Button::Right, Type::Release),
+                ] {
+                    app.handle_input(mouse(button, kind));
+                    assert_eq!(toast_lines(&shell).len(), 2, "only right press dismisses");
+                }
+                app.render(&root).expect("render before dismissal");
+                app.handle_input(mouse(Button::Right, Type::Press));
+                assert!(app.needs_redraw(), "dismissal repaints immediately");
+                assert_eq!(toast_lines(&shell), ["keep this toast"]);
+                assert_eq!(earliest_toast_deadline(&shell.borrow().toasts), deadline);
+                assert!(prune_expired(&shell.borrow().toasts));
+                app.render(&root).expect("render dismissal");
+                let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+                assert!(!painted.contains("dismiss this toast"));
+                assert!(painted.contains("keep this toast"));
+                if modal {
+                    assert!(
+                        shell.borrow().overlays.borrow().is_open(),
+                        "click leaves dialog open"
+                    );
+                    writer.write_all(b"\x1b").expect("escape");
+                    let event = app.next_input().await.expect("input");
+                    app.handle_input(event);
+                    assert!(
+                        !shell.borrow().overlays.borrow().is_open(),
+                        "dialog kept keyboard focus"
+                    );
+                } else {
+                    writer.write_all(b"x").expect("type in editor");
+                    let event = app.next_input().await.expect("input");
+                    app.handle_input(event);
+                    assert_eq!(shell.borrow().view().editor.borrow().text(), "x");
+                }
+            }
+        }
     }
 
     /// machinery: after the tick fires, the next ctrl+c re-arms instead

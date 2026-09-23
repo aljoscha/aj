@@ -204,13 +204,16 @@ impl Widget for Scrim {
 }
 
 /// An event target for transient surfaces painted above base content.
+/// Forwards mouse input to the surface's own target, when present, while
+/// preventing button events from reaching obscured content.
 pub(crate) struct MouseBlocker {
     on_mouse: Box<dyn FnMut()>,
+    target: Option<WidgetRef>,
 }
 
 impl MouseBlocker {
-    pub(crate) fn new(on_mouse: Box<dyn FnMut()>) -> MouseBlocker {
-        MouseBlocker { on_mouse }
+    pub(crate) fn new(on_mouse: Box<dyn FnMut()>, target: Option<WidgetRef>) -> MouseBlocker {
+        MouseBlocker { on_mouse, target }
     }
 }
 
@@ -224,6 +227,9 @@ impl Widget for MouseBlocker {
             return;
         };
         (self.on_mouse)();
+        if let Some(target) = &self.target {
+            target.borrow_mut().handle_event(ctx, event);
+        }
         if !matches!(
             m.button,
             mouse::Button::WheelUp
@@ -554,7 +560,7 @@ mod tests {
     fn transient_blocker_consumes_buttons_but_leaves_wheel_scrolling_available() {
         let seen = Rc::new(std::cell::Cell::new(0));
         let seen_c = Rc::clone(&seen);
-        let mut blocker = MouseBlocker::new(Box::new(move || seen_c.set(seen_c.get() + 1)));
+        let mut blocker = MouseBlocker::new(Box::new(move || seen_c.set(seen_c.get() + 1)), None);
         let event = |button| {
             Event::Mouse(mouse::Mouse {
                 col: 0,
