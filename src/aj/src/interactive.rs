@@ -3591,7 +3591,7 @@ async fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
         let shell = shell.borrow();
         let view = shell.view();
         let mut editor = view.editor.borrow_mut();
-        let text = editor.text().trim().to_string();
+        let text = editor.expanded_text().trim().to_string();
         editor.clear();
         text
     };
@@ -13812,7 +13812,8 @@ mod tests {
     #[tokio::test]
     async fn submit_while_running_queues_and_the_wake_delivers_it() {
         let dir = TempDir::new().expect("tempdir");
-        let mut world = scripted_world(&dir, "streaming-text").await;
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
 
         handle_submit(&mut world, "first".to_string()).await;
         fold_ready_frames(&mut world);
@@ -13843,14 +13844,26 @@ mod tests {
             let _ = world.directory.apply(frame);
         }
 
-        handle_submit(&mut world, "second".to_string()).await;
+        let paste = "follow up with this literal payload αβγ\n".repeat(100);
+        app.handle_input(Event::Paste(paste.clone()));
+        assert_ne!(
+            shell.borrow().view().editor.borrow().text(),
+            paste,
+            "fixture collapses the paste"
+        );
+        app.handle_input(Event::KeyPress(Key {
+            codepoint: Key::ENTER,
+            ..Key::default()
+        }));
+        let submitted = shell.borrow().take_submitted().expect("submit callback");
+        handle_editor_submit(&mut world, &shell, submitted).await;
         let snapshot = world.handles().queues.snapshot(AgentId::Main);
         assert_eq!(
             snapshot.kind,
             Some(aj_agent::queue::PendingKind::FollowUp),
             "busy submit queues instead of spawning",
         );
-        assert_eq!(snapshot.text, "second");
+        assert_eq!(snapshot.text, paste.trim());
         fold_ready_frames(&mut world);
         assert_eq!(
             world.chat.borrow().queue().queues.len(),
@@ -13880,7 +13893,7 @@ mod tests {
         assert!(
             entries.iter().any(|e| matches!(
                 &e.kind,
-                EntryKind::User(u) if u.joined_text() == "second"
+                EntryKind::User(u) if u.joined_text() == paste.trim()
             )),
             "queued text landed as a user entry",
         );
@@ -14043,16 +14056,16 @@ mod tests {
         assert!(world.client().working(), "busy");
 
         // Busy + editor text: queue as steering, clear the editor.
-        shell
-            .borrow()
-            .view()
-            .editor
+        let paste = "steer with this literal payload αβγ\n".repeat(100);
+        let editor = Rc::clone(&shell.borrow().view().editor);
+        editor
             .borrow_mut()
-            .insert_at_cursor("steer this");
+            .handle_event(&mut EventContext::new(), &Event::Paste(paste.clone()));
+        assert_ne!(editor.borrow().text(), paste, "fixture collapses the paste");
         assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
         let snapshot = world.handles().queues.snapshot(AgentId::Main);
         assert_eq!(snapshot.kind, Some(aj_agent::queue::PendingKind::Steering));
-        assert_eq!(snapshot.text, "steer this");
+        assert_eq!(snapshot.text, paste.trim());
         assert_eq!(
             shell.borrow().view().editor.borrow().text(),
             "",
