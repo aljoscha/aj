@@ -579,9 +579,24 @@ side's limitation. Neither side's values fall back to the other's.
   wall-clock timestamps. Clients replace their task table with this
   after `caught_up`, and ignore `TaskOutput` for unknown task ids.
 - `GET /v1/sessions/{id}/tasks/{task_id}`: `{id, status, stdout_tail,
-  stderr_tail, stdout_total_bytes, stderr_total_bytes, report?}`. This
-  backs the task-output overlay in connect mode, the spill file on the
-  host's disk is not reachable remotely.
+  stderr_tail, stdout_total_bytes, stderr_total_bytes, report?}`. Rolling
+  tails and an optional agent report, not the complete output.
+- `GET /v1/sessions/{id}/tasks/{task_id}/output?offset=N`: `TaskOutput` in
+  `aj-wire`, `{id, status, offset, total_bytes, bytes}`. Reads the retained
+  task's full interleaved spill output at the required unsigned byte offset.
+  `bytes` is a JSON byte array preserving invalid UTF-8 and split code points,
+  capped at `TASK_OUTPUT_CHUNK_BYTES` (65536). `total_bytes` is the file length
+  captured before reading, and a read never crosses that captured length.
+  Advance by `bytes.length` to continue. At that length the result is empty,
+  and a running task may append afterward. Status is sampled before the file
+  read, so it can lag completion. An offset beyond the captured length is
+  400 `invalid_request`. Unknown tasks, including cold-session tasks, are
+  404 `unknown_task`. Missing or unreadable spill output is 409 `unsupported`
+  with a clear explanation, never a tail substituted for full output.
+  File paths come only from the session task registry, not the request.
+  Reads use bounded allocation and blocking-pool file I/O. Running and completed
+  tasks are readable while retained by the live registry, with no persistent
+  task archive. Capability `task_output` (section 5.10).
 - `GET /v1/sessions/{id}/queue`: `{queues: [{agent_id, steering,
   follow_up}]}`, the pending messages per agent.
 - `GET /v1/sessions/{id}/tree`: `{segments, head?}`, the
@@ -840,6 +855,7 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `transcript_settings` | user-message `branch_settings` and `GET /v1/sessions/{id}/env/before/{entry}` | hosts |
   | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
   | `session_export` | `GET /v1/sessions/{id}/export` | hosts |
+  | `task_output` | `GET /v1/sessions/{id}/tasks/{task_id}/output?offset=N` | hosts |
   | `provider_usage` | `GET /v1/sessions/{id}/usage` | hosts |
   | `provider_usage_reset` | `POST /v1/sessions/{id}/usage/reset` | hosts |
   | `session_info` | `GET /v1/sessions/{id}/info` | hosts |

@@ -23,7 +23,7 @@ use aj_wire::{
     AccountList, AccountRequest, ArchiveRequest, CancelRequest, CompactRequest,
     CreateSessionRequest, DecodedFrame, EnvRequest, Frame, HeadRequest, Hello, PROTOCOL_VERSION,
     PromptRequest, QueueOperation, QueueOutcome, QueueRequest, QueueState, SessionCreated,
-    SessionList, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
+    SessionList, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskTable,
 };
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures::{Stream, StreamExt};
@@ -310,13 +310,26 @@ impl RemoteClient {
         self.get(&format!("/v1/sessions/{session}/tasks")).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn task(
         &self,
         session: &str,
         task: TaskId,
-    ) -> Result<TaskDetails, RemoteError> {
+    ) -> Result<aj_wire::TaskDetails, RemoteError> {
         self.get(&format!("/v1/sessions/{session}/tasks/{task}"))
             .await
+    }
+
+    pub(crate) async fn task_output(
+        &self,
+        session: &str,
+        task: TaskId,
+        offset: u64,
+    ) -> Result<aj_wire::TaskOutput, RemoteError> {
+        self.get(&format!(
+            "/v1/sessions/{session}/tasks/{task}/output?offset={offset}"
+        ))
+        .await
     }
 
     pub(crate) async fn queue(&self, session: &str) -> Result<QueueState, RemoteError> {

@@ -197,6 +197,7 @@ fn router(state: Arc<ServerState>) -> Router {
         )
         .route("/v1/sessions/{id}/tasks", get(tasks))
         .route("/v1/sessions/{id}/tasks/{task_id}", get(task))
+        .route("/v1/sessions/{id}/tasks/{task_id}/output", get(task_output))
         .route("/v1/sessions/{id}/tasks/{task_id}/kill", post(kill_task))
         .route("/v1/sessions/{id}/queue", get(queue).post(queue_command))
         .route("/v1/sessions/{id}/tree", get(tree))
@@ -319,6 +320,22 @@ async fn task(
 ) -> Result<Response, ApiError> {
     let task = task_id(&task)?;
     Ok(Json(state.host.task(&session, task).await?).into_response())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskOutputQuery {
+    offset: u64,
+}
+
+async fn task_output(
+    State(state): State<Arc<ServerState>>,
+    Path((session, task)): Path<(String, String)>,
+    query: Result<Query<TaskOutputQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Response, ApiError> {
+    let task = task_id(&task)?;
+    let Query(query) = query.map_err(|_| ApiError::invalid("invalid task output offset query"))?;
+    Ok(Json(state.host.task_output(&session, task, query.offset).await?).into_response())
 }
 
 async fn kill_task(

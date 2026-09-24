@@ -3,32 +3,31 @@
 //! Drilled into from the agent picker, which drops out on the way in, so
 //! Esc from here returns to the editor, not the picker.
 //! It shows the task's command, a live status line, and the scrollable
-//! output. The body tails and the status flips on their own: locally the
-//! viewer re-reads the registry on every draw, remotely the drive loop
-//! polls the per-task read and pushes each snapshot in.
+//! output. The body follows new output until the user scrolls away. End resumes
+//! following. Status and output update through the same read in every mode.
 //!
 //! `Ctrl+K` ([`ACTION_TASK_KILL`]) parks a still-running task's id for the
 //! drive loop to kill through the session command gate. Esc/Enter close.
 //!
-//! Content source: the registry's stateless [`TaskRead`] snapshot. When
-//! the task persists a spill file (background bash tasks always do) the
-//! viewer reads it for the full output; otherwise it falls back to the
-//! bounded rolling tails the model sees. The remote read carries the tails
-//! only, since the spill file sits on the host's disk and is not reachable
-//! over the wire.
+//! Output arrives in bounded byte chunks through `Control`. Reads are polled
+//! alongside terminal input, never from drawing. Closing drops the pending read.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use aj_agent::TaskRegistry;
-use aj_agent::tool::{TaskId, TaskRead, TaskStatus};
+use aj_agent::tool::{TaskId, TaskStatus};
 use aj_app::keybindings::{ACTION_TASK_KILL, action_shortcut, format_keybinding};
-use aj_wire::TaskDetails;
+use aj_wire::TaskOutput;
+use futures::{FutureExt, future::LocalBoxFuture};
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use crate::control::{Control, ControlError};
 use vaxis::cell::Style;
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
-    DrawContext, Event, EventContext, ListView, MaxSize, RelativePoint, ScrollBars, Size, Source,
-    SubSurface, Surface, Text, Widget, WidgetRef, to_widget_ref,
+    Builder, DrawContext, Event, EventContext, ListView, MaxSize, RelativePoint, ScrollBars, Size,
+    Source, SubSurface, Surface, Text, Widget, WidgetRef, to_widget_ref,
 };
 
 use crate::keymap::action_matches;
@@ -40,25 +39,94 @@ use crate::transcript::faint;
 /// line, the status line, and a blank separator.
 const HEADER_ROWS: u16 = 3;
 
-/// Where the viewer's content comes from, and where a kill goes.
-pub(crate) enum TaskBacking {
-    /// A live registry re-read at draw. Kills still park for the drive loop so
-    /// the selected session's Caught gate applies uniformly.
-    Local(TaskRegistry, Rc<RefCell<Option<TaskId>>>),
-    /// The host's per-task read: the drive loop pushes snapshots in
-    /// through [`TaskOutputView::apply_details`], and a kill is parked in the
-    /// slot for it to send as a command.
-    Remote(Rc<RefCell<Option<TaskId>>>),
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A single in-flight read. Its future owns only the addressed host and session,
+/// so a focus change cannot redirect an answer to another task.
+struct OutputReader {
+    control: Control,
+    session: String,
+    read: LocalBoxFuture<'static, Result<TaskOutput, ControlError>>,
+    retry_delay: Duration,
+}
+
+impl OutputReader {
+    fn request(&mut self, task: TaskId, offset: u64, delay: Duration) {
+        let control = self.control.clone();
+        let session = self.session.clone();
+        self.read = async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            control.task_output(&session, task, offset).await
+        }
+        .boxed_local();
+    }
+}
+
+/// Raw bytes keep UTF-8 and partial lines intact across chunk boundaries. Only
+/// visible rows are decoded and turned into widgets.
+#[derive(Default)]
+struct OutputBuffer {
+    bytes: Vec<u8>,
+    starts: Vec<usize>,
+}
+
+impl OutputBuffer {
+    fn append(&mut self, bytes: &[u8]) {
+        if self.starts.is_empty() {
+            self.starts.push(0);
+        }
+        let offset = self.bytes.len();
+        self.starts.extend(
+            bytes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| (*b == b'\n').then_some(offset + i + 1)),
+        );
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn len(&self) -> usize {
+        self.starts.len() - usize::from(self.starts.last() == Some(&self.bytes.len()))
+    }
+}
+
+struct OutputRows {
+    buffer: Rc<RefCell<OutputBuffer>>,
+    style: Style,
+}
+
+impl Builder for OutputRows {
+    fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
+        let buffer = self.buffer.borrow();
+        if idx >= buffer.len() {
+            return None;
+        }
+        let start = buffer.starts[idx];
+        let end = buffer
+            .starts
+            .get(idx + 1)
+            .map_or(buffer.bytes.len(), |end| end - 1);
+        let line = String::from_utf8_lossy(&buffer.bytes[start..end]);
+        let mut text = Text::new(decode_line(&line));
+        text.style = self.style;
+        text.softwrap = false;
+        Some(Rc::new(RefCell::new(text)))
+    }
 }
 
 /// A read-only, scrollable viewer that tails one background task.
 pub(crate) struct TaskOutputView {
-    backing: TaskBacking,
+    kill: Rc<RefCell<Option<TaskId>>>,
+    buffer: Rc<RefCell<OutputBuffer>>,
+    reader: Option<OutputReader>,
+    notice: Option<String>,
     id: TaskId,
     /// Command line, shown (truncated) in the header for context.
     command: String,
-    /// The row list, shared with `bars` (which draws it). Rebuilt from
-    /// the registry snapshot on each refresh.
+    /// The row list, shared with `bars` (which draws it). Rows are built lazily
+    /// from the accumulated output.
     list: Rc<RefCell<ListView>>,
     bars: Rc<RefCell<ScrollBars<ListView>>>,
     status: TaskStatus,
@@ -78,20 +146,27 @@ pub(crate) struct TaskOutputView {
 
 impl TaskOutputView {
     fn new(
-        backing: TaskBacking,
+        kill: Rc<RefCell<Option<TaskId>>>,
         id: TaskId,
         command: String,
         text_style: Style,
         dim_style: Style,
         thumb_style: Style,
     ) -> TaskOutputView {
-        let mut list = ListView::new(Source::Slice(Vec::new()));
+        let buffer = Rc::new(RefCell::new(OutputBuffer::default()));
+        let mut list = ListView::new(Source::Builder(Box::new(OutputRows {
+            buffer: Rc::clone(&buffer),
+            style: text_style,
+        })));
         list.draw_cursor = false;
         let bars = ScrollBars::new(list);
         bars.borrow_mut().draw_horizontal_scrollbar = false;
         let list = Rc::clone(&bars.borrow().view);
-        let mut view = TaskOutputView {
-            backing,
+        TaskOutputView {
+            kill,
+            buffer,
+            reader: None,
+            notice: Some("Loading output…".to_string()),
             id,
             command,
             list,
@@ -103,74 +178,97 @@ impl TaskOutputView {
             dim_style,
             thumb_style,
             on_close: None,
-        };
-        view.refresh();
-        view
-    }
-
-    /// Pull the live status and output from the registry and rebuild the
-    /// body rows. A remote viewer has nothing to pull: the drive loop pushes
-    /// its snapshots in instead (see [`Self::apply_details`]).
-    fn refresh(&mut self) {
-        let TaskBacking::Local(registry, _) = &self.backing else {
-            return;
-        };
-        let Some((status, read)) = registry.read(self.id) else {
-            // A task evicted from the registry keeps its last-known body.
-            return;
-        };
-        self.status = status;
-        self.total_bytes = read.stdout_total_bytes + read.stderr_total_bytes;
-        let text = task_text(&read);
-        self.set_body(&text);
-    }
-
-    /// Apply one snapshot from the per-task read, for a viewer with no
-    /// registry to re-read.
-    pub(crate) fn apply_details(&mut self, details: TaskDetails) {
-        self.status = details.status;
-        self.total_bytes = details.stdout_total_bytes + details.stderr_total_bytes;
-        let text = joined_tails(&details.stdout_tail, &details.stderr_tail);
-        self.set_body(&text);
-    }
-
-    /// The task this viewer shows, so the drive loop knows what to poll for.
-    pub(crate) fn task(&self) -> TaskId {
-        self.id
-    }
-
-    /// Rebuild the body rows from `text`. Following pins to the bottom;
-    /// otherwise preserve the reading position, clamping it if the buffer
-    /// shrinks past it. The hidden cursor does not track document scrolling.
-    fn set_body(&self, text: &str) {
-        let lines = to_lines(text);
-        let count = u32::try_from(lines.len()).unwrap_or(u32::MAX);
-        {
-            let mut list = self.list.borrow_mut();
-            list.item_count = Some(count);
-            list.children = Source::Slice(self.row_widgets(&lines));
         }
-        if self.follow {
-            self.list.borrow_mut().scroll_to_bottom();
-        } else {
-            let mut list = self.list.borrow_mut();
-            if list.scroll_top() >= count {
-                list.jump_to_item(count.saturating_sub(1));
+    }
+
+    pub(crate) fn read_from(&mut self, control: Control, session: String) {
+        let mut reader = OutputReader {
+            control,
+            session,
+            read: futures::future::pending().boxed_local(),
+            retry_delay: POLL_INTERVAL,
+        };
+        reader.request(self.id, self.offset(), Duration::ZERO);
+        self.reader = Some(reader);
+    }
+
+    fn offset(&self) -> u64 {
+        u64::try_from(self.buffer.borrow().bytes.len()).expect("output length fits u64")
+    }
+
+    /// Poll once from the drive loop's select, releasing the widget borrow
+    /// before waiting. A closed or fully read terminal task has no more work.
+    pub(crate) fn poll_output(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(reader) = self.reader.as_mut() else {
+            return Poll::Pending;
+        };
+        let Poll::Ready(result) = reader.read.poll_unpin(cx) else {
+            return Poll::Pending;
+        };
+        let mut reader = self.reader.take().expect("polled reader");
+        match result {
+            Ok(output) => {
+                if output.id != self.id
+                    || output.offset != self.offset()
+                    || output
+                        .offset
+                        .checked_add(u64::try_from(output.bytes.len()).unwrap())
+                        .is_none_or(|end| end > output.total_bytes)
+                    || (output.bytes.is_empty() && output.offset < output.total_bytes)
+                {
+                    self.notice = Some("Host returned inconsistent task output.".to_string());
+                    return Poll::Ready(());
+                }
+                let total = output.total_bytes;
+                let running = output.status == TaskStatus::Running;
+                self.apply_output(output);
+                let caught_up = self.offset() == total;
+                if running || !caught_up {
+                    reader.retry_delay = POLL_INTERVAL;
+                    reader.request(
+                        self.id,
+                        self.offset(),
+                        if caught_up {
+                            POLL_INTERVAL
+                        } else {
+                            Duration::ZERO
+                        },
+                    );
+                    self.reader = Some(reader);
+                }
+            }
+            Err(err) => {
+                if err.unknown_endpoint() {
+                    self.notice = Some(
+                        "Host does not support full task output (upgrade the host).".to_string(),
+                    );
+                } else {
+                    self.notice = Some(format!("Output unavailable: {err}"));
+                    reader.request(self.id, self.offset(), reader.retry_delay);
+                    reader.retry_delay = (reader.retry_delay * 2).min(Duration::from_secs(30));
+                    self.reader = Some(reader);
+                }
             }
         }
+        Poll::Ready(())
     }
 
-    fn row_widgets(&self, lines: &[String]) -> Vec<WidgetRef> {
-        lines
-            .iter()
-            .map(|line| {
-                let mut text = Text::new(line);
-                text.style = self.text_style;
-                text.softwrap = false;
-                let widget: WidgetRef = Rc::new(RefCell::new(text));
-                widget
-            })
-            .collect()
+    fn apply_output(&mut self, output: TaskOutput) {
+        self.status = output.status;
+        self.total_bytes = output.total_bytes;
+        self.buffer.borrow_mut().append(&output.bytes);
+        self.notice = (self.offset() < self.total_bytes).then(|| {
+            format!(
+                "Loading output: {} / {}",
+                human_bytes(self.offset()),
+                human_bytes(self.total_bytes)
+            )
+        });
+        let count = u32::try_from(self.buffer.borrow().len()).unwrap_or(u32::MAX);
+        self.list.borrow_mut().item_count = Some(count);
+        if self.follow {
+            self.list.borrow_mut().scroll_to_bottom();
+        }
     }
 
     /// The status line: glyph + status word + total bytes.
@@ -215,7 +313,6 @@ impl TaskOutputView {
 
 impl Widget for TaskOutputView {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        self.refresh();
         let size = ctx.max.size();
         // Opaque full-size surface so a shorter refresh can't leave stale
         // cells from a taller previous frame.
@@ -227,6 +324,11 @@ impl Widget for TaskOutputView {
             .children
             .push(self.header_row(ctx, 1, self.status_line(), self.text_style));
 
+        if let Some(notice) = &self.notice {
+            surface
+                .children
+                .push(self.header_row(ctx, 2, notice.clone(), self.dim_style));
+        }
         let body_height = size.height.saturating_sub(HEADER_ROWS);
         if body_height > 0 {
             let body_ctx = ctx.with_constraints(
@@ -267,21 +369,18 @@ impl Widget for TaskOutputView {
         if key.matches(Key::ESCAPE, Modifiers::empty())
             || key.matches(Key::ENTER, Modifiers::empty())
         {
+            self.reader = None;
             if let Some(cb) = self.on_close.as_mut() {
                 cb(ctx);
             }
             ctx.consume_and_redraw();
             return;
         }
-        // Overlay-local kill: parked for the drive loop so local and
-        // remote viewers share mutation gating. The status flip arrives via the
-        // task's `TaskEnd` and repaints the header. Inert once terminal.
+        // Park kills for the drive loop's mutation gate in every mode. The
+        // output read carries the resulting status. Inert once terminal.
         if action_matches(key, ACTION_TASK_KILL) {
             if self.status == TaskStatus::Running {
-                let slot = match &self.backing {
-                    TaskBacking::Local(_, slot) | TaskBacking::Remote(slot) => slot,
-                };
-                *slot.borrow_mut() = Some(self.id);
+                *self.kill.borrow_mut() = Some(self.id);
             }
             ctx.consume_and_redraw();
             return;
@@ -322,39 +421,6 @@ impl Widget for TaskOutputView {
     fn wants_events(&self) -> bool {
         true
     }
-}
-
-/// The task's output text: the full spill file when present, else the
-/// bounded rolling tails from the snapshot.
-fn task_text(read: &TaskRead) -> String {
-    if let Some(path) = &read.spill_path
-        && let Ok(bytes) = std::fs::read(path)
-    {
-        return String::from_utf8_lossy(&bytes).into_owned();
-    }
-    joined_tails(&read.stdout_tail, &read.stderr_tail)
-}
-
-/// The two output tails as one body, stderr after stdout on its own line.
-fn joined_tails(stdout: &str, stderr: &str) -> String {
-    let mut out = stdout.to_string();
-    if !stderr.is_empty() {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(stderr);
-    }
-    out
-}
-
-/// Split output into display lines, dropping a single trailing blank
-/// (from a final newline) so a well-formed stream shows no phantom row.
-fn to_lines(text: &str) -> Vec<String> {
-    let mut lines: Vec<String> = text.split('\n').map(decode_line).collect();
-    if lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-    lines
 }
 
 /// Decode one output line for display: approximate a terminal's bare
@@ -423,19 +489,18 @@ fn subtitle() -> String {
     format!("{up}/{down} scroll  \u{2022}  {kill} kill  \u{2022}  {close} to close")
 }
 
-/// Open the task-output viewer for task `id`, pushing it onto `stack` and
-/// returning it so a caller that has to feed it snapshots can keep the
-/// handle. Does not move focus: the caller (host) posts the refocus event.
+/// Push a viewer for task `id` onto `stack`. The caller binds its output source,
+/// polls reads alongside input, and posts the refocus event.
 pub(crate) fn open_task_output(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
     chrome: &OverlayChrome,
-    backing: TaskBacking,
+    kill: Rc<RefCell<Option<TaskId>>>,
     id: TaskId,
     command: String,
 ) -> Rc<RefCell<TaskOutputView>> {
     let view = Rc::new(RefCell::new(TaskOutputView::new(
-        backing,
+        kill,
         id,
         command,
         chrome.select.label,
@@ -466,55 +531,9 @@ pub(crate) fn open_task_output(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use aj_agent::events::AgentId;
-    use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead};
-    use tempfile::NamedTempFile;
     use vaxis::vxfw::Phase;
 
     use super::*;
-
-    /// Output source returning a fixed snapshot, so the viewer can
-    /// resolve a spill path and byte totals from the registry.
-    struct FakeSource {
-        read: TaskRead,
-    }
-
-    impl TaskOutputSource for FakeSource {
-        fn snapshot(&self) -> TaskRead {
-            self.read.clone()
-        }
-    }
-
-    /// Register a bash task over a spill file pre-filled with `contents`.
-    /// Keep the returned `NamedTempFile` alive so the spill isn't
-    /// unlinked.
-    fn task(contents: &str, status: TaskStatus) -> (TaskRegistry, TaskId, NamedTempFile) {
-        use std::io::Write;
-        let mut file = NamedTempFile::new().expect("temp spill");
-        file.write_all(contents.as_bytes()).expect("write spill");
-        file.flush().expect("flush spill");
-        let read = TaskRead {
-            spill_path: Some(file.path().to_path_buf()),
-            stdout_total_bytes: u64::try_from(contents.len()).expect("length fits u64"),
-            ..TaskRead::default()
-        };
-        let registry = TaskRegistry::default();
-        let (id, _cancel) = registry.register_unowned_for_test(
-            AgentId::Main,
-            "test-call".to_string(),
-            TaskKind::Bash {
-                command: "echo hi".to_string(),
-            },
-            "echo hi".to_string(),
-            Arc::new(FakeSource { read }),
-        );
-        if status != TaskStatus::Running {
-            registry.set_status(id, status);
-        }
-        (registry, id, file)
-    }
 
     fn draw_ctx(width: u16, height: u16) -> DrawContext {
         DrawContext {
@@ -538,10 +557,6 @@ mod tests {
         crate::test_support::rows(surface).join("\n")
     }
 
-    fn local_backing(registry: TaskRegistry) -> TaskBacking {
-        TaskBacking::Local(registry, Rc::new(RefCell::new(None)))
-    }
-
     fn press(view: &mut TaskOutputView, codepoint: u32, mods: Modifiers) {
         let mut ctx = EventContext::new();
         ctx.phase = Phase::Capturing;
@@ -556,9 +571,9 @@ mod tests {
         assert!(ctx.consume_event);
     }
 
-    fn remote_view() -> TaskOutputView {
+    fn viewer() -> TaskOutputView {
         TaskOutputView::new(
-            TaskBacking::Remote(Rc::new(RefCell::new(None))),
+            Rc::new(RefCell::new(None)),
             7,
             "echo hi".to_string(),
             Style::default(),
@@ -568,15 +583,14 @@ mod tests {
     }
 
     fn output_through(view: &mut TaskOutputView, last: u32) {
-        let stdout_tail: String = (1..=last).map(|n| format!("line{n}\n")).collect();
-        view.apply_details(TaskDetails {
-            id: view.task(),
+        let text: String = (1..=last).map(|n| format!("line{n}\n")).collect();
+        let offset = view.offset();
+        view.apply_output(TaskOutput {
+            id: view.id,
             status: TaskStatus::Running,
-            stdout_total_bytes: u64::try_from(stdout_tail.len()).unwrap(),
-            stdout_tail,
-            stderr_tail: String::new(),
-            stderr_total_bytes: 0,
-            report: None,
+            offset,
+            total_bytes: u64::try_from(text.len()).unwrap(),
+            bytes: text.as_bytes()[usize::try_from(offset).unwrap()..].to_vec(),
         });
     }
 
@@ -606,7 +620,7 @@ mod tests {
 
     #[test]
     fn keyboard_scrolls_drawn_rows_by_lines_and_viewport_pages() {
-        let mut view = remote_view();
+        let mut view = viewer();
         output_through(&mut view, 100);
         // Reuse the view to cover paging after a resize as well as tiny bodies.
         for height in [5, 16, 2, 1] {
@@ -642,7 +656,7 @@ mod tests {
             (Key::HOME, Modifiers::empty(), 1),
             (u32::from('g'), Modifiers::empty(), 1),
         ] {
-            let mut view = remote_view();
+            let mut view = viewer();
             output_through(&mut view, 10);
             assert_body(&mut view, 5, 6..=10);
             output_through(&mut view, 20);
@@ -664,157 +678,69 @@ mod tests {
     }
 
     #[test]
-    fn shrinking_output_preserves_or_clamps_the_reading_position() {
-        let mut view = remote_view();
-        output_through(&mut view, 100);
-        assert_body(&mut view, 5, 96..=100);
-        for _ in 0..3 {
-            press(&mut view, Key::PAGE_UP, Modifiers::empty());
-            view.draw(&draw_ctx(40, 5 + HEADER_ROWS));
-        }
-        assert_body(&mut view, 5, 87..=91);
-        output_through(&mut view, 95);
-        assert_body(&mut view, 5, 87..=91);
-        output_through(&mut view, 20);
-        assert_body(&mut view, 5, 16..=20);
-        output_through(&mut view, 2);
-        assert_body(&mut view, 5, 1..=2);
-        output_through(&mut view, 0);
-        assert_body(&mut view, 5, []);
-        output_through(&mut view, 10);
-        assert_body(&mut view, 5, 1..=5);
-    }
-
-    #[test]
-    fn renders_command_status_and_body() {
-        let contents: String = (1..=5).map(|n| format!("line{n}\n")).collect();
-        let (registry, id, _f) = task(&contents, TaskStatus::Running);
-        let mut view = TaskOutputView::new(
-            local_backing(registry),
-            id,
-            "echo hi".to_string(),
-            Style::default(),
-            Style::default(),
-            Style::default(),
-        );
-        let rendered = flatten(&view.draw(&draw_ctx(40, 12)));
-        assert!(rendered.contains("echo hi"), "command header: {rendered}");
-        assert!(rendered.contains("running"), "status header: {rendered}");
-        assert!(rendered.contains("line5"), "tail body: {rendered}");
-    }
-
-    #[test]
-    fn terminal_status_shows_in_header() {
-        let (registry, id, _f) = task("out\n", TaskStatus::Exited(Some(0)));
-        let mut view = TaskOutputView::new(
-            local_backing(registry),
-            id,
-            "echo hi".to_string(),
-            Style::default(),
-            Style::default(),
-            Style::default(),
-        );
-        let rendered = flatten(&view.draw(&draw_ctx(40, 10)));
-        assert!(rendered.contains("exited 0"), "{rendered}");
-        assert!(rendered.contains('\u{2713}'), "{rendered}");
-    }
-
-    #[test]
-    fn ctrl_k_parks_a_running_local_task_for_the_drive_loop() {
-        let (registry, id, _f) = task("out\n", TaskStatus::Running);
-        let slot = Rc::new(RefCell::new(None));
-        let mut view = TaskOutputView::new(
-            TaskBacking::Local(registry.clone(), Rc::clone(&slot)),
-            id,
-            "echo hi".to_string(),
-            Style::default(),
-            Style::default(),
-            Style::default(),
-        );
-        let ctrl_k = Event::KeyPress(Key {
-            codepoint: u32::from('k'),
-            mods: Modifiers::CTRL,
-            ..Key::default()
-        });
-        let mut ctx = EventContext::new();
-        ctx.phase = Phase::Capturing;
-        view.capture_event(&mut ctx, &ctrl_k);
-        assert_eq!(*slot.borrow(), Some(id), "the drive loop owns the kill");
-        assert_eq!(
-            registry.summary(id).map(|summary| summary.status),
-            Some(TaskStatus::Running),
-            "the widget killed locally around the drive gate",
-        );
-        assert!(ctx.consume_event, "kill consumed the chord");
-    }
-
-    /// A remote viewer has no registry: it renders the pushed snapshot's
-    /// tails and parks a kill for the drive loop instead of killing in place.
-    #[test]
-    fn a_remote_viewer_renders_pushed_snapshots_and_parks_its_kill() {
-        let slot: Rc<RefCell<Option<TaskId>>> = Rc::new(RefCell::new(None));
-        let mut view = TaskOutputView::new(
-            TaskBacking::Remote(Rc::clone(&slot)),
-            7,
-            "echo hi".to_string(),
-            Style::default(),
-            Style::default(),
-            Style::default(),
-        );
-        view.apply_details(TaskDetails {
+    fn renders_chunks_and_status_and_parks_kill_only_while_running() {
+        let mut view = viewer();
+        let bytes = "out\nerr\n".as_bytes().to_vec();
+        view.apply_output(TaskOutput {
             id: 7,
             status: TaskStatus::Running,
-            stdout_tail: "out line\n".to_string(),
-            stderr_tail: "err line\n".to_string(),
-            stdout_total_bytes: 9,
-            stderr_total_bytes: 9,
-            report: None,
+            offset: 0,
+            total_bytes: 8,
+            bytes,
         });
         let rendered = flatten(&view.draw(&draw_ctx(40, 12)));
-        assert!(rendered.contains("out line"), "{rendered}");
-        assert!(rendered.contains("err line"), "{rendered}");
-        assert!(rendered.contains("running"), "{rendered}");
-        assert!(rendered.contains("18 B"), "both totals counted: {rendered}");
-
-        let ctrl_k = Event::KeyPress(Key {
-            codepoint: u32::from('k'),
-            mods: Modifiers::CTRL,
-            ..Key::default()
-        });
-        let mut ctx = EventContext::new();
-        ctx.phase = Phase::Capturing;
-        view.capture_event(&mut ctx, &ctrl_k);
-        assert_eq!(*slot.borrow(), Some(7), "the kill is parked for the loop");
-        assert!(ctx.consume_event);
-
-        // A terminal task's kill is inert, so the slot stays as it was.
-        *slot.borrow_mut() = None;
-        view.apply_details(TaskDetails {
+        for text in ["echo hi", "out", "err", "running", "8 B"] {
+            assert!(rendered.contains(text), "{rendered}");
+        }
+        press(&mut view, u32::from('k'), Modifiers::CTRL);
+        assert_eq!(*view.kill.borrow_mut(), Some(7));
+        *view.kill.borrow_mut() = None;
+        view.apply_output(TaskOutput {
             id: 7,
             status: TaskStatus::Exited(Some(0)),
-            stdout_tail: "out line\n".to_string(),
-            stderr_tail: String::new(),
-            stdout_total_bytes: 9,
-            stderr_total_bytes: 0,
-            report: None,
+            offset: 8,
+            total_bytes: 8,
+            bytes: Vec::new(),
         });
-        let mut ctx = EventContext::new();
-        ctx.phase = Phase::Capturing;
-        view.capture_event(&mut ctx, &ctrl_k);
-        assert_eq!(*slot.borrow(), None, "a finished task is not killed again");
+        press(&mut view, u32::from('k'), Modifiers::CTRL);
+        assert_eq!(*view.kill.borrow_mut(), None);
+        assert!(flatten(&view.draw(&draw_ctx(40, 12))).contains("exited 0"));
+    }
+
+    #[test]
+    fn split_utf8_partial_lines_and_invalid_bytes_render_without_losing_output() {
+        let mut view = viewer();
+        let bytes = "first\n雪\ttab\rfinal 雪\nlast".as_bytes();
+        for (i, byte) in bytes.iter().enumerate() {
+            view.apply_output(TaskOutput {
+                id: 7,
+                status: TaskStatus::Running,
+                offset: u64::try_from(i).unwrap(),
+                total_bytes: u64::try_from(bytes.len()).unwrap(),
+                bytes: vec![*byte],
+            });
+        }
+        let rendered = flatten(&view.draw(&draw_ctx(40, 12)));
+        for text in ["first", "final 雪", "last"] {
+            assert!(rendered.contains(text), "{rendered}");
+        }
+        assert!(
+            !rendered.contains('�'),
+            "split UTF-8 was corrupted: {rendered}"
+        );
+        view.apply_output(TaskOutput {
+            id: 7,
+            status: TaskStatus::Exited(Some(0)),
+            offset: u64::try_from(bytes.len()).unwrap(),
+            total_bytes: u64::try_from(bytes.len() + 2).unwrap(),
+            bytes: vec![0xff, b'\n'],
+        });
+        assert!(flatten(&view.draw(&draw_ctx(40, 12))).contains("last�"));
     }
 
     #[test]
     fn esc_and_enter_close() {
-        let (registry, id, _f) = task("x\n", TaskStatus::Running);
-        let mut view = TaskOutputView::new(
-            local_backing(registry),
-            id,
-            "echo hi".to_string(),
-            Style::default(),
-            Style::default(),
-            Style::default(),
-        );
+        let mut view = viewer();
         let closed = Rc::new(RefCell::new(0));
         let sink = Rc::clone(&closed);
         view.on_close = Some(Box::new(move |_ctx| *sink.borrow_mut() += 1));
@@ -867,8 +793,6 @@ mod tests {
     /// in `draw` leaves the thumb at the default fg and fails here.
     #[test]
     fn scrollbar_thumb_carries_the_muted_tint() {
-        let contents: String = (1..=40).map(|n| format!("line{n}\n")).collect();
-        let (registry, id, _f) = task(&contents, TaskStatus::Running);
         // A distinct thumb fg so the tinted thumb can't be confused with a
         // default-styled cell or the header's faint dim_style.
         let thumb = Style {
@@ -876,13 +800,14 @@ mod tests {
             ..Style::default()
         };
         let mut view = TaskOutputView::new(
-            local_backing(registry),
-            id,
+            Rc::new(RefCell::new(None)),
+            7,
             "echo hi".to_string(),
             Style::default(),
             Style::default(),
             thumb,
         );
+        output_through(&mut view, 40);
         let surface = view.draw(&draw_ctx(20, 8));
         // The thumb sits on the body's right edge, in a child surface, so
         // composite the tree before reading the cell's style.

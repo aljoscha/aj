@@ -893,6 +893,7 @@ impl SessionHost {
                 aj_wire::CREDENTIALS_CAPABILITY.to_string(),
                 aj_wire::BRANCH_SETTINGS_CAPABILITY.to_string(),
                 aj_wire::TRANSCRIPT_SETTINGS_CAPABILITY.to_string(),
+                aj_wire::TASK_OUTPUT_CAPABILITY.to_string(),
             ],
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.host_id.clone(),
@@ -1416,6 +1417,67 @@ impl SessionHost {
             stderr_total_bytes: read.stderr_total_bytes,
             report: read.report,
         })
+    }
+
+    /// Read at most `TASK_OUTPUT_CHUNK_BYTES` raw bytes from a retained task's
+    /// spill file. The offset must not exceed its captured length. No task
+    /// archive is consulted and rolling tails are never substituted for a file.
+    pub async fn task_output(
+        &self,
+        session: &str,
+        task: TaskId,
+        offset: u64,
+    ) -> Result<aj_wire::TaskOutput, HostError> {
+        let Some(live) = self.live_or_cold(session).await? else {
+            return Err(HostError::UnknownTask(task));
+        };
+        let (status, read) = live
+            .core
+            .task_registry
+            .read(task)
+            .ok_or(HostError::UnknownTask(task))?;
+        let path = read.spill_path.ok_or_else(|| {
+            HostError::Unsupported(format!(
+                "full output unavailable for task {task}: no spill file"
+            ))
+        })?;
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+
+            let unavailable = |err: std::io::Error| {
+                HostError::Unsupported(format!("full output unavailable for task {task}: {err}"))
+            };
+            let mut file = std::fs::File::open(path).map_err(unavailable)?;
+            let metadata = file.metadata().map_err(unavailable)?;
+            if !metadata.is_file() {
+                return Err(HostError::Unsupported(format!(
+                    "full output unavailable for task {task}: spill is not a regular file"
+                )));
+            }
+            let total_bytes = metadata.len();
+            if offset > total_bytes {
+                return Err(HostError::Invalid(format!(
+                    "task output offset {offset} exceeds current length {total_bytes}"
+                )));
+            }
+            // Bound both allocation and reading by the captured length, even
+            // if the running task appends while this read is in progress.
+            let length = usize::try_from(total_bytes - offset)
+                .unwrap_or(usize::MAX)
+                .min(aj_wire::TASK_OUTPUT_CHUNK_BYTES);
+            file.seek(SeekFrom::Start(offset)).map_err(unavailable)?;
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes).map_err(unavailable)?;
+            Ok(aj_wire::TaskOutput {
+                id: task,
+                status,
+                offset,
+                total_bytes,
+                bytes,
+            })
+        })
+        .await
+        .map_err(|err| HostError::Internal(Box::new(err)))?
     }
 
     /// The session's pending steering and follow-up messages. Empty, and no

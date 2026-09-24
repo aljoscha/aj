@@ -111,7 +111,7 @@ use crate::sidebar::{
 use crate::sidebar::{RowStatus, SidebarRow};
 use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{Connection, STATUS_WAKE_EVENT, StatusLine, StatusState};
-use crate::task_output::{TaskBacking, TaskOutputView, open_task_output};
+use crate::task_output::{TaskOutputView, open_task_output};
 use crate::terminal::TerminalCaps;
 use crate::toasts::{ToastBody, ToastStack, Toasts, busy_refusal, show_toast};
 use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
@@ -4357,28 +4357,20 @@ async fn apply_picker_outcome(
     }
 }
 
-/// Open the task-output viewer for `id`, backed by the live registry locally
-/// and by the per-task read over a connection. A remote viewer's
-/// handle is kept so the drive loop can push the snapshots it polls.
+/// Open the shared task viewer and bind its reads to this host and session.
 fn open_task_viewer(world: &World, shell: &Rc<RefCell<Shell>>, id: TaskId, command: String) {
     let handles = shell.borrow().overlay_handles();
-    let backing = match world.local.as_ref() {
-        Some(local) => {
-            TaskBacking::Local(local.task_registry.clone(), Rc::clone(&handles.task_kill))
-        }
-        None => TaskBacking::Remote(Rc::clone(&handles.task_kill)),
-    };
     let view = open_task_output(
         &handles.stack,
         &handles.editor,
         &handles.chrome,
-        backing,
+        Rc::clone(&handles.task_kill),
         id,
         command,
     );
-    if world.control.is_remote() {
-        *shell.borrow().task_view.borrow_mut() = Some(view);
-    }
+    view.borrow_mut()
+        .read_from(world.control.clone(), world.session().to_string());
+    *shell.borrow().task_view.borrow_mut() = Some(view);
 }
 
 /// Kill background task `id`, answering the notice to fold.
@@ -6177,13 +6169,11 @@ struct Shell {
     /// The agent picker's confirmed pick / kill, parked for the drive
     /// loop (which owns the chat model and the task registry).
     picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>>,
-    /// A task kill parked by a remote task-output viewer, for the drive loop
+    /// A task kill parked by the task-output viewer, for the drive loop
     /// to send as a command.
     task_kill: Rc<RefCell<Option<TaskId>>>,
-    /// The open remote task-output viewer, so the drive loop can push the
-    /// per-task read's snapshots into it. `None` whenever no such viewer is
-    /// open: the close-all chord and a session rebind clear it, and the loop
-    /// retires it when the overlay stack empties (see [`poll_task_output`]).
+    /// The open task-output viewer. The drive loop polls its read alongside
+    /// input. Closing or switching sessions drops the pending read.
     task_view: Rc<RefCell<Option<Rc<RefCell<TaskOutputView>>>>>,
     /// A prompt-history scan request parked by the overlay (on open and
     /// on scope toggle) for the drive loop to run and fill.
@@ -7701,15 +7691,6 @@ impl Retry {
     fn clear(&mut self) {
         *self = Self::default();
     }
-
-    /// Drop the pacing but hold the next attempt back by `delay`, for a caller
-    /// that polls on a cadence of its own.
-    fn again_in(&mut self, delay: Duration) {
-        *self = Self {
-            due: Some(Instant::now() + delay),
-            ..Self::default()
-        };
-    }
 }
 
 /// Where a client stands in getting its frame stream back.
@@ -7828,51 +7809,20 @@ enum ResumeAdvance {
     OpenFailed { state: Resume, error: ControlError },
 }
 
-/// How often an open task-output overlay is refreshed from the per-task read
-/// in connect mode. A tail the user is watching should move visibly without
-/// the read becoming a load of its own.
-const TASK_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Refresh the open remote task-output viewer from the per-task read (spec
-/// 6.7), answering whether anything was pushed into it.
-///
-/// `retry` paces the read: at most one per [`TASK_POLL_INTERVAL`] while such a
-/// viewer is open, and a backed-off retry while the host is failing it, so a
-/// read that takes its full timeout cannot be re-issued the moment it returns.
-/// A local viewer re-reads its registry at draw time and never reaches here.
-async fn poll_task_output(world: &World, shell: &Rc<RefCell<Shell>>, retry: &mut Retry) -> bool {
-    // The viewer's own close callback cannot reach the slot (the widget knows
-    // nothing about it), so an empty overlay stack is what retires it. The
-    // picker drops out before the viewer opens, so the viewer is the only
-    // overlay up and its Esc empties the stack. A stale handle under some
-    // other overlay would only mean refreshing an invisible view until it
-    // does.
+/// Retire the viewer when its overlay closes, dropping any in-flight read.
+fn active_task_view(shell: &Rc<RefCell<Shell>>) -> Option<Rc<RefCell<TaskOutputView>>> {
     if !shell.borrow().overlays.borrow().is_open() {
         *shell.borrow().task_view.borrow_mut() = None;
     }
-    let view = shell.borrow().task_view.borrow().clone();
-    let Some(view) = view else {
-        retry.clear();
-        return false;
-    };
-    if !retry.ready() {
-        return false;
-    }
-    let task = view.borrow().task();
-    match world.control.task_details(world.session(), task).await {
-        Ok(details) => {
-            retry.again_in(TASK_POLL_INTERVAL);
-            view.borrow_mut().apply_details(details);
-            true
-        }
-        Err(err) => {
-            // The task may simply be gone from the host's registry. The viewer
-            // keeps its last-known body, matching the local one.
-            retry.failed();
-            tracing::debug!("could not read background task {task}: {err}");
-            false
-        }
-    }
+    shell.borrow().task_view.borrow().clone()
+}
+
+async fn recv_task_output(view: Option<&Rc<RefCell<TaskOutputView>>>) {
+    futures::future::poll_fn(|cx| match view {
+        Some(view) => view.borrow_mut().poll_output(cx),
+        None => std::task::Poll::Pending,
+    })
+    .await;
 }
 
 /// Advance a pending re-attach by one step, reporting a pending block, an open
@@ -8008,11 +7958,6 @@ async fn drive(
         sync_status(world);
         app.request_redraw();
     }
-    // Paces the per-task read behind an open remote task-output overlay: the
-    // steady cadence while it answers, a backoff while it does not. Cleared
-    // while no such viewer is open, which is what bounds the poll to an
-    // overlay that can show its answer.
-    let mut task_poll = Retry::default();
     // Frame pacing: cap redraws at `REDRAW_FPS_CAP`. Requests that arrive
     // within a frame budget coalesce into one paint (the redraw latch is a
     // single bool), and a request landing inside the current budget is
@@ -8125,11 +8070,9 @@ async fn drive(
         // requests the clearing repaint, so each toast vanishes exactly on
         // time even while others stay live.
         let toast_deadline = crate::toasts::earliest_toast_deadline(&shell.borrow().toasts);
-        // A pending re-attach, an open remote task viewer, and a paced read
-        // retry all have work due at a known time, and none has an event to
-        // wake the loop.
+        // Re-attach and client-read retries need a timer to wake the loop.
         let resume_deadline = resume.as_ref().map(Resume::due);
-        let poll_deadline = task_poll.due();
+        let task_view = active_task_view(shell);
         let reads_deadline = owes_client_reads(world)
             .then(|| world.reads_retry.due())
             .flatten();
@@ -8138,7 +8081,6 @@ async fn drive(
             frame_deadline,
             toast_deadline,
             resume_deadline,
-            poll_deadline,
             reads_deadline,
         ]
         .into_iter()
@@ -8542,6 +8484,11 @@ async fn drive(
                 }
             }
 
+            // Task output waits independently of input and frame processing.
+            _ = recv_task_output(task_view.as_ref()) => {
+                app.request_redraw();
+            }
+
             // --- Autocomplete delivery ---
             // A completed one-shot query result or a streaming-session wake
             // from the editor's autocomplete pipeline. The widget spawned the
@@ -8669,8 +8616,7 @@ async fn drive(
         if resume.is_none() && world.stream.is_some() && fold_ready_frames(world) {
             app.request_redraw();
         }
-        // A task kill parked by the remote task viewer, which has no registry
-        // to kill through.
+        // The viewer parks kills so the focused session's command gate applies.
         let killed = shell.borrow().task_kill.borrow_mut().take();
         if let Some(task) = killed {
             if !refuse_while_attaching(world, shell, "kill a task") {
@@ -8764,10 +8710,7 @@ async fn drive(
             }
             app.request_redraw();
         }
-        // Refresh the open remote task viewer from the per-task read.
-        if poll_task_output(world, shell, &mut task_poll).await {
-            app.request_redraw();
-        }
+
         // Continuity broke or a refusal's directory edge fired. Hand it to the
         // same loop-driven recovery as a lost stream, so a producer-paced block
         // keeps rendering and accepting navigation rather than being awaited
@@ -20128,21 +20071,6 @@ mod tests {
             notices.iter().any(|n| n.contains("not in the registry")),
             "{notices:?}"
         );
-    }
-
-    /// The task viewer, opened from the host path, renders the task's
-    /// output and status. (`Ctrl+K`/close behavior is covered by the
-    /// widget's own tests.)
-    #[tokio::test]
-    async fn task_viewer_renders_output_from_the_registry() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let id = register_bash_task(&mut world, "echo hello").await;
-        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(id)).await;
-        // The viewer shows the command header and a running status.
-        let rendered = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-        assert!(rendered.contains("echo hello"), "command: {rendered}");
-        assert!(rendered.contains("running"), "status: {rendered}");
     }
 
     /// Prompt history opens showing a loading placeholder, fills from a
@@ -31818,60 +31746,234 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// The task-output overlay in connect mode is backed by the per-task read:
-    /// the drive loop polls it and pushes each snapshot into the open viewer.
+    /// Scrollback, appends and kill travel through the composed viewer and drive
+    /// loop, using the real adapters. Tails deliberately omit the first marker.
     #[tokio::test]
-    async fn connect_mode_task_overlay_renders_the_per_task_read() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "background-task").await;
-        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+    async fn task_output_scrollback_local_direct_and_gateway() {
+        use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
 
-        assert!(handle_submit(&mut world, "run something".to_string()).await);
-        // Wait for the background task to show up in the client's model.
-        let deadline = Instant::now() + SETTLE_DEADLINE;
-        loop {
-            fold_ready_frames(&mut world);
-            let known = world.chat.borrow().tasks().keys().next().copied();
-            if let Some(task) = known {
-                let command = match &world.chat.borrow().tasks()[&task].kind {
-                    aj_agent::tool::TaskKind::Bash { command } => command.clone(),
-                    aj_agent::tool::TaskKind::Agent { .. } => panic!("a bash task"),
-                };
-                open_task_viewer(&world, &shell, task, command);
-                break;
+        struct FileOutput(PathBuf);
+        impl TaskOutputSource for FileOutput {
+            fn snapshot(&self) -> TaskRead {
+                TaskRead {
+                    spill_path: Some(self.0.clone()),
+                    stdout_tail: "TAIL-ONLY".into(),
+                    ..TaskRead::default()
+                }
             }
-            assert!(Instant::now() < deadline, "no background task started");
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(
-            shell.borrow().task_view.borrow().is_some(),
-            "the remote viewer is kept for the poll"
-        );
 
-        // The first poll fills the viewer from the read.
-        let mut polled = Retry::default();
-        assert!(
-            poll_task_output(&world, &shell, &mut polled).await,
-            "the per-task read fed the viewer"
-        );
-        // And it is bounded: a second poll inside the interval does nothing.
-        assert!(!poll_task_output(&world, &shell, &mut polled).await);
+        async fn visible(shell: &Rc<RefCell<Shell>>, marker: &str) {
+            tokio::time::timeout(SETTLE_DEADLINE, async {
+                loop {
+                    let rendered = painted_rows(shell, 100, 40).join("\n");
+                    if rendered.contains(marker) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("task viewer never showed {marker}"));
+        }
 
-        // Closing the viewer retires the poll: an empty overlay stack is what
-        // the loop reads, since the widget cannot clear the slot itself.
-        shell.borrow().overlays.borrow_mut().close_all();
-        assert!(!poll_task_output(&world, &shell, &mut polled).await);
-        assert!(
-            shell.borrow().task_view.borrow().is_none(),
-            "the closed viewer was retired"
-        );
-        assert!(
-            polled.due().is_none(),
-            "the poll clock resets with the viewer"
-        );
+        for mode in ["local", "direct", "gateway"] {
+            let host_dir = TempDir::new().unwrap();
+            let client_dir = TempDir::new().unwrap();
+            let remote = RemoteHost::at_directory(&host_dir).await;
+            let session = remote.host.create().await.unwrap();
+            let registry = remote
+                .host
+                .local_handles(&session)
+                .await
+                .unwrap()
+                .task_registry;
+            let path = host_dir.path().join("task.log");
+            let content = format!(
+                "EARLY-SCROLLBACK\n{}INITIAL-END\n",
+                "middle output line\n".repeat(10000)
+            );
+            assert!(content.len() > aj_wire::TASK_OUTPUT_CHUNK_BYTES);
+            std::fs::write(&path, &content).unwrap();
+            let (id, cancel, driver) = registry.register_driver(
+                AgentId::Main,
+                "task-output-test".into(),
+                TaskKind::Bash {
+                    command: "long output".into(),
+                },
+                "long output".into(),
+                Arc::new(FileOutput(path.clone())),
+            );
+            let finishing = registry.clone();
+            driver.spawn(async move {
+                cancel.cancelled().await;
+                finishing.set_status(id, TaskStatus::Killed);
+            });
+            assert!(
+                !remote
+                    .host
+                    .task(&session, id)
+                    .await
+                    .unwrap()
+                    .stdout_tail
+                    .contains("EARLY-SCROLLBACK")
+            );
+            let gateway = RemoteGateway::over(&[&remote]).await;
+            gateway.until_sessions(1).await;
+            let (url, address) = if mode == "gateway" {
+                (
+                    gateway.url(),
+                    format!("{}:{session}", remote.host.hello().host_id),
+                )
+            } else {
+                (remote.url(), session.clone())
+            };
+            let (mut world, shell) =
+                connect_world_and_shell_at(&client_dir, &url, &[&address]).await;
+            if mode == "local" {
+                world.control = Control::local(remote.host.clone());
+            }
+            for completed in [false, true] {
+                assert!(matches!(
+                    apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(id))
+                        .await,
+                    ActionEffect::OpenedOverlay,
+                ));
+                let (mut app, mut writer, root) = app_over(&shell).await;
+                focus_overlay(&mut app, &root);
+                let (mut theme_watch, mut history) = drive_parts();
+                let interaction = async {
+                    visible(
+                        &shell,
+                        if completed {
+                            "LIVE-APPEND"
+                        } else {
+                            "INITIAL-END"
+                        },
+                    )
+                    .await;
+                    writer.write_all(b"g").unwrap();
+                    visible(&shell, "EARLY-SCROLLBACK").await;
+                    if !completed {
+                        let mut file = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&path)
+                            .unwrap();
+                        file.write_all(b"LIVE-APPEND\n").unwrap();
+                        writer.write_all(b"G").unwrap();
+                        visible(&shell, "LIVE-APPEND").await;
+                        writer.write_all(&[0x0b]).unwrap();
+                        visible(&shell, "killed").await;
+                    }
+                    writer.write_all(b"\r").unwrap();
+                    tokio::time::timeout(SETTLE_DEADLINE, async {
+                        while shell.borrow().overlays.borrow().is_open() {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("close stays responsive");
+                    drop(writer);
+                };
+                let (exit, ()) = tokio::join!(
+                    drive(
+                        &mut app,
+                        &root,
+                        &shell,
+                        &mut world,
+                        &mut theme_watch,
+                        &mut history
+                    ),
+                    interaction,
+                );
+                assert!(matches!(exit.unwrap(), SessionExit::Quit));
+                assert_eq!(registry.summary(id).unwrap().status, TaskStatus::Killed);
+            }
+            gateway.shutdown().await;
+            remote.shutdown().await;
+        }
+    }
 
-        settle(&mut world).await;
-        remote.shutdown().await;
+    #[tokio::test]
+    async fn task_output_slow_or_failed_reads_do_not_block_close() {
+        use axum::{Json, Router, routing::get};
+        use reqwest::StatusCode;
+
+        for failure in ["slow", "unsupported", "unavailable"] {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let signal = Arc::clone(&started);
+            let router = Router::new().route(
+                "/v1/sessions/{session}/tasks/{task}/output",
+                get(move || {
+                    let signal = Arc::clone(&signal);
+                    async move {
+                        signal.notify_one();
+                        if failure == "slow" {
+                            futures::future::pending::<()>().await;
+                        }
+                        (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                            "code": if failure == "unsupported" { "unknown_endpoint" } else { "unknown_task" },
+                            "message": "task is no longer available",
+                        })))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let dir = TempDir::new().unwrap();
+            let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+            let id = register_bash_task(&mut world, "waiting task").await;
+            let host = world.control.host().unwrap().clone();
+            world.control = Control::remote(crate::remote::RemoteClient::new(&url).unwrap());
+            open_task_viewer(&world, &shell, id, "waiting task".into());
+            let (mut app, mut writer, root) = app_over(&shell).await;
+            focus_overlay(&mut app, &root);
+            let (mut theme_watch, mut history) = drive_parts();
+            let interaction = async {
+                tokio::time::timeout(SETTLE_DEADLINE, started.notified())
+                    .await
+                    .unwrap();
+                if failure != "slow" {
+                    let expected = if failure == "unsupported" {
+                        "does not support full task output"
+                    } else {
+                        "Output unavailable"
+                    };
+                    tokio::time::timeout(SETTLE_DEADLINE, async {
+                        while !painted_rows(&shell, 100, 40).join("\n").contains(expected) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("read failure is visible");
+                }
+                writer.write_all(b"g\r").unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while shell.borrow().overlays.borrow().is_open() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("close must not wait for the host read");
+                drop(writer);
+            };
+            let (exit, ()) = tokio::join!(
+                drive(
+                    &mut app,
+                    &root,
+                    &shell,
+                    &mut world,
+                    &mut theme_watch,
+                    &mut history
+                ),
+                interaction,
+            );
+            assert!(matches!(exit.unwrap(), SessionExit::Quit));
+            host.shutdown().await;
+            serving.abort();
+            let _ = serving.await;
+        }
     }
 
     /// Every entry from `entry` up to the log's root, `entry` included.

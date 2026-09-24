@@ -876,6 +876,24 @@ pub struct TaskTable {
     pub tasks: Vec<TaskSummary>,
 }
 
+/// Hosts supporting bounded reads of retained task spill files.
+pub const TASK_OUTPUT_CAPABILITY: &str = "task_output";
+
+/// Maximum number of raw output bytes returned by one task-output read.
+pub const TASK_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+
+/// A byte range of a retained task's interleaved output. `total_bytes` is the
+/// file length captured before reading. Append-only output may grow afterward.
+/// Bytes are not decoded, so invalid UTF-8 and split code points are preserved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskOutput {
+    pub id: TaskId,
+    pub status: TaskStatus,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub bytes: Vec<u8>,
+}
+
 /// Detailed status and remotely reachable output for one background task.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDetails {

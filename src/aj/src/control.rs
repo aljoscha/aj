@@ -31,7 +31,7 @@ use aj_wire::{
     AccountList, AccountRequest, ArchiveRequest, CancelRequest, CompactRequest,
     CreateSessionRequest, EnvRequest, Frame, HeadRequest, ModelSelection, PromptInput,
     PromptRequest, QueueOperation, QueueRequest, QueueState, SessionList, SessionSettings,
-    SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
+    SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskTable,
 };
 use futures::{FutureExt, StreamExt};
 use reqwest::StatusCode;
@@ -464,16 +464,16 @@ impl Control {
         }
     }
 
-    /// One task's detailed output, which is what backs the task-output
-    /// overlay: the spill file on the host's disk is not reachable remotely.
-    pub(crate) async fn task_details(
+    /// A bounded byte range of the task's full retained output.
+    pub(crate) async fn task_output(
         &self,
         session: &str,
         task: TaskId,
-    ) -> Result<TaskDetails, ControlError> {
+        offset: u64,
+    ) -> Result<aj_wire::TaskOutput, ControlError> {
         match self {
-            Self::Local(local) => Ok(local.host.task(session, task).await?),
-            Self::Remote(remote) => Ok(remote.client.task(session, task).await?),
+            Self::Local(local) => Ok(local.host.task_output(session, task, offset).await?),
+            Self::Remote(remote) => Ok(remote.client.task_output(session, task, offset).await?),
         }
     }
 
@@ -1330,3 +1330,6 @@ mod credential_tests;
 
 #[cfg(test)]
 mod context_tests;
+
+#[cfg(test)]
+mod task_output_tests;
