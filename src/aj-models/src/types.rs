@@ -726,9 +726,10 @@ pub struct StreamOptions {
     /// provider default applies (typically [`ToolChoice::Auto`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
-    /// Per-call cancellation token. When set, the provider drives
-    /// its streaming HTTP request inside a `select!` against
-    /// [`CancellationToken::cancelled`]; on cancel the partial
+    /// Per-call cancellation token. Cancellation interrupts credential
+    /// resolution and the streaming HTTP request. During resolution it drops
+    /// the resolver future and emits an empty aborted message with no account.
+    /// Otherwise, on cancel the partial
     /// [`AssistantMessage`] built up so far is emitted via
     /// [`AssistantMessageEvent::Error`](crate::streaming::AssistantMessageEvent::Error)
     /// with reason

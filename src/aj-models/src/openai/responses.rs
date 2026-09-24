@@ -232,12 +232,22 @@ async fn run_stream_inner(
         return Ok(());
     }
 
-    let credential = options.resolve_api_key().await.map_err(|err| {
-        AssistantError::new(
-            ErrorCategory::Auth,
-            format!("openai-responses provider: {err}"),
-        )
-    })?;
+    let credential =
+        match select_cancel(options.cancel.as_ref(), options.resolve_api_key()).await {
+            SelectOutcome::Ready(result) => result,
+            SelectOutcome::Cancelled => {
+                producer.push(AssistantMessageEvent::aborted(empty_partial(
+                    API_NAME, model, None,
+                )));
+                return Ok(());
+            }
+        }
+        .map_err(|err| {
+            AssistantError::new(
+                ErrorCategory::Auth,
+                format!("openai-responses provider: {err}"),
+            )
+        })?;
 
     // Reject a thinking level the model can't honour before building
     // the request: aj sends the chosen effort verbatim.

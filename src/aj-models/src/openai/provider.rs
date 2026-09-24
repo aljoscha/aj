@@ -132,10 +132,10 @@ async fn run_stream(
 /// event) and `Ok(())` once the SSE stream has been fully consumed
 /// and a terminal event has been pushed.
 ///
-/// Honours [`StreamOptions::cancel`] at three checkpoints: before the
-/// HTTP handshake, around the handshake `await`, and around every
-/// `sse.next()` poll. On cancel the running [`StreamState::partial`]
-/// is projected onto an [`AssistantMessageEvent::aborted`] event so
+/// Honours [`StreamOptions::cancel`] before work begins, during credential
+/// resolution and the HTTP handshake, and around every `sse.next()` poll.
+/// On cancel the running [`StreamState::partial`] is projected onto an
+/// [`AssistantMessageEvent::aborted`] event so
 /// consumers see a normal terminal event carrying whatever deltas
 /// had arrived.
 async fn run_stream_inner(
@@ -152,12 +152,20 @@ async fn run_stream_inner(
         return Ok(());
     }
 
-    let credential = options.resolve_api_key().await.map_err(|err| {
-        AssistantError::new(
-            ErrorCategory::Auth,
-            format!("openai-completions provider: {err}"),
-        )
-    })?;
+    let credential =
+        match select_cancel(options.cancel.as_ref(), options.resolve_api_key()).await {
+            SelectOutcome::Ready(result) => result,
+            SelectOutcome::Cancelled => {
+                producer.push(AssistantMessageEvent::aborted(empty_partial(model, None)));
+                return Ok(());
+            }
+        }
+        .map_err(|err| {
+            AssistantError::new(
+                ErrorCategory::Auth,
+                format!("openai-completions provider: {err}"),
+            )
+        })?;
 
     // Reject a thinking level the model can't honour before building
     // the request: aj sends the chosen effort verbatim.
