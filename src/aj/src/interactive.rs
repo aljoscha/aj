@@ -2283,7 +2283,7 @@ fn credential_host(world: &World) -> String {
 
 fn credential_error(err: &ControlError, write: bool) -> String {
     // reqwest diagnostics can embed a base URL's userinfo or query secrets.
-    // The overlay already identifies the host without displaying its address.
+    // Connected overlays identify the host without displaying its address.
     let reason = match err {
         ControlError::Remote(RemoteError::Transport(err)) if err.is_timeout() => {
             "The host connection timed out.".to_string()
@@ -2303,6 +2303,14 @@ fn credential_error(err: &ControlError, write: bool) -> String {
     }
 }
 
+fn credential_title(world: &World, title: &str, host: &str) -> String {
+    if world.control.is_remote() {
+        format!("{title} · {host}")
+    } else {
+        title.to_string()
+    }
+}
+
 fn open_credential_picker(world: &World, shell: &Rc<RefCell<Shell>>, action: CommandAction) {
     let host = credential_host(world);
     let session = world.session().to_string();
@@ -2318,7 +2326,7 @@ fn open_credential_picker(world: &World, shell: &Rc<RefCell<Shell>>, action: Com
         &handles.editor,
         &handles.chrome,
         &handles.auth_request,
-        &format!("{title} · {host}"),
+        &credential_title(world, title, &host),
         Vec::new(),
         AuthPickerTarget {
             session: session.to_string(),
@@ -2592,6 +2600,8 @@ fn start_login(
     session: String,
     host: String,
 ) {
+    let dialog_name = credential_title(world, &provider_name, &host);
+    // Completion feedback keeps the captured destination if focus moves.
     let provider_name = format!("{provider_name} on {host}");
     // Shared handles: the dialog (UI thread) holds clones; the originals
     // move into the login task's callbacks.
@@ -2618,7 +2628,7 @@ fn start_login(
             &handles.chrome,
             &snapshot,
             caps,
-            &provider_name,
+            &dialog_name,
             Arc::clone(&state),
             Arc::clone(&pending_input),
             Arc::clone(&cancel),
@@ -2746,7 +2756,7 @@ fn open_default_logout_resolution(
         &handles.editor,
         &handles.chrome,
         &handles.auth_request,
-        &format!("Log out · {host}"),
+        &credential_title(world, "Log out", host),
         Vec::new(),
         AuthPickerTarget {
             session: session.to_string(),
@@ -5264,9 +5274,12 @@ fn spawn_overlay_fetch(
             let session = world.session().to_string();
             let host = credential_host(world);
             tokio::spawn(async move {
-                let mut rows = vec![crate::content_overlay::plain(format!(
-                    "Credentials on {host}"
-                ))];
+                let mut rows = Vec::new();
+                if control.is_remote() {
+                    rows.push(crate::content_overlay::plain(format!(
+                        "Credentials on {host}"
+                    )));
+                }
                 match control.credential_overview(&session).await {
                     Ok(overview) => {
                         rows.extend(auth_rows(&overview.statuses, &styles, width_method))
@@ -15659,8 +15672,10 @@ mod tests {
                 .flatten()
                 .map(|s| s.text.as_str())
                 .collect::<String>();
-            assert!(
-                page.contains("credential-left") && page.contains("host-sentinel"),
+            assert!(page.contains("host-sentinel"), "{page}");
+            assert_eq!(
+                page.contains("Credentials on credential-left"),
+                mode != "local",
                 "{page}"
             );
             assert!(
@@ -15693,6 +15708,16 @@ mod tests {
             let (redraw, _) = unbounded_channel();
             let mut login = None;
             apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+            let title = &top_overlay_rows(&shell)[0];
+            assert_eq!(
+                title.contains("credential-left"),
+                mode != "local",
+                "{title}"
+            );
+            assert!(
+                !title.contains("credential-right"),
+                "login keeps its captured host: {title}"
+            );
             answer_login(&shell, &mut app, &mut writer, &root, "Account name", "work").await;
             let outcome =
                 tokio::time::timeout(Duration::from_secs(3), &mut login.as_mut().unwrap().handle)
@@ -15831,8 +15856,12 @@ mod tests {
             }
             apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
             run_fills(&shell).await;
-            let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-            assert!(page.contains("credential-left"), "{page}");
+            let title = &top_overlay_rows(&shell)[0];
+            assert_eq!(
+                title.contains("credential-left"),
+                mode != "local",
+                "{title}"
+            );
             focus_overlay(&mut app, &root);
             press(&mut app, &mut writer, b"\r").await;
             let request = shell.borrow().take_auth_request().unwrap();
@@ -16149,7 +16178,10 @@ mod tests {
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(page.contains("No stored credentials"), "{page}");
-        assert!(page.contains(&credential_host(&world)), "{page}");
+        assert!(
+            !top_overlay_rows(&shell)[0].contains(&credential_host(&world)),
+            "{page}"
+        );
         shut_down(&world).await;
     }
 
@@ -26312,6 +26344,12 @@ mod tests {
                 ));
                 focus_overlay(&mut app, &root);
                 type_text(&mut app, &mut writer, "anthropic").await;
+                let title = &top_overlay_rows(&shell)[0];
+                assert_eq!(
+                    title.contains(&credential_host(&world)),
+                    connected,
+                    "{action:?}: {title}"
+                );
                 let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
                 assert!(
                     page.contains("Anthropic subscription · work"),
