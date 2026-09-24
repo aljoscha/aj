@@ -625,6 +625,7 @@ pub(crate) fn auth_rows(
 /// Provider/account headings with globally aligned labels, percentages and
 /// reset columns. Reset-credit counts share the percentage column. Notes are
 /// prose beneath their own group and do not participate in column sizing.
+/// Unsupported accounts and providers without a usage source are omitted.
 pub(crate) fn usage_rows(
     statuses: &[ProviderUsageStatus],
     styles: &ContentStyles,
@@ -655,19 +656,8 @@ pub(crate) fn usage_rows(
     }
     let mut rows = Vec::new();
     for status in statuses {
-        if !rows.is_empty() {
-            rows.push(plain(" "));
-        }
-        let identity = report_identity(
-            &status.provider_id,
-            &status.provider_name,
-            status.account.as_deref(),
-        );
-        rows.push(vec![span(
-            account_label_for_auth_row(&identity, usize::from(AUTH_ROW_CELL_LIMIT), width_method),
-            Style::default(),
-        )]);
-        let mut detail = |text: String| rows.push(vec![span(format!("  {text}"), styles.muted)]);
+        let mut group = Vec::new();
+        let mut detail = |text: String| group.push(vec![span(format!("  {text}"), styles.muted)]);
         match &status.outcome {
             UsageOutcome::Usage(usage) => {
                 if usage.windows.is_empty()
@@ -700,10 +690,10 @@ pub(crate) fn usage_rows(
                             styles.muted,
                         ));
                     }
-                    rows.push(row);
+                    group.push(row);
                 }
                 for note in &usage.notes {
-                    rows.push(vec![span(format!("  {note}"), styles.muted)]);
+                    group.push(vec![span(format!("  {note}"), styles.muted)]);
                 }
                 if let Some(credits) = &usage.reset_credits {
                     let desc = if credits.available > 0 {
@@ -711,7 +701,7 @@ pub(crate) fn usage_rows(
                     } else {
                         "no resets available".into()
                     };
-                    rows.push(vec![
+                    group.push(vec![
                         span(
                             format!("  {}", pad_cells(reset_label, label_width, width_method)),
                             Style::default(),
@@ -720,16 +710,26 @@ pub(crate) fn usage_rows(
                     ]);
                 }
             }
-            UsageOutcome::Unsupported { reason } => {
-                detail(format!("usage not available · {reason}"))
-            }
+            UsageOutcome::Unsupported { .. } | UsageOutcome::NoSource => continue,
             UsageOutcome::NotConfigured => detail("not configured".into()),
-            UsageOutcome::NoSource => detail("usage reporting not supported".into()),
             UsageOutcome::Error(err) => detail(format!("error: {err}")),
         }
+        if !rows.is_empty() {
+            rows.push(plain(" "));
+        }
+        let identity = report_identity(
+            &status.provider_id,
+            &status.provider_name,
+            status.account.as_deref(),
+        );
+        rows.push(vec![span(
+            account_label_for_auth_row(&identity, usize::from(AUTH_ROW_CELL_LIMIT), width_method),
+            Style::default(),
+        )]);
+        rows.extend(group);
     }
     if rows.is_empty() {
-        rows.push(plain("No usage sources."));
+        rows.push(plain("No accounts support usage reporting."));
     }
     rows
 }
@@ -1482,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_rows_preserve_outcomes_and_account_labels() {
+    fn usage_rows_hide_unsupported_accounts_but_preserve_diagnostics_and_labels() {
         use aj_models::usage::ProviderUsage;
         let mut statuses: Vec<_> = [
             UsageOutcome::NotConfigured,
@@ -1509,14 +1509,19 @@ mod tests {
         let text = rows_text(&rows);
         for expected in [
             "not configured",
-            "usage reporting not supported",
-            "API account",
             "error: fetch failed",
             "no usage data reported",
         ] {
             assert!(text.contains(expected), "{text}");
         }
-        assert_eq!(text.matches("provider ·  a    b ").count(), statuses.len());
+        assert!(!text.contains("usage reporting not supported"), "{text}");
+        assert!(!text.contains("API account"), "{text}");
+        assert_eq!(text.matches("provider ·  a    b ").count(), 3);
+        for unsupported in [&statuses[1..3], &statuses[..0]] {
+            let rows = usage_rows(unsupported, &test_styles(), Method::Unicode);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(row_text(&rows[0]), "No accounts support usage reporting.");
+        }
         statuses[0].account = Some("a".repeat(70_000));
         let rows = usage_rows(&statuses[..1], &test_styles(), Method::Unicode);
         assert!(row_text(&rows[0]).contains("[clipped"));

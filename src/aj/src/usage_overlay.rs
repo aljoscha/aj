@@ -1629,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_fetch_renders_every_stored_account() {
+    fn initial_fetch_omits_accounts_without_usage_support() {
         use aj_models::auth::AuthCredential;
 
         let auth = scratch_auth();
@@ -1660,13 +1660,24 @@ mod tests {
             Rc::new(RefCell::new(String::new())),
         );
 
-        let output = wait_for(&mut overlay, "work");
-        assert!(output.contains("personal"), "{output}");
-        assert_eq!(
-            output.matches("Anthropic ·").count(),
-            2,
-            "each account is a complete rendered group:\n{output}"
+        let output = wait_for(&mut overlay, "No accounts support usage reporting.");
+        let statuses = overlay.statuses.as_ref().expect("host report loaded");
+        assert!(
+            statuses
+                .iter()
+                .any(|status| matches!(status.outcome, UsageOutcome::Unsupported { .. }))
         );
+        assert!(
+            statuses
+                .iter()
+                .any(|status| matches!(status.outcome, UsageOutcome::NoSource))
+        );
+        for hidden in ["Anthropic", "OpenAI", "OpenRouter", "personal", "work"] {
+            assert!(
+                !output.contains(hidden),
+                "unsupported account leaked into view: {output}"
+            );
+        }
     }
 
     #[test]
