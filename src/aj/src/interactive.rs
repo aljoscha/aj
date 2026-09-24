@@ -20302,6 +20302,33 @@ mod tests {
     #[tokio::test]
     async fn prompt_history_stream_keeps_the_drawn_view_and_recalled_selection() {
         use crate::remote::tests::{history_event, history_peer, history_value};
+
+        #[derive(Default)]
+        struct Rendered {
+            rows: Vec<String>,
+            cells: Vec<Vec<vaxis::cell::Cell>>,
+        }
+        struct RenderProbe {
+            child: WidgetRef,
+            frame: Rc<RefCell<Rendered>>,
+        }
+        impl Widget for RenderProbe {
+            fn draw(&mut self, ctx: &DrawContext) -> Surface {
+                let surface = draw_widget(&self.child, ctx);
+                *self.frame.borrow_mut() = Rendered {
+                    rows: crate::test_support::rows(&surface),
+                    cells: crate::test_support::flatten(&surface),
+                };
+                Surface::with_children(
+                    surface.size,
+                    vec![SubSurface {
+                        origin: RelativePoint { row: 0, col: 0 },
+                        surface,
+                        z_index: 0,
+                    }],
+                )
+            }
+        }
         let dir = TempDir::new().unwrap();
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let local = world.control.clone();
@@ -20322,7 +20349,15 @@ mod tests {
         later.prompts.extend(untouched.prompts.clone());
         later.incomplete = initial.incomplete.clone();
         let observed = Rc::clone(&shell);
-        let (exit, recalled) = drive_until(&mut world, &shell, move |mut writer| async move {
+        let (mut app, mut writer, input_root) = app_over(&shell).await;
+        let frame = Rc::new(RefCell::new(Rendered::default()));
+        // Wrap only the render root. Input dispatch retains the original root,
+        // so focus-only layouts cannot be mistaken for a published frame.
+        let render_root: WidgetRef = Rc::new(RefCell::new(RenderProbe {
+            child: input_root,
+            frame: Rc::clone(&frame),
+        }));
+        let interaction = async move {
             writer.write_all(b"\x12").unwrap();
             crate::remote::tests::bounded("history opened", peer.requests.recv())
                 .await
@@ -20332,8 +20367,10 @@ mod tests {
                 .await
                 .unwrap();
             poll_for(|| {
-                let rows = top_overlay_rows(&observed);
-                rows.iter()
+                frame
+                    .borrow()
+                    .rows
+                    .iter()
                     .any(|row| row.contains("prompt-00"))
                     .then_some(())
             })
@@ -20344,14 +20381,16 @@ mod tests {
                 .await
                 .unwrap();
             poll_for(|| {
-                top_overlay_rows(&observed)
+                frame
+                    .borrow()
+                    .rows
                     .iter()
                     .any(|row| row.contains("early-newest"))
                     .then_some(())
             })
             .await
             .expect("untouched history follows the newest arrival");
-            let rows = flatten(&observed.borrow_mut().draw(&full_draw_ctx()));
+            let rows = frame.borrow().rows.clone();
             let (row, line) = rows
                 .iter()
                 .enumerate()
@@ -20368,19 +20407,21 @@ mod tests {
             )
             .unwrap();
             let (before, row) = poll_for(|| {
-                let (top, selected_bg) = {
-                    let shell = observed.borrow();
-                    let top = Rc::clone(&shell.overlays.borrow().top().unwrap().widget);
-                    (top, shell.overlay_handles().chrome.select.selected_bg)
-                };
-                let surface = top.borrow_mut().draw(&full_draw_ctx());
-                let rows = crate::test_support::rows(&surface);
-                let row = rows.iter().position(|row| row.contains("prompt-05"))?;
-                let cells = crate::test_support::flatten(&surface);
-                cells[row]
+                let selected_bg = observed
+                    .borrow()
+                    .overlay_handles()
+                    .chrome
+                    .select
+                    .selected_bg;
+                let painted = frame.borrow();
+                let row = painted
+                    .rows
                     .iter()
-                    .any(|cell| cell.style.bg == selected_bg)
-                    .then_some((rows, row))
+                    .position(|row| row.contains("prompt-05"))?;
+                let line = &painted.rows[row];
+                let col = line[..line.find("prompt-05")?].chars().count();
+                (painted.cells[row][col].style.bg == selected_bg)
+                    .then(|| (painted.rows.clone(), row))
             })
             .await
             .expect("click selected the chosen prompt without closing the overlay");
@@ -20395,7 +20436,7 @@ mod tests {
                 .await
                 .unwrap();
             let after = poll_for(|| {
-                let rows = top_overlay_rows(&observed);
+                let rows = frame.borrow().rows.clone();
                 (!rows.join("\n").contains("Loading")
                     && rows.iter().any(|row| row.contains("prompt-05")))
                 .then_some(rows)
@@ -20415,8 +20456,19 @@ mod tests {
             .expect("prompt recalled");
             drop(writer);
             recalled
-        })
-        .await;
+        };
+        let (mut theme_watch, mut history) = drive_parts();
+        let (exit, recalled) = tokio::join!(
+            drive(
+                &mut app,
+                &render_root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut history
+            ),
+            interaction,
+        );
         assert!(matches!(exit, Ok(SessionExit::Quit)));
         assert_eq!(recalled, "prompt-05");
         assert_eq!(

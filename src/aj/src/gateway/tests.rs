@@ -952,65 +952,103 @@ async fn a_preview_batch_outwaits_the_gateways_stalled_upstream() {
 
 /// Stalled hosts must not make a healthy host wait for a read slot or make
 /// partial results wait for successive timeout waves.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn a_preview_batch_returns_healthy_hosts_without_timeout_waves() {
-    use axum::response::sse::{Event, Sse};
-    use axum::routing::get;
-    use futures::StreamExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-    let requested = Arc::new(StdMutex::new(Vec::new()));
+    let (requested, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+    let (stop, stopping) = tokio::sync::watch::channel(());
     let mut serving = tokio::task::JoinSet::new();
     let mut addresses = Vec::new();
     let sessions: Vec<_> = (0..16)
         .map(|index| format!("h{index:02}:session"))
         .collect();
     for index in 0..16 {
-        let hello = serde_json::json!({
-            "protocol": PROTOCOL_VERSION, "capabilities": [], "app_version": "0",
-            "host_id": format!("h{index:02}"), "name": format!("host-{index:02}")
-        });
-        let requested = Arc::clone(&requested);
-        let app = axum::Router::new()
-            .route("/v1/hello", get(move || {
-                let hello = hello.clone();
-                async move { axum::Json(hello) }
-            }))
-            .route("/v1/events", get(|| async {
-                let list = serde_json::json!({"kind": "list", "sessions": [{
-                    "id": "session", "live": true, "working": false,
-                    "queued": {"steering": 0, "follow_up": 0}, "tasks": 0,
-                    "last_activity": "2026-01-01T00:00:00Z"
-                }]});
-                Sse::new(futures::stream::iter([Ok::<_, std::convert::Infallible>(
-                    Event::default().data(list.to_string())
-                )]).chain(futures::stream::pending()))
-            }))
-            .route("/v1/previews", get(move |axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>| {
-                let requested = Arc::clone(&requested);
-                async move {
-                    assert_eq!(params, [("session".to_string(), "session".to_string())]);
-                    requested.lock().unwrap().push(index);
-                    // A healthy host follows more than eight stalled hosts in
-                    // routing order. Their timeouts cannot hide its preview.
-                    if (4..15).contains(&index) {
-                        std::future::pending::<()>().await;
-                    }
-                    axum::Json(serde_json::json!({"previews": [{
-                        "session_id": "session", "modified": "2026-01-01T00:00:00Z",
-                        "created_at": "2026-01-01T00:00:00Z", "last_message_at": "2026-01-01T00:00:00Z",
-                        "size_bytes": 100, "message_count": 1,
-                        "first_user_message": format!("healthy preview {index}"),
-                        "tag": null, "archived": false
-                    }], "incomplete": []}))
-                }
-            }));
         let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
             .await
             .expect("bind peer");
         addresses.push(
             HostAddress::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
         );
-        serving.spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let requested = requested.clone();
+        let completed = completed.clone();
+        let mut stopping = stopping.clone();
+        serving.spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (socket, _) = tokio::select! {
+                    accepted = listener.accept() => accepted.unwrap(),
+                    _ = stopping.changed() => break,
+                };
+                let requested = requested.clone();
+                let completed = completed.clone();
+                connections.spawn(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    socket.read_line(&mut request).await.unwrap();
+                    loop {
+                        let mut header = String::new();
+                        socket.read_line(&mut header).await.unwrap();
+                        if header == "\r\n" || header.is_empty() {
+                            break;
+                        }
+                    }
+                    let path = request.split_whitespace().nth(1).expect("request path");
+                    let body = match path {
+                        "/v1/hello" => serde_json::json!({
+                            "protocol": PROTOCOL_VERSION, "capabilities": [], "app_version": "0",
+                            "host_id": format!("h{index:02}"), "name": format!("host-{index:02}")
+                        }),
+                        "/v1/events" => {
+                            let list = serde_json::json!({"kind": "list", "sessions": [{
+                                "id": "session", "live": true, "working": false,
+                                "queued": {"steering": 0, "follow_up": 0}, "tasks": 0,
+                                "last_activity": "2026-01-01T00:00:00Z"
+                            }]});
+                            socket.write_all(format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {list}\n\n"
+                            ).as_bytes()).await.unwrap();
+                            std::future::pending::<()>().await;
+                            return;
+                        }
+                        "/v1/previews?session=session" => {
+                            requested.send(index).unwrap();
+                            // A healthy host follows more than eight stalled hosts
+                            // in routing order. No read may wait for a free slot.
+                            if (4..15).contains(&index) {
+                                std::future::pending::<()>().await;
+                            }
+                            serde_json::json!({"previews": [{
+                                "session_id": "session", "modified": "2026-01-01T00:00:00Z",
+                                "created_at": "2026-01-01T00:00:00Z", "last_message_at": "2026-01-01T00:00:00Z",
+                                "size_bytes": 100, "message_count": 1,
+                                "first_user_message": format!("healthy preview {index}"),
+                                "tag": null, "archived": false
+                            }], "incomplete": []})
+                        }
+                        _ => panic!("unexpected request: {request}"),
+                    }.to_string();
+                    socket.write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    ).as_bytes()).await.unwrap();
+                    if path.starts_with("/v1/previews?") {
+                        // Client EOF acknowledges transport receipt on this
+                        // close-only connection. Advancing the clock cannot
+                        // race response bytes still waiting on the OS.
+                        assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+                        completed.send(index).unwrap();
+                    }
+                });
+            }
+            connections.abort_all();
+            while let Some(result) = connections.join_next().await {
+                if let Err(error) = result {
+                    assert!(error.is_cancelled(), "peer connection failed: {error}");
+                }
+            }
+        });
     }
     let budget = Duration::from_secs(1);
     let fixture = Fixture::tuned(
@@ -1029,14 +1067,50 @@ async fn a_preview_batch_returns_healthy_hosts_without_timeout_waves() {
         })
         .await;
 
-    // Leave transport/scheduling margin, but not enough for a second wave.
-    let answer = tokio::time::timeout(
-        budget + budget / 2,
-        fixture.client.session_previews(&sessions),
-    )
-    .await
-    .expect("one batch budget, not two upstream waves")
-    .expect("a partial response, not a client timeout");
+    // A running blocking task inhibits Tokio's automatic clock advance while
+    // loopback I/O is pending. Its wall deadline is only a deadlock watchdog,
+    // independent of the batch budget under test. Dropping the sender releases
+    // it even if an assertion unwinds.
+    let (release_clock, hold_clock) = std::sync::mpsc::channel::<()>();
+    let mut watchdog = tokio::task::spawn_blocking(move || {
+        let _ = hold_clock.recv_timeout(Duration::from_secs(20));
+    });
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let client = fixture.client.clone();
+    let batch = sessions.clone();
+    let reading = tokio::spawn(async move { client.session_previews(&batch).await });
+    let phase = std::cell::Cell::new("all sixteen host reads");
+    let answer = tokio::select! {
+        _ = &mut watchdog => panic!("waiting for {} with the clock frozen", phase.get()),
+        answer = async {
+            let mut seen = Vec::new();
+            for _ in 0..16 {
+                seen.push(requests.recv().await.expect("peer request"));
+            }
+            seen.sort_unstable();
+            assert_eq!(seen, (0..16).collect::<Vec<_>>(),
+                "every owning host receives its read before any timeout");
+            phase.set("five healthy responses to be consumed");
+            let mut healthy = Vec::new();
+            for _ in 0..5 {
+                healthy.push(completions.recv().await.expect("healthy read completed"));
+            }
+            healthy.sort_unstable();
+            assert_eq!(healthy, [0, 1, 2, 3, 15]);
+            assert!(!reading.is_finished(), "stalled reads still need their budget");
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            phase.set("the partial response after one batch budget");
+            // Tokio rounds deadlines up to its next millisecond tick.
+            tokio::time::advance(budget + Duration::from_millis(1)).await;
+            reading.await.expect("preview task")
+                .expect("a partial response after one batch budget")
+        } => answer,
+    };
+    assert_eq!(started.elapsed(), budget + Duration::from_millis(1));
+    tokio::time::resume();
+    drop(release_clock);
+    watchdog.await.unwrap();
     let mut previews = answer.previews;
     previews.sort_by(|a, b| a.session_id.cmp(&b.session_id));
     assert_eq!(previews.len(), 5);
@@ -1052,17 +1126,11 @@ async fn a_preview_batch_returns_healthy_hosts_without_timeout_waves() {
         assert_eq!(failure.host, format!("host-{:02}", index + 4));
         assert_eq!(failure.message, "preview read timed out");
     }
-    let mut seen = requested.lock().unwrap().clone();
-    seen.sort_unstable();
-    assert_eq!(
-        seen,
-        (0..16).collect::<Vec<_>>(),
-        "every owning host receives its read within the batch budget"
-    );
-
     fixture.shutdown().await;
-    serving.abort_all();
-    while serving.join_next().await.is_some() {}
+    stop.send(()).unwrap();
+    while let Some(result) = serving.join_next().await {
+        result.expect("peer server");
+    }
 }
 
 /// A row travels as the host that owns it wrote it: the gateway
