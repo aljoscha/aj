@@ -550,6 +550,7 @@ mod tests {
             epoch: EPOCH.to_string(),
             working: true,
             settings: AgentSettings {
+                context_window: 0,
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),

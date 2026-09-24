@@ -925,7 +925,10 @@ impl Client {
             .expect("attach");
         let mut this = Self {
             client: SessionClient::new(session.to_string()),
-            chat: ChatState::new(settings(), 200_000, Arc::new(Vec::new())),
+            chat: ChatState::new(aj_agent::events::AgentSettings {
+                context_window: 200_000,
+                ..settings()
+            }),
             stream,
         };
         // Armed from what the attach reports it served, which is the
@@ -1075,6 +1078,7 @@ fn sub_report(state: &CanonicalState, child: usize) -> Option<String> {
 
 fn settings() -> AgentSettings {
     AgentSettings {
+        context_window: 0,
         provider: "scripted".into(),
         model_id: "scripted".into(),
         thinking: "off".into(),
@@ -6961,7 +6965,10 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         .await
         .expect("attach");
     let mut client = SessionClient::new(session.clone());
-    let mut chat = ChatState::new(settings(), 200_000, Arc::new(Vec::new()));
+    let mut chat = ChatState::new(aj_agent::events::AgentSettings {
+        context_window: 200_000,
+        ..settings()
+    });
     client.expect_attach();
     let opening = bounded("the attach opening state", stream.recv())
         .await
@@ -8416,7 +8423,10 @@ async fn an_attach_block_opens_the_bracket_of_a_live_sub() {
 
     // And the fold turns it into the mark every reader derives from.
     let mut joiner = SessionClient::new(session.to_string());
-    let mut chat = ChatState::new(settings(), 200_000, Arc::new(Vec::new()));
+    let mut chat = ChatState::new(aj_agent::events::AgentSettings {
+        context_window: 200_000,
+        ..settings()
+    });
     joiner.expect_attach();
     for frame in frames {
         let _ = joiner.apply(&mut chat, frame);
@@ -12934,7 +12944,7 @@ async fn branch_restore_harness() -> (Harness, String, String, String) {
         ("historical", "high", "fast", "high"),
         ("active", "low", "standard", "low"),
     ] {
-        log.append_model_change(ThreadFilter::USER, "openai", id)
+        log.append_model_change(ThreadFilter::USER, "openai", id, 0)
             .unwrap();
         log.append_thinking_change(ThreadFilter::USER, thinking)
             .unwrap();
@@ -13411,7 +13421,7 @@ async fn branch_empty_commit_keeps_unavailable_model_fallback() {
     let unavailable = {
         let mut log = handles.log.lock().await;
         log.set_head(historical).unwrap();
-        log.append_model_change(ThreadFilter::USER, "openai", "unavailable")
+        log.append_model_change(ThreadFilter::USER, "openai", "unavailable", 0)
             .unwrap();
         let parent = log.head().cloned();
         let head = log

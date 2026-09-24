@@ -172,10 +172,6 @@ struct AgentFooter {
     /// Next-turn settings (provider, model_id, thinking, speed).
     /// Speed is carried but not rendered.
     settings: AgentSettings,
-    /// Context window of the settings' model, in tokens. Zero
-    /// means unknown and suppresses the footer's occupancy
-    /// indicator.
-    context_window: u64,
     /// Prompt size of the agent's most recent turn, `None` until
     /// the first `UsageUpdate` arrives.
     last_turn_context_tokens: Option<u64>,
@@ -200,13 +196,12 @@ impl AgentFooters {
     /// context window. Main's `last_turn_context_tokens` starts as
     /// `None` so the footer initially renders `?/<window>` until
     /// the first assistant turn lands.
-    pub fn new(main_settings: AgentSettings, main_context_window: u64) -> Self {
+    pub fn new(main_settings: AgentSettings) -> Self {
         let mut agents = HashMap::new();
         agents.insert(
             AgentId::Main,
             AgentFooter {
                 settings: main_settings,
-                context_window: main_context_window,
                 last_turn_context_tokens: None,
                 last_turn_incomplete: false,
             },
@@ -218,7 +213,7 @@ impl AgentFooters {
     /// denominator) for `id`, preserving an existing entry's
     /// `last_turn_context_tokens` — a model swap doesn't erase what
     /// the last prompt cost.
-    pub fn note_settings(&mut self, id: AgentId, settings: AgentSettings, context_window: u64) {
+    pub fn note_settings(&mut self, id: AgentId, settings: AgentSettings) {
         let last_turn_context_tokens = self
             .agents
             .get(&id)
@@ -231,7 +226,6 @@ impl AgentFooters {
             id,
             AgentFooter {
                 settings,
-                context_window,
                 last_turn_context_tokens,
                 last_turn_incomplete,
             },
@@ -255,6 +249,7 @@ impl AgentFooters {
     pub fn record_turn_usage(&mut self, id: AgentId, usage: &TokenUsage) {
         let entry = self.agents.entry(id).or_insert_with(|| AgentFooter {
             settings: AgentSettings {
+                context_window: 0,
                 provider: String::new(),
                 model_id: String::new(),
                 thinking: String::new(),
@@ -262,7 +257,6 @@ impl AgentFooters {
                 speed: String::new(),
                 verbosity: String::new(),
             },
-            context_window: 0,
             last_turn_context_tokens: None,
             last_turn_incomplete: false,
         });
@@ -277,7 +271,7 @@ impl AgentFooters {
         let entry = self.resolve(id);
         ContextUsage {
             tokens: entry.last_turn_context_tokens,
-            context_window: entry.context_window,
+            context_window: entry.settings.context_window,
             incomplete: entry.last_turn_incomplete,
         }
     }
@@ -364,6 +358,7 @@ mod tests {
 
     fn settings(model_id: &str, thinking: &str) -> AgentSettings {
         AgentSettings {
+            context_window: 0,
             provider: "anthropic".to_string(),
             model_id: model_id.to_string(),
             thinking: thinking.to_string(),
@@ -375,7 +370,10 @@ mod tests {
 
     #[test]
     fn new_seeds_main_with_unknown_tokens_and_given_window() {
-        let f = AgentFooters::new(settings("opus", "high"), 200_000);
+        let f = AgentFooters::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..settings("opus", "high")
+        });
         let cu = f.context_usage(AgentId::Main);
         assert_eq!(cu.tokens, None);
         assert_eq!(cu.context_window, 200_000);
@@ -383,8 +381,17 @@ mod tests {
 
     #[test]
     fn record_turn_usage_folds_per_agent() {
-        let mut f = AgentFooters::new(settings("opus", "high"), 200_000);
-        f.note_settings(AgentId::Sub(1), settings("haiku", "off"), 100_000);
+        let mut f = AgentFooters::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..settings("opus", "high")
+        });
+        f.note_settings(
+            AgentId::Sub(1),
+            aj_agent::events::AgentSettings {
+                context_window: 100_000,
+                ..settings("haiku", "off")
+            },
+        );
 
         f.record_turn_usage(AgentId::Sub(1), &token_usage(1_000, 0, 50, 200));
         assert_eq!(f.context_usage(AgentId::Main).tokens, None);
@@ -402,9 +409,18 @@ mod tests {
 
     #[test]
     fn note_settings_preserves_existing_numerator() {
-        let mut f = AgentFooters::new(settings("opus", "high"), 200_000);
+        let mut f = AgentFooters::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..settings("opus", "high")
+        });
         f.record_turn_usage(AgentId::Main, &token_usage(1_000, 0, 0, 0));
-        f.note_settings(AgentId::Main, settings("sonnet", "low"), 100_000);
+        f.note_settings(
+            AgentId::Main,
+            aj_agent::events::AgentSettings {
+                context_window: 100_000,
+                ..settings("sonnet", "low")
+            },
+        );
         let cu = f.context_usage(AgentId::Main);
         assert_eq!(cu.tokens, Some(1_000));
         assert_eq!(cu.context_window, 100_000);
@@ -412,11 +428,20 @@ mod tests {
 
     #[test]
     fn latest_turn_completeness_survives_settings_and_clears_on_new_evidence() {
-        let mut f = AgentFooters::new(settings("opus", "high"), 200_000);
+        let mut f = AgentFooters::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..settings("opus", "high")
+        });
         let mut partial = token_usage(20_000, 0, 0, 0);
         partial.turn_incomplete = true;
         f.record_turn_usage(AgentId::Main, &partial);
-        f.note_settings(AgentId::Main, settings("sonnet", "low"), 100_000);
+        f.note_settings(
+            AgentId::Main,
+            aj_agent::events::AgentSettings {
+                context_window: 100_000,
+                ..settings("sonnet", "low")
+            },
+        );
         assert_eq!(
             context_usage_display(f.context_usage(AgentId::Main))
                 .expect("known window")
@@ -435,7 +460,10 @@ mod tests {
 
     #[test]
     fn context_usage_falls_back_to_main_for_unknown_id() {
-        let mut f = AgentFooters::new(settings("opus", "high"), 200_000);
+        let mut f = AgentFooters::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..settings("opus", "high")
+        });
         f.record_turn_usage(AgentId::Main, &token_usage(1_000, 0, 0, 0));
         let cu = f.context_usage(AgentId::Sub(7));
         assert_eq!(cu.tokens, Some(1_000));
@@ -444,7 +472,10 @@ mod tests {
 
     #[test]
     fn model_line_formats_and_falls_back() {
-        let mut f = AgentFooters::new(settings("opus", "high"), 200_000);
+        let mut f = AgentFooters::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..settings("opus", "high")
+        });
         assert_eq!(f.model_line(AgentId::Main).as_deref(), Some("opus high"));
         // Unknown id falls back to Main.
         assert_eq!(f.model_line(AgentId::Sub(3)).as_deref(), Some("opus high"));
@@ -456,9 +487,16 @@ mod tests {
 
     #[test]
     fn settings_returns_snapshot_without_main_fallback() {
-        let mut f = AgentFooters::new(settings("opus", "high"), 200_000);
-        f.note_settings(AgentId::Sub(2), settings("haiku", "off"), 100_000);
-        assert_eq!(f.settings(AgentId::Sub(2)), Some(&settings("haiku", "off")));
+        let mut f = AgentFooters::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..settings("opus", "high")
+        });
+        let child = AgentSettings {
+            context_window: 100_000,
+            ..settings("haiku", "off")
+        };
+        f.note_settings(AgentId::Sub(2), child.clone());
+        assert_eq!(f.settings(AgentId::Sub(2)), Some(&child));
         assert_eq!(f.settings(AgentId::Sub(9)), None);
     }
 

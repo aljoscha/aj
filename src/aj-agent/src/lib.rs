@@ -3528,6 +3528,7 @@ impl SessionContextWrapper<'_> {
                     tool_name: self.tool_name.clone(),
                     background: matches!(mode, SpawnMode::Background),
                     settings: AgentSettings {
+                        context_window: config.model_info.context_window,
                         provider: config.model_info.provider.clone(),
                         model_id: config.model_info.id.clone(),
                         thinking: aj_models::thinking_config_name(config.thinking.as_ref())
@@ -4571,6 +4572,7 @@ mod event_protocol_tests {
                 parent: *parent,
                 child: *child,
             },
+            AgentEvent::SubAgentSettings { .. } => EventLabel::Other("SubAgentSettings"),
             AgentEvent::StreamRetry {
                 agent_id, attempt, ..
             } => EventLabel::StreamRetry(*agent_id, *attempt),

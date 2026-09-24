@@ -196,12 +196,21 @@ internally tagged with `kind`:
 - `state`: `{kind, session, epoch, working, settings, oracle_settings?, last_seq}`.
   `working` says whether the session's **main agent** has a turn in
   flight, `settings` is the active `AgentSettings` (`provider`,
-  `model_id`, `thinking`, `thinking_display`, `speed`, `verbosity`),
+  `model_id`, `thinking`, `thinking_display`, `speed`, `verbosity`, `context_window`),
   `oracle_settings` carries the independently staged Oracle bundle in the same
   `AgentSettings` shape. Hosts with Oracle support always supply it. Older hosts
   may omit it.
   Both identities are staged for the next main turn, including runtime fallbacks,
   unlike the recorded facts in session-info and `branch_settings`.
+  `context_window` is the capacity in tokens of the host's resolved model bundle.
+  Clients use it for context occupancy and warning thresholds, never a client
+  catalog lookup. Missing or zero capacity suppresses the indicator. Subagent
+  spawn settings carry the same metadata, retained in the session log for replay.
+  Subagent model and thinking changes publish `sub_agent_settings` events with
+  `child`, confirmation `text`, and flattened `AgentSettings`. The snapshot
+  replaces that child's footer settings without clearing its measured usage.
+  Replay and synthesized continuation starts preserve these changes. Main's
+  footer settings come from `state`, not historical settings entries.
   `last_seq` is the durable high-water mark. Sent at the start of every
   attach block, before the backfill, and whenever `working` or
   `settings` or `oracle_settings` changes, never for `last_seq` alone. The host publishes no
@@ -239,7 +248,7 @@ Every frame is in exactly one class:
 - **Durable** event frames correspond to persisted log entries: the
   `MessageEnd` that triggers persistence, the `SubAgentStart` that
   writes the spawn root, the `CompactionEnd` whose checkpoint entry the
-  compaction path appends, and the notices the projection derives from
+  compaction path appends, and the notices or `SubAgentSettings` the projection derives from
   notice-producing state entries. Durable frames carry `seq` (the
   entry's 1-based append position, so `0` reads as nothing durable yet)
   and `entry_id`. They are exactly what backfill can regenerate. Seqs

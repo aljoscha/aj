@@ -214,8 +214,7 @@ struct World {
     /// settings windows mutate one layer, recompute the effective config, and
     /// persist that layer's file (see [`aj_app::settings`]).
     config_layers: Arc<StdMutex<ConfigLayers>>,
-    /// The client model catalog, used to seed [`ChatState`]'s context-window
-    /// resolver. Host-facing selectors fetch their catalog through Control.
+    /// The client model catalog. Host-facing selectors fetch theirs through Control.
     catalog: Arc<Vec<ModelInfo>>,
     /// This process's credential store. Login uses only its OAuth provider
     /// registry: the flow runs here, where the browser is, and the result is
@@ -346,12 +345,7 @@ async fn build_world(
         StartupSession::Resume(id) => id,
     };
     let control = Control::local(host);
-    let chat = Rc::new(RefCell::new(seeded_chat(
-        &config,
-        unknown_settings(),
-        0,
-        &catalog,
-    )));
+    let chat = Rc::new(RefCell::new(seeded_chat(&config, unknown_settings())));
     let mut directory = SessionDirectory::new(session.clone(), Rc::clone(&chat));
     // The stream before the handles: its attachment is what stops the host from
     // releasing the session in between (attachment is the retention signal an
@@ -364,14 +358,14 @@ async fn build_world(
         .local_handles(&session)
         .await?;
     let env = handles.env.clone();
-    let (settings, context_window) = {
+    let settings = {
         let cfg = handles
             .run_config
             .lock()
             .expect("run config mutex poisoned");
-        (cfg.settings(), cfg.main.model_info.context_window)
+        cfg.settings()
     };
-    *chat.borrow_mut() = seeded_chat(&config, settings, context_window, &catalog);
+    *chat.borrow_mut() = seeded_chat(&config, settings);
     let mut world = World {
         control,
         directory,
@@ -540,12 +534,7 @@ async fn build_connect_world(
         created,
     } = connected;
     let working_directory_follows_focus = working_directory.is_none();
-    let chat = Rc::new(RefCell::new(seeded_chat(
-        &config,
-        unknown_settings(),
-        0,
-        &catalog,
-    )));
+    let chat = Rc::new(RefCell::new(seeded_chat(&config, unknown_settings())));
     let mut directory = SessionDirectory::new(session.clone(), Rc::clone(&chat));
     // No run config to seed from: the block's opening `state` frame carries
     // the host's own settings and lands before the first paint.
@@ -633,13 +622,8 @@ fn connect_url(world: &World) -> String {
 /// live run config for a local run. A connection has no such handle, and its
 /// attach block opens with a `state` frame carrying the same identity, which
 /// is folded before the first paint.
-fn seeded_chat(
-    config: &Arc<StdMutex<Config>>,
-    settings: AgentSettings,
-    context_window: u64,
-    catalog: &Arc<Vec<ModelInfo>>,
-) -> ChatState {
-    let mut chat = ChatState::new(settings, context_window, Arc::clone(catalog));
+fn seeded_chat(config: &Arc<StdMutex<Config>>, settings: AgentSettings) -> ChatState {
+    let mut chat = ChatState::new(settings);
     let config = config.lock().expect("config mutex poisoned");
     chat.show_thinking_block = config.show_thinking_block;
     chat.show_token_usage = config.show_token_usage;
@@ -650,12 +634,12 @@ fn seeded_chat(
 }
 
 /// The settings a local session's next main turn runs against.
-fn local_settings_seed(handles: &LocalHandles) -> (AgentSettings, u64) {
+fn local_settings_seed(handles: &LocalHandles) -> AgentSettings {
     let cfg = handles
         .run_config
         .lock()
         .expect("run config mutex poisoned");
-    (cfg.settings(), cfg.main.model_info.context_window)
+    cfg.settings()
 }
 
 /// The settings placeholder a connect-mode chat model starts on, replaced by
@@ -665,6 +649,7 @@ fn local_settings_seed(handles: &LocalHandles) -> (AgentSettings, u64) {
 /// arrived must not be mistakable for the host's own settings.
 fn unknown_settings() -> AgentSettings {
     AgentSettings {
+        context_window: 0,
         provider: String::new(),
         model_id: String::new(),
         thinking: String::new(),
@@ -1560,12 +1545,7 @@ async fn focus_session(
         .map(|view| Rc::clone(&view.chat));
     world.directory.focus(&session, || {
         remembered.unwrap_or_else(|| {
-            Rc::new(RefCell::new(seeded_chat(
-                &world.config,
-                unknown_settings(),
-                0,
-                &world.catalog,
-            )))
+            Rc::new(RefCell::new(seeded_chat(&world.config, unknown_settings())))
         })
     });
     world.chat = world.directory.chat();
@@ -4795,12 +4775,12 @@ fn note_main_footer(world: &World) {
     let Some(handles) = world.local.as_ref() else {
         return;
     };
-    let (settings, context_window) = local_settings_seed(handles);
+    let settings = local_settings_seed(handles);
     world
         .chat
         .borrow_mut()
         .footers_mut()
-        .note_settings(AgentId::Main, settings, context_window);
+        .note_settings(AgentId::Main, settings);
 }
 
 /// Send a settings change to the host, returning the note to fold when it
@@ -4838,7 +4818,6 @@ async fn confirm_thinking(
     persist: PersistAction,
     level: Option<ThinkingConfig>,
 ) -> Option<String> {
-    let name = aj_app::commands::thinking_level_name(&level).to_string();
     let note = match command_settings(owner, target, persist, SettingsAxis::Thinking(level)).await {
         Ok(note) => note,
         Err(refusal) => return Some(refusal),
@@ -4846,9 +4825,8 @@ async fn confirm_thinking(
     if owner.session != world.session() {
         return note;
     }
-    match target {
-        AgentId::Main => note_main_footer(world),
-        AgentId::Sub(_) => patch_sub_footer(world, target, |settings| settings.thinking = name),
+    if target == AgentId::Main {
+        note_main_footer(world);
     }
     note
 }
@@ -4861,61 +4839,17 @@ async fn confirm_model(
     persist: PersistAction,
     info: ModelInfo,
 ) -> Option<String> {
-    let note =
-        match command_settings(owner, target, persist, SettingsAxis::Model(info.clone())).await {
-            Ok(note) => note,
-            Err(refusal) => return Some(refusal),
-        };
+    let note = match command_settings(owner, target, persist, SettingsAxis::Model(info)).await {
+        Ok(note) => note,
+        Err(refusal) => return Some(refusal),
+    };
     if owner.session != world.session() {
         return note;
     }
-    match target {
-        AgentId::Main => note_main_footer(world),
-        AgentId::Sub(_) => {
-            let window = info.context_window;
-            patch_sub_footer_window(world, target, window, |settings| {
-                settings.provider = info.provider.clone();
-                settings.model_id = info.id.clone();
-            });
-        }
+    if target == AgentId::Main {
+        note_main_footer(world);
     }
     note
-}
-
-/// Patch the footer entry the frontend tracks for `target`, keeping its
-/// context window.
-///
-/// A sub-agent's settings live in its own override map, which no run config
-/// and no `state` frame carries, so the axis that moved is written onto the
-/// entry the footer already holds. A target with no entry yet has no footer
-/// row to correct.
-fn patch_sub_footer(world: &World, target: AgentId, patch: impl FnOnce(&mut AgentSettings)) {
-    let window = world
-        .chat
-        .borrow()
-        .footers()
-        .context_usage(target)
-        .context_window;
-    patch_sub_footer_window(world, target, window, patch);
-}
-
-/// [`patch_sub_footer`] with a fresh context window, for a change that moves
-/// the model the gauge measures against.
-fn patch_sub_footer_window(
-    world: &World,
-    target: AgentId,
-    context_window: u64,
-    patch: impl FnOnce(&mut AgentSettings),
-) {
-    let Some(mut settings) = world.chat.borrow().footers().settings(target).cloned() else {
-        return;
-    };
-    patch(&mut settings);
-    world
-        .chat
-        .borrow_mut()
-        .footers_mut()
-        .note_settings(target, settings, context_window);
 }
 
 /// Persist a skills-window toggle into `disabled_skills` (user layer). Only
@@ -9186,6 +9120,7 @@ mod tests {
     fn empty_chat() -> Rc<RefCell<ChatState>> {
         Rc::new(RefCell::new(ChatState::new(
             aj_agent::events::AgentSettings {
+                context_window: 0,
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
@@ -9193,8 +9128,6 @@ mod tests {
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
-            0,
-            Arc::new(Vec::new()),
         )))
     }
 
@@ -9585,6 +9518,7 @@ mod tests {
                 task: "inspect the picker wiring".into(),
                 background: false,
                 settings: aj_agent::events::AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "off".into(),
@@ -10124,18 +10058,15 @@ mod tests {
     /// the entry-shape, report, and `header_only` comparisons these tests
     /// make.
     async fn eager_chat(world: &World, view: AgentId) -> ChatState {
-        let mut eager = ChatState::new(
-            aj_agent::events::AgentSettings {
-                provider: "scripted".into(),
-                model_id: "scripted".into(),
-                thinking: "off".into(),
-                thinking_display: "default".into(),
-                speed: "standard".into(),
-                verbosity: "default".into(),
-            },
-            0,
-            Arc::new(Vec::new()),
-        );
+        let mut eager = ChatState::new(aj_agent::events::AgentSettings {
+            context_window: 0,
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        });
         let mut life = AgentLifecycle::default();
         {
             let log = world.handles().log.lock().await;
@@ -17590,6 +17521,7 @@ mod tests {
         let theme = ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor));
         let chat = Rc::new(RefCell::new(ChatState::new(
             aj_agent::events::AgentSettings {
+                context_window: 200_000,
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
@@ -17597,8 +17529,6 @@ mod tests {
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
-            200_000,
-            Arc::new(Vec::new()),
         )));
         chat.borrow_mut()
             .footers_mut()
@@ -19392,6 +19322,7 @@ mod tests {
     /// chat model through the reducer, so a picker snapshot lists both.
     fn seed_sub_and_task(world: &mut World) {
         let settings = aj_agent::events::AgentSettings {
+            context_window: 0,
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),
@@ -19594,6 +19525,7 @@ mod tests {
                 task: "reason harder".into(),
                 background: false,
                 settings: aj_agent::events::AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "xhigh".into(),
@@ -19671,6 +19603,7 @@ mod tests {
                 task: "reason harder".into(),
                 background: false,
                 settings: aj_agent::events::AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "xhigh".into(),
@@ -19751,6 +19684,7 @@ mod tests {
                 task: "reason harder".into(),
                 background: false,
                 settings: aj_agent::events::AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "standard".into(),
@@ -19814,6 +19748,7 @@ mod tests {
                 task: "reason harder".into(),
                 background: false,
                 settings: aj_agent::events::AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "standard".into(),
@@ -19867,6 +19802,7 @@ mod tests {
                 task: "reason harder".into(),
                 background: false,
                 settings: aj_agent::events::AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "minimal".into(),
@@ -19950,6 +19886,7 @@ mod tests {
                 task: "reason harder".into(),
                 background: false,
                 settings: aj_agent::events::AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "xhigh".into(),
@@ -21204,7 +21141,7 @@ mod tests {
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", layers).await;
         run_prompt(&mut world, "original").await;
-        let original = local_settings_seed(world.handles()).0;
+        let original = local_settings_seed(world.handles());
         let (message, old_head) = {
             let log = world.handles().log.lock().await;
             let message = log.entries_in_order().into_iter().find(|entry| matches!(&entry.entry,
@@ -21232,7 +21169,7 @@ mod tests {
             branch_settings(&shell).unwrap().thinking.as_deref(),
             Some("high")
         );
-        assert_eq!(local_settings_seed(world.handles()).0, original);
+        assert_eq!(local_settings_seed(world.handles()), original);
         assert!(
             std::fs::read_to_string(&project_path)
                 .unwrap()
@@ -21298,7 +21235,7 @@ mod tests {
         );
         assert!(ctx.consume_event);
         assert!(branch_settings(&shell).is_none());
-        assert_eq!(local_settings_seed(world.handles()).0, original);
+        assert_eq!(local_settings_seed(world.handles()), original);
         assert_eq!(
             shell.borrow().view().editor.borrow().text(),
             "keep my prompt"
@@ -24907,7 +24844,7 @@ mod tests {
                 .expect("user index");
             let generation = world.chat.borrow().generation();
             let mut lifecycle = AgentLifecycle::default();
-            let mut replacement = seeded_chat(&world.config, unknown_settings(), 0, &world.catalog);
+            let mut replacement = seeded_chat(&world.config, unknown_settings());
             // Replace the message at the focused index, not just the length of
             // the transcript. A stale branch chord could otherwise be inert.
             for _ in 0..user_index {
@@ -26279,11 +26216,13 @@ mod tests {
         focus_overlay(&mut app, &root);
         let mut changed = world.client().settings().unwrap().clone();
         changed.provider = "another-provider".to_string();
-        world
-            .chat
-            .borrow_mut()
-            .footers_mut()
-            .note_settings(AgentId::Main, changed, 0);
+        world.chat.borrow_mut().footers_mut().note_settings(
+            AgentId::Main,
+            aj_agent::events::AgentSettings {
+                context_window: 0,
+                ..changed
+            },
+        );
         assert_eq!(viewed_model(&world, AgentId::Main).0, "another-provider");
         press(&mut app, &mut writer, b"\x1b[B").await;
         press(&mut app, &mut writer, b"\r").await;
@@ -28222,6 +28161,7 @@ mod tests {
             epoch: epoch.to_string(),
             working: false,
             settings: aj_agent::events::AgentSettings {
+                context_window: 0,
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
@@ -30719,12 +30659,7 @@ mod tests {
             // Keep the overlay alive while changing the same directory focus that
             // subsequent commands read, without closing the overlay.
             world.directory.focus(&focus_next, || {
-                Rc::new(RefCell::new(seeded_chat(
-                    &world.config,
-                    unknown_settings(),
-                    0,
-                    &world.catalog,
-                )))
+                Rc::new(RefCell::new(seeded_chat(&world.config, unknown_settings())))
             });
             assert_ne!(world.session(), opening);
             press(&mut app, &mut writer, b"\r").await;

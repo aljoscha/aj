@@ -1028,9 +1028,12 @@ pub async fn confirm_model(
             let (entry, log_note) = {
                 let mut log = core.log.lock().await;
                 record(match target {
-                    ModelTarget::Main => {
-                        log.append_model_change(ThreadFilter::USER, &info.provider, &info.id)
-                    }
+                    ModelTarget::Main => log.append_model_change(
+                        ThreadFilter::USER,
+                        &info.provider,
+                        &info.id,
+                        info.context_window,
+                    ),
                     ModelTarget::Oracle => log.append_oracle_model_change(&info.provider, &info.id),
                 })
             };
@@ -1142,7 +1145,12 @@ pub async fn confirm_model_for_sub(
             // resumed transcript reflects it.
             let (entry, log_note) = {
                 let mut log = core.log.lock().await;
-                record(log.append_model_change(ThreadFilter::subagent(n), &info.provider, &info.id))
+                record(log.append_model_change(
+                    ThreadFilter::subagent(n),
+                    &info.provider,
+                    &info.id,
+                    info.context_window,
+                ))
             };
             SubConfirm {
                 notice: format!(

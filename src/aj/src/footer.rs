@@ -167,7 +167,6 @@ impl Widget for FooterLine {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
     use aj_agent::tool::TaskNotice;
@@ -179,18 +178,15 @@ mod tests {
     use super::*;
 
     fn chat_with_window(window: u64) -> Rc<RefCell<ChatState>> {
-        Rc::new(RefCell::new(ChatState::new(
-            AgentSettings {
-                provider: "anthropic".into(),
-                model_id: "opus".into(),
-                thinking: "high".into(),
-                thinking_display: "default".into(),
-                speed: "standard".into(),
-                verbosity: "default".into(),
-            },
-            window,
-            Arc::new(Vec::new()),
-        )))
+        Rc::new(RefCell::new(ChatState::new(AgentSettings {
+            context_window: window,
+            provider: "anthropic".into(),
+            model_id: "opus".into(),
+            thinking: "high".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        })))
     }
 
     fn styles() -> Rc<TranscriptStyles> {

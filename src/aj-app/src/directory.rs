@@ -675,7 +675,6 @@ fn delivered_seq(frame: &Frame) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
     use aj_agent::message::AgentMessage;
@@ -693,6 +692,7 @@ mod tests {
 
     fn settings() -> AgentSettings {
         AgentSettings {
+            context_window: 0,
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),
@@ -704,9 +704,10 @@ mod tests {
 
     fn chat() -> Rc<RefCell<ChatState>> {
         Rc::new(RefCell::new(ChatState::new(
-            settings(),
-            200_000,
-            Arc::new(Vec::new()),
+            aj_agent::events::AgentSettings {
+                context_window: 200_000,
+                ..settings()
+            },
         )))
     }
 

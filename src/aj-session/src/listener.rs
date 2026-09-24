@@ -628,6 +628,7 @@ mod tests {
             tool_name: "agent".into(),
             background: false,
             settings: AgentSettings {
+                context_window: 0,
                 provider: "anthropic".to_string(),
                 model_id: "claude-x".to_string(),
                 thinking: "medium".to_string(),
@@ -1191,7 +1192,7 @@ mod tests {
             if seeded {
                 let mut guard = log.lock().await;
                 guard
-                    .append_model_change(ThreadFilter::USER, "provider", "seed")
+                    .append_model_change(ThreadFilter::USER, "provider", "seed", 0)
                     .unwrap();
                 guard
                     .append_account_change("provider", Some("work"))
@@ -1285,7 +1286,7 @@ mod tests {
             // not replace either message's historical parent-path baseline.
             let mut guard = log.lock().await;
             guard
-                .append_model_change(ThreadFilter::USER, "later", "later")
+                .append_model_change(ThreadFilter::USER, "later", "later", 0)
                 .unwrap();
             guard
                 .append_thinking_change(ThreadFilter::USER, "max")

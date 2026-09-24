@@ -405,6 +405,7 @@ fn an_unparseable_whois_answer_is_a_lookup_failure() {
 /// The scripted settings every session in this file starts under.
 fn settings() -> AgentSettings {
     AgentSettings {
+        context_window: 0,
         provider: "scripted".into(),
         model_id: "scripted".into(),
         thinking: "off".into(),
@@ -984,7 +985,10 @@ impl Attached {
             transport,
             source,
             client: SessionClient::new(session.to_string()),
-            chat: ChatState::new(settings(), 200_000, Arc::new(Vec::new())),
+            chat: ChatState::new(aj_agent::events::AgentSettings {
+                context_window: 200_000,
+                ..settings()
+            }),
             delivered: None,
         };
         this.client.expect_attach();

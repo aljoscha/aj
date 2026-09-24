@@ -105,6 +105,7 @@ fn state(last_seq: u64) -> Frame {
         epoch: "epoch-1".into(),
         working: true,
         settings: AgentSettings {
+            context_window: 0,
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),

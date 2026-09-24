@@ -468,7 +468,7 @@ mod tests {
         // anchored back at the fork point.
         log.set_head(fork.clone()).expect("set head to fork");
         let settings = log
-            .append_model_change(ThreadFilter::USER, "prov", "model")
+            .append_model_change(ThreadFilter::USER, "prov", "model", 0)
             .expect("append settings entry")
             .id;
 
@@ -538,6 +538,7 @@ mod tests {
         // message, then one message on the sub thread. Neither advances the
         // user-thread head.
         let settings = AgentSettings {
+            context_window: 0,
             provider: "anthropic".into(),
             model_id: "claude".into(),
             thinking: "off".into(),

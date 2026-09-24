@@ -413,7 +413,13 @@ pub enum ConversationEntryKind {
     SystemPrompt { text: String },
     /// The active model changed (or was first recorded). `provider`
     /// and `model_id` key into the model catalog.
-    ModelChange { provider: String, model_id: String },
+    ModelChange {
+        provider: String,
+        model_id: String,
+        /// Capacity of the resolved bundle at the change. Zero is unknown.
+        #[serde(default)]
+        context_window: u64,
+    },
     /// Oracle model choice on the user branch, keyed into the model catalog.
     OracleModelChange { provider: String, model_id: String },
     /// Oracle thinking effort, with the same values as [`Self::ThinkingChange`].
@@ -714,7 +720,9 @@ impl SessionSettings {
     /// The caller selects the thread and ancestry before applying entries.
     pub(crate) fn apply(&mut self, entry: &ConversationEntryKind) {
         match entry {
-            ConversationEntryKind::ModelChange { provider, model_id } => {
+            ConversationEntryKind::ModelChange {
+                provider, model_id, ..
+            } => {
                 self.model = Some((provider.clone(), model_id.clone()));
             }
             ConversationEntryKind::OracleModelChange { provider, model_id } => {
@@ -2081,12 +2089,14 @@ impl ConversationLog {
         filter: ThreadFilter,
         provider: &str,
         model_id: &str,
+        context_window: u64,
     ) -> Result<EntryRef, ConversationError> {
         self.append_state_entry(
             filter,
             ConversationEntryKind::ModelChange {
                 provider: provider.to_string(),
                 model_id: model_id.to_string(),
+                context_window,
             },
         )
     }
@@ -2598,7 +2608,7 @@ mod tests {
         log.set_system_prompt("system".to_string())
             .expect("system prompt");
         log.append_env_change(env.clone()).expect("creation env");
-        log.append_model_change(ThreadFilter::USER, "scripted", "scripted")
+        log.append_model_change(ThreadFilter::USER, "scripted", "scripted", 0)
             .expect("model seed");
         log.append_thinking_change(ThreadFilter::USER, "off")
             .expect("thinking seed");
@@ -2737,7 +2747,7 @@ mod tests {
             view.add_message(user_text("hi")).expect("add user message");
         }
         let model_id = log
-            .append_model_change(ThreadFilter::USER, "prov", "model")
+            .append_model_change(ThreadFilter::USER, "prov", "model", 0)
             .expect("buffer a model change")
             .id;
         let thinking_id = log
@@ -2786,7 +2796,7 @@ mod tests {
             .expect("first error carries persistence identity");
 
         for later in [
-            log.append_model_change(ThreadFilter::USER, "other", "other")
+            log.append_model_change(ThreadFilter::USER, "other", "other", 0)
                 .expect_err("append after fuse"),
             log.flush_pending().expect_err("flush fast path after fuse"),
             log.set_head(head.clone())
@@ -2948,7 +2958,7 @@ mod tests {
     fn pending_write_failure_releases_only_completed_record_ownership() {
         let (_dir, persistence, session_id, _) = resume_fixture();
         let mut log = ConversationLog::resume(&persistence, &session_id).expect("resume");
-        log.append_model_change(ThreadFilter::USER, "provider", "model")
+        log.append_model_change(ThreadFilter::USER, "provider", "model", 0)
             .expect("first pending record");
         log.append_thinking_change(ThreadFilter::USER, "high")
             .expect("second pending record");
@@ -2991,7 +3001,7 @@ mod tests {
     fn pending_flush_failure_keeps_every_record_owned() {
         let (_dir, persistence, session_id, _) = resume_fixture();
         let mut log = ConversationLog::resume(&persistence, &session_id).expect("resume");
-        log.append_model_change(ThreadFilter::USER, "provider", "model")
+        log.append_model_change(ThreadFilter::USER, "provider", "model", 0)
             .expect("first pending record");
         log.append_thinking_change(ThreadFilter::USER, "high")
             .expect("second pending record");
@@ -3030,7 +3040,7 @@ mod tests {
     fn punctuation_failure_advances_only_fully_written_pending_records() {
         let (_dir, persistence, session_id, _) = resume_fixture();
         let mut log = ConversationLog::resume(&persistence, &session_id).expect("resume");
-        log.append_model_change(ThreadFilter::USER, "provider", "model")
+        log.append_model_change(ThreadFilter::USER, "provider", "model", 0)
             .expect("first pending record");
         log.append_thinking_change(ThreadFilter::USER, "high")
             .expect("second pending record");
@@ -4132,7 +4142,7 @@ mod tests {
         let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             log.set_system_prompt("p".into()).expect("set sp");
-            log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+            log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x", 200_000)
                 .expect("model change");
             log.append_thinking_change(ThreadFilter::USER, "high")
                 .expect("thinking change");
@@ -4151,9 +4161,14 @@ mod tests {
         let entries = resumed.entries_in_order();
         assert_eq!(entries.len(), 6);
         match &entries[1].entry {
-            ConversationEntryKind::ModelChange { provider, model_id } => {
+            ConversationEntryKind::ModelChange {
+                provider,
+                model_id,
+                context_window,
+            } => {
                 assert_eq!(provider, "anthropic");
                 assert_eq!(model_id, "claude-x");
+                assert_eq!(*context_window, 200_000);
             }
             other => panic!("expected ModelChange, got {other:?}"),
         }
@@ -4172,12 +4187,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_model_change_capacity_is_unknown() {
+        let entry: ConversationEntryKind = serde_json::from_value(serde_json::json!({
+            "type": "model_change", "provider": "anthropic", "model_id": "claude-x"
+        }))
+        .expect("legacy model change");
+        assert!(matches!(
+            entry,
+            ConversationEntryKind::ModelChange {
+                context_window: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn settings_only_log_does_not_create_file_until_punctuation() {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
-        log.append_model_change(ThreadFilter::USER, "openai", "gpt-x")
+        log.append_model_change(ThreadFilter::USER, "openai", "gpt-x", 0)
             .expect("model change");
         log.append_thinking_change(ThreadFilter::USER, "off")
             .expect("thinking change");
@@ -5058,7 +5088,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
-        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x", 0)
             .expect("model change");
         {
             let mut view = ConversationView::user(&mut log);
@@ -5082,13 +5112,13 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
-        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x", 0)
             .expect("mc1");
         log.append_thinking_change(ThreadFilter::USER, "low")
             .expect("tc1");
         log.append_speed_change(ThreadFilter::USER, "standard")
             .expect("sc1");
-        log.append_model_change(ThreadFilter::USER, "openai", "gpt-y")
+        log.append_model_change(ThreadFilter::USER, "openai", "gpt-y", 0)
             .expect("mc2");
         log.append_thinking_change(ThreadFilter::USER, "off")
             .expect("tc2");
@@ -5149,7 +5179,7 @@ mod tests {
             view.add_message(assistant_from("anthropic", "claude-a"))
                 .expect("a");
         }
-        log.append_model_change(ThreadFilter::USER, "openai", "gpt-b")
+        log.append_model_change(ThreadFilter::USER, "openai", "gpt-b", 0)
             .expect("mc");
 
         let head = log.latest_leaf(ThreadFilter::USER).expect("head");
@@ -5166,7 +5196,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
-        log.append_model_change(ThreadFilter::USER, "openai", "gpt-b")
+        log.append_model_change(ThreadFilter::USER, "openai", "gpt-b", 0)
             .expect("mc");
         {
             let mut view = ConversationView::user(&mut log);
@@ -5199,7 +5229,7 @@ mod tests {
                 .expect("sub prompt")
                 .id
         };
-        log.append_model_change(ThreadFilter::subagent(1), "openai", "gpt-sub")
+        log.append_model_change(ThreadFilter::subagent(1), "openai", "gpt-sub", 0)
             .expect("sub mc");
         log.append_thinking_change(ThreadFilter::subagent(1), "low")
             .expect("sub tc");
@@ -5233,7 +5263,7 @@ mod tests {
         let sp_id = log.set_system_prompt("p".into()).expect("set sp").id;
 
         let mc_id = log
-            .append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+            .append_model_change(ThreadFilter::USER, "anthropic", "claude-x", 0)
             .expect("model change")
             .id;
         let mc_entry = log.core.entries.get(&mc_id).expect("entry exists");
@@ -5254,6 +5284,7 @@ mod tests {
 
     fn spawn_settings() -> aj_agent::events::AgentSettings {
         aj_agent::events::AgentSettings {
+            context_window: 0,
             provider: "anthropic".to_string(),
             model_id: "claude-x".to_string(),
             thinking: "high".to_string(),
@@ -5730,7 +5761,7 @@ mod tests {
         let mut refs = vec![
             log.set_system_prompt("p".to_string())
                 .expect("system prompt"),
-            log.append_model_change(ThreadFilter::USER, "prov", "m")
+            log.append_model_change(ThreadFilter::USER, "prov", "m", 0)
                 .expect("model change"),
             log.append_thinking_change(ThreadFilter::USER, "high")
                 .expect("thinking change"),

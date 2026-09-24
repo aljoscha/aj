@@ -421,7 +421,6 @@ impl Widget for SubAgentBox {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings, SubAgentConclusion};
     use aj_agent::message::AgentMessage;
@@ -446,18 +445,15 @@ mod tests {
     }
 
     fn chat() -> ChatState {
-        ChatState::new(
-            AgentSettings {
-                provider: "scripted".into(),
-                model_id: "scripted".into(),
-                thinking: "off".into(),
-                thinking_display: "default".into(),
-                speed: "standard".into(),
-                verbosity: "default".into(),
-            },
-            0,
-            Arc::new(Vec::new()),
-        )
+        ChatState::new(AgentSettings {
+            context_window: 0,
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        })
     }
 
     fn assistant(text: &str) -> AssistantMessage {
@@ -497,6 +493,7 @@ mod tests {
                 tool_name: tool_name.into(),
                 background: false,
                 settings: AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "off".into(),
@@ -1056,6 +1053,7 @@ mod tests {
                 tool_name: "agent".into(),
                 background: false,
                 settings: AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "off".into(),

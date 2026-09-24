@@ -9,7 +9,6 @@
 //! and the fold under test is the real [`SessionClient`].
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_app::chat::{ChatState, EntryKind, SubAgentStatus, ToolStatus, reduce};
@@ -48,7 +47,10 @@ impl Client {
     fn attached(seeded: &LogSnapshot) -> Self {
         let mut this = Self {
             client: SessionClient::new(SESSION.to_string()),
-            chat: ChatState::new(scripted_settings(), 200_000, Arc::new(Vec::new())),
+            chat: ChatState::new(aj_agent::events::AgentSettings {
+                context_window: 200_000,
+                ..scripted_settings()
+            }),
         };
         this.reattach(seeded, EPOCH);
         this
@@ -179,6 +181,7 @@ fn is_lossy(event: &AgentEvent) -> bool {
 
 fn scripted_settings() -> AgentSettings {
     AgentSettings {
+        context_window: 0,
         provider: "scripted".into(),
         model_id: "scripted".into(),
         thinking: "off".into(),
@@ -563,7 +566,10 @@ async fn reapplying_the_whole_projected_suffix_changes_nothing() {
             log,
             ..
         } = &run;
-        let mut chat = ChatState::new(scripted_settings(), 200_000, Arc::new(Vec::new()));
+        let mut chat = ChatState::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..scripted_settings()
+        });
         let mut life = AgentLifecycle::default();
         // What a client attached at creation folded: the seeded log's block,
         // then the turn live.

@@ -111,6 +111,7 @@ impl ModelConfig {
     /// The staged identity for the next turn, not the running agent's lagging copy.
     pub fn settings(&self) -> AgentSettings {
         AgentSettings {
+            context_window: self.model_info.context_window,
             provider: self.model_key.0.clone(),
             model_id: self.model_key.1.clone(),
             thinking: thinking_config_name(self.thinking.as_ref()).to_string(),
@@ -858,6 +859,7 @@ pub fn freeze_and_seed(
                 ThreadFilter::USER,
                 &run.main.model_key.0,
                 &run.main.model_key.1,
+                run.main.model_info.context_window,
             )?;
             log.append_thinking_change(
                 ThreadFilter::USER,

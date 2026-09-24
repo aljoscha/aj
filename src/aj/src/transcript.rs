@@ -3677,7 +3677,6 @@ impl Widget for TranscriptView {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use aj_agent::events::AgentEvent;
     use aj_agent::message::AgentMessage;
@@ -4446,18 +4445,15 @@ mod tests {
     fn chat_with_notices(n: usize) -> Rc<RefCell<ChatState>> {
         use aj_agent::events::AgentSettings;
 
-        let mut chat = ChatState::new(
-            AgentSettings {
-                provider: "scripted".into(),
-                model_id: "scripted".into(),
-                thinking: "off".into(),
-                thinking_display: "default".into(),
-                speed: "standard".into(),
-                verbosity: "default".into(),
-            },
-            0,
-            Arc::new(Vec::new()),
-        );
+        let mut chat = ChatState::new(AgentSettings {
+            context_window: 0,
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        });
         let mut lifecycle = aj_app::session::AgentLifecycle::default();
         for i in 0..n {
             let _ = aj_app::chat::reduce(
@@ -6111,6 +6107,7 @@ mod tests {
 
     fn cache_settings() -> aj_agent::events::AgentSettings {
         aj_agent::events::AgentSettings {
+            context_window: 0,
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),
@@ -6122,9 +6119,10 @@ mod tests {
 
     fn empty_chat() -> Rc<RefCell<ChatState>> {
         Rc::new(RefCell::new(ChatState::new(
-            cache_settings(),
-            0,
-            Arc::new(Vec::new()),
+            aj_agent::events::AgentSettings {
+                context_window: 0,
+                ..cache_settings()
+            },
         )))
     }
 
@@ -7495,7 +7493,10 @@ mod tests {
 
         // Reuse EntryId(0), content length, and display settings.
         {
-            let mut fresh = ChatState::new(cache_settings(), 0, Arc::new(Vec::new()));
+            let mut fresh = ChatState::new(aj_agent::events::AgentSettings {
+                context_window: 0,
+                ..cache_settings()
+            });
             let mut fresh_life = AgentLifecycle::default();
             let _ = reduce(&mut fresh, &mut fresh_life, user_end("world"), None);
             *chat.borrow_mut() = fresh;

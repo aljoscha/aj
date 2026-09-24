@@ -713,7 +713,6 @@ pub(crate) fn build_tool_cell(
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::Arc;
     use std::time::Instant;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
@@ -1750,18 +1749,15 @@ mod tests {
 
     #[test]
     fn tool_events_reduce_and_render_through_the_transcript_view() {
-        let mut chat = ChatState::new(
-            AgentSettings {
-                provider: "scripted".into(),
-                model_id: "scripted".into(),
-                thinking: "off".into(),
-                thinking_display: "default".into(),
-                speed: "standard".into(),
-                verbosity: "default".into(),
-            },
-            0,
-            Arc::new(Vec::new()),
-        );
+        let mut chat = ChatState::new(AgentSettings {
+            context_window: 0,
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        });
         let mut lifecycle = aj_app::session::AgentLifecycle::default();
         let _ = reduce(
             &mut chat,

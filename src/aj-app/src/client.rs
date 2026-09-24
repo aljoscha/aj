@@ -358,9 +358,8 @@ impl SessionClient {
                 }
                 // The host is authoritative for all of these, at every
                 // emission: neither is derivable from projected events.
-                let context_window = chat.resolve_window(&settings);
                 chat.footers_mut()
-                    .note_settings(AgentId::Main, settings.clone(), context_window);
+                    .note_settings(AgentId::Main, settings.clone());
                 self.seed_lifecycle(working);
                 self.settings = Some(settings);
                 self.oracle_settings = oracle_settings;
@@ -827,8 +826,6 @@ impl SessionClient {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-
     use aj_agent::events::CompactionReason;
     use aj_agent::message::AgentMessage;
     use aj_agent::tool::{TaskKind, TaskStatus, ToolDetails};
@@ -847,6 +844,7 @@ mod tests {
 
     fn settings() -> AgentSettings {
         AgentSettings {
+            context_window: 0,
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),
@@ -857,7 +855,10 @@ mod tests {
     }
 
     fn chat() -> ChatState {
-        ChatState::new(settings(), 200_000, Arc::new(Vec::new()))
+        ChatState::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..settings()
+        })
     }
 
     /// A client that has attached an empty session: the opening `state`,
@@ -903,6 +904,55 @@ mod tests {
             epoch: epoch.to_string(),
             last_seq,
         }
+    }
+
+    #[test]
+    fn context_capacity_belongs_to_the_host_snapshot() {
+        let mut client = SessionClient::new(SESSION.into());
+        let mut chat = chat();
+        let host_settings = serde_json::from_value(serde_json::json!({
+            "provider": "scripted", "model_id": "scripted",
+            "thinking": "off", "speed": "standard", "verbosity": "default",
+            "context_window": 100_000
+        }))
+        .unwrap();
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state_with(EPOCH, false, host_settings));
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+        assert_eq!(
+            chat.footers().context_usage(AgentId::Main).context_window,
+            100_000
+        );
+        chat.footers_mut().set_context_tokens(AgentId::Main, 95_000);
+        let display = |chat: &ChatState| {
+            crate::footer::context_usage_display(chat.footers().context_usage(AgentId::Main))
+        };
+        let shown = display(&chat).unwrap();
+        assert_eq!(shown.percent.as_deref(), Some("(95.0%)"));
+        assert_eq!(shown.severity, crate::footer::UsageSeverity::Critical);
+
+        let changed = AgentSettings {
+            model_id: "custom-bundle".into(),
+            context_window: 400_000,
+            ..settings()
+        };
+        let _ = client.apply(&mut chat, state_with(EPOCH, false, changed));
+        let shown = display(&chat).unwrap();
+        assert_eq!(shown.percent.as_deref(), Some("(23.8%)"));
+        assert_eq!(shown.severity, crate::footer::UsageSeverity::Normal);
+
+        let legacy = serde_json::from_value(serde_json::json!({
+            "provider": "scripted", "model_id": "custom-bundle",
+            "thinking": "off", "speed": "standard", "verbosity": "default"
+        }))
+        .unwrap();
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state_with("new-epoch", false, legacy));
+        let _ = client.apply(&mut chat, caught_up("new-epoch", 0));
+        assert!(
+            display(&chat).is_none(),
+            "missing metadata must clear cached capacity"
+        );
     }
 
     #[test]

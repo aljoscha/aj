@@ -772,7 +772,6 @@ fn round_u16(v: f64) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
@@ -783,18 +782,15 @@ mod tests {
     use super::*;
 
     fn chat() -> Rc<RefCell<ChatState>> {
-        Rc::new(RefCell::new(ChatState::new(
-            AgentSettings {
-                provider: "scripted".into(),
-                model_id: "scripted".into(),
-                thinking: "off".into(),
-                thinking_display: "default".into(),
-                speed: "standard".into(),
-                verbosity: "default".into(),
-            },
-            0,
-            Arc::new(Vec::new()),
-        )))
+        Rc::new(RefCell::new(ChatState::new(AgentSettings {
+            context_window: 0,
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        })))
     }
 
     fn styles() -> Rc<TranscriptStyles> {

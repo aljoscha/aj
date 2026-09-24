@@ -700,7 +700,7 @@ async fn legacy_logs_keep_unknown_oracle_history_and_use_independent_defaults() 
     let mut log = ConversationLog::create(&store.persistence()).unwrap();
     log.set_system_prompt("Legacy session instructions".into())
         .unwrap();
-    log.append_model_change(ThreadFilter::USER, "fixture", "main-b")
+    log.append_model_change(ThreadFilter::USER, "fixture", "main-b", 0)
         .unwrap();
     log.append_thinking_change(ThreadFilter::USER, "low")
         .unwrap();
@@ -826,7 +826,7 @@ async fn unavailable_recorded_oracle_keeps_fallback_and_restores_request_speed()
     let mut log = ConversationLog::create(&store.persistence()).unwrap();
     log.set_system_prompt("Shared engineering instructions".into())
         .unwrap();
-    log.append_model_change(ThreadFilter::USER, "fixture", "main-a")
+    log.append_model_change(ThreadFilter::USER, "fixture", "main-a", 0)
         .unwrap();
     log.append_thinking_change(ThreadFilter::USER, "low")
         .unwrap();
@@ -866,7 +866,7 @@ async fn branch_model_restore_preserves_unrecorded_verbosity() {
     let mut log = ConversationLog::create(&store.persistence()).unwrap();
     log.set_system_prompt("Shared engineering instructions".into())
         .unwrap();
-    log.append_model_change(ThreadFilter::USER, "fixture", "main-b")
+    log.append_model_change(ThreadFilter::USER, "fixture", "main-b", 0)
         .unwrap();
     log.append_oracle_model_change("fixture", "oracle-b")
         .unwrap();

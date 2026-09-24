@@ -53,6 +53,10 @@ where
 /// `thinking_display`, which is live-only session state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSettings {
+    /// Context capacity from the owning host's resolved model bundle.
+    /// Zero means unavailable. Consumers must not substitute their own catalog.
+    #[serde(default)]
+    pub context_window: u64,
     /// Provider of the model bundle (e.g. "anthropic").
     pub provider: String,
     /// Catalog id of the model.
@@ -307,6 +311,14 @@ pub enum AgentEvent {
         #[serde(flatten)]
         settings: AgentSettings,
     },
+    /// Host-resolved sub-agent settings after a recorded model or thinking change.
+    /// Carries the confirmation and snapshot as one replayable event.
+    SubAgentSettings {
+        child: AgentId,
+        text: String,
+        #[serde(flatten)]
+        settings: AgentSettings,
+    },
     /// A sub-agent has finished and returned its report.
     SubAgentEnd {
         parent: AgentId,
@@ -474,6 +486,7 @@ impl AgentEvent {
             | Self::TaskEnd { agent_id, .. }
             | Self::QueueUpdate { agent_id, .. } => *agent_id,
             Self::SubAgentStart { parent, .. } | Self::SubAgentEnd { parent, .. } => *parent,
+            Self::SubAgentSettings { child, .. } => *child,
         }
     }
 }
@@ -499,6 +512,7 @@ mod tests {
             tool_name: "agent".into(),
             background: false,
             settings: AgentSettings {
+                context_window: 0,
                 provider: "scripted".into(),
                 model_id: "scripted-model".into(),
                 thinking: "off".into(),
@@ -589,6 +603,7 @@ mod tests {
             tool_name: "oracle".into(),
             background: true,
             settings: AgentSettings {
+                context_window: 0,
                 provider: "anthropic".into(),
                 model_id: "claude-x".into(),
                 thinking: "medium".into(),

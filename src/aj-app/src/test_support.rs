@@ -753,6 +753,7 @@ mod tests {
 
     fn agent_settings() -> AgentSettings {
         AgentSettings {
+            context_window: 0,
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),
@@ -769,7 +770,10 @@ mod tests {
     /// task's launch cell both record where they sit, so a mask that drops
     /// a row without renumbering leaves them naming the wrong one.
     fn folded(notice: Option<&str>) -> CanonicalState {
-        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut chat = ChatState::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..agent_settings()
+        });
         let mut lifecycle = AgentLifecycle::default();
         let mut apply = |chat: &mut ChatState, event| {
             let _ = reduce(chat, &mut lifecycle, event, None);
@@ -823,7 +827,10 @@ mod tests {
     /// observer blindness has an absolute detector.
     #[test]
     fn the_canonical_form_keeps_known_reducer_values_for_the_swept_axes() {
-        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut chat = ChatState::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..agent_settings()
+        });
         let mut lifecycle = AgentLifecycle::default();
         let mut assistant =
             AgentMessage::wire(Message::Assistant(finalized_text_message("answer")));
@@ -941,7 +948,10 @@ mod tests {
     fn the_canonical_form_keeps_exact_client_queue_payloads() {
         let session = "known-session";
         let epoch = "known-epoch";
-        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut chat = ChatState::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..agent_settings()
+        });
         let mut client = SessionClient::new(session.to_string());
         client.expect_attach();
         let _ = client.apply(
@@ -1067,7 +1077,10 @@ mod tests {
     /// backfill, so a re-attached client has it and both tiers compare it.
     #[test]
     fn the_convergent_tier_keeps_a_notice_a_log_entry_backs() {
-        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut chat = ChatState::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..agent_settings()
+        });
         let mut lifecycle = AgentLifecycle::default();
         let _ = reduce(
             &mut chat,
@@ -1084,7 +1097,10 @@ mod tests {
         );
         let projected = CanonicalState::of_reduced(&chat, &lifecycle);
         let empty = CanonicalState::of_reduced(
-            &ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new())),
+            &ChatState::new(aj_agent::events::AgentSettings {
+                context_window: 200_000,
+                ..agent_settings()
+            }),
             &AgentLifecycle::default(),
         );
 
@@ -1098,7 +1114,10 @@ mod tests {
     /// In-flight text is not recoverable until a finalized message backs it.
     #[test]
     fn the_convergent_tier_masks_the_in_flight_streaming_row() {
-        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut chat = ChatState::new(aj_agent::events::AgentSettings {
+            context_window: 200_000,
+            ..agent_settings()
+        });
         let mut lifecycle = AgentLifecycle::default();
         let mut partial = finalized_text_message("half a th");
         partial.response_id = None;
@@ -1120,7 +1139,10 @@ mod tests {
         );
         let streaming = CanonicalState::of_reduced(&chat, &lifecycle);
         let quiet = CanonicalState::of_reduced(
-            &ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new())),
+            &ChatState::new(aj_agent::events::AgentSettings {
+                context_window: 200_000,
+                ..agent_settings()
+            }),
             &AgentLifecycle::default(),
         );
 

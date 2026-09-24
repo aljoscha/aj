@@ -2402,6 +2402,7 @@ fn is_known_event_type(event_type: &str) -> bool {
             | "tool_execution_update"
             | "tool_execution_end"
             | "sub_agent_start"
+            | "sub_agent_settings"
             | "sub_agent_end"
             | "task_start"
             | "task_output"

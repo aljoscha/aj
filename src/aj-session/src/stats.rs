@@ -457,6 +457,7 @@ mod tests {
 
     fn spawn_settings() -> AgentSettings {
         AgentSettings {
+            context_window: 0,
             provider: "zeta".to_string(),
             model_id: "tie-z".to_string(),
             thinking: "off".to_string(),

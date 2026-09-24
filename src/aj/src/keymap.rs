@@ -308,6 +308,7 @@ mod tests {
             login_active: false,
             chat: Rc::new(RefCell::new(ChatState::new(
                 aj_agent::events::AgentSettings {
+                    context_window: 0,
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "off".into(),
@@ -315,8 +316,6 @@ mod tests {
                     speed: "standard".into(),
                     verbosity: "default".into(),
                 },
-                0,
-                std::sync::Arc::new(Vec::new()),
             ))),
             active_view: AgentId::Main,
         }

@@ -1080,10 +1080,10 @@ impl Driver {
         Ok(CommandOutcome::Accepted)
     }
 
-    /// Publish a settings entry's notice: the projected one tagged with the
+    /// Publish a settings entry's event: the projected one tagged with the
     /// entry, or `confirmation` untagged when the entry projects none.
     ///
-    /// A settings entry that lands before its thread's first message
+    /// A main-thread settings seed before the first message
     /// projects no notice, so a tagged frame would name something no
     /// backfill can regenerate. Publishing the confirmation untagged is
     /// what keeps the pre-first-prompt settings gesture from going silent:

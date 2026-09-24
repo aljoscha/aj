@@ -443,6 +443,27 @@ pub fn reduce(
         }
 
         // ---- Sub-agent boxes ------------------------------------------------
+        AgentEvent::SubAgentSettings {
+            child,
+            text,
+            settings,
+        } => {
+            if matches!(child, AgentId::Sub(_)) {
+                state.footers.note_settings(child, settings);
+                record_notice(
+                    state,
+                    child,
+                    NoticeLevel::Info,
+                    text,
+                    entry.map(String::as_str),
+                );
+                Redraw(true)
+            } else {
+                // Main's staged settings come only from the host state frame,
+                // never from historical settings entries in a backfill.
+                Redraw(false)
+            }
+        }
         AgentEvent::SubAgentStart {
             parent,
             child,
@@ -493,8 +514,7 @@ pub fn reduce(
                 // Seed the child's footer entry with its spawn-time
                 // settings so its view shows a model line and (when
                 // resolvable) a context window.
-                let window = state.resolve_window(&settings);
-                state.footers.note_settings(child, settings, window);
+                state.footers.note_settings(child, settings);
             }
             Redraw(true)
         }
@@ -1197,7 +1217,6 @@ mod tests {
     use aj_agent::message::{AgentMessage, TaskNotification, TaskNotificationKind, TaskOutcome};
     use aj_agent::tool::{TaskKind, ToolDetails};
     use aj_agent::types::TokenUsage;
-    use aj_models::registry::ModelInfo;
     use aj_models::types::{
         AssistantError, TextContent, ThinkingContent, ToolCall, Usage, UserMessage,
     };
@@ -1213,6 +1232,7 @@ mod tests {
 
     fn main_settings() -> AgentSettings {
         AgentSettings {
+            context_window: 0,
             provider: "anthropic".into(),
             model_id: "claude-main".into(),
             thinking: "off".into(),
@@ -1222,14 +1242,11 @@ mod tests {
         }
     }
 
-    fn state_with_catalog(catalog: Vec<ModelInfo>) -> ChatState {
-        // 200k matches the canonical Sonnet window so incidental
-        // window expectations don't need a synthetic value.
-        ChatState::new(main_settings(), 200_000, Arc::new(catalog))
-    }
-
     fn state() -> ChatState {
-        state_with_catalog(Vec::new())
+        ChatState::new(AgentSettings {
+            context_window: 200_000,
+            ..main_settings()
+        })
     }
 
     #[test]
@@ -1404,6 +1421,7 @@ mod tests {
 
     fn sub_settings(provider: &str, model_id: &str) -> AgentSettings {
         AgentSettings {
+            context_window: 0,
             provider: provider.into(),
             model_id: model_id.into(),
             thinking: "off".into(),
@@ -3384,7 +3402,10 @@ mod tests {
     #[test]
     fn usage_update_completeness_reaches_the_context_footer() {
         let display = |incomplete| {
-            let mut state = ChatState::new(main_settings(), 20_000_000, Arc::new(Vec::new()));
+            let mut state = ChatState::new(aj_agent::events::AgentSettings {
+                context_window: 20_000_000,
+                ..main_settings()
+            });
             let mut lifecycle = AgentLifecycle::default();
             let mut usage = token_usage([9_999, 0, 0, 0]);
             usage.turn_incomplete = incomplete;
@@ -3410,44 +3431,20 @@ mod tests {
     }
 
     #[test]
-    fn sub_agent_start_resolves_window_via_catalog_main_identity_and_miss() {
-        let catalog_model = ModelInfo {
-            id: "gpt-sub".into(),
-            name: "gpt-sub".into(),
-            family: None,
-            api: "anthropic-messages".into(),
-            provider: "openai".into(),
-            base_url: "https://example.invalid".into(),
-            reasoning: false,
-            reasoning_options: Vec::new(),
-            supports_verbosity: false,
-            input: vec![aj_models::registry::InputModality::Text],
-            cost: aj_models::registry::ModelCost::default(),
-            context_window: 400_000,
-            max_tokens: 100,
-        };
-        let mut s = state_with_catalog(vec![catalog_model]);
+    fn sub_agent_capacity_comes_from_its_snapshot_even_for_the_main_model() {
+        let mut s = state();
         let mut life = AgentLifecycle::default();
-
-        // Catalog hit.
-        apply(&mut s, &mut life, sub_agent_start(1, "openai", "gpt-sub"));
-        assert_eq!(
-            s.footers().context_usage(AgentId::Sub(1)).context_window,
-            400_000,
-        );
-        // Catalog miss with a Main-identity match: Main's window.
-        apply(
-            &mut s,
-            &mut life,
-            sub_agent_start(2, "anthropic", "claude-main"),
-        );
-        assert_eq!(
-            s.footers().context_usage(AgentId::Sub(2)).context_window,
-            200_000,
-        );
-        // Full miss: 0 suppresses the indicator.
-        apply(&mut s, &mut life, sub_agent_start(3, "mystery", "unknown"));
-        assert_eq!(s.footers().context_usage(AgentId::Sub(3)).context_window, 0,);
+        for (n, capacity) in [(1, 400_000), (2, 0)] {
+            let mut event = sub_agent_start(n, "anthropic", "claude-main");
+            if let AgentEvent::SubAgentStart { settings, .. } = &mut event {
+                settings.context_window = capacity;
+            }
+            apply(&mut s, &mut life, event);
+            assert_eq!(
+                s.footers().context_usage(AgentId::Sub(n)).context_window,
+                capacity
+            );
+        }
     }
 
     #[test]
@@ -3501,18 +3498,15 @@ mod tests {
             .await
             .expect("scripted turn");
 
-        let mut s = ChatState::new(
-            AgentSettings {
-                provider: "scripted".into(),
-                model_id: "scripted".into(),
-                thinking: "off".into(),
-                thinking_display: "default".into(),
-                speed: "standard".into(),
-                verbosity: "default".into(),
-            },
-            200_000,
-            Arc::new(Vec::new()),
-        );
+        let mut s = ChatState::new(AgentSettings {
+            context_window: 200_000,
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        });
         let mut life = AgentLifecycle::default();
         for event in recorded.lock().unwrap().drain(..) {
             let _ = reduce(&mut s, &mut life, event, None);
@@ -3762,24 +3756,12 @@ mod tests {
         // gets its `SubAgentStart` re-synthesized from the run's
         // remembered task, run mode and settings. The box and the
         // footer it seeded have to survive that.
-        let catalog_model = ModelInfo {
-            id: "gpt-sub".into(),
-            name: "gpt-sub".into(),
-            family: None,
-            api: "anthropic-messages".into(),
-            provider: "openai".into(),
-            base_url: "https://example.invalid".into(),
-            reasoning: false,
-            reasoning_options: Vec::new(),
-            supports_verbosity: false,
-            input: vec![aj_models::registry::InputModality::Text],
-            cost: aj_models::registry::ModelCost::default(),
-            context_window: 400_000,
-            max_tokens: 100,
-        };
-        let mut s = state_with_catalog(vec![catalog_model]);
+        let mut s = state();
         let mut life = AgentLifecycle::default();
-        let start = sub_agent_start(1, "openai", "gpt-sub");
+        let mut start = sub_agent_start(1, "openai", "gpt-sub");
+        if let AgentEvent::SubAgentStart { settings, .. } = &mut start {
+            settings.context_window = 400_000;
+        }
         apply(&mut s, &mut life, start.clone());
         apply(
             &mut s,
@@ -5073,7 +5055,7 @@ mod tests {
         for mutate in mutations {
             let mut settings = main_settings();
             mutate(&mut settings);
-            let variant = ChatState::new(settings.clone(), 200_000, Arc::new(Vec::new()));
+            let variant = ChatState::new(settings.clone());
             assert_ne!(
                 canon(&variant, &life),
                 reference,

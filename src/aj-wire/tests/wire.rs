@@ -27,6 +27,7 @@ const EVENT_TYPES: &[&str] = &[
     "tool_execution_update",
     "tool_execution_end",
     "sub_agent_start",
+    "sub_agent_settings",
     "sub_agent_end",
     "task_start",
     "task_output",
@@ -754,6 +755,7 @@ fn create_environment_is_optional_and_empty_is_not_absent() {
 #[test]
 fn state_and_task_detail_models_pin_the_new_phase_two_fields() {
     let settings = AgentSettings {
+        context_window: 0,
         provider: "openai".into(),
         model_id: "gpt-remote".into(),
         thinking: "high".into(),
@@ -792,6 +794,7 @@ fn state_and_task_detail_models_pin_the_new_phase_two_fields() {
 #[test]
 fn state_round_trips_independent_oracle_settings() {
     let main = AgentSettings {
+        context_window: 0,
         provider: "main-provider".into(),
         model_id: "main-model".into(),
         thinking: "off".into(),
@@ -800,6 +803,7 @@ fn state_round_trips_independent_oracle_settings() {
         verbosity: "default".into(),
     };
     let oracle = AgentSettings {
+        context_window: 0,
         provider: "oracle-provider".into(),
         model_id: "oracle-model".into(),
         thinking: "high".into(),
@@ -2825,6 +2829,7 @@ fn agent_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolExecutionUpdate { .. } => "tool_execution_update",
         AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end",
         AgentEvent::SubAgentStart { .. } => "sub_agent_start",
+        AgentEvent::SubAgentSettings { .. } => "sub_agent_settings",
         AgentEvent::SubAgentEnd { .. } => "sub_agent_end",
         AgentEvent::TaskStart { .. } => "task_start",
         AgentEvent::TaskOutput { .. } => "task_output",
@@ -2891,6 +2896,7 @@ fn local_frames() -> Vec<Frame> {
             epoch: "epoch-1".to_string(),
             working: true,
             settings: AgentSettings {
+                context_window: 0,
                 provider: "scripted".to_string(),
                 model_id: "scripted-model".to_string(),
                 thinking: "off".to_string(),

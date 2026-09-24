@@ -228,11 +228,11 @@ pub fn project_suffix<'a>(
 }
 
 impl LogSnapshot {
-    /// The [`AgentEvent::Notice`] the projection derives from a
-    /// notice-producing state entry, `None` when it derives none (or when
+    /// The notice or typed settings event the projection derives from a
+    /// state entry, `None` when it derives none (or when
     /// `entry` is not such an entry on the active path).
     ///
-    /// A state entry before its thread's first message projects
+    /// Main-thread seeds before the first message project
     /// nothing, so a host that synthesized a notice unconditionally would
     /// emit a live frame that no backfill regenerates. Asking here is
     /// what keeps the two in agreement.
@@ -244,8 +244,12 @@ impl LogSnapshot {
         // and those are never tagged with a state entry.
         project_suffix(self, None, &BTreeSet::new()).find_map(|tagged| {
             let tagged_entry = tagged.entry?;
-            (tagged_entry.id == *entry && matches!(tagged.event, AgentEvent::Notice { .. }))
-                .then_some(tagged.event)
+            (tagged_entry.id == *entry
+                && matches!(
+                    tagged.event,
+                    AgentEvent::Notice { .. } | AgentEvent::SubAgentSettings { .. }
+                ))
+            .then_some(tagged.event)
         })
     }
 }
@@ -268,9 +272,10 @@ pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
 /// [`AgentEvent::SubAgentEnd`] events, with identical reports. The only
 /// difference: for an entry whose agent is a sub-agent it does not push
 /// the projected `MessageStart`/`End`, `ToolExecution*`, `UsageUpdate`,
-/// or `Notice` events. Main-agent entries project exactly as in full
-/// replay. A caller reconstructs a sub-agent's withheld content on
-/// demand with [`project_thread`].
+/// or `Notice` events. Typed `SubAgentSettings` updates remain visible so
+/// the box metadata converges without loading its transcript. Main-agent
+/// entries project exactly as in full replay. A caller reconstructs withheld
+/// content on demand with [`project_thread`].
 ///
 /// This makes resuming a large session cheap. The projection clones
 /// every sub-agent message and tool payload into an event, and
@@ -287,9 +292,9 @@ pub fn replay_deferring_subs(log: &ConversationLog) -> impl Iterator<Item = Agen
 /// `conv` must be the linearization of a single sub-agent thread
 /// (`log.linearize(head, ThreadFilter::subagent(n))`) and `agent` the
 /// matching [`AgentId::Sub`]. It emits that sub-agent's
-/// `MessageStart`/`End`, `ToolExecution*`, `UsageUpdate`, and `Notice`
-/// events, equal in order and payload to what full [`replay`] emits for
-/// the same thread. It does not emit [`AgentEvent::SubAgentStart`] /
+/// `MessageStart`/`End`, `ToolExecution*`, `UsageUpdate`, `Notice`, and
+/// `SubAgentSettings` events, equal in order and payload to what full
+/// [`replay`] emits for the same thread. It does not emit [`AgentEvent::SubAgentStart`] /
 /// [`AgentEvent::SubAgentEnd`] and does not bracket, because the box
 /// these events fill already exists.
 ///
@@ -322,6 +327,9 @@ pub fn project_thread(conv: &Conversation, agent: AgentId) -> Vec<AgentEvent> {
             agent_id_for(entry).is_none_or(|id| id == agent),
             "project_thread received an entry for a different agent"
         );
+        // Advance the same settings fold as full replay, without emitting
+        // brackets for the box the caller already has.
+        state.bracket_subagent(entry, None, false, &BTreeSet::new(), &mut VecDeque::new());
         state.project_entry(entry, None, None, &mut out);
     }
     out.into_iter().map(|projected| projected.event).collect()
@@ -510,6 +518,14 @@ impl Iterator for Replay<'_> {
                             // `close_run` reads, so the `SubAgentEnd`
                             // matches full replay byte for byte.
                             self.state.capture_sub_report_from_entry(entry);
+                            if matches!(
+                                entry.entry,
+                                ConversationEntryKind::ModelChange { .. }
+                                    | ConversationEntryKind::ThinkingChange { .. }
+                            ) {
+                                self.state
+                                    .project_entry(entry, at, Some(self.log), &mut projected);
+                            }
                         } else {
                             self.state
                                 .project_entry(entry, at, Some(self.log), &mut projected);
@@ -593,7 +609,7 @@ struct ReplayState {
     /// concluding unconcluded runs needs (see [`Backfill::seen_subs`]).
     seen_subs: BTreeSet<usize>,
     /// The [`AgentEvent::SubAgentStart`] each sub-agent's run was opened
-    /// with, kept after the run closes.
+    /// with, updated by settings edits and kept after the run closes.
     ///
     /// A background sub-agent's entries interleave with its parent's, so a
     /// run the walk considers finished is closed at the parent's next entry
@@ -615,6 +631,7 @@ struct ReplayState {
 /// "standard".
 fn fallback_settings() -> AgentSettings {
     AgentSettings {
+        context_window: 0,
         provider: String::new(),
         model_id: String::new(),
         thinking: "off".to_string(),
@@ -730,6 +747,31 @@ impl ReplayState {
         let Some(n) = current_sub else {
             return;
         };
+        // Metadata must advance even when content is deferred or this entry
+        // is below the cursor. Both cached starts can later reach the client.
+        for start in self.spawned.get_mut(&n).into_iter().chain(
+            self.open_runs
+                .get_mut(&n)
+                .and_then(|run| run.start.as_mut()),
+        ) {
+            if let AgentEvent::SubAgentStart { settings, .. } = start {
+                match &entry.entry {
+                    ConversationEntryKind::ModelChange {
+                        provider,
+                        model_id,
+                        context_window,
+                    } => {
+                        settings.provider.clone_from(provider);
+                        settings.model_id.clone_from(model_id);
+                        settings.context_window = *context_window;
+                    }
+                    ConversationEntryKind::ThinkingChange { level } => {
+                        settings.thinking.clone_from(level);
+                    }
+                    _ => {}
+                }
+            }
+        }
         if !matches!(
             entry.entry,
             ConversationEntryKind::Message { .. } | ConversationEntryKind::SubAgentSpawn { .. }
@@ -944,14 +986,17 @@ impl ReplayState {
             ConversationEntryKind::SystemPrompt { .. } => {
                 // Model-facing metadata; not user-visible.
             }
-            ConversationEntryKind::ModelChange { provider, model_id }
+            ConversationEntryKind::ModelChange {
+                provider, model_id, ..
+            }
             | ConversationEntryKind::OracleModelChange { provider, model_id } => {
                 let label = match &entry.entry {
                     ConversationEntryKind::OracleModelChange { .. } => "Oracle model",
                     _ => "Model",
                 };
-                self.state_notice(
+                self.settings_notice(
                     agent_id,
+                    &entry.entry,
                     at,
                     format!("{label} set to {provider}/{model_id}."),
                     out,
@@ -971,7 +1016,13 @@ impl ReplayState {
                     ConversationEntryKind::OracleThinkingChange { .. } => "Oracle thinking effort",
                     _ => "Thinking effort",
                 };
-                self.state_notice(agent_id, at, format!("{label} set to {level}."), out);
+                self.settings_notice(
+                    agent_id,
+                    &entry.entry,
+                    at,
+                    format!("{label} set to {level}."),
+                    out,
+                );
             }
             ConversationEntryKind::SpeedChange { speed }
             | ConversationEntryKind::OracleSpeedChange { speed } => {
@@ -1082,6 +1133,36 @@ impl ReplayState {
                     }
                 }
             }
+        }
+    }
+
+    /// A spawned sub's settings are visible before its first message. Other
+    /// state entries retain the seed gate used by ordinary notices.
+    fn settings_notice(
+        &self,
+        agent_id: AgentId,
+        entry: &ConversationEntryKind,
+        at: Option<EntryRef>,
+        text: String,
+        out: &mut VecDeque<TaggedEvent>,
+    ) {
+        if matches!(
+            entry,
+            ConversationEntryKind::ModelChange { .. }
+                | ConversationEntryKind::ThinkingChange { .. }
+        ) && let AgentId::Sub(n) = agent_id
+            && let Some(AgentEvent::SubAgentStart { settings, .. }) = self.spawned.get(&n)
+        {
+            out.push_back(durable(
+                at,
+                AgentEvent::SubAgentSettings {
+                    child: agent_id,
+                    text,
+                    settings: settings.clone(),
+                },
+            ));
+        } else {
+            self.state_notice(agent_id, at, text, out);
         }
     }
 
@@ -1445,7 +1526,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).unwrap();
         log.set_system_prompt("p".into()).unwrap();
-        log.append_model_change(ThreadFilter::USER, "main", "seed")
+        log.append_model_change(ThreadFilter::USER, "main", "seed", 0)
             .unwrap();
         log.append_thinking_change(ThreadFilter::USER, "medium")
             .unwrap();
@@ -1474,7 +1555,7 @@ mod tests {
             .add_message(user_msg("alternate"))
             .unwrap();
         log.set_head(fork.id.clone()).unwrap();
-        log.append_model_change(ThreadFilter::USER, "main", "changed")
+        log.append_model_change(ThreadFilter::USER, "main", "changed", 0)
             .unwrap();
         log.append_oracle_thinking_change("high").unwrap();
         let selected = ConversationView::user(&mut log)
@@ -1590,7 +1671,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).unwrap();
         let root = log.set_system_prompt("p".into()).unwrap();
-        log.append_model_change(ThreadFilter::USER, "provider", "seed")
+        log.append_model_change(ThreadFilter::USER, "provider", "seed", 0)
             .unwrap();
         log.append_thinking_change(ThreadFilter::USER, "high")
             .unwrap();
@@ -1610,7 +1691,7 @@ mod tests {
             oracle_verbosity: Some("high".into()),
             ..SessionSettings::default()
         };
-        log.append_model_change(ThreadFilter::USER, "abandoned", "model")
+        log.append_model_change(ThreadFilter::USER, "abandoned", "model", 0)
             .unwrap();
         log.append_thinking_change(ThreadFilter::USER, "off")
             .unwrap();
@@ -3194,7 +3275,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
-        log.append_model_change(crate::log::ThreadFilter::USER, "anthropic", "claude-x")
+        log.append_model_change(crate::log::ThreadFilter::USER, "anthropic", "claude-x", 0)
             .expect("mc");
         log.append_thinking_change(crate::log::ThreadFilter::USER, "high")
             .expect("tc");
@@ -3407,7 +3488,7 @@ mod tests {
             let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
         }
-        log.append_model_change(crate::log::ThreadFilter::USER, "openai", "gpt-x")
+        log.append_model_change(crate::log::ThreadFilter::USER, "openai", "gpt-x", 0)
             .expect("mc");
         log.append_thinking_change(crate::log::ThreadFilter::USER, "medium")
             .expect("tc");
@@ -3458,6 +3539,7 @@ mod tests {
         };
 
         let settings = AgentSettings {
+            context_window: 0,
             provider: "anthropic".into(),
             model_id: "claude-x".into(),
             thinking: "high".into(),
@@ -3539,6 +3621,7 @@ mod tests {
             view.head().cloned().expect("head present")
         };
         let settings = AgentSettings {
+            context_window: 0,
             provider: "anthropic".into(),
             model_id: "claude-x".into(),
             thinking: "high".into(),
@@ -3604,6 +3687,7 @@ mod tests {
             ConversationEntryKind::ModelChange {
                 provider: "anthropic".into(),
                 model_id: "claude-x".into(),
+                context_window: 0,
             },
         )
         .expect("mc");
@@ -3727,6 +3811,7 @@ mod tests {
         };
 
         let settings = AgentSettings {
+            context_window: 0,
             provider: "anthropic".into(),
             model_id: "claude-x".into(),
             thinking: "high".into(),
@@ -4413,7 +4498,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("system prompt");
-        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x", 0)
             .expect("seed model change");
         let first_kept = {
             let mut view = ConversationView::user(&mut log);
@@ -4486,6 +4571,7 @@ mod tests {
     /// re-synthesized start can be told apart from a synthesized one.
     fn sub_settings() -> AgentSettings {
         AgentSettings {
+            context_window: 0,
             provider: "anthropic".to_string(),
             model_id: "claude-sub".to_string(),
             thinking: "medium".to_string(),
@@ -4499,6 +4585,7 @@ mod tests {
     /// tell each run's remembered start from the other's.
     fn other_sub_settings() -> AgentSettings {
         AgentSettings {
+            context_window: 0,
             provider: "openai".to_string(),
             model_id: "gpt-sub".to_string(),
             thinking: "high".to_string(),
@@ -5417,7 +5504,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_thread_settings_change_projects_a_tagged_notice_in_place() {
+    fn a_sub_thread_settings_change_projects_a_tagged_settings_event_in_place() {
         let (_dir, log) = log_with_sub_settings_change();
         let backfill = collect_suffix(&log.snapshot(), None, &live([1]));
 
@@ -5435,25 +5522,209 @@ mod tests {
                 (None, "message_start".to_string()),
                 (Some(6), "message_end".to_string()),
                 (None, "usage_update".to_string()),
-                (Some(7), "notice".to_string()),
+                (Some(7), "sub_agent_settings".to_string()),
                 (None, "message_start".to_string()),
                 (Some(8), "message_end".to_string()),
                 (None, "usage_update".to_string()),
             ],
-            "the notice sits between the sub's two turns"
+            "the settings event sits between the sub's two turns"
         );
         let notice = backfill
             .events
             .iter()
-            .find(|projected| matches!(projected.event, AgentEvent::Notice { .. }))
-            .expect("the mid-run settings entry projects a notice");
+            .find(|projected| matches!(projected.event, AgentEvent::SubAgentSettings { .. }))
+            .expect("the mid-run settings entry projects a settings event");
         match &notice.event {
-            AgentEvent::Notice { agent_id, text } => {
-                assert_eq!(*agent_id, AgentId::Sub(1), "on the sub's own thread");
+            AgentEvent::SubAgentSettings {
+                child,
+                text,
+                settings,
+            } => {
+                assert_eq!(*child, AgentId::Sub(1), "on the sub's own thread");
                 assert_eq!(text, "Thinking effort set to high.");
+                assert_eq!(
+                    *settings,
+                    AgentSettings {
+                        thinking: "high".into(),
+                        ..sub_settings()
+                    }
+                );
             }
-            other => panic!("expected a notice, got {other:?}"),
+            other => panic!("expected settings, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sub_settings_converge_before_messages_and_across_reopened_runs() {
+        for before_first_message in [false, true] {
+            for interleaved in [false, true] {
+                let dir = fresh_sessions_dir();
+                let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+                let mut log = ConversationLog::create(&persistence).unwrap();
+                log.set_system_prompt("p".into()).unwrap();
+                let parent = ConversationView::user(&mut log)
+                    .add_message(user_msg("delegate"))
+                    .unwrap()
+                    .id;
+                let spawn = log
+                    .append_subagent_spawn(1, parent, "subtask", "agent", true, &sub_settings())
+                    .unwrap();
+                if !before_first_message {
+                    ConversationView::subagent(&mut log, spawn.id, 1)
+                        .add_message(user_msg("subtask"))
+                        .unwrap();
+                }
+                let sub = ThreadFilter::subagent(1);
+                let model = log
+                    .append_model_change(sub, "other", "new-model", 123_456)
+                    .unwrap();
+                if interleaved {
+                    ConversationView::user(&mut log)
+                        .add_message(user_msg("meanwhile"))
+                        .unwrap();
+                }
+                let thinking = log.append_thinking_change(sub, "high").unwrap();
+                let snapshot_before_message = log.snapshot();
+                let changed_model = AgentSettings {
+                    provider: "other".into(),
+                    model_id: "new-model".into(),
+                    context_window: 123_456,
+                    ..sub_settings()
+                };
+                let changed = AgentSettings {
+                    thinking: "high".into(),
+                    ..changed_model.clone()
+                };
+                let expected = [
+                    (
+                        model,
+                        AgentEvent::SubAgentSettings {
+                            child: AgentId::Sub(1),
+                            text: "Model set to other/new-model.".into(),
+                            settings: changed_model,
+                        },
+                    ),
+                    (
+                        thinking.clone(),
+                        AgentEvent::SubAgentSettings {
+                            child: AgentId::Sub(1),
+                            text: "Thinking effort set to high.".into(),
+                            settings: changed.clone(),
+                        },
+                    ),
+                ];
+                for (entry, event) in &expected {
+                    assert_eq!(
+                        wire(
+                            &snapshot_before_message
+                                .project_state_entry(&entry.id)
+                                .unwrap()
+                        ),
+                        wire(event)
+                    );
+                }
+                let leaf = log.latest_leaf(sub).unwrap();
+                ConversationView::subagent(&mut log, leaf, 1)
+                    .add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                        text: "report".into(),
+                        text_signature: None,
+                    })]))
+                    .unwrap();
+                log.flush_pending().unwrap();
+                let resumed = ConversationLog::resume(&persistence, log.session_id()).unwrap();
+                let snapshot = resumed.snapshot();
+                let full: Vec<_> = project_suffix(&snapshot, None, &BTreeSet::new()).collect();
+                for (entry, event) in &expected {
+                    let tagged: Vec<_> = full
+                        .iter()
+                        .filter(|e| e.entry.as_ref() == Some(entry))
+                        .collect();
+                    assert_eq!(
+                        tagged.len(),
+                        1,
+                        "a settings entry has exactly one durable event"
+                    );
+                    assert_eq!(wire(&tagged[0].event), wire(event));
+                }
+                let metadata = |event: &AgentEvent| {
+                    matches!(
+                        event,
+                        AgentEvent::SubAgentStart { .. }
+                            | AgentEvent::SubAgentEnd { .. }
+                            | AgentEvent::SubAgentSettings { .. }
+                    )
+                };
+                assert_eq!(
+                    replay_deferring_subs(&resumed)
+                        .filter(&metadata)
+                        .map(|e| wire(&e))
+                        .collect::<Vec<_>>(),
+                    full.iter()
+                        .map(|e| &e.event)
+                        .filter(|e| metadata(e))
+                        .map(wire)
+                        .collect::<Vec<_>>(),
+                    "deferred boxes have the same settings and reports",
+                );
+                for live_subs in [BTreeSet::new(), live([1])] {
+                    let suffix: Vec<_> =
+                        project_suffix(&snapshot, Some(thinking.seq), &live_subs).collect();
+                    let starts: Vec<_> = suffix
+                        .iter()
+                        .filter_map(|e| match &e.event {
+                            AgentEvent::SubAgentStart { settings, .. } => Some(settings),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        starts,
+                        vec![&changed],
+                        "a cursor-dropped edit must survive a synthetic start"
+                    );
+                }
+                let conv = resumed.linearize(&resumed.latest_leaf(sub).unwrap(), sub);
+                let projected = project_thread(&conv, AgentId::Sub(1));
+                assert_eq!(
+                    projected
+                        .iter()
+                        .filter(|e| matches!(e, AgentEvent::SubAgentSettings { .. }))
+                        .map(wire)
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .map(|(_, event)| wire(event))
+                        .collect::<Vec<_>>(),
+                    "on-demand content agrees with full replay",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_sub_settings_keep_unknown_model_and_capacity() {
+        let (_dir, mut log) = log_with_legacy_sub();
+        let sub = ThreadFilter::subagent(1);
+        let thinking = log.append_thinking_change(sub, "high").unwrap();
+        let expected = AgentSettings {
+            thinking: "high".into(),
+            ..fallback_settings()
+        };
+        let event = log.snapshot().project_state_entry(&thinking.id).unwrap();
+        assert!(
+            matches!(event, AgentEvent::SubAgentSettings { settings, .. } if settings == expected)
+        );
+        let model = log
+            .append_model_change(sub, "unknown-provider", "unknown-model", 0)
+            .unwrap();
+        let expected = AgentSettings {
+            provider: "unknown-provider".into(),
+            model_id: "unknown-model".into(),
+            ..expected
+        };
+        let event = log.snapshot().project_state_entry(&model.id).unwrap();
+        assert!(
+            matches!(event, AgentEvent::SubAgentSettings { settings, .. } if settings == expected)
+        );
     }
 
     #[test]
@@ -5464,7 +5735,7 @@ mod tests {
             .unwrap();
         let before: Vec<_> = replay(&log).map(|e| wire(&e)).collect();
         let edit = log
-            .append_model_change(ThreadFilter::subagent(1), "other", "new-model")
+            .append_model_change(ThreadFilter::subagent(1), "other", "new-model", 321_000)
             .unwrap();
         let snapshot = log.snapshot();
         let suffix: Vec<_> =
@@ -5475,10 +5746,17 @@ mod tests {
             "a trailing edit must not fabricate a bracket or empty report"
         );
         assert_eq!(suffix[0].entry.as_ref(), Some(&edit));
-        assert!(matches!(&suffix[0].event, AgentEvent::Notice { .. }));
+        assert!(
+            matches!(&suffix[0].event, AgentEvent::SubAgentSettings { settings, .. }
+            if settings.model_id == "new-model" && settings.context_window == 321_000 && settings.thinking == "high")
+        );
         let after: Vec<_> = replay(&log).map(|e| wire(&e)).collect();
         assert_eq!(after[..before.len()], before);
         assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(
+            wire(&replay_deferring_subs(&log).last().unwrap()),
+            wire(&suffix[0].event)
+        );
     }
 
     #[test]

@@ -21,7 +21,6 @@ use aj_agent::events::{AgentId, AgentSettings, CompactionPhase};
 use aj_agent::message::{TaskNotificationKind, TaskOutcome};
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
 use aj_agent::types::{SubAgentUsage, TokenUsage, UsageSummary};
-use aj_models::registry::ModelInfo;
 use aj_models::types::{AssistantMessage, UserContent};
 use aj_wire::{AgentQueue, QueueState, TaskTable};
 use chrono::Utc;
@@ -499,9 +498,6 @@ pub struct ChatState {
     queue: QueueState,
     /// Per-agent footer store (model line + context occupancy).
     pub(crate) footers: AgentFooters,
-    /// Model catalog, for resolving a settings identity's context
-    /// window.
-    pub(crate) catalog: Arc<Vec<ModelInfo>>,
     /// Locates the `Sub(n)` box entry: the parent transcript that
     /// holds it plus the entry id inside it.
     pub(crate) sub_boxes: HashMap<usize, (AgentId, EntryId)>,
@@ -539,15 +535,9 @@ pub struct ChatState {
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl ChatState {
-    /// Build a fresh model seeded with the Main agent's settings and
-    /// context window (the footer seed) and the model catalog used to
-    /// resolve sub-agent context windows. Display flags start at their
-    /// defaults. The host overrides them from config.
-    pub fn new(
-        main_settings: AgentSettings,
-        main_context_window: u64,
-        catalog: Arc<Vec<ModelInfo>>,
-    ) -> Self {
+    /// Build a fresh model seeded with the Main agent's settings snapshot.
+    /// Display flags start at their defaults.
+    pub fn new(main_settings: AgentSettings) -> Self {
         let mut transcripts = HashMap::new();
         transcripts.insert(AgentId::Main, Transcript::default());
         Self {
@@ -556,8 +546,7 @@ impl ChatState {
             render: HashMap::new(),
             tasks: BTreeMap::new(),
             queue: QueueState::default(),
-            footers: AgentFooters::new(main_settings, main_context_window),
-            catalog,
+            footers: AgentFooters::new(main_settings),
             sub_boxes: HashMap::new(),
             compaction_phase: HashMap::new(),
             show_thinking_block: true,
@@ -846,34 +835,6 @@ impl ChatState {
         self.compaction_phase.get(&id).copied()
     }
 
-    /// Resolve the context window for a settings identity known only
-    /// as `(provider, model_id)` strings:
-    ///
-    /// 1. Catalog scan. The catalog is the authoritative source and
-    ///    is loaded once at startup.
-    /// 2. On a miss, an identity equal to the Main entry's settings
-    ///    resolves to Main's window. This covers scripted runs and
-    ///    `--model-url` bundles absent from the catalog: sub-agents
-    ///    inherit the parent's bundle, so the identity match is exact
-    ///    in practice.
-    /// 3. Otherwise `0`, which suppresses the indicator.
-    pub fn resolve_window(&self, settings: &AgentSettings) -> u64 {
-        if let Some(info) = self
-            .catalog
-            .iter()
-            .find(|m| m.provider == settings.provider && m.id == settings.model_id)
-        {
-            return info.context_window;
-        }
-        if let Some(main) = self.footers.settings(AgentId::Main)
-            && main.provider == settings.provider
-            && main.model_id == settings.model_id
-        {
-            return self.footers.context_usage(AgentId::Main).context_window;
-        }
-        0
-    }
-
     /// Whether a freshly appended tool entry for `agent_id` should
     /// render header-only: sub-agent tools live inside the compact
     /// box unless that sub is the observed full view.
@@ -1032,7 +993,7 @@ impl ChatState {
     /// history it is about to be served, so the fold restarts from the full
     /// backfill.
     ///
-    /// The display flags and the model catalog survive: they come from
+    /// The display flags survive: they come from
     /// config, not from the stream. Main's footer keeps its settings seed,
     /// which the stream never wrote either: a client reads the host's
     /// active settings off the `state` frame. Every other agent's footer
@@ -1160,18 +1121,15 @@ mod tests {
     }
 
     fn chat_state() -> ChatState {
-        ChatState::new(
-            AgentSettings {
-                provider: "scripted".into(),
-                model_id: "scripted".into(),
-                thinking: "off".into(),
-                thinking_display: "default".into(),
-                speed: "standard".into(),
-                verbosity: "default".into(),
-            },
-            0,
-            Arc::new(Vec::new()),
-        )
+        ChatState::new(AgentSettings {
+            context_window: 0,
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        })
     }
 
     /// A launch cell for `call_id`, as a client that only ever saw the

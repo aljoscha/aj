@@ -6642,6 +6642,7 @@ async fn decoded_until(
 /// a `state` frame matters here.
 fn fake_settings() -> AgentSettings {
     AgentSettings {
+        context_window: 0,
         provider: "scripted".into(),
         model_id: "scripted".into(),
         thinking: "off".into(),

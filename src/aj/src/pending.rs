@@ -221,7 +221,6 @@ impl Widget for PendingBox {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use aj_agent::events::AgentSettings;
     use aj_app::theme::Theme;
@@ -230,18 +229,15 @@ mod tests {
     use super::*;
 
     fn chat() -> Rc<RefCell<ChatState>> {
-        Rc::new(RefCell::new(ChatState::new(
-            AgentSettings {
-                provider: "scripted".into(),
-                model_id: "scripted".into(),
-                thinking: "off".into(),
-                thinking_display: "default".into(),
-                speed: "standard".into(),
-                verbosity: "default".into(),
-            },
-            0,
-            Arc::new(Vec::new()),
-        )))
+        Rc::new(RefCell::new(ChatState::new(AgentSettings {
+            context_window: 0,
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        })))
     }
 
     fn styles() -> Rc<TranscriptStyles> {

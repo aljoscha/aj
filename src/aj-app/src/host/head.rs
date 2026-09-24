@@ -82,8 +82,13 @@ pub(super) fn append_changes(
             .map_err(persist)?;
     }
     if changes.settings.model.is_some() {
-        log.append_model_change(ThreadFilter::USER, &settings.provider, &settings.model_id)
-            .map_err(persist)?;
+        log.append_model_change(
+            ThreadFilter::USER,
+            &settings.provider,
+            &settings.model_id,
+            settings.context_window,
+        )
+        .map_err(persist)?;
     }
     if changes.settings.thinking.is_some() {
         log.append_thinking_change(ThreadFilter::USER, &settings.thinking)
