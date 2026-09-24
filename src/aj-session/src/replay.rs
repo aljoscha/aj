@@ -543,9 +543,7 @@ struct OpenRun {
     /// The run's [`AgentEvent::SubAgentStart`], kept so a suffix whose
     /// cursor falls inside the run can re-synthesize it. `None` until
     /// the run's `SubAgentSpawn` entry, or the legacy fallback at its
-    /// first `Message` entry, produces one. A run that reaches its close
-    /// with `None` still gets a balanced bracket from a synthesized
-    /// start.
+    /// first `Message` entry, produces one.
     start: Option<AgentEvent>,
     /// Whether `start` reached the output. False while the run opened on
     /// an entry the walk dropped, which is what tells the suffix
@@ -699,8 +697,8 @@ impl ReplayState {
     ///
     /// Transitions are keyed off `agent_id_for`: an entry for `Main` or a
     /// different sub closes the runs that [`Self::close_finished_runs`]
-    /// considers finished. Entering a `Sub(n)` with no run open opens
-    /// one. The run's [`AgentEvent::SubAgentStart`] is emitted from its
+    /// considers finished. A message or spawn for a `Sub(n)` with no run
+    /// open opens one. The run's [`AgentEvent::SubAgentStart`] is emitted from its
     /// `SubAgentSpawn` entry (task + settings snapshot); legacy logs
     /// whose sub threads lead with the task user message instead emit it
     /// at the run's first `Message` entry, with the task from its user
@@ -732,6 +730,13 @@ impl ReplayState {
         let Some(n) = current_sub else {
             return;
         };
+        if !matches!(
+            entry.entry,
+            ConversationEntryKind::Message { .. } | ConversationEntryKind::SubAgentSpawn { .. }
+        ) {
+            self.deliver_start(n, keep, out);
+            return;
+        }
         self.seen_subs.insert(n);
         let run = self.open_runs.entry(n).or_default();
         if matches!(entry.entry, ConversationEntryKind::Message { .. }) {
@@ -878,23 +883,14 @@ impl ReplayState {
     }
 
     /// Close run `n`, emitting its [`AgentEvent::SubAgentEnd`] with the
-    /// accumulated report. A run that produced neither a `SubAgentSpawn`
-    /// entry nor a `Message` entry has no start yet; emit one with an
-    /// empty task and default settings so the bracketing stays balanced.
+    /// accumulated report. Only messages and spawns open runs, so every
+    /// run has a start by the time it closes.
     fn close_run(&mut self, n: usize, keep: bool, out: &mut VecDeque<TaggedEvent>) {
         self.deliver_start(n, keep, out);
         let Some(run) = self.open_runs.remove(&n) else {
             return;
         };
-        if run.start.is_none() {
-            out.push_back(transient(sub_start_event(
-                n,
-                String::new(),
-                String::new(),
-                false,
-                fallback_settings(),
-            )));
-        }
+        debug_assert!(run.start.is_some());
         out.push_back(transient(AgentEvent::SubAgentEnd {
             parent: AgentId::Main,
             child: AgentId::Sub(n),
@@ -5458,6 +5454,31 @@ mod tests {
             }
             other => panic!("expected a notice, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trailing_sub_settings_do_not_reopen_a_finished_report() {
+        let (_dir, mut log) = log_with_sub_settings_change();
+        ConversationView::user(&mut log)
+            .add_message(user_msg("finished"))
+            .unwrap();
+        let before: Vec<_> = replay(&log).map(|e| wire(&e)).collect();
+        let edit = log
+            .append_model_change(ThreadFilter::subagent(1), "other", "new-model")
+            .unwrap();
+        let snapshot = log.snapshot();
+        let suffix: Vec<_> =
+            project_suffix(&snapshot, Some(edit.seq - 1), &BTreeSet::new()).collect();
+        assert_eq!(
+            suffix.len(),
+            1,
+            "a trailing edit must not fabricate a bracket or empty report"
+        );
+        assert_eq!(suffix[0].entry.as_ref(), Some(&edit));
+        assert!(matches!(&suffix[0].event, AgentEvent::Notice { .. }));
+        let after: Vec<_> = replay(&log).map(|e| wire(&e)).collect();
+        assert_eq!(after[..before.len()], before);
+        assert_eq!(after.len(), before.len() + 1);
     }
 
     #[test]
