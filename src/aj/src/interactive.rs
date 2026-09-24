@@ -8961,6 +8961,7 @@ mod tests {
     use vaxis::vxfw::{MaxSize, Size};
 
     use super::*;
+    use crate::overlay::OverlayPlacement;
 
     /// Run an environment-sensitive test alone, without changing sibling tests'
     /// environment. The parent owns HOME until the child process has exited,
@@ -15188,6 +15189,165 @@ mod tests {
         }
     }
 
+    fn drawn_modal(composed: &Surface) -> &Surface {
+        &composed.children[0]
+            .surface
+            .children
+            .iter()
+            .find(|child| child.z_index == 2)
+            .expect("Shell drew the open modal")
+            .surface
+    }
+
+    fn modal_content(surface: &Surface) -> String {
+        crate::test_support::flatten(surface)
+            .iter()
+            .skip(1)
+            .take(usize::from(surface.size.height.saturating_sub(2)))
+            .flat_map(|row| row.iter().skip(1).take(row.len().saturating_sub(2)))
+            .flat_map(|cell| cell.char.grapheme().chars())
+            .filter(|ch| !ch.is_whitespace())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn palette_auth_small_modal_preserves_wrapped_credentials() {
+        let dir = TempDir::new().unwrap();
+        let (mut app, mut writer, world, shell, root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        for (label, expires) in [("personal", i64::MAX), ("engineering-production", 0)] {
+            world
+                .auth
+                .insert_account(
+                    "anthropic",
+                    label,
+                    AuthCredential::OAuth(OAuthCredentials::new(
+                        "refresh-secret-sentinel",
+                        "access-secret-sentinel",
+                        expires,
+                    )),
+                )
+                .await
+                .unwrap();
+        }
+        press(&mut app, &mut writer, &[0x0f]).await;
+        app.render(&root).unwrap();
+        type_text(&mut app, &mut writer, "auth status").await;
+        press(&mut app, &mut writer, b"\r").await;
+        let fetch = shell.borrow().take_fetch().expect("palette auth fetch");
+        assert_eq!(fetch.kind, FetchKind::Auth);
+        let (tx, rx) = oneshot::channel();
+        spawn_shell_overlay_fetch(&world, &shell, fetch.kind, tx);
+        let rows = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let credentials: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row.iter()
+                    .any(|segment| segment.text.contains("subscription"))
+            })
+            .collect();
+        assert_eq!(credentials.len(), 2, "one logical row per credential");
+        assert!(
+            credentials.iter().any(|row| row.iter().any(|segment| {
+                segment
+                    .text
+                    .contains("expired (auto-refreshes on next request)")
+            })),
+            "expiry detail stays inline with its credential"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.iter().any(|segment| !segment.text.trim().is_empty())),
+            "auth has no blank group separators"
+        );
+        let muted = ContentStyles::from_theme(&shell.borrow().theme.read()).muted;
+        let expiry = credentials
+            .iter()
+            .flat_map(|row| row.iter())
+            .find(|segment| segment.text.contains("expired"))
+            .unwrap();
+        assert_eq!(expiry.style, muted, "inline detail is muted");
+        set_rows(&fetch.list, rows);
+        for (width, height, expected_width, expected_height) in
+            [(80, 24, 72, 24), (120, 40, 90, 26), (200, 60, 100, 26)]
+        {
+            let composed = shell.borrow_mut().draw(&draw_ctx(width, height));
+            let modal = drawn_modal(&composed);
+            assert_eq!(
+                modal.size,
+                Size {
+                    width: expected_width,
+                    height: expected_height
+                }
+            );
+            let content = modal_content(modal);
+            for text in [
+                "Anthropic subscription",
+                "personal",
+                "engineering-production",
+                "expired (auto-refreshes on next request)",
+            ] {
+                let expected: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+                assert!(content.contains(&expected), "{width}x{height}: {content}");
+            }
+            assert!(!content.contains("secret-sentinel"), "{content}");
+            if width == 80 {
+                let lines = crate::test_support::rows(modal);
+                let account_line = lines
+                    .iter()
+                    .position(|line| line.contains("engineering-production"))
+                    .unwrap();
+                let detail_line = lines
+                    .iter()
+                    .position(|line| line.contains("expired"))
+                    .unwrap();
+                assert!(
+                    detail_line > account_line,
+                    "the narrow fixture must exercise wrapping: {lines:?}"
+                );
+            }
+        }
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn palette_help_and_session_info_keep_large_modal_geometry() {
+        for (query, title) in [("help", "Help & Keymap"), ("info", "Session info")] {
+            let dir = TempDir::new().unwrap();
+            let (mut app, mut writer, world, shell, root) =
+                init_app_with_world(&dir, "streaming-text").await;
+            press(&mut app, &mut writer, &[0x0f]).await;
+            app.render(&root).unwrap();
+            type_text(&mut app, &mut writer, query).await;
+            press(&mut app, &mut writer, b"\r").await;
+            if query == "info" {
+                let fetch = shell.borrow().take_fetch().expect("session info fetch");
+                assert_eq!(fetch.kind, FetchKind::SessionInfo);
+                let (tx, rx) = oneshot::channel();
+                spawn_shell_overlay_fetch(&world, &shell, fetch.kind, tx);
+                let rows = tokio::time::timeout(Duration::from_secs(2), rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                set_rows(&fetch.list, rows);
+            }
+            let composed = shell.borrow_mut().draw(&draw_ctx(120, 40));
+            let modal = drawn_modal(&composed);
+            assert_eq!(
+                modal.size,
+                Size {
+                    width: 102,
+                    height: 32
+                }
+            );
+            assert!(crate::test_support::rows(modal).join("\n").contains(title));
+            shut_down(&world).await;
+        }
+    }
+
     #[tokio::test]
     async fn auth_fetch_draws_exact_limit_legacy_row_at_narrow_overlay_geometry() {
         let dir = TempDir::new().expect("tempdir");
@@ -15234,6 +15394,7 @@ mod tests {
             &handles.editor,
             &handles.chrome,
             "Authentication",
+            OverlayPlacement::Small,
             crate::content_overlay::loading_rows(),
             &mut event_ctx,
         );
@@ -30818,6 +30979,68 @@ mod tests {
 
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         assert_eq!(shell.borrow().overlays.borrow().depth(), 1);
+    }
+
+    #[tokio::test]
+    async fn usage_small_modal_preserves_account_reports() {
+        use crate::remote::tests::provider_usage::FakeUsage;
+        let host_dir = TempDir::new().unwrap();
+        let client_dir = TempDir::new().unwrap();
+        let source = FakeUsage::new("OpenAI Codex subscription");
+        let host = source.host(&host_dir).await;
+        let session = host.create().await.unwrap();
+        let remote = RemoteHost {
+            server: crate::remote::RemoteServer::bind(
+                host.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                crate::remote::IdentityGate::local(),
+            )
+            .await
+            .unwrap(),
+            host,
+        };
+        let (mut world, shell) =
+            connect_world_and_shell_at(&client_dir, &remote.url(), &[&session]).await;
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await,
+            ActionEffect::OpenedOverlay
+        ));
+        crate::remote::tests::bounded("usage modal filled", async {
+            loop {
+                let composed = shell.borrow_mut().draw(&draw_ctx(120, 40));
+                if modal_content(drawn_modal(&composed))
+                    .contains("OpenAICodexsubscriptionworkreport")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        for (width, height, expected_width, expected_height) in
+            [(80, 24, 72, 24), (120, 40, 90, 26), (200, 60, 100, 26)]
+        {
+            let composed = shell.borrow_mut().draw(&draw_ctx(width, height));
+            let modal = drawn_modal(&composed);
+            assert_eq!(
+                modal.size,
+                Size {
+                    width: expected_width,
+                    height: expected_height
+                }
+            );
+            let content = modal_content(modal);
+            for account in ["personal", "work"] {
+                assert!(
+                    content.contains(&format!("OpenAICodexsubscription{account}report")),
+                    "{width}x{height}: {content}"
+                );
+                assert!(content.contains(&format!("{account}credits")), "{content}");
+            }
+            assert_eq!(content.matches("2available").count(), 2, "{content}");
+            assert!(!content.contains("secret"), "{content}");
+        }
+        remote.shutdown().await;
     }
 
     async fn usage_page_until(shell: &Rc<RefCell<Shell>>, needle: &str) -> String {

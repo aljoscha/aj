@@ -47,15 +47,14 @@ const LARGE_OVERLAY_MAX_INNER_ROWS: u16 = 32;
 /// size each frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OverlayPlacement {
-    /// The command palette and the compact pickers: centered, ~75% of the
-    /// terminal width clamped to [72, 100] columns so the box doesn't
+    /// The command palette, auth/usage pages and compact pickers: centered,
+    /// ~75% of the terminal width clamped to [72, 100] columns so the box doesn't
     /// stretch uncomfortably wide on large monitors, at a fixed height of
     /// 22 inner rows plus chrome.
     Small,
-    /// The content-heavy overlays (help, auth status, session info,
-    /// usage): centered, ~85% of the terminal width clamped to
-    /// [72, 120] columns, with inner rows at ~80% of the terminal
-    /// height minus chrome, clamped to [14, 32].
+    /// The content-heavy overlays (help and session info): centered, ~85% of
+    /// the terminal width clamped to [72, 120] columns, with inner rows at
+    /// ~80% of the terminal height minus chrome, clamped to [14, 32].
     Large,
 }
 

@@ -145,7 +145,11 @@ fn dispatch_from_palette(
 ) {
     let open_fetch = |kind: FetchKind, title: &str, ctx: &mut EventContext| {
         let ch = chrome.borrow();
-        let list = open_content_overlay(stack, editor, &ch, title, loading_rows(), ctx);
+        let placement = match kind {
+            FetchKind::Auth => OverlayPlacement::Small,
+            FetchKind::SessionInfo => OverlayPlacement::Large,
+        };
+        let list = open_content_overlay(stack, editor, &ch, title, placement, loading_rows(), ctx);
         *fetch_slot.borrow_mut() = Some(PendingFetch { kind, list });
     };
     match action {
@@ -158,6 +162,7 @@ fn dispatch_from_palette(
                 editor,
                 &ch,
                 "Help & Keymap",
+                OverlayPlacement::Large,
                 help_rows(&content_styles),
                 ctx,
             );

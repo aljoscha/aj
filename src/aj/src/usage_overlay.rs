@@ -816,7 +816,7 @@ pub(crate) fn open_usage_overlay(
         String::new(),
         to_widget_ref(overlay),
         focus,
-        OverlayPlacement::Large,
+        OverlayPlacement::Small,
     );
     window.borrow_mut().subtitle_source = Some(footer_source);
 }

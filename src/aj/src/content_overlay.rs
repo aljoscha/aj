@@ -235,6 +235,7 @@ pub(crate) fn open_content_overlay(
     editor: &WidgetRef,
     chrome: &OverlayChrome,
     title: &str,
+    placement: OverlayPlacement,
     rows: Vec<Row>,
     ctx: &mut EventContext,
 ) -> Rc<RefCell<ListView>> {
@@ -269,7 +270,7 @@ pub(crate) fn open_content_overlay(
     stack.borrow_mut().push(OpenOverlay {
         widget: to_widget_ref(Rc::new(RefCell::new(window))),
         focus: Rc::clone(&focus),
-        placement: OverlayPlacement::Large,
+        placement,
     });
     ctx.request_focus(focus);
     ctx.redraw = true;
@@ -562,8 +563,8 @@ fn pad_cells(text: &str, width: usize, method: vaxis::gwidth::Method) -> String 
     )
 }
 
-/// Each credential has a left-aligned identity, a globally aligned status,
-/// and an optional indented detail line. Defaults belong to the status.
+/// Each credential occupies one logical row with a left-aligned identity,
+/// globally aligned muted status and detail, and a trailing default marker.
 pub(crate) fn auth_rows(
     statuses: &[CredentialStatus],
     styles: &ContentStyles,
@@ -574,7 +575,7 @@ pub(crate) fn auth_rows(
     }
     // At a one-cell viewport each cell becomes a row. Budget the shared
     // identity column against every status so RichText's u16 height stays valid.
-    let status_width = statuses
+    let suffix_width = statuses
         .iter()
         .map(|s| {
             terminal_cells(&s.summary, width_method)
@@ -583,10 +584,13 @@ pub(crate) fn auth_rows(
                 } else {
                     0
                 }
+                + s.detail.as_ref().map_or(0, |detail| {
+                    terminal_cells(&format!(" · {detail}"), width_method)
+                })
         })
         .max()
         .unwrap_or(0);
-    let budget = usize::from(AUTH_ROW_CELL_LIMIT).saturating_sub(status_width + 2);
+    let budget = usize::from(AUTH_ROW_CELL_LIMIT).saturating_sub(suffix_width + 2);
     let identities: Vec<_> = statuses
         .iter()
         .map(|s| {
@@ -604,20 +608,17 @@ pub(crate) fn auth_rows(
         .unwrap_or(0);
     let mut rows = Vec::new();
     for (status, identity) in statuses.iter().zip(identities) {
-        if !rows.is_empty() {
-            rows.push(plain(" "));
-        }
         let mut row = vec![
             span(pad_cells(&identity, width, width_method), Style::default()),
-            span(format!("  {}", status.summary), Style::default()),
+            span(format!("  {}", status.summary), styles.muted),
         ];
+        if let Some(detail) = &status.detail {
+            row.push(span(format!(" · {detail}"), styles.muted));
+        }
         if status.is_default {
             row.push(span(" · provider default", styles.muted));
         }
         rows.push(row);
-        if let Some(detail) = &status.detail {
-            rows.push(vec![span(format!("  {detail}"), styles.muted)]);
-        }
     }
     rows
 }
@@ -1283,8 +1284,17 @@ mod tests {
     }
 
     #[test]
-    fn auth_rows_budget_the_exact_limit_label_against_the_complete_row() {
-        let label = format!("{}\u{0100}", "a".repeat(65_533));
+    fn auth_rows_budget_inline_details_against_the_complete_row() {
+        let label = format!("{}\u{0100}", "a".repeat(65_460));
+        let detail = "expired (auto-refreshes on next request)";
+        let without_detail = format!("provider · {label}  API key (stored) · provider default");
+        assert!(
+            terminal_cells(&without_detail, Method::Unicode) <= usize::from(AUTH_ROW_CELL_LIMIT)
+        );
+        assert!(
+            terminal_cells(&format!("{without_detail} · {detail}"), Method::Unicode)
+                > usize::from(AUTH_ROW_CELL_LIMIT)
+        );
         let rows = auth_rows(
             &[CredentialStatus {
                 provider_name: String::new(),
@@ -1293,7 +1303,7 @@ mod tests {
                 is_default: true,
                 configured: true,
                 summary: "API key (stored)".into(),
-                detail: Some("legacy credential".into()),
+                detail: Some(detail.into()),
             }],
             &test_styles(),
             Method::Unicode,
@@ -1305,7 +1315,7 @@ mod tests {
         );
         assert!(
             !text.contains('\u{0100}'),
-            "the exact-limit tail entered RichText: {text}"
+            "the over-budget tail entered RichText: {text}"
         );
         let cells = rows[0]
             .iter()
@@ -1318,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_rows_align_status_and_separate_detail_from_identity() {
+    fn auth_rows_align_status_and_keep_details_in_the_credential_row() {
         let styles = test_styles();
         let rows = auth_rows(
             &[
@@ -1344,11 +1354,12 @@ mod tests {
             &styles,
             Method::Unicode,
         );
+        assert_eq!(rows.len(), 2, "one logical row per credential");
         let first = row_text(&rows[0]);
-        let second = row_text(&rows[3]);
+        let second = row_text(&rows[1]);
         assert!(first.starts_with("Claude · 個人"), "{first}");
         assert!(
-            first.ends_with("subscription · provider default"),
+            first.ends_with("subscription · expires in 1h · provider default"),
             "{first}"
         );
         assert!(second.starts_with("openai"), "{second}");
@@ -1359,9 +1370,14 @@ mod tests {
                 Method::Unicode
             ),
         );
-        assert_eq!(row_text(&rows[1]), "  expires in 1h");
-        assert_eq!(rows[1][0].style, styles.muted);
-        assert_eq!(row_text(&rows[2]), " ");
+        assert_eq!(rows[0].last().unwrap().style, styles.muted);
+        let summary_col =
+            terminal_cells(first.split("subscription").next().unwrap(), Method::Unicode);
+        let mut overlay = ContentOverlay::new(rows);
+        let surface = overlay.draw(&crate::test_support::draw_ctx(80, Some(12)));
+        let cells = crate::test_support::flatten(&surface);
+        assert_eq!(cells[0][0].style, Style::default());
+        assert_eq!(cells[0][summary_col].style, styles.muted);
     }
 
     #[test]
@@ -1406,7 +1422,7 @@ mod tests {
 
             assert_eq!(
                 summary_col(&rows[0]),
-                summary_col(&rows[2]),
+                summary_col(&rows[1]),
                 "summary columns for {left:?} and {right:?} under {method:?}"
             );
         };
@@ -2162,7 +2178,15 @@ mod tests {
         let stack = Rc::new(RefCell::new(OverlayStack::default()));
         let mut ctx = EventContext::new();
         let rows = (0..50).map(|i| plain(format!("line {i}"))).collect();
-        open_content_overlay(&stack, &editor, &chrome, "Title", rows, &mut ctx);
+        open_content_overlay(
+            &stack,
+            &editor,
+            &chrome,
+            "Title",
+            OverlayPlacement::Large,
+            rows,
+            &mut ctx,
+        );
 
         // Draw the pushed window and composite its child tree, then read the
         // thumb glyph's tint from wherever it lands inside the border.
