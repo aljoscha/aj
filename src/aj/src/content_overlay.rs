@@ -622,9 +622,9 @@ pub(crate) fn auth_rows(
     rows
 }
 
-/// Provider/account headings with globally aligned window, percentage and
-/// reset columns. Notes and credits are prose beneath their own group and do
-/// not participate in window sizing.
+/// Provider/account headings with globally aligned labels, percentages and
+/// reset columns. Reset-credit counts share the percentage column. Notes are
+/// prose beneath their own group and do not participate in column sizing.
 pub(crate) fn usage_rows(
     statuses: &[ProviderUsageStatus],
     styles: &ContentStyles,
@@ -638,7 +638,7 @@ pub(crate) fn usage_rows(
             _ => None,
         })
         .flatten();
-    let (label_width, percent_width) = windows.fold((0, 0), |(labels, percents), window| {
+    let (mut label_width, percent_width) = windows.fold((0, 0), |(labels, percents), window| {
         (
             labels.max(terminal_cells(&window.label, width_method)),
             percents.max(terminal_cells(
@@ -647,6 +647,12 @@ pub(crate) fn usage_rows(
             )),
         )
     });
+    let reset_label = "Rate-limit resets";
+    if statuses.iter().any(|status| {
+        matches!(&status.outcome, UsageOutcome::Usage(usage) if usage.reset_credits.is_some())
+    }) {
+        label_width = label_width.max(terminal_cells(reset_label, width_method));
+    }
     let mut rows = Vec::new();
     for status in statuses {
         if !rows.is_empty() {
@@ -705,10 +711,13 @@ pub(crate) fn usage_rows(
                     } else {
                         "no resets available".into()
                     };
-                    rows.push(vec![span(
-                        format!("  Rate-limit resets: {desc}"),
-                        styles.muted,
-                    )]);
+                    rows.push(vec![
+                        span(
+                            format!("  {}", pad_cells(reset_label, label_width, width_method)),
+                            Style::default(),
+                        ),
+                        span(format!("  {desc}"), styles.muted),
+                    ]);
                 }
             }
             UsageOutcome::Unsupported { reason } => {
@@ -1395,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_rows_group_reports_and_align_only_window_columns() {
+    fn usage_rows_align_window_metrics_and_reset_credits_across_groups() {
         use aj_models::usage::{
             ProviderUsage, RateLimitResetCredits, RateLimitResetTarget, UsageWindow,
         };
@@ -1445,7 +1454,7 @@ mod tests {
             );
             assert_eq!(row_text(&rows[3]), " ");
             assert_eq!(row_text(&rows[4]), "openai-codex · Unnamed account");
-            assert_eq!(row_text(&rows[6]), "  Rate-limit resets: 2 available");
+            assert_eq!(row_text(&rows[6]), "  Rate-limit resets  2 available");
             let mut ctx = crate::test_support::draw_ctx(80, Some(1));
             ctx.width_method = method;
             let column = |row: &Row, needle: &str| {
@@ -1459,10 +1468,16 @@ mod tests {
                     .position(|cells| cells.concat() == needle)
                     .unwrap()
             };
-            assert_eq!(column(&rows[1], "1"), 10);
+            assert_eq!(column(&rows[1], "1"), 21);
+            assert_eq!(column(&rows[6], "2 available"), column(&rows[1], "100%"));
             assert_eq!(column(&rows[1], "% used"), column(&rows[5], "% used"));
             assert_eq!(column(&rows[1], "resets"), column(&rows[5], "resets"));
             assert!(row_text(&rows[1]).ends_with("resets now"));
+            let widget = row_widgets(&rows[6..7]).pop().unwrap();
+            let surface = vaxis::vxfw::draw_widget(&widget, &ctx);
+            let cells = crate::test_support::flatten(&surface);
+            assert_eq!(cells[0][2].style, Style::default());
+            assert_eq!(cells[0][21].style, test_styles().muted);
         }
     }
 
