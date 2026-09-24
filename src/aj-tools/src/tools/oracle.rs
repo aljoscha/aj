@@ -55,11 +55,11 @@ Do not use Oracle for routine reassurance, codebase searches, or implementation.
 It advises rather than edits. You remain responsible for assessing its report,
 implementing any changes, and verifying the result.
 
-Oracle does not see your conversation. Supply the intended outcome, constraints,
-relevant file paths, what you already checked, and the decision needed. For a
-review, identify the diff and intended behavior. For a follow-up, name the prior
-finding and what changed. Ask it to inspect the actual code and evidence, and
-keep the scope explicit.
+Each call starts fresh. Oracle does not see your conversation or previous Oracle
+invocations. Supply the intended outcome, constraints, relevant file paths, what
+you already checked, and the decision needed. For a review, identify the diff and
+intended behavior. For a follow-up, name the prior finding and what changed. Ask
+it to inspect the actual code and evidence, and keep the scope explicit.
 
 By default the call waits for the final report. Set run_in_background: true to
 keep working while Oracle runs. The call then returns a task id, and its report
