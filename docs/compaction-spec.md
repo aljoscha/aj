@@ -313,7 +313,11 @@ the first retained entry. Constraints, mirroring the reference design:
   is an assistant message mid-turn, not a turn-starting user message),
   the turn's prefix is summarized separately and appended to the main
   summary under a "Turn Context (split turn)" heading, so the retained
-  suffix still has the turn's setup.
+  suffix still has the turn's setup. If that prefix is the only new
+  history to summarize, it becomes the main summary input instead.
+  This allows a long first turn, or a turn spanning successive
+  checkpoints, to compact in one call with the previous summary and
+  custom focus when present.
 
 ```rust
 pub struct CutPoint {
@@ -357,6 +361,13 @@ section headings (goal, constraints/preferences, progress
 done/in-progress/blocked, key decisions, next steps, critical context)
 and stress preserving exact file paths, identifiers, and error
 messages.
+
+The update prompt asks for a current continuation checkpoint, not a
+complete work log. It keeps active goals, constraints, and preferences,
+updates the state of work, and removes stale or duplicated detail.
+Completed work and failed approaches are retained when they prevent
+repeated work or mistakes. Verified results are distinguished from
+plans and assumptions.
 
 ```rust
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str;
@@ -668,6 +679,14 @@ Cancellation (`cancel`) is selected against the `complete_oneshot`
 calls; an abort before step 4 leaves the log untouched (no partial
 compaction is ever persisted). A summarizer error returns
 `Failed { error }` and likewise writes nothing.
+
+Each summarizer response must finish normally with non-whitespace text
+and no tool calls. An empty, thinking-only, length-limited, or tool-use
+response fails compaction without changing the live transcript or
+writing a checkpoint. This applies to both calls of a split-turn
+compaction, so a valid history summary cannot mask an invalid prefix
+summary. The checks validate completion, not the factual quality or
+formatting of the model's summary.
 
 **Trailing-failed-assistant trim.** During the reseed, `run_compaction`
 drops a trailing `Error`/`Aborted` assistant message that carries no

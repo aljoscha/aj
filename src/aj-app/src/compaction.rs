@@ -22,15 +22,31 @@ use tokio_util::sync::CancellationToken;
 /// own `max_tokens`.
 const SUMMARY_OUTPUT_CAP: u64 = 8192;
 
-/// The text blocks of a summarizer response, concatenated.
-fn assistant_text(message: &AssistantMessage) -> String {
+/// Accept only a completed, nonempty text summary before replacing history.
+fn summary_text(message: &AssistantMessage) -> Result<String, &'static str> {
+    if message.stop_reason == StopReason::Length {
+        return Err("Compaction summary reached the output limit. History was not changed.");
+    }
+    if message.stop_reason != StopReason::Stop
+        || message
+            .content
+            .iter()
+            .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+    {
+        return Err(
+            "Compaction did not produce a completed text summary. History was not changed.",
+        );
+    }
     let mut out = String::new();
     for block in &message.content {
         if let AssistantContent::Text(t) = block {
             out.push_str(&t.text);
         }
     }
-    out
+    if out.trim().is_empty() {
+        return Err("Compaction produced an empty summary. History was not changed.");
+    }
+    Ok(out)
 }
 
 /// Outcome of a compaction run, for callers that render text (the CLI)
@@ -130,7 +146,13 @@ pub async fn run_compaction(
     {
         Ok(message) => {
             summarizer_usage.accumulate(&message.usage);
-            assistant_text(&message)
+            match summary_text(&message) {
+                Ok(text) => text,
+                Err(error) => {
+                    return finish_failed(agent, reason, plan.tokens_before, error.to_string())
+                        .await;
+                }
+            }
         }
         Err(TurnError::Aborted) => return finish_canceled(agent, reason, plan.tokens_before).await,
         Err(err) => return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await,
@@ -154,7 +176,13 @@ pub async fn run_compaction(
         {
             Ok(message) => {
                 summarizer_usage.accumulate(&message.usage);
-                assistant_text(&message)
+                match summary_text(&message) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        return finish_failed(agent, reason, plan.tokens_before, error.to_string())
+                            .await;
+                    }
+                }
             }
             Err(TurnError::Aborted) => {
                 return finish_canceled(agent, reason, plan.tokens_before).await;
@@ -390,6 +418,239 @@ async fn finish_canceled(
 mod tests {
     use super::*;
     use aj_models::types::{AssistantMessage, ToolCall, UserMessage};
+
+    struct RecordingProvider {
+        inner: Arc<dyn aj_models::provider::Provider>,
+        requests: Arc<std::sync::Mutex<Vec<aj_models::types::Context>>>,
+    }
+
+    impl aj_models::provider::Provider for RecordingProvider {
+        fn stream(
+            &self,
+            model: &aj_models::registry::ModelInfo,
+            context: &aj_models::types::Context,
+            options: &aj_models::types::StreamOptions,
+        ) -> aj_models::streaming::AssistantMessageEventStream {
+            self.requests.lock().unwrap().push(context.clone());
+            self.inner.stream(model, context, options)
+        }
+
+        fn stream_simple(
+            &self,
+            model: &aj_models::registry::ModelInfo,
+            context: &aj_models::types::Context,
+            options: &aj_models::types::SimpleStreamOptions,
+        ) -> aj_models::streaming::AssistantMessageEventStream {
+            self.requests.lock().unwrap().push(context.clone());
+            self.inner.stream_simple(model, context, options)
+        }
+    }
+
+    /// Exercise a first-turn cut through real tools, durable projection, resume,
+    /// and the next provider request. The retained tool result must keep its call.
+    #[tokio::test]
+    async fn compaction_of_a_long_first_turn_preserves_the_tail_on_resume_and_continuation() {
+        use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
+        use aj_session::ConversationPersistence;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let old_path = dir.path().join("old.txt");
+        let recent_path = dir.path().join("recent.txt");
+        std::fs::write(&old_path, format!("OLD_EVIDENCE {}", "x".repeat(8000))).unwrap();
+        std::fs::write(&recent_path, "RECENT_EVIDENCE").unwrap();
+        let read = |id: &str, path: &std::path::Path| {
+            let mut message = finalized_text_message("");
+            message.stop_reason = StopReason::ToolUse;
+            message.content = vec![AssistantContent::ToolCall(ToolCall {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": path}),
+            })];
+            message
+        };
+        let run_config = scripted_run_config(vec![
+            read("old", &old_path),
+            read("recent", &recent_path),
+            finalized_text_message("kept reply"),
+            finalized_text_message("CHECKPOINT"),
+            finalized_text_message("continued"),
+        ]);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let mut config = run_config.lock().unwrap();
+            config.main.provider = Arc::new(RecordingProvider {
+                inner: Arc::clone(&config.main.provider),
+                requests: Arc::clone(&requests),
+            });
+        }
+        let store = ConversationPersistence::new(dir.path().join("sessions"));
+        let (mut agent, log, _persistence) = build_test_agent(&store, &run_config);
+        agent
+            .prompt("inspect both files".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let before = serde_json::to_string(agent.messages()).unwrap();
+        assert!(before.contains("OLD_EVIDENCE") && before.contains("RECENT_EVIDENCE"));
+
+        let outcome = run_compaction(
+            &mut agent,
+            &log,
+            &AppendHandoff::default(),
+            CompactionReason::Manual,
+            Some("focus on the evidence"),
+            100,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "{outcome:?}"
+        );
+        let compacted = serde_json::to_value(agent.messages()).unwrap();
+        let reduced = compacted.to_string();
+        assert!(reduced.contains("CHECKPOINT") && reduced.contains("RECENT_EVIDENCE"));
+        assert!(!reduced.contains("OLD_EVIDENCE"));
+        assert!(reduced.contains("kept reply"));
+        assert!(reduced.len() < before.len());
+
+        let session_id = log.lock().await.session_id().to_string();
+        let resumed = ConversationLog::resume(&store, &session_id).unwrap();
+        let conversation = resumed.linearize(resumed.head().unwrap(), ThreadFilter::USER);
+        assert_eq!(
+            serde_json::to_value(conversation.agent_messages()).unwrap(),
+            compacted
+        );
+
+        agent
+            .prompt("continue".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            5,
+            "one summary call, not an empty history call plus a prefix call"
+        );
+        let summary_request = &requests[3];
+        assert!(summary_request.tools.is_empty());
+        let summary_input = serde_json::to_string(&summary_request.messages).unwrap();
+        assert!(
+            summary_input.contains("inspect both files") && summary_input.contains("OLD_EVIDENCE")
+        );
+        assert!(summary_input.contains("focus on the evidence"));
+        assert!(!summary_input.contains("RECENT_EVIDENCE"));
+        let next = &requests[4].messages;
+        assert!(
+            next.windows(2).any(|pair| matches!(pair,
+                [Message::Assistant(a), Message::ToolResult(result)]
+                    if result.tool_call_id == "recent" && a.content.iter().any(|block|
+                        matches!(block, AssistantContent::ToolCall(call) if call.id == "recent"))
+            )),
+            "the retained result needs its original call on the next request"
+        );
+        assert!(
+            !serde_json::to_string(next)
+                .unwrap()
+                .contains("OLD_EVIDENCE")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_compaction_summaries_leave_live_and_durable_history_unchanged() {
+        use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
+        use aj_agent::bus::listener_from_sync;
+        use aj_session::ConversationPersistence;
+
+        let mut length_limited = finalized_text_message("incomplete checkpoint");
+        length_limited.stop_reason = StopReason::Length;
+        let mut tool_use = finalized_text_message("not a checkpoint");
+        tool_use.stop_reason = StopReason::ToolUse;
+        tool_use.content.push(tool_call());
+        let mut unexpected_tool_call = tool_use.clone();
+        unexpected_tool_call.stop_reason = StopReason::Stop;
+        let mut thinking_only = finalized_text_message("");
+        thinking_only.content = vec![AssistantContent::Thinking(
+            aj_models::types::ThinkingContent {
+                thinking: "summary deliberation".into(),
+                thinking_signature: None,
+                redacted: false,
+            },
+        )];
+
+        for invalid in [
+            finalized_text_message(" \n\t"),
+            thinking_only,
+            length_limited,
+            tool_use,
+            unexpected_tool_call,
+        ] {
+            for fail_prefix in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let store = ConversationPersistence::new(dir.path().to_path_buf());
+                let mut script = vec![
+                    finalized_text_message("first answer"),
+                    finalized_text_message(&"recent work ".repeat(400)),
+                ];
+                if fail_prefix {
+                    script.push(finalized_text_message("valid history summary"));
+                }
+                script.push(invalid.clone());
+                if !fail_prefix {
+                    script.push(finalized_text_message("valid prefix summary"));
+                }
+                let run_config = scripted_run_config(script);
+                let (mut agent, log, _persistence) = build_test_agent(&store, &run_config);
+                agent
+                    .prompt("first question".into(), CancellationToken::new())
+                    .await
+                    .unwrap();
+                agent
+                    .prompt("second question".into(), CancellationToken::new())
+                    .await
+                    .unwrap();
+                let live_before = serde_json::to_value(agent.messages()).unwrap();
+                let (path, head_before) = {
+                    let guard = log.lock().await;
+                    (guard.path().to_path_buf(), guard.head().cloned())
+                };
+                let durable_before = std::fs::read(&path).unwrap();
+                let ends = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let recorded = Arc::clone(&ends);
+                let _events = agent.subscribe(listener_from_sync(move |event| {
+                    if let AgentEvent::CompactionEnd { .. } = event {
+                        recorded.lock().unwrap().push(event.clone());
+                    }
+                }));
+
+                let outcome = run_compaction(
+                    &mut agent,
+                    &log,
+                    &AppendHandoff::default(),
+                    CompactionReason::Manual,
+                    None,
+                    100,
+                    CancellationToken::new(),
+                )
+                .await;
+                assert!(
+                    matches!(outcome, CompactionOutcome::Failed(_)),
+                    "{outcome:?}"
+                );
+                assert_eq!(serde_json::to_value(agent.messages()).unwrap(), live_before);
+                assert_eq!(log.lock().await.head().cloned(), head_before);
+                assert_eq!(std::fs::read(&path).unwrap(), durable_before);
+                assert!(matches!(
+                    ends.lock().unwrap().as_slice(),
+                    [AgentEvent::CompactionEnd {
+                        summary: None,
+                        error: Some(_),
+                        usage: None,
+                        ..
+                    }]
+                ));
+            }
+        }
+    }
 
     fn user(text: &str) -> AgentMessage {
         AgentMessage::wire(Message::User(UserMessage::text(text)))

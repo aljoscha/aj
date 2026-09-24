@@ -125,48 +125,14 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, identifiers, and error messages.";
 
-/// Format instruction for a follow-up compaction: fold the new messages
-/// into the previous summary. The explicit merge rules keep
-/// still-relevant information from being dropped as history is folded
-/// forward.
-const UPDATE_SUMMARY_INSTRUCTION: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+/// Update a continuation checkpoint, not an accumulating work log.
+const UPDATE_SUMMARY_INSTRUCTION: &str = "Use the new conversation messages and <previous-summary> to write an up-to-date checkpoint for another model to continue the work.
 
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed
-- UPDATE \"Next Steps\" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
+Keep the user's active goals, constraints, and preferences. Update progress, decisions, blockers, and next steps to reflect the current state. Retain completed work and failed approaches only when they help avoid repeating work or mistakes. Remove stale, superseded, and duplicate detail. Distinguish verified results from plans and assumptions.
 
-Use this EXACT format:
+Use these headings: ## Goal, ## Constraints & Preferences, ## Progress (### Done, ### In Progress, ### Blocked), ## Key Decisions, ## Next Steps, and ## Critical Context.
 
-## Goal
-[Preserve existing goals, add new ones if the task expanded]
-
-## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
-
-## Progress
-### Done
-- [x] [Include previously done items AND newly completed items]
-
-### In Progress
-- [ ] [Current work - update based on progress]
-
-### Blocked
-- [Current blockers - remove if resolved]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
-
-## Next Steps
-1. [Update based on current state]
-
-## Critical Context
-- [Preserve important context, add new if needed]
-
-Keep each section concise. Preserve exact file paths, function names, identifiers, and error messages.";
+Be concise. Preserve exact file paths, function names, identifiers, and error messages needed to continue.";
 
 /// Build the synthetic user-role message that stands in for compacted
 /// history (the wrapped summary the model reads as context).
@@ -678,7 +644,7 @@ pub fn prepare_compaction(
     let cut = find_cut_point(entries, boundary_start, keep_recent_tokens)?;
     let history_end = cut.turn_start_index.unwrap_or(cut.first_kept_index);
 
-    let messages_to_summarize: Vec<Message> = entries[boundary_start..history_end]
+    let mut messages_to_summarize: Vec<Message> = entries[boundary_start..history_end]
         .iter()
         .filter_map(|e| match &e.entry {
             ConversationEntryKind::Message { message } => {
@@ -688,13 +654,7 @@ pub fn prepare_compaction(
         })
         .collect();
 
-    // Nothing accumulated before the cut: the session is too small to
-    // benefit from a summary, so decline rather than write an empty one.
-    if messages_to_summarize.is_empty() {
-        return None;
-    }
-
-    let turn_prefix_messages: Vec<Message> = match cut.turn_start_index {
+    let mut turn_prefix_messages: Vec<Message> = match cut.turn_start_index {
         Some(turn_start) => entries[turn_start..cut.first_kept_index]
             .iter()
             .filter_map(|e| match &e.entry {
@@ -706,6 +666,16 @@ pub fn prepare_compaction(
             .collect(),
         None => Vec::new(),
     };
+
+    // A long turn can be the only history before the cut. Summarize its
+    // prefix as the main checkpoint so it gets the previous summary and
+    // custom focus too, without an empty history call or a second call.
+    if messages_to_summarize.is_empty() {
+        messages_to_summarize = std::mem::take(&mut turn_prefix_messages);
+        if messages_to_summarize.is_empty() {
+            return None;
+        }
+    }
 
     let mut all_summarized = messages_to_summarize.clone();
     all_summarized.extend(turn_prefix_messages.iter().cloned());
@@ -1031,6 +1001,32 @@ mod tests {
             joined.contains("<task-notification>") && joined.contains("TASK_MARKER"),
             "notice text must feed the summary, got {joined:?}"
         );
+    }
+
+    #[test]
+    fn compaction_can_advance_with_only_a_split_turn_after_the_checkpoint() {
+        let entries = vec![
+            msg_entry("0", user("earlier task")),
+            msg_entry("1", assistant_text("earlier work")),
+            msg_entry("2", user("active request")),
+            compaction_entry("3", "2", "prior checkpoint"),
+            msg_entry("4", tool_call("c1", "read_file", json!({"path": "/x"}))),
+            msg_entry("5", tool_result("c1", "read_file", &"x".repeat(4000))),
+            msg_entry("6", assistant_text("recent work")),
+        ];
+        let conv = Conversation::from_entries("t".to_string(), entries);
+        let plan =
+            prepare_compaction(&conv, 100).expect("the active turn has a summarizable prefix");
+        assert_eq!(plan.previous_summary.as_deref(), Some("prior checkpoint"));
+        let input = serialize_conversation(&plan.messages_to_summarize);
+        assert!(input.contains("active request") && input.contains("[tool call: read_file"));
+        assert!(!input.contains("earlier task") && !input.contains("recent work"));
+        assert!(
+            plan.turn_prefix_messages.is_empty(),
+            "one summary folds in the checkpoint"
+        );
+        assert_eq!(plan.first_kept_entry_id, "6");
+        assert_eq!(plan.file_ops.read_files, ["/x"]);
     }
 
     #[test]
