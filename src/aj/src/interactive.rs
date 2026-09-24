@@ -16772,6 +16772,18 @@ mod tests {
             .expect("login dialog redraw channel remains open");
         let prompt = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(prompt.contains("Account name"), "account prompt: {prompt}");
+        let starting = prompt.find("Starting login").expect("login progress shown");
+        let instruction = prompt
+            .find("Enter an account name below, then press Enter to continue.")
+            .expect("visible instruction to type and submit a name");
+        assert!(
+            instruction > starting,
+            "instruction follows progress: {prompt}"
+        );
+        assert!(
+            prompt.contains("Use a local nickname, such as work or personal."),
+            "account-name meaning: {prompt}"
+        );
         assert!(
             prompt.contains("Unnamed account"),
             "existing account: {prompt}"

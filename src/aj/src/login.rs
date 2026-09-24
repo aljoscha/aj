@@ -361,11 +361,12 @@ impl Widget for LoginDialog {
             height: 0,
         };
 
-        let (line_count, prompt, url, input_error) = {
+        let (line_count, prompt, input_kind, url, input_error) = {
             let st = self.state.lock().expect("login dialog state poisoned");
             (
                 st.lines.len(),
                 st.input_prompt.clone(),
+                st.input_kind,
                 st.url.clone(),
                 st.input_error.clone(),
             )
@@ -389,19 +390,55 @@ impl Widget for LoginDialog {
             }
         }
 
-        // Reserve the bottom rows: a prompt label + field pair while
-        // prompting, and one row for the notice.
+        // Keep the input visible even when the progress history overflows.
         let mut reserved: u16 = 0;
-        if prompt.is_some() {
-            reserved = reserved.saturating_add(2);
-        }
         if self.notice.is_some() {
             reserved = reserved.saturating_add(1);
         }
         if input_error.is_some() {
             reserved = reserved.saturating_add(1);
         }
-        let list_height = size.height.saturating_sub(reserved);
+        let prompt_surface = prompt.as_ref().map(|prompt| {
+            let mut label = Text::new(prompt.clone());
+            label.style = self.styles.prompt;
+            label.width_basis = WidthBasis::Parent;
+            label.draw(&ctx.with_constraints(
+                zero,
+                MaxSize {
+                    width: Some(size.width),
+                    height: Some(size.height.saturating_sub(reserved.saturating_add(1))),
+                },
+            ))
+        });
+        if let Some(label) = &prompt_surface {
+            reserved = reserved.saturating_add(label.size.height).saturating_add(1);
+        }
+        let mut list_height = size.height.saturating_sub(reserved);
+        if input_kind == Some(LoginInputKind::AccountLabel) {
+            // Account setup is a form, not a wait screen. Fit the history to
+            // its wrapped content so the field follows its instructions.
+            let builder = LineBuilder {
+                state: Arc::clone(&self.state),
+                styles: self.styles,
+            };
+            let measure_ctx = ctx.with_constraints(
+                zero,
+                MaxSize {
+                    width: Some(size.width),
+                    height: None,
+                },
+            );
+            let mut height: u16 = 0;
+            for index in 0..line_count {
+                if let Some(line) = builder.item_at_idx(index, 0) {
+                    height = height.saturating_add(draw_widget(&line, &measure_ctx).size.height);
+                }
+                if height >= list_height {
+                    break;
+                }
+            }
+            list_height = list_height.min(height);
+        }
 
         if list_height > 0 {
             let list_ctx = ctx.with_constraints(
@@ -419,10 +456,8 @@ impl Widget for LoginDialog {
         }
 
         let mut row = list_height;
-        if let Some(prompt) = &prompt {
-            let mut label = Text::new(prompt.clone());
-            label.style = self.styles.prompt;
-            label.width_basis = WidthBasis::Parent;
+        if let Some(label) = prompt_surface {
+            let label_height = label.size.height;
             let one_row = ctx.with_constraints(
                 zero,
                 MaxSize {
@@ -437,10 +472,10 @@ impl Widget for LoginDialog {
                     row: i32::from(row),
                     col: 0,
                 },
-                surface: label.draw(&one_row),
+                surface: label,
                 z_index: 0,
             });
-            row = row.saturating_add(1);
+            row = row.saturating_add(label_height);
 
             let field_surface = self.field.draw(&one_row);
             let field_cursor = field_surface.cursor;
@@ -700,6 +735,14 @@ impl DialogCallbacks {
         let (tx, rx) = oneshot::channel();
         {
             let mut st = self.state.lock().expect("login dialog state poisoned");
+            if kind == LoginInputKind::AccountLabel {
+                st.lines.push(LoginLine::Info(
+                    "Enter an account name below, then press Enter to continue.".to_string(),
+                ));
+                st.lines.push(LoginLine::Info(
+                    "Use a local nickname, such as work or personal.".to_string(),
+                ));
+            }
             st.input_prompt = Some(prompt.to_string());
             st.input_kind = Some(kind);
             st.input_error = None;
@@ -1362,6 +1405,67 @@ mod tests {
         dialog.handle_event(&mut ctx, &Event::Paste("code".to_string()));
         dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
         assert_eq!(fut.await.unwrap().unwrap(), ("work".into(), "code".into()));
+    }
+
+    #[tokio::test]
+    async fn account_entry_follows_wrapped_instructions_and_stays_visible_when_short() {
+        let (mut dialog, state, pending, _cancel) = make();
+        let (cb, _rx) = callbacks(&state, &pending);
+        cb.on_progress("Starting login…");
+        let task = tokio::spawn(async move { cb.prompt_account_label(&[]).await });
+        tokio::task::yield_now().await;
+        let mut ctx = EventContext::new();
+        dialog.handle_event(&mut ctx, &Event::Paste("work".to_string()));
+
+        for (width, height) in [(80, 16), (32, 20), (32, 5)] {
+            let surface = dialog.draw(&crate::test_support::draw_ctx(width, Some(height)));
+            let rows = crate::test_support::rows(&surface);
+            let label = rows.iter().position(|row| row == "Account name:").unwrap();
+            assert_eq!(rows[label + 1], "work", "field follows label: {rows:?}");
+            let cursor = surface.cursor.expect("account entry has a cursor");
+            assert_eq!(usize::from(cursor.row), label + 1);
+            assert!(cursor.row < height, "entry stays in the viewport");
+            if height > 5 {
+                assert!(rows[..label].iter().all(|row| !row.is_empty()));
+                assert!(rows[label - 1].ends_with("personal."), "{rows:?}");
+                assert!(label + 2 < usize::from(height), "fixture has spare room");
+            }
+        }
+
+        dialog.handle_event(&mut ctx, &Event::Paste("\n".to_string()));
+        let surface = dialog.draw(&crate::test_support::draw_ctx(80, Some(16)));
+        let rows = crate::test_support::rows(&surface);
+        let field = rows.iter().position(|row| row == "work").unwrap();
+        assert!(rows[field + 1].starts_with("Account label paste rejected:"));
+        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+        assert_eq!(task.await.unwrap().unwrap(), "work");
+    }
+
+    #[tokio::test]
+    async fn manual_code_prompt_wraps_without_hiding_input() {
+        let (mut dialog, state, pending, _cancel) = make();
+        let (cb, _rx) = callbacks(&state, &pending);
+        let task = tokio::spawn(async move { cb.on_manual_code_input().await });
+        tokio::task::yield_now().await;
+        let prompt = state.lock().unwrap().input_prompt.clone().unwrap();
+        let mut ctx = EventContext::new();
+        dialog.handle_event(&mut ctx, &Event::Paste("code123".to_string()));
+        for width in [80, 32] {
+            assert!(prompt.len() > usize::from(width), "fixture needs wrapping");
+            let surface = dialog.draw(&crate::test_support::draw_ctx(width, Some(14)));
+            let rows = crate::test_support::rows(&surface);
+            let cursor = surface.cursor.expect("manual input has a cursor");
+            assert!(cursor.row < 14);
+            assert_eq!(rows[usize::from(cursor.row)], "code123");
+            let visible = rows[..usize::from(cursor.row)]
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(visible, prompt, "the entire prompt is readable at {width}");
+        }
+        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+        assert_eq!(task.await.unwrap().unwrap(), "code123");
     }
 
     /// While a prompt is active, the field's cursor is lifted onto the
