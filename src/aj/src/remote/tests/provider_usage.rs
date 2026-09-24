@@ -136,6 +136,10 @@ impl UsageSource for FakeUsage {
             .count();
         Ok(UsageReport::Usage(ProviderUsage {
             windows: vec![],
+            details: vec![aj_models::usage::UsageDetail {
+                label: "Usage credits".into(),
+                value: format!("{account} credits"),
+            }],
             notes: vec![format!("{} {account} report", self.name)],
             reset_credits: Some(RateLimitResetCredits::new(
                 2 - u32::try_from(spent).unwrap(),

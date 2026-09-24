@@ -58,3 +58,44 @@ pub enum UsageResetFailure {
 
 /// Provider result, carried independently of HTTP and session-address refusals.
 pub type UsageResetResponse = Result<ResetOutcome, UsageResetFailure>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aj_models::usage::UsageDetail;
+
+    #[test]
+    fn usage_details_default_for_old_reports_and_roundtrip_with_notes() {
+        let old = serde_json::json!({
+            "statuses": [{
+                "provider_id": "anthropic",
+                "account": null,
+                "outcome": {"Usage": {
+                    "windows": [],
+                    "notes": ["a freeform note"],
+                    "reset_credits": null
+                }}
+            }],
+            "reset_providers": []
+        });
+        let mut report: ProviderUsageReport = serde_json::from_value(old).unwrap();
+        let UsageOutcome::Usage(usage) = &mut report.statuses[0].outcome else {
+            panic!("expected usage");
+        };
+        assert!(usage.details.is_empty());
+        assert_eq!(usage.notes, ["a freeform note"]);
+        usage.details.push(UsageDetail {
+            label: "Usage credits".to_string(),
+            value: "off".to_string(),
+        });
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            encoded["statuses"][0]["outcome"]["Usage"]["details"],
+            serde_json::json!([{"label": "Usage credits", "value": "off"}])
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderUsageReport>(encoded).unwrap(),
+            report
+        );
+    }
+}

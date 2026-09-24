@@ -554,6 +554,7 @@ mod tests {
                         used: 0.25,
                         resets_at: Some(123),
                     }],
+                    details: Vec::new(),
                     notes: vec!["personal note".to_string()],
                     reset_credits: None,
                 })),

@@ -623,8 +623,8 @@ pub(crate) fn auth_rows(
 }
 
 /// Provider/account headings with globally aligned labels, percentages and
-/// reset columns. Reset-credit counts share the percentage column. Notes are
-/// prose beneath their own group and do not participate in column sizing.
+/// reset columns. Labeled details and reset-credit counts share the percentage
+/// column. Free-form notes do not participate in column sizing.
 /// Unsupported accounts and providers without a usage source are omitted.
 pub(crate) fn usage_rows(
     statuses: &[ProviderUsageStatus],
@@ -648,6 +648,13 @@ pub(crate) fn usage_rows(
             )),
         )
     });
+    for status in statuses {
+        if let UsageOutcome::Usage(usage) = &status.outcome {
+            for detail in &usage.details {
+                label_width = label_width.max(terminal_cells(&detail.label, width_method));
+            }
+        }
+    }
     let reset_label = "Rate-limit resets";
     if statuses.iter().any(|status| {
         matches!(&status.outcome, UsageOutcome::Usage(usage) if usage.reset_credits.is_some())
@@ -661,6 +668,7 @@ pub(crate) fn usage_rows(
         match &status.outcome {
             UsageOutcome::Usage(usage) => {
                 if usage.windows.is_empty()
+                    && usage.details.is_empty()
                     && usage.notes.is_empty()
                     && usage.reset_credits.is_none()
                 {
@@ -691,6 +699,15 @@ pub(crate) fn usage_rows(
                         ));
                     }
                     group.push(row);
+                }
+                for detail in &usage.details {
+                    group.push(vec![
+                        span(
+                            format!("  {}", pad_cells(&detail.label, label_width, width_method)),
+                            Style::default(),
+                        ),
+                        span(format!("  {}", detail.value), styles.muted),
+                    ]);
                 }
                 for note in &usage.notes {
                     group.push(vec![span(format!("  {note}"), styles.muted)]);
@@ -1414,6 +1431,7 @@ mod tests {
                 provider_name: "Claude".into(),
                 account: Some("個人".into()),
                 outcome: UsageOutcome::Usage(ProviderUsage {
+                    details: Vec::new(),
                     windows: vec![UsageWindow {
                         label: "週末".into(),
                         used: 1.0,
@@ -1428,6 +1446,7 @@ mod tests {
                 provider_name: String::new(),
                 account: Some(String::new()),
                 outcome: UsageOutcome::Usage(ProviderUsage {
+                    details: Vec::new(),
                     windows: vec![UsageWindow {
                         label: "5-hour".into(),
                         used: 0.01,
@@ -1482,6 +1501,50 @@ mod tests {
     }
 
     #[test]
+    fn labeled_usage_details_share_the_metric_column_and_keep_values_muted() {
+        use aj_models::usage::{ProviderUsage, UsageDetail, UsageWindow};
+        let statuses = [
+            ProviderUsageStatus {
+                provider_id: "first".into(),
+                provider_name: String::new(),
+                account: None,
+                outcome: UsageOutcome::Usage(ProviderUsage {
+                    windows: vec![UsageWindow {
+                        label: "5h limit".into(),
+                        used: 1.0,
+                        resets_at: Some(0),
+                    }],
+                    ..ProviderUsage::default()
+                }),
+            },
+            ProviderUsageStatus {
+                provider_id: "second".into(),
+                provider_name: String::new(),
+                account: None,
+                outcome: UsageOutcome::Usage(ProviderUsage {
+                    details: vec![UsageDetail {
+                        label: "Usage credits".into(),
+                        value: "off".into(),
+                    }],
+                    ..ProviderUsage::default()
+                }),
+            },
+        ];
+        let mut overlay =
+            ContentOverlay::new(usage_rows(&statuses, &test_styles(), Method::Unicode));
+        let surface = overlay.draw(&crate::test_support::draw_ctx(80, Some(12)));
+        let rows = crate::test_support::rows(&surface);
+        let cells = crate::test_support::flatten(&surface);
+        assert_eq!(rows[4], "  Usage credits  off");
+        assert!(rows[1].contains("100% used"));
+        let column = rows[1].find("100% used").unwrap();
+        assert_eq!(rows[4].find("off"), Some(column));
+        assert_eq!(cells[4][2].style, Style::default());
+        assert_eq!(cells[4][column].style, test_styles().muted);
+        assert!(!rows.join("\n").contains("no usage data reported"));
+    }
+
+    #[test]
     fn usage_rows_hide_unsupported_accounts_but_preserve_diagnostics_and_labels() {
         use aj_models::usage::ProviderUsage;
         let mut statuses: Vec<_> = [
@@ -1492,6 +1555,7 @@ mod tests {
             },
             UsageOutcome::Error("fetch failed".into()),
             UsageOutcome::Usage(ProviderUsage {
+                details: Vec::new(),
                 windows: vec![],
                 notes: vec![],
                 reset_credits: None,

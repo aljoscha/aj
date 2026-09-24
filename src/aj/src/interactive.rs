@@ -30920,6 +30920,10 @@ mod tests {
             focus_overlay(&mut app, &root);
             let page = usage_page_until(&shell, "usage-owner work report").await;
             assert!(page.contains("usage-owner personal report"));
+            assert!(
+                page.contains("Usage credits") && page.contains("work credits"),
+                "{page}"
+            );
             assert_eq!(page.matches("2 available").count(), 2);
             assert!(
                 !page.contains("other-host") && !page.contains("secret"),

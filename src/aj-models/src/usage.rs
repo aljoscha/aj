@@ -33,12 +33,22 @@ pub struct UsageWindow {
     pub resets_at: Option<i64>,
 }
 
+/// A labeled usage fact, ready for independent label and value styling.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageDetail {
+    pub label: String,
+    pub value: String,
+}
+
 /// A provider's full usage report.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderUsage {
     /// Rate-limit windows in the source's preferred display order.
     pub windows: Vec<UsageWindow>,
-    /// Free-form extra lines, e.g. a usage-credit balance.
+    /// Labeled facts in the source's preferred display order.
+    #[serde(default)]
+    pub details: Vec<UsageDetail>,
+    /// Free-form extra lines.
     pub notes: Vec<String>,
     /// Earned rate-limit reset credits and the exact account they apply to.
     /// `None` means no safely targetable reset mechanism was reported.
@@ -258,7 +268,7 @@ pub mod anthropic {
     use async_trait::async_trait;
     use chrono::DateTime;
 
-    use super::{ProviderUsage, UsageError, UsageReport, UsageSource, UsageWindow};
+    use super::{ProviderUsage, UsageDetail, UsageError, UsageReport, UsageSource, UsageWindow};
     use crate::auth::AuthStorage;
 
     /// Reports plan rate-limit utilization via the Claude.ai
@@ -317,19 +327,27 @@ pub mod anthropic {
             .filter(|windows| !windows.is_empty())
             .unwrap_or_else(|| map_legacy_windows(usage));
 
-        let mut notes = Vec::new();
-        if let Some(note) = usage.spend.as_ref().and_then(spend_note) {
-            notes.push(note);
-        }
-        if let Some(note) = usage.extra_usage.as_ref().and_then(extra_usage_note) {
-            if !notes.iter().any(|existing| existing == &note) {
-                notes.push(note);
+        let mut details = Vec::new();
+        for value in [
+            usage.spend.as_ref().and_then(spend_value),
+            usage.extra_usage.as_ref().and_then(extra_usage_value),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let detail = UsageDetail {
+                label: "Usage credits".to_string(),
+                value,
+            };
+            if !details.contains(&detail) {
+                details.push(detail);
             }
         }
 
         ProviderUsage {
             windows,
-            notes,
+            details,
+            notes: Vec::new(),
             // Anthropic has no rate-limit reset-credit mechanism.
             reset_credits: None,
         }
@@ -473,11 +491,11 @@ pub mod anthropic {
             .map(|dt| dt.timestamp_millis())
     }
 
-    fn spend_note(spend: &OAuthSpend) -> Option<String> {
+    fn spend_value(spend: &OAuthSpend) -> Option<String> {
         if spend.enabled == Some(false) {
             return Some(match spend.disabled_reason.as_deref() {
-                Some(reason) => format!("Usage credits: off ({})", disabled_reason_text(reason)),
-                None => "Usage credits: off".to_string(),
+                Some(reason) => format!("off ({})", disabled_reason_text(reason)),
+                None => "off".to_string(),
             });
         }
 
@@ -488,17 +506,11 @@ pub mod anthropic {
             .or(spend.cap.as_ref())
             .and_then(format_money_amount);
         match (used, limit, spend.percent) {
-            (Some(used), Some(limit), _) => Some(format!("Usage credits: {used} of {limit} spent")),
-            (Some(used), None, _) => Some(format!("Usage credits: {used} spent")),
-            (None, None, Some(percent)) => Some(format!(
-                "Usage credits: {:.0}% used",
-                percent.clamp(0.0, 100.0)
-            )),
-            (None, None, None) => spend
-                .disabled_reason
-                .as_deref()
-                .map(|reason| format!("Usage credits: {}", disabled_reason_text(reason))),
-            (None, Some(limit), _) => Some(format!("Usage credits: limit {limit}")),
+            (Some(used), Some(limit), _) => Some(format!("{used} of {limit} spent")),
+            (Some(used), None, _) => Some(format!("{used} spent")),
+            (None, None, Some(percent)) => Some(format!("{:.0}% used", percent.clamp(0.0, 100.0))),
+            (None, None, None) => spend.disabled_reason.as_deref().map(disabled_reason_text),
+            (None, Some(limit), _) => Some(format!("limit {limit}")),
         }
     }
 
@@ -530,12 +542,12 @@ pub mod anthropic {
         text.to_string()
     }
 
-    fn extra_usage_note(extra: &OAuthExtraUsage) -> Option<String> {
+    fn extra_usage_value(extra: &OAuthExtraUsage) -> Option<String> {
         if extra.is_enabled != Some(true) {
             return extra
                 .disabled_reason
                 .as_deref()
-                .map(|reason| format!("Usage credits: off ({})", disabled_reason_text(reason)));
+                .map(|reason| format!("off ({})", disabled_reason_text(reason)));
         }
         let decimals = extra.decimal_places.unwrap_or(2);
         let used = format_money_minor(
@@ -547,7 +559,7 @@ pub mod anthropic {
             Some(limit) => format_money_minor(limit, extra.currency.as_deref(), decimals),
             None => "unlimited".to_string(),
         };
-        Some(format!("Usage credits: {used} of {limit} spent"))
+        Some(format!("{used} of {limit} spent"))
     }
 
     fn format_money_amount(money: &OAuthMoney) -> Option<String> {
@@ -570,6 +582,45 @@ pub mod anthropic {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn credit_details_preserve_distinct_values_and_deduplicate_matches() {
+            for (spend, extra, expected) in [
+                (
+                    serde_json::json!({"enabled": false}),
+                    serde_json::json!({"is_enabled": true, "used_credits": 230}),
+                    vec!["off", "$2.30 of unlimited spent"],
+                ),
+                (
+                    serde_json::json!({"enabled": true, "percent": 37}),
+                    serde_json::json!({"is_enabled": false, "disabled_reason": "org_level_disabled"}),
+                    vec!["37% used", "off (turned off by your organization)"],
+                ),
+                (
+                    serde_json::json!({"used": {"amount_minor": 123}, "cap": {"amount_minor": 5000}}),
+                    serde_json::json!({"is_enabled": true, "used_credits": 123, "monthly_limit": 5000}),
+                    vec!["$1.23 of $50.00 spent"],
+                ),
+            ] {
+                let usage = serde_json::from_value(serde_json::json!({
+                    "spend": spend,
+                    "extra_usage": extra,
+                }))
+                .unwrap();
+                let report = map_usage(&usage);
+                assert_eq!(
+                    report.details,
+                    expected
+                        .into_iter()
+                        .map(|value| UsageDetail {
+                            label: "Usage credits".to_string(),
+                            value: value.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                );
+                assert!(report.notes.is_empty());
+            }
+        }
 
         #[test]
         fn maps_windows_in_display_order_and_skips_empty() {
@@ -655,7 +706,7 @@ pub mod anthropic {
         }
 
         #[test]
-        fn spend_note_formats_credit_shape() {
+        fn spend_value_formats_credit_shape() {
             let spend: OAuthSpend = serde_json::from_str(
                 r#"{
                     "enabled": true,
@@ -664,41 +715,32 @@ pub mod anthropic {
                 }"#,
             )
             .unwrap();
-            assert_eq!(
-                spend_note(&spend).unwrap(),
-                "Usage credits: $1.23 of $50.00 spent"
-            );
+            assert_eq!(spend_value(&spend).unwrap(), "$1.23 of $50.00 spent");
 
             let disabled: OAuthSpend =
                 serde_json::from_str(r#"{"enabled": false, "disabled_reason": "out_of_credits"}"#)
                     .unwrap();
-            assert_eq!(
-                spend_note(&disabled).unwrap(),
-                "Usage credits: off (out of credits)"
-            );
+            assert_eq!(spend_value(&disabled).unwrap(), "off (out of credits)");
         }
 
         #[test]
-        fn extra_usage_note_formats_money() {
+        fn extra_usage_value_formats_money() {
             let extra: OAuthExtraUsage = serde_json::from_str(
                 r#"{"is_enabled": true, "monthly_limit": 5000, "used_credits": 123, "currency": "USD"}"#,
             )
             .unwrap();
-            assert_eq!(
-                extra_usage_note(&extra).unwrap(),
-                "Usage credits: $1.23 of $50.00 spent"
-            );
+            assert_eq!(extra_usage_value(&extra).unwrap(), "$1.23 of $50.00 spent");
         }
 
         #[test]
-        fn extra_usage_note_unlimited_and_disabled() {
+        fn extra_usage_value_unlimited_and_disabled() {
             let unlimited: OAuthExtraUsage = serde_json::from_str(
                 r#"{"is_enabled": true, "monthly_limit": null, "used_credits": 200, "currency": "EUR"}"#,
             )
             .unwrap();
             assert_eq!(
-                extra_usage_note(&unlimited).unwrap(),
-                "Usage credits: 2.00 EUR of unlimited spent"
+                extra_usage_value(&unlimited).unwrap(),
+                "2.00 EUR of unlimited spent"
             );
 
             let disabled: OAuthExtraUsage = serde_json::from_str(
@@ -706,8 +748,8 @@ pub mod anthropic {
             )
             .unwrap();
             assert_eq!(
-                extra_usage_note(&disabled).unwrap(),
-                "Usage credits: off (out of credits)"
+                extra_usage_value(&disabled).unwrap(),
+                "off (out of credits)"
             );
         }
 
@@ -718,8 +760,8 @@ pub mod anthropic {
             )
             .unwrap();
             assert_eq!(
-                spend_note(&spend).unwrap(),
-                "Usage credits: off (monthly spend limit reached)"
+                spend_value(&spend).unwrap(),
+                "off (monthly spend limit reached)"
             );
 
             let extra: OAuthExtraUsage = serde_json::from_str(
@@ -727,8 +769,8 @@ pub mod anthropic {
             )
             .unwrap();
             assert_eq!(
-                extra_usage_note(&extra).unwrap(),
-                "Usage credits: off (monthly spend limit reached)"
+                extra_usage_value(&extra).unwrap(),
+                "off (monthly spend limit reached)"
             );
 
             // The plain code is an admin switching credits off, the
@@ -758,7 +800,7 @@ pub mod codex {
 
     use super::{
         ProviderUsage, RateLimitResetCredits, RateLimitResetSource, RateLimitResetTarget,
-        ResetOutcome, UsageError, UsageReport, UsageSource, UsageWindow,
+        ResetOutcome, UsageDetail, UsageError, UsageReport, UsageSource, UsageWindow,
     };
     use crate::auth::AuthStorage;
     use crate::oauth::openai::extract_account_id;
@@ -1027,7 +1069,7 @@ pub mod codex {
     /// Map the wire payload into the generic report. Windows come from
     /// the primary/secondary rolling limits, the per-feature
     /// `additional_rate_limits`, and the workspace monthly credit cap.
-    /// The credits balance rides along as a note. Earned reset credits
+    /// The credits balance is a labeled detail. Earned reset credits
     /// surface as the structured [`ProviderUsage::reset_credits`].
     fn map_usage(payload: &UsagePayload, reset_target: RateLimitResetTarget) -> ProviderUsage {
         let mut windows = Vec::new();
@@ -1053,10 +1095,12 @@ pub mod codex {
             windows.push(window);
         }
 
-        let mut notes = Vec::new();
-        if let Some(note) = payload.credits.as_ref().and_then(Credits::note) {
-            notes.push(note);
-        }
+        let details = payload
+            .credits
+            .as_ref()
+            .and_then(Credits::detail)
+            .into_iter()
+            .collect();
 
         // Negative counts shouldn't happen, but clamp defensively so a
         // bad payload can't wrap into a huge unsigned value.
@@ -1069,7 +1113,8 @@ pub mod codex {
 
         ProviderUsage {
             windows,
-            notes,
+            details,
+            notes: Vec::new(),
             reset_credits,
         }
     }
@@ -1143,18 +1188,25 @@ pub mod codex {
     }
 
     impl Credits {
-        /// One note line describing the credit balance, or `None` when
-        /// the account has no credit tracking (matching the windows-only
-        /// view those accounts get).
-        fn note(&self) -> Option<String> {
+        /// Credit balance, or `None` when the account has no credit tracking
+        /// or no nonblank balance to report.
+        fn detail(&self) -> Option<UsageDetail> {
             if !self.has_credits {
                 return None;
             }
-            if self.unlimited {
-                return Some("Credits: unlimited".to_string());
-            }
-            let balance = self.balance.as_deref()?.trim();
-            (!balance.is_empty()).then(|| format!("Credits: {balance}"))
+            let value = if self.unlimited {
+                "unlimited"
+            } else {
+                let balance = self.balance.as_deref()?.trim();
+                if balance.is_empty() {
+                    return None;
+                }
+                balance
+            };
+            Some(UsageDetail {
+                label: "Credits".to_string(),
+                value: value.to_string(),
+            })
         }
     }
 
@@ -1288,12 +1340,13 @@ pub mod codex {
         }
 
         #[test]
-        fn team_plan_reports_reset_credits_and_no_credit_note() {
+        fn team_plan_reports_reset_credits_and_no_credit_detail() {
             let payload: UsagePayload = serde_json::from_str(TEAM_PLAN_RESPONSE).unwrap();
             let report = map_usage(&payload, reset_target("acct-team"));
-            // has_credits is false, so no credit-balance note; the two
+            // has_credits is false, so no credit-balance detail. The two
             // available reset credits surface as the structured count.
             assert!(report.notes.is_empty());
+            assert!(report.details.is_empty());
             let offer = report.reset_credits.unwrap();
             assert_eq!(offer.available, 2);
             assert_eq!(offer.target.upstream_account_id, "acct-team");
@@ -1348,10 +1401,55 @@ pub mod codex {
             );
             // remaining_percent 40 => 60% used.
             assert_eq!(report.windows[2].used, 0.6);
-            // available_count 0 keeps the note list to just the balance,
+            // available_count 0 keeps the details to just the balance,
             // and surfaces the supported-but-empty reset count.
-            assert_eq!(report.notes, vec!["Credits: 1234".to_string()]);
+            assert_eq!(
+                report.details,
+                vec![UsageDetail {
+                    label: "Credits".to_string(),
+                    value: "1234".to_string(),
+                }]
+            );
+            assert!(report.notes.is_empty());
             assert_eq!(report.reset_credits.unwrap().available, 0);
+        }
+
+        #[test]
+        fn credit_details_preserve_balance_and_unlimited_semantics() {
+            for (credits, expected) in [
+                (
+                    serde_json::json!({"has_credits": true, "balance": " 12.34 "}),
+                    Some("12.34"),
+                ),
+                (
+                    serde_json::json!({"has_credits": true, "unlimited": true}),
+                    Some("unlimited"),
+                ),
+                (
+                    serde_json::json!({"has_credits": true, "balance": " "}),
+                    None,
+                ),
+                (serde_json::json!({"has_credits": true}), None),
+                (
+                    serde_json::json!({"has_credits": false, "unlimited": true, "balance": "12"}),
+                    None,
+                ),
+            ] {
+                let payload =
+                    serde_json::from_value(serde_json::json!({"credits": credits})).unwrap();
+                let report = map_usage(&payload, reset_target("acct-work"));
+                assert_eq!(
+                    report.details,
+                    expected
+                        .into_iter()
+                        .map(|value| UsageDetail {
+                            label: "Credits".to_string(),
+                            value: value.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                );
+                assert!(report.notes.is_empty());
+            }
         }
 
         #[test]

@@ -1137,6 +1137,7 @@ mod tests {
             provider_id: provider_id.into(),
             account: account.map(str::to_string),
             outcome: UsageOutcome::Usage(ProviderUsage {
+                details: Vec::new(),
                 windows: vec![UsageWindow {
                     label: "5h limit".into(),
                     used: 0.96,

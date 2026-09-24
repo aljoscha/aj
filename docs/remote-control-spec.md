@@ -627,9 +627,13 @@ side's limitation. Neither side's values fall back to the other's.
   `statuses` sorted by provider and exact account label, and `reset_providers`
   naming providers with a configured reset adapter. Each status contains
   `provider_id`, `provider_name`, nullable `account`, and `outcome`: `Usage`
-  (windows, notes, optional reset credits), `Unsupported` (reason),
+  (windows, details, notes, optional reset credits), `Unsupported` (reason),
   `NotConfigured`, `NoSource`, or `Error` (message). Enums use serde's externally
   tagged representation.
+  `details` is an ordered array of `{label, value}` string pairs for labeled
+  facts such as credit balances. This additive field defaults to an empty array
+  when absent. Labels and values render independently, without parsing display
+  strings. `notes` remains freeform text.
   `provider_name` is the host display label for the credential kind: the
   registered OAuth name for subscriptions, or the friendly API-provider name
   for API keys. Unknown providers fall back to their ID. This additive field
