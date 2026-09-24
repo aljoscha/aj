@@ -15181,14 +15181,16 @@ mod tests {
                 .expect("auth fetch channel remains open");
             let rows = rows
                 .into_iter()
-                .filter(|row| row.iter().any(|segment| segment.text.contains(provider_id)))
+                .filter(|row| {
+                    row.spans()
+                        .any(|segment| segment.text.contains(provider_id))
+                })
                 .collect::<Vec<_>>();
             assert_eq!(rows.len(), 2, "one row per exact account");
 
             let summary_col = |row: &Row| {
-                let text: WidgetRef =
-                    Rc::new(RefCell::new(vaxis::vxfw::RichText::new(row.clone())));
-                let surface = draw_widget(&text, &ctx);
+                let widgets = crate::content_row::row_widgets(std::slice::from_ref(row));
+                let surface = draw_widget(&widgets[0], &ctx);
                 crate::test_support::flatten(&surface)[0]
                     .iter()
                     .position(|cell| cell.char.grapheme() == "A")
@@ -15221,6 +15223,66 @@ mod tests {
             .flat_map(|cell| cell.char.grapheme().chars())
             .filter(|ch| !ch.is_whitespace())
             .collect()
+    }
+
+    fn assert_modal_columns(surface: &Surface, label: &str, value: &str, must_wrap: bool) {
+        let cells = crate::test_support::flatten(surface);
+        // Recover each column separately from the actual value origin. Reading
+        // whole lines would also accept continuation text spilling under labels.
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        };
+        let expected = compact(value);
+        let first_word = value.split_whitespace().next().unwrap();
+        for (start, row) in cells.iter().enumerate() {
+            for origin in 1..row.len().saturating_sub(1) {
+                let text: String = row[origin..row.len() - 1]
+                    .iter()
+                    .map(|cell| cell.char.grapheme())
+                    .collect();
+                if !text.starts_with(first_word) {
+                    continue;
+                }
+                let mut left = String::new();
+                let mut right = String::new();
+                for (line, row) in cells.iter().enumerate().skip(start) {
+                    left.extend(
+                        row[1..origin]
+                            .iter()
+                            .flat_map(|cell| cell.char.grapheme().chars()),
+                    );
+                    right.extend(
+                        row[origin..row.len() - 1]
+                            .iter()
+                            .flat_map(|cell| cell.char.grapheme().chars()),
+                    );
+                    if !expected.starts_with(&compact(&right)) {
+                        break;
+                    }
+                    if compact(&right) == expected && compact(&left).contains(&compact(label)) {
+                        if !must_wrap {
+                            return;
+                        }
+                        assert!(line > start, "the value must wrap in this fixture");
+                        let first_label: String = cells[start][1..origin]
+                            .iter()
+                            .map(|cell| cell.char.grapheme())
+                            .collect();
+                        assert!(
+                            !compact(&first_label).contains(&compact(label)),
+                            "the label must wrap independently in this fixture"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        panic!(
+            "wrapped value {value:?} must stay at or right of its rendered origin beside label {label:?}: {:?}",
+            crate::test_support::rows(surface)
+        );
     }
 
     #[tokio::test]
@@ -15258,13 +15320,13 @@ mod tests {
         let credentials: Vec<_> = rows
             .iter()
             .filter(|row| {
-                row.iter()
+                row.spans()
                     .any(|segment| segment.text.contains("subscription"))
             })
             .collect();
         assert_eq!(credentials.len(), 2, "one logical row per credential");
         assert!(
-            credentials.iter().any(|row| row.iter().any(|segment| {
+            credentials.iter().any(|row| row.spans().any(|segment| {
                 segment
                     .text
                     .contains("expired (auto-refreshes on next request)")
@@ -15273,13 +15335,13 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .all(|row| row.iter().any(|segment| !segment.text.trim().is_empty())),
+                .all(|row| row.spans().any(|segment| !segment.text.trim().is_empty())),
             "auth has no blank group separators"
         );
         let muted = ContentStyles::from_theme(&shell.borrow().theme.read()).muted;
         let expiry = credentials
             .iter()
-            .flat_map(|row| row.iter())
+            .flat_map(|row| row.spans())
             .find(|segment| segment.text.contains("expired"))
             .unwrap();
         assert_eq!(expiry.style, muted, "inline detail is muted");
@@ -15297,32 +15359,25 @@ mod tests {
                 }
             );
             let content = modal_content(modal);
-            for text in [
-                "Anthropic subscription",
-                "personal",
-                "engineering-production",
-                "expired (auto-refreshes on next request)",
-            ] {
+            for text in ["Anthropic subscription", "personal"] {
                 let expected: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
                 assert!(content.contains(&expected), "{width}x{height}: {content}");
             }
             assert!(!content.contains("secret-sentinel"), "{content}");
-            if width == 80 {
-                let lines = crate::test_support::rows(modal);
-                let account_line = lines
-                    .iter()
-                    .position(|line| line.contains("engineering-production"))
-                    .unwrap();
-                let detail_line = lines
-                    .iter()
-                    .position(|line| line.contains("expired"))
-                    .unwrap();
-                assert!(
-                    detail_line > account_line,
-                    "the narrow fixture must exercise wrapping: {lines:?}"
-                );
-            }
+            assert_modal_columns(
+                modal,
+                "engineering-production",
+                "subscription · expired (auto-refreshes on next request)",
+                false,
+            );
         }
+        let composed = shell.borrow_mut().draw(&draw_ctx(40, 60));
+        assert_modal_columns(
+            drawn_modal(&composed),
+            "engineering-production",
+            "subscription · expired (auto-refreshes on next request)",
+            true,
+        );
         shut_down(&world).await;
     }
 
@@ -15389,14 +15444,14 @@ mod tests {
         let rows = rows
             .into_iter()
             .filter(|row| {
-                row.iter()
+                row.spans()
                     .any(|segment| segment.text.contains("provider ·"))
             })
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1, "the legacy row is the measured list child");
         let fetched = rows
             .iter()
-            .flat_map(|row| row.iter())
+            .flat_map(|row| row.spans())
             .map(|segment| segment.text.as_str())
             .collect::<String>();
 
@@ -15669,7 +15724,7 @@ mod tests {
             let rows = rx.await.unwrap();
             let page = rows
                 .iter()
-                .flatten()
+                .flat_map(Row::spans)
                 .map(|s| s.text.as_str())
                 .collect::<String>();
             assert!(page.contains("host-sentinel"), "{page}");
@@ -15982,7 +16037,7 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .flatten()
+            .flat_map(Row::spans)
             .map(|s| s.text.as_str())
             .collect::<String>();
         assert!(
@@ -31078,6 +31133,13 @@ mod tests {
             assert_eq!(content.matches("2available").count(), 2, "{content}");
             assert!(!content.contains("secret"), "{content}");
         }
+        let composed = shell.borrow_mut().draw(&draw_ctx(30, 60));
+        assert_modal_columns(
+            drawn_modal(&composed),
+            "Usage credits",
+            "personal credits",
+            true,
+        );
         remote.shutdown().await;
     }
 

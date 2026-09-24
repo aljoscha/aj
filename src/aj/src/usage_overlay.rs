@@ -44,6 +44,7 @@ use vaxis::vxfw::{
 };
 
 use crate::content_overlay::{ContentStyles, Row, plain, usage_rows};
+use crate::content_row::row_widgets;
 use crate::control::Control;
 use crate::keymap::action_matches;
 use crate::overlay::{
@@ -824,16 +825,6 @@ pub(crate) fn open_usage_overlay(
 /// The single-row "Loading…" seed.
 fn loading_row() -> Row {
     plain("Loading usage\u{2026}")
-}
-
-/// Build the list-row widgets for a set of read-only rows.
-fn row_widgets(rows: &[Row]) -> Vec<WidgetRef> {
-    rows.iter()
-        .map(|r| {
-            let text: WidgetRef = Rc::new(RefCell::new(RichText::new(r.clone())));
-            text
-        })
-        .collect()
 }
 
 /// Confirm menu for one exact provider account. It defaults to the reset since
@@ -1699,7 +1690,7 @@ mod tests {
         let rows = overlay.display_rows();
         let text: String = rows
             .iter()
-            .flat_map(|r| r.iter().map(|s| s.text.clone()))
+            .flat_map(|r| r.spans().map(|s| s.text.clone()))
             .collect();
         assert!(text.contains("Loading usage"), "loading row: {text}");
     }

@@ -7,7 +7,7 @@
 //! PgUp/PgDn scroll a viewport-scaled page, while Home/End jump straight
 //! to the first and last line rather than scrolling. Every other key is
 //! swallowed so nothing leaks to the
-//! layout behind the modal. Each row is a list of styled spans ([`Row`])
+//! layout behind the modal. Each [`Row`] contains prose or wrapping columns
 //! the host builds from the shared `aj_app` data, so the one widget backs
 //! all three read-only overlays.
 //!
@@ -41,8 +41,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use vaxis::cell::{Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
-    DrawContext, Event, EventContext, ListView, OverlayWindow, RelativePoint, RichText, ScrollBars,
-    Source, SubSurface, Surface, TextArea, Widget, WidgetRef, to_widget_ref,
+    DrawContext, Event, EventContext, ListView, OverlayWindow, RelativePoint, ScrollBars, Source,
+    SubSurface, Surface, TextArea, Widget, WidgetRef, to_widget_ref,
 };
 
 use crate::overlay::{
@@ -51,17 +51,13 @@ use crate::overlay::{
 use crate::text::one_line;
 use crate::transcript::vaxis_color;
 
-/// A single content-overlay row: styled spans laid out as one line.
-///
-/// A plain row is one default-styled span. Because [`RichText::new`]'s
-/// layout defaults match [`Text`](vaxis::vxfw::Text)'s, a plain row draws
-/// exactly like a plain-string row would, so converting the plain builders
-/// to this model is appearance-preserving.
-pub(crate) type Row = Vec<Segment>;
+/// Shared prose and column-aware rows for read-only overlay content.
+pub(crate) use crate::content_row::Row;
+use crate::content_row::row_widgets;
 
 /// A single default-styled span carrying `text`.
 pub(crate) fn plain(text: impl Into<String>) -> Row {
-    vec![span(text, Style::default())]
+    Row::Text(vec![span(text, Style::default())])
 }
 
 /// A styled span for one column of a row.
@@ -201,16 +197,6 @@ impl Widget for ContentOverlay {
     fn wants_events(&self) -> bool {
         true
     }
-}
-
-/// Build the list-row widgets for a set of rows.
-fn row_widgets(rows: &[Row]) -> Vec<WidgetRef> {
-    rows.iter()
-        .map(|r| {
-            let text: WidgetRef = Rc::new(RefCell::new(RichText::new(r.clone())));
-            text
-        })
-        .collect()
 }
 
 /// Replace an open overlay's rows, for an async overlay whose fetch has
@@ -454,7 +440,9 @@ fn render_section(lines: &[HelpLine], styles: &ContentStyles) -> Vec<Row> {
     let key_w = lines
         .iter()
         .filter_map(|line| match line {
-            HelpLine::Entry { key, .. } => Some(key.chars().count()),
+            HelpLine::Entry { key, .. } => {
+                Some(terminal_cells(key, vaxis::gwidth::Method::Unicode))
+            }
             _ => None,
         })
         .max()
@@ -462,9 +450,16 @@ fn render_section(lines: &[HelpLine], styles: &ContentStyles) -> Vec<Row> {
     lines
         .iter()
         .map(|line| match line {
-            HelpLine::Heading(text) => vec![span(*text, styles.heading)],
-            HelpLine::Group(text) => vec![span(format!("  {text}"), styles.muted)],
-            HelpLine::Entry { key, desc } => plain(format!("    {key:<key_w$}  {desc}")),
+            HelpLine::Heading(text) => Row::Text(vec![span(*text, styles.heading)]),
+            HelpLine::Group(text) => Row::Text(vec![span(format!("  {text}"), styles.muted)]),
+            HelpLine::Entry { key, desc } => Row::columns(
+                4,
+                vec![key_w],
+                vec![
+                    vec![span(key.clone(), Style::default())],
+                    vec![span(desc.clone(), Style::default())],
+                ],
+            ),
             // A single space, not the empty string: an empty `RichText` row
             // collapses to zero height in the `ListView` (see
             // `session_info_rows`).
@@ -556,13 +551,6 @@ fn report_identity(provider_id: &str, provider_name: &str, account: Option<&str>
     }
 }
 
-fn pad_cells(text: &str, width: usize, method: vaxis::gwidth::Method) -> String {
-    format!(
-        "{text}{}",
-        " ".repeat(width.saturating_sub(terminal_cells(text, method)))
-    )
-}
-
 /// Each credential occupies one logical row with a left-aligned identity,
 /// globally aligned muted status and detail, and a trailing default marker.
 pub(crate) fn auth_rows(
@@ -608,17 +596,18 @@ pub(crate) fn auth_rows(
         .unwrap_or(0);
     let mut rows = Vec::new();
     for (status, identity) in statuses.iter().zip(identities) {
-        let mut row = vec![
-            span(pad_cells(&identity, width, width_method), Style::default()),
-            span(format!("  {}", status.summary), styles.muted),
-        ];
+        let mut row = vec![span(status.summary.clone(), styles.muted)];
         if let Some(detail) = &status.detail {
             row.push(span(format!(" · {detail}"), styles.muted));
         }
         if status.is_default {
             row.push(span(" · provider default", styles.muted));
         }
-        rows.push(row);
+        rows.push(Row::columns(
+            0,
+            vec![width],
+            vec![vec![span(identity, Style::default())], row],
+        ));
     }
     rows
 }
@@ -665,7 +654,13 @@ pub(crate) fn usage_rows(
     let mut rows = Vec::new();
     for status in statuses {
         let mut group = Vec::new();
-        let mut detail = |text: String| group.push(vec![span(format!("  {text}"), styles.muted)]);
+        let mut detail = |text: String| {
+            group.push(Row::columns(
+                2,
+                vec![],
+                vec![vec![span(text, styles.muted)]],
+            ))
+        };
         match &status.outcome {
             UsageOutcome::Usage(usage) => {
                 if usage.windows.is_empty()
@@ -677,41 +672,44 @@ pub(crate) fn usage_rows(
                 }
                 for window in &usage.windows {
                     let percent = format_window_status(window.used, None, now_ms);
-                    let mut row = vec![
-                        span(
-                            format!("  {}", pad_cells(&window.label, label_width, width_method)),
-                            Style::default(),
-                        ),
-                        span(
+                    let mut cells = vec![
+                        vec![span(window.label.clone(), Style::default())],
+                        vec![span(
                             format!(
-                                "  {}{percent}",
+                                "{}{percent}",
                                 " ".repeat(
                                     percent_width
                                         .saturating_sub(terminal_cells(&percent, width_method))
                                 )
                             ),
                             styles.muted,
-                        ),
+                        )],
                     ];
-                    if let Some(reset) = window.resets_at {
-                        row.push(span(
-                            format!("  resets {}", aj_app::usage::format_reset(reset, now_ms)),
-                            styles.muted,
-                        ));
-                    }
-                    group.push(row);
+                    let reset = window
+                        .resets_at
+                        .map(|reset| {
+                            format!("resets {}", aj_app::usage::format_reset(reset, now_ms))
+                        })
+                        .unwrap_or_default();
+                    cells.push(vec![span(reset, styles.muted)]);
+                    group.push(Row::columns(2, vec![label_width, percent_width], cells));
                 }
                 for detail in &usage.details {
-                    group.push(vec![
-                        span(
-                            format!("  {}", pad_cells(&detail.label, label_width, width_method)),
-                            Style::default(),
-                        ),
-                        span(format!("  {}", detail.value), styles.muted),
-                    ]);
+                    group.push(Row::columns(
+                        2,
+                        vec![label_width, percent_width],
+                        vec![
+                            vec![span(detail.label.clone(), Style::default())],
+                            vec![span(detail.value.clone(), styles.muted)],
+                        ],
+                    ));
                 }
                 for note in &usage.notes {
-                    group.push(vec![span(format!("  {note}"), styles.muted)]);
+                    group.push(Row::columns(
+                        2,
+                        vec![],
+                        vec![vec![span(note.clone(), styles.muted)]],
+                    ));
                 }
                 if let Some(credits) = &usage.reset_credits {
                     let desc = if credits.available > 0 {
@@ -719,13 +717,14 @@ pub(crate) fn usage_rows(
                     } else {
                         "no resets available".into()
                     };
-                    group.push(vec![
-                        span(
-                            format!("  {}", pad_cells(reset_label, label_width, width_method)),
-                            Style::default(),
-                        ),
-                        span(format!("  {desc}"), styles.muted),
-                    ]);
+                    group.push(Row::columns(
+                        2,
+                        vec![label_width, percent_width],
+                        vec![
+                            vec![span(reset_label, Style::default())],
+                            vec![span(desc, styles.muted)],
+                        ],
+                    ));
                 }
             }
             UsageOutcome::Unsupported { .. } | UsageOutcome::NoSource => continue,
@@ -740,10 +739,11 @@ pub(crate) fn usage_rows(
             &status.provider_name,
             status.account.as_deref(),
         );
-        rows.push(vec![span(
-            account_label_for_auth_row(&identity, usize::from(AUTH_ROW_CELL_LIMIT), width_method),
-            Style::default(),
-        )]);
+        rows.push(plain(account_label_for_auth_row(
+            &identity,
+            usize::from(AUTH_ROW_CELL_LIMIT),
+            width_method,
+        )));
         rows.extend(group);
     }
     if rows.is_empty() {
@@ -761,7 +761,7 @@ pub(crate) fn usage_rows(
 /// Ordinary digest fields are folded to one line at this render boundary.
 /// Environment pairs retain their typed row until here, where both sides are
 /// quoted and escaped to an ASCII-only representation. Long representations
-/// are split into numbered continuation rows before they reach [`RichText`].
+/// are split into numbered continuation rows before they reach [`RichText`](vaxis::vxfw::RichText).
 /// This keeps every valid pair distinguishable and terminal-inert while
 /// bounding the work and height of each unbounded [`ListView`] child.
 pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<Row> {
@@ -770,7 +770,10 @@ pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<
     let key_width = rows
         .iter()
         .filter_map(|row| match row {
-            aj_app::session_info::InfoRow::Kv { key, .. } => Some(one_line(key).chars().count()),
+            aj_app::session_info::InfoRow::Kv { key, .. } => Some(terminal_cells(
+                &one_line(key),
+                vaxis::gwidth::Method::Unicode,
+            )),
             _ => None,
         })
         .max()
@@ -782,7 +785,14 @@ pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<
             aj_app::session_info::InfoRow::Kv { key, value } => {
                 let key = one_line(&key);
                 let value = one_line(&value);
-                rendered.push(plain(format!("  {key:<key_width$}  {value}")));
+                rendered.push(Row::columns(
+                    2,
+                    vec![key_width],
+                    vec![
+                        vec![span(key, Style::default())],
+                        vec![span(value, Style::default())],
+                    ],
+                ));
             }
             aj_app::session_info::InfoRow::Env { key, value } => {
                 rendered.extend(environment_rows(&key, &value));
@@ -827,7 +837,7 @@ fn environment_rows(key: &str, value: &str) -> Vec<Row> {
 }
 
 /// Quote arbitrary persisted environment text with an injective representation
-/// made only of graphic ASCII. Spaces are explicit too: [`RichText`] may drop
+/// made only of graphic ASCII. Spaces are explicit too: [`RichText`](vaxis::vxfw::RichText) may drop
 /// separator whitespace at a soft-wrap boundary, while `\x20` remains visible
 /// and reconstructable wherever the terminal wraps the row.
 fn quoted_env_text(value: &str) -> String {
@@ -859,7 +869,32 @@ mod tests {
     /// Concatenate a row's span texts, so the plain-text `.contains(...)`
     /// assertions keep working on a styled row.
     fn row_text(row: &Row) -> String {
-        row.iter().map(|s| s.text.as_str()).collect()
+        let text = |spans: &[Segment]| {
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        };
+        match row {
+            Row::Text(spans) => text(spans),
+            Row::Columns {
+                indent,
+                widths,
+                cells,
+            } => {
+                let mut out = " ".repeat(usize::from(*indent));
+                for (index, cell) in cells.iter().enumerate() {
+                    let value = text(cell);
+                    out.push_str(&value);
+                    if let Some(width) = widths.get(index).filter(|_| index + 1 < cells.len()) {
+                        out.push_str(&" ".repeat(
+                            width.saturating_sub(terminal_cells(&value, Method::Unicode)) + 2,
+                        ));
+                    }
+                }
+                out
+            }
+        }
     }
 
     /// Join a set of rows into one plain-text blob for `.contains(...)`.
@@ -943,9 +978,13 @@ mod tests {
             // A heading is one span carrying the heading style, not the
             // default: dropping a section removes its heading and fails the
             // `find`, and leaving a heading default-styled fails here.
-            assert_eq!(row.len(), 1, "heading is one span: {row:?}");
-            assert_eq!(row[0].style, styles.heading, "heading {heading:?} tint");
-            assert_ne!(row[0].style, Style::default());
+            assert_eq!(row.spans().count(), 1, "heading is one span: {row:?}");
+            assert_eq!(
+                row.spans().next().unwrap().style,
+                styles.heading,
+                "heading {heading:?} tint"
+            );
+            assert_ne!(row.spans().next().unwrap().style, Style::default());
         }
 
         // The injected `test_styles` above only proves the render applies
@@ -1318,7 +1357,7 @@ mod tests {
             "the over-budget tail entered RichText: {text}"
         );
         let cells = rows[0]
-            .iter()
+            .spans()
             .map(|segment| terminal_cells(&segment.text, Method::Unicode))
             .sum::<usize>();
         assert!(
@@ -1370,7 +1409,7 @@ mod tests {
                 Method::Unicode
             ),
         );
-        assert_eq!(rows[0].last().unwrap().style, styles.muted);
+        assert_eq!(rows[0].spans().last().unwrap().style, styles.muted);
         let summary_col =
             terminal_cells(first.split("subscription").next().unwrap(), Method::Unicode);
         let mut overlay = ContentOverlay::new(rows);
@@ -1841,7 +1880,7 @@ mod tests {
         // grapheme-width conversion. Escaping it into independent ASCII cells
         // prevents both a u8-width panic and hard-break injection.
         for row in &rows {
-            let mut text = RichText::new(row.clone());
+            let mut text = row.clone();
             let _ = text.draw(&narrow);
         }
         let mut overlay = ContentOverlay::new(rows[env + 1..activity - 1].to_vec());
@@ -2174,7 +2213,10 @@ mod tests {
     fn open_content_overlay_tints_the_thumb_from_the_chrome() {
         let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
         let chrome = OverlayChrome::from_theme(&theme);
-        let editor: WidgetRef = Rc::new(RefCell::new(RichText::new(plain(" "))));
+        let editor: WidgetRef = Rc::new(RefCell::new(vaxis::vxfw::RichText::new(vec![span(
+            " ",
+            Style::default(),
+        )])));
         let stack = Rc::new(RefCell::new(OverlayStack::default()));
         let mut ctx = EventContext::new();
         let rows = (0..50).map(|i| plain(format!("line {i}"))).collect();
@@ -2205,17 +2247,58 @@ mod tests {
         );
     }
 
-    /// A plain builder produces single-span, default-styled rows, pinning
-    /// the appearance-preserving path: a plain row is one default span, so
-    /// it draws exactly as a plain-string row would.
     #[test]
-    fn plain_builder_rows_are_single_default_spans() {
-        for row in session_info_rows(&sample_stats(), Some("fix-auth")) {
-            assert_eq!(row.len(), 1, "plain row is one span: {row:?}");
+    fn help_and_session_values_wrap_beside_their_labels() {
+        let help = render_section(
+            &[HelpLine::Entry {
+                key: "Ctrl+X".into(),
+                desc: "DESCRIPTION continues inside its own column".into(),
+            }],
+            &test_styles(),
+        );
+        let stats = sample_stats();
+        let session = session_info_rows(&stats, Some("VALUE continues inside its own column"));
+        let session_row = session
+            .into_iter()
+            .find(|row| row.spans().any(|span| span.text.starts_with("VALUE")))
+            .unwrap();
+        for (mut row, marker, expected) in [
+            (
+                help[0].clone(),
+                "DESCRIPTION",
+                "DESCRIPTION continues inside its own column",
+            ),
+            (
+                session_row,
+                "VALUE",
+                "VALUE continues inside its own column",
+            ),
+        ] {
+            let surface = row.draw(&crate::test_support::draw_ctx(40, None));
+            let rows = crate::test_support::rows(&surface);
+            assert!(rows.len() > 1, "fixture wraps: {rows:?}");
+            let start = rows[0].find(marker).unwrap();
+            let continuation = rows.iter().skip(1).filter(|row| !row.trim().is_empty());
+            for line in continuation {
+                assert!(
+                    line[..start].trim().is_empty(),
+                    "continuation escaped column: {rows:?}"
+                );
+            }
+            let value = rows
+                .iter()
+                .map(|line| line.get(start..).unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ");
             assert_eq!(
-                row[0].style,
-                Style::default(),
-                "plain row default-styled: {row:?}"
+                value.split_whitespace().collect::<Vec<_>>().join(" "),
+                expected
+            );
+            assert!(
+                crate::test_support::flatten(&surface)
+                    .iter()
+                    .flatten()
+                    .all(|cell| cell.style == Style::default())
             );
         }
     }
@@ -2226,14 +2309,14 @@ mod tests {
     /// walk, which happens inside the draw.
     #[test]
     fn a_control_character_in_a_peer_tag_never_reaches_a_row() {
-        use vaxis::vxfw::{RichText, Widget};
+        use vaxis::vxfw::Widget;
 
         let rows = session_info_rows(&sample_stats(), Some("ab\rcd"));
         let blob = rows_text(&rows);
         assert!(!blob.contains('\r'), "the label is folded: {blob:?}");
         assert!(blob.contains("abcd"), "and it is still the label: {blob:?}");
         for row in rows {
-            let mut text = RichText::new(row);
+            let mut text = row;
             text.draw(&crate::test_support::draw_ctx(60, Some(1)));
         }
     }

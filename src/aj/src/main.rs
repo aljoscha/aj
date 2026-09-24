@@ -62,6 +62,7 @@ mod branch;
 mod bubble;
 mod connect;
 mod content_overlay;
+mod content_row;
 mod control;
 mod corner_box;
 mod footer;
