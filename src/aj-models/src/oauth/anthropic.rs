@@ -153,7 +153,7 @@ impl OAuthProvider for AnthropicOAuth {
     }
 
     fn name(&self) -> &str {
-        "Anthropic (Claude Pro/Max)"
+        "Anthropic subscription"
     }
 
     fn uses_callback_server(&self) -> bool {
@@ -747,7 +747,7 @@ mod tests {
     fn anthropic_oauth_implements_provider_metadata() {
         let provider = AnthropicOAuth::new();
         assert_eq!(provider.id(), "anthropic");
-        assert!(provider.name().contains("Anthropic"));
+        assert_eq!(provider.name(), "Anthropic subscription");
         assert!(provider.uses_callback_server());
         // Default `get_api_key` returns the access token verbatim.
         let creds = OAuthCredentials::new("r", "an-access-token", 0);

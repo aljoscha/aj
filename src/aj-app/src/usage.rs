@@ -13,10 +13,12 @@ use std::sync::Arc;
 
 use chrono::{Datelike, Local, TimeZone, Utc};
 
-use aj_models::auth::AuthStorage;
+use aj_models::auth::{AuthStorage, StoredProviderCredentials};
 #[cfg(test)]
 use aj_models::usage::ProviderUsage;
 use aj_models::usage::{UsageError, UsageReport, UsageSource, default_usage_sources};
+
+use crate::auth::{api_provider_name, credential_provider_name};
 
 /// Per-account timeout. The Anthropic source's HTTP request already
 /// caps itself at 5 s; this outer bound also covers credential
@@ -134,7 +136,7 @@ async fn collect_usage_from_sources(
     for (provider_id, source) in providers {
         let auth = auth.clone();
         discoveries.spawn(async move {
-            let accounts = account_labels(&auth, &provider_id, source_timeout).await;
+            let accounts = account_names(&auth, &provider_id, source_timeout).await;
             (provider_id, source, accounts)
         });
     }
@@ -153,6 +155,7 @@ async fn collect_usage_from_sources(
             Ok(accounts) => accounts,
             Err(message) => {
                 statuses.push(ProviderUsageStatus {
+                    provider_name: api_provider_name(&provider_id).to_string(),
                     provider_id,
                     account: None,
                     outcome: source
@@ -162,14 +165,17 @@ async fn collect_usage_from_sources(
             }
         };
         let Some(source) = source else {
-            statuses.extend(accounts.into_iter().map(|account| ProviderUsageStatus {
-                provider_id: provider_id.clone(),
-                account,
-                outcome: UsageOutcome::NoSource,
+            statuses.extend(accounts.into_iter().map(|(account, provider_name)| {
+                ProviderUsageStatus {
+                    provider_id: provider_id.clone(),
+                    provider_name,
+                    account,
+                    outcome: UsageOutcome::NoSource,
+                }
             }));
             continue;
         };
-        for account in accounts {
+        for (account, provider_name) in accounts {
             let source = Arc::clone(&source);
             let auth = auth.clone();
             tasks.spawn(async move {
@@ -185,6 +191,7 @@ async fn collect_usage_from_sources(
                 };
                 ProviderUsageStatus {
                     provider_id: source.provider_id().to_string(),
+                    provider_name,
                     account,
                     outcome,
                 }
@@ -206,30 +213,37 @@ async fn collect_usage_from_sources(
     statuses
 }
 
-/// The account rows a provider owes: each stored label, or `[None]` for a
-/// bare credential, an empty store, or a runtime override.
-async fn account_labels(
+/// Discover labels and credential-kind names without resolving or refreshing tokens.
+async fn account_names(
     auth: &AuthStorage,
     provider_id: &str,
     timeout: std::time::Duration,
-) -> Result<Vec<Option<String>>, String> {
+) -> Result<Vec<(Option<String>, String)>, String> {
+    let bare = || vec![(None, api_provider_name(provider_id).to_string())];
     if auth.has_runtime_override(provider_id).await {
-        return Ok(vec![None]);
+        return Ok(bare());
     }
-    let accounts = match tokio::time::timeout(timeout, auth.accounts(provider_id)).await {
-        Ok(Ok(accounts)) => accounts,
+    let stored = match tokio::time::timeout(timeout, auth.stored_credentials(provider_id)).await {
+        Ok(Ok(stored)) => stored,
         Ok(Err(err)) => return Err(usage_error_message(err.into())),
         Err(_) => return Err("timed out".to_string()),
     };
-    let labels: Vec<Option<String>> = accounts
-        .into_iter()
-        .flat_map(|set| set.accounts)
-        .map(|(label, _)| Some(label))
-        .collect();
-    Ok(if labels.is_empty() {
-        vec![None]
-    } else {
-        labels
+    let providers = auth.oauth_provider_ids().await;
+    let oauth_name = providers
+        .iter()
+        .find(|(id, _)| id == provider_id)
+        .map(|(_, name)| name.as_str());
+    let name =
+        |credential: &_| credential_provider_name(provider_id, credential, oauth_name).to_string();
+    Ok(match stored {
+        Some(StoredProviderCredentials::Bare(credential)) => vec![(None, name(&credential))],
+        Some(StoredProviderCredentials::Accounts(set)) if set.accounts.is_empty() => bare(),
+        Some(StoredProviderCredentials::Accounts(set)) => set
+            .accounts
+            .into_iter()
+            .map(|(label, credential)| (Some(label), name(&credential)))
+            .collect(),
+        None => bare(),
     })
 }
 
@@ -250,7 +264,7 @@ pub fn format_window_status(used: f64, resets_at: Option<i64>, now_ms: i64) -> S
 /// the machine's timezone appended: `"17:00 (Europe/Berlin)"` within
 /// the same day, `"Mon 09:00 (Europe/Berlin)"` within a week,
 /// `"Jun 15 (Europe/Berlin)"` beyond that, `"now"` when already past.
-fn format_reset(reset_ms: i64, now_ms: i64) -> String {
+pub fn format_reset(reset_ms: i64, now_ms: i64) -> String {
     if reset_ms <= now_ms {
         return "now".to_string();
     }
@@ -585,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn collect_fetches_every_account_and_times_out_one_without_hiding_its_sibling() {
         let dir = TempDir::with_prefix("aj-usage-accounts-").expect("create temp dir");
-        let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
         seed_accounts(&auth, "anthropic").await;
         seed_accounts(&auth, "openrouter").await;
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -600,6 +614,7 @@ mod tests {
 
         let anthropic = accounts_of(&statuses, "anthropic");
         assert_eq!(labels(&anthropic), vec![Some("personal"), Some("work")]);
+        assert!(anthropic.iter().all(|row| row.provider_name == "Anthropic"));
         let UsageOutcome::Usage(personal) = &anthropic[0].outcome else {
             panic!("personal account lost its usage report")
         };
@@ -615,6 +630,11 @@ mod tests {
 
         let openrouter = accounts_of(&statuses, "openrouter");
         assert_eq!(labels(&openrouter), vec![Some("personal"), Some("work")]);
+        assert!(
+            openrouter
+                .iter()
+                .all(|row| row.provider_name == "OpenRouter")
+        );
         assert!(
             openrouter
                 .iter()

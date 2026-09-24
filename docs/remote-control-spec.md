@@ -626,9 +626,16 @@ side's limitation. Neither side's values fall back to the other's.
   session's token totals. Returns `ProviderUsageReport` in `aj-wire`, with
   `statuses` sorted by provider and exact account label, and `reset_providers`
   naming providers with a configured reset adapter. Each status contains
-  `provider_id`, nullable `account`, and `outcome`: `Usage` (windows, notes,
-  optional reset credits), `Unsupported` (reason), `NotConfigured`, `NoSource`,
-  or `Error` (message). Enums use serde's externally tagged representation.
+  `provider_id`, `provider_name`, nullable `account`, and `outcome`: `Usage`
+  (windows, notes, optional reset credits), `Unsupported` (reason),
+  `NotConfigured`, `NoSource`, or `Error` (message). Enums use serde's externally
+  tagged representation.
+  `provider_name` is the host display label for the credential kind: the
+  registered OAuth name for subscriptions, or the friendly API-provider name
+  for API keys. Unknown providers fall back to their ID. This additive field
+  defaults to an empty string when absent. Clients display `provider_id` when
+  it is empty, without inferring a name from human-readable status text.
+  Naming alone never refreshes a token.
   A runtime credential override collapses its provider to one unlabeled row.
   The host reads credentials and performs any OAuth refresh and writeback.
   Capability `provider_usage` (section 5.10).
@@ -912,11 +919,17 @@ session is only an address: the host checks it exists and neither resumes it
 nor takes its writer lock. Capability `credentials`.
 
 - `GET` returns `CredentialOverview`: the host's OAuth providers (id and
-  display name), one safe status row per provider account (provider, optional
-  label, default and configured flags, summary, optional detail), and a
-  `stored` map from provider id to `{kind:"bare"}` or `{kind:"accounts",
-  default, accounts:[labels...]}`. No keys or tokens are returned and the read
-  never refreshes anything.
+  display name), one safe status row per provider account (`provider_id`,
+  `provider_name`, optional label, default and configured flags, summary,
+  optional detail), and a `stored` map from provider id to `{kind:"bare"}` or
+  `{kind:"accounts", default, accounts:[labels...]}`. No keys or tokens are
+  returned and the read never refreshes anything. `provider_name` follows the
+  usage report naming and empty-string compatibility rules (section 5.7).
+  The summary describes
+  method/source without repeating the provider name. A runtime override has
+  its own API-key row and does not hide stored bare or labeled credentials.
+  Rows are sorted by provider ID and account label, with the runtime override
+  before stored credentials for that provider.
 - `POST` takes one `CredentialMutation`, tagged by `action`:
   `store {provider, target, credentials}`, `logout_bare {provider}`,
   `logout {provider, account_label}`, `set_default {provider,

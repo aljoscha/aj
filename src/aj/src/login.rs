@@ -933,8 +933,11 @@ fn picker_items(rows: &[AuthRow]) -> Vec<SelectItem> {
     rows.iter()
         .enumerate()
         .map(|(index, row)| {
-            let mut item = SelectItem::new(row.label.clone(), row.filter_key.clone())
-                .with_value(format!("auth-row-{index}"));
+            let mut item = SelectItem::new(
+                row.label.clone(),
+                format!("{} {}", row.filter_key, row.label),
+            )
+            .with_value(format!("auth-row-{index}"));
             if let Some(summary) = &row.summary {
                 item = item.with_description(summary.clone());
             }

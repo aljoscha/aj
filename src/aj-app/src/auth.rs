@@ -24,7 +24,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aj_models::auth::{AuthCredential, AuthStorage, find_env_keys};
+use aj_models::auth::{AuthCredential, AuthStorage, StoredProviderCredentials, find_env_keys};
 use aj_models::oauth::OAuthAuthInfo;
 
 mod login;
@@ -39,10 +39,32 @@ const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openr
 
 pub use aj_wire::CredentialStatus as ProviderAuthStatus;
 
+/// Friendly API-provider label, falling back to the exact provider ID.
+pub fn api_provider_name(provider_id: &str) -> &str {
+    match provider_id {
+        "anthropic" => "Anthropic",
+        "openai" => "OpenAI",
+        "openrouter" => "OpenRouter",
+        "openai-codex" => "OpenAI Codex",
+        other => other,
+    }
+}
+
+pub(crate) fn credential_provider_name<'a>(
+    provider_id: &'a str,
+    credential: &AuthCredential,
+    oauth_name: Option<&'a str>,
+) -> &'a str {
+    match credential {
+        AuthCredential::OAuth(_) => oauth_name.unwrap_or(provider_id),
+        AuthCredential::ApiKey { .. } => api_provider_name(provider_id),
+    }
+}
+
 /// Compute the auth status for a single `provider_id`.
 ///
 /// `oauth_name` is the provider's display name when it's an OAuth
-/// provider (used to annotate a stored subscription), otherwise
+/// provider (used to name a stored subscription), otherwise
 /// `None`. Mirrors the precedence in
 /// [`AuthStorage::get_api_key`] but only *describes* the credential —
 /// it never refreshes an OAuth token.
@@ -55,6 +77,7 @@ pub async fn provider_status(
     if auth.has_runtime_override(provider_id).await {
         return ProviderAuthStatus {
             provider_id: provider_id.to_string(),
+            provider_name: api_provider_name(provider_id).to_string(),
             account_label: None,
             is_default: false,
             configured: true,
@@ -66,29 +89,8 @@ pub async fn provider_status(
     // 2 & 3. Stored credential, reported before the environment to
     //        match the resolution order in `AuthStorage::get_api_key`.
     match auth.get(provider_id).await {
-        Ok(Some(AuthCredential::ApiKey { .. })) => {
-            return ProviderAuthStatus {
-                provider_id: provider_id.to_string(),
-                account_label: None,
-                is_default: false,
-                configured: true,
-                summary: "API key (stored)".to_string(),
-                detail: None,
-            };
-        }
-        Ok(Some(AuthCredential::OAuth(creds))) => {
-            let summary = match oauth_name {
-                Some(name) => format!("subscription · {name}"),
-                None => "subscription".to_string(),
-            };
-            return ProviderAuthStatus {
-                provider_id: provider_id.to_string(),
-                account_label: None,
-                is_default: false,
-                configured: true,
-                summary,
-                detail: Some(format_remaining(creds.expires, now_unix_ms())),
-            };
+        Ok(Some(credential)) => {
+            return stored_status(provider_id, None, false, credential, oauth_name);
         }
         Ok(None) => {}
         // A corrupt/locked auth.json shouldn't take down the overlay;
@@ -96,6 +98,7 @@ pub async fn provider_status(
         Err(_) => {
             return ProviderAuthStatus {
                 provider_id: provider_id.to_string(),
+                provider_name: api_provider_name(provider_id).to_string(),
                 account_label: None,
                 is_default: false,
                 configured: false,
@@ -109,6 +112,7 @@ pub async fn provider_status(
     if let Some(var) = first_set_env_var(provider_id) {
         return ProviderAuthStatus {
             provider_id: provider_id.to_string(),
+            provider_name: api_provider_name(provider_id).to_string(),
             account_label: None,
             is_default: false,
             configured: true,
@@ -120,6 +124,7 @@ pub async fn provider_status(
     // 5. Nothing configured at any layer.
     ProviderAuthStatus {
         provider_id: provider_id.to_string(),
+        provider_name: api_provider_name(provider_id).to_string(),
         account_label: None,
         is_default: false,
         configured: false,
@@ -128,30 +133,27 @@ pub async fn provider_status(
     }
 }
 
-/// Describe one credential in a provider's labeled set without resolving or
-/// refreshing it. The exact raw label remains separate from the rendered row.
-fn account_status(
+/// Describe a stored credential without resolving or refreshing it.
+/// The exact raw label remains separate from the rendered row.
+fn stored_status(
     provider_id: &str,
-    label: String,
+    label: Option<String>,
     is_default: bool,
     credential: AuthCredential,
     oauth_name: Option<&str>,
 ) -> ProviderAuthStatus {
+    let provider_name = credential_provider_name(provider_id, &credential, oauth_name).to_string();
     let (summary, detail) = match credential {
         AuthCredential::ApiKey { .. } => ("API key (stored)".to_string(), None),
-        AuthCredential::OAuth(creds) => {
-            let summary = oauth_name
-                .map(|name| format!("subscription · {name}"))
-                .unwrap_or_else(|| "subscription".to_string());
-            (
-                summary,
-                Some(format_remaining(creds.expires, now_unix_ms())),
-            )
-        }
+        AuthCredential::OAuth(creds) => (
+            "subscription".to_string(),
+            Some(format_remaining(creds.expires, now_unix_ms())),
+        ),
     };
     ProviderAuthStatus {
         provider_id: provider_id.to_string(),
-        account_label: Some(label),
+        provider_name,
+        account_label: label,
         is_default,
         configured: true,
         summary,
@@ -162,8 +164,8 @@ fn account_status(
 /// Build status rows for every provider worth showing: the [`KNOWN_PROVIDERS`]
 /// set, every registered OAuth provider, and any provider with a stored
 /// `auth.json` entry. A provider contributes its provider-level source when one
-/// exists and one row per labeled account. Rows are sorted by provider id, then
-/// account label.
+/// exists and one row per stored bare credential or labeled account. Rows are
+/// sorted by provider id, then account label, with overrides before stored rows.
 pub async fn collect_statuses(auth: &AuthStorage) -> Vec<ProviderAuthStatus> {
     let oauth = auth.oauth_provider_ids().await;
 
@@ -192,12 +194,15 @@ pub async fn collect_statuses(auth: &AuthStorage) -> Vec<ProviderAuthStatus> {
         if has_override {
             out.push(provider_status(auth, &id, name).await);
         }
-        match auth.accounts(&id).await {
-            Ok(Some(set)) => {
+        match auth.stored_credentials(&id).await {
+            Ok(Some(StoredProviderCredentials::Bare(credential))) => {
+                out.push(stored_status(&id, None, false, credential, name));
+            }
+            Ok(Some(StoredProviderCredentials::Accounts(set))) => {
                 let default = set.default;
                 out.extend(set.accounts.into_iter().map(|(label, credential)| {
                     let is_default = label == default;
-                    account_status(&id, label, is_default, credential, name)
+                    stored_status(&id, Some(label), is_default, credential, name)
                 }));
             }
             Ok(None) | Err(_) if !has_override => out.push(provider_status(auth, &id, name).await),
@@ -470,6 +475,171 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    struct CustomOAuth;
+
+    #[async_trait::async_trait]
+    impl aj_models::oauth::OAuthProvider for CustomOAuth {
+        fn id(&self) -> &str {
+            "openrouter"
+        }
+
+        fn name(&self) -> &str {
+            "Team subscription"
+        }
+
+        async fn login(
+            &self,
+            _: &dyn aj_models::oauth::OAuthCallbacks,
+        ) -> Result<OAuthCredentials, aj_models::oauth::OAuthError> {
+            panic!("display must not log in")
+        }
+
+        async fn refresh_token(
+            &self,
+            _: &OAuthCredentials,
+        ) -> Result<OAuthCredentials, aj_models::oauth::OAuthError> {
+            panic!("display must not refresh")
+        }
+    }
+
+    #[tokio::test]
+    async fn host_names_follow_credential_kind_and_preserve_stored_bare_under_override() {
+        let dir = TempDir::new().unwrap();
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        auth.register_oauth_provider(std::sync::Arc::new(CustomOAuth))
+            .await;
+        let usage = crate::usage::UsageSources {
+            usage: vec![],
+            resets: vec![],
+        };
+        for (id, subscription_name) in [
+            ("anthropic", "Anthropic subscription"),
+            ("openai-codex", "OpenAI Codex subscription"),
+            ("openrouter", "Team subscription"),
+        ] {
+            auth.insert_bare(
+                id,
+                AuthCredential::OAuth(OAuthCredentials::new("secret-refresh", "secret-access", 0)),
+            )
+            .await
+            .unwrap();
+            let statuses = collect_statuses(&auth).await;
+            let row = statuses.iter().find(|row| row.provider_id == id).unwrap();
+            assert_eq!(row.provider_name, subscription_name);
+            assert_eq!(row.summary, "subscription");
+            let report = usage.collect(&auth).await;
+            assert_eq!(
+                report
+                    .statuses
+                    .iter()
+                    .find(|row| row.provider_id == id)
+                    .unwrap()
+                    .provider_name,
+                subscription_name
+            );
+
+            auth.set_runtime_api_key(id, "secret-override".into()).await;
+            let statuses = collect_statuses(&auth).await;
+            let rows: Vec<_> = statuses
+                .iter()
+                .filter(|row| row.provider_id == id)
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].provider_name, api_provider_name(id));
+            assert_eq!(rows[0].summary, "API key (--api-key override)");
+            assert_eq!(rows[1].provider_name, subscription_name);
+            assert_eq!(rows[1].summary, "subscription");
+            let report = usage.collect(&auth).await;
+            let rows: Vec<_> = report
+                .statuses
+                .iter()
+                .filter(|row| row.provider_id == id)
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].provider_name, api_provider_name(id));
+            assert!(
+                !serde_json::to_string(&statuses)
+                    .unwrap()
+                    .contains("secret-")
+            );
+            assert!(!serde_json::to_string(&report).unwrap().contains("secret-"));
+        }
+    }
+
+    #[tokio::test]
+    async fn host_names_distinguish_mixed_accounts_and_unknown_providers() {
+        let dir = TempDir::new().unwrap();
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        for (id, api_name) in [
+            ("anthropic", "Anthropic"),
+            ("openai", "OpenAI"),
+            ("openai-codex", "OpenAI Codex"),
+            ("openrouter", "OpenRouter"),
+            ("custom-id", "custom-id"),
+        ] {
+            auth.insert_account(
+                id,
+                "api",
+                AuthCredential::ApiKey {
+                    key: "secret-key".into(),
+                },
+            )
+            .await
+            .unwrap();
+            auth.insert_account(
+                id,
+                "subscription",
+                AuthCredential::OAuth(OAuthCredentials::new("refresh", "access", 0)),
+            )
+            .await
+            .unwrap();
+            let statuses = collect_statuses(&auth).await;
+            let row = statuses
+                .iter()
+                .find(|row| row.provider_id == id && row.account_label.as_deref() == Some("api"))
+                .unwrap();
+            assert_eq!(row.provider_name, api_name);
+            assert_eq!(row.summary, "API key (stored)");
+            let oauth_name = match id {
+                "anthropic" => "Anthropic subscription",
+                "openai-codex" => "OpenAI Codex subscription",
+                other => other,
+            };
+            assert_eq!(
+                statuses
+                    .iter()
+                    .find(|row| row.provider_id == id
+                        && row.account_label.as_deref() == Some("subscription"))
+                    .unwrap()
+                    .provider_name,
+                oauth_name
+            );
+            let report = crate::usage::UsageSources {
+                usage: vec![],
+                resets: vec![],
+            }
+            .collect(&auth)
+            .await;
+            let rows: Vec<_> = report
+                .statuses
+                .iter()
+                .filter(|row| row.provider_id == id)
+                .collect();
+            // Usage inventory includes known providers and registered usage sources.
+            assert_eq!(rows.len(), if id == "custom-id" { 0 } else { 2 });
+            for row in rows {
+                assert_eq!(
+                    row.provider_name,
+                    if row.account.as_deref() == Some("api") {
+                        api_name
+                    } else {
+                        oauth_name
+                    }
+                );
+            }
+        }
     }
 
     #[tokio::test]

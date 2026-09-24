@@ -124,18 +124,6 @@ impl MenuItem {
     }
 }
 
-/// The picker and confirm text for one reset target, including unnamed accounts.
-fn target_display(target: &RateLimitResetTarget) -> String {
-    match target.account() {
-        Some(account) => format!(
-            "{} / {}",
-            target.provider_id(),
-            crate::login::account_label_text(account)
-        ),
-        None => target.provider_id().to_string(),
-    }
-}
-
 /// The interactive usage overlay: a phase machine over the usage report
 /// with the in-overlay reset-credit action.
 ///
@@ -163,6 +151,7 @@ pub(crate) struct UsageOverlay {
     /// Content-column tints for the read-only Display rows, snapshotted at
     /// construction.
     styles: ContentStyles,
+    width_method: vaxis::gwidth::Method,
     /// The selection-band styles for the interactive menu phases,
     /// snapshotted at construction.
     ///
@@ -223,6 +212,7 @@ impl UsageOverlay {
             list,
             bars,
             styles,
+            width_method: vaxis::gwidth::Method::Unicode,
             chrome_select,
             control,
             session,
@@ -272,6 +262,26 @@ impl UsageOverlay {
                     subtitle_close()
                 )
             }
+        }
+    }
+
+    /// Resolve display text from the fetched host report, never from local auth.
+    fn target_display(&self, target: &RateLimitResetTarget) -> String {
+        let provider = self
+            .statuses
+            .as_ref()
+            .and_then(|statuses| {
+                statuses.iter().find(|status| {
+                    status.provider_id == target.provider_id()
+                        && status.account.as_deref() == target.account()
+                })
+            })
+            .map(|status| status.provider_name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| target.provider_id());
+        match target.account() {
+            Some(account) => format!("{provider} · {}", crate::login::account_label_text(account)),
+            None => provider.to_string(),
         }
     }
 
@@ -424,7 +434,7 @@ impl UsageOverlay {
             Err(UsageError::StaleResetTarget) => Phase::Done {
                 message: format!(
                     "The selected {} changed. Refresh usage before resetting.",
-                    target_display(&target)
+                    self.target_display(&target)
                 ),
             },
             Err(err) => Phase::Failed {
@@ -504,7 +514,9 @@ impl UsageOverlay {
         // matches only borrow `&self.phase` and end before the mutation.
         let menu_items: Vec<MenuItem> = match &self.phase {
             Phase::SelectProvider => provider_items(&self.eligible_targets(), self),
-            Phase::Confirm { target } => confirm_items(target, self.available_for(target)),
+            Phase::Confirm { target } => {
+                confirm_items(&self.target_display(target), self.available_for(target))
+            }
             Phase::Failed { message, .. } => failed_items(message),
             _ => Vec::new(),
         };
@@ -548,7 +560,7 @@ impl UsageOverlay {
             return vec![plain(message.clone())];
         }
         match self.statuses.as_ref() {
-            Some(statuses) => usage_rows(statuses, &self.styles),
+            Some(statuses) => usage_rows(statuses, &self.styles, self.width_method),
             None => vec![loading_row()],
         }
     }
@@ -684,6 +696,16 @@ impl UsageOverlay {
 
 impl Widget for UsageOverlay {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        if self.width_method != ctx.width_method {
+            self.width_method = ctx.width_method;
+            if matches!(self.phase, Phase::Display) {
+                // Reflow changes column padding, not the document position.
+                let rows = self.display_rows();
+                let mut list = self.list.borrow_mut();
+                list.children = Source::Slice(row_widgets(&rows));
+                list.item_count = Some(u32::try_from(rows.len()).expect("row count fits u32"));
+            }
+        }
         // Poll first: the redraw ping guarantees this draw runs after an
         // off-thread task lands, so draining here is where results are
         // applied.
@@ -816,13 +838,9 @@ fn row_widgets(rows: &[Row]) -> Vec<WidgetRef> {
 
 /// Confirm menu for one exact provider account. It defaults to the reset since
 /// that is the reason the user opened it.
-fn confirm_items(target: &RateLimitResetTarget, available: u32) -> Vec<MenuItem> {
+fn confirm_items(identity: &str, available: u32) -> Vec<MenuItem> {
     vec![
-        MenuItem::new(
-            "confirm",
-            format!("Use a reset for {}", target_display(target)),
-        )
-        .with_description(format!(
+        MenuItem::new("confirm", format!("Use a reset for {identity}")).with_description(format!(
             "clears the current limits \u{00b7} {available} available"
         )),
         MenuItem::new("cancel", "Cancel"),
@@ -845,7 +863,7 @@ fn provider_items(targets: &[RateLimitResetTarget], overlay: &UsageOverlay) -> V
         .iter()
         .enumerate()
         .map(|(index, target)| {
-            MenuItem::new(format!("reset-{index}"), target_display(target))
+            MenuItem::new(format!("reset-{index}"), overlay.target_display(target))
                 .with_description(format!("{} available", overlay.available_for(target)))
                 .with_target(target.clone())
         })
@@ -1115,6 +1133,7 @@ mod tests {
         reset_credits: Option<u32>,
     ) -> ProviderUsageStatus {
         ProviderUsageStatus {
+            provider_name: String::new(),
             provider_id: provider_id.into(),
             account: account.map(str::to_string),
             outcome: UsageOutcome::Usage(ProviderUsage {
@@ -1570,7 +1589,7 @@ mod tests {
         let picker = body(&mut overlay);
         // Both labels fold to the same display text; the exact raw label
         // still travels with the row, never parsed back from what was drawn.
-        assert!(picker.contains("openai-codex / work"), "{picker}");
+        assert!(picker.contains("openai-codex · work"), "{picker}");
         assert!(!picker.contains("wo\nrk"), "{picker:?}");
         overlay.select_menu_value("reset-1");
         send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
@@ -1605,7 +1624,7 @@ mod tests {
         send(&mut overlay, &key(Key::ENTER, Modifiers::empty()));
         let message = wait_for(&mut overlay, "Refresh usage before resetting");
 
-        assert!(message.contains("openai-codex / work"), "{message}");
+        assert!(message.contains("openai-codex · work"), "{message}");
         assert!(matches!(overlay.phase, Phase::Done { .. }));
     }
 
@@ -1644,7 +1663,7 @@ mod tests {
         let output = wait_for(&mut overlay, "work");
         assert!(output.contains("personal"), "{output}");
         assert_eq!(
-            output.matches("anthropic").count(),
+            output.matches("Anthropic ·").count(),
             2,
             "each account is a complete rendered group:\n{output}"
         );
@@ -1755,20 +1774,22 @@ mod tests {
         assert!(!out.contains(&hint), "footer leaked into body:\n{out}");
     }
 
-    /// The Display rows keep the P4a tinting: the provider-id column and the
-    /// status detail in the muted tint. Fails if a column is left at the
-    /// default fg.
+    /// Identity and window labels are primary text, metrics are secondary.
     #[test]
-    fn display_rows_preserve_column_tints() {
-        let (overlay, _) = overlay_with(vec![codex_status(Some(2))], vec![]);
-        let rows = overlay.display_rows();
-        let first = &rows[0];
-        assert_eq!(first.len(), 3, "id, label, and detail spans: {first:?}");
-        assert!(first[0].text.contains("openai-codex"), "{first:?}");
-        assert_eq!(first[0].style, test_styles().muted);
-        assert!(first[1].text.contains("5h limit"), "{first:?}");
-        assert_eq!(first[1].style, Style::default());
-        assert_eq!(first[2].style, test_styles().muted);
+    fn display_distinguishes_primary_labels_from_secondary_metrics() {
+        let (mut overlay, _) = overlay_with(vec![codex_status(Some(2))], vec![]);
+        let surface = overlay.draw(&crate::test_support::draw_ctx(80, Some(10)));
+        let rows = crate::test_support::rows(&surface);
+        let cells = crate::test_support::flatten(&surface);
+        assert!(rows[0].starts_with("openai-codex"), "{rows:?}");
+        assert!(rows[1].starts_with("  5h limit"), "{rows:?}");
+        assert_eq!(cells[0][0].style, Style::default());
+        assert_eq!(cells[1][2].style, Style::default());
+        let percent = cells[1]
+            .iter()
+            .position(|cell| cell.char.grapheme() == "%")
+            .unwrap();
+        assert_eq!(cells[1][percent].style, test_styles().muted);
     }
 
     /// The read-only body's scrollbar thumb is tinted Muted, via the shared

@@ -183,7 +183,7 @@ impl OAuthProvider for OpenAIOAuth {
     }
 
     fn name(&self) -> &str {
-        "ChatGPT Plus/Pro (Codex Subscription)"
+        "OpenAI Codex subscription"
     }
 
     fn uses_callback_server(&self) -> bool {
@@ -810,7 +810,7 @@ mod tests {
     fn openai_oauth_implements_provider_metadata() {
         let provider = OpenAIOAuth::new();
         assert_eq!(provider.id(), "openai-codex");
-        assert!(provider.name().contains("ChatGPT"));
+        assert_eq!(provider.name(), "OpenAI Codex subscription");
         assert!(provider.uses_callback_server());
         // Default `get_api_key` returns the access token verbatim.
         let creds = OAuthCredentials::new("r", "an-access-token", 0);

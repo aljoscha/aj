@@ -217,6 +217,44 @@ impl Control {
         }
     }
 
+    /// Account choices for every provider advertised by the host, including
+    /// providers using an environment key rather than a stored account.
+    pub(crate) async fn account_overview(
+        &self,
+        session: &str,
+        additional_providers: &[String],
+    ) -> Result<(aj_wire::CredentialOverview, Vec<AccountList>), ControlError> {
+        let overview = self.credential_overview(session).await?;
+        // Pins outlive stored credentials. Keep their providers reachable so
+        // the user can clear a pin after its last account has been removed.
+        let settings = self.session_info(session).await?.settings;
+        let providers: std::collections::BTreeSet<_> = overview
+            .statuses
+            .iter()
+            .map(|status| status.provider_id.as_str())
+            .chain(overview.stored.keys().map(String::as_str))
+            .chain(
+                overview
+                    .oauth_providers
+                    .iter()
+                    .map(|provider| provider.id.as_str()),
+            )
+            .chain(settings.accounts.keys().map(String::as_str))
+            .chain(
+                settings
+                    .model
+                    .as_ref()
+                    .map(|(provider, _)| provider.as_str()),
+            )
+            .chain(additional_providers.iter().map(String::as_str))
+            .collect();
+        let mut accounts = Vec::with_capacity(providers.len());
+        for provider in providers {
+            accounts.push(self.accounts(session, Some(provider)).await?);
+        }
+        Ok((overview, accounts))
+    }
+
     /// Change the host's credential store: store a login this client ran,
     /// log out, or pick a default account.
     pub(crate) async fn mutate_credentials(

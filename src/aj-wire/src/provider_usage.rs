@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderUsageStatus {
     pub provider_id: String,
+    /// Host display label. Clients use `provider_id` when this is empty.
+    #[serde(default)]
+    pub provider_name: String,
     /// The exact stored account label. `None` is the effective unlabeled
     /// credential or an unconfigured provider.
     pub account: Option<String>,

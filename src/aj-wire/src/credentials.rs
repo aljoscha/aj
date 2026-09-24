@@ -33,6 +33,9 @@ pub struct OAuthProviderInfo {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialStatus {
     pub provider_id: String,
+    /// Host display label. Clients use `provider_id` when this is empty.
+    #[serde(default)]
+    pub provider_name: String,
     /// Exact account identity. None denotes a bare credential or provider source.
     pub account_label: Option<String>,
     /// Whether this account is the store default.
@@ -110,5 +113,34 @@ pub enum CredentialOutcome {
 impl crate::request::Sealed for CredentialMutation {
     fn decode(body: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn status_names_accept_old_replies_and_roundtrip_host_labels() {
+        let credential = serde_json::json!({
+            "provider_id": "anthropic", "account_label": null,
+            "is_default": false, "configured": true,
+            "summary": "subscription", "detail": null
+        });
+        let usage = serde_json::json!({
+            "provider_id": "anthropic", "account": null, "outcome": "NoSource"
+        });
+        let mut credential: super::CredentialStatus = serde_json::from_value(credential).unwrap();
+        let mut usage: crate::ProviderUsageStatus = serde_json::from_value(usage).unwrap();
+        assert!(credential.provider_name.is_empty());
+        assert!(usage.provider_name.is_empty());
+        credential.provider_name = "Anthropic subscription".into();
+        usage.provider_name = "Anthropic subscription".into();
+        assert_eq!(
+            credential,
+            serde_json::from_str(&serde_json::to_string(&credential).unwrap()).unwrap()
+        );
+        assert_eq!(
+            usage,
+            serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap()
+        );
     }
 }

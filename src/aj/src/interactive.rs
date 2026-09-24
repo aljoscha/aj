@@ -2309,6 +2309,7 @@ fn open_credential_picker(world: &World, shell: &Rc<RefCell<Shell>>, action: Com
     let title = match action {
         CommandAction::OpenLoginSelector => "Log in",
         CommandAction::OpenLogoutSelector => "Log out",
+        CommandAction::OpenAccountSelector => "Session account",
         _ => "Default account",
     };
     let handles = shell.borrow().overlay_handles();
@@ -2325,20 +2326,78 @@ fn open_credential_picker(world: &World, shell: &Rc<RefCell<Shell>>, action: Com
         },
     );
     let control = world.control.clone();
+    let branch = branch_settings(shell);
+    let mut additional_providers: Vec<String> = branch
+        .as_ref()
+        .map(|state| state.accounts.keys().cloned().collect())
+        .unwrap_or_default();
+    if let Some((provider, _)) = editing_model(world, shell, editing_target(world, shell)) {
+        additional_providers.push(provider);
+    }
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        let _ = tx.send(control.credential_overview(&session).await);
+        let result = if action == CommandAction::OpenAccountSelector {
+            control
+                .account_overview(&session, &additional_providers)
+                .await
+                .map(|(overview, lists)| {
+                    let mut rows = Vec::new();
+                    for mut list in lists {
+                        if let Some(state) = &branch {
+                            list.selected = state.accounts.get(&list.provider).cloned();
+                        }
+                        rows.extend(session_account_rows(&overview, list));
+                    }
+                    (rows, "No providers available for account selection.")
+                })
+        } else {
+            control
+                .credential_overview(&session)
+                .await
+                .map(|overview| credential_picker_rows(action, overview))
+        };
+        let _ = tx.send(result);
     });
     shell.borrow_mut().fills.push(Box::pin(async move {
         match rx.await {
-            Ok(Ok(overview)) => {
-                let (rows, empty) = credential_picker_rows(action, overview);
+            Ok(Ok((rows, empty))) => {
                 fill.fill(rows, empty);
             }
             Ok(Err(err)) => fill.fill(Vec::new(), &credential_error(&err, false)),
             Err(_) => fill.fill(Vec::new(), "Credential read task stopped."),
         }
     }));
+}
+
+fn credential_provider_name(
+    overview: &CredentialOverview,
+    provider: &str,
+    account: Option<&str>,
+) -> String {
+    let account = if matches!(
+        overview.stored.get(provider),
+        Some(StoredCredentialMetadata::Bare)
+    ) {
+        None
+    } else {
+        account
+    };
+    // Stored rows follow runtime overrides. Pickers name the stored account,
+    // not the override that may currently mask it.
+    overview
+        .statuses
+        .iter()
+        .rev()
+        .find(|status| status.provider_id == provider && status.account_label.as_deref() == account)
+        .map(|status| {
+            if status.provider_name.is_empty() {
+                provider
+            } else {
+                &status.provider_name
+            }
+        })
+        .map(crate::text::one_line)
+        .unwrap_or_else(|| crate::text::one_line(provider))
 }
 
 fn credential_picker_rows(
@@ -2379,7 +2438,10 @@ fn credential_picker_rows(
                             provider_name: name.clone(),
                             target: LoginTarget::ExistingAccount(None),
                         },
-                        label: format!("{name} · Unnamed account"),
+                        label: format!(
+                            "{} · Unnamed account",
+                            credential_provider_name(&overview, id, None)
+                        ),
                         filter_key: format!(
                             "{id} {name} Unnamed account existing credential reauthenticate"
                         ),
@@ -2388,6 +2450,8 @@ fn credential_picker_rows(
                     Some(StoredCredentialMetadata::Accounts { accounts, .. }) => {
                         rows.extend(accounts.into_iter().map(|account_label| {
                             let shown = account_label_text(&account_label);
+                            let shown_name =
+                                credential_provider_name(&overview, id, Some(&account_label));
                             let request = AuthPickerAction::Login {
                                 provider_id: id.clone(),
                                 provider_name: name.clone(),
@@ -2395,7 +2459,7 @@ fn credential_picker_rows(
                             };
                             AuthRow {
                                 request,
-                                label: format!("{name} · {shown}"),
+                                label: format!("{shown_name} · {shown}"),
                                 filter_key: format!("{id} {name} {shown} reauthenticate"),
                                 summary: Some("log in again and replace this account".to_string()),
                             }
@@ -2414,7 +2478,10 @@ fn credential_picker_rows(
                         request: AuthPickerAction::LogoutBare {
                             provider_id: id.clone(),
                         },
-                        label: format!("{id} · Unnamed account"),
+                        label: format!(
+                            "{} · Unnamed account",
+                            credential_provider_name(&overview, id, None)
+                        ),
                         filter_key: format!("{id} Unnamed account bare credential"),
                         summary: Some("remove the stored credential".to_string()),
                     }),
@@ -2432,7 +2499,10 @@ fn credential_picker_rows(
                             };
                             AuthRow {
                                 request: AuthPickerAction::ApplyAccount(action),
-                                label: format!("{id} · {shown}"),
+                                label: format!(
+                                    "{} · {shown}",
+                                    credential_provider_name(&overview, id, Some(&account_label))
+                                ),
                                 filter_key: format!("{id} {shown}"),
                                 summary: Some(format!("remove this {suffix}")),
                             }
@@ -2461,13 +2531,12 @@ fn credential_picker_rows(
                     };
                     AuthRow {
                         request: AuthPickerAction::ApplyAccount(action),
-                        label: if is_current {
-                            format!("{id} · {shown} (current)")
-                        } else {
-                            format!("{id} · {shown}")
-                        },
+                        label: format!(
+                            "{} · {shown}",
+                            credential_provider_name(&overview, id, Some(&account_label))
+                        ),
                         filter_key: format!("{id} {shown}"),
-                        summary: None,
+                        summary: is_current.then(|| "provider default".to_string()),
                     }
                 }));
             }
@@ -2629,11 +2698,14 @@ fn default_logout_rows(
         return Vec::new();
     }
     let expected_accounts = accounts.clone();
+    let removed = account_label_text(&account_label);
+    let name = crate::text::one_line(aj_app::auth::api_provider_name(&provider_id));
     let mut rows = accounts
         .iter()
         .filter(|label| *label != &account_label)
         .map(|new_default| {
             let shown = account_label_text(new_default);
+            let name = credential_provider_name(&overview, &provider_id, Some(new_default));
             let action = AccountAction::LogoutWithNewDefault {
                 provider_id: provider_id.clone(),
                 account_label: account_label.clone(),
@@ -2642,8 +2714,8 @@ fn default_logout_rows(
             AuthRow {
                 request: AuthPickerAction::ApplyAccount(action),
                 filter_key: format!("{provider_id} {shown}"),
-                label: shown,
-                summary: Some("make default, then remove the selected account".to_string()),
+                label: format!("{name} · {shown}"),
+                summary: Some(format!("make default and remove {removed}")),
             }
         })
         .collect::<Vec<_>>();
@@ -2652,9 +2724,9 @@ fn default_logout_rows(
             provider_id: provider_id.clone(),
             expected_accounts,
         }),
-        label: format!("Remove all {provider_id} accounts"),
+        label: format!("Remove all {name} accounts"),
         filter_key: format!("{provider_id} remove all accounts"),
-        summary: Some("remove the complete labeled set".to_string()),
+        summary: Some("remove all stored accounts for this provider".to_string()),
     });
     rows
 }
@@ -2674,7 +2746,7 @@ fn open_default_logout_resolution(
         &handles.editor,
         &handles.chrome,
         &handles.auth_request,
-        &format!("Choose a new default or remove all accounts · {host}"),
+        &format!("Log out · {host}"),
         Vec::new(),
         AuthPickerTarget {
             session: session.to_string(),
@@ -2727,35 +2799,45 @@ async fn logout_notice(control: &Control, session: &str, provider: &str, removed
 
 /// Following the default and pinning that exact account are distinct choices,
 /// even when their credential source agrees. The picker owns their target.
-fn session_account_rows(provider: &str, list: aj_wire::AccountList) -> Vec<AuthRow> {
+fn session_account_rows(overview: &CredentialOverview, list: aj_wire::AccountList) -> Vec<AuthRow> {
+    let provider = list.provider.as_str();
     let request = |account| AuthPickerAction::SelectAccount {
         provider: provider.to_string(),
         account,
     };
     let default = list.default.as_deref().map(account_label_text);
     let source = crate::text::one_line(&list.source);
+    let name = credential_provider_name(overview, provider, list.default.as_deref());
+    let mut summary = default.unwrap_or(source);
+    if list.override_active {
+        summary = "--api-key override active".to_string();
+    } else if list.selected.is_none() {
+        summary.push_str(" · selected");
+    }
     let mut rows = vec![AuthRow {
         request: request(None),
-        label: if list.selected.is_none() {
-            "Provider default (current)".to_string()
-        } else {
-            "Provider default".to_string()
-        },
-        filter_key: "Provider default shared follow".to_string(),
-        summary: Some(default.unwrap_or(source)),
+        label: format!("{name} · Follow provider default"),
+        filter_key: format!("{provider} Provider default shared follow"),
+        summary: Some(summary),
     }];
     rows.extend(list.accounts.into_iter().map(|account| {
         let shown = account_label_text(&account);
         let selected = list.selected.as_ref() == Some(&account);
+        let name = credential_provider_name(overview, provider, Some(&account));
+        let mut states = Vec::new();
+        if list.default.as_ref() == Some(&account) {
+            states.push("provider default");
+        }
+        if list.override_active {
+            states.push("--api-key override active");
+        } else if selected {
+            states.push("selected");
+        }
         AuthRow {
             request: request(Some(account)),
-            label: if selected {
-                format!("{shown} (current)")
-            } else {
-                shown.clone()
-            },
-            filter_key: shown,
-            summary: None,
+            label: format!("{name} · {shown}"),
+            filter_key: format!("{provider} {shown}"),
+            summary: (!states.is_empty()).then(|| states.join(" · ")),
         }
     }));
     rows
@@ -2837,6 +2919,27 @@ async fn start_auth_request(
     } = request;
     match request {
         AuthPickerAction::SelectAccount { provider, account } => {
+            match world.control.accounts(&session, Some(&provider)).await {
+                Ok(list) if list.override_active => {
+                    fold_notice(
+                        world,
+                        &format!(
+                            "{host}: --api-key overrides stored account choices for {provider}. Remove the runtime override before selecting an account."
+                        ),
+                    );
+                    app.request_redraw();
+                    return;
+                }
+                Err(err) => {
+                    fold_notice(
+                        world,
+                        &format!("{host}: Could not read accounts: {}", peer_refusal(&err)),
+                    );
+                    app.request_redraw();
+                    return;
+                }
+                Ok(_) => {}
+            }
             if session == world.session() && shell.borrow().view().branch_anchor.borrow().is_some()
             {
                 if let Some(draft) = shell.borrow().view().branch_anchor.borrow_mut().as_mut() {
@@ -4154,15 +4257,6 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenAccountSelector => {
-            let session = world.session().to_string();
-            let host = credential_host(world);
-            let target = editing_target(world, shell);
-            let Some((provider, _)) = editing_model(world, shell, target) else {
-                shell.borrow().show_toast(
-                    "Choose a model before selecting a branch account: no model was recorded here.",
-                );
-                return ActionEffect::Redraw;
-            };
             if shell
                 .borrow()
                 .view()
@@ -4176,44 +4270,8 @@ async fn apply_command_action(
                     .show_toast("This host does not provide recorded branch account choices.");
                 return ActionEffect::Redraw;
             }
-            match world.control.accounts(&session, Some(&provider)).await {
-                Ok(list) if list.override_active => {
-                    fold_notice(
-                        world,
-                        "--api-key overrides stored account choices. Remove the runtime override before selecting an account.",
-                    );
-                    ActionEffect::Redraw
-                }
-                Ok(mut list) => {
-                    if let Some(state) = branch_settings(shell) {
-                        list.selected = state.accounts.get(&provider).cloned();
-                    }
-                    let rows = session_account_rows(&provider, list);
-                    let handles = shell.borrow().overlay_handles();
-                    crate::login::open_auth_picker(
-                        &handles.stack,
-                        &handles.editor,
-                        &handles.chrome,
-                        &handles.auth_request,
-                        &format!("Account · {} · {host}", crate::text::one_line(&provider)),
-                        rows,
-                        AuthPickerTarget {
-                            session: session.to_string(),
-                            host: host.to_string(),
-                        },
-                    );
-                    ActionEffect::OpenedOverlay
-                }
-                Err(err) => {
-                    let message = if err.unknown_endpoint() {
-                        "This host does not support session account selection.".to_string()
-                    } else {
-                        format!("Could not read accounts: {}", peer_refusal(&err))
-                    };
-                    fold_notice(world, &format!("{host}: {message}"));
-                    ActionEffect::Redraw
-                }
-            }
+            open_credential_picker(world, shell, CommandAction::OpenAccountSelector);
+            ActionEffect::OpenedOverlay
         }
         action @ (CommandAction::OpenLoginSelector
         | CommandAction::OpenLogoutSelector
@@ -15044,12 +15102,13 @@ mod tests {
                         && status.account_label.as_deref().is_none_or(str::is_empty)
                 })
                 .unwrap();
-            assert_eq!(unnamed.summary, format!("subscription · {name}"));
+            assert_eq!(unnamed.summary, "subscription");
+            assert_eq!(unnamed.provider_name, name);
 
-            for (action, prefix) in [
-                (CommandAction::OpenLoginSelector, name.as_str()),
-                (CommandAction::OpenLogoutSelector, provider),
-                (CommandAction::OpenDefaultAccountSelector, provider),
+            for action in [
+                CommandAction::OpenLoginSelector,
+                CommandAction::OpenLogoutSelector,
+                CommandAction::OpenDefaultAccountSelector,
             ] {
                 assert!(matches!(
                     apply_command(&mut world, &shell, action).await,
@@ -15058,11 +15117,11 @@ mod tests {
                 focus_overlay(&mut app, &root);
                 let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
                 assert!(
-                    painted.contains(&format!("{prefix} · Unnamed account")),
+                    painted.contains(&format!("{name} · Unnamed account")),
                     "{painted}"
                 );
                 if grown {
-                    assert!(painted.contains(&format!("{prefix} · work")), "{painted}");
+                    assert!(painted.contains("Anthropic · work"), "{painted}");
                 }
                 assert!(!painted.contains("bare credential"), "{painted}");
                 press(&mut app, &mut writer, b"\x1b").await;
@@ -15156,7 +15215,10 @@ mod tests {
             .expect("auth fetch channel remains open");
         let rows = rows
             .into_iter()
-            .filter(|row| row.iter().any(|segment| segment.text.trim() == "provider"))
+            .filter(|row| {
+                row.iter()
+                    .any(|segment| segment.text.contains("provider ·"))
+            })
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1, "the legacy row is the measured list child");
         let fetched = rows
@@ -15708,6 +15770,7 @@ mod tests {
             CommandAction::OpenLoginSelector,
             CommandAction::OpenLogoutSelector,
             CommandAction::OpenDefaultAccountSelector,
+            CommandAction::OpenAccountSelector,
         ] {
             let (export, _) = unbounded_channel();
             let (redraw, _) = unbounded_channel();
@@ -16284,7 +16347,10 @@ mod tests {
         let picker = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(picker.contains("Default account"), "{picker}");
         assert!(
-            picker.contains("provider · personal (current)"),
+            picker
+                .lines()
+                .any(|line| line.contains("provider · personal")
+                    && line.contains("provider default")),
             "current default is visible and tagged: {picker}"
         );
         assert!(!picker.contains("current default account"), "{picker}");
@@ -26034,6 +26100,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_pickers_share_host_subscription_names_locally_and_remotely() {
+        for connected in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let remote = if connected {
+                Some(RemoteHost::start(&dir, "streaming-text").await)
+            } else {
+                None
+            };
+            let (mut world, shell) = match &remote {
+                Some(remote) => connect_world_and_shell(&dir, remote, &["--new"]).await,
+                None => world_and_shell(&dir, "streaming-text").await,
+            };
+            let auth = AuthStorage::new(dir.path().join("auth.json"));
+            for provider in ["anthropic", "openai-codex"] {
+                auth.insert_account(
+                    provider,
+                    "work",
+                    AuthCredential::OAuth(OAuthCredentials::new(
+                        "unused-access",
+                        "unused-refresh",
+                        i64::MAX,
+                    )),
+                )
+                .await
+                .unwrap();
+            }
+            auth.insert_account(
+                "anthropic",
+                "api",
+                AuthCredential::ApiKey {
+                    key: "unused-key".into(),
+                },
+            )
+            .await
+            .unwrap();
+            if connected {
+                assert!(world.auth.list().await.unwrap().is_empty());
+            }
+            let (mut app, mut writer, root) = app_over(&shell).await;
+            for action in [
+                CommandAction::OpenLoginSelector,
+                CommandAction::OpenLogoutSelector,
+                CommandAction::OpenDefaultAccountSelector,
+                CommandAction::OpenAccountSelector,
+            ] {
+                assert!(matches!(
+                    apply_command(&mut world, &shell, action).await,
+                    ActionEffect::OpenedOverlay
+                ));
+                focus_overlay(&mut app, &root);
+                type_text(&mut app, &mut writer, "anthropic").await;
+                let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+                assert!(
+                    page.contains("Anthropic subscription · work"),
+                    "{action:?}: {page}"
+                );
+                assert!(
+                    page.contains("Anthropic · api"),
+                    "API key must not be named a subscription: {page}"
+                );
+                press(&mut app, &mut writer, b"\x1b").await;
+                assert!(matches!(
+                    apply_command(&mut world, &shell, action).await,
+                    ActionEffect::OpenedOverlay
+                ));
+                focus_overlay(&mut app, &root);
+                type_text(&mut app, &mut writer, "openai-codex").await;
+                let page = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+                assert!(
+                    page.contains("OpenAI Codex subscription · work"),
+                    "{action:?}: {page}"
+                );
+                press(&mut app, &mut writer, b"\x1b").await;
+            }
+            if let Some(remote) = remote {
+                remote.shutdown().await;
+            } else {
+                shut_down(&world).await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn session_account_picker_keeps_default_and_exact_pins_distinct_locally_and_remotely() {
         for connected in [false, true] {
             let dir = TempDir::new().expect("tempdir");
@@ -26083,6 +26232,128 @@ mod tests {
             let (mut app, mut writer, root) = app_over(&shell).await;
             let (tx, _rx) = unbounded_channel();
             let mut login_session = None;
+            let other = "other-account-provider";
+            assert_ne!(provider, other, "fixture exercises an inactive provider");
+            auth.insert_account(
+                other,
+                "work",
+                AuthCredential::ApiKey {
+                    key: "other-secret".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                apply_command(&mut world, &shell, CommandAction::OpenAccountSelector).await,
+                ActionEffect::OpenedOverlay
+            ));
+            run_fills(&shell).await;
+            focus_overlay(&mut app, &root);
+            for byte in other.bytes() {
+                press(&mut app, &mut writer, &[byte]).await;
+            }
+            let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+            assert!(
+                painted.contains("other-account-provider · work"),
+                "{painted}"
+            );
+            press(&mut app, &mut writer, b"\x1b[B").await;
+            press(&mut app, &mut writer, b"\r").await;
+            let request = shell
+                .borrow()
+                .take_auth_request()
+                .expect("inactive provider choice");
+            assert_eq!(
+                request.action,
+                AuthPickerAction::SelectAccount {
+                    provider: other.into(),
+                    account: Some("work".into()),
+                }
+            );
+            apply_auth_request(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut login_session,
+                &tx,
+                request,
+            )
+            .await;
+            assert_eq!(
+                world
+                    .control
+                    .accounts(&session, Some(other))
+                    .await
+                    .unwrap()
+                    .selected
+                    .as_deref(),
+                Some("work")
+            );
+            assert_eq!(
+                viewed_model(&world, AgentId::Main).0,
+                provider,
+                "account selection does not change models"
+            );
+            assert_eq!(
+                world
+                    .control
+                    .accounts(&session, Some(&provider))
+                    .await
+                    .unwrap()
+                    .selected,
+                None
+            );
+            auth.remove_account(other, "work").await.unwrap();
+            let overview = world.control.credential_overview(&session).await.unwrap();
+            assert!(!overview.stored.contains_key(other));
+            assert!(
+                !overview
+                    .statuses
+                    .iter()
+                    .any(|status| status.provider_id == other)
+            );
+            let orphan = world.control.accounts(&session, Some(other)).await.unwrap();
+            assert_eq!(orphan.selected.as_deref(), Some("work"));
+            assert!(
+                orphan.accounts.is_empty(),
+                "the pin outlives its last stored account"
+            );
+            let request = pick_credential(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut writer,
+                &root,
+                CommandAction::OpenAccountSelector,
+                other,
+            )
+            .await;
+            assert_eq!(
+                request.action,
+                AuthPickerAction::SelectAccount {
+                    provider: other.into(),
+                    account: None
+                }
+            );
+            apply_auth_request(
+                &mut world,
+                &shell,
+                &mut app,
+                &mut login_session,
+                &tx,
+                request,
+            )
+            .await;
+            assert_eq!(
+                world
+                    .control
+                    .accounts(&session, Some(other))
+                    .await
+                    .unwrap()
+                    .selected,
+                None
+            );
+
             let mut current = None;
             for (index, expected) in [
                 (4, Some("default")),
@@ -26095,17 +26366,21 @@ mod tests {
                     apply_command(&mut world, &shell, CommandAction::OpenAccountSelector).await,
                     ActionEffect::OpenedOverlay
                 ));
+                run_fills(&shell).await;
                 focus_overlay(&mut app, &root);
+                for byte in provider.bytes() {
+                    press(&mut app, &mut writer, &[byte]).await;
+                }
                 let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
-                assert!(painted.contains("Provider default"), "{painted}");
+                assert!(painted.contains("Follow provider default"), "{painted}");
                 assert!(painted.contains("Unnamed account"), "{painted}");
                 let default_row = painted
                     .lines()
-                    .find(|line| line.contains("Provider default"))
+                    .find(|line| line.contains("Follow provider default"))
                     .unwrap();
                 assert!(
                     default_row
-                        .split_once("Provider default")
+                        .split_once("Follow provider default")
                         .unwrap()
                         .1
                         .contains("default"),
@@ -26113,9 +26388,12 @@ mod tests {
                 );
                 let current_label = current
                     .map(account_label_text)
-                    .unwrap_or_else(|| "Provider default".to_string());
+                    .unwrap_or_else(|| "Follow provider default".to_string());
                 assert!(
-                    painted.contains(&format!("{current_label} (current)")),
+                    painted
+                        .lines()
+                        .any(|line| line.contains(&format!(" · {current_label}"))
+                            && line.contains("selected")),
                     "{painted}"
                 );
                 for explanation in [
@@ -26205,7 +26483,11 @@ mod tests {
             apply_command(&mut world, &shell, CommandAction::OpenAccountSelector).await,
             ActionEffect::OpenedOverlay
         ));
+        run_fills(&shell).await;
         focus_overlay(&mut app, &root);
+        for byte in provider.bytes() {
+            press(&mut app, &mut writer, &[byte]).await;
+        }
         let mut changed = world.client().settings().unwrap().clone();
         changed.provider = "another-provider".to_string();
         world.chat.borrow_mut().footers_mut().note_settings(
@@ -26282,8 +26564,29 @@ mod tests {
         );
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenAccountSelector).await,
-            ActionEffect::Redraw
+            ActionEffect::OpenedOverlay
         ));
+        run_fills(&shell).await;
+        focus_overlay(&mut app, &root);
+        for byte in provider.bytes() {
+            press(&mut app, &mut writer, &[byte]).await;
+        }
+        let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(painted.contains("--api-key override active"), "{painted}");
+        press(&mut app, &mut writer, b"\r").await;
+        let request = shell
+            .borrow()
+            .take_auth_request()
+            .expect("attempt account choice");
+        apply_auth_request(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut login_session,
+            &tx,
+            request,
+        )
+        .await;
         assert!(!shell.borrow().overlays.borrow().is_open());
         assert!(
             main_notices(&world)
@@ -30642,7 +30945,7 @@ mod tests {
             assert!(
                 top_overlay_rows(&shell)
                     .join("\n")
-                    .contains("openai-codex / work")
+                    .contains("usage-owner · work")
             );
             assert!(
                 source.spent().is_empty(),
