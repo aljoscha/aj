@@ -1648,7 +1648,7 @@ mod tests {
         );
         assert_eq!(gpt55.api, "openai-codex-responses");
         assert_eq!(gpt55.base_url, "https://chatgpt.com/backend-api");
-        assert_eq!(gpt55.context_window, 400_000);
+        assert_eq!(gpt55.context_window, 1_050_000);
         assert_eq!(gpt55.max_tokens, 128_000);
     }
 }
