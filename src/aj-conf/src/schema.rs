@@ -672,11 +672,10 @@ pub struct Config {
     /// fires. Defaults to `0.85`. Must be in the half-open range
     /// `(0.0, 1.0]`.
     pub compact_threshold: f64,
-    /// Approximate tokens of recent conversation kept verbatim after a
-    /// compaction; everything older is summarized into the checkpoint.
-    /// A fixed budget rather than a fraction of the window, so the
-    /// summarized range depends only on how much recent context we want
-    /// to retain, not on the model. Defaults to `20_000`.
+    /// Approximate tokens kept verbatim after compaction. Up to half is
+    /// reserved for recent original user messages, with the remainder
+    /// used for a tool-safe recent tail. Summary and framing are additional.
+    /// A fixed budget, independent of the model window. Defaults to `20_000`.
     pub compact_keep_recent: u64,
     /// Route eligible `bash` tool commands through `rtk`
     /// (https://github.com/rtk-ai/rtk), a CLI proxy that compresses
@@ -1186,7 +1185,7 @@ impl Config {
         },
         ConfigOption {
             name: "compact_keep_recent",
-            description: "Approximate tokens of recent context kept verbatim after a compaction.",
+            description: "Verbatim context budget after compaction, prioritizing recent user messages.",
             kind: ValueKind::Number,
             apply_toml_fn: |v, c| {
                 // Accept a TOML integer or float (so `20000` and

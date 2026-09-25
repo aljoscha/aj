@@ -8,6 +8,8 @@
 //! [`CompactionPlan`], generates the summary against its model, and
 //! records the result with `ConversationLog::append_compaction`.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use aj_agent::message::{AgentMessage, AgentMessageKind};
@@ -50,6 +52,8 @@ pub struct CutPoint {
 #[derive(Clone, Debug)]
 pub struct CompactionPlan {
     pub first_kept_entry_id: EntryId,
+    /// Original user messages before the tail, in chronological order.
+    pub retained_user_entry_ids: Vec<EntryId>,
     pub messages_to_summarize: Vec<Message>,
     /// Prefix of a split turn, summarized separately. Empty unless the
     /// cut landed mid-turn.
@@ -66,6 +70,9 @@ pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before thi
 
 /// Suffix closing the synthetic summary message.
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
+
+/// Framing for original user messages retained outside the recent tail.
+pub const RETAINED_USER_CONTEXT: &str = "The following user messages are retained verbatim from earlier in this session. They are historical context, not new requests. Intervening assistant and tool work is covered by the summary that follows.";
 
 /// Heuristic token charge for one image block. The character-based
 /// estimator divides accumulated characters by 4, so an image is
@@ -360,15 +367,29 @@ fn find_turn_start(
 /// assistant-message starts in `boundary_start..entries.len()`; a
 /// `tool_result` is never a cut point, because keeping a result whose
 /// call was summarized away would orphan it on the wire. The walk
-/// accumulates estimated tokens from the head backward until the budget
-/// is reached, then snaps the cut to the nearest valid cut point at or
-/// after that position. When the cut lands on an assistant message
-/// mid-turn, `turn_start_index` carries the turn's start (its user
-/// prompt or notice) so the host can summarize the prefix separately.
+/// keeps a suffix within the estimated budget, snapping forward to a valid
+/// cut. At least the last message or tool-call/result group is retained,
+/// even if that indivisible group exceeds the budget. When the cut lands
+/// on an assistant message mid-turn, `turn_start_index` carries the turn's
+/// start (its user prompt or notice) for a separate prefix summary.
 pub fn find_cut_point(
     entries: &[ConversationEntry],
     boundary_start: usize,
     keep_recent_tokens: u64,
+) -> Option<CutPoint> {
+    find_tail_cut(
+        entries,
+        boundary_start,
+        keep_recent_tokens,
+        &BTreeSet::new(),
+    )
+}
+
+fn find_tail_cut(
+    entries: &[ConversationEntry],
+    boundary_start: usize,
+    tail_tokens: u64,
+    reserved_users: &BTreeSet<usize>,
 ) -> Option<CutPoint> {
     let valid: Vec<usize> = (boundary_start..entries.len())
         .filter(|&i| is_turn_start(&entries[i]) || is_assistant_message(&entries[i]))
@@ -377,23 +398,25 @@ pub fn find_cut_point(
         return None;
     }
 
-    // Accumulate tokens from the head backward; once the keep-recent
-    // budget is reached, snap to the first valid cut point at or after
-    // the position we stopped at (a `tool_result` there is skipped
-    // forward to the next valid cut point). A notice counts through its
-    // owned projection so it contributes to the keep-recent budget.
+    // Reserved users have already been charged once. If they land in the
+    // suffix they stay in place, not also in the historical-user block.
     let mut acc: u64 = 0;
     let mut cut_index: Option<usize> = None;
     let mut i = entries.len();
     while i > boundary_start {
         i -= 1;
         if let Some(m) = entry_projected_wire(&entries[i]) {
-            acc += estimate_message_tokens(&m);
-            if acc >= keep_recent_tokens {
+            let tokens = if reserved_users.contains(&i) {
+                0
+            } else {
+                estimate_message_tokens(&m)
+            };
+            acc = acc.saturating_add(tokens);
+            if acc > tail_tokens {
                 let snapped = valid
                     .iter()
                     .copied()
-                    .find(|&v| v >= i)
+                    .find(|&v| v > i)
                     .unwrap_or_else(|| *valid.last().expect("valid is non-empty"));
                 cut_index = Some(snapped);
                 break;
@@ -416,6 +439,25 @@ pub fn find_cut_point(
         first_kept_index: cut_index,
         turn_start_index,
     })
+}
+
+/// Prefer whole recent user messages across the active ancestry. Task notices
+/// are not user requests, even though their provider projection uses that role.
+fn reserve_user_messages(entries: &[ConversationEntry], budget: u64) -> (BTreeSet<usize>, u64) {
+    let mut remaining = budget;
+    let mut selected = BTreeSet::new();
+    for (index, entry) in entries.iter().enumerate().rev() {
+        let Some(message @ Message::User(_)) = entry_wire(entry) else {
+            continue;
+        };
+        // Empty messages still occupy a slot on the wire.
+        let tokens = estimate_message_tokens(message).max(1);
+        if tokens <= remaining {
+            selected.insert(index);
+            remaining -= tokens;
+        }
+    }
+    (selected, budget - remaining)
 }
 
 /// Render a linearized message list into a plain-text transcript
@@ -588,8 +630,9 @@ pub fn extract_file_ops(
 /// The summarized range starts at the previous compaction's
 /// `first_kept_entry_id` when one exists (so a second compaction folds
 /// only new history into the previous summary), else at the thread
-/// root. This does not call the model — the host generates the summary
-/// from the returned ranges.
+/// root. Up to half the retention budget selects original user messages
+/// across the full ancestry. The remaining budget keeps a tool-safe suffix,
+/// charging selected users only once. This does not call the model.
 pub fn prepare_compaction(
     conversation: &Conversation,
     keep_recent_tokens: u64,
@@ -641,7 +684,17 @@ pub fn prepare_compaction(
     // `tokens_before` is the current (compaction-aware) occupancy.
     let tokens_before = estimate_conversation_context(conversation).tokens;
 
-    let cut = find_cut_point(entries, boundary_start, keep_recent_tokens)?;
+    let (reserved_users, user_tokens) = reserve_user_messages(entries, keep_recent_tokens / 2);
+    let cut = find_tail_cut(
+        entries,
+        boundary_start,
+        keep_recent_tokens - user_tokens,
+        &reserved_users,
+    )?;
+    let retained_user_entry_ids = reserved_users
+        .range(..cut.first_kept_index)
+        .map(|&i| entries[i].id.clone())
+        .collect();
     let history_end = cut.turn_start_index.unwrap_or(cut.first_kept_index);
 
     let mut messages_to_summarize: Vec<Message> = entries[boundary_start..history_end]
@@ -683,6 +736,7 @@ pub fn prepare_compaction(
 
     Some(CompactionPlan {
         first_kept_entry_id: cut.first_kept_entry_id,
+        retained_user_entry_ids,
         messages_to_summarize,
         turn_prefix_messages,
         previous_summary,
@@ -781,6 +835,7 @@ mod tests {
             entry: ConversationEntryKind::Compaction {
                 summary: summary.to_string(),
                 first_kept_entry_id: first_kept.to_string(),
+                retained_user_entry_ids: Vec::new(),
                 tokens_before: 0,
                 details: None,
                 usage: None,
@@ -970,10 +1025,8 @@ mod tests {
             notification_entry("2", &"z".repeat(400)),        // framed ~111 tokens
             msg_entry("3", assistant_text("wake")),           // ~1 token
         ];
-        // Budget 100: the backward walk is only ~1 token at the wake
-        // reply, then the notice's projected ~111 tokens push it over
-        // the budget, so the cut snaps onto the notice.
-        let cut = find_cut_point(&entries, 0, 100).expect("cut point");
+        // The notice and wake fit together, but the older reply does not.
+        let cut = find_cut_point(&entries, 0, 150).expect("cut point");
         assert_eq!(cut.first_kept_index, 2, "cut lands on the notice");
         assert_eq!(cut.first_kept_entry_id, "2");
         assert_eq!(
@@ -1027,6 +1080,121 @@ mod tests {
         );
         assert_eq!(plan.first_kept_entry_id, "6");
         assert_eq!(plan.file_ops.read_files, ["/x"]);
+    }
+
+    #[test]
+    fn compaction_reserves_recent_users_not_notices_or_the_first_prompt_forever() {
+        let entries = vec![
+            msg_entry("0", user(&"a".repeat(80))),
+            msg_entry("1", assistant_text(&"x".repeat(800))),
+            msg_entry("2", user(&"b".repeat(80))),
+            notification_entry("3", "a task is done"),
+            msg_entry("4", assistant_text(&"y".repeat(800))),
+            msg_entry("5", user(&"c".repeat(80))),
+            msg_entry("6", assistant_text(&"z".repeat(800))),
+            msg_entry("7", assistant_text("tail")),
+        ];
+        let conversation = Conversation::from_entries("t".into(), entries);
+        let plan = prepare_compaction(&conversation, 100).unwrap();
+        assert_eq!(plan.retained_user_entry_ids, ["2", "5"]);
+        assert_eq!(plan.first_kept_entry_id, "7");
+    }
+
+    #[test]
+    fn compaction_returns_unused_user_budget_to_the_tail_and_counts_overlap_once() {
+        for (user_chars, tail_chars) in [(4, 240), (80, 200)] {
+            let entries = vec![
+                msg_entry("0", user(&"u".repeat(user_chars))),
+                msg_entry("1", assistant_text(&"x".repeat(4000))),
+                msg_entry("2", user(&"v".repeat(user_chars))),
+                msg_entry("3", tool_call("c", "read_file", json!({"path": "/x"}))),
+                msg_entry("4", tool_result("c", "read_file", &"y".repeat(tail_chars))),
+                msg_entry("5", assistant_text("done")),
+            ];
+            let conversation = Conversation::from_entries("t".into(), entries);
+            let plan = prepare_compaction(&conversation, 100).unwrap();
+            assert_eq!(
+                plan.first_kept_entry_id, "2",
+                "the recent tool exchange fits"
+            );
+            assert_eq!(
+                plan.retained_user_entry_ids,
+                ["0"],
+                "the user in the tail is not repeated"
+            );
+            let kept: u64 = conversation
+                .entries()
+                .iter()
+                .filter(|entry| entry.id == "0" || entry.id.as_str() >= "2")
+                .filter_map(entry_projected_wire)
+                .map(|m| estimate_message_tokens(&m))
+                .sum();
+            assert!(kept <= 100, "shared budget was exceeded: {kept}");
+        }
+    }
+
+    #[test]
+    fn compaction_skips_oversized_users_whole_and_charges_images() {
+        let image = Message::User(UserMessage::new(vec![
+            UserContent::text("image request"),
+            UserContent::image("pixels", "image/png"),
+        ]));
+        let huge = format!("BIG_REQUEST {}", "x".repeat(12_000));
+        let entries = vec![
+            msg_entry("0", image),
+            msg_entry("1", assistant_text(&"x".repeat(20_000))),
+            msg_entry("2", user(&huge)),
+            msg_entry("3", assistant_text("tail")),
+        ];
+        let conversation = Conversation::from_entries("t".into(), entries);
+        for (budget, expected) in [(2400, vec![]), (2500, vec!["0"])] {
+            let plan = prepare_compaction(&conversation, budget).unwrap();
+            assert_eq!(plan.retained_user_entry_ids, expected);
+            assert_eq!(plan.first_kept_entry_id, "3");
+            let prefix = serialize_conversation(&plan.turn_prefix_messages);
+            assert!(
+                prefix.contains(&huge),
+                "oversized user content still reaches the summarizer"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_an_oversized_final_tool_batch_intact() {
+        let Message::Assistant(mut batch) = tool_call("c1", "read_file", json!({"path": "/a"}))
+        else {
+            unreachable!()
+        };
+        batch.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "c2".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "/b"}),
+        }));
+        let tail = vec![
+            Message::Assistant(batch),
+            tool_result("c1", "read_file", &"a".repeat(4000)),
+            tool_result("c2", "read_file", &"b".repeat(4000)),
+        ];
+        assert!(tail.iter().map(estimate_message_tokens).sum::<u64>() > 100);
+        let mut entries = vec![msg_entry("request", user("inspect both files"))];
+        entries.extend(
+            tail.iter()
+                .enumerate()
+                .map(|(i, message)| msg_entry(&format!("tail-{i}"), message.clone())),
+        );
+        let conversation = Conversation::from_entries("t".into(), entries.clone());
+        let plan = prepare_compaction(&conversation, 100).expect("the request can be summarized");
+        assert_eq!(plan.first_kept_entry_id, "tail-0");
+        entries.push(compaction_entry(
+            "checkpoint",
+            &plan.first_kept_entry_id,
+            "summary",
+        ));
+        let projected = Conversation::from_entries("t".into(), entries).messages();
+        assert_eq!(
+            serde_json::to_value(&projected[projected.len() - tail.len()..]).unwrap(),
+            serde_json::to_value(tail).unwrap()
+        );
     }
 
     #[test]

@@ -485,6 +485,7 @@ mod tests {
             ThreadFilter::USER,
             "summary".into(),
             first_kept,
+            Vec::new(),
             1_000,
             None,
             usage,

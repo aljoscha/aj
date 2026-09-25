@@ -488,18 +488,22 @@ pub enum ConversationEntryKind {
     /// A compaction checkpoint: the thread's history before
     /// `first_kept_entry_id` was summarized into `summary`. Projection
     /// ([`Conversation::agent_messages`] / [`Conversation::messages`])
-    /// replaces that prefix with a single synthetic summary message and
-    /// keeps everything from `first_kept_entry_id` onward verbatim. The
-    /// summarized entries stay on disk — compaction changes only the
-    /// projection, never deletes lines.
+    /// replaces that prefix with selected original user messages and a
+    /// summary, and keeps everything from `first_kept_entry_id` onward
+    /// verbatim. All original entries stay on disk. Compaction changes
+    /// only the projection, never deletes lines.
     Compaction {
         /// LLM-generated structured summary that stands in for the
         /// summarized prefix.
         summary: String,
-        /// First retained entry. Everything strictly before it on this
-        /// thread (back to the previous compaction boundary, or the
-        /// thread root) is represented by `summary`.
+        /// First entry in the retained suffix. Earlier history is represented
+        /// by `summary` and the selected original user messages.
         first_kept_entry_id: EntryId,
+        /// Original user messages retained before the summary, in addition to
+        /// the tail. IDs must identify distinct user messages on this ancestry
+        /// strictly before `first_kept_entry_id`. An absent field retains none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained_user_entry_ids: Vec<EntryId>,
         /// Estimated context tokens before this compaction ran. Carried
         /// for the UI ("freed ~N tokens") and telemetry; not used by
         /// projection.
@@ -816,9 +820,9 @@ impl Conversation {
     /// Borrow every wire-level message in this view, in chronological
     /// order. Honors the latest compaction (see
     /// [`Self::projected_agent_messages`]): the summarized prefix is
-    /// replaced by one synthetic summary message. Non-message entries
-    /// (system prompt, settings) are skipped — the wire layer only
-    /// cares about turn-by-turn conversation.
+    /// replaced by selected users and one synthetic summary message.
+    /// Non-message entries (system prompt, settings) are skipped. The wire
+    /// layer only cares about turn-by-turn conversation.
     pub fn messages(&self) -> Vec<Message> {
         self.projected_agent_messages()
             .iter()
@@ -836,12 +840,12 @@ impl Conversation {
 
     /// Project entries to the agent transcript, honoring the latest
     /// compaction: everything before its `first_kept_entry_id` is
-    /// replaced by a single synthetic summary message.
+    /// replaced by historical user messages and a synthetic summary message.
     ///
     /// The last compaction wins — its summary already folds in any
     /// earlier compaction and its `first_kept_entry_id` points past the
-    /// earlier boundary, so the latest summary plus its retained tail
-    /// reconstruct the full reduced context.
+    /// earlier boundary. Its frozen user selection, summary, and retained
+    /// tail reconstruct the full reduced context.
     fn projected_agent_messages(&self) -> Vec<AgentMessage> {
         let last_compaction = self
             .entries
@@ -852,12 +856,13 @@ impl Conversation {
                 ConversationEntryKind::Compaction {
                     summary,
                     first_kept_entry_id,
+                    retained_user_entry_ids,
                     ..
-                } => Some((c, summary.clone(), first_kept_entry_id.clone())),
+                } => Some((c, summary, first_kept_entry_id, retained_user_entry_ids)),
                 _ => None,
             });
 
-        let Some((c, summary, first_kept)) = last_compaction else {
+        let Some((c, summary, first_kept, retained_users)) = last_compaction else {
             return self
                 .entries
                 .iter()
@@ -876,7 +881,7 @@ impl Conversation {
         let k = self
             .entries
             .iter()
-            .position(|entry| entry.id == first_kept)
+            .position(|entry| &entry.id == first_kept)
             .unwrap_or_else(|| {
                 tracing::warn!(
                     "compaction first_kept_entry_id {first_kept} missing from linearized view; \
@@ -886,7 +891,18 @@ impl Conversation {
             });
 
         let mut out: Vec<AgentMessage> = Vec::new();
-        out.push(crate::compaction::summary_message(&summary));
+        let users = retained_user_messages(&self.entries[..k], retained_users);
+        if !users.is_empty() {
+            out.push(AgentMessage::wire(Message::User(
+                aj_models::types::UserMessage::text(crate::compaction::RETAINED_USER_CONTEXT),
+            )));
+            out.extend(
+                users
+                    .into_iter()
+                    .map(|message| expand_message(message.clone())),
+            );
+        }
+        out.push(crate::compaction::summary_message(summary));
         for entry in &self.entries[k..] {
             if let ConversationEntryKind::Message { message } = &entry.entry {
                 out.push(expand_message(message.clone()));
@@ -921,6 +937,28 @@ impl Conversation {
             expand_message(message.clone()).to_projected_wire()
         })
     }
+}
+
+// Resolve only within the supplied prefix, in original chronology. Invalid
+// references in a damaged checkpoint cannot import another branch, promote a
+// task notice to a user request, or duplicate a message already in the tail.
+fn retained_user_messages<'a>(
+    entries: &'a [ConversationEntry],
+    ids: &[EntryId],
+) -> Vec<&'a AgentMessage> {
+    let selected: BTreeSet<_> = ids.iter().collect();
+    entries
+        .iter()
+        .filter_map(|entry| match &entry.entry {
+            ConversationEntryKind::Message { message }
+                if selected.contains(&entry.id)
+                    && matches!(message.as_stored_wire(), Some(Message::User(_))) =>
+            {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// A cloneable, read-only image of a log's entry tree.
@@ -2249,12 +2287,15 @@ impl ConversationLog {
     /// Record a compaction checkpoint on `filter`'s thread, anchored at
     /// the thread's current leaf. Punctuation: flushes immediately (see
     /// [`ConversationEntryKind::is_punctuation`]). `first_kept_entry_id`
-    /// must be an existing entry in the log.
+    /// must be an existing entry in the log. Retained users must be distinct
+    /// original user messages on this thread's ancestry before that cut.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_compaction(
         &mut self,
         filter: ThreadFilter,
         summary: String,
         first_kept_entry_id: EntryId,
+        retained_user_entry_ids: Vec<EntryId>,
         tokens_before: u64,
         details: Option<crate::compaction::CompactionDetails>,
         usage: Option<aj_models::types::Usage>,
@@ -2266,6 +2307,28 @@ impl ConversationLog {
             )));
         }
         let parent = self.core.parent_for_thread_append(filter);
+        if !retained_user_entry_ids.is_empty() {
+            let valid = parent.as_ref().is_some_and(|head| {
+                let conversation = self.core.linearize(head, filter);
+                conversation
+                    .entries()
+                    .iter()
+                    .position(|e| e.id == first_kept_entry_id)
+                    .is_some_and(|cut| {
+                        retained_user_messages(
+                            &conversation.entries()[..cut],
+                            &retained_user_entry_ids,
+                        )
+                        .len()
+                            == retained_user_entry_ids.len()
+                    })
+            });
+            if !valid {
+                return Err(ConversationError::InvalidAppend(
+                    "retained compaction users must be distinct user messages before the cut on this ancestry".into(),
+                ));
+            }
+        }
         self.append(
             parent,
             filter.thread,
@@ -2273,6 +2336,7 @@ impl ConversationLog {
             ConversationEntryKind::Compaction {
                 summary,
                 first_kept_entry_id,
+                retained_user_entry_ids,
                 tokens_before,
                 details,
                 usage,
@@ -4872,6 +4936,7 @@ mod tests {
             ThreadFilter::USER,
             "SUMMARY".into(),
             first_kept.id,
+            Vec::new(),
             1_000,
             None,
             None,
@@ -5051,6 +5116,7 @@ mod tests {
             ThreadFilter::USER,
             "summary".into(),
             unnamed_tip.id,
+            Vec::new(),
             100,
             None,
             None,
@@ -5463,10 +5529,12 @@ mod tests {
                 summary,
                 tokens_before,
                 usage,
+                retained_user_entry_ids,
                 ..
             } => {
                 assert_eq!(summary, "older summary");
                 assert_eq!(tokens_before, 1234);
+                assert!(retained_user_entry_ids.is_empty());
                 assert!(
                     usage.is_none(),
                     "an old entry records no spend, which is not the same as recording zero"
@@ -5516,15 +5584,15 @@ mod tests {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
-        let (session_id, first_kept) = {
+        let (session_id, first_kept, retained_user) = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             log.set_system_prompt("p".into()).expect("set sp");
 
-            let first_kept = {
+            let (first_kept, retained_user) = {
                 let mut view = ConversationView::user(&mut log);
-                view.add_message(user_text("one")).expect("u1");
+                let retained = view.add_message(user_text("one")).expect("u1").id;
                 view.add_message(assistant_text("a1")).expect("a1");
-                view.add_message(user_text("two")).expect("u2").id
+                (view.add_message(user_text("two")).expect("u2").id, retained)
             };
 
             let details = crate::compaction::CompactionDetails {
@@ -5544,6 +5612,7 @@ mod tests {
                 ThreadFilter::USER,
                 "the summary".into(),
                 first_kept.clone(),
+                vec![retained_user.clone()],
                 1234,
                 Some(details),
                 Some(usage),
@@ -5556,7 +5625,14 @@ mod tests {
                 "compaction is punctuation; file must exist right after append"
             );
 
-            (log.session_id().to_string(), first_kept)
+            let text = std::fs::read_to_string(&path).unwrap();
+            let checkpoint: serde_json::Value =
+                serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            assert_eq!(
+                checkpoint["retained_user_entry_ids"],
+                serde_json::json!([retained_user])
+            );
+            (log.session_id().to_string(), first_kept, retained_user)
         };
 
         let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
@@ -5567,12 +5643,14 @@ mod tests {
             ConversationEntryKind::Compaction {
                 summary,
                 first_kept_entry_id,
+                retained_user_entry_ids,
                 tokens_before,
                 details,
                 usage,
             } => {
                 assert_eq!(summary, "the summary");
                 assert_eq!(first_kept_entry_id, &first_kept);
+                assert_eq!(retained_user_entry_ids, &[retained_user]);
                 assert_eq!(*tokens_before, 1234);
                 // The durability edge: the summarizer's spend has no
                 // other record, so a field that does not survive the
@@ -5603,12 +5681,88 @@ mod tests {
                 ThreadFilter::USER,
                 "s".into(),
                 "no-such-id".into(),
+                Vec::new(),
                 0,
                 None,
                 None,
             )
             .expect_err("must reject unknown first_kept id");
         assert!(matches!(err, ConversationError::InvalidAppend(_)));
+    }
+
+    #[test]
+    fn retained_compaction_users_cannot_cross_branches_or_duplicate_the_tail() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).unwrap();
+        log.set_system_prompt("p".into()).unwrap();
+        let (original, assistant, kept) = {
+            let mut view = ConversationView::user(&mut log);
+            let original = view.add_message(user_text("ORIGINAL")).unwrap().id;
+            let assistant = view.add_message(assistant_text("WORK")).unwrap().id;
+            let kept = view.add_message(user_text("TAIL")).unwrap().id;
+            (original, assistant, kept)
+        };
+        log.set_head(assistant.clone()).unwrap();
+        let sibling = ConversationView::user(&mut log)
+            .add_message(user_text("SIBLING"))
+            .unwrap()
+            .id;
+        log.set_head(kept.clone()).unwrap();
+        let before = std::fs::read(log.path()).unwrap();
+        for ids in [
+            vec!["missing".into()],
+            vec![assistant.clone()],
+            vec![kept.clone()],
+            vec![sibling.clone()],
+            vec![original.clone(), original.clone()],
+        ] {
+            assert!(matches!(
+                log.append_compaction(
+                    ThreadFilter::USER,
+                    "SUMMARY".into(),
+                    kept.clone(),
+                    ids,
+                    0,
+                    None,
+                    None,
+                ),
+                Err(ConversationError::InvalidAppend(_))
+            ));
+            assert_eq!(log.head(), Some(&kept));
+            assert_eq!(std::fs::read(log.path()).unwrap(), before);
+        }
+
+        // A malformed selection cannot escape the prefix or duplicate messages.
+        let checkpoint = log
+            .append(
+                Some(kept.clone()),
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Compaction {
+                    summary: "SUMMARY".into(),
+                    first_kept_entry_id: kept.clone(),
+                    retained_user_entry_ids: vec![
+                        original.clone(),
+                        original,
+                        assistant,
+                        sibling,
+                        kept,
+                        "missing".into(),
+                    ],
+                    tokens_before: 0,
+                    details: None,
+                    usage: None,
+                },
+            )
+            .unwrap();
+        let messages = log
+            .linearize(&checkpoint.id, ThreadFilter::USER)
+            .agent_messages();
+        let json = serde_json::to_string(&messages).unwrap();
+        assert_eq!(json.matches("ORIGINAL").count(), 1);
+        assert_eq!(json.matches("TAIL").count(), 1);
+        assert!(!json.contains("SIBLING") && !json.contains("WORK"));
     }
 
     #[test]
@@ -5634,6 +5788,7 @@ mod tests {
             ThreadFilter::USER,
             "SUMMARY".into(),
             kept_user,
+            Vec::new(),
             999,
             None,
             None,
@@ -5709,6 +5864,7 @@ mod tests {
             ThreadFilter::USER,
             "SUMMARY".into(),
             first_kept,
+            Vec::new(),
             999,
             None,
             None,
@@ -5806,6 +5962,7 @@ mod tests {
                 ThreadFilter::USER,
                 "sum".to_string(),
                 user.id.clone(),
+                Vec::new(),
                 42,
                 None,
                 None,

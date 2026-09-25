@@ -158,6 +158,7 @@ fn log_with_compaction(responses: Vec<Message>, usage: Usage) -> (TempDir, Conve
         ThreadFilter::USER,
         "summary".into(),
         first_kept,
+        Vec::new(),
         1_000,
         None,
         Some(usage),

@@ -4,9 +4,10 @@ Status: proposed. This document specifies client-side context
 compaction for `aj`: a manual `/compact` command, automatic
 threshold-driven compaction, and reactive recovery from a
 context-overflow error. Compaction replaces the earlier part of a
-thread with an LLM-generated structured summary while keeping a recent
-tail of messages verbatim, so a long-running session stays within the
-model's context window without losing the thread of work.
+thread with an LLM-generated structured summary while retaining selected
+original user messages and a recent tail verbatim. User requests get
+priority within a shared retention budget, so a long-running session
+keeps their exact wording alongside the recent work.
 
 The design is host-orchestrated: the binary (`aj`) owns the policy and
 the end-to-end flow, the on-disk log is the source of truth for the
@@ -21,7 +22,8 @@ transcript and emits events.
 Goals:
 
 - Summarize-and-continue: when context grows past a threshold, replace
-  the old prefix with a summary and keep recent messages verbatim.
+  the old prefix with selected original user messages and a summary,
+  keeping a tool-safe recent suffix verbatim.
 - Three triggers: manual (`/compact [instructions]`), automatic
   (occupancy crosses a configured fraction of the window), and reactive
   (a turn fails with a context-overflow error → compact and retry once).
@@ -97,19 +99,22 @@ Add a variant to `ConversationEntryKind` (`aj-session/src/log.rs:106`):
 ```rust
 /// A compaction checkpoint: the thread's history before
 /// `first_kept_entry_id` was summarized into `summary`. Projection
-/// (`Conversation::agent_messages` / `messages`) replaces that prefix
-/// with a single synthetic summary message and keeps everything from
-/// `first_kept_entry_id` onward verbatim. The summarized entries stay
-/// on disk — compaction changes only the projection, never deletes
-/// lines.
+/// (`Conversation::agent_messages` / `messages`) emits framed original
+/// user messages selected from that prefix, a synthetic summary, and
+/// everything from `first_kept_entry_id` onward verbatim. Compaction
+/// changes only the projection. All original entries stay on disk.
 Compaction {
     /// LLM-generated structured summary that stands in for the
     /// summarized prefix.
     summary: String,
-    /// First retained entry. Everything strictly before it on this
-    /// thread (back to the previous compaction boundary, or the
-    /// thread root) is represented by `summary`.
+    /// First entry of the recent suffix. Earlier history is represented
+    /// by `summary` and the selected original user messages.
     first_kept_entry_id: EntryId,
+    /// Extra original user messages before the cut, in chronological
+    /// order. IDs refer to distinct stored Wire(User) messages on this
+    /// thread's ancestry. An absent field retains no extra users.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retained_user_entry_ids: Vec<EntryId>,
     /// Estimated context tokens before this compaction ran. Carried
     /// for the UI ("freed ~N tokens") and telemetry; not used by
     /// projection.
@@ -128,6 +133,11 @@ Compaction {
 
 `CompactionDetails` lives in `aj-session::compaction` (§4.6) and is
 serialized verbatim onto the entry.
+
+`retained_user_entry_ids` freezes the selection at compaction time. It
+contains only users before the suffix, not selected users already in it.
+Checkpoints without this field retain their summary-plus-suffix behavior.
+Resume never recomputes the selection under the current budget.
 
 ### 3.2 Durability: `is_punctuation`
 
@@ -148,34 +158,56 @@ compaction-aware with one shared helper. Algorithm over the linearized
 (chronological) `entries`:
 
 1. Find the index `c` of the **last** `Compaction` entry. If none, the
-   projection is unchanged (today's filter-map over `Message` entries).
-2. Read `first_kept_entry_id = K` from entry `c`; find `K`'s index `k`.
-   (If `K` is missing — a corrupt/edited log — fall back to projecting
-   from `c+1`, dropping nothing extra, and log a warning.)
-3. Emit a single synthetic **summary message** built from entry `c`'s
-   `summary` (§3.4), then project every `Message` entry at index `>= k`,
-   skipping the `Compaction` marker itself (it is not a `Message`, so
-   the existing filter naturally skips it).
+   projection filters and projects `Message` entries normally.
+2. Read `first_kept_entry_id = K` and `retained_user_entry_ids` from `c`.
+   Find `K`'s index `k`. If `K` is missing in a corrupt or edited log,
+   use the marker's index `c` and log a warning. The suffix then contains
+   only messages after the marker.
+3. Resolve the selected IDs against original stored `Wire(User)` entries
+   strictly before `k` on this ancestry. If any resolve, emit historical
+   context framing (§3.4), followed by those originals in their original
+   chronological order, with all content blocks intact. Invalid references
+   cannot import other branches, task notices, or messages in the suffix.
+4. Emit the synthetic **summary message** built from `c`'s `summary`
+   (§3.4), then project every `Message` entry at index `>= k`. Skip
+   compaction markers. Selected users in the suffix stay in place and
+   are not repeated before the summary.
 
 Why "last compaction wins": a second compaction's `summary` is generated
 with the previous summary as input (the update prompt, §4.5), so it
 already subsumes it, and its `first_kept_entry_id` points past the
-previous boundary. Taking only the latest compaction's summary plus its
-retained tail therefore reconstructs the full reduced context.
+previous boundary. Its frozen user selection, summary, and retained
+suffix reconstruct the reduced context. Selections from older checkpoints
+are not merged into it, and resume does not run retention planning.
 
 Why this slices correctly on disk: a `Compaction` entry is appended with
 `parent_id` = the thread's current head, so it sits *after* the retained
 tail in append order, and subsequent turns chain off it. The retained
-tail `[K .. head]` lands between `K` and the marker; post-compaction
-turns land after the marker; everything before `K` is dropped. The
-walk is linear and needs no special tree traversal.
+tail `[K .. head]` lands between `K` and the marker. Post-compaction
+turns land after the marker. Only selected original user messages are
+projected verbatim from before `K`. The walk is linear and needs no
+special tree traversal.
 
 This shared helper is the single seam where compaction affects what the
 model sees; `transcript_to_messages` (`aj-agent/src/projection.rs:26`)
 stays a trivial clone-and-collect because the agent's transcript is
 *already* the reduced projection after a reseed (§6.2).
 
-### 3.4 Summary wire representation
+### 3.4 Historical context and summary wire representation
+
+When extra user messages are retained before the summary, a plain
+user-role framing message introduces them as historical context, not
+new requests:
+
+```
+The following user messages are retained verbatim from earlier in this session. They are historical context, not new requests. Intervening assistant and tool work is covered by the summary that follows.
+```
+
+The original messages follow without text deduplication or content
+rewriting, including their image blocks. No framing is emitted when the
+selection is empty. Framing and summary tokens are outside the retention
+budget, but count toward projected context occupancy. Provider transport
+and opaque-content handling are unchanged.
 
 The synthetic summary message is a plain user-role wire message wrapped
 in a fixed prefix/suffix so the model reads it as context rather than an
@@ -212,12 +244,14 @@ The binary's log-append surface is settings-only today
 /// Record a compaction checkpoint on `filter`'s thread, anchored at
 /// the thread's current leaf. Punctuation: flushes immediately
 /// (see `ConversationEntryKind::is_punctuation`). `first_kept_entry_id`
-/// must be an existing entry on the same thread.
+/// must exist in the log. Retained IDs must identify distinct original
+/// user messages on the current thread's ancestry strictly before it.
 pub fn append_compaction(
     &mut self,
     filter: ThreadFilter,
     summary: String,
     first_kept_entry_id: EntryId,
+    retained_user_entry_ids: Vec<EntryId>,
     tokens_before: u64,
     details: Option<CompactionDetails>,
     usage: Option<Usage>,
@@ -227,6 +261,11 @@ pub fn append_compaction(
 It anchors at `latest_leaf(filter)` (falling back to the system-prompt
 root) exactly like `append_settings_entry` (`log.rs:852`), validates
 that `first_kept_entry_id` exists, and appends a `Compaction` entry.
+Before appending, it rejects duplicate retained IDs and any ID that is
+not an original stored `Wire(User)` message on the current ancestry
+strictly before the cut. Task notices are not original user messages,
+even when their provider projection uses the user role. An empty selection
+preserves the existing append behavior.
 
 ## 4. Compaction planning library (`aj-session::compaction`)
 
@@ -245,8 +284,9 @@ occupancy:
   (`footer_data.rs:113`).
 - **Heuristic fallback** for messages with no usage (or trailing
   messages after the last assistant turn): `ceil(chars / 4)`, counting
-  text/thinking/tool-call argument characters, with a fixed
-  `ESTIMATED_IMAGE_CHARS` charge per image block.
+  text/thinking/tool-call argument characters, with a fixed 1,200-token
+  charge per image block. Retained user images keep their original blocks,
+  not placeholders.
 
 ```rust
 /// Estimate context tokens for a single wire message (heuristic).
@@ -261,19 +301,15 @@ pub fn estimate_context_tokens(messages: &[Message]) -> ContextEstimate;
 pub fn estimate_conversation_context(conversation: &Conversation) -> ContextEstimate;
 ```
 
-The usage anchor needs one correction once compaction enters the
-picture: a retained assistant message's `usage` measures the prompt as
-it was *when that turn ran*, including history that a later compaction
-has since summarized away. So immediately after a compaction (no real
-turn has run since), the most recent assistant `usage` over-reports by
-the entire summarized prefix. `estimate_conversation_context` guards
-against this: when a `Compaction` is the most recent entry among
-{compaction, assistant message}, it estimates the projected messages
-(summary + retained tail) purely heuristically instead of anchoring on
-the stale usage; otherwise it defers to `estimate_context_tokens` over
-the projection. Both compaction `tokens_before` / `tokens_after` and the
-resumed footer occupancy go through it, so the reported numbers match
-what the next turn actually sends.
+A retained assistant message's `usage` measures the prompt for that
+turn, not the checkpoint's reduced projection. When a `Compaction` is
+the most recent entry among {compaction, assistant message},
+`estimate_conversation_context` estimates the projected messages
+(historical framing + selected users + summary + suffix) purely
+heuristically instead of anchoring on stale usage. Otherwise it defers to
+`estimate_context_tokens` over the projection. Both compaction
+`tokens_before` / `tokens_after` and resumed footer occupancy go through
+it, so the estimates describe the context sent on the next turn.
 
 ### 4.2 The trigger predicate
 
@@ -291,26 +327,60 @@ The numerator at runtime is the footer occupancy
 `agent.model_info().context_window`. Default `threshold` is `0.85`
 (§9).
 
-### 4.3 Cut-point selection
+### 4.3 User-first retention and cut-point selection
 
-Given the linearized entries and a `keep_recent_tokens` budget, choose
-the first retained entry. Constraints, mirroring the reference design:
+`compact_keep_recent` (default `20_000`) is a shared approximate
+verbatim-content budget, independent of the model's window size. There
+is no separate user-retention setting. Each compaction plan selects
+afresh and allocates the budget as follows:
 
-- **Valid cut points** are user- or assistant-message starts (and a
-  prior compaction's summary boundary). A `tool_result` is **never** a
-  cut point: keeping a `tool_result` whose `tool_call` was summarized
-  away would orphan it on the wire and providers reject that. (The
-  transform layer synthesizes results for orphaned *calls* but cannot
-  un-orphan a *result*.)
-- **Keep-recent tail**: walk backward from the head accumulating
-  estimated tokens until `keep_recent_tokens` is reached, then snap the
-  cut to the nearest valid cut point at or before that position.
+1. Reserve at most half the budget for whole original stored `Wire(User)`
+   messages. Scan newest-first across the full active ancestry, including
+   history before previous checkpoints. Select each message only if its
+   estimated cost fits the remaining reserve, otherwise skip it and keep
+   scanning. Task notices and synthetic projection messages are ineligible.
+   Equal text in distinct entries remains distinct, and the first prompt
+   has no pinned status.
+2. Subtract the actual selected token cost once from the shared budget.
+   All remaining capacity, including unused user reserve, goes to the
+   tool-safe recent suffix. Selected users encountered in the suffix cost
+   nothing more because they have already been charged.
+3. Persist only selected users strictly before the suffix in
+   `retained_user_entry_ids`, in original chronological order. Selected
+   users inside the suffix stay in place, without a second copy before
+   the summary.
+
+For example, a 20,000-token budget allows at most 10,000 for user
+selection. If the candidates cost 4,000, 8,000, and 3,000 newest-first,
+select the 4,000-token message, skip the 8,000-token message, and select
+the 3,000-token message. Their 7,000-token cost leaves 13,000 for other
+suffix content. A selected user inside that suffix is not charged again.
+
+User selection never truncates messages or strips image blocks. An
+oversized user message that does not fit the reserve remains represented
+only by the summary when it is outside the suffix. Summary and historical
+framing are outside this retention budget.
+
+The suffix obeys these constraints:
+
+- **Valid cut points** are user-message, task-notice, or assistant-message
+  starts. A `tool_result` is **never** a cut point: keeping a result whose
+  call was summarized away would orphan it on the wire. The transform
+  layer can synthesize results for orphaned calls, not repair orphaned
+  results.
+- **Keep-recent suffix**: walk backward from the head accumulating
+  estimated costs, excluding already-charged selected users. Exclude the
+  whole message that would exceed the remaining tail budget, then snap
+  forward to the next valid cut. Never split a message. The last indivisible
+  message or tool-call/result group is the minimum suffix and may exceed
+  the budget.
 - **Boundary start**: when a previous `Compaction` exists, the
   summarized range starts at that compaction's `first_kept_entry_id`
   (not the thread root) and its `summary` is fed to the update prompt
-  (§4.5).
+  (§4.5). This limits suffix planning and new summary input, not user
+  selection across the full ancestry.
 - **Split turn**: if the chosen cut lands inside a turn (the cut point
-  is an assistant message mid-turn, not a turn-starting user message),
+  is an assistant message mid-turn, not a user message or task notice),
   the turn's prefix is summarized separately and appended to the main
   summary under a "Turn Context (split turn)" heading, so the retained
   suffix still has the turn's setup. If that prefix is the only new
@@ -333,12 +403,11 @@ pub fn find_cut_point(
 ) -> Option<CutPoint>;
 ```
 
-`keep_recent_tokens` is a fixed token budget (`compact_keep_recent`,
-default `20_000`), not a fraction of the window: the summarized range
-depends only on how much recent context we want to retain, independent
-of the model. With a 0.85 trigger and a small recent tail plus a short
-summary, post-compaction occupancy lands well under the threshold,
-leaving headroom so the next turn does not immediately re-trigger.
+`find_cut_point` applies these suffix rules to its supplied budget without
+a user reservation. `prepare_compaction` applies the shared allocation
+above, including charging selected users only once. The budget is not a
+hard occupancy cap because framing, summary, and the minimum indivisible
+suffix can add tokens beyond it.
 
 ### 4.4 Conversation serialization
 
@@ -352,6 +421,12 @@ pairing rules and never re-sends image bytes:
 /// as placeholders) for embedding in the summarizer prompt.
 pub fn serialize_conversation(messages: &[Message]) -> String;
 ```
+
+User messages in the summarized prefix remain in the summarizer input
+even when selected for verbatim retention. Their summary representation
+provides fallback if a later checkpoint excludes them from its selection.
+Previously summarized history is carried by the previous summary, not
+re-added as raw summarizer input.
 
 ### 4.5 Summary prompts
 
@@ -412,6 +487,9 @@ module constants to avoid a hard dependency on `aj-tools`.
 /// from the linearized log.
 pub struct CompactionPlan {
     pub first_kept_entry_id: EntryId,
+    /// Extra selected original users before the suffix, in chronological
+    /// order. Empty when none are retained outside the suffix.
+    pub retained_user_entry_ids: Vec<EntryId>,
     pub messages_to_summarize: Vec<Message>,
     pub turn_prefix_messages: Vec<Message>, // empty unless split turn
     pub previous_summary: Option<String>,
@@ -428,9 +506,11 @@ pub fn prepare_compaction(
 ```
 
 `prepare_compaction` finds the previous compaction boundary, computes
-`tokens_before`, runs `find_cut_point`, and collects the message ranges.
-It does **not** call the model — summary generation is the host's job
-(§7.1), because it needs the provider.
+`tokens_before`, selects users across the full ancestry, chooses the
+tool-safe suffix from the remaining budget, and collects the summary
+ranges without filtering out selected users. It returns the extra
+pre-suffix IDs for the checkpoint. It does **not** call the model.
+Summary generation is the host's job (§7.1), because it needs the provider.
 
 ## 5. (reserved)
 
@@ -635,7 +715,7 @@ pub async fn run_compaction(
     log: &Arc<TokioMutex<ConversationLog>>,
     reason: CompactionReason,
     custom_instructions: Option<&str>,
-    keep_recent_tokens: u64, // fixed recent-tail budget to keep verbatim
+    keep_recent_tokens: u64, // shared user-and-suffix verbatim budget
     cancel: CancellationToken,
 ) -> CompactionOutcome;
 ```
@@ -657,7 +737,8 @@ Steps:
    successful summarizer response and append the file-op lists.
    `max_tokens` for the summary = `min(model.max_tokens, SUMMARY_OUTPUT_CAP)`.
 4. **Persist**: lock `log`, `append_compaction(USER, summary,
-   plan.first_kept_entry_id, plan.tokens_before, Some(plan.file_ops),
+   plan.first_kept_entry_id, plan.retained_user_entry_ids,
+   plan.tokens_before, Some(plan.file_ops),
    Some(summarizer_usage.clone()))`.
 5. **Reseed**: re-linearize from the new head → `agent_messages()`
    (now compaction-aware) → `reseed_transcript(...)` on the borrowed
@@ -725,7 +806,7 @@ pub enum TurnStart {
 pub struct TurnPolicy {
     pub recover_overflow: bool,      // compact + retry once on a context-overflow failure
     pub auto_threshold: Option<f64>, // Some(t): compact after a turn that crossed t of the window
-    pub keep_recent: u64,            // recent-tail budget kept verbatim across a compaction
+    pub keep_recent: u64,            // shared user-and-suffix verbatim budget
 }
 
 /// Drive one turn and its automatic compaction continuations to
@@ -916,9 +997,10 @@ pub auto_compact: bool,            // default true
 /// to 0.85. Clamped to (0, 1].
 pub compact_threshold: f64,        // default 0.85
 
-/// Approximate tokens of recent conversation kept verbatim after a
-/// compaction; everything older is summarized. A fixed budget, not a
-/// fraction of the window. Defaults to 20_000.
+/// Shared approximate verbatim-content budget after compaction. At most
+/// half selects original user messages, with the remaining capacity
+/// keeping a tool-safe recent suffix. Excludes summary and framing.
+/// A fixed budget, not a fraction of the window. Defaults to 20_000.
 pub compact_keep_recent: u64,      // default 20_000
 ```
 
@@ -949,23 +1031,35 @@ Pure planning (`aj-session::compaction`), the bulk of coverage:
 
 - Token estimation: usage-preferred vs heuristic fallback; image charge.
 - `should_compact`: boundary at exactly the threshold; zero window.
-- `find_cut_point`: never cuts on a `tool_result`; keeps ~the requested
-  tail; snaps to a turn start; split-turn detection; honors a prior
-  compaction's `boundary_start`.
+- Suffix selection excludes a whole message that would exceed the budget
+  and snaps forward to a user, notice, or assistant start, never a
+  `tool_result`. It retains the last indivisible message or tool-call/result
+  group even when oversized, detects split turns, and honors `boundary_start`.
+- User selection is newest-first over the full active ancestry, including
+  pre-checkpoint history. It skips messages that do not fit, preserves
+  equal-text entries independently, does not pin the first prompt, and
+  excludes task notices. Images retain their blocks and 1,200-token charge.
+- Shared budgeting subtracts selected user costs once, returns unused
+  reserve to the suffix, and does not charge selected suffix users again.
 - `serialize_conversation`: tool calls/results inlined; images noted.
 - `extract_file_ops`: read/edit/write tools picked up; previous details
   carried forward.
-- `prepare_compaction`: `None` when too small / already compacted;
-  correct `messages_to_summarize` and `first_kept_entry_id`.
+- `prepare_compaction`: `None` when too small / already compacted.
+  Summary ranges include selected users, and `retained_user_entry_ids`
+  contains only pre-suffix users. Users excluded by a later selection
+  still have summary fallback.
 
 Log + projection (`aj-session::log`):
 
 - `append_compaction` flushes immediately (punctuation) and round-trips
-  through `resume`.
-- `agent_messages` / `messages` drop the pre-`first_kept` prefix, inject
-  the wrapped summary, and keep the tail; "last compaction wins" across
-  two compaction entries; missing `first_kept_entry_id` falls back
-  safely.
+  through `resume`. It rejects duplicate, off-ancestry, non-user, notice,
+  and at-or-after-cut retained IDs.
+- `agent_messages` / `messages` emit framing, selected originals in
+  chronological order, summary, and suffix. Selected suffix users appear
+  only in place. Empty selections omit framing. The latest checkpoint wins,
+  and missing `first_kept_entry_id` falls back safely.
+- Resume uses the frozen IDs even under a changed retention budget.
+  Checkpoints without the field keep their summary-plus-suffix projection.
 
 Replay: a `Compaction` entry yields the summary row; the prefix entries
 still replay into scrollback.
@@ -1026,11 +1120,12 @@ test.
   round-trip but pulls summarization/persistence concerns into
   `aj-agent` and needs a new event + anchor mechanism. Deferred; revisit
   if long single-turn overflows prove common.
-- **Keep-recent budget.** The recent tail kept verbatim is a fixed token
-  budget (`compact_keep_recent`, default 20_000) rather than a fraction
-  of the window, so the summarized range depends only on retention, not
-  on the model's window size. It is a user-tunable `ValueKind::Number`
-  option alongside `compact_threshold`.
+- **Retention budget.** `compact_keep_recent` (default 20_000) is a fixed,
+  shared approximate budget for original user messages and the recent
+  suffix, not a fraction of the model's window. At most half selects users,
+  and unused reserve goes to the suffix. Summary and framing are outside
+  the budget, and the minimum indivisible suffix may exceed it. The
+  existing setting controls retention without an additional knob.
 - **Summarizer model.** The summary is generated with the session's
   active model. A cheaper/faster dedicated summarizer model could be a
   later option; for now "one model per session" keeps auth and

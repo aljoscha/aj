@@ -7189,6 +7189,7 @@ async fn legacy_compaction_without_usage_stays_unknown_across_an_older_cursor() 
             ThreadFilter::USER,
             "legacy summary".to_string(),
             first_kept,
+            Vec::new(),
             123,
             None,
             None,
@@ -7249,6 +7250,7 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         message: AssistantMessage,
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        gate_first: std::sync::atomic::AtomicBool,
     }
 
     impl aj_models::provider::Provider for GatedSummaryProvider {
@@ -7272,9 +7274,16 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
             let message = self.message.clone();
             let started = Arc::clone(&self.started);
             let release = Arc::clone(&self.release);
+            let gate = self
+                .gate_first
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
             tokio::spawn(async move {
-                started.notify_one();
-                release.notified().await;
+                // The fault is installed once the plan is captured. A split
+                // prefix may need another inference, not another release.
+                if gate {
+                    started.notify_one();
+                    release.notified().await;
+                }
                 producer.push(aj_models::streaming::AssistantMessageEvent::Done {
                     reason: aj_models::streaming::DoneReason::Stop,
                     message,
@@ -7353,6 +7362,7 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         message: priced("SUMMARY", summarizer),
         started: Arc::clone(&started),
         release: Arc::clone(&release),
+        gate_first: std::sync::atomic::AtomicBool::new(true),
     });
     let fault_persistence = ConversationPersistence::new(harness._dir.path().join("append-fault"));
     let mut replacement = ConversationLog::create(&fault_persistence).expect("replacement log");

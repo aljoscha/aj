@@ -209,6 +209,7 @@ pub async fn run_compaction(
             ThreadFilter::USER,
             summary.clone(),
             plan.first_kept_entry_id.clone(),
+            plan.retained_user_entry_ids.clone(),
             plan.tokens_before,
             Some(plan.file_ops.clone()),
             Some(summarizer_usage.clone()),
@@ -444,6 +445,220 @@ mod tests {
             self.requests.lock().unwrap().push(context.clone());
             self.inner.stream_simple(model, context, options)
         }
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_original_requests_across_repeated_compaction_and_session_resume() {
+        use crate::session::{SessionCore, SessionEntry, SessionSpec};
+        use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
+        use aj_agent::bus::listener_from_sync;
+        use aj_agent::queue::MessageQueues;
+        use aj_models::types::UserContent;
+        use aj_session::{ConversationEntryKind, ConversationPersistence};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("evidence.txt");
+        std::fs::write(&path, "evidence").unwrap();
+        let mut read = finalized_text_message("");
+        read.stop_reason = StopReason::ToolUse;
+        read.content = vec![AssistantContent::ToolCall(ToolCall {
+            id: "read".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": path}),
+        })];
+        // Large assistant work pushes requests out of the recent tail. Neither
+        // generated checkpoint repeats the request text, so only retention can save it.
+        let run_config = scripted_run_config(vec![
+            finalized_text_message(&"old work ".repeat(3000)),
+            read,
+            finalized_text_message(&"more work ".repeat(3000)),
+            finalized_text_message("recent reply"),
+            finalized_text_message("CHECKPOINT_ONE"),
+            finalized_text_message(&"new work ".repeat(3000)),
+            finalized_text_message("recent reply"),
+            finalized_text_message("CHECKPOINT_TWO"),
+            finalized_text_message("resumed reply"),
+        ]);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let mut config = run_config.lock().unwrap();
+            config.main.provider = Arc::new(RecordingProvider {
+                inner: Arc::clone(&config.main.provider),
+                requests: Arc::clone(&requests),
+            });
+        }
+        let store = ConversationPersistence::new(dir.path().join("sessions"));
+        let (mut agent, log, persistence) = build_test_agent(&store, &run_config);
+        let queues = MessageQueues::default();
+        agent.set_message_queues(queues.clone());
+        let _steering = agent.subscribe(listener_from_sync(move |event| {
+            if matches!(event, AgentEvent::ToolExecutionEnd { .. }) {
+                queues.append_steering(AgentId::Main, "STEERING_CONSTRAINT");
+            }
+        }));
+        agent
+            .prompt_with_content(
+                vec![
+                    UserContent::text("ORIGINAL_REQUEST"),
+                    UserContent::image("original-pixels", "image/png"),
+                ],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        agent
+            .prompt("ORIGINAL_REQUEST".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        agent
+            .prompt("continue".into(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let mut prior_selected = Vec::new();
+        for round in 0..2 {
+            if round == 1 {
+                agent
+                    .prompt("continue".into(), CancellationToken::new())
+                    .await
+                    .unwrap();
+                agent
+                    .prompt("continue".into(), CancellationToken::new())
+                    .await
+                    .unwrap();
+            }
+            let outcome = run_compaction(
+                &mut agent,
+                &log,
+                &AppendHandoff::default(),
+                CompactionReason::Manual,
+                None,
+                4000,
+                CancellationToken::new(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, CompactionOutcome::Compacted { .. }),
+                "{outcome:?}"
+            );
+            let guard = log.lock().await;
+            let conversation = guard.linearize(guard.head().unwrap(), ThreadFilter::USER);
+            let ConversationEntryKind::Compaction {
+                retained_user_entry_ids,
+                first_kept_entry_id,
+                ..
+            } = &conversation.entries().last().unwrap().entry
+            else {
+                panic!("checkpoint missing")
+            };
+            assert!(
+                retained_user_entry_ids.len() >= 3,
+                "both original requests and steering were outside the tail"
+            );
+            for id in &prior_selected {
+                assert!(
+                    retained_user_entry_ids.contains(id),
+                    "compaction alone must not age out a user request"
+                );
+            }
+            prior_selected = retained_user_entry_ids.clone();
+            let cut = conversation
+                .entries()
+                .iter()
+                .position(|entry| &entry.id == first_kept_entry_id)
+                .unwrap();
+            assert!(
+                conversation.entries()[cut..]
+                    .iter()
+                    .filter_map(|entry| match &entry.entry {
+                        ConversationEntryKind::Message { message } =>
+                            Some(serde_json::to_string(message).unwrap()),
+                        _ => None,
+                    })
+                    .all(|text| !text.contains("ORIGINAL_REQUEST")
+                        && !text.contains("STEERING_CONSTRAINT"))
+            );
+        }
+        let live = serde_json::to_value(agent.messages()).unwrap();
+        let session_id = log.lock().await.session_id().to_string();
+        drop(persistence);
+        drop(agent);
+        drop(log);
+
+        // Resuming under a different budget must not recompute a checkpoint's selection.
+        let config = aj_conf::Config {
+            compact_keep_recent: 1,
+            ..Default::default()
+        };
+        let snapshot = run_config.lock().unwrap().clone();
+        let (core, _) = SessionCore::build(
+            &config,
+            snapshot,
+            &store,
+            &SessionSpec::Resume {
+                session_id,
+                entry: SessionEntry::Startup,
+            },
+            None,
+        )
+        .unwrap();
+        let (mut resumed, _log, _persistence) = core.into_test_agent();
+        assert_eq!(serde_json::to_value(resumed.messages()).unwrap(), live);
+        resumed
+            .prompt("next".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        let next = &requests.last().unwrap().messages;
+        let texts: Vec<_> = next
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => match user.content.first() {
+                    Some(UserContent::Text(text)) => Some(text.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|&&text| text == "ORIGINAL_REQUEST")
+                .count(),
+            2
+        );
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|&&text| text == "STEERING_CONSTRAINT")
+                .count(),
+            1
+        );
+        assert_eq!(
+            texts.iter().filter(|&&text| text == "continue").count(),
+            3,
+            "equal text is not a duplicate message"
+        );
+        assert_eq!(texts[0], planning::RETAINED_USER_CONTEXT);
+        let summary_index = texts
+            .iter()
+            .position(|text| text.contains("CHECKPOINT_TWO"))
+            .unwrap();
+        assert!(texts[..summary_index].contains(&"STEERING_CONSTRAINT"));
+        assert!(!texts.iter().any(|text| text.contains("CHECKPOINT_ONE")));
+        let images: Vec<_> = next
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(&user.content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|content| match content {
+                UserContent::Image(image) => Some(image.data.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images, ["original-pixels"]);
     }
 
     /// Exercise a first-turn cut through real tools, durable projection, resume,
@@ -746,7 +961,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let store = ConversationPersistence::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![
-            finalized_text_message("first answer"),
+            finalized_text_message(&"first answer ".repeat(400)),
             finalized_text_message("second answer"),
             finalized_text_message("SUMMARY"),
         ]);
@@ -809,13 +1024,9 @@ mod tests {
             .prompt("first question".to_string(), CancellationToken::new())
             .await
             .expect("first turn");
-        // A long second prompt so the keep-recent cut leaves the first
-        // turn to summarize.
+        // The large first answer leaves one complete turn to summarize.
         agent
-            .prompt(
-                format!("second question {}", "X".repeat(2000)),
-                CancellationToken::new(),
-            )
+            .prompt("second question".to_string(), CancellationToken::new())
             .await
             .expect("second turn");
 
@@ -982,7 +1193,7 @@ mod tests {
             ..Usage::default()
         };
         let run_config = scripted_run_config(vec![
-            finalized_text_message("first answer"),
+            finalized_text_message(&"first answer ".repeat(400)),
             finalized_text_message("second answer"),
             summary,
         ]);
@@ -1020,10 +1231,7 @@ mod tests {
             .await
             .expect("first turn");
         agent
-            .prompt(
-                format!("second question {}", "X".repeat(2000)),
-                CancellationToken::new(),
-            )
+            .prompt("second question".to_string(), CancellationToken::new())
             .await
             .expect("second turn");
         while rx.try_recv().is_ok() {}

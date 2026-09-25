@@ -78,7 +78,7 @@ pub struct TurnPolicy {
     /// the model's context window, compact (no re-drive). `None`
     /// disables the threshold trigger (print mode, sub-agents).
     pub auto_threshold: Option<f64>,
-    /// Recent-tail budget kept verbatim across a compaction.
+    /// Shared verbatim budget for original user messages and the recent tail.
     pub keep_recent: u64,
 }
 
@@ -993,15 +993,13 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         // Window 1000; the threshold turn records a 900-token lower bound
-        // (> 0.85 * 1000), which is sufficient to compact. The turn's large
-        // user prompt makes the keep-recent cut land on that user message, a
-        // turn start, so no split. That leaves the prior turn as the range to
-        // summarize.
+        // (> 0.85 * 1000), which is sufficient to compact. The recent turn
+        // fits in the tail, while the large older answer must be summarized.
         let mut threshold_turn = finalized_text_message_with_usage("ok", 900);
         threshold_turn.usage.incomplete = true;
         let run_config = scripted_run_config_with_window(
             vec![
-                finalized_text_message("first answer"),
+                finalized_text_message(&"first answer ".repeat(100)),
                 threshold_turn,
                 finalized_text_message("SUMMARY of earlier work"),
             ],
@@ -1024,7 +1022,7 @@ mod tests {
             &log,
             &AppendHandoff::default(),
             &policy,
-            TurnStart::Prompt("X".repeat(2000)),
+            TurnStart::Prompt("next".into()),
             |_| {},
             CancellationToken::new(),
         )
@@ -1048,7 +1046,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![
-            finalized_text_message("shared answer"),
+            finalized_text_message(&"shared answer ".repeat(400)),
             finalized_text_message("active answer"),
             finalized_text_message("abandoned answer"),
             finalized_text_message("SUMMARY of shared work"),
@@ -1066,13 +1064,9 @@ mod tests {
             guard.head().cloned().expect("common head")
         };
 
-        // Branch A (active): a large user prompt so the keep-recent cut
-        // lands on it, leaving the shared prefix as the summarized range.
+        // Branch A fits in the tail, while the large shared answer does not.
         agent
-            .prompt(
-                format!("ACTIVE {}", "X".repeat(2000)),
-                CancellationToken::new(),
-            )
+            .prompt("ACTIVE request".to_string(), CancellationToken::new())
             .await
             .expect("active turn completes");
         let active_head = {
