@@ -1911,7 +1911,9 @@ fn cell_range_text(row: &[Cell], from: usize, to: usize) -> String {
     let mut col = from;
     while col < to {
         let cell = &row[col];
-        out.push_str(cell.char.grapheme());
+        if !cell.selection_excluded {
+            out.push_str(cell.char.grapheme());
+        }
         col = col.saturating_add(usize::from(cell.char.width.max(1)));
     }
     out
@@ -3465,7 +3467,7 @@ impl TranscriptView {
                     // Screen col `c` is the content col directly (no gutter).
                     // The scrollbar column sits past `width` and so is never
                     // hit.
-                    if c >= from && c < to {
+                    if c >= from && c < to && !cell.selection_excluded {
                         cell.style.bg = selection_bg;
                         // A highlighted cell is painted, not blank, so
                         // clear `default`. Otherwise the diff's default
@@ -7642,6 +7644,98 @@ mod tests {
                 ..Cell::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn quote_selection_copies_and_highlights_content_not_borders() {
+        let chat = empty_chat();
+        apply(
+            &chat,
+            &mut AgentLifecycle::default(),
+            assistant_message_end(text_message(
+                "> outer\n>\n> > \"inner\" │ literal\n>\n> - item",
+            )),
+        );
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(50, 20);
+        let _ = view.draw(&ctx);
+        let id = entry_id(&chat, 0);
+        let width = view.content_width();
+        let rows = view.entry_rows(id, width);
+        let rendered: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|c| c.char.grapheme())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            &rendered[..5],
+            [
+                " │ outer",
+                " │",
+                " │ │ \"inner\" │ literal",
+                " │",
+                " │ - item"
+            ]
+        );
+        let anchor = SelPos {
+            entry: id,
+            line: 0,
+            col: 0,
+        };
+        let caret = SelPos {
+            entry: id,
+            line: 4,
+            col: usize::from(width),
+        };
+        assert_eq!(
+            view.extract_selection(width, anchor, caret),
+            "outer\n\n\"inner\" │ literal\n\n- item"
+        );
+        assert_eq!(
+            view.extract_selection(width, caret, anchor),
+            "outer\n\n\"inner\" │ literal\n\n- item"
+        );
+        assert_eq!(
+            view.extract_selection(
+                width,
+                SelPos {
+                    line: 2,
+                    col: 5,
+                    ..anchor
+                },
+                SelPos {
+                    line: 2,
+                    col: 12,
+                    ..anchor
+                }
+            ),
+            "\"inner\""
+        );
+
+        view.selection = Some(Selection { anchor, caret });
+        let grid = surface_rows(&view.draw(&ctx));
+        let borders: Vec<_> = grid
+            .iter()
+            .flatten()
+            .filter(|c| c.selection_excluded)
+            .collect();
+        assert!(!borders.is_empty(), "fixture must paint quote borders");
+        assert!(
+            borders
+                .iter()
+                .all(|c| c.style.bg != view.styles.selection_bg)
+        );
+        let literal_bar = grid
+            .iter()
+            .flatten()
+            .find(|c| c.char.grapheme() == "│" && !c.selection_excluded)
+            .expect("literal bar remains content");
+        assert_eq!(literal_bar.style.bg, view.styles.selection_bg);
     }
 
     /// The per-row range reader that both extraction and (indirectly) the

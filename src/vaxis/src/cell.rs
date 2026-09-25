@@ -30,6 +30,9 @@ pub struct Cell {
     /// helps with primary-screen resizes.
     pub wrapped: bool,
     pub scale: Scale,
+    /// Rendering decoration that text selection must neither copy nor highlight.
+    /// Carried with the cell through surface composition, independent of style.
+    pub selection_excluded: bool,
 }
 
 impl Cell {

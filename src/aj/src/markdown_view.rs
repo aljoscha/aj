@@ -148,7 +148,12 @@ struct RowCache {
     width: u16,
     /// One entry per surface row, in paint order. Blank rows (segment
     /// separators) are empty span vectors.
-    rows: Vec<Vec<TextSpan>>,
+    rows: Vec<Vec<SelectionSpan>>,
+}
+
+struct SelectionSpan {
+    span: TextSpan,
+    excluded: bool,
 }
 
 /// A markdown transcript entry: optional plain leading rows (a compaction
@@ -265,8 +270,8 @@ fn segment_rows(
     segments: &[MarkdownSegment],
     styles: &MarkdownStyles,
     width: u16,
-) -> Vec<Vec<TextSpan>> {
-    let mut rows: Vec<Vec<TextSpan>> = Vec::new();
+) -> Vec<Vec<SelectionSpan>> {
+    let mut rows: Vec<Vec<SelectionSpan>> = Vec::new();
     for seg in segments {
         let seg_rows = render_markdown(&seg.text, usize::from(width), &seg.opts);
         if seg_rows.is_empty() {
@@ -318,7 +323,7 @@ fn to_vaxis_row(
     row: &[StyledSpan],
     seg: &MarkdownSegment,
     styles: &MarkdownStyles,
-) -> Vec<TextSpan> {
+) -> Vec<SelectionSpan> {
     row.iter()
         .map(|span| {
             let style = styles.resolve(span, seg.base_style);
@@ -329,10 +334,13 @@ fn to_vaxis_row(
                 },
                 _ => Hyperlink::default(),
             };
-            TextSpan {
-                text: span.text.clone(),
-                style,
-                link,
+            SelectionSpan {
+                span: TextSpan {
+                    text: span.text.clone(),
+                    style,
+                    link,
+                },
+                excluded: span.kind == SpanKind::QuoteBorder,
             }
         })
         .collect()
@@ -340,9 +348,10 @@ fn to_vaxis_row(
 
 /// Paint one pre-wrapped span row into `surface` at `row`, left to right. The
 /// row already fits `width`, so there is no wrapping or clipping here.
-fn paint_row(surface: &mut Surface, row: u16, spans: &[TextSpan], ctx: &DrawContext) {
+fn paint_row(surface: &mut Surface, row: u16, spans: &[SelectionSpan], ctx: &DrawContext) {
     let mut col: u16 = 0;
-    for span in spans {
+    for selection_span in spans {
+        let span = &selection_span.span;
         for item in ctx.grapheme_iterator(&span.text) {
             let grapheme = item.bytes(&span.text);
             let width = u8::try_from(ctx.string_width(grapheme)).unwrap_or(1);
@@ -353,6 +362,7 @@ fn paint_row(surface: &mut Surface, row: u16, spans: &[TextSpan], ctx: &DrawCont
                     char: Character::new(grapheme, width),
                     style: span.style,
                     link: span.link.clone(),
+                    selection_excluded: selection_span.excluded,
                     ..Cell::default()
                 },
             );
