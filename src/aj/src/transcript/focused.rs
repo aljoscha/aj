@@ -39,6 +39,8 @@ struct Group {
     counts: Vec<(String, usize)>,
     running: Vec<String>,
     failures: Vec<String>,
+    task_failures: Vec<String>,
+    stopped_tasks: Vec<String>,
 }
 
 impl Group {
@@ -64,6 +66,15 @@ impl Group {
         }
         if let Some(first) = self.failures.first() {
             fields.push(format!("{} failed: {first}", self.failures.len()));
+        }
+        for (outcome, tasks) in [
+            ("failed", &self.task_failures),
+            ("stopped", &self.stopped_tasks),
+        ] {
+            if let Some(first) = tasks.first() {
+                let plural = if tasks.len() == 1 { "" } else { "s" };
+                fields.push(format!("{} task{plural} {outcome}: {first}", tasks.len()));
+            }
         }
         format!(
             "{} {}",
@@ -188,6 +199,26 @@ impl FocusedTranscript {
                         self.push(entry.id, Part::Body);
                     }
                 }
+                EntryKind::TaskNotification(notification) => {
+                    let g = self.activity(&mut group, chat, entry.id, index, 0);
+                    // A completion is a result, not another invocation of the
+                    // launching tool. Keep its outcome distinct from tool failures.
+                    g.count("task results");
+                    match notification.outcome {
+                        TaskOutcome::Succeeded => {}
+                        TaskOutcome::Failed { code } => {
+                            let label = short(&notification.label);
+                            g.task_failures.push(match code {
+                                Some(code) => format!("{label} (exit {code})"),
+                                None => label,
+                            });
+                        }
+                        TaskOutcome::Killed => g.stopped_tasks.push(short(&notification.label)),
+                    }
+                    if g.open {
+                        self.push(entry.id, Part::Body);
+                    }
+                }
                 EntryKind::TurnUsage(_) if group.is_some() => {
                     if group.as_ref().is_some_and(|g| g.open) {
                         self.push(entry.id, Part::Body);
@@ -237,6 +268,8 @@ impl FocusedTranscript {
                 counts: Vec::new(),
                 running: Vec::new(),
                 failures: Vec::new(),
+                task_failures: Vec::new(),
+                stopped_tasks: Vec::new(),
             }
         })
     }
@@ -255,7 +288,9 @@ impl FocusedTranscript {
                     && *id == g.id
                 {
                     *text = label;
-                    *failed = !g.failures.is_empty();
+                    *failed = !g.failures.is_empty()
+                        || !g.task_failures.is_empty()
+                        || !g.stopped_tasks.is_empty();
                     *selected = self.selected == Some(g.id);
                     break;
                 }

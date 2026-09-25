@@ -6806,6 +6806,156 @@ mod tests {
     }
 
     #[test]
+    fn focused_task_results_fold_in_arrival_order_without_crossing_prose_or_notices() {
+        let chat = focused_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "launch",
+                "bash",
+                bash("cargo test", "Launched", Some(0), None),
+            ),
+        );
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("While tests run.")),
+        );
+        apply(
+            &chat,
+            &mut life,
+            task_notification_end("cargo test", TaskOutcome::Succeeded, "Tests passed."),
+        );
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "read",
+                "read_file",
+                ToolDetails::Text {
+                    summary: "Read complete".into(),
+                    body: "Read body".into(),
+                },
+            ),
+        );
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: AgentMessage::task_notification(aj_agent::message::TaskNotification::new(
+                    "Review".into(),
+                    aj_agent::message::TaskNotificationKind::Agent,
+                    TaskOutcome::Succeeded,
+                    "Agent report.".into(),
+                )),
+            },
+        );
+        apply(&chat, &mut life, notice("Important notice"));
+        apply(
+            &chat,
+            &mut life,
+            task_notification_end("build", TaskOutcome::Succeeded, "Build finished."),
+        );
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("Final answer.")),
+        );
+        let mut view = transcript_view(&chat);
+        let text = transcript_text(&mut view, 100);
+        assert_eq!(text.matches("▸").count(), 3, "{text}");
+        assert!(text.contains("▸ bash ×1"), "{text}");
+        let summary = "task results ×2 · read_file ×1";
+        assert!(text.contains(summary), "{text}");
+        assert!(
+            text.find("While tests run.").unwrap() < text.find(summary).unwrap(),
+            "{text}"
+        );
+        assert!(
+            text.find("Important notice").unwrap() < text.find("task results ×1").unwrap(),
+            "{text}"
+        );
+        for body in [
+            "Tests passed.",
+            "Read body",
+            "Agent report.",
+            "Build finished.",
+        ] {
+            assert!(!text.contains(body), "{body} should be folded: {text}");
+        }
+        click_activity(&mut view, &draw_ctx(100, 60), summary);
+        let text = transcript_text(&mut view, 100);
+        let positions = ["Tests passed.", "Read body", "Agent report."]
+            .map(|body| text.find(body).expect(body));
+        assert!(positions.windows(2).all(|p| p[0] < p[1]), "{text}");
+        assert!(
+            !text.contains("Build finished."),
+            "other groups stay folded: {text}"
+        );
+        click_activity(&mut view, &draw_ctx(100, 60), summary);
+        assert!(!transcript_text(&mut view, 100).contains("Agent report."));
+        for mode in [
+            aj_conf::TranscriptMode::Full,
+            aj_conf::TranscriptMode::Compact,
+        ] {
+            chat.borrow_mut().transcript_mode = mode;
+            let text = transcript_text(&mut view, 100);
+            for body in ["Tests passed.", "Agent report.", "Build finished."] {
+                assert!(text.contains(body), "{mode} retains notifications: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn focused_task_outcomes_remain_visible_while_notification_bodies_are_folded() {
+        for (outcome, indication) in [
+            (TaskOutcome::Succeeded, None),
+            (
+                TaskOutcome::Failed { code: Some(1) },
+                Some("1 task failed: cargo test (exit 1)"),
+            ),
+            (
+                TaskOutcome::Failed { code: None },
+                Some("1 task failed: cargo test"),
+            ),
+            (TaskOutcome::Killed, Some("1 task stopped: cargo test")),
+        ] {
+            let chat = focused_chat();
+            apply(
+                &chat,
+                &mut AgentLifecycle::default(),
+                task_notification_end("cargo test", outcome, "Notification body"),
+            );
+            let mut view = transcript_view(&chat);
+            let ctx = draw_ctx(100, 20);
+            let surface = view.draw(&ctx);
+            let rows = crate::test_support::rows(&surface);
+            let header = rows
+                .iter()
+                .position(|row| row.contains("▸ task results ×1"))
+                .expect("notification starts an activity block");
+            assert!(
+                !rows.iter().any(|row| row.contains("Notification body")),
+                "{rows:?}"
+            );
+            if let Some(indication) = indication {
+                assert!(rows[header].contains(indication), "{rows:?}");
+                let cells = crate::test_support::flatten(&surface);
+                assert_eq!(cells[header][1].style.fg, view.styles.error.fg);
+            } else {
+                assert_eq!(rows[header].trim(), "▸ task results ×1");
+            }
+            click_activity(&mut view, &ctx, "task results ×1");
+            assert!(transcript_text(&mut view, 100).contains("Notification body"));
+        }
+    }
+
+    #[test]
     fn focused_mouse_folds_independently_and_body_selection_does_not_fold() {
         let chat = focused_chat();
         let mut life = AgentLifecycle::default();

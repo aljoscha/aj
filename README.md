@@ -130,7 +130,9 @@ overrides user config, regardless of which spelling each file uses.
 Full shows individual activity entries with their usual previews. Compact keeps
 tool headers and bash commands. Focused folds activity between messages into
 muted summaries such as `thinking ×2 · read_file ×3 · bash ×2`, with running work
-and failures called out. Assistant text and notices remain visible.
+and failures called out. Background task notifications join these groups as
+`task results ×N`, with failed and stopped outcomes visible in the summary.
+Assistant text and ordinary notices remain visible outside the groups.
 
 Click an activity summary to expand or fold that group. Text inside an expanded
 group remains selectable. For keyboard access, focus the transcript with `Tab`,
