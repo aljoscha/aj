@@ -14,6 +14,41 @@ use thiserror::Error;
 
 use crate::paths::display_path;
 
+/// How much detail the interactive transcript displays.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptMode {
+    #[default]
+    Full,
+    Compact,
+    Focused,
+}
+
+impl fmt::Display for TranscriptMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Full => "full",
+            Self::Compact => "compact",
+            Self::Focused => "focused",
+        })
+    }
+}
+
+impl FromStr for TranscriptMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "compact" => Ok(Self::Compact),
+            "focused" => Ok(Self::Focused),
+            _ => Err(format!(
+                "invalid transcript mode '{s}': expected full, compact, or focused"
+            )),
+        }
+    }
+}
+
 /// Thinking level that can be set in `config.toml` as a default baseline.
 ///
 /// When set, this is used for every request.
@@ -623,12 +658,9 @@ pub struct Config {
     /// recorded, this toggles only its visibility, so it takes
     /// effect at runtime.
     pub show_token_usage: bool,
-    /// Render tool cells header-only in the interactive TUI (a bash
-    /// cell keeps its command line). Defaults to `false`. A durable
-    /// view mode, distinct from `auto_compact` and the `compact_*`
-    /// keys, which control context-window compaction. Applied at
-    /// runtime when toggled from the settings window.
-    pub compact_transcript: bool,
+    /// Transcript detail in the interactive UI, applied immediately from settings.
+    /// Defaults to Full. This does not affect context-window compaction.
+    pub transcript_mode: TranscriptMode,
     /// Show a frame-statistics debug overlay in the corner of the
     /// interactive TUI. Off by default.
     pub show_frame_stats: bool,
@@ -725,7 +757,7 @@ impl Default for Config {
             disabled_skills: Vec::new(),
             show_thinking_block: false,
             show_token_usage: true,
-            compact_transcript: false,
+            transcript_mode: TranscriptMode::Full,
             show_frame_stats: false,
             sidebar_cols: DEFAULT_SIDEBAR_COLS,
             // Image features: resize and inline-render by default;
@@ -1023,15 +1055,18 @@ impl Config {
             to_toml_fn: |c| bool_item(c.show_token_usage, true),
         },
         ConfigOption {
-            name: "compact_transcript",
-            description: "Render tool cells header-only in the TUI (bash keeps its command line).",
-            kind: ValueKind::Bool,
+            name: "transcript_mode",
+            description: "Transcript detail: full, compact, or focused.",
+            kind: ValueKind::Enum(&["full", "compact", "focused"]),
             apply_toml_fn: |v, c| {
-                c.compact_transcript = v.try_into()?;
+                c.transcript_mode = v.try_into()?;
                 Ok(())
             },
-            display_fn: |c| c.compact_transcript.to_string(),
-            to_toml_fn: |c| bool_item(c.compact_transcript, false),
+            display_fn: |c| c.transcript_mode.to_string(),
+            to_toml_fn: |c| {
+                (c.transcript_mode != TranscriptMode::Full)
+                    .then(|| toml_edit::value(c.transcript_mode.to_string()))
+            },
         },
         ConfigOption {
             name: "show_frame_stats",
@@ -1379,6 +1414,9 @@ impl Config {
             if item_value_repr(&new_item) == item_value_repr(&option.to_toml(baseline)) {
                 continue;
             }
+            if option.name == "transcript_mode" {
+                doc.remove("compact_transcript");
+            }
             match new_item {
                 Some(item) => doc[option.name] = item,
                 None => {
@@ -1401,7 +1439,7 @@ impl Config {
 /// defaults only happens when the file isn't valid TOML at all
 /// ([`ConfigDiagnostic::ParseFailed`]).
 fn parse_config(content: &str, path: &Path) -> (Config, Vec<ConfigDiagnostic>) {
-    let table = match content.parse::<toml::Table>() {
+    let mut table = match content.parse::<toml::Table>() {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -1417,6 +1455,7 @@ fn parse_config(content: &str, path: &Path) -> (Config, Vec<ConfigDiagnostic>) {
     let mut config = Config::default();
     let mut diagnostics = Vec::new();
 
+    normalize_transcript_mode(&mut table, path, &mut diagnostics);
     for (key, value) in table {
         // `[keybindings]` is a free-form action-id-to-chord table rather than
         // a fixed option, so it is parsed here instead of through the option
@@ -1466,6 +1505,39 @@ fn parse_config(content: &str, path: &Path) -> (Config, Vec<ConfigDiagnostic>) {
     }
 
     (config, diagnostics)
+}
+
+/// Normalize aliases within each file so overlay precedence stays per layer.
+/// Presence of the canonical key wins, even when its value is invalid.
+fn normalize_transcript_mode(
+    table: &mut toml::Table,
+    path: &Path,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let Some(legacy) = table.remove("compact_transcript") else {
+        return;
+    };
+    if table.contains_key("transcript_mode") {
+        return;
+    }
+    match legacy.as_bool() {
+        Some(compact) => {
+            let mode = if compact {
+                TranscriptMode::Compact
+            } else {
+                TranscriptMode::Full
+            };
+            table.insert(
+                "transcript_mode".into(),
+                toml::Value::String(mode.to_string()),
+            );
+        }
+        None => diagnostics.push(ConfigDiagnostic::InvalidValue {
+            path: path.to_path_buf(),
+            key: "compact_transcript".into(),
+            error: "compact_transcript must be a boolean".into(),
+        }),
+    }
 }
 
 /// Return the closest known key to `unknown` if it's within
@@ -1615,6 +1687,9 @@ impl ConfigLayer {
             if new_value == baseline.values.get(option.name) {
                 continue;
             }
+            if option.name == "transcript_mode" {
+                doc.remove("compact_transcript");
+            }
             match new_value {
                 Some(value) => doc[option.name] = toml_value_to_item(value),
                 None => {
@@ -1633,7 +1708,7 @@ impl ConfigLayer {
 /// whole-file TOML syntax error yields an empty layer plus
 /// [`ConfigDiagnostic::ParseFailed`].
 fn parse_layer(content: &str, path: &Path) -> (ConfigLayer, Vec<ConfigDiagnostic>) {
-    let table = match content.parse::<toml::Table>() {
+    let mut table = match content.parse::<toml::Table>() {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -1650,6 +1725,7 @@ fn parse_layer(content: &str, path: &Path) -> (ConfigLayer, Vec<ConfigDiagnostic
     let mut diagnostics = Vec::new();
     let mut scratch = Config::default();
 
+    normalize_transcript_mode(&mut table, path, &mut diagnostics);
     for (key, value) in table {
         match Config::option(&key) {
             Some(option) => {
@@ -1798,6 +1874,121 @@ fn try_steal_stale_lock(lock_path: &Path, max_age: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_mode_reads_aliases_per_layer() {
+        let path = Path::new("config.toml");
+        let focused = Config {
+            transcript_mode: TranscriptMode::Focused,
+            ..Config::default()
+        };
+        for (text, expected) in [
+            ("compact_transcript = true", TranscriptMode::Compact),
+            ("compact_transcript = false", TranscriptMode::Full),
+            ("transcript_mode = 'full'", TranscriptMode::Full),
+            ("transcript_mode = 'compact'", TranscriptMode::Compact),
+            ("transcript_mode = 'focused'", TranscriptMode::Focused),
+            (
+                "compact_transcript = true\ntranscript_mode = 'full'",
+                TranscriptMode::Full,
+            ),
+            (
+                "transcript_mode = 'focused'\ncompact_transcript = false",
+                TranscriptMode::Focused,
+            ),
+        ] {
+            let (config, diagnostics) = parse_config(text, path);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            assert_eq!(config.transcript_mode, expected);
+            let (layer, diagnostics) = parse_layer(text, path);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            assert!(layer.is_set("transcript_mode"));
+            assert_eq!(layer.overlay_onto(&focused).transcript_mode, expected);
+        }
+        let (legacy, _) = parse_config("compact_transcript = true", path);
+        let (project, _) = parse_layer("transcript_mode = 'full'", path);
+        assert_eq!(
+            project.overlay_onto(&legacy).transcript_mode,
+            TranscriptMode::Full
+        );
+        assert_eq!(
+            parse_config("", path).0.transcript_mode,
+            TranscriptMode::Full
+        );
+        assert_eq!(
+            parse_layer("", path)
+                .0
+                .overlay_onto(&focused)
+                .transcript_mode,
+            TranscriptMode::Focused
+        );
+
+        for text in [
+            "compact_transcript = 'yes'",
+            "transcript_mode = 'unknown'",
+            "transcript_mode = true",
+            "compact_transcript = true\ntranscript_mode = 'unknown'",
+        ] {
+            let (config, diagnostics) = parse_config(text, path);
+            assert!(matches!(
+                diagnostics.as_slice(),
+                [ConfigDiagnostic::InvalidValue { .. }]
+            ));
+            assert_eq!(config.transcript_mode, TranscriptMode::Full);
+            let (layer, diagnostics) = parse_layer(text, path);
+            assert!(matches!(
+                diagnostics.as_slice(),
+                [ConfigDiagnostic::InvalidValue { .. }]
+            ));
+            assert!(!layer.is_set("transcript_mode"));
+            assert_eq!(
+                layer.overlay_onto(&focused).transcript_mode,
+                TranscriptMode::Focused
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_mode_edits_do_not_revive_legacy_values() {
+        let path = Path::new("config.toml");
+        let text = "compact_transcript = true\n# Keep this\nshow_token_usage = false\n";
+        let (baseline, _) = parse_config(text, path);
+        for mode in [TranscriptMode::Full, TranscriptMode::Focused] {
+            let mut config = baseline.clone();
+            config.transcript_mode = mode;
+            let mut doc = text.parse::<toml_edit::DocumentMut>().unwrap();
+            config.apply_changed_into_document(&baseline, &mut doc);
+            assert!(!doc.contains_key("compact_transcript"));
+            assert!(doc.to_string().contains("# Keep this"));
+            assert_eq!(parse_config(&doc.to_string(), path).0.transcript_mode, mode);
+        }
+
+        let (baseline, _) = parse_layer(text, path);
+        for value in [Some("full"), Some("focused"), None] {
+            let mut layer = baseline.clone();
+            match value {
+                Some(value) => layer.set_str("transcript_mode", value).unwrap(),
+                None => layer.clear("transcript_mode"),
+            }
+            let mut doc = text.parse::<toml_edit::DocumentMut>().unwrap();
+            layer.apply_changed_into_document(&baseline, &mut doc);
+            assert!(!doc.contains_key("compact_transcript"));
+            assert!(doc.to_string().contains("# Keep this"));
+            let (reloaded, diagnostics) = parse_layer(&doc.to_string(), path);
+            assert!(diagnostics.is_empty());
+            assert_eq!(reloaded.is_set("transcript_mode"), value.is_some());
+            let base = Config {
+                transcript_mode: TranscriptMode::Compact,
+                ..Config::default()
+            };
+            assert_eq!(
+                reloaded.overlay_onto(&base).transcript_mode,
+                value
+                    .map(|v| v.parse().unwrap())
+                    .unwrap_or(base.transcript_mode)
+            );
+        }
+    }
 
     #[test]
     fn test_config_default() {

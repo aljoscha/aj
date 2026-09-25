@@ -7,6 +7,10 @@
 //! builder ([`build_entry_widget`]) is shared with the sub-agent
 //! box, which lays the same widgets out inside its own frame.
 
+mod focused;
+
+use focused::{FocusedTranscript, GroupId};
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -219,7 +223,7 @@ struct CachedEntry {
 /// `Rc<RefCell<..>>`. One slot per key, so stale `(fingerprint, width)`
 /// variants never accumulate. Session-wide render inputs (the theme,
 /// `tools_expanded`, `show_thinking_block`, `show_token_usage`,
-/// `compact_transcript`, `syntax_highlight`, `show_image_in_terminal`, the
+/// `transcript_mode`, `syntax_highlight`, `show_image_in_terminal`, the
 /// active view) are handled by clearing the whole cache when they change rather
 /// than folding them into every fingerprint (see [`TranscriptView::draw`] and
 /// [`TranscriptView::set_styles`]). Width is a per-slot key.
@@ -496,6 +500,7 @@ enum EntryBorder {
 
 struct EntryBuilder {
     chat: Rc<RefCell<ChatState>>,
+    activity: Rc<RefCell<FocusedTranscript>>,
     styles: Rc<TranscriptStyles>,
     cache: Rc<RefCell<EntryRenderCache>>,
     /// The transcript-focus flag, shared with [`TranscriptView`] and the
@@ -609,10 +614,13 @@ impl Builder for EntryBuilder {
         // the caller already holds, keeps the gate on one seam. Recording a
         // visible-but-untransmitted image as pending is what makes transmission
         // lazy: only entries drawn this frame get recorded.
-        let images_enabled = self.styles.images && chat.show_image_in_terminal;
+        let images_enabled = self.styles.images
+            && chat.show_image_in_terminal
+            && self.activity.borrow().shows_body(entry.id);
         let image = self.resolve_image(agent, entry, images_enabled);
         let mut hasher = DefaultHasher::new();
-        fingerprint_into(entry, &chat, &mut hasher);
+        entry_fingerprint(entry, &chat).hash(&mut hasher);
+        self.activity.borrow().hash(entry.id, &mut hasher);
         border.hash(&mut hasher);
         // Fold the image render state so the entry rebuilds the frame its
         // transmit resolves: `Pending` -> `Transmitted` places the image and
@@ -631,6 +639,7 @@ impl Builder for EntryBuilder {
         Some(Rc::new(RefCell::new(CachingEntry {
             cache: Rc::clone(&self.cache),
             chat: Rc::clone(&self.chat),
+            activity: Rc::clone(&self.activity),
             styles: Rc::clone(&self.styles),
             agent,
             entry_id: entry.id,
@@ -655,6 +664,7 @@ impl Builder for EntryBuilder {
 struct CachingEntry {
     cache: Rc<RefCell<EntryRenderCache>>,
     chat: Rc<RefCell<ChatState>>,
+    activity: Rc<RefCell<FocusedTranscript>>,
     styles: Rc<TranscriptStyles>,
     agent: AgentId,
     entry_id: EntryId,
@@ -722,10 +732,9 @@ impl Widget for CachingEntry {
                 EntryBorder::Focus => Some(self.copy_label.as_slice()),
                 EntryBorder::Branch => Some(self.branch_label.as_slice()),
             };
-            let mut widget =
-                build_entry_widget(entry, &chat, &self.styles, false, label, self.image)
-                    .into_indented_boxed();
-            widget.draw(ctx)
+            self.activity
+                .borrow_mut()
+                .draw(entry, &chat, &self.styles, label, self.image, ctx)
         };
         // A bypass entry is never stored, so it can't strand a stale slot when
         // its glyph advances or when it later concludes and becomes cacheable.
@@ -750,7 +759,7 @@ impl Widget for CachingEntry {
 /// Philosophy: over-fingerprint. A field we forget shows stale content (a real
 /// bug); a field we include that doesn't affect rendering only costs a
 /// harmless rebuild. Session-wide render inputs (`tools_expanded`,
-/// `show_thinking_block`, `show_token_usage`, `compact_transcript`,
+/// `show_thinking_block`, `show_token_usage`, `transcript_mode`,
 /// `syntax_highlight`, `show_image_in_terminal`, the active view, the theme,
 /// the draw width) are NOT hashed here: the cache clears wholesale when they
 /// change, and width is a per-slot key.
@@ -1157,7 +1166,7 @@ pub(crate) fn build_entry_widget(
             tool,
             chat.tasks(),
             chat.tools_expanded,
-            chat.compact_transcript,
+            chat.transcript_mode == aj_conf::TranscriptMode::Compact,
             styles,
             image,
         )),
@@ -1426,6 +1435,15 @@ fn build_assistant_markdown(
     syntax_highlight: bool,
     styles: &TranscriptStyles,
 ) -> MarkdownView {
+    build_assistant_blocks(&a.message.content, show_thinking, syntax_highlight, styles)
+}
+
+fn build_assistant_blocks(
+    blocks: &[AssistantContent],
+    show_thinking: bool,
+    syntax_highlight: bool,
+    styles: &TranscriptStyles,
+) -> MarkdownView {
     let text_opts = RenderOpts {
         hyperlinks: styles.hyperlinks,
         default_emphasis: Emphasis::default(),
@@ -1442,7 +1460,7 @@ fn build_assistant_markdown(
         syntax_highlight,
     };
     let mut segments = Vec::new();
-    for block in &a.message.content {
+    for block in blocks {
         let segment = match block {
             AssistantContent::Text(t) => MarkdownSegment {
                 text: t.text.clone(),
@@ -1705,6 +1723,13 @@ fn round_lines(v: f64) -> i32 {
 /// double dispatch.
 pub struct TranscriptView {
     chat: Rc<RefCell<ChatState>>,
+    activity: Rc<RefCell<FocusedTranscript>>,
+    activity_click: Option<GroupId>,
+    activity_hit_rows: Vec<Option<GroupId>>,
+    /// Folding is an explicit reading gesture, even when the expanded content
+    /// still fits the viewport. Only a scroll toward the tail or a resume
+    /// gesture may resume following newly arriving activity.
+    activity_reading: bool,
     /// The chat list, shared with `bars`, which draws it and routes
     /// thumb drag-to-jump into it.
     list: Rc<RefCell<ListView>>,
@@ -1830,7 +1855,7 @@ struct GlobalRenderInputs {
     tools_expanded: bool,
     show_thinking_block: bool,
     show_token_usage: bool,
-    compact_transcript: bool,
+    transcript_mode: aj_conf::TranscriptMode,
     syntax_highlight: bool,
     show_image_in_terminal: bool,
 }
@@ -1842,7 +1867,7 @@ impl GlobalRenderInputs {
             tools_expanded: chat.tools_expanded,
             show_thinking_block: chat.show_thinking_block,
             show_token_usage: chat.show_token_usage,
-            compact_transcript: chat.compact_transcript,
+            transcript_mode: chat.transcript_mode,
             syntax_highlight: chat.syntax_highlight,
             show_image_in_terminal: chat.show_image_in_terminal,
         }
@@ -1989,7 +2014,9 @@ impl TranscriptView {
         // caps-aware styles once the probe lands. See [`TerminalCaps`].
         let styles = Rc::new(TranscriptStyles::from_theme(theme, TerminalCaps::default()));
         let cache = Rc::new(RefCell::new(EntryRenderCache::new()));
+        let activity = Rc::new(RefCell::new(FocusedTranscript::default()));
         let builder = EntryBuilder {
+            activity: Rc::clone(&activity),
             chat: Rc::clone(&chat),
             styles: Rc::clone(&styles),
             cache: Rc::clone(&cache),
@@ -2017,6 +2044,10 @@ impl TranscriptView {
         let generation = chat.borrow().generation();
         TranscriptView {
             chat,
+            activity,
+            activity_click: None,
+            activity_hit_rows: Vec::new(),
+            activity_reading: false,
             list,
             bars,
             cache,
@@ -2086,12 +2117,15 @@ impl TranscriptView {
         self.entry_text.clear();
         self.cancel_selection_gesture();
         self.agent_hit_rows.clear();
+        self.activity_hit_rows.clear();
+        self.activity.borrow_mut().selected = None;
         self.agent_hit_width = 0;
         let mut list = self.list.borrow_mut();
         list.suspend();
         list.cursor = 0;
         drop(list);
         self.follow_tail = true;
+        self.activity_reading = false;
         self.selection = None;
         self.cancel_scroll_anim();
     }
@@ -2102,6 +2136,7 @@ impl TranscriptView {
         let generation = self.chat.borrow().generation();
         if self.generation != generation {
             self.reset_to_tail();
+            *self.activity.borrow_mut() = FocusedTranscript::default();
             self.focused.set(false);
             self.generation = generation;
             return true;
@@ -2128,6 +2163,7 @@ impl TranscriptView {
 
     fn cancel_selection_gesture(&mut self) {
         self.agent_click = None;
+        self.activity_click = None;
         self.selection_origin = None;
         self.selection_unit = SelectionUnit::Character;
         self.last_click = None;
@@ -2208,6 +2244,7 @@ impl TranscriptView {
     /// the move sees the current length even before the focused view's first
     /// draw.
     fn focus_item(&mut self, ctx: &mut EventContext, idx: usize) {
+        self.activity.borrow_mut().selected = None;
         let count = self.entry_count();
         {
             let mut list = self.list.borrow_mut();
@@ -2588,6 +2625,7 @@ impl TranscriptView {
     /// (the overlay's `request_focus` sends this a `FocusOut`).
     fn exit_focus_mode(&self, ctx: &mut EventContext) {
         self.focused.set(false);
+        self.activity.borrow_mut().selected = None;
         ctx.redraw = true;
     }
 
@@ -2606,6 +2644,30 @@ impl TranscriptView {
             return;
         }
         let empty = Modifiers::empty();
+        if self.chat.borrow().transcript_mode == aj_conf::TranscriptMode::Focused {
+            if key.matches(u32::from('['), empty) || key.matches(u32::from(']'), empty) {
+                let cursor = usize::try_from(self.list.borrow().cursor).unwrap_or(0);
+                let next = self
+                    .activity
+                    .borrow_mut()
+                    .navigate(cursor, key.matches(u32::from(']'), empty));
+                if let Some((index, entry)) = next {
+                    self.reveal_activity(index, entry);
+                }
+                return ctx.consume_and_redraw();
+            }
+            if key.matches(Key::ENTER, empty) {
+                let selected = self.activity.borrow().selected;
+                if let Some(id) = selected {
+                    self.toggle_activity(id);
+                    let index = usize::try_from(self.list.borrow().cursor).unwrap_or(0);
+                    if let Some(entry) = self.entry_id_at(index) {
+                        self.reveal_activity(index, entry);
+                    }
+                    return ctx.consume_and_redraw();
+                }
+            }
+        }
         let ctrl = Modifiers::CTRL;
         if key.matches(Key::UP, empty)
             || key.matches(u32::from('k'), empty)
@@ -2667,6 +2729,7 @@ impl TranscriptView {
     /// [`draw`](Widget::draw)), so paging down to the end resumes following
     /// streamed content.
     pub(crate) fn page_down(&mut self, ctx: &mut EventContext) {
+        self.activity_reading = false;
         let lines = crate::scroll::half_page_scroll_lines(self.list.borrow().viewport_height());
         self.start_line_scroll(ctx, lines);
     }
@@ -2725,6 +2788,7 @@ impl TranscriptView {
     /// Re-engages follow-tail so the next draw pins the transcript to the bottom.
     pub(crate) fn resume_follow_tail(&mut self) {
         self.cancel_scroll_anim();
+        self.activity_reading = false;
         self.follow_tail = true;
     }
 
@@ -2740,6 +2804,7 @@ impl TranscriptView {
         self.entry_text.clear();
         let builder = EntryBuilder {
             chat: Rc::clone(&self.chat),
+            activity: Rc::clone(&self.activity),
             styles: Rc::clone(&styles),
             cache: Rc::clone(&self.cache),
             focus_mode: Rc::clone(&self.focused),
@@ -2772,7 +2837,12 @@ impl TranscriptView {
             let chat = self.chat.borrow();
             let agent = chat.active_view();
             match chat.transcript(agent).and_then(|t| t.get(id)) {
-                Some(entry) => (chat.generation(), entry_fingerprint(entry, &chat)),
+                Some(entry) => {
+                    let mut hasher = DefaultHasher::new();
+                    entry_fingerprint(entry, &chat).hash(&mut hasher);
+                    self.activity.borrow().hash(entry.id, &mut hasher);
+                    (chat.generation(), hasher.finish())
+                }
                 None => return Rc::new(Vec::new()),
             }
         };
@@ -2801,16 +2871,14 @@ impl TranscriptView {
             // `entry_rows` feeds the select-to-copy measurement, so an image
             // renders as its `[image: ...]` text (copying over an image yields
             // that text, not a blank reserve). Force `Disabled` here.
-            let mut widget = build_entry_widget(
+            let surface = self.activity.borrow_mut().draw(
                 entry,
                 &chat,
                 &self.styles,
-                false,
                 None,
                 ImageRender::Disabled,
-            )
-            .into_indented_boxed();
-            let surface = widget.draw(&ctx);
+                &ctx,
+            );
             let mut rows = surface_rows(&surface);
             for row in &mut rows {
                 // The list composites entries into a `width`-wide surface, so a
@@ -2876,6 +2944,10 @@ impl TranscriptView {
         let mut parts: Vec<String> = Vec::with_capacity(ids.len());
         for id in ids {
             let rows = self.entry_rows(id, width);
+            // Folded activity has no rendered boundary to copy.
+            if rows.is_empty() {
+                continue;
+            }
             // The start entry is read from the anchor position, the end entry
             // up to the caret position, and whole entries in between.
             let from_line = if id == start.entry { start.line } else { 0 };
@@ -2933,6 +3005,7 @@ impl TranscriptView {
                 // A thumb drag moves the viewport, so it takes over from any
                 // in-flight glide and leaves the tail.
                 self.cancel_scroll_anim();
+                self.activity_reading = false;
                 self.follow_tail = false;
             }
             return;
@@ -2940,11 +3013,14 @@ impl TranscriptView {
         if m.button.is_wheel() {
             // Scrolling interrupts a plain click, not a held selection.
             self.agent_click = None;
+            self.activity_click = None;
             self.last_click = None;
             self.cancel_scroll_anim();
         }
         if m.button == mouse::Button::WheelUp {
             self.follow_tail = false;
+        } else if m.button == mouse::Button::WheelDown {
+            self.activity_reading = false;
         }
     }
 
@@ -3170,25 +3246,66 @@ impl TranscriptView {
         let width = self.content_width();
         let positions = self.drawn_row_positions(height);
         let mut rows = Vec::with_capacity(height);
+        let mut activity_rows = Vec::with_capacity(height);
 
         for pos in positions {
             let Some(pos) = pos else {
                 rows.push(None);
+                activity_rows.push(None);
                 continue;
             };
+            let activity = self.activity.borrow();
+            let header = activity.header_at(pos.entry, pos.line);
+            activity_rows.push(header);
             let chat = self.chat.borrow();
             let agent = chat
                 .transcript(chat.active_view())
                 .and_then(|transcript| transcript.get(pos.entry))
                 .and_then(|entry| match &entry.kind {
-                    EntryKind::SubAgent(sub) => Some(AgentId::Sub(sub.child)),
+                    EntryKind::SubAgent(sub) if activity.body_at(pos.entry, pos.line) => {
+                        Some(AgentId::Sub(sub.child))
+                    }
                     _ => None,
                 });
             rows.push(agent);
         }
 
         self.agent_hit_rows = rows;
+        self.activity_hit_rows = activity_rows;
         self.agent_hit_width = width;
+    }
+
+    fn activity_at_point(&self, row: i16, col: i16) -> Option<GroupId> {
+        if col < 0 || u16::try_from(col).ok()? >= self.agent_hit_width {
+            return None;
+        }
+        self.activity_hit_rows
+            .get(usize::try_from(row).ok()?)
+            .copied()
+            .flatten()
+    }
+
+    fn toggle_activity(&mut self, id: GroupId) {
+        self.cancel_scroll_anim();
+        self.follow_tail = false;
+        self.activity_reading = true;
+        self.selection = None;
+        let agent = self.chat.borrow().active_view();
+        self.activity.borrow_mut().toggle(agent, id);
+        self.activity.borrow_mut().rebuild(&self.chat.borrow());
+        self.entry_text.clear();
+    }
+
+    fn reveal_activity(&mut self, index: usize, entry: EntryId) {
+        self.cancel_scroll_anim();
+        self.activity.borrow_mut().rebuild(&self.chat.borrow());
+        self.entry_rows(entry, self.content_width());
+        let line = self.activity.borrow().selected_line().unwrap_or(0);
+        let mut list = self.list.borrow_mut();
+        list.cursor = u32::try_from(index).expect("entry index fits u32");
+        let cursor = list.cursor;
+        list.jump_to_item(cursor);
+        list.scroll_lines(i32::try_from(line).unwrap_or(i32::MAX));
     }
 
     /// Drive the free-form selection from a left-button mouse event. Called
@@ -3218,6 +3335,11 @@ impl TranscriptView {
                 } else {
                     None
                 };
+                self.activity_click = if count == 1 && m.mods.is_empty() {
+                    self.activity_at_point(m.row, m.col)
+                } else {
+                    None
+                };
                 self.selection_unit = match count {
                     2 => SelectionUnit::Word,
                     3 => SelectionUnit::Line,
@@ -3232,6 +3354,7 @@ impl TranscriptView {
             }
             mouse::Type::Drag => {
                 self.agent_click = None;
+                self.activity_click = None;
                 self.last_click = None;
                 // Dragging past the top or bottom edge auto-scrolls by the
                 // overshoot so a selection can span more than one screen. The
@@ -3258,6 +3381,9 @@ impl TranscriptView {
                 ctx.redraw = true;
             }
             mouse::Type::Release => {
+                let fold = self.activity_click.take().filter(|id| {
+                    m.mods.is_empty() && self.activity_at_point(m.row, m.col) == Some(*id)
+                });
                 let released_agent = if m.mods.is_empty() {
                     self.subagent_at_point(m.row, m.col)
                 } else {
@@ -3294,6 +3420,11 @@ impl TranscriptView {
                 }
                 self.selection_origin = None;
                 self.selection_unit = SelectionUnit::Character;
+                if let Some(id) = fold {
+                    self.toggle_activity(id);
+                    self.last_click = None;
+                    ctx.redraw = true;
+                }
                 if let Some(id) = observe
                     && let Some(on_observe) = self.on_observe_agent.as_mut()
                 {
@@ -3552,6 +3683,7 @@ impl Widget for TranscriptView {
             self.entry_text.clear();
             self.last_globals = globals;
         }
+        self.activity.borrow_mut().rebuild(&self.chat.borrow());
         let count = self.entry_count();
         // Focus mode hands the viewport to the item cursor, so follow-tail
         // must neither pin the bottom nor re-engage while it is active, or the
@@ -3574,7 +3706,7 @@ impl Widget for TranscriptView {
         // the bottom" is now accurate. Landing there re-engages
         // follow-tail (except in focus mode, where the cursor owns the
         // viewport).
-        if !focus_mode && self.list.borrow().is_at_bottom() {
+        if !focus_mode && !self.activity_reading && self.list.borrow().is_at_bottom() {
             self.follow_tail = true;
         }
         // Wrap the bars in an opaque full-size surface: the list draws
@@ -3608,6 +3740,7 @@ impl Widget for TranscriptView {
         if let Event::Mouse(m) = event {
             if m.kind == mouse::Type::Drag {
                 self.agent_click = None;
+                self.activity_click = None;
             }
             self.observe_mouse(ctx, event, m);
         }
@@ -3648,6 +3781,7 @@ impl Widget for TranscriptView {
             }
             Event::MouseLeave => {
                 self.agent_click = None;
+                self.activity_click = None;
                 self.last_click = None;
                 self.bars.borrow_mut().handle_event(ctx, event);
             }
@@ -6152,6 +6286,7 @@ mod tests {
         let copy_label = Rc::new(copy_label_spans(&styles));
         let branch_label = Rc::new(branch_label_spans(&styles));
         EntryBuilder {
+            activity: Rc::new(RefCell::new(FocusedTranscript::default())),
             chat: Rc::clone(chat),
             styles,
             cache: Rc::new(RefCell::new(EntryRenderCache::new())),
@@ -6179,6 +6314,7 @@ mod tests {
         let copy_label = Rc::new(copy_label_spans(&styles));
         let branch_label = Rc::new(branch_label_spans(&styles));
         EntryBuilder {
+            activity: Rc::new(RefCell::new(FocusedTranscript::default())),
             chat: Rc::clone(chat),
             styles,
             cache: Rc::new(RefCell::new(EntryRenderCache::new())),
@@ -6551,6 +6687,583 @@ mod tests {
     }
 
     // ---- Render cache: effectiveness (hits happen) -----------------------
+
+    fn thinking(text: &str) -> AssistantContent {
+        AssistantContent::Thinking(ThinkingContent {
+            thinking: text.into(),
+            thinking_signature: None,
+            redacted: false,
+        })
+    }
+
+    fn focused_chat() -> Rc<RefCell<ChatState>> {
+        let chat = empty_chat();
+        chat.borrow_mut().transcript_mode = aj_conf::TranscriptMode::Focused;
+        chat.borrow_mut().show_token_usage = false;
+        chat
+    }
+
+    fn transcript_text(view: &mut TranscriptView, width: u16) -> String {
+        crate::test_support::rows(&view.draw(&draw_ctx(width, 60))).join("\n")
+    }
+
+    fn click_activity(view: &mut TranscriptView, ctx: &DrawContext, needle: &str) {
+        let rows = crate::test_support::rows(&view.draw(ctx));
+        let row = i16::try_from(
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .expect("header visible"),
+        )
+        .unwrap();
+        assert!(
+            view.activity_at_point(row, 2).is_some(),
+            "not a clickable header: {rows:?}"
+        );
+        for kind in [mouse::Type::Press, mouse::Type::Release] {
+            view.handle_event(&mut EventContext::new(), &mouse(2, row, kind));
+        }
+    }
+
+    #[test]
+    fn focused_groups_activity_without_hiding_prose_or_notices() {
+        let chat = focused_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, user_end("Please investigate"));
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(assistant_message(vec![
+                thinking("private reasoning"),
+                AssistantContent::Text(TextContent {
+                    text: "I found the cause.".into(),
+                    text_signature: None,
+                }),
+                thinking("another thought"),
+            ])),
+        );
+        for call in ["first", "second"] {
+            apply(
+                &chat,
+                &mut life,
+                tool_start(AgentId::Main, call, "custom_search"),
+            );
+            apply(
+                &chat,
+                &mut life,
+                tool_end(
+                    AgentId::Main,
+                    call,
+                    "custom_search",
+                    ToolDetails::Text {
+                        summary: "Search results".into(),
+                        body: "hidden results".into(),
+                    },
+                ),
+            );
+        }
+        apply(&chat, &mut life, notice("Important warning"));
+        apply(
+            &chat,
+            &mut life,
+            tool_start(AgentId::Main, "third", "read_file"),
+        );
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("Here is the answer.")),
+        );
+        let mut view = transcript_view(&chat);
+        let text = transcript_text(&mut view, 100);
+        assert!(text.contains("Please investigate"), "{text}");
+        assert!(text.contains("thinking ×1 · custom_search ×2"), "{text}");
+        assert_eq!(text.matches("▸").count(), 3, "{text}");
+        assert!(
+            !text.contains("private reasoning") && !text.contains("hidden results"),
+            "{text}"
+        );
+        let ordered = [
+            "thinking ×1",
+            "I found the cause.",
+            "custom_search ×2",
+            "Important warning",
+            "read_file ×1",
+            "Here is the answer.",
+        ];
+        let mut previous = 0;
+        for phrase in ordered {
+            let at = text.find(phrase).expect(phrase);
+            assert!(at >= previous, "{phrase}: {text}");
+            previous = at;
+        }
+        chat.borrow_mut().transcript_mode = aj_conf::TranscriptMode::Full;
+        chat.borrow_mut().show_thinking_block = true;
+        let text = transcript_text(&mut view, 100);
+        assert!(
+            text.contains("private reasoning") && text.contains("hidden results"),
+            "{text}"
+        );
+        assert!(!text.contains("custom_search ×2"), "{text}");
+    }
+
+    #[test]
+    fn focused_mouse_folds_independently_and_body_selection_does_not_fold() {
+        let chat = focused_chat();
+        let mut life = AgentLifecycle::default();
+        for (call, tool, body) in [
+            ("a", "read_file", "first body"),
+            ("b", "edit_file", "second body"),
+        ] {
+            apply(&chat, &mut life, tool_start(AgentId::Main, call, tool));
+            apply(
+                &chat,
+                &mut life,
+                tool_end(
+                    AgentId::Main,
+                    call,
+                    tool,
+                    ToolDetails::Text {
+                        summary: "Result".into(),
+                        body: body.into(),
+                    },
+                ),
+            );
+            apply(
+                &chat,
+                &mut life,
+                assistant_message_end(text_message("Visible prose")),
+            );
+        }
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(80, 60);
+        click_activity(&mut view, &ctx, "read_file ×1");
+        let text = transcript_text(&mut view, 80);
+        assert!(
+            text.contains("first body") && !text.contains("second body"),
+            "{text}"
+        );
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        let row =
+            i16::try_from(rows.iter().position(|r| r.contains("first body")).unwrap()).unwrap();
+        for (col, kind) in [
+            (2, mouse::Type::Press),
+            (7, mouse::Type::Drag),
+            (7, mouse::Type::Release),
+        ] {
+            view.handle_event(&mut EventContext::new(), &mouse(col, row, kind));
+        }
+        assert!(
+            view.selection_copied.get().is_some(),
+            "drag copies visible activity text"
+        );
+        assert!(transcript_text(&mut view, 80).contains("first body"));
+        click_activity(&mut view, &ctx, "read_file ×1");
+        assert!(!transcript_text(&mut view, 80).contains("first body"));
+        click_activity(&mut view, &ctx, "edit_file ×1");
+        let text = transcript_text(&mut view, 80);
+        assert!(
+            !text.contains("first body") && text.contains("second body"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn focused_selection_copies_visible_rows_without_hidden_entry_separators() {
+        let chat = focused_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("Before")),
+        );
+        for i in 0..50 {
+            apply(
+                &chat,
+                &mut life,
+                tool_end(
+                    AgentId::Main,
+                    &format!("call-{i}"),
+                    "read_file",
+                    ToolDetails::Text {
+                        summary: "Hidden result".into(),
+                        body: "Hidden body".into(),
+                    },
+                ),
+            );
+        }
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("After")),
+        );
+        let mut view = transcript_view(&chat);
+        let rows = crate::test_support::rows(&view.draw(&draw_ctx(80, 12)));
+        let start = i16::try_from(rows.iter().position(|r| r.contains("Before")).unwrap()).unwrap();
+        let end = i16::try_from(rows.iter().position(|r| r.contains("After")).unwrap()).unwrap();
+        assert_eq!(rows.iter().filter(|r| !r.is_empty()).count(), 3, "{rows:?}");
+        view.handle_event(
+            &mut EventContext::new(),
+            &mouse(1, start, mouse::Type::Press),
+        );
+        view.handle_event(&mut EventContext::new(), &mouse(6, end, mouse::Type::Drag));
+        let mut events = EventContext::new();
+        view.handle_event(&mut events, &mouse(6, end, mouse::Type::Release));
+        let copied = events.cmds.iter().find_map(|command| match command {
+            vaxis::vxfw::Command::CopyToClipboard(text) => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(copied, Some("Before\n\n▸ read_file ×50\n\nAfter"));
+    }
+
+    #[test]
+    fn focused_expansion_keeps_the_readers_position_when_activity_grows() {
+        let chat = focused_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "first",
+                "read_file",
+                ToolDetails::Text {
+                    summary: "Result".into(),
+                    body: "Keep reading here".into(),
+                },
+            ),
+        );
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(80, 20);
+        click_activity(&mut view, &ctx, "read_file ×1");
+        let text = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(text.contains("Keep reading here"), "{text}");
+        for i in 0..30 {
+            apply(
+                &chat,
+                &mut life,
+                tool_end(
+                    AgentId::Main,
+                    &format!("next-{i}"),
+                    "read_file",
+                    ToolDetails::Text {
+                        summary: "Result".into(),
+                        body: format!("More output {i}"),
+                    },
+                ),
+            );
+        }
+        let text = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            text.contains("Keep reading here") && text.contains("▾ read_file ×31"),
+            "{text}"
+        );
+        view.resume_follow_tail();
+        let text = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            text.contains("More output 29") && !text.contains("Keep reading here"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn focused_live_counts_failures_and_background_status_update_in_place() {
+        let chat = focused_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, tool_start(AgentId::Main, "a", "bash"));
+        let mut view = transcript_view(&chat);
+        assert!(transcript_text(&mut view, 100).contains("bash ×1 · running: bash"));
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "a",
+                "bash",
+                bash("false", "bad output", Some(1), None),
+            ),
+        );
+        apply(&chat, &mut life, tool_start(AgentId::Main, "b", "bash"));
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "b",
+                "bash",
+                bash("true", "good output", Some(0), None),
+            ),
+        );
+        let text = transcript_text(&mut view, 100);
+        assert!(text.contains("bash ×2 · 1 failed: bash: exit 1"), "{text}");
+        click_activity(&mut view, &draw_ctx(100, 60), "bash ×2");
+        apply(&chat, &mut life, tool_start(AgentId::Main, "c", "bash"));
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 7,
+                call_id: "c".into(),
+                kind: aj_agent::tool::TaskKind::Bash {
+                    command: "cargo test".into(),
+                },
+                label: "cargo test".into(),
+            },
+        );
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c",
+                "bash",
+                bash("cargo test", "launched", None, Some(7)),
+            ),
+        );
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("Tests are running.")),
+        );
+        let text = transcript_text(&mut view, 120);
+        assert!(
+            text.contains("▾ bash ×3 · running: cargo test · 1 failed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("bad output") && text.contains("Tests are running."),
+            "{text}"
+        );
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::TaskEnd {
+                agent_id: AgentId::Main,
+                task_id: 7,
+                call_id: "c".into(),
+                label: "cargo test".into(),
+                status: TaskStatus::Exited(Some(0)),
+            },
+        );
+        let text = transcript_text(&mut view, 120);
+        assert!(!text.contains("running: cargo test"), "{text}");
+        assert!(text.contains("▾ bash ×3 · 1 failed"), "{text}");
+    }
+
+    #[test]
+    fn focused_keyboard_navigation_and_expand_all_reveal_activity() {
+        let chat = focused_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, user_end("Question"));
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(assistant_message(vec![thinking("Reasoning")])),
+        );
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "a",
+                "read_file",
+                ToolDetails::Text {
+                    summary: "Result".into(),
+                    body: "The body".into(),
+                },
+            ),
+        );
+        let mut view = transcript_view(&chat);
+        transcript_text(&mut view, 80);
+        view.handle_event(&mut EventContext::new(), &Event::FocusIn);
+        for code in [u32::from(']'), Key::ENTER] {
+            view.handle_event(
+                &mut EventContext::new(),
+                &Event::KeyPress(Key {
+                    codepoint: code,
+                    ..Key::default()
+                }),
+            );
+            transcript_text(&mut view, 80);
+        }
+        let text = transcript_text(&mut view, 80);
+        assert!(
+            text.contains("▾ thinking ×1 · read_file ×1") && text.contains("The body"),
+            "{text}"
+        );
+        view.handle_event(
+            &mut EventContext::new(),
+            &Event::KeyPress(Key {
+                codepoint: Key::ENTER,
+                ..Key::default()
+            }),
+        );
+        assert!(!transcript_text(&mut view, 80).contains("The body"));
+        chat.borrow_mut().tools_expanded = true;
+        assert!(transcript_text(&mut view, 80).contains("The body"));
+    }
+
+    #[test]
+    fn focused_streaming_thinking_counts_blocks_and_reveals_text_immediately() {
+        let chat = focused_chat();
+        let mut life = AgentLifecycle::default();
+        let mut view = transcript_view(&chat);
+        let message = AgentMessage::wire(Message::Assistant(assistant_message(Vec::new())));
+        for contents in [
+            vec![thinking("one")],
+            vec![thinking("one growing")],
+            vec![
+                thinking("one growing"),
+                AssistantContent::Text(TextContent {
+                    text: "Visible immediately".into(),
+                    text_signature: None,
+                }),
+            ],
+        ] {
+            apply(
+                &chat,
+                &mut life,
+                AgentEvent::MessageUpdate {
+                    agent_id: AgentId::Main,
+                    message: message.clone(),
+                    event: AssistantMessageEvent::ThinkingDelta {
+                        content_index: 0,
+                        delta: String::new(),
+                        partial: assistant_message(contents),
+                    },
+                },
+            );
+            let text = transcript_text(&mut view, 35);
+            assert_eq!(text.matches("thinking ×1").count(), 1, "{text}");
+            assert!(
+                !text.contains("thinking ×2") && !text.contains("one growing"),
+                "{text}"
+            );
+        }
+        let text = transcript_text(&mut view, 35);
+        assert!(text.contains("Visible immediately"), "{text}");
+        assert!(!text.contains("running: thinking"), "{text}");
+        click_activity(&mut view, &draw_ctx(35, 60), "thinking ×1");
+        chat.borrow_mut().show_thinking_block = true;
+        let text = transcript_text(&mut view, 35);
+        assert!(
+            text.contains("one growing") && text.contains("Visible immediately"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn focused_keyboard_reaches_groups_inside_a_long_assistant_message() {
+        let chat = focused_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, user_end("Question"));
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(assistant_message(vec![
+                thinking("first"),
+                AssistantContent::Text(TextContent {
+                    text: "A paragraph.\n\n".repeat(30),
+                    text_signature: None,
+                }),
+                thinking("second"),
+            ])),
+        );
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 12);
+        view.draw(&ctx);
+        view.handle_event(&mut EventContext::new(), &Event::FocusIn);
+        for _ in 0..2 {
+            view.handle_event(
+                &mut EventContext::new(),
+                &Event::KeyPress(Key {
+                    codepoint: u32::from(']'),
+                    ..Key::default()
+                }),
+            );
+            let text = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+            assert!(
+                text.contains("Enter to toggle"),
+                "selected group must be visible: {text}"
+            );
+        }
+        chat.borrow_mut().show_thinking_block = true;
+        view.handle_event(
+            &mut EventContext::new(),
+            &Event::KeyPress(Key {
+                codepoint: Key::ENTER,
+                ..Key::default()
+            }),
+        );
+        let text = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            text.contains("Thinking: second") && !text.contains("Thinking: first"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn focused_subagent_summary_folds_without_observing_and_body_still_observes() {
+        let chat = focused_chat();
+        spawn_sub(&chat, &mut AgentLifecycle::default());
+        let mut view = transcript_view(&chat);
+        let observed = Rc::new(std::cell::Cell::new(None));
+        let record = Rc::clone(&observed);
+        view.set_on_observe_agent(Box::new(move |agent| record.set(Some(agent))));
+        let ctx = draw_ctx(80, 30);
+        click_activity(&mut view, &ctx, "agent ×1");
+        assert_eq!(observed.get(), None, "header unfolds rather than observing");
+        view.draw(&ctx);
+        let row = i16::try_from(
+            view.agent_hit_rows
+                .iter()
+                .position(|id| *id == Some(AgentId::Sub(0)))
+                .expect("expanded box is clickable"),
+        )
+        .unwrap();
+        for kind in [mouse::Type::Press, mouse::Type::Release] {
+            view.handle_event(&mut EventContext::new(), &mouse(2, row, kind));
+        }
+        assert_eq!(observed.get(), Some(AgentId::Sub(0)));
+    }
+
+    #[test]
+    fn focused_images_are_transmitted_and_placed_only_when_revealed() {
+        let chat = chat_with_image_entry();
+        chat.borrow_mut().transcript_mode = aj_conf::TranscriptMode::Focused;
+        let mut view = transcript_view(&chat);
+        view.set_styles(Rc::new(TranscriptStyles::from_theme(
+            &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
+            TerminalCaps {
+                images: true,
+                ..TerminalCaps::default()
+            },
+        )));
+        let ctx = draw_ctx(80, 30);
+        view.draw(&ctx);
+        assert!(view.image_store.borrow_mut().take_pending().is_empty());
+        click_activity(&mut view, &ctx, "read_file ×1");
+        view.draw(&ctx);
+        let pending = view.image_store.borrow_mut().take_pending();
+        assert_eq!(pending.len(), 1, "revealed image requests transmission");
+        view.image_store
+            .borrow_mut()
+            .insert(pending[0].0, pending[0].1, 7);
+        let surface = view.draw(&ctx);
+        assert!(
+            surface_rows(&surface)
+                .iter()
+                .flatten()
+                .any(|cell| cell.image.is_some_and(|image| image.img_id == 7))
+        );
+        click_activity(&mut view, &ctx, "read_file ×1");
+        let surface = view.draw(&ctx);
+        assert!(
+            surface_rows(&surface)
+                .iter()
+                .flatten()
+                .all(|cell| cell.image.is_none())
+        );
+    }
 
     /// Rendering an unchanged transcript twice records HITS on the second
     /// pass and no new misses, so the cache actually elides work.

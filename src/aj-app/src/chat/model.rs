@@ -514,10 +514,8 @@ pub struct ChatState {
     /// Whether the inline per-turn token-usage rows are visible. Usage
     /// is always recorded, this only gates its display.
     pub show_token_usage: bool,
-    /// Compact transcript: tool cells render header-only (bash keeps its
-    /// command line). The `tools_expanded` override still reveals full
-    /// bodies, so it stays a hidden escape hatch under this mode.
-    pub compact_transcript: bool,
+    /// Transcript detail selected by the frontend, read at draw time.
+    pub transcript_mode: aj_conf::TranscriptMode,
     pub tools_expanded: bool,
     pub show_image_in_terminal: bool,
     /// Whether fenced code blocks in rendered markdown are syntax-highlighted.
@@ -551,7 +549,7 @@ impl ChatState {
             compaction_phase: HashMap::new(),
             show_thinking_block: true,
             show_token_usage: true,
-            compact_transcript: false,
+            transcript_mode: aj_conf::TranscriptMode::Full,
             tools_expanded: false,
             show_image_in_terminal: true,
             syntax_highlight: false,

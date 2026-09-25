@@ -46,7 +46,7 @@ pub fn is_presentation(key: &str) -> bool {
         "theme"
             | "show_thinking_block"
             | "show_token_usage"
-            | "compact_transcript"
+            | "transcript_mode"
             | "show_frame_stats"
             | "sidebar_cols"
             | "show_image_in_terminal"
@@ -1376,7 +1376,7 @@ pub fn option_description(option: &aj_conf::ConfigOption) -> String {
         "compact_threshold" => describe(option, "A fraction between 0.0 and 1.0."),
         "compact_keep_recent" => describe(option, "A positive number of tokens."),
         // Plain schema string: thinking, theme, show_thinking_block,
-        // show_token_usage, show_image_in_terminal, compact_transcript,
+        // show_token_usage, show_image_in_terminal, transcript_mode,
         // auto_compact, syntax_highlighting, show_frame_stats, and
         // model_name (folded into the model row, never shown alone).
         _ => option.description.to_string(),
@@ -1421,9 +1421,27 @@ mod tests {
 
     #[test]
     fn plain_option_returns_the_schema_string() {
-        for name in ["thinking", "syntax_highlighting", "compact_transcript"] {
+        for name in ["thinking", "syntax_highlighting", "transcript_mode"] {
             let opt = option(name);
             assert_eq!(option_description(opt), opt.description, "option {name}");
+        }
+    }
+
+    #[test]
+    fn transcript_mode_is_a_frontend_enum_setting() {
+        let opt = option("transcript_mode");
+        assert!(matches!(
+            opt.kind,
+            aj_conf::ValueKind::Enum(["full", "compact", "focused"])
+        ));
+        assert!(super::is_presentation(opt.name));
+        assert!(Config::option("compact_transcript").is_none());
+        let mut config = Config::default();
+        assert_eq!(super::schema_values(&config)[opt.name], "full");
+        for value in ["full", "compact", "focused"] {
+            opt.apply_str(value, &mut config).unwrap();
+            assert_eq!(super::schema_values(&config)[opt.name], value);
+            assert!(!super::host_values(&config).contains_key(opt.name));
         }
     }
 

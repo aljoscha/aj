@@ -79,7 +79,7 @@ pub(crate) fn expand_hint(more: usize, kind: HintKind) -> String {
 /// How the finished (or running) call should read to the viewer.
 /// Drives the header glyph and the bubble's background tint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum VisualStatus {
+pub(crate) enum VisualStatus {
     Pending,
     Succeeded,
     Failed,
@@ -99,7 +99,7 @@ enum VisualStatus {
 /// launch call's own result only covers the spawn, and the badge's
 /// outcome is what the user actually cares about. Untracked ids
 /// (resumed cells, task still running) keep the base status.
-fn derive_status(entry: &ToolEntry, tasks: &BTreeMap<TaskId, TaskInfo>) -> VisualStatus {
+pub(crate) fn derive_status(entry: &ToolEntry, tasks: &BTreeMap<TaskId, TaskInfo>) -> VisualStatus {
     let base = match entry.status {
         ToolStatus::Running => VisualStatus::Pending,
         ToolStatus::Done { is_error: true } => VisualStatus::Failed,
@@ -130,7 +130,7 @@ fn derive_status(entry: &ToolEntry, tasks: &BTreeMap<TaskId, TaskInfo>) -> Visua
 /// `entry.task` is unset) still shows the badge. The live
 /// `entry.task` covers the window between `TaskStart` and the launch
 /// call's own result landing on the entry.
-fn badge_task_id(entry: &ToolEntry) -> Option<TaskId> {
+pub(crate) fn badge_task_id(entry: &ToolEntry) -> Option<TaskId> {
     if let Some(ToolDetails::Bash {
         task_id: Some(id), ..
     }) = &entry.details

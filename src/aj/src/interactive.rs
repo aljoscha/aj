@@ -627,7 +627,7 @@ fn seeded_chat(config: &Arc<StdMutex<Config>>, settings: AgentSettings) -> ChatS
     let config = config.lock().expect("config mutex poisoned");
     chat.show_thinking_block = config.show_thinking_block;
     chat.show_token_usage = config.show_token_usage;
-    chat.compact_transcript = config.compact_transcript;
+    chat.transcript_mode = config.transcript_mode;
     chat.show_image_in_terminal = config.show_image_in_terminal;
     chat.syntax_highlight = config.syntax_highlighting;
     chat
@@ -5107,12 +5107,10 @@ fn presentation_save(
             world.chat.borrow_mut().show_token_usage = on;
             format!("Token-usage rows {}.", if on { "shown" } else { "hidden" })
         }
-        "compact_transcript" => {
-            world.chat.borrow_mut().compact_transcript = on;
-            format!(
-                "Compact transcript {}.",
-                if on { "enabled" } else { "disabled" }
-            )
+        "transcript_mode" => {
+            let mode = value.parse::<aj_conf::TranscriptMode>()?;
+            world.chat.borrow_mut().transcript_mode = mode;
+            format!("Transcript mode set to {mode}.")
         }
         "syntax_highlighting" => {
             world.chat.borrow_mut().syntax_highlight = on;
@@ -8975,6 +8973,66 @@ mod tests {
 
     use super::*;
     use crate::overlay::OverlayPlacement;
+
+    #[tokio::test]
+    async fn transcript_mode_settings_cycle_updates_chat_and_persistence() {
+        let Some(_home) = isolated_test_home() else {
+            return;
+        };
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        assert_eq!(
+            world.chat.borrow().transcript_mode,
+            aj_conf::TranscriptMode::Full
+        );
+        let observed = Rc::clone(&shell);
+        let chat = Rc::clone(&world.chat);
+        let (exit, ()) = drive_until(&mut world, &shell, move |mut writer| async move {
+            writer.write_all(b"\x0fsettings\r").unwrap();
+            assert!(
+                poll_for(|| observed
+                    .borrow()
+                    .settings_ui
+                    .borrow()
+                    .as_ref()
+                    .and_then(|ui| ui.value_of("transcript_mode"))
+                    .filter(|value| value == "full"))
+                .await
+                .is_some()
+            );
+            writer.write_all(b"transcript_mode").unwrap();
+            for mode in [
+                aj_conf::TranscriptMode::Compact,
+                aj_conf::TranscriptMode::Focused,
+                aj_conf::TranscriptMode::Full,
+            ] {
+                writer.write_all(b"\r").unwrap();
+                assert!(
+                    poll_for(|| {
+                        let (saved, diagnostics) = Config::load();
+                        (diagnostics.is_empty()
+                            && saved.transcript_mode == mode
+                            && chat.borrow().transcript_mode == mode)
+                            .then_some(())
+                    })
+                    .await
+                    .is_some(),
+                    "settings must apply and persist {mode}"
+                );
+            }
+        })
+        .await;
+        exit.unwrap();
+        let config = Arc::new(StdMutex::new(Config {
+            transcript_mode: aj_conf::TranscriptMode::Focused,
+            ..Config::default()
+        }));
+        assert_eq!(
+            seeded_chat(&config, unknown_settings()).transcript_mode,
+            aj_conf::TranscriptMode::Focused
+        );
+        world.host().shutdown().await;
+    }
 
     /// Run an environment-sensitive test alone, without changing sibling tests'
     /// environment. The parent owns HOME until the child process has exited,

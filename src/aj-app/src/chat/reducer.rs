@@ -5031,7 +5031,7 @@ mod tests {
 
         second.show_thinking_block = !second.show_thinking_block;
         second.show_token_usage = !second.show_token_usage;
-        second.compact_transcript = !second.compact_transcript;
+        second.transcript_mode = aj_conf::TranscriptMode::Focused;
         second.tools_expanded = !second.tools_expanded;
         second.set_active_view(AgentId::Sub(1));
 

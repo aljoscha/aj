@@ -120,6 +120,24 @@ Configuration lives in `~/.aj/config.toml`. The settings window (open it from
 the command palette) covers every option and writes your changes there. You can
 also edit the file by hand.
 
+`transcript_mode = "full"` selects transcript detail. The settings window cycles
+through `full` (the default), `compact`, and `focused`, applying changes immediately.
+This controls display, not context-window compaction. The legacy
+`compact_transcript` boolean is accepted when `transcript_mode` is absent in the
+same file, mapping `true` to `compact` and `false` to `full`. Project config still
+overrides user config, regardless of which spelling each file uses.
+
+Full shows individual activity entries with their usual previews. Compact keeps
+tool headers and bash commands. Focused folds activity between messages into
+muted summaries such as `thinking ×2 · read_file ×3 · bash ×2`, with running work
+and failures called out. Assistant text and notices remain visible.
+
+Click an activity summary to expand or fold that group. Text inside an expanded
+group remains selectable. For keyboard access, focus the transcript with `Tab`,
+use `[` / `]` to select the previous / next activity group, and press `Enter` to
+toggle it. The tools-expand action also expands all activity groups. Individual
+fold choices last for the current view session and do not change the saved log.
+
 ### Keybindings
 
 Override an action's shortcut in the `[keybindings]` table:
