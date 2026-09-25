@@ -7,7 +7,7 @@
 //! `Text`). Unifying them would be an improvement, but it is deferred pending
 //! sign-off, so both are reproduced faithfully.
 
-use crate::cell::{Cell, Character, Segment, Style};
+use crate::cell::{Cell, Character, Grapheme, Segment, Style};
 use crate::vxfw::{DrawContext, Overflow, Size, Surface, TextAlign, Widget, WidthBasis};
 
 /// A styled run of text. Alias of [`Segment`], matching upstream's
@@ -123,9 +123,20 @@ impl Widget for RichText {
                     TextAlign::Center => container_size.width.saturating_sub(line.width) / 2,
                     TextAlign::Right => container_size.width.saturating_sub(line.width),
                 };
+                let mut continuation_col = 0;
                 for cell in line.cells {
+                    if col < container_size.width
+                        && !cell.cell.char.grapheme().chars().all(char::is_whitespace)
+                    {
+                        continuation_col = col;
+                    }
                     surface.write_cell(col, row, cell.cell);
                     col = col.saturating_add(cell.width);
+                }
+                if let Some(continuation) = line.continuation {
+                    let mut cell = surface.read_cell(continuation_col, row).clone();
+                    cell.selection_continuation = Some(continuation);
+                    surface.write_cell(continuation_col, row, cell);
                 }
                 row += 1;
             }
@@ -187,6 +198,7 @@ struct LayoutCell {
 struct SoftLine {
     width: u16,
     cells: Vec<LayoutCell>,
+    continuation: Option<Grapheme>,
 }
 
 /// Wraps a sequence of laid-out cells to a maximum width, breaking on spaces
@@ -337,6 +349,7 @@ impl SoftwrapIterator {
                 return Some(SoftLine {
                     width,
                     cells: self.line.clone(),
+                    continuation: None,
                 });
             }
         };
@@ -368,10 +381,7 @@ impl SoftwrapIterator {
                                 self.index += 1;
                             }
                             let end = self.index;
-                            return Some(SoftLine {
-                                width: cur_width,
-                                cells: self.line[start..end].to_vec(),
-                            });
+                            return Some(self.soft_line(start, end, cur_width));
                         }
                         cur_width = cur_width.saturating_add(cell.width);
                         self.index += 1;
@@ -381,10 +391,7 @@ impl SoftwrapIterator {
                 // Soft-wrap: skip to the start of the next word, which is the
                 // count of leading whitespace cells we trimmed.
                 self.index += word.len() - trimmed_len;
-                return Some(SoftLine {
-                    width: cur_width,
-                    cells: self.line[start..end].to_vec(),
-                });
+                return Some(self.soft_line(start, end, cur_width));
             }
 
             self.index = idx;
@@ -393,7 +400,30 @@ impl SoftwrapIterator {
         Some(SoftLine {
             width: cur_width,
             cells: self.line[start..].to_vec(),
+            continuation: None,
         })
+    }
+
+    fn soft_line(&self, start: usize, end: usize, width: u16) -> SoftLine {
+        let cells = self.line[start..end].to_vec();
+        let continuation = (self.index < self.line.len()).then(|| {
+            // Copy trims displayed trailing whitespace. Restore it together with
+            // skipped wrap spaces, but never repeat whitespace retained inside a row.
+            let retained_end = cells
+                .iter()
+                .rposition(|cell| !cell.cell.char.grapheme().chars().all(char::is_whitespace))
+                .map_or(start, |index| start + index + 1);
+            let mut hidden = Grapheme::default();
+            for cell in &self.line[retained_end..self.index] {
+                hidden.push_str(cell.cell.char.grapheme());
+            }
+            hidden
+        });
+        SoftLine {
+            width,
+            cells,
+            continuation,
+        }
     }
 }
 
@@ -447,6 +477,152 @@ mod tests {
                 height: 20,
             },
             width_method: gwidth::Method::Unicode,
+        }
+    }
+
+    /// Read the copy contract from the surface, skipping wide-cell coverage.
+    fn selection_rows(surface: &Surface) -> Vec<(String, Option<String>)> {
+        (0..surface.size.height)
+            .map(|row| {
+                let mut text = String::new();
+                let mut continuation = None;
+                let mut last_content_col = 0;
+                let mut col = 0;
+                while col < surface.size.width {
+                    let cell = surface.read_cell(col, row);
+                    let grapheme = cell.char.grapheme();
+                    text.push_str(grapheme);
+                    if !grapheme.chars().all(char::is_whitespace) {
+                        last_content_col = col;
+                    }
+                    if let Some(hidden) = &cell.selection_continuation {
+                        assert!(continuation.is_none(), "one continuation per row");
+                        continuation = Some((col, hidden.to_string()));
+                    }
+                    assert!(!cell.wrapped, "selection must not set terminal autowrap");
+                    col += u16::from(cell.char.width.max(1));
+                }
+                if let Some((col, _)) = &continuation {
+                    assert_eq!(*col, last_content_col, "continuation anchor on row {row}");
+                }
+                (
+                    text.trim_end().to_string(),
+                    continuation.map(|(_, hidden)| hidden),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selection_continuations_reconstruct_softwraps_not_hard_breaks() {
+        for text in [
+            "a  b   c",
+            "ab   abcdefghijk z",
+            "     abcdefghijk",
+            "   abc",
+            "abcdefghijk\nnext  line\n\nend",
+            "界界  e\u{301}clair 😀xyz",
+            "ab\tcd  ef",
+            "ab  \r\ncd   \ref  ",
+        ] {
+            let expected = text
+                .replace('\t', "        ")
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .split('\n')
+                .map(|line| line.trim_end_matches(' '))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for width in 1..=16 {
+                // Span boundaries and style changes must not become copy breaks.
+                let c = ctx(MaxSize {
+                    width: Some(width),
+                    height: None,
+                });
+                let spans = c
+                    .grapheme_iterator(text)
+                    .enumerate()
+                    .map(|(index, grapheme)| Segment {
+                        text: grapheme.bytes(text).to_string(),
+                        style: Style {
+                            bold: index % 2 == 0,
+                            ..Style::default()
+                        },
+                        ..Segment::default()
+                    })
+                    .collect();
+                let mut rich_text = RichText::new(spans);
+                let surface = rich_text.draw(&c);
+                let rows = selection_rows(&surface);
+                let mut copied = String::new();
+                for (index, (visible, continuation)) in rows.iter().enumerate() {
+                    copied.push_str(visible);
+                    if let Some(hidden) = continuation {
+                        copied.push_str(hidden);
+                    } else if index + 1 < rows.len() {
+                        copied.push('\n');
+                    }
+                }
+                assert_eq!(copied, expected, "text={text:?}, width={width}");
+                assert!(rows.last().unwrap().1.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn selection_continuations_preserve_visible_wrap_layout() {
+        for (text, width, expected) in [
+            ("ab   cd", 4, vec![("ab", Some("   ")), ("cd", None)]),
+            (
+                "ab   abcdef",
+                4,
+                vec![("ab", Some("  ")), (" abc", Some("")), ("def", None)],
+            ),
+            (
+                "    abcdef",
+                3,
+                vec![
+                    ("", Some("   ")),
+                    (" ab", Some("")),
+                    ("cde", Some("")),
+                    ("f", None),
+                ],
+            ),
+            ("ab\ncd", 2, vec![("ab", None), ("cd", None)]),
+        ] {
+            let mut rich_text = RichText::new(vec![Segment {
+                text: text.into(),
+                ..Segment::default()
+            }]);
+            let surface = rich_text.draw(&ctx(MaxSize {
+                width: Some(width),
+                height: None,
+            }));
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(visible, hidden)| (visible.to_string(), hidden.map(str::to_string)))
+                .collect();
+            assert_eq!(selection_rows(&surface), expected, "{text:?}");
+        }
+
+        for (softwrap, width) in [(true, None), (false, Some(3))] {
+            let mut rich_text = RichText {
+                softwrap,
+                ..RichText::new(vec![Segment {
+                    text: "ab cd\nef".into(),
+                    ..Segment::default()
+                }])
+            };
+            let surface = rich_text.draw(&ctx(MaxSize {
+                width,
+                height: None,
+            }));
+            assert!(
+                surface
+                    .buffer
+                    .iter()
+                    .all(|cell| cell.selection_continuation.is_none())
+            );
         }
     }
 

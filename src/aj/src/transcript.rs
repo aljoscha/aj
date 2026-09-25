@@ -1868,7 +1868,9 @@ fn content_start(row: &[Cell]) -> usize {
 
 fn content_end(row: &[Cell]) -> usize {
     row.iter()
-        .rposition(|cell| !cell.char.grapheme().trim().is_empty())
+        .rposition(|cell| {
+            cell.selection_preserve_whitespace || !cell.char.grapheme().trim().is_empty()
+        })
         .map_or_else(|| content_start(row), |i| i + 1)
 }
 
@@ -1919,9 +1921,9 @@ fn cell_range_text(row: &[Cell], from: usize, to: usize) -> String {
     out
 }
 
-/// Read the graphemes of the cell range `a..=b` out of `lines`, joining rows
-/// with `\n`. Backs [`TranscriptView::extract_selection`], see it for the
-/// contract.
+/// Read selected content from `lines`, restoring soft-wrap whitespace and
+/// retaining logical line breaks. Decorative cells and rows do not contribute.
+/// Backs [`TranscriptView::extract_selection`].
 fn extract_from_lines(lines: &[Vec<Cell>], a: (usize, usize), b: (usize, usize)) -> String {
     // A selection's anchor and caret may be in either order; normalize to
     // min..=max in (row, col) lexicographic order (tuples compare that way).
@@ -1933,11 +1935,15 @@ fn extract_from_lines(lines: &[Vec<Cell>], a: (usize, usize), b: (usize, usize))
     let (end_row, end_col) = end;
 
     let mut out = String::new();
+    let mut separator = None;
     for row in start_row..=end_row {
         // Rows only increase, so an out-of-range row means nothing more to read.
         let Some(cells) = lines.get(row) else {
             break;
         };
+        if cells.iter().any(|cell| cell.selection_skip_row) {
+            continue;
+        }
         // The covered column span on this row: from `start_col` on the first
         // row, up to `end_col` on the last, whole otherwise. Clamped to the
         // row so an out-of-range column reads nothing rather than panicking.
@@ -1948,10 +1954,16 @@ fn extract_from_lines(lines: &[Vec<Cell>], a: (usize, usize), b: (usize, usize))
         let from = from.max(content_start(cells));
         let from = from.min(cells.len());
         let to = to.min(cells.len()).max(from);
-        if row != start_row {
-            out.push('\n');
+        if let Some(separator) = separator {
+            out.push_str(separator);
         }
         out.push_str(&cell_range_text(cells, from, to));
+        separator = Some(
+            cells
+                .iter()
+                .find_map(|cell| cell.selection_continuation.as_deref())
+                .unwrap_or("\n"),
+        );
     }
     out
 }
@@ -7644,6 +7656,170 @@ mod tests {
                 ..Cell::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn user_bubble_selection_joins_wraps_and_keeps_partial_endpoints() {
+        let text = "alpha   beta abcdefghijklmnopqrstuvwxyz\nnext line";
+        let chat = empty_chat();
+        apply(&chat, &mut AgentLifecycle::default(), user_end(text));
+        let mut view = transcript_view(&chat);
+        let id = entry_id(&chat, 0);
+        for width in [12, 24, 80] {
+            let _ = view.draw(&draw_ctx(width, 30));
+            let content_width = view.content_width();
+            let rows = view.entry_rows(id, content_width);
+            let nonblank =
+                |row: &Vec<Cell>| row.iter().any(|c| !c.char.grapheme().trim().is_empty());
+            let first = rows.iter().position(nonblank).expect("first content row");
+            let last = rows.iter().rposition(nonblank).expect("last content row");
+            let anchor = SelPos {
+                entry: id,
+                line: first,
+                col: 0,
+            };
+            let caret = SelPos {
+                entry: id,
+                line: last,
+                col: content_end(&rows[last]),
+            };
+            assert_eq!(
+                view.extract_selection(content_width, anchor, caret),
+                text,
+                "width={width}"
+            );
+            assert_eq!(
+                view.extract_selection(
+                    content_width,
+                    SelPos { col: 3, ..anchor },
+                    SelPos {
+                        col: caret.col - 2,
+                        ..caret
+                    }
+                ),
+                "pha   beta abcdefghijklmnopqrstuvwxyz\nnext li",
+                "partial selection at width={width}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_selection_preserves_source_whitespace_without_fences_or_insets() {
+        let code = "fn main() {\n    let value = \"abcdefghijklmnopqrstuvwxyz\";  \n\n                \n    println!(\"界界\");\n}";
+        for quoted in [false, true] {
+            let source = format!("```rust\n{code}\n```");
+            let source = if quoted {
+                source
+                    .lines()
+                    .map(|s| format!("> {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                source
+            };
+            let chat = empty_chat();
+            apply(
+                &chat,
+                &mut AgentLifecycle::default(),
+                assistant_message_end(text_message(&source)),
+            );
+            let mut view = transcript_view(&chat);
+            let id = entry_id(&chat, 0);
+            for highlight in [false, true] {
+                chat.borrow_mut().syntax_highlight = highlight;
+                for width in [10, 19, 80] {
+                    let _ = view.draw(&draw_ctx(width, 60));
+                    let content_width = view.content_width();
+                    let rows = view.entry_rows(id, content_width);
+                    assert!(
+                        rows.iter().flatten().any(|c| c.selection_skip_row),
+                        "fixture must render fences"
+                    );
+                    let anchor = SelPos {
+                        entry: id,
+                        line: 0,
+                        col: 0,
+                    };
+                    let caret = SelPos {
+                        entry: id,
+                        line: rows.len() - 2,
+                        col: usize::from(content_width),
+                    };
+                    assert_eq!(
+                        view.extract_selection(content_width, anchor, caret),
+                        code,
+                        "width={width}, quoted={quoted}, highlight={highlight}"
+                    );
+                    view.selection = Some(Selection { anchor, caret });
+                    let grid = surface_rows(&view.draw(&draw_ctx(width, 60)));
+                    assert!(
+                        grid.iter()
+                            .flatten()
+                            .filter(|c| c.selection_excluded)
+                            .all(|c| c.style.bg != view.styles.selection_bg)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selection_restores_soft_wraps_but_preserves_logical_breaks() {
+        for (source, expected) in [
+            (
+                "alpha   **beta** abcdefghijklmnopqrstuvwxyz 界界 e\u{301}clair\nnext line\n\nparagraph",
+                "alpha   beta abcdefghijklmnopqrstuvwxyz 界界 e\u{301}clair\nnext line\n\nparagraph",
+            ),
+            (
+                "> > alpha   beta abcdefghijklmnopqrstuvwxyz\n> >\n> > end",
+                "alpha   beta abcdefghijklmnopqrstuvwxyz\n\nend",
+            ),
+            (
+                "3. alpha beta gamma delta\n4. another item",
+                "3. alpha beta gamma delta\n4. another item",
+            ),
+        ] {
+            let chat = empty_chat();
+            apply(
+                &chat,
+                &mut AgentLifecycle::default(),
+                assistant_message_end(text_message(source)),
+            );
+            let mut view = transcript_view(&chat);
+            let id = entry_id(&chat, 0);
+            for width in [12, 19, 40, 100] {
+                let _ = view.draw(&draw_ctx(width, 30));
+                let content_width = view.content_width();
+                let rows = view.entry_rows(id, content_width);
+                if width == 12 {
+                    assert!(
+                        rows.iter()
+                            .flatten()
+                            .any(|c| c.selection_continuation.is_some()),
+                        "fixture must soft-wrap"
+                    );
+                }
+                let anchor = SelPos {
+                    entry: id,
+                    line: 0,
+                    col: 0,
+                };
+                let caret = SelPos {
+                    entry: id,
+                    line: rows.len() - 2,
+                    col: usize::from(content_width),
+                };
+                assert_eq!(
+                    view.extract_selection(content_width, anchor, caret),
+                    expected,
+                    "width={width}, source={source:?}"
+                );
+                assert_eq!(
+                    view.extract_selection(content_width, caret, anchor),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

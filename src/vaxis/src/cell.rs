@@ -33,6 +33,16 @@ pub struct Cell {
     /// Rendering decoration that text selection must neither copy nor highlight.
     /// Carried with the cell through surface composition, independent of style.
     pub selection_excluded: bool,
+    /// On the last content cell of a soft-wrapped row, the text hidden at the
+    /// wrap boundary. Selection uses this instead of a newline when crossing
+    /// into the next row. An empty string joins a word broken across rows.
+    /// This is independent of terminal autowrap (`wrapped`).
+    pub selection_continuation: Option<Grapheme>,
+    /// Source whitespace (for example in code), rather than layout padding.
+    pub selection_preserve_whitespace: bool,
+    /// This cell belongs to a wholly decorative row, such as a code fence.
+    /// Copying across that row must not introduce a logical line break.
+    pub selection_skip_row: bool,
 }
 
 impl Cell {

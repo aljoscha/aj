@@ -56,6 +56,8 @@ pub enum SpanKind {
     InlineCode,
     /// A line of a fenced or indented code block.
     CodeBlock,
+    /// Layout inset before a code line, not indentation from the source.
+    CodeBlockIndent,
     /// The ```` ``` ```` fence rows that frame a code block.
     CodeBlockBorder,
     /// A list bullet or ordinal marker (`- `, `1. `).
@@ -183,7 +185,21 @@ impl StyledSpan {
 }
 
 /// One pre-wrapped visual row: the spans that paint a single terminal line.
-pub type MarkdownRow = Vec<StyledSpan>;
+#[derive(Clone, Debug, Default)]
+pub struct MarkdownRow {
+    pub spans: Vec<StyledSpan>,
+    /// Text omitted at a soft-wrap boundary. `Some("")` joins a split word,
+    /// while `None` means the next row starts a distinct logical line.
+    pub continuation: Option<String>,
+}
+
+impl std::ops::Deref for MarkdownRow {
+    type Target = [StyledSpan];
+
+    fn deref(&self) -> &Self::Target {
+        &self.spans
+    }
+}
 
 /// Knobs that affect the produced rows.
 #[derive(Clone, Debug, Default)]
@@ -235,13 +251,11 @@ pub fn render_markdown(text: &str, width: usize, opts: &RenderOpts) -> Vec<Markd
 
     let mut rows: Vec<MarkdownRow> = Vec::new();
     for block in &blocks {
-        for logical_line in render_block(block, width, opts) {
-            rows.extend(wrap_spans(&logical_line, width));
-        }
+        rows.extend(render_block(block, width, opts));
         // One blank spacer after every block. Consecutive blocks are then
         // separated by exactly one blank row, and the trailing-trim below
         // drops the spacer after the final block.
-        rows.push(Vec::new());
+        rows.push(MarkdownRow::default());
     }
 
     while rows.last().is_some_and(is_blank_row) {
@@ -270,11 +284,9 @@ const CODE_BLOCK_INDENT: &str = "  ";
 /// wide terminals.
 const HR_MAX_WIDTH: usize = 80;
 
-/// Render a block into logical lines of styled spans (pre-wrap). Each
-/// returned line may still contain embedded `'\n'` from soft/hard breaks;
-/// [`wrap_spans`] splits those into rows.
-fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<StyledSpan>> {
-    match block {
+/// Render a block into visual rows, retaining its logical line boundaries.
+fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<MarkdownRow> {
+    let lines = match block {
         Block::Heading(level, inlines) => {
             // Heading text is bold, and H1 is additionally underlined. This
             // base emphasis is the starting point for the inline walk. The
@@ -325,13 +337,9 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
                 SpanKind::CodeBlockBorder,
             )]);
             // Classify each source line into (category, text) runs. The
-            // indent is folded into a leading no-syntax `CodeBlock` span so
-            // a backend that backgrounds code covers the inset too. Long
-            // lines are word-wrapped by the shared wrap (via the outer
-            // render loop), which preserves each run's syntax across the
-            // break because a split span copies the `syntax` field. This
-            // matches the styled renderer, which wraps every emitted line
-            // uniformly.
+            // layout inset has its own role so selection can omit it without
+            // losing source indentation. Wrapping preserves each run's syntax
+            // across the break because a split span copies the `syntax` field.
             //
             // With highlighting off we skip the syntect classifier and emit
             // each source line as a single uncategorized run, which the
@@ -339,7 +347,10 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
             if opts.syntax_highlight {
                 let highlighted = highlight_code(code, lang.as_deref());
                 for line_runs in highlighted.iter() {
-                    let mut spans = vec![StyledSpan::plain(CODE_BLOCK_INDENT, SpanKind::CodeBlock)];
+                    let mut spans = vec![StyledSpan::plain(
+                        CODE_BLOCK_INDENT,
+                        SpanKind::CodeBlockIndent,
+                    )];
                     for (category, text) in line_runs {
                         spans.push(StyledSpan {
                             text: text.clone(),
@@ -354,7 +365,7 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
             } else {
                 for line in code.lines() {
                     lines.push(vec![
-                        StyledSpan::plain(CODE_BLOCK_INDENT, SpanKind::CodeBlock),
+                        StyledSpan::plain(CODE_BLOCK_INDENT, SpanKind::CodeBlockIndent),
                         StyledSpan::plain(line, SpanKind::CodeBlock),
                     ]);
                 }
@@ -366,19 +377,23 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
             let rule = "─".repeat(width.min(HR_MAX_WIDTH));
             vec![vec![StyledSpan::plain(rule, SpanKind::Hr)]]
         }
-        Block::UnorderedList(items) => render_list(items, false, 0, width, opts),
-        Block::OrderedList(items) => render_list(items, true, 0, width, opts),
-        Block::Blockquote(sub_blocks) => render_blockquote(sub_blocks, width, opts),
+        Block::UnorderedList(items) => return render_list(items, false, 0, width, opts),
+        Block::OrderedList(items) => return render_list(items, true, 0, width, opts),
+        Block::Blockquote(sub_blocks) => return render_blockquote(sub_blocks, width, opts),
         Block::Table {
             headers,
             alignments,
             rows,
             raw,
         } => render_table(headers, alignments, rows, raw, width, opts),
-    }
+    };
+    lines
+        .iter()
+        .flat_map(|line| wrap_spans(line, width))
+        .collect()
 }
 
-/// Render a list into logical lines of styled spans (pre-wrap).
+/// Render a list into wrapped rows, preserving each item's line boundary.
 ///
 /// One logical line per item: a [`SpanKind::ListMarker`] span carrying the
 /// depth indent plus the bullet, followed by the item's inline content.
@@ -386,12 +401,8 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
 /// the leading spaces carry no visible color. `depth` drives that indent
 /// and grows by one per nesting level.
 ///
-/// We stay width-agnostic and emit each item as a single logical line. The
-/// outer wrap in [`render_markdown`] then breaks a long item, and because
-/// that wrap carries no hang indent the continuation rows land flush-left
-/// at column 0 rather than under the bullet. This is the same
-/// continuation-flush-left shape the styled renderer produces by wrapping
-/// list lines uniformly.
+/// Each item wraps without a hanging indent, so continuation rows land
+/// flush-left rather than under the bullet.
 ///
 /// Ordered items number from `item.number` when the parser captured a
 /// source marker, falling back to the positional index. Keying off the
@@ -409,7 +420,7 @@ fn render_list(
     depth: usize,
     width: usize,
     opts: &RenderOpts,
-) -> Vec<Vec<StyledSpan>> {
+) -> Vec<MarkdownRow> {
     let indent = "  ".repeat(depth);
     let mut lines = Vec::new();
     for (idx, item) in items.iter().enumerate() {
@@ -436,7 +447,7 @@ fn render_list(
             opts,
             &mut spans,
         );
-        lines.push(spans);
+        lines.extend(wrap_spans(&spans, width));
         for sub in &item.sub_blocks {
             let sub_lines = match sub {
                 Block::UnorderedList(sub_items) => {
@@ -453,7 +464,7 @@ fn render_list(
     lines
 }
 
-/// Render a blockquote into logical lines of styled spans (pre-wrap).
+/// Render a blockquote into bordered visual rows.
 ///
 /// The quote body is a full sub-document: each sub-block renders as its
 /// own native block ([`render_block`]) at `inner_width`, so a nested
@@ -478,11 +489,7 @@ fn render_list(
 /// gives top-level blocks, and trailing blanks are dropped so the quote
 /// does not end in a bare border. A surviving mid-quote blank row still
 /// gets the border prefix, rendering as `│ ` rather than an empty line.
-fn render_blockquote(
-    sub_blocks: &[Block],
-    width: usize,
-    opts: &RenderOpts,
-) -> Vec<Vec<StyledSpan>> {
+fn render_blockquote(sub_blocks: &[Block], width: usize, opts: &RenderOpts) -> Vec<MarkdownRow> {
     // The `"│ "` border is two columns. `.max(1)` keeps a usable inner
     // width on a degenerate outer width so the recursion still makes
     // progress. For any non-degenerate width it is a no-op.
@@ -502,10 +509,8 @@ fn render_blockquote(
 
     let mut inner_rows: Vec<MarkdownRow> = Vec::new();
     for sub in sub_blocks {
-        for logical_line in render_block(sub, inner_width, &inner_opts) {
-            inner_rows.extend(wrap_spans(&logical_line, inner_width));
-        }
-        inner_rows.push(Vec::new());
+        inner_rows.extend(render_block(sub, inner_width, &inner_opts));
+        inner_rows.push(MarkdownRow::default());
     }
     while inner_rows.last().is_some_and(is_blank_row) {
         inner_rows.pop();
@@ -514,14 +519,18 @@ fn render_blockquote(
     let mut rows: Vec<MarkdownRow> = Vec::with_capacity(inner_rows.len());
     for inner in inner_rows {
         let mut row = vec![StyledSpan::plain("│ ", SpanKind::QuoteBorder)];
-        for mut span in inner {
+        for mut span in inner.spans {
             if span.kind == SpanKind::Text {
                 span.kind = SpanKind::Quote;
                 span.emphasis.italic = true;
             }
             row.push(span);
         }
-        rows.push(row);
+        let mut bordered = wrap_spans(&row, width);
+        if let Some(last) = bordered.last_mut() {
+            last.continuation = inner.continuation;
+        }
+        rows.extend(bordered);
     }
     rows
 }
@@ -813,7 +822,7 @@ fn render_table_row(
             // A zero-width column holds a single empty line: the shared wrap
             // makes no progress at width 0, so we short-circuit it.
             if widths[c] == 0 {
-                vec![Vec::new()]
+                vec![MarkdownRow::default()]
             } else {
                 wrap_spans(spans, widths[c])
             }
@@ -824,14 +833,14 @@ fn render_table_row(
 
     let mut out: Vec<Vec<StyledSpan>> = Vec::with_capacity(max_lines);
     for line_idx in 0..max_lines {
-        let mut row: MarkdownRow = vec![StyledSpan::plain("│", SpanKind::TableBorder)];
+        let mut row = vec![StyledSpan::plain("│", SpanKind::TableBorder)];
         for col in 0..n {
             let cell_line = wrapped_per_cell[col]
                 .get(line_idx)
                 .cloned()
                 .unwrap_or_default();
             row.push(StyledSpan::plain(" ", SpanKind::Text));
-            pad_cell(&mut row, cell_line, widths[col], alignments[col]);
+            pad_cell(&mut row, cell_line.spans, widths[col], alignments[col]);
             row.push(StyledSpan::plain(" ", SpanKind::Text));
             row.push(StyledSpan::plain("│", SpanKind::TableBorder));
         }
@@ -845,7 +854,12 @@ fn render_table_row(
 /// never shows. A line already at or over `width` gets no padding: the cell
 /// was pre-wrapped to the column width, and a wide grapheme can still land
 /// one column over at a degenerate width.
-fn pad_cell(row: &mut MarkdownRow, cell_line: MarkdownRow, width: usize, alignment: Alignment) {
+fn pad_cell(
+    row: &mut Vec<StyledSpan>,
+    cell_line: Vec<StyledSpan>,
+    width: usize,
+    alignment: Alignment,
+) {
     let vw: usize = cell_line.iter().map(span_width).sum();
     if vw >= width {
         row.extend(cell_line);
@@ -2084,7 +2098,7 @@ fn wrap_spans(spans: &[StyledSpan], width: usize) -> Vec<MarkdownRow> {
         rows.extend(wrap_logical_line(&line, width));
     }
     if rows.is_empty() {
-        rows.push(Vec::new());
+        rows.push(MarkdownRow::default());
     }
     rows
 }
@@ -2111,24 +2125,30 @@ fn split_on_newlines(spans: &[StyledSpan]) -> Vec<Vec<StyledSpan>> {
 /// Wrap one logical line (no embedded newlines) into rows.
 fn wrap_logical_line(line: &[StyledSpan], width: usize) -> Vec<MarkdownRow> {
     if line.is_empty() {
-        return vec![Vec::new()];
+        return vec![MarkdownRow::default()];
     }
     // Fits as-is: return verbatim (coalesced) without trimming, matching
     // the ANSI wrap's fast path which keeps trailing whitespace on a line
     // that already fits.
     if row_width(line) <= width {
-        return vec![finalize_row(line.to_vec(), false)];
+        return vec![MarkdownRow {
+            spans: finalize_row(line.to_vec(), false),
+            continuation: None,
+        }];
     }
 
     let tokens = split_into_tokens(line);
-    let mut rows: Vec<MarkdownRow> = Vec::new();
-    let mut current: MarkdownRow = Vec::new();
+    let code = line
+        .iter()
+        .any(|span| matches!(span.kind, SpanKind::CodeBlock | SpanKind::CodeBlockIndent));
+    let mut rows: Vec<Vec<StyledSpan>> = Vec::new();
+    let mut current: Vec<StyledSpan> = Vec::new();
     let mut current_width = 0usize;
 
     for token in &tokens {
-        // A non-whitespace token wider than the whole width fits on no row;
-        // break it grapheme by grapheme, flushing the in-progress row first.
-        if token.width > width && !token.is_whitespace {
+        // An over-wide word fits on no row. Code whitespace must also fit
+        // rather than clip away, since selection preserves it as source text.
+        if token.width > width && (!token.is_whitespace || code) {
             if !current.is_empty() {
                 rows.push(std::mem::take(&mut current));
                 current_width = 0;
@@ -2146,12 +2166,14 @@ fn wrap_logical_line(line: &[StyledSpan], width: usize) -> Vec<MarkdownRow> {
 
         let total_needed = current_width + token.width;
         if total_needed > width && current_width > 0 {
-            rows.push(std::mem::take(&mut current));
-            if token.is_whitespace {
-                // A wrap boundary drops the whitespace run that would have
-                // led the next row.
+            if token.is_whitespace && !code {
+                // Keep the hidden boundary spaces until finalization records
+                // them for copying. They do not contribute painted columns.
+                current.extend(token.spans.iter().cloned());
+                rows.push(std::mem::take(&mut current));
                 current_width = 0;
             } else {
+                rows.push(std::mem::take(&mut current));
                 current = token.spans.clone();
                 current_width = token.width;
             }
@@ -2168,7 +2190,23 @@ fn wrap_logical_line(line: &[StyledSpan], width: usize) -> Vec<MarkdownRow> {
         rows.push(Vec::new());
     }
 
-    rows.into_iter().map(|r| finalize_row(r, true)).collect()
+    let count = rows.len();
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let text: String = row
+                .iter()
+                .filter(|s| !matches!(s.kind, SpanKind::QuoteBorder | SpanKind::CodeBlockIndent))
+                .map(|s| s.text.as_str())
+                .collect();
+            let suffix = &text[text.trim_end().len()..];
+            let preserve_end = i + 1 == count && row.iter().any(|s| s.kind == SpanKind::CodeBlock);
+            MarkdownRow {
+                spans: finalize_row(row, !preserve_end),
+                continuation: (i + 1 < count).then(|| suffix.to_string()),
+            }
+        })
+        .collect()
 }
 
 /// Split a logical line into wrap tokens on space/non-space boundaries.
@@ -2212,9 +2250,9 @@ fn finish_token(spans: Vec<StyledSpan>) -> Token {
 /// grapheme's originating style. Mirrors the ANSI long-word break: a
 /// grapheme that would overflow the current row starts a new one, even at
 /// width 1 where a wide grapheme still occupies its own (over-width) row.
-fn break_long_token(token: &Token, width: usize) -> Vec<MarkdownRow> {
-    let mut rows: Vec<MarkdownRow> = Vec::new();
-    let mut current: MarkdownRow = Vec::new();
+fn break_long_token(token: &Token, width: usize) -> Vec<Vec<StyledSpan>> {
+    let mut rows: Vec<Vec<StyledSpan>> = Vec::new();
+    let mut current: Vec<StyledSpan> = Vec::new();
     let mut current_width = 0usize;
 
     for piece in &token.spans {
@@ -2240,7 +2278,7 @@ fn break_long_token(token: &Token, width: usize) -> Vec<MarkdownRow> {
 
 /// Append grapheme `g` to `row`, coalescing into the last span when it
 /// shares `style`'s styling, otherwise starting a new span from `style`.
-fn push_grapheme(row: &mut MarkdownRow, g: &str, style: &StyledSpan) {
+fn push_grapheme(row: &mut Vec<StyledSpan>, g: &str, style: &StyledSpan) {
     if let Some(last) = row.last_mut()
         && last.same_style(style)
     {
@@ -2253,7 +2291,7 @@ fn push_grapheme(row: &mut MarkdownRow, g: &str, style: &StyledSpan) {
 /// Coalesce adjacent same-style spans and (optionally) trim trailing
 /// whitespace. Coalescing yields the minimal span representation. Trimming
 /// drops the trailing whitespace a wrap boundary leaves behind.
-fn finalize_row(row: MarkdownRow, trim: bool) -> MarkdownRow {
+fn finalize_row(row: Vec<StyledSpan>, trim: bool) -> Vec<StyledSpan> {
     let mut row = coalesce(row);
     if trim {
         trim_row_end(&mut row);
@@ -2261,8 +2299,8 @@ fn finalize_row(row: MarkdownRow, trim: bool) -> MarkdownRow {
     row
 }
 
-fn coalesce(row: MarkdownRow) -> MarkdownRow {
-    let mut out: MarkdownRow = Vec::with_capacity(row.len());
+fn coalesce(row: Vec<StyledSpan>) -> Vec<StyledSpan> {
+    let mut out: Vec<StyledSpan> = Vec::with_capacity(row.len());
     for span in row {
         if let Some(last) = out.last_mut()
             && last.same_style(&span)
@@ -2275,7 +2313,7 @@ fn coalesce(row: MarkdownRow) -> MarkdownRow {
     out
 }
 
-fn trim_row_end(row: &mut MarkdownRow) {
+fn trim_row_end(row: &mut Vec<StyledSpan>) {
     while let Some(last) = row.last_mut() {
         let trimmed_len = last.text.trim_end().len();
         if trimmed_len == last.text.len() {
@@ -2865,10 +2903,10 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0].kind, SpanKind::CodeBlockBorder);
         assert_eq!(rows[0][0].text, "```rust");
-        // The body row is split into highlighted runs, all `CodeBlock`
-        // kind, with the indent folded into a leading no-syntax span. Its
-        // concatenated text still reproduces the indented source line.
-        assert!(rows[1].iter().all(|s| s.kind == SpanKind::CodeBlock));
+        // The layout inset is distinct from source text, even with highlighting.
+        assert_eq!(rows[1][0].kind, SpanKind::CodeBlockIndent);
+        assert_eq!(rows[1][0].text, "  ");
+        assert!(rows[1][1..].iter().all(|s| s.kind == SpanKind::CodeBlock));
         assert_eq!(row_text(&rows[1]), "  let x = 1;");
         assert_eq!(rows[2][0].kind, SpanKind::CodeBlockBorder);
         assert_eq!(rows[2][0].text, "```");
@@ -3164,7 +3202,8 @@ mod tests {
         // none of them get retagged to `Quote`.
         assert_eq!(rows[0][1].kind, SpanKind::CodeBlockBorder);
         assert_eq!(rows[2][1].kind, SpanKind::CodeBlockBorder);
-        assert!(rows[1][1..].iter().all(|s| s.kind == SpanKind::CodeBlock));
+        assert_eq!(rows[1][1].kind, SpanKind::CodeBlockIndent);
+        assert!(rows[1][2..].iter().all(|s| s.kind == SpanKind::CodeBlock));
         assert_eq!(row_text(&rows[1]), "│   let x = 1;");
     }
 
@@ -3561,7 +3600,7 @@ mod tests {
         );
         for row in &rows {
             assert!(row_width(row) <= 12, "row too wide: {:?}", row_text(row));
-            for span in row {
+            for span in &row.spans {
                 assert_ne!(
                     span.kind,
                     SpanKind::TableBorder,

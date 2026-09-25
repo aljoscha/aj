@@ -16,7 +16,9 @@
 //! to `Text` spans. Every other [`SpanKind`] resolves through the theme-driven
 //! [`MarkdownStyles`] mapper.
 
-use aj_app::markdown::{RenderOpts, SpanKind, StyledSpan, SyntaxCategory, render_markdown};
+use aj_app::markdown::{
+    MarkdownRow, RenderOpts, SpanKind, StyledSpan, SyntaxCategory, render_markdown,
+};
 use aj_app::theme::{Theme, ThemeColor};
 use vaxis::cell::{Cell, Character, Color, Hyperlink, Style, Underline};
 use vaxis::vxfw::{DrawContext, MaxSize, RichText, Size, Surface, TextSpan, Widget};
@@ -119,7 +121,7 @@ impl MarkdownStyles {
             SpanKind::Text | SpanKind::TableBorder | SpanKind::TableCell => base,
             SpanKind::Heading(_) => self.heading,
             SpanKind::InlineCode => self.inline_code,
-            SpanKind::CodeBlock => self.code_block,
+            SpanKind::CodeBlock | SpanKind::CodeBlockIndent => self.code_block,
             SpanKind::CodeBlockBorder => self.code_block_border,
             SpanKind::ListMarker => self.list_marker,
             SpanKind::QuoteBorder => self.quote_border,
@@ -148,12 +150,20 @@ struct RowCache {
     width: u16,
     /// One entry per surface row, in paint order. Blank rows (segment
     /// separators) are empty span vectors.
-    rows: Vec<Vec<SelectionSpan>>,
+    rows: Vec<SelectionRow>,
+}
+
+#[derive(Default)]
+struct SelectionRow {
+    spans: Vec<SelectionSpan>,
+    continuation: Option<String>,
+    excluded: bool,
 }
 
 struct SelectionSpan {
     span: TextSpan,
     excluded: bool,
+    preserve_whitespace: bool,
 }
 
 /// A markdown transcript entry: optional plain leading rows (a compaction
@@ -270,8 +280,8 @@ fn segment_rows(
     segments: &[MarkdownSegment],
     styles: &MarkdownStyles,
     width: u16,
-) -> Vec<Vec<SelectionSpan>> {
-    let mut rows: Vec<Vec<SelectionSpan>> = Vec::new();
+) -> Vec<SelectionRow> {
+    let mut rows = Vec::new();
     for seg in segments {
         let seg_rows = render_markdown(&seg.text, usize::from(width), &seg.opts);
         if seg_rows.is_empty() {
@@ -280,7 +290,7 @@ fn segment_rows(
         // One blank row between consecutive segments, matching the block
         // separation the plain-text renderer used before.
         if !rows.is_empty() {
-            rows.push(Vec::new());
+            rows.push(SelectionRow::default());
         }
         for md_row in &seg_rows {
             rows.push(to_vaxis_row(md_row, seg, styles));
@@ -319,12 +329,9 @@ pub(crate) fn draw_markdown_segments(
 /// The OSC-8 target rides along only when the segment allows hyperlinks. With
 /// hyperlinks off the renderer already appended a visible ` (url)` span, so
 /// emitting the escape too would be redundant.
-fn to_vaxis_row(
-    row: &[StyledSpan],
-    seg: &MarkdownSegment,
-    styles: &MarkdownStyles,
-) -> Vec<SelectionSpan> {
-    row.iter()
+fn to_vaxis_row(row: &MarkdownRow, seg: &MarkdownSegment, styles: &MarkdownStyles) -> SelectionRow {
+    let spans = row
+        .iter()
         .map(|span| {
             let style = styles.resolve(span, seg.base_style);
             let link = match (seg.opts.hyperlinks, &span.link) {
@@ -340,21 +347,52 @@ fn to_vaxis_row(
                     style,
                     link,
                 },
-                excluded: span.kind == SpanKind::QuoteBorder,
+                excluded: matches!(
+                    span.kind,
+                    SpanKind::QuoteBorder | SpanKind::CodeBlockBorder | SpanKind::CodeBlockIndent
+                ),
+                preserve_whitespace: span.kind == SpanKind::CodeBlock,
             }
         })
-        .collect()
+        .collect();
+    SelectionRow {
+        spans,
+        continuation: row.continuation.clone(),
+        excluded: row.iter().any(|s| s.kind == SpanKind::CodeBlockBorder)
+            && row
+                .iter()
+                .all(|s| matches!(s.kind, SpanKind::QuoteBorder | SpanKind::CodeBlockBorder)),
+    }
 }
 
 /// Paint one pre-wrapped span row into `surface` at `row`, left to right. The
 /// row already fits `width`, so there is no wrapping or clipping here.
-fn paint_row(surface: &mut Surface, row: u16, spans: &[SelectionSpan], ctx: &DrawContext) {
+fn paint_row(surface: &mut Surface, row: u16, spans: &SelectionRow, ctx: &DrawContext) {
+    // A fence is a whole decorative row, including its unpainted padding.
+    // Quote-only blank rows are not fences and still separate paragraphs.
+    if spans.excluded {
+        for col in 0..surface.size.width {
+            surface.write_cell(
+                col,
+                row,
+                Cell {
+                    selection_excluded: true,
+                    selection_skip_row: true,
+                    ..Cell::default()
+                },
+            );
+        }
+    }
     let mut col: u16 = 0;
-    for selection_span in spans {
+    let mut last_content_col = 0;
+    for selection_span in &spans.spans {
         let span = &selection_span.span;
         for item in ctx.grapheme_iterator(&span.text) {
             let grapheme = item.bytes(&span.text);
             let width = u8::try_from(ctx.string_width(grapheme)).unwrap_or(1);
+            if !grapheme.trim().is_empty() {
+                last_content_col = col;
+            }
             surface.write_cell(
                 col,
                 row,
@@ -363,11 +401,19 @@ fn paint_row(surface: &mut Surface, row: u16, spans: &[SelectionSpan], ctx: &Dra
                     style: span.style,
                     link: span.link.clone(),
                     selection_excluded: selection_span.excluded,
+                    selection_preserve_whitespace: selection_span.preserve_whitespace,
+                    selection_skip_row: spans.excluded,
                     ..Cell::default()
                 },
             );
             col = col.saturating_add(u16::from(width));
         }
+    }
+    if let Some(continuation) = &spans.continuation {
+        let mut cell = surface.read_cell(last_content_col, row);
+        cell.selection_continuation = Some(continuation.as_str().into());
+        cell.default = false;
+        surface.write_cell(last_content_col, row, cell);
     }
 }
 
