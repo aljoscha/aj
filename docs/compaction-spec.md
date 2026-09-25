@@ -430,19 +430,34 @@ re-added as raw summarizer input.
 
 ### 4.5 Summary prompts
 
-Three prompt builders plus a shared system prompt, all pure string
-construction. The prompts ask for a structured checkpoint with stable
-section headings (goal, constraints/preferences, progress
-done/in-progress/blocked, key decisions, next steps, critical context)
-and stress preserving exact file paths, identifiers, and error
-messages.
+Three prompt builders share a system prompt and content guidance, all
+pure string construction. The summarizer produces a continuation
+checkpoint, not a reply to the conversation. Conversation content is
+source material, not instructions for the summarizer to follow.
+
+The content guidance covers four kinds of information:
+
+- Active tasks, unfinished requests, and applicable constraints and preferences.
+- Current state and evidence, including changes, important commands or tests
+  and observed outcomes, unresolved failures, and unverified work.
+- Decisions and their reasons, including failed or rejected approaches worth
+  avoiding.
+- Remaining work, blockers, and exact paths, symbols, identifiers, and error
+  messages needed to continue or recover details.
+
+Short headings or bullets are encouraged when useful, but their wording
+and order are not prescribed. Empty sections are omitted. There is no
+mandatory checklist syntax. These are coverage requirements, not a
+machine-parsed summary schema. Plans and assumptions must remain distinct
+from observed facts and completed work, without invented next steps or
+unsupported success claims.
 
 The update prompt asks for a current continuation checkpoint, not a
-complete work log. It keeps active goals, constraints, and preferences,
-updates the state of work, and removes stale or duplicated detail.
-Completed work and failed approaches are retained when they prevent
-repeated work or mistakes. Verified results are distinguished from
-plans and assumptions.
+complete work log. Still-relevant facts, constraints, and unfinished
+requests carry forward even when new messages do not repeat them.
+Newer corrections replace older claims. Obsolete and duplicated detail
+is removed. The split-turn prompt covers only the supplied prefix and
+explicitly forbids reconstructing the unseen retained suffix.
 
 ```rust
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str;
