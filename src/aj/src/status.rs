@@ -69,6 +69,9 @@ pub(crate) struct StatusState {
     /// Count of running `Sub(_)` agents, for the footer's activity
     /// indicator.
     pub(crate) sub_agents_running: usize,
+    /// Main's active goal needs footer clock ticks even while the user views a
+    /// finished sub-agent whose own loader is idle.
+    pub(crate) goal_running: bool,
     /// Connection state, mirrored from the world alongside the lifecycle
     /// bits.
     pub(crate) connection: Connection,
@@ -92,6 +95,7 @@ impl StatusState {
     pub(crate) fn animating(&self) -> bool {
         self.running
             || self.compacting
+            || self.goal_running
             || matches!(
                 self.connection,
                 Connection::Reconnecting | Connection::CatchingUp
@@ -331,6 +335,38 @@ mod tests {
             .borrow_mut()
             .draw(&crate::test_support::draw_ctx(80, None));
         assert_eq!(surface.size.height, 0);
+    }
+
+    #[test]
+    fn goal_runtime_keeps_ticking_while_the_viewed_agent_is_idle() {
+        let (line, status) = loader(StatusState {
+            goal_running: true,
+            ..StatusState::default()
+        });
+        assert!(
+            rows(&line).is_empty(),
+            "Main's goal does not make a finished sub-agent look busy"
+        );
+        let mut ctx = EventContext::new();
+        line.borrow_mut().handle_event(
+            &mut ctx,
+            &Event::App(vaxis::vxfw::UserEvent {
+                name: STATUS_WAKE_EVENT.into(),
+                data: None,
+            }),
+        );
+        assert!(
+            ctx.cmds
+                .iter()
+                .any(|command| matches!(command, Command::Tick(_)))
+        );
+        status.borrow_mut().goal_running = false;
+        let mut ctx = EventContext::new();
+        line.borrow_mut().handle_event(&mut ctx, &Event::Tick);
+        assert!(
+            ctx.cmds.is_empty(),
+            "stopped goal does not keep a tick chain alive"
+        );
     }
 
     #[test]

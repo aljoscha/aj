@@ -40,6 +40,9 @@ use aj_wire::{Frame, ModelSelection, SessionSettings, SessionSummary};
 use tempfile::TempDir;
 use tracing_subscriber::fmt::MakeWriter;
 
+#[path = "session_host/goals.rs"]
+mod goals;
+
 /// Every wait in this file is bounded by this, so a wedged host fails a
 /// test instead of hanging CI.
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -5626,9 +5629,10 @@ async fn cancelling_a_foreground_sub_cascades_to_main() {
     harness.host.shutdown().await;
 }
 
-/// A turn that spawns a background sub-agent whose run outlives it.
+/// A host whose background sub-agent run outlives its parent turn.
 ///
-/// When the fixture streams one character at a time, the child's long answer
+/// Parent and child have independent scripts: scheduler order must not decide
+/// which agent receives which answer. At one character per tick, the long answer
 /// keeps its run going both while the parent's turn streams its short answer
 /// and after that turn has ended. That lets one fixture serve both states a
 /// gesture can arrive in.
@@ -5636,18 +5640,60 @@ async fn cancelling_a_foreground_sub_cascades_to_main() {
 /// The trailing message is the parent acknowledging the task's completion
 /// notice: a `TaskEnd` wakes its owner whatever the task's status, so a
 /// killed run costs the same inferences a completed one does.
-fn detached_sub_turn() -> Vec<AssistantMessage> {
-    vec![
-        calling(
-            "kicking that off",
-            "call-bg",
-            "agent",
-            serde_json::json!({"task": "look into it", "run_in_background": true}),
+fn detached_sub_harness() -> Harness {
+    const TASK: &str = "look into it";
+    struct DetachedProvider {
+        parent: Arc<ScriptedProvider>,
+        child: Arc<ScriptedProvider>,
+    }
+    impl aj_models::provider::Provider for DetachedProvider {
+        fn stream(
+            &self,
+            model: &aj_models::registry::ModelInfo,
+            context: &aj_models::types::Context,
+            options: &aj_models::types::StreamOptions,
+        ) -> aj_models::streaming::AssistantMessageEventStream {
+            let child = matches!(context.messages.first(),
+                Some(aj_models::types::Message::User(user))
+                    if user.content.iter().any(|content| matches!(content,
+                        UserContent::Text(text) if text.text == TASK)));
+            let provider = if child { &self.child } else { &self.parent };
+            provider.stream(model, context, options)
+        }
+
+        fn stream_simple(
+            &self,
+            model: &aj_models::registry::ModelInfo,
+            context: &aj_models::types::Context,
+            options: &aj_models::types::SimpleStreamOptions,
+        ) -> aj_models::streaming::AssistantMessageEventStream {
+            self.stream(model, context, &options.base)
+        }
+    }
+    let parent = scripted(
+        vec![
+            calling(
+                "kicking that off",
+                "call-bg",
+                "agent",
+                serde_json::json!({"task": TASK, "run_in_background": true}),
+            ),
+            finalized_text_message(PARENT_ANSWER),
+            finalized_text_message("noted, thanks"),
+        ],
+        1,
+        Duration::from_millis(20),
+    );
+    let mut run = snapshot(Arc::clone(&parent));
+    run.main.provider = Arc::new(DetachedProvider {
+        parent,
+        child: scripted(
+            vec![finalized_text_message(CHILD_ANSWER)],
+            1,
+            Duration::from_millis(20),
         ),
-        finalized_text_message(PARENT_ANSWER),
-        finalized_text_message(CHILD_ANSWER),
-        finalized_text_message("noted, thanks"),
-    ]
+    });
+    Harness::with_run_config(run, Vec::new(), None, None)
 }
 
 /// The parent's own answer, which the child's ending must never touch.
@@ -5704,12 +5750,11 @@ struct DetachedEnding {
     parent_answered_in_full: bool,
 }
 
-/// Run [`detached_sub_turn`] until the child's run is detached and live with
+/// Run [`detached_sub_harness`] until the child's run is detached and live with
 /// its parent turn in state `parent`, end the run with `gesture`, and report
 /// the ending.
 async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedEnding {
-    let harness =
-        Harness::with_provider(scripted(detached_sub_turn(), 1, Duration::from_millis(20)));
+    let harness = detached_sub_harness();
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
     harness
@@ -7592,8 +7637,7 @@ async fn a_persistence_failure_ends_the_materialization_and_a_reopen_rebuilds_it
 /// working and its bytes are untouched.
 #[tokio::test]
 async fn a_detached_writers_persistence_failure_ends_only_its_session() {
-    let harness =
-        Harness::with_provider(scripted(detached_sub_turn(), 1, Duration::from_millis(20)));
+    let harness = detached_sub_harness();
     let affected = harness.create().await;
     let healthy = harness.create().await;
     harness
@@ -11168,8 +11212,7 @@ async fn shutdown_releases_every_session() {
 /// publishes those events before closing the attachment.
 #[tokio::test]
 async fn shutdown_publishes_a_detached_sub_agents_terminal_events_before_eof() {
-    let harness =
-        Harness::with_provider(scripted(detached_sub_turn(), 1, Duration::from_millis(20)));
+    let harness = detached_sub_harness();
     let session = harness.create().await;
     let mut stream = harness
         .host
@@ -11917,8 +11960,7 @@ async fn session_owner_retains_the_lock_while_a_non_abortable_task_reaps() {
 #[tokio::test(start_paused = true)]
 async fn timed_out_background_agent_cannot_append_after_a_rival_takes_the_lock() {
     let (capture, start) = trace_capture();
-    let harness =
-        Harness::with_provider(scripted(detached_sub_turn(), 1, Duration::from_millis(20)));
+    let harness = detached_sub_harness();
     let session = harness.create().await;
     let mut stream = harness
         .host

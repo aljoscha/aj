@@ -105,6 +105,12 @@ pub async fn run_compaction(
         return finish_nothing(agent, reason, keep_recent_tokens).await;
     };
 
+    match agent.admit_goal_inference(cancel.clone()).await {
+        Ok(()) => {}
+        Err(TurnError::Aborted) => return finish_canceled(agent, reason, plan.tokens_before).await,
+        Err(err) => return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await,
+    }
+
     // Best-effort UI signal; a failed emit must not abort the run.
     if let Err(err) = agent
         .emit_event(AgentEvent::CompactionStart {

@@ -746,6 +746,7 @@ mod tests {
             working: false,
             settings: settings(),
             oracle_settings: None,
+            goal: None,
             credential_warning: None,
         }
     }

@@ -754,6 +754,7 @@ impl ReplayState {
             | ConversationEntryKind::SpeedChange { .. }
             | ConversationEntryKind::VerbosityChange { .. }
             | ConversationEntryKind::EnvChange { .. }
+            | ConversationEntryKind::GoalChange { .. }
             | ConversationEntryKind::Context { .. }
             | ConversationEntryKind::SystemPrompt { .. }
             | ConversationEntryKind::Compaction { .. } => {}
@@ -947,6 +948,8 @@ impl ReplayState {
                     .join(", ");
                 self.state_notice(agent_id, at, format!("Environment set to [{keys}]."), out);
             }
+            // Goals are carried by host state, not transcript events.
+            ConversationEntryKind::GoalChange { .. } => {}
             ConversationEntryKind::Context { .. } => {
                 unreachable!("a context entry is projected before the thread is read")
             }
@@ -994,7 +997,8 @@ impl ReplayState {
                 self.seen_message.insert(agent_id);
                 match &agent_msg.kind {
                     AgentMessageKind::Wire(Message::User(_))
-                    | AgentMessageKind::TaskNotification(_) => {
+                    | AgentMessageKind::TaskNotification(_)
+                    | AgentMessageKind::InternalContext(_) => {
                         // User prompts and task notices both replay as a
                         // MessageStart/End pair around the entry, carrying the
                         // typed `AgentMessage` so the frontend rebuilds them on

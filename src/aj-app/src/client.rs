@@ -234,6 +234,7 @@ impl SessionClient {
                 working,
                 settings,
                 oracle_settings,
+                goal,
                 credential_warning,
             } => {
                 if !self.is_ours(&session) {
@@ -258,6 +259,7 @@ impl SessionClient {
                 self.seed_lifecycle(working);
                 self.settings = Some(settings);
                 self.oracle_settings = oracle_settings;
+                chat.note_goal(goal, working);
                 self.working = working;
                 Redraw(true)
             }
@@ -675,6 +677,7 @@ mod tests {
             working,
             settings,
             oracle_settings: None,
+            goal: None,
             credential_warning: credential_warning.map(str::to_string),
         }
     }
@@ -691,6 +694,104 @@ mod tests {
             tasks,
             queues,
         }
+    }
+
+    #[test]
+    fn goal_snapshots_replace_clear_and_ignore_other_sessions() {
+        use aj_agent::goal::{Goal, GoalStatus};
+        let mut client = SessionClient::new(SESSION.into());
+        let mut chat = chat();
+        let goal = Goal {
+            id: "g".into(),
+            objective: "finish".into(),
+            status: GoalStatus::Paused,
+            token_budget: Some(100),
+            tokens_used: 20,
+            time_used_seconds: 0,
+        };
+        let mut snapshot = opening(EPOCH, false);
+        if let Frame::State { goal: slot, .. } = &mut snapshot {
+            *slot = Some(goal.clone());
+        }
+        let _ = client.apply(&mut chat, snapshot.clone());
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+        assert_eq!(chat.goal, Some(goal));
+        let mut foreign = state_with(EPOCH, false, settings());
+        if let Frame::State { session, .. } = &mut foreign {
+            *session = "other".into();
+        }
+        let _ = client.apply(&mut chat, foreign);
+        assert!(chat.goal.is_some());
+        let _ = client.apply(&mut chat, state_with(EPOCH, false, settings()));
+        assert!(chat.goal.is_none());
+        let _ = client.apply(&mut chat, snapshot);
+        assert!(chat.goal.is_some());
+        let _ = client.apply(&mut chat, opening("new-head", false));
+        assert!(chat.goal.is_none());
+    }
+
+    #[test]
+    fn goal_runtime_advances_from_host_state_without_changing_reported_usage() {
+        use aj_agent::goal::{Goal, GoalStatus};
+        use std::time::{Duration, Instant};
+        let mut client = SessionClient::new(SESSION.into());
+        let mut chat = chat();
+        let state = |opens_block, status, working, seconds| {
+            let mut frame = if opens_block {
+                opening(EPOCH, working)
+            } else {
+                state_with(EPOCH, working, settings())
+            };
+            if let Frame::State { goal, .. } = &mut frame {
+                *goal = Some(Goal {
+                    id: "g".into(),
+                    objective: "finish".into(),
+                    status,
+                    token_budget: None,
+                    tokens_used: 20,
+                    time_used_seconds: seconds,
+                });
+            }
+            frame
+        };
+        let _ = client.apply(&mut chat, state(true, GoalStatus::Active, true, 90));
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+        let now = Instant::now();
+        assert_eq!(
+            chat.goal_runtime_seconds(now + Duration::from_secs(10))
+                - chat.goal_runtime_seconds(now),
+            10
+        );
+        assert_eq!(chat.goal.as_ref().unwrap().time_used_seconds, 90);
+
+        for (status, working) in [
+            (GoalStatus::Active, false),
+            (GoalStatus::Paused, true),
+            (GoalStatus::BudgetLimited, true),
+            (GoalStatus::Complete, true),
+        ] {
+            let _ = client.apply(&mut chat, state(false, status, working, 125));
+            assert_eq!(
+                chat.goal_runtime_seconds(Instant::now() + Duration::from_secs(3600)),
+                125
+            );
+        }
+        let _ = client.apply(&mut chat, state(false, GoalStatus::Active, true, 5));
+        let now = Instant::now();
+        let reported = chat.goal_runtime_seconds(now);
+        assert!(
+            reported < 125,
+            "a fresh subtotal replaces the previous timer"
+        );
+        assert_eq!(
+            chat.goal_runtime_seconds(now + Duration::from_secs(10)) - reported,
+            10
+        );
+        let _ = client.apply(&mut chat, state_with(EPOCH, false, settings()));
+        assert_eq!(
+            chat.goal_runtime_seconds(now + Duration::from_secs(3600)),
+            0
+        );
     }
 
     #[test]
@@ -755,6 +856,7 @@ mod tests {
             working: false,
             settings: settings(),
             oracle_settings,
+            goal: None,
             credential_warning: None,
         };
         let opening = |session, epoch, oracle| frame(session, epoch, true, oracle);

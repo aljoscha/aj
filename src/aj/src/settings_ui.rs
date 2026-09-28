@@ -684,6 +684,16 @@ impl SettingList {
         self.prompt.focus_target()
     }
 
+    /// Clear the action filter and return to the first row without moving focus.
+    pub(crate) fn clear_filter(&self) {
+        self.prompt.clear();
+        let mut state = self.state.borrow_mut();
+        state.query.clear();
+        let mut list = self.list.borrow_mut();
+        apply_setting_filter(&mut state, &mut list);
+        list.jump_to_item(0);
+    }
+
     /// Replace the row styles (a runtime theme swap).
     pub(crate) fn set_styles(&self, styles: SelectStyles) {
         *self.styles.borrow_mut() = styles;
@@ -742,6 +752,20 @@ impl SettingList {
                 state.rows.push(row);
             }
         }
+        drop(state);
+        self.refilter_preserving_selection(selected);
+    }
+
+    /// Replace live rows without moving selection when its row still exists.
+    /// The filter field and scroll position remain owned by the list.
+    pub(crate) fn replace_rows(&self, rows: Vec<SettingRow>) {
+        let selected = self.selected().map(|row| row.id);
+        self.state.borrow_mut().rows = rows;
+        self.refilter_preserving_selection(selected);
+    }
+
+    fn refilter_preserving_selection(&self, selected: Option<String>) {
+        let mut state = self.state.borrow_mut();
         state.label_width = state
             .rows
             .iter()
@@ -753,15 +777,17 @@ impl SettingList {
         if let Some(position) =
             selected.and_then(|id| state.visible.iter().position(|&i| state.rows[i].id == id))
         {
-            list.cursor = u32::try_from(position).expect("row count fits u32");
+            let cursor = u32::try_from(position).expect("row count fits u32");
+            if list.cursor != cursor {
+                list.cursor = cursor;
+                list.ensure_scroll();
+            }
         } else {
-            list.cursor = list.cursor.min(
-                u32::try_from(state.visible.len())
-                    .unwrap()
-                    .saturating_sub(1),
-            );
+            // A vanished action must not silently select whichever different
+            // action inherited its position (for example Pause becoming Resume).
+            list.cursor = 0;
+            list.ensure_scroll();
         }
-        list.ensure_scroll();
     }
 
     pub(crate) fn host_hint(&self, hint: String) {
@@ -2541,6 +2567,90 @@ mod tests {
             Some("b".to_string()),
             "the second re-derived row is reachable via the refreshed item count"
         );
+    }
+
+    #[test]
+    fn live_row_replacement_keeps_the_selected_action_and_removes_missing_rows() {
+        let mut list = SettingList::new(
+            vec![cycle_row("a", "true"), cycle_row("b", "true")],
+            styles(),
+            false,
+        );
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&actions);
+        list.on_change = Some(Box::new(move |_, id, value| {
+            observed
+                .borrow_mut()
+                .push((id.to_string(), value.to_string()))
+        }));
+        send(&mut list, &key(Key::DOWN, Modifiers::empty()));
+        list.replace_rows(vec![
+            cycle_row("c", "true"),
+            cycle_row("d", "true"),
+            cycle_row("b", "false"),
+        ]);
+        send(&mut list, &enter());
+        assert_eq!(*actions.borrow(), vec![("b".into(), "true".into())]);
+        assert!(list.value_of("a").is_none());
+        list.replace_rows(vec![
+            cycle_row("c", "true"),
+            cycle_row("d", "true"),
+            cycle_row("e", "true"),
+        ]);
+        send(&mut list, &enter());
+        assert_eq!(actions.borrow().last(), Some(&("c".into(), "false".into())));
+    }
+
+    #[test]
+    fn live_row_replacement_preserves_mouse_scrolling_away_from_selection() {
+        use crate::test_support::{draw_ctx, rows};
+        let data = |value| {
+            (0..20)
+                .map(|i| cycle_row(&format!("row-{i:02}"), value))
+                .collect()
+        };
+        let visible = |surface: &Surface| {
+            rows(surface)
+                .iter()
+                .filter_map(|line| {
+                    line.split_whitespace()
+                        .find(|text| text.starts_with("row-"))
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut list = SettingList::new(data("true"), styles(), false);
+        let ctx = draw_ctx(60, Some(9));
+        list.draw(&ctx);
+        let wheel = Event::Mouse(vaxis::mouse::Mouse {
+            col: 0,
+            row: 0,
+            xoffset: 0,
+            yoffset: 0,
+            button: vaxis::mouse::Button::WheelDown,
+            mods: vaxis::mouse::Modifiers::empty(),
+            kind: vaxis::mouse::Type::Press,
+        });
+        for _ in 0..3 {
+            list.list
+                .borrow_mut()
+                .handle_event(&mut EventContext::new(), &wheel);
+        }
+        let scrolled = visible(&list.draw(&ctx));
+        assert!(!scrolled.is_empty() && !scrolled.iter().any(|row| row == "row-00"));
+        assert_eq!(
+            list.selected().unwrap().id,
+            "row-00",
+            "wheel scrolling must leave selection outside the viewport"
+        );
+        for value in ["true", "false"] {
+            list.replace_rows(data(value));
+            assert_eq!(
+                visible(&list.draw(&ctx)),
+                scrolled,
+                "live values must not pull the viewport back to selection"
+            );
+        }
     }
 
     /// The skills placeholder row is inert on Enter: its empty cycle set fires

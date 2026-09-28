@@ -125,6 +125,7 @@ impl RemoteError {
 /// there is no client-side vocabulary that the wire does not have.
 #[derive(Clone, Debug)]
 pub(crate) enum RemoteCommand {
+    Goal(aj_wire::GoalRequest),
     Prompt(PromptRequest),
     Steer(SteerRequest),
     Cancel(CancelRequest),
@@ -143,6 +144,7 @@ impl RemoteCommand {
     /// The route under `/v1/sessions/{id}/`.
     pub(super) fn route(&self) -> String {
         match self {
+            Self::Goal(_) => "goal".to_string(),
             Self::Prompt(_) => "prompt".to_string(),
             Self::Steer(_) => "steer".to_string(),
             Self::Cancel(_) => "cancel".to_string(),
@@ -160,6 +162,7 @@ impl RemoteCommand {
 
     pub(super) fn body(&self) -> Result<Vec<u8>, RemoteError> {
         match self {
+            Self::Goal(request) => encode(request),
             Self::Prompt(request) => encode(request),
             Self::Steer(request) => encode(request),
             Self::Cancel(request) => encode(request),
@@ -500,6 +503,10 @@ impl RemoteClient {
     ) -> Result<CommandOutcome, RemoteError> {
         let path = format!("/v1/sessions/{session}/{}", command.route());
         let response = self.post(&path, command.body()?).await?;
+        if matches!(command, RemoteCommand::Goal(_)) {
+            let outcome: aj_wire::GoalOutcome = decode(response).await?;
+            return Ok(CommandOutcome::Goal(outcome.goal));
+        }
         if !command.withdraws() {
             let body = response.bytes().await?;
             let acceptance = if body.is_empty() {

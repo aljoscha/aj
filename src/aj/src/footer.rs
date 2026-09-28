@@ -9,17 +9,23 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use aj_agent::TaskRegistry;
+use aj_agent::goal::{Goal, GoalStatus};
 use aj_agent::tool::{TaskKind, TaskStatus};
 use aj_app::chat::ChatState;
 use aj_app::footer::{
     UsageSeverity, context_usage_display, format_agent_activity, format_pending_notices,
+    format_tokens,
 };
 use vaxis::cell::Style;
-use vaxis::vxfw::{DrawContext, Event, EventContext, RichText, Surface, TextSpan, Widget};
+use vaxis::vxfw::{
+    DrawContext, Event, EventContext, MaxSize, RelativePoint, RichText, Size, SubSurface, Surface,
+    TextSpan, Widget,
+};
 
-use crate::status::StatusState;
+use crate::status::{Connection, StatusState};
 use crate::transcript::TranscriptStyles;
 
 /// Display label of the agent-picker chord shown in the activity
@@ -103,6 +109,15 @@ impl Widget for FooterLine {
         // Each part is a short span list so the context-usage part
         // can color its percentage while everything else stays dim.
         let mut parts: Vec<Vec<TextSpan>> = Vec::new();
+        let goal = chat.goal.as_ref().map(|goal| {
+            let status = self.status.borrow();
+            let seconds = if status.connection == Connection::Connected && !status.rebuilding {
+                chat.goal_runtime_seconds(Instant::now())
+            } else {
+                goal.time_used_seconds
+            };
+            span(goal_indicator(goal, seconds), self.styles.warning)
+        });
         if let Some(model) = chat.footers().model_line(active) {
             parts.push(vec![span(model, dim)]);
         }
@@ -159,10 +174,109 @@ impl Widget for FooterLine {
         }
         let mut rich = RichText::new(spans);
         rich.softwrap = false;
-        rich.draw(ctx)
+        // The goal is right-aligned and reserves its width, so the usual
+        // fields truncate before it. Only a goal wider than the whole row
+        // gives way to them.
+        let Some((goal, width)) = goal.zip(ctx.max.width) else {
+            return rich.draw(ctx);
+        };
+        let goal_width = u16::try_from(ctx.string_width(&goal.text)).unwrap_or(u16::MAX);
+        let Some(facts_width) = width.checked_sub(goal_width.saturating_add(GOAL_GAP)) else {
+            return rich.draw(ctx);
+        };
+        let facts = rich.draw(&ctx.with_constraints(
+            Size {
+                width: 0,
+                height: ctx.min.height,
+            },
+            MaxSize {
+                width: Some(facts_width),
+                height: ctx.max.height,
+            },
+        ));
+        let mut goal = RichText::new(vec![goal]);
+        goal.softwrap = false;
+        let goal = goal.draw(ctx);
+        let mut surface = Surface::with_size(Size {
+            width,
+            height: facts.size.height.max(goal.size.height),
+        });
+        surface.children.push(SubSurface {
+            origin: RelativePoint {
+                row: 0,
+                col: i32::from(width - goal.size.width),
+            },
+            surface: goal,
+            z_index: 0,
+        });
+        surface.children.push(SubSurface {
+            origin: RelativePoint { row: 0, col: 0 },
+            surface: facts,
+            z_index: 0,
+        });
+        surface
     }
 
     fn handle_event(&mut self, _ctx: &mut EventContext, _event: &Event) {}
+}
+
+/// Minimum blank columns between the usual fields and the goal.
+const GOAL_GAP: u16 = 2;
+
+/// One compact phrase per status: what pursuit is doing, the one usage figure
+/// that matters in that state, and how to act on a resumable stop.
+fn goal_indicator(goal: &Goal, seconds: u64) -> String {
+    let budget_usage = |suffix: &str| {
+        goal.token_budget.map(|budget| {
+            format!(
+                "{} / {}{suffix}",
+                format_tokens(goal.tokens_used),
+                format_tokens(budget)
+            )
+        })
+    };
+    let resume = || {
+        format!(
+            "{} goal",
+            aj_app::keybindings::action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
+                .expect("palette has a default chord")
+        )
+    };
+    let (label, detail) = match goal.status {
+        GoalStatus::Active => (
+            "Pursuing goal",
+            budget_usage("").or_else(|| Some(format_goal_runtime(seconds))),
+        ),
+        GoalStatus::Paused => ("Goal paused", Some(resume())),
+        GoalStatus::Blocked => ("Goal stalled", Some(resume())),
+        GoalStatus::UsageLimited => ("Goal hit usage limits", Some(resume())),
+        GoalStatus::BudgetLimited => ("Goal unmet", budget_usage(" tokens")),
+        GoalStatus::Complete => (
+            "Goal achieved",
+            Some(if goal.token_budget.is_some() {
+                format!("{} tokens", format_tokens(goal.tokens_used))
+            } else {
+                format_goal_runtime(seconds)
+            }),
+        ),
+    };
+    detail.map_or_else(|| label.to_string(), |detail| format!("{label} ({detail})"))
+}
+
+fn format_goal_runtime(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    if hours >= 24 {
+        format!("{}d {}h {}m", hours / 24, hours % 24, minutes % 60)
+    } else if hours > 0 && minutes % 60 == 0 {
+        format!("{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {}m", minutes % 60)
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +357,106 @@ mod tests {
     fn draw_rows(f: &mut FooterLine, width: u16) -> Vec<String> {
         let surface = f.draw(&crate::test_support::draw_ctx(width, None));
         crate::test_support::rows(&surface)
+    }
+
+    fn goal(status: GoalStatus, token_budget: Option<u64>) -> Goal {
+        Goal {
+            id: "g".into(),
+            objective: "finish".into(),
+            status,
+            token_budget,
+            tokens_used: 40_000,
+            time_used_seconds: 5400,
+        }
+    }
+
+    #[test]
+    fn goal_shows_one_compact_phrase_per_status_at_the_right_edge() {
+        let chat = chat_with_window(0);
+        let mut footer = footer(Rc::clone(&chat), StatusState::default());
+        let facts = draw_rows(&mut footer, 120)[0].clone();
+        for (status, budget, want) in [
+            (
+                GoalStatus::Active,
+                Some(50_000),
+                "Pursuing goal (40k / 50k)",
+            ),
+            (GoalStatus::Active, None, "Pursuing goal (1h 30m)"),
+            (
+                GoalStatus::Paused,
+                Some(50_000),
+                "Goal paused (Ctrl+O goal)",
+            ),
+            (GoalStatus::Blocked, None, "Goal stalled (Ctrl+O goal)"),
+            (
+                GoalStatus::UsageLimited,
+                None,
+                "Goal hit usage limits (Ctrl+O goal)",
+            ),
+            (
+                GoalStatus::BudgetLimited,
+                Some(30_000),
+                "Goal unmet (40k / 30k tokens)",
+            ),
+            (GoalStatus::BudgetLimited, None, "Goal unmet"),
+            (
+                GoalStatus::Complete,
+                Some(50_000),
+                "Goal achieved (40k tokens)",
+            ),
+            (GoalStatus::Complete, None, "Goal achieved (1h 30m)"),
+        ] {
+            chat.borrow_mut().goal = Some(goal(status, budget));
+            let row = &draw_rows(&mut footer, 120)[0];
+            assert!(row.starts_with(&facts), "{row}");
+            assert!(row.ends_with(&format!("  {want}")), "{row}");
+            assert_eq!(row.chars().count(), 120, "flush right: {row}");
+        }
+
+        for (seconds, runtime) in [
+            (59, "59s"),
+            (90, "1m"),
+            (7200, "2h"),
+            (5400, "1h 30m"),
+            (93780, "1d 2h 3m"),
+        ] {
+            let mut active = goal(GoalStatus::Active, None);
+            active.time_used_seconds = seconds;
+            chat.borrow_mut().goal = Some(active);
+            assert!(
+                draw_rows(&mut footer, 120)[0].ends_with(&format!("Pursuing goal ({runtime})"))
+            );
+        }
+
+        *chat.borrow_mut() = ChatState::new(
+            chat_with_window(0)
+                .borrow()
+                .footers()
+                .settings(AgentId::Main)
+                .unwrap()
+                .clone(),
+        );
+        assert_eq!(
+            draw_rows(&mut footer, 120)[0],
+            facts,
+            "cleared with session state"
+        );
+    }
+
+    #[test]
+    fn narrow_footers_truncate_session_facts_before_the_goal() {
+        let chat = chat_with_window(0);
+        let mut footer = footer(Rc::clone(&chat), StatusState::default());
+        footer.set_working_directory("/long".repeat(100));
+        chat.borrow_mut().goal = Some(goal(GoalStatus::Paused, None));
+        let row = &draw_rows(&mut footer, 60)[0];
+        assert!(row.starts_with(" opus high  ·  /long"), "{row}");
+        assert!(row.ends_with("…  Goal paused (Ctrl+O goal)"), "{row}");
+
+        // Only a goal wider than the whole row gives way to the usual fields.
+        let with_goal = draw_rows(&mut footer, 20);
+        chat.borrow_mut().goal = None;
+        assert_eq!(with_goal, draw_rows(&mut footer, 20));
     }
 
     #[test]

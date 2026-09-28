@@ -277,6 +277,8 @@ async fn run_inner<W: Write + Send + 'static>(
         &run_config,
         restore_context.as_ref(),
     )?;
+    let goal = crate::host::driver::restore_goal(&mut log)?;
+    let has_goal_history = crate::host::driver::has_goal_history(&log);
     if let Some(notice) = &recovery_notice {
         eprintln!("aj: {notice}");
     }
@@ -350,6 +352,14 @@ async fn run_inner<W: Write + Send + 'static>(
         &run_config.lock().expect("run config mutex poisoned"),
     );
     agent.set_session_env(session_env.unwrap_or_default());
+    if has_goal_history {
+        let queues = aj_agent::queue::MessageQueues::default();
+        queues.set_context(
+            aj_agent::events::AgentId::Main,
+            Some(crate::host::driver::goal_context(goal.as_ref(), false)),
+        );
+        agent.set_message_queues(queues);
+    }
     for d in &env.skill_diagnostics {
         eprintln!("aj: warning: {d}");
     }

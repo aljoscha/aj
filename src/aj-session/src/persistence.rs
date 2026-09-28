@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use crate::log::{ConversationEntry, ConversationEntryKind, ConversationError};
+use crate::log::{ConversationEntry, ConversationEntryKind, ConversationError, ThreadKind};
 
 /// The extension of the sidecar holding a session's label.
 const TAG_SIDECAR: &str = "tag";
@@ -543,9 +543,10 @@ impl SessionMetadata {
 ///
 /// Unlike [`SessionMetadata`] (which is purely a filesystem-stat
 /// payload), [`SessionPreview`] opens the JSONL and walks far enough
-/// to count `Message` entries and capture the first user-role text
-/// block. Producing one through [`ConversationPersistence::session_preview`]
-/// is therefore O(file size).
+/// to count `Message` entries and capture the first nonempty user-role text
+/// block, falling back to the first nonempty goal objective. Producing one
+/// through [`ConversationPersistence::session_preview`] is therefore
+/// O(file size).
 #[derive(Debug, Clone)]
 pub struct SessionPreview {
     /// Filename stem of the session file (e.g.
@@ -582,10 +583,13 @@ pub struct SessionPreview {
     /// contribute; non-message entries (`SystemPrompt`) are
     /// skipped.
     pub message_count: usize,
-    /// First user-role textual content block in the file, if any.
-    /// `None` for a freshly-minted session that hasn't yet seen a
-    /// user prompt. The string carries the verbatim text — the
-    /// renderer applies its own truncation policy.
+    /// Display text from the first nonempty user-thread, user-role textual block,
+    /// falling back to the first nonempty `GoalChange` objective in the file.
+    /// Internal context and delegated task prompts are not user input. Later goal
+    /// edits or clears do not replace the fallback. `None` when neither source
+    /// has nonempty text.
+    /// Text is trimmed but not truncated. This display fallback does not
+    /// contribute to `message_count` or `last_message_at`.
     pub first_user_message: Option<String>,
     /// The label the session carries, `None` when it has none.
     ///
@@ -607,7 +611,8 @@ pub struct SessionPreview {
 /// JSON lines that fail to parse are skipped. Invalid UTF-8 ends the walk at
 /// the readable prefix. Either way the entries already read produce a preview,
 /// matching the resume-time tolerance for a truncated tail. The walk is
-/// one-pass, and stops updating `first_user_message` once it has one.
+/// one-pass. User text takes precedence over a goal objective regardless of
+/// their order in the file.
 fn read_session_preview_file(
     session_id: &str,
     path: &std::path::Path,
@@ -625,6 +630,7 @@ fn read_session_preview_file(
 
     let mut message_count = 0usize;
     let mut first_user_message: Option<String> = None;
+    let mut first_goal_objective: Option<String> = None;
     // Track the largest message-kind timestamp seen so far. Tracking
     // the max (not the last) lets the field tolerate out-of-order
     // writes: a tool result that lands after a streaming assistant
@@ -653,7 +659,7 @@ fn read_session_preview_file(
         };
         if let ConversationEntryKind::Message { message: msg } = &entry.entry {
             message_count += 1;
-            if first_user_message.is_none() {
+            if first_user_message.is_none() && entry.thread == ThreadKind::User {
                 if let Some(Message::User(u)) = msg.as_stored_wire() {
                     if let Some(text) = first_user_text(&u.content) {
                         first_user_message = Some(text);
@@ -665,6 +671,13 @@ fn read_session_preview_file(
                     Some(prev) if prev >= ts => prev,
                     _ => ts,
                 });
+            }
+        } else if first_goal_objective.is_none()
+            && let ConversationEntryKind::GoalChange { goal: Some(goal) } = &entry.entry
+        {
+            let objective = goal.objective.trim();
+            if !objective.is_empty() {
+                first_goal_objective = Some(objective.to_string());
             }
         }
     }
@@ -690,7 +703,7 @@ fn read_session_preview_file(
         last_message_at,
         size_bytes,
         message_count,
-        first_user_message,
+        first_user_message: first_user_message.or(first_goal_objective),
         // Not in the log: `session_preview` fills these from the sidecars.
         tag: None,
         archived: false,
@@ -747,6 +760,7 @@ fn first_user_text(content: &[UserContent]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use aj_agent::goal::{Goal, GoalStatus};
     use aj_agent::message::AgentMessage;
     use aj_models::types::{
         AssistantContent, AssistantMessage, Message, TextContent, ToolCall, ToolResultMessage,
@@ -1135,6 +1149,17 @@ mod tests {
         }))
     }
 
+    fn goal(objective: &str) -> Goal {
+        Goal {
+            id: "goal-1".into(),
+            objective: objective.into(),
+            status: GoalStatus::Active,
+            token_budget: None,
+            tokens_used: 0,
+            time_used_seconds: 0,
+        }
+    }
+
     /// Append one user-text message and one assistant-text message
     /// via the high-level [`ConversationView::add_message`] path.
     fn append_user_then_assistant(log: &mut ConversationLog, u: &str, a: &str) {
@@ -1183,6 +1208,92 @@ mod tests {
         assert_eq!(p.message_count, 3);
         assert_eq!(p.first_user_message.as_deref(), Some("hello world"));
         assert!(p.size_bytes > 0);
+    }
+
+    #[test]
+    fn previews_fall_back_to_first_nonempty_goal_objective() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        for objective in [None, Some(""), Some(" \n ")] {
+            log.append_goal_change(objective.map(goal)).expect("goal");
+        }
+        {
+            let p = preview_of(&persistence, log.session_id());
+            assert_eq!(p.first_user_message, None);
+            assert_eq!(p.message_count, 0);
+            assert_eq!(p.last_message_at, p.modified);
+        }
+
+        log.append_goal_change(Some(goal("  Repair login\nKeep compatibility  ")))
+            .expect("submitted goal");
+        {
+            let p = preview_of(&persistence, log.session_id());
+            assert_eq!(
+                p.first_user_message.as_deref(),
+                Some("Repair login\nKeep compatibility")
+            );
+            assert_eq!(p.message_count, 0, "an objective is not a message");
+            assert_eq!(p.last_message_at, p.modified);
+        }
+
+        ConversationView::user(&mut log)
+            .add_message(AgentMessage::internal_context("Pursue the goal".into()))
+            .expect("internal context");
+        let head = log.head().unwrap().clone();
+        ConversationView::subagent(&mut log, head, 1)
+            .add_message(user_msg("Inspect one file for the parent agent"))
+            .expect("delegated task prompt");
+        let before = persistence
+            .session_preview(log.session_id(), &|| false)
+            .expect("read")
+            .expect("preview");
+        log.append_goal_change(Some(goal("Edited objective")))
+            .expect("edit goal");
+        log.append_goal_change(None).expect("clear goal");
+        {
+            let p = preview_of(&persistence, log.session_id());
+            assert_eq!(
+                p.first_user_message.as_deref(),
+                Some("Repair login\nKeep compatibility"),
+                "internal context, delegated tasks, edits and clears do not replace the objective"
+            );
+            assert_eq!(
+                p.message_count, 2,
+                "only internal context and the task are messages"
+            );
+            assert_eq!(p.last_message_at, before.last_message_at);
+        }
+    }
+
+    #[test]
+    fn previews_prefer_genuine_user_text_over_goal_objectives_in_either_order() {
+        for goal_first in [true, false] {
+            let (_dir, persistence) = fixture();
+            let mut log = ConversationLog::create(&persistence).expect("create");
+            ConversationView::user(&mut log)
+                .add_message(AgentMessage::internal_context("Pursue the goal".into()))
+                .expect("internal context");
+            if goal_first {
+                log.append_goal_change(Some(goal("Repair login")))
+                    .expect("goal");
+            }
+            append_user_then_assistant(&mut log, "  Focus on the timeout  ", "Understood");
+            if !goal_first {
+                log.append_goal_change(Some(goal("Repair login")))
+                    .expect("goal");
+            }
+            ConversationView::user(&mut log)
+                .add_message(user_msg("Second user prompt"))
+                .expect("follow-up");
+            {
+                let p = preview_of(&persistence, log.session_id());
+                assert_eq!(
+                    p.first_user_message.as_deref(),
+                    Some("Focus on the timeout")
+                );
+                assert_eq!(p.message_count, 4);
+            }
+        }
     }
 
     /// A file whose stem is not a session id is not a session: the store can

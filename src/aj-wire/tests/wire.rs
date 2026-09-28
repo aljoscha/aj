@@ -773,6 +773,7 @@ fn state_frame_carries_display_settings_and_credential_warning() {
         working: false,
         settings,
         oracle_settings: None,
+        goal: None,
         credential_warning: Some("host credentials are missing".into()),
     };
     let frame = serde_json::to_value(frame).unwrap();
@@ -808,6 +809,7 @@ fn state_round_trips_independent_oracle_settings() {
             working: false,
             settings: main.clone(),
             oracle_settings: oracle_settings.clone(),
+            goal: None,
             credential_warning: None,
         };
         let encoded = serde_json::to_value(frame).unwrap();
@@ -1171,6 +1173,7 @@ fn frame_decode_is_forward_compatible() {
         state.value(),
         Frame::State {
             oracle_settings: None,
+            goal: None,
             credential_warning: None,
             ..
         }
@@ -2923,6 +2926,7 @@ fn local_frames() -> Vec<Frame> {
                 verbosity: "default".to_string(),
             },
             oracle_settings: None,
+            goal: None,
             credential_warning: None,
         },
         Frame::CaughtUp {
@@ -3170,5 +3174,56 @@ fn durable_branch_settings_are_optional_additive_and_losslessly_forwarded() {
     assert_eq!(
         serde_json::from_str::<aj_wire::BranchSettings>("{}").unwrap(),
         aj_wire::BranchSettings::default()
+    );
+}
+
+#[test]
+fn goal_request_is_strict_and_state_round_trips_goal() {
+    use aj_agent::goal::{Goal, GoalStatus};
+    for body in [
+        r#"{"action":{"op":"get"},"extra":true}"#,
+        r#"{"action":{"op":"get","extra":true}}"#,
+        r#"{"action":{"op":"create","objective":"x","time_budget":10}}"#,
+        r#"{"action":{"op":"set_budget","token_budget":5,"extra":true}}"#,
+        r#"{"action":{"op":"replace","objective":"x"},"expected_goal_id":5}"#,
+    ] {
+        assert!(
+            aj_wire::decode_request::<aj_wire::GoalRequest>(body.as_bytes()).is_err(),
+            "{body}"
+        );
+    }
+    for action in [
+        json!({"op":"set_budget", "token_budget":null}),
+        json!({"op":"set_budget", "token_budget":500}),
+        json!({"op":"replace", "objective":"new work", "token_budget":500}),
+        json!({"op":"edit", "objective":"revised work"}),
+    ] {
+        let body = json!({"action":action, "expected_goal_id":"viewed-goal"});
+        let request =
+            aj_wire::decode_request::<aj_wire::GoalRequest>(body.to_string().as_bytes()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), body);
+    }
+    let goal = Goal {
+        id: "g".into(),
+        objective: "finish".into(),
+        status: GoalStatus::Paused,
+        token_budget: Some(100),
+        tokens_used: 25,
+        time_used_seconds: 2,
+    };
+    let mut value = json!({
+        "kind": "state", "session": "s", "epoch": "e", "working": false,
+        "settings": {"provider":"scripted", "model_id":"m", "thinking":"off", "speed":"standard", "verbosity":"default"}
+    });
+    assert!(matches!(
+        serde_json::from_value::<Frame>(value.clone()).unwrap(),
+        Frame::State { goal: None, .. }
+    ));
+    value["goal"] = serde_json::to_value(&goal).unwrap();
+    let frame: Frame = serde_json::from_value(value).unwrap();
+    assert!(matches!(&frame, Frame::State { goal: Some(actual), .. } if actual == &goal));
+    assert_eq!(
+        serde_json::to_value(frame).unwrap()["goal"],
+        serde_json::to_value(goal).unwrap()
     );
 }

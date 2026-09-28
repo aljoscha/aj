@@ -117,6 +117,7 @@ fn state(revision: u64) -> Frame {
             verbosity: "default".into(),
         },
         oracle_settings: None,
+        goal: None,
         credential_warning: None,
     }
 }

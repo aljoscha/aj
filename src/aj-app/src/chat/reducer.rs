@@ -137,9 +137,11 @@ pub fn reduce(
             let message_id = match &message.kind {
                 AgentMessageKind::Wire(Message::User(_) | Message::Assistant(_))
                 | AgentMessageKind::TaskNotification(_) => durable_id(message.id()),
-                AgentMessageKind::Wire(Message::ToolResult(_)) => None,
+                AgentMessageKind::Wire(Message::ToolResult(_))
+                | AgentMessageKind::InternalContext(_) => None,
             };
             match message.kind {
+                AgentMessageKind::InternalContext(_) => Redraw(false),
                 AgentMessageKind::Wire(Message::User(user)) => reduce_user_end(
                     state,
                     agent_id,

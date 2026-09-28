@@ -31,6 +31,7 @@
     "epoch": "epoch-1",
     "opens_block": true,
     "working": false,
+    "goal": null,
     "settings": {
       "context_window": 64000,
       "provider": "scripted",
@@ -46,6 +47,7 @@
     "session": "session-1",
     "epoch": "epoch-1",
     "working": true,
+    "goal": null,
     "settings": {
       "context_window": 64000,
       "provider": "scripted",

@@ -68,6 +68,7 @@ mod corner_box;
 mod footer;
 mod frame_stats_box;
 mod gateway;
+mod goal_ui;
 mod host_picker;
 mod image_store;
 mod interactive;

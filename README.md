@@ -42,14 +42,14 @@ aj "explain this codebase"  # submit a first message on launch
 Most actions live in the **command palette**, opened with
 `Ctrl+O`. From there you can switch model, set the reasoning effort, start or
 resume a session, log in or out, check usage across providers, toggle skills,
-open settings, and more.
+set or manage a **Goal**, open settings, and more.
 
 A handful of keys worth knowing:
 
 | Key | Action |
 | --- | --- |
 | `Enter` | Send your message |
-| `Shift+Enter` | Insert a newline |
+| `Ctrl+J` | Insert a newline (`Shift+Enter` also works where supported) |
 | `Ctrl+O` | Open the command palette |
 | `Ctrl+R` | Search your prompt history |
 | `Tab` | Focus the transcript, then step through older user messages |

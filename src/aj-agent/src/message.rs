@@ -97,6 +97,17 @@ impl AgentMessage {
         }
     }
 
+    /// Application steering, distinct from editable user input.
+    pub fn internal_context(text: String) -> Self {
+        Self {
+            id: format!("{:032x}", rand::random::<u128>()),
+            kind: AgentMessageKind::InternalContext(InternalContext {
+                tag: ContextTag::InternalContext,
+                text,
+            }),
+        }
+    }
+
     /// Borrow the wire [`Message`] this entry *literally stores*, or
     /// `None` for agent-only kinds that have no stored wire form.
     ///
@@ -107,7 +118,7 @@ impl AgentMessage {
     pub fn as_stored_wire(&self) -> Option<&Message> {
         match &self.kind {
             AgentMessageKind::Wire(m) => Some(m),
-            AgentMessageKind::TaskNotification(_) => None,
+            AgentMessageKind::TaskNotification(_) | AgentMessageKind::InternalContext(_) => None,
         }
     }
 
@@ -120,6 +131,9 @@ impl AgentMessage {
     pub fn to_projected_wire(&self) -> Option<Message> {
         match &self.kind {
             AgentMessageKind::Wire(m) => Some(m.clone()),
+            AgentMessageKind::InternalContext(c) => {
+                Some(Message::User(UserMessage::text(c.text.clone())))
+            }
             AgentMessageKind::TaskNotification(n) => {
                 // Byte-identical to the pre-typed tagged string: the
                 // delimiters sit on their own lines so the body renders
@@ -245,6 +259,8 @@ pub enum AgentMessageKind {
     /// projected onto the wire as a framed user message (see
     /// [`AgentMessage::to_projected_wire`]).
     TaskNotification(TaskNotification),
+    /// Host-provided steering, not user-authored text.
+    InternalContext(InternalContext),
 }
 
 impl From<Message> for AgentMessage {
@@ -257,6 +273,24 @@ impl From<Message> for AgentMessage {
 mod tests {
     use super::*;
     use aj_models::types::{TextContent, UserContent};
+
+    #[test]
+    fn internal_context_round_trips_distinct_from_user_input() {
+        let message = AgentMessage::internal_context("host hint".into());
+        assert!(!message.id().is_empty());
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["role"], "internal_context");
+        let restored: AgentMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            restored.kind,
+            AgentMessageKind::InternalContext(_)
+        ));
+        assert!(restored.as_stored_wire().is_none());
+        assert!(matches!(
+            restored.to_projected_wire(),
+            Some(Message::User(_))
+        ));
+    }
 
     #[test]
     fn agent_message_round_trips_through_json() {
@@ -439,4 +473,18 @@ mod tests {
             other => panic!("expected User projection, got {other:?}"),
         }
     }
+}
+
+/// Host-provided context projected to the provider as a user-role message.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InternalContext {
+    #[serde(rename = "role")]
+    tag: ContextTag,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum ContextTag {
+    #[serde(rename = "internal_context")]
+    InternalContext,
 }

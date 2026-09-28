@@ -261,6 +261,7 @@ impl TextField {
     /// Clears the text, keeping the buffer's capacity, and resets scroll state.
     pub fn clear_retaining_capacity(&mut self) {
         self.buf.clear_retaining_capacity();
+        self.previous_val.clear();
         self.reset();
     }
 

@@ -960,6 +960,7 @@ mod tests {
                 working: false,
                 settings: agent_settings(),
                 oracle_settings: None,
+                goal: None,
                 credential_warning: None,
             },
         );

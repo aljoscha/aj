@@ -373,6 +373,8 @@ fn keep_tail(path: &str) -> &str {
 /// Commands that act on "the viewed agent" locally carry the target
 /// explicitly, so a client resolves its own view to a parameter.
 pub enum Command {
+    /// Read or change the goal on the selected user branch.
+    Goal(aj_agent::goal::GoalRequest),
     Prompt {
         agent: AgentId,
         content: Vec<UserContent>,
@@ -491,6 +493,7 @@ pub struct SettingsChange {
 /// What accepting a command handed back.
 #[derive(Debug)]
 pub enum CommandOutcome {
+    Goal(Option<aj_agent::goal::Goal>),
     /// Accepted, with nothing to return.
     Accepted,
     /// The session changed, but a requested save or log record failed.
@@ -2107,7 +2110,10 @@ impl SessionHost {
                 self.inner.cold.archived(&session_id)
             }
         };
-        let log = core.log.lock().await;
+        let mut log = core.log.lock().await;
+        let goal =
+            driver::restore_goal(&mut log).map_err(|err| HostError::Internal(Box::new(err)))?;
+        let goal_revision = u64::from(driver::has_goal_history(&log));
         let (settings, oracle_settings) = settings_of(&core.run_config);
         let status = SessionStatus {
             epoch: mint_epoch(),
@@ -2115,6 +2121,7 @@ impl SessionHost {
             working: false,
             settings,
             oracle_settings,
+            goal,
             // Nothing runs at materialization, so every sub-agent the log
             // names has finished. Seeding them is what keeps a backfill
             // concluding a resumed session's boxes while leaving the
@@ -2129,6 +2136,44 @@ impl SessionHost {
         };
         drop(log);
         let (requests_tx, requests) = unbounded_channel();
+        let goal_requests = requests_tx.clone();
+        let goal_control: aj_agent::goal::GoalControl =
+            Arc::new(move |action, cancel, revision| {
+                let requests = goal_requests.clone();
+                Box::pin(async move {
+                    let (reply, result) = oneshot::channel();
+                    requests
+                        .send(Request::GoalTool {
+                            action,
+                            cancel,
+                            revision,
+                            reply,
+                        })
+                        .map_err(|_| aj_agent::goal::GoalError::Unsupported)?;
+                    result
+                        .await
+                        .map_err(|_| aj_agent::goal::GoalError::Unsupported)?
+                })
+            });
+        {
+            let mut agent = core.agent.lock().await;
+            let goal_inferences = requests_tx.clone();
+            agent.set_goal_control(
+                goal_control,
+                Arc::new(move |cancel| {
+                    let requests = goal_inferences.clone();
+                    Box::pin(async move {
+                        let (reply, result) = oneshot::channel();
+                        requests
+                            .send(Request::GoalInference { cancel, reply })
+                            .map_err(|_| aj_agent::goal::GoalError::Unsupported)?;
+                        result
+                            .await
+                            .map_err(|_| aj_agent::goal::GoalError::Unsupported)?
+                    })
+                }),
+            );
+        }
         let session = Arc::new(LiveSession::new(core, handoff, status, requests_tx));
         let driver = Driver::new(
             Arc::clone(&session),
@@ -2136,6 +2181,7 @@ impl SessionHost {
             events,
             requests,
             persistence_failure,
+            goal_revision,
         );
         // The map remains locked through insertion. If shutdown starts after
         // this check, its drain still includes this owner.
@@ -2235,6 +2281,7 @@ impl SessionHost {
             working_seen,
             settings_seen,
             oracle_settings_seen,
+            goal_seen,
             finished_subs,
             driven_subs,
         ) = {
@@ -2250,6 +2297,7 @@ impl SessionHost {
                 status.working,
                 status.settings.clone(),
                 status.oracle_settings.clone(),
+                status.goal.clone(),
                 status.finished_subs.clone(),
                 status.driven_subs.clone(),
             )
@@ -2304,6 +2352,7 @@ impl SessionHost {
                 working: working_seen,
                 settings: settings_seen.clone(),
                 oracle_settings: oracle_settings_seen.clone(),
+                goal: goal_seen,
                 credential_warning,
             },
         )

@@ -45,6 +45,11 @@ impl PromptInput {
         to_widget_ref(Rc::clone(&self.field))
     }
 
+    /// Clear the input without firing the change callback or changing focus.
+    pub fn clear(&self) {
+        self.field.borrow_mut().clear_retaining_capacity();
+    }
+
     /// Install the change callback, fired with the field's text after each
     /// edit that actually changes it.
     pub fn set_on_change(&self, on_change: impl FnMut(&mut EventContext, &str) + 'static) {
@@ -177,5 +182,27 @@ mod tests {
         // Full width overall, field left with the remainder past the marker.
         assert_eq!(surface.size.width, 20);
         assert_eq!(surface.children[0].surface.size.width, 18);
+    }
+
+    #[test]
+    fn clearing_preserves_focus_and_notifies_when_the_same_query_is_reentered() {
+        let mut prompt = PromptInput::new("> ", Style::default());
+        let changes = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&changes);
+        prompt.set_on_change(move |_, text| observed.borrow_mut().push(text.to_string()));
+        let focus = prompt.focus_target();
+        let paste = crate::vxfw::Event::Paste("pause".into());
+        focus
+            .borrow_mut()
+            .handle_event(&mut EventContext::new(), &paste);
+        prompt.clear();
+        assert_eq!(*changes.borrow(), ["pause"], "clearing is silent");
+        assert!(Rc::ptr_eq(&focus, &prompt.focus_target()));
+        let surface = prompt.draw(&draw_ctx(20, 1));
+        assert!(row_text(&surface.children[0].surface).trim().is_empty());
+        focus
+            .borrow_mut()
+            .handle_event(&mut EventContext::new(), &paste);
+        assert_eq!(*changes.borrow(), ["pause", "pause"]);
     }
 }

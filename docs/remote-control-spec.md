@@ -197,7 +197,7 @@ internally tagged with `kind`:
   the host's runtime fallback or validation. It contains no environment values,
   credentials, or live-only thinking display. Live delivery and backfill supply
   the same context, including across compaction. Older hosts may omit the field.
-- `state`: `{kind, session, epoch, opens_block?, working, settings, oracle_settings?}`.
+- `state`: `{kind, session, epoch, opens_block?, working, settings, oracle_settings?, goal?}`.
   `opens_block: true` marks the `state` that opens an attach block
   (section 5.5), absent reads false. It is the only thing that tells a
   block's opening from an on-change `state`, so a client reads it off the
@@ -220,8 +220,8 @@ internally tagged with `kind`:
   Replay and synthesized continuation starts preserve these changes. Main's
   footer settings come from `state`, not historical settings entries.
   Sent at the start of every attach block, before the backfill and marked
-  `opens_block`, and unmarked whenever `working` or `settings` or
-  `oracle_settings` changes. The host publishes no
+  `opens_block`, and unmarked whenever `working`, `settings`,
+  `oracle_settings`, or `goal` changes. The host publishes no
   "restored session" notice, a client renders one from the first
   attach's `state`. `working` applies on every `state` frame and
   self-heals a spinner left running by a missed `AgentEnd`. It says
@@ -481,6 +481,98 @@ Client application rules:
     session, so the host's return costs an incremental catch-up. Explicit
     selection also retries.
 
+### Goals
+
+Hosts advertise `goals`. Clients attempt the command and show an unsupported
+notice if the host lacks the endpoint, including through a gateway.
+`POST /v1/sessions/{id}/goal` accepts `{ "action": { "op": "get" } }`.
+Every action returns HTTP 200 `{ "goal": <snapshot or null> }`.
+Actions are `get`, `create` (`objective`, optional `token_budget`), `edit`
+(`objective`), `set_budget` (`token_budget`), `replace` (`objective`, optional
+`token_budget`), `pause`, `resume`, `clear`, `complete`, and `block`. Unknown
+fields are rejected. Goals belong only to Main.
+
+Requests may include `expected_goal_id` beside `action`. The host refuses a
+mismatched or missing current goal with 409 `conflict` before applying the
+action. Clients use this field for actions on a displayed goal, so delayed
+edits cannot change a replacement. `replace` requires `expected_goal_id` and
+validates the new objective and budget before replacing anything. It creates
+a new identity with zero usage in one operation. `create` cannot replace an
+unfinished goal. Model tools cannot replace, edit, change budgets, resume or
+clear goals.
+
+Every `state` frame carries the current branch-local `goal`, or null when
+cleared. An absent field decodes as no goal for compatibility. A snapshot has
+`id`, `objective`, `status`, `token_budget`, `tokens_used`, and
+`time_used_seconds`. Status is `active`, `paused`, `blocked`,
+`budget_limited`, `usage_limited`, or `complete`.
+
+Goal state and usage persist on the user branch. Reopening a session or
+switching heads does not automatically pursue a restored goal. Explicit
+resume is required. Cancelling Main pauses pursuit. Reconnecting to a still
+live session does not pause it. Goal commands do not cancel a turn or its tools.
+Explicit pause, block and completion close goal accounting, whether requested
+by the user or the model. Later reporting and descendant results are outside
+that subtotal. Clearing a goal also stops its accounting and continuations.
+Creation, replacement and resume are accepted during work. They admit subsequent
+Main inference into the goal without charging inference already in flight.
+Descendants belong to the goal that admitted their work, not a replacement.
+`edit` steers a changed active objective into the current turn at its next
+inference opportunity. Editing preserves identity,
+budget and usage. Active, paused, blocked and usage-limited states are preserved.
+Editing a complete or budget-limited goal requests activation, but an exhausted
+budget keeps it budget-limited. Tool mutations from an inference preceding a
+user goal change are refused until the model has sampled current goal context.
+
+`set_budget` accepts a positive integer, or null/omission for unlimited. It
+preserves identity, objective and usage, and does not reactivate stopped work.
+Lowering an active goal's budget to or below its usage makes it budget-limited.
+An exhausted goal can resume after the user increases or removes its budget.
+The token budget is soft: usage includes
+uncached input, output, cache writes, and descendant agents, but not cache
+reads. A running turn can exceed the budget. No time budget is supported.
+Three goal turns with `bash` tool errors and no successful Main tool calls stop
+pursuit as blocked. Any successful Main tool call resets that audit, including
+`get_goal`. Text-only turns do not. A normally completed command with a nonzero
+exit code is not a tool error. Resuming or changing the objective starts a fresh
+audit.
+Print mode refuses goal tools without a session host.
+Disabling `update_goal` prevents starting or resuming pursuit, since the model
+must be able to conclude the objective. Active pursuit pauses before its next
+turn if that tool becomes disabled. Usage is checkpointed and best-effort: it
+counts what providers reported, and usage an interrupted run never checkpointed
+is not recovered.
+
+The command palette's Goal entry opens a management window over the same live
+session state as the footer. Actions use Control against the session captured
+at open, never host files. The window has no separate fetched goal snapshot.
+Creation has a multiline objective, an optional positive token budget (blank
+means unlimited), and an explicit Start goal action. Existing goals offer
+objective and budget editing, Pause, Resume, Clear, and a new-goal flow.
+Replacing unfinished work asks for confirmation. Submitting an objective edit
+that resumes completed work says so. Exhausted goals offer budget adjustment
+rather than a Resume action that must fail. Streamed updates keep status and
+usage current without replacing editor drafts. Failed requests retain open
+drafts for correction or retry, and request errors remain visible after the
+window closes. Successful actions clear the action filter. Management shows a
+wrapped objective preview. The objective editor shows the full text, and Escape
+closes it without making changes.
+Entering an idle saved session with a resumable paused, blocked
+or usage-limited goal offers Resume or leave stopped, without prompting again
+on live pauses or reconnects.
+There is no slash-argument command interface. The footer reads live snapshots
+and shows one compact goal phrase per status. Active pursuit shows budget usage,
+or elapsed runtime without a budget. Paused, stalled (blocked) and
+usage-limited goals show the control hint. A budget-limited goal shows its
+usage against the budget. A complete goal shows tokens used when it had a
+budget, otherwise elapsed runtime.
+Runtime advances locally between snapshots while the goal is active and Main
+is working, including while viewing another agent. Stopped goals and unsettled
+connections show the host's recorded time. This display clock never changes
+persisted usage.
+The goal is right-aligned and reserves its width, so narrow terminals truncate
+the usual fields before it. Only a goal wider than the whole footer is omitted.
+
 ### 5.6 Commands
 
 Commands are JSON POSTs. Effects are observable on the stream or the
@@ -705,7 +797,12 @@ side's limitation. Neither side's values fall back to the other's.
   bearer tokens, or credential contents travel in either request or report.
 - `GET /v1/previews?session=<id>` (repeatable): the session browser's
   `SessionPreviews` in `aj-wire`, `{previews, incomplete}`. Each preview
-  carries the full first user text block, message count, creation and
+  carries the full first nonempty user-thread user text block in
+  `first_user_message`, falling back to the first nonempty goal objective when
+  no such message exists.
+  Internal context and delegated task prompts are not user input. This fallback
+  does not count as a message.
+  Previews also carry message count, creation and
   last-message timestamps, file modification time and size, tag, and archive
   bit, describing the whole log rather than the active branch. The read uses
   the ordinary preview scanner without materializing any session. An id the

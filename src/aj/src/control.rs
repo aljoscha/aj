@@ -663,6 +663,7 @@ impl Control {
 /// credentials, so a client never hands a peer a model row it made up.
 fn wire_command(command: Command) -> RemoteCommand {
     match command {
+        Command::Goal(request) => RemoteCommand::Goal(request),
         Command::Prompt { agent, content } => RemoteCommand::Prompt(PromptRequest {
             agent: agent_target(agent),
             input: PromptInput::Content { content },
@@ -1262,3 +1263,6 @@ mod context_tests;
 
 #[cfg(test)]
 mod task_output_tests;
+
+#[cfg(test)]
+mod goal_tests;

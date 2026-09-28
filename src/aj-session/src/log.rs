@@ -33,6 +33,7 @@ use std::{
 };
 
 use aj_agent::events::AgentSettings;
+use aj_agent::goal::Goal;
 use aj_agent::message::AgentMessage;
 use aj_models::types::Message;
 use chrono::{DateTime, Utc};
@@ -459,6 +460,8 @@ pub enum ConversationEntryKind {
     /// Meta records provide a session baseline. Values remain on disk for
     /// restore but are never included in replay notices.
     EnvChange { env: BTreeMap<String, String> },
+    /// A complete goal snapshot on the user branch. `None` explicitly clears it.
+    GoalChange { goal: Option<Goal> },
     /// The context the session was created with, as the user sees it: the base
     /// system prompt, the instruction files stitched into it, and the skills
     /// discovered for it. Written once as root-parented [`ThreadKind::Meta`]
@@ -542,9 +545,11 @@ impl ConversationEntryKind {
     /// A `Compaction` checkpoint is likewise punctuation: it must be
     /// durable on its own so that resuming a compacted-then-abandoned
     /// session still sees the reduced context.
+    /// A goal is also a submitted task, even before its first inference.
+    /// Its state must survive a restart independently of model messages.
     pub fn is_punctuation(&self) -> bool {
         match self {
-            Self::Message { .. } | Self::Compaction { .. } => true,
+            Self::Message { .. } | Self::Compaction { .. } | Self::GoalChange { .. } => true,
             Self::SystemPrompt { .. }
             | Self::ModelChange { .. }
             | Self::OracleModelChange { .. }
@@ -755,7 +760,9 @@ impl SessionSettings {
             ConversationEntryKind::VerbosityChange { verbosity } => {
                 self.verbosity = Some(verbosity.clone());
             }
-            ConversationEntryKind::EnvChange { .. } | ConversationEntryKind::Context { .. } => {}
+            ConversationEntryKind::EnvChange { .. }
+            | ConversationEntryKind::GoalChange { .. }
+            | ConversationEntryKind::Context { .. } => {}
             ConversationEntryKind::SubAgentSpawn { settings: snap, .. } => {
                 self.model = Some((snap.provider.clone(), snap.model_id.clone()));
                 self.thinking = Some(snap.thinking.clone());
@@ -1054,6 +1061,23 @@ pub struct ConversationLog {
 }
 
 impl LogSnapshot {
+    /// Latest user-branch goal on the ancestry ending at `head`, inclusive.
+    /// An explicit clear stops inheritance. Meta and sub-agent records are ignored.
+    /// An unknown head or a broken chain without a goal yields `None`.
+    pub fn goal_at(&self, head: &EntryId) -> Option<Goal> {
+        let mut cursor = Some(head);
+        while let Some(id) = cursor {
+            let entry = self.entries.get(id)?;
+            if entry.thread == ThreadKind::User
+                && let ConversationEntryKind::GoalChange { goal } = &entry.entry
+            {
+                return goal.clone();
+            }
+            cursor = entry.parent_id.as_ref();
+        }
+        None
+    }
+
     /// The id under which this log is listed by `aj list-sessions`.
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -1988,6 +2012,11 @@ impl ConversationLog {
         self.core.settings_at(head)
     }
 
+    /// See [`LogSnapshot::goal_at`]. Does not select the head.
+    pub fn goal_at(&self, head: &EntryId) -> Option<Goal> {
+        self.core.goal_at(head)
+    }
+
     /// The entry tree behind this log, for in-crate readers that already
     /// hold the log.
     pub(crate) fn core(&self) -> &LogSnapshot {
@@ -2264,6 +2293,19 @@ impl ConversationLog {
         env: BTreeMap<String, String>,
     ) -> Result<EntryRef, ConversationError> {
         self.append_state_entry(ThreadFilter::USER, ConversationEntryKind::EnvChange { env })
+    }
+
+    /// Replace or clear the goal on the active user branch.
+    /// A goal is a submitted task, so this materializes the log even when no
+    /// model messages have been recorded.
+    pub fn append_goal_change(
+        &mut self,
+        goal: Option<Goal>,
+    ) -> Result<EntryRef, ConversationError> {
+        self.append_state_entry(
+            ThreadFilter::USER,
+            ConversationEntryKind::GoalChange { goal },
+        )
     }
 
     /// Record what the session's system prompt was assembled from, beside the
@@ -4807,6 +4849,102 @@ mod tests {
                 "tail repair ran before identity validation"
             );
         }
+    }
+
+    fn test_goal() -> Goal {
+        Goal {
+            id: "goal-1".into(),
+            objective: "Implement the requested feature".into(),
+            status: aj_agent::goal::GoalStatus::Active,
+            token_budget: Some(10_000),
+            tokens_used: 123,
+            time_used_seconds: 45,
+        }
+    }
+
+    #[test]
+    fn goals_inherit_at_the_fork_point_and_round_trip_with_clears() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        let root = log.set_system_prompt("p".into()).expect("root");
+        assert_eq!(log.goal_at(&root.id), None);
+        let original = test_goal();
+        let seed = log
+            .append_goal_change(Some(original.clone()))
+            .expect("goal");
+        assert_eq!(log.parent_of(&seed.id), Some(&root.id));
+        assert_eq!(log.head(), Some(&seed.id));
+        assert!(
+            log.is_durable(),
+            "a submitted goal must survive before the first inference"
+        );
+        let saved = ConversationLog::resume(&persistence, log.session_id()).expect("saved goal");
+        assert_eq!(saved.goal_at(&seed.id), Some(original.clone()));
+        let common = punctuation(&mut log, "common").expect("publish");
+        let edited_goal = Goal {
+            status: aj_agent::goal::GoalStatus::Paused,
+            tokens_used: 456,
+            token_budget: None,
+            ..original.clone()
+        };
+        let edited = log
+            .append_goal_change(Some(edited_goal.clone()))
+            .expect("edit");
+        log.set_head(common.id.clone()).expect("fork");
+        let sibling = punctuation(&mut log, "sibling").expect("sibling");
+        assert_eq!(log.goal_at(&sibling.id), Some(original.clone()));
+        let cleared = log.append_goal_change(None).expect("clear");
+        assert_eq!(log.parent_of(&cleared.id), Some(&sibling.id));
+        assert_eq!(log.goal_at(&cleared.id), None);
+        assert_eq!(log.goal_at(&edited.id), Some(edited_goal.clone()));
+        log.flush_pending().expect("flush trailing clear");
+        let resumed = ConversationLog::resume(&persistence, log.session_id()).expect("resume");
+        assert_eq!(resumed.head(), Some(&cleared.id));
+        for (head, expected) in [
+            (&root.id, None),
+            (&common.id, Some(original.clone())),
+            (&sibling.id, Some(original)),
+            (&edited.id, Some(edited_goal)),
+            (&cleared.id, None),
+        ] {
+            assert_eq!(resumed.goal_at(head), expected);
+        }
+    }
+
+    #[test]
+    fn goal_metadata_survives_compaction_without_entering_messages_or_replay() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        log.set_system_prompt("p".into()).expect("root");
+        let goal = test_goal();
+        let seed = log.append_goal_change(Some(goal.clone())).expect("goal");
+        let conv = log.linearize(&seed.id, ThreadFilter::USER);
+        assert!(conv.messages().is_empty());
+        assert!(conv.agent_messages().is_empty());
+        assert!(crate::replay::replay(&log).next().is_none());
+        punctuation(&mut log, "summarized").expect("prefix");
+        let tail = punctuation(&mut log, "retained").expect("tail");
+        let compacted = log
+            .append_compaction(
+                ThreadFilter::USER,
+                "summary".into(),
+                tail.id,
+                vec![],
+                1000,
+                None,
+                aj_models::types::Usage::default(),
+            )
+            .expect("compact");
+        let resumed = ConversationLog::resume(&persistence, log.session_id()).expect("resume");
+        let conv = resumed.linearize(&compacted.id, ThreadFilter::USER);
+        assert_eq!(
+            conv.messages().len(),
+            2,
+            "only summary and retained message"
+        );
+        assert_eq!(resumed.goal_at(&compacted.id), Some(goal));
     }
 
     #[test]

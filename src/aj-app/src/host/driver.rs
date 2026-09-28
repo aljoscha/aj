@@ -49,6 +49,9 @@ use crate::session::AgentLifecycle;
 use crate::settings::{ConfirmOutcome, PersistAction};
 use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 
+mod goal;
+pub(crate) use goal::{context as goal_context, has_goal_history, restore_goal};
+
 /// Resolve a head target against `log` to the entry the head moves to.
 ///
 /// A `before` target answers its entry's parent, which is what makes a branch
@@ -126,6 +129,10 @@ pub(crate) struct Driver {
     /// polled again and a turn that failed on that same write does not report
     /// the storage error a second time.
     persistence_failed: bool,
+    goal: goal::GoalRun,
+    /// Zero means no goal history. User mutations advance this revision, which
+    /// admission returns to fence tools from an older objective or stop request.
+    goal_revision: u64,
 }
 
 impl Driver {
@@ -135,8 +142,10 @@ impl Driver {
         events: UnboundedReceiver<TaggedEvent>,
         requests: UnboundedReceiver<Request>,
         persistence_failure: oneshot::Receiver<PersistenceFailure>,
+        goal_revision: u64,
     ) -> Self {
         let turns = Turns::with_handoff(session.handoff.clone());
+        let goal = goal::GoalRun::new(session.status().goal.clone());
         Self {
             session,
             shared,
@@ -146,6 +155,8 @@ impl Driver {
             requests,
             persistence_failure,
             persistence_failed: false,
+            goal,
+            goal_revision,
         }
     }
 
@@ -180,6 +191,26 @@ impl Driver {
                     // channel rather than the state before them.
                     self.catch_up();
                     match request {
+                        Some(Request::GoalInference { cancel, reply }) => {
+                            let outcome = if cancel.is_cancelled() || reply.is_closed() {
+                                Err(aj_agent::goal::GoalError::Conflict("The originating turn was cancelled.".into()))
+                            } else {
+                                Ok(self.admit_goal_inference())
+                            };
+                            let _ = reply.send(outcome);
+                        }
+                        Some(Request::GoalTool { action, cancel, revision, reply }) => {
+                            let outcome = if cancel.is_cancelled() || reply.is_closed() {
+                                Err(aj_agent::goal::GoalError::Conflict("The originating turn was cancelled.".into()))
+                            } else if !matches!(action, aj_agent::goal::GoalAction::Get)
+                                && revision != self.goal_revision
+                            {
+                                Err(aj_agent::goal::GoalError::Conflict("The user changed the goal after this inference started. Read the current goal context before updating it.".into()))
+                            } else {
+                                self.goal_action(action, true).await
+                            };
+                            let _ = reply.send(outcome);
+                        }
                         Some(Request::Command { command, reply }) => {
                             let outcome = self.command(command).await;
                             let _ = reply.send(outcome);
@@ -213,6 +244,13 @@ impl Driver {
 
                 joined = self.turns.join_next() => self.on_join(joined),
             }
+            if let Err(err) = self.checkpoint_goal().await {
+                self.fail_goal_persistence(err).await;
+            } else if self.requests.is_empty() && self.events.is_empty() {
+                if let Err(err) = self.continue_goal().await {
+                    self.fail_goal_persistence(err).await;
+                }
+            }
         }
     }
 
@@ -241,6 +279,7 @@ impl Driver {
             event,
             branch_settings,
         } = tagged;
+        self.observe_goal_event(&event);
         // Captured off a borrow, because `publish_event` below takes the
         // event by value. The wake it decides on has to wait until after
         // `apply_lifecycle`: `Turns::spawn_wake` refuses a busy owner, and
@@ -321,6 +360,9 @@ impl Driver {
     /// reap swept, wake on queued work, and surface the outcome.
     fn on_join(&mut self, joined: Joined) {
         let Joined { agent, outcome } = joined;
+        if agent == AgentId::Main {
+            self.goal.finish(&outcome);
+        }
         for idled in self
             .turns
             .reap(&mut self.lifecycle, &self.session.core.task_registry, agent)
@@ -405,6 +447,9 @@ impl Driver {
     }
 
     fn wake(&mut self, owner: AgentId) {
+        if !self.turns.is_busy(&self.lifecycle, owner) {
+            self.prepare_goal_turn(owner, false);
+        }
         self.note_driven(owner, true);
         self.turns.spawn_wake(
             owner,
@@ -527,9 +572,19 @@ impl Driver {
 
     async fn command(&mut self, command: Command) -> Result<CommandOutcome, HostError> {
         match command {
+            Command::Goal(request) => self
+                .goal_request(request)
+                .await
+                .map(CommandOutcome::Goal)
+                .map_err(goal::host_error),
             Command::Prompt { agent, content } => self.prompt(agent, content),
             Command::Steer { agent, text } => self.steer(agent, text),
-            Command::Cancel { agent } => self.cancel(agent),
+            Command::Cancel { agent } => {
+                if agent == AgentId::Main {
+                    self.pause_goal().await?;
+                }
+                self.cancel(agent)
+            }
             Command::Queue(op) => Ok(self.queue_op(op)),
             Command::Compact { instructions } => self.compact(instructions),
             Command::Settings(change) => self.settings(change).await,
@@ -740,6 +795,7 @@ impl Driver {
     }
 
     fn spawn(&mut self, agent: AgentId, start: TurnStart) -> Result<CommandOutcome, HostError> {
+        self.prepare_goal_turn(agent, matches!(&start, TurnStart::Goal(_)));
         // Before the spawn: a sub-agent's turn task can append to its thread
         // as soon as it runs, and a backfill in between has to see the run as
         // live rather than as the finished one it continues.
@@ -1215,6 +1271,11 @@ impl Driver {
             let entry = resolve_head_target(&log, &target)?;
             let (prepared, env) = self.prepare_head(&log, &entry, &changes).await?;
             log.set_head(entry).map_err(internal)?;
+            self.goal = goal::GoalRun::new(restore_goal(&mut log).map_err(internal)?);
+            self.session
+                .core
+                .message_queues
+                .set_context(AgentId::Main, None);
             for agent in self.session.core.message_queues.queued_agents() {
                 self.session.core.message_queues.clear(agent);
                 self.publish_queue(agent);
@@ -1244,6 +1305,7 @@ impl Driver {
             // an attach that snapshots the log cannot pair the new
             // projection with the old epoch.
             let mut status = self.session.status();
+            status.goal = self.goal.current.clone();
             (status.settings, status.oracle_settings) = settings_of(&self.session.core.run_config);
             status.epoch = mint_epoch();
             status.last_seq = log.last_seq();
@@ -1337,6 +1399,7 @@ impl Driver {
     /// hold, and a release is waited on with the host's session map held.
     async fn wind_down(&mut self) {
         self.session.start_draining();
+        self.goal.stop_pursuit();
         self.turns.cancel_all();
         let grace = tokio::time::sleep(TURN_DRAIN_GRACE);
         tokio::pin!(grace);
@@ -1366,6 +1429,10 @@ impl Driver {
         // Detached task drivers emit their terminal events while quiescing.
         // Publish those before the host closes the attachment streams.
         self.drain_events();
+        match tokio::time::timeout(LOG_FLUSH_GRACE, self.checkpoint_goal()).await {
+            Ok(Ok(())) => {}
+            outcome => tracing::warn!(?outcome, "could not checkpoint goal usage at teardown"),
+        }
         // Buffered non-punctuation entries (the state records, spawn
         // roots) are lost with the process otherwise: nothing else forces
         // them out.

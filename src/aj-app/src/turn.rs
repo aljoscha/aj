@@ -41,13 +41,20 @@ fn tools_for_turn(
 ) -> Vec<aj_agent::tool::ErasedToolDefinition> {
     let mut tools = builtin_tools_for_model(options, disabled, family);
     if !include_agent_tool {
-        tools.retain(|tool| tool.name != "agent" && tool.name != "oracle");
+        tools.retain(|tool| {
+            !matches!(
+                tool.name.as_str(),
+                "agent" | "oracle" | "create_goal" | "get_goal" | "update_goal"
+            )
+        });
     }
     tools
 }
 
 /// How a turn sequence begins.
 pub enum TurnStart {
+    /// Application-generated goal continuation, not a user-authored prompt.
+    Goal(String),
     /// A typed user prompt. Drives [`Agent::prompt`].
     Prompt(String),
     /// CLI launch content (text + `@file`/image blocks). Drives
@@ -564,6 +571,7 @@ pub async fn drive_turn(
             .await;
             return Ok(());
         }
+        TurnStart::Goal(text) => agent.prompt_context(text, cancel.clone()).await,
         TurnStart::Prompt(text) => agent.prompt(text, cancel.clone()).await,
         TurnStart::Content(content) => agent.prompt_with_content(content, cancel.clone()).await,
         TurnStart::Wake => agent.wake(cancel.clone()).await.map(|_| ()),

@@ -1234,6 +1234,11 @@ pub struct SpawnAgentConfig {
 /// list), sub-agent spawning, progress updates, and a cancellation
 /// token tools must honor for long-running work.
 pub trait ToolContext: Send {
+    /// Application-owned goal capability. Absent in print mode and subagents.
+    fn goal(&self, _action: crate::goal::GoalAction) -> crate::goal::GoalFuture {
+        Box::pin(async { Err(crate::goal::GoalError::Unsupported) })
+    }
+
     /// Current working directory for the session.
     fn working_directory(&self) -> PathBuf;
 

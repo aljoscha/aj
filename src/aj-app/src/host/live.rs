@@ -32,6 +32,16 @@ use crate::session_setup::RunConfigSnapshot;
 /// the driver is the single writer of the turn set, the lifecycle, and the
 /// published status, and no command can race a turn's own bookkeeping.
 pub(crate) enum Request {
+    GoalInference {
+        cancel: tokio_util::sync::CancellationToken,
+        reply: oneshot::Sender<Result<u64, aj_agent::goal::GoalError>>,
+    },
+    GoalTool {
+        action: aj_agent::goal::GoalAction,
+        cancel: tokio_util::sync::CancellationToken,
+        revision: u64,
+        reply: oneshot::Sender<Result<Option<aj_agent::goal::Goal>, aj_agent::goal::GoalError>>,
+    },
     Command {
         command: Command,
         reply: oneshot::Sender<Result<CommandOutcome, HostError>>,
@@ -118,6 +128,7 @@ pub(crate) struct SessionStatus {
     pub(crate) settings: AgentSettings,
     /// The Oracle settings staged for the next main turn, cached beside main.
     pub(crate) oracle_settings: Option<AgentSettings>,
+    pub(crate) goal: Option<aj_agent::goal::Goal>,
     /// The sub-agents the host has observed going idle, plus every one the
     /// log already named when the session was materialized (nothing runs at
     /// that point, so they are all finished).
@@ -185,6 +196,7 @@ impl SessionStatus {
             working: self.working,
             settings: self.settings.clone(),
             oracle_settings: self.oracle_settings.clone(),
+            goal: self.goal.clone(),
             credential_warning: None,
         }
     }

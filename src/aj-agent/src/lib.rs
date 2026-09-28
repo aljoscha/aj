@@ -8,6 +8,7 @@
 pub mod bus;
 pub mod error;
 pub mod events;
+pub mod goal;
 pub mod hooks;
 pub mod message;
 pub mod projection;
@@ -306,6 +307,10 @@ pub struct Agent {
     /// and kill tasks. Tasks in a default registry die with the
     /// process — same caveats as [`SubAgentRegistry`].
     task_registry: TaskRegistry,
+    /// Main-only application capability, absent in standalone/print execution.
+    goal_control: Option<goal::GoalControl>,
+    goal_admission: Option<goal::GoalAdmission>,
+    inference_goal_revision: u64,
     /// Shared steering / follow-up message queues, keyed by
     /// [`AgentId`]. The binary injects a shared instance and threads a
     /// clone into each spawned sub-agent (see
@@ -399,6 +404,9 @@ impl Agent {
             block_images: false,
             sub_agent_registry: SubAgentRegistry::default(),
             task_registry: TaskRegistry::default(),
+            goal_control: None,
+            goal_admission: None,
+            inference_goal_revision: 0,
             message_queues: MessageQueues::default(),
             max_tool_concurrency: max_tool_concurrency(),
             stream_retry_limit: DEFAULT_STREAM_RETRY_LIMIT,
@@ -962,8 +970,48 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<(), TurnError> {
         self.cancellation = cancel;
-        self.run_top_level_turn(Some(UserMessage::text(message)))
+        self.run_top_level_turn(Some(AgentMessage::wire(Message::User(UserMessage::text(
+            message,
+        )))))
+        .await
+    }
+
+    /// Run a normal turn with host context instead of user-authored input.
+    pub async fn prompt_context(
+        &mut self,
+        text: String,
+        cancel: CancellationToken,
+    ) -> Result<(), TurnError> {
+        self.cancellation = cancel;
+        self.run_top_level_turn(Some(AgentMessage::internal_context(text)))
             .await
+    }
+
+    /// Install the main-agent application capability. It is never inherited.
+    /// Admission captures ownership and a context revision before each inference.
+    /// Tools carry that revision so user changes can invalidate stale mutations.
+    pub fn set_goal_control(&mut self, control: goal::GoalControl, admission: goal::GoalAdmission) {
+        self.goal_control = Some(control);
+        self.goal_admission = Some(admission);
+    }
+
+    /// Settle goal accounting and admit Main inference, including host-driven
+    /// compaction. Call before starting provider work, without holding the log.
+    /// This does not drain context or authorize pursuit of a stopped goal.
+    pub async fn admit_goal_inference(
+        &mut self,
+        cancel: CancellationToken,
+    ) -> Result<(), TurnError> {
+        if self.agent_id == AgentId::Main
+            && let Some(admit) = &self.goal_admission
+        {
+            self.inference_goal_revision = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(TurnError::Aborted),
+                result = admit(cancel.clone()) => result.map_err(|err| TurnError::Fatal(Box::new(err)))?,
+            };
+        }
+        Ok(())
     }
 
     /// Like [`Agent::prompt`], but the user message carries explicit
@@ -977,8 +1025,10 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<(), TurnError> {
         self.cancellation = cancel;
-        self.run_top_level_turn(Some(UserMessage::new(content)))
-            .await
+        self.run_top_level_turn(Some(AgentMessage::wire(Message::User(UserMessage::new(
+            content,
+        )))))
+        .await
     }
 
     /// Wake the agent on pending work it can react to without a fresh
@@ -1049,7 +1099,7 @@ impl Agent {
     /// [`Agent::continue_run`] and [`Agent::wake`] (the existing
     /// transcript — including any just-drained notices — is fed back
     /// to the model unchanged).
-    async fn run_top_level_turn(&mut self, prompt: Option<UserMessage>) -> Result<(), TurnError> {
+    async fn run_top_level_turn(&mut self, prompt: Option<AgentMessage>) -> Result<(), TurnError> {
         // Mirror the run as `AgentStart` / `AgentEnd` events on the
         // bus. `AgentEnd` carries a clone of the agent's transcript
         // so a listener can take a final snapshot without replaying
@@ -1076,8 +1126,19 @@ impl Agent {
 
     async fn run_top_level_turn_inner(
         &mut self,
-        prompt: Option<UserMessage>,
+        prompt: Option<AgentMessage>,
     ) -> Result<(), TurnError> {
+        // A synthetic continuation was prepared before this task started. Newer
+        // steering and user input must follow it, not be superseded by it.
+        let prompt = match prompt {
+            Some(message)
+                if matches!(&message.kind, message::AgentMessageKind::InternalContext(_)) =>
+            {
+                self.record_input(message).await?;
+                None
+            }
+            other => other,
+        };
         // Notices that arrived while the agent was idle land before
         // the user's new message, in arrival order.
         self.drain_task_notices().await?;
@@ -1087,32 +1148,12 @@ impl Agent {
         // first (more urgent), then follow-up. On a fresh user prompt
         // both queues are empty (the queue box only appears while the
         // agent is busy), so these are no-ops.
+        self.drain_context().await?;
         self.drain_queued_messages(PendingKind::Steering).await?;
         self.drain_queued_messages(PendingKind::FollowUp).await?;
 
-        if let Some(user) = prompt {
-            // Append the user message to the in-memory transcript
-            // and emit a `MessageStart` / `MessageEnd` pair so
-            // listeners (renderers + the persistence listener) see
-            // a complete lifecycle for the user input. The
-            // transcript update happens before the bus emits so
-            // the in-memory state can never trail the bus.
-            let user_message = AgentMessage::wire(Message::User(user));
-            self.transcript.push(user_message.clone());
-            self.bus
-                .emit(AgentEvent::MessageStart {
-                    agent_id: self.agent_id,
-                    message: user_message.clone(),
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
-            self.bus
-                .emit(AgentEvent::MessageEnd {
-                    agent_id: self.agent_id,
-                    message: user_message,
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
+        if let Some(user_message) = prompt {
+            self.record_input(user_message).await?;
         }
 
         self.execute_turn().await
@@ -1289,11 +1330,11 @@ impl Agent {
             }
             retrying = false;
 
-            let mut response_stream = self.run_inference_streaming();
-            // Cheap clone — `CancellationToken` is `Arc`-backed and
-            // the same handle is shared with the provider task via
-            // `run_inference_streaming`'s `options.cancel`.
-            let cancel = self.cancellation.clone();
+            // Admission precedes the context drain. A racing edit can deliver
+            // newer text with an older revision, never authorize tools against
+            // a revised objective the model has not seen.
+            self.admit_goal_inference(self.cancellation.clone()).await?;
+            self.drain_context().await?;
 
             // Bracket the streaming inference with `MessageStart` /
             // `MessageEnd`.
@@ -1309,6 +1350,9 @@ impl Agent {
                 })
                 .await
                 .map_err(TurnError::Fatal)?;
+
+            let mut response_stream = self.run_inference_streaming();
+            let cancel = self.cancellation.clone();
 
             // Terminal `AssistantMessage` captured from the stream's
             // `Done` (success) or `Error` (failure) event. The
@@ -1712,6 +1756,7 @@ impl Agent {
                 // results and before the next inference — the urgent
                 // path. Follow-up messages are left for the wake drain
                 // when the turn ends.
+                self.drain_context().await?;
                 self.drain_queued_messages(PendingKind::Steering).await?;
 
                 // Continue the conversation loop to get the model's
@@ -1784,6 +1829,33 @@ impl Agent {
                 .map_err(TurnError::Fatal)?;
         }
         Ok(())
+    }
+
+    async fn drain_context(&mut self) -> Result<(), TurnError> {
+        if let Some(text) = self.message_queues.take_context(self.agent_id) {
+            self.record_input(AgentMessage::internal_context(text))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn record_input(&mut self, message: AgentMessage) -> Result<(), TurnError> {
+        // Transcript ownership precedes publication to renderers and persistence.
+        self.transcript.push(message.clone());
+        self.bus
+            .emit(AgentEvent::MessageStart {
+                agent_id: self.agent_id,
+                message: message.clone(),
+            })
+            .await
+            .map_err(TurnError::Fatal)?;
+        self.bus
+            .emit(AgentEvent::MessageEnd {
+                agent_id: self.agent_id,
+                message,
+            })
+            .await
+            .map_err(TurnError::Fatal)
     }
 
     /// Drain `kind`'s queued messages for this agent into the
@@ -2151,6 +2223,8 @@ impl Agent {
             speed: self.speed,
             sub_agent_registry: self.sub_agent_registry.clone(),
             task_registry: self.task_registry.clone(),
+            goal_control: self.goal_control.clone(),
+            goal_revision: self.inference_goal_revision,
             message_queues: self.message_queues.clone(),
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -3410,6 +3484,9 @@ struct SessionContextWrapper<'a> {
     /// tasks started by this tool call (and by spawned sub-agents)
     /// land in the same map the binary observes.
     task_registry: TaskRegistry,
+    /// Main-only capability borrowed by goal tools.
+    goal_control: Option<goal::GoalControl>,
+    goal_revision: u64,
     /// Shared steering / follow-up message queues, cloned from the
     /// parent so a spawned sub-agent drains the same per-agent slots
     /// the binary's TUI enqueues onto.
@@ -3441,7 +3518,7 @@ impl SessionContextWrapper<'_> {
             let allowed_tool_names = config
                 .as_ref()
                 .map(|config| config.tools.iter().map(|tool| tool.name.clone()).collect());
-            let config = config.unwrap_or_else(|| tool::SpawnAgentConfig {
+            let mut config = config.unwrap_or_else(|| tool::SpawnAgentConfig {
                 provider: Arc::clone(&self.provider),
                 model_info: Arc::clone(&self.model_info),
                 stream_options: self.stream_options.clone(),
@@ -3455,6 +3532,12 @@ impl SessionContextWrapper<'_> {
                     .cloned()
                     .collect(),
                 system_prompt_suffix: String::new(),
+            });
+            config.tools.retain(|tool| {
+                !matches!(
+                    tool.name.as_str(),
+                    "create_goal" | "get_goal" | "update_goal"
+                )
             });
             // Get the next agent ID
             let agent_id = self.session_state.next_sub_agent_id();
@@ -3671,6 +3754,15 @@ impl SessionContextWrapper<'_> {
 }
 
 impl ToolContext for SessionContextWrapper<'_> {
+    fn goal(&self, action: goal::GoalAction) -> goal::GoalFuture {
+        if self.agent_id == AgentId::Main {
+            if let Some(control) = &self.goal_control {
+                return control(action, self.cancellation.clone(), self.goal_revision);
+            }
+        }
+        Box::pin(async { Err(goal::GoalError::Unsupported) })
+    }
+
     fn working_directory(&self) -> PathBuf {
         self.session_state.working_directory()
     }
@@ -4541,6 +4633,7 @@ mod event_protocol_tests {
             AgentMessageKind::Wire(Message::Assistant(_)) => "Assistant",
             AgentMessageKind::Wire(Message::ToolResult(_)) => "ToolResult",
             AgentMessageKind::TaskNotification(_) => "TaskNotification",
+            AgentMessageKind::InternalContext(_) => "InternalContext",
         }
     }
 
@@ -5401,6 +5494,122 @@ mod event_protocol_tests {
             }
             other => panic!("expected ToolDetails::Text, got {other:#?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn goal_tool_capability_is_main_only_and_opt_in() {
+        let mut tool: ErasedToolDefinition = PingTool.into();
+        tool.func = Arc::new(|ctx, _| {
+            Box::pin(async move {
+                let result = ctx.goal(crate::goal::GoalAction::Get).await;
+                Ok(ToolOutcome {
+                    content: Vec::new(),
+                    details: ToolDetails::Text {
+                        summary: String::new(),
+                        body: String::new(),
+                    },
+                    is_error: result.is_err(),
+                })
+            })
+        });
+        let mut agent = build_agent(Vec::new(), vec![tool]);
+        assert!(
+            agent
+                .execute_tool("call", "ping", serde_json::json!({}))
+                .await
+                .unwrap()
+                .is_error
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        agent.set_goal_control(
+            Arc::new(move |_, _, _| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(None) })
+            }),
+            Arc::new(|_| Box::pin(async { Ok(0) })),
+        );
+        assert!(
+            !agent
+                .execute_tool("call", "ping", serde_json::json!({}))
+                .await
+                .unwrap()
+                .is_error
+        );
+        agent.set_agent_id(AgentId::Sub(1));
+        assert!(
+            agent
+                .execute_tool("call", "ping", serde_json::json!({}))
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn host_context_is_persistable_but_does_not_wake_a_turn() {
+        use crate::message::AgentMessageKind;
+        let mut agent = build_agent(
+            vec![
+                finalize_script(finalize_text("ok")),
+                finalize_script(finalize_text("ok")),
+            ],
+            Vec::new(),
+        );
+        agent
+            .message_queues
+            .set_context(AgentId::Main, Some("snapshot".into()));
+        assert!(matches!(
+            agent.wake(CancellationToken::new()).await.unwrap(),
+            crate::WakeOutcome::Empty
+        ));
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::MessageEnd { message, .. } = event {
+                sink.lock().unwrap().push(message.clone());
+            }
+        }));
+        agent
+            .prompt("real user".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        {
+            let messages = recorded.lock().unwrap();
+            assert!(matches!(
+                messages[0].kind,
+                AgentMessageKind::InternalContext(_)
+            ));
+            assert!(matches!(
+                messages[1].kind,
+                AgentMessageKind::Wire(Message::User(_))
+            ));
+        }
+        agent
+            .message_queues
+            .set_context(AgentId::Main, Some("stale goal".into()));
+        agent
+            .message_queues
+            .set_context(AgentId::Main, Some("revised goal".into()));
+        agent
+            .message_queues
+            .append_follow_up(AgentId::Main, "new user request");
+        agent
+            .prompt_context("continue goal".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let messages = recorded.lock().unwrap();
+        assert!(matches!(
+            &messages[3].kind,
+            AgentMessageKind::InternalContext(context) if context.text == "continue goal"
+        ));
+        assert!(matches!(&messages[4].kind,
+            AgentMessageKind::InternalContext(context) if context.text == "revised goal"));
+        assert!(matches!(
+            &messages[5].kind,
+            AgentMessageKind::Wire(Message::User(_))
+        ));
     }
 
     #[tokio::test]
@@ -6600,9 +6809,16 @@ mod event_protocol_tests {
         });
         let mut oracle: ErasedToolDefinition = PingTool.into();
         oracle.name = "oracle".into();
-        let mut parent = build_agent(
-            Vec::new(),
-            vec![SpawnTool::blocking().into(), oracle, PingTool.into()],
+        let mut tools = vec![SpawnTool::blocking().into(), oracle, PingTool.into()];
+        for name in ["create_goal", "get_goal", "update_goal"] {
+            let mut tool: ErasedToolDefinition = PingTool.into();
+            tool.name = name.into();
+            tools.push(tool);
+        }
+        let mut parent = build_agent(Vec::new(), tools);
+        parent.set_goal_control(
+            Arc::new(|_, _, _| Box::pin(async { Ok(None) })),
+            Arc::new(|_| Box::pin(async { Ok(0) })),
         );
         parent.provider = Arc::<ChildRecordingProvider>::clone(&provider);
         parent.stream_options.temperature = Some(0.75);
@@ -6612,6 +6828,8 @@ mod event_protocol_tests {
             .run_single_turn("parent-only history".into())
             .await
             .unwrap();
+        let child = parent.sub_agent_registry.get(1).unwrap();
+        assert!(child.lock().await.goal_control.is_none());
         let calls = provider.calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
         for (index, (model, context, options)) in calls.iter().enumerate() {
@@ -7104,7 +7322,8 @@ mod event_protocol_tests {
                 crate::message::AgentMessageKind::TaskNotification(notification) => {
                     Some(notification)
                 }
-                crate::message::AgentMessageKind::Wire(_) => None,
+                crate::message::AgentMessageKind::Wire(_)
+                | crate::message::AgentMessageKind::InternalContext(_) => None,
             })
             .expect("failure notification delivered");
         assert_eq!(notification.kind, TaskNotificationKind::Agent);

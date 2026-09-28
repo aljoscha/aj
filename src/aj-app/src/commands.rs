@@ -54,6 +54,14 @@ pub struct Command {
 /// help UI are the discovery surface.
 pub const COMMANDS: &[Command] = &[
     Command {
+        name: "goal",
+        title: "goal",
+        category: "session",
+        description: "Manage this session's goal: objective, token budget, status, pause, resume, and clear.",
+        action_id: None,
+        action: CommandAction::Goal,
+    },
+    Command {
         name: "thinking",
         title: "thinking effort",
         category: "agent",
@@ -299,6 +307,7 @@ pub fn load_model_catalog() -> Arc<Vec<ModelInfo>> {
 /// one, dispatched by the agent picker drilling into a task's output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandAction {
+    Goal,
     /// Open the global command palette overlay.
     OpenCommandPalette,
     /// Open the thinking-effort selector overlay. The current level
@@ -370,7 +379,9 @@ pub enum CommandAction {
     /// drilled into from the agent picker. Not a catalog command: it
     /// carries the task id and is dispatched only by the picker's
     /// confirm, never surfaced in the palette or help.
-    OpenTaskOutput { id: usize },
+    OpenTaskOutput {
+        id: usize,
+    },
     /// Open the settings window overlay. Changes apply (and persist
     /// to `config.toml`) as the user makes them; `Esc` closes.
     OpenSettings,

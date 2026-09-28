@@ -2990,6 +2990,14 @@ fn sync_status(world: &World) -> bool {
             .into_iter()
             .filter(|a| matches!(a, AgentId::Sub(_)))
             .count(),
+        goal_running: world.connection == Connection::Connected
+            && world.client().working()
+            && world
+                .chat
+                .borrow()
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.status == aj_agent::goal::GoalStatus::Active),
         connection: world.connection,
         rebuilding: world.client().rebuilding(),
     };
@@ -3762,6 +3770,7 @@ async fn apply_command_action(
     redraw_tx: &UnboundedSender<()>,
 ) -> ActionEffect {
     let gated = match action {
+        CommandAction::Goal => Some("manage a goal"),
         CommandAction::ArchiveSession => Some("archive the session"),
         CommandAction::Compact => Some("compact"),
         CommandAction::ExportHtml => Some("export the session"),
@@ -3787,6 +3796,18 @@ async fn apply_command_action(
         return ActionEffect::Redraw;
     }
     match action {
+        CommandAction::Goal => {
+            let fill = crate::goal_ui::open_goal(
+                shell.borrow().overlay_handles(),
+                world.control.clone(),
+                world.session().to_string(),
+                Rc::clone(&world.chat),
+                redraw_tx.clone(),
+                false,
+            );
+            shell.borrow_mut().fills.push(fill);
+            ActionEffect::OpenedOverlay
+        }
         CommandAction::ArchiveSession => {
             apply_archive(world, !focused_archived(world)).await;
             ActionEffect::Redraw
@@ -5953,12 +5974,13 @@ struct Shell {
     /// A confirmed authentication request parked by a picker and drained by
     /// the drive loop, which owns the credential store and login task machinery.
     auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
-    /// Reads that openers park for the drive loop to run to completion: a
-    /// window opens on a placeholder at once and its fill lands here. Each
-    /// fill holds its own window weakly and checks it is still the one on
-    /// show before writing, so a late reply cannot land on a reopened window
-    /// and closing a window is all it takes to discard its read.
+    /// Overlay work owned by the drive loop. Reads hold their window weakly,
+    /// so late replies cannot fill a reopened window. Mutations keep reporting
+    /// errors even after their window closes.
     fills: Vec<futures::future::LocalBoxFuture<'static, ()>>,
+    /// Consumed after the selected session becomes usable, not on reconnect or
+    /// live goal updates. Only a user session selection arms it again.
+    goal_entry_pending: bool,
     /// Last queued client presentation write, retained through shutdown.
     presentation_save_tail: Option<PresentationSave>,
     /// A credential write belongs to the shell, not the selected session.
@@ -6350,6 +6372,7 @@ impl Shell {
             session_request,
             auth_request,
             fills: Vec::new(),
+            goal_entry_pending: true,
             presentation_save_tail: None,
             credential_change: None,
             tag_edit,
@@ -6592,6 +6615,7 @@ impl Shell {
     fn select_session(&mut self, world: &World) {
         let current = self.view();
         if current.id != world.session() {
+            self.goal_entry_pending = true;
             current.suspend();
             let incoming = self.views.borrow_mut().parked.remove(world.session());
             let incoming = incoming.unwrap_or_else(|| {
@@ -7750,6 +7774,37 @@ async fn drive(
         // already buffered when the loop is re-entered to be answered from rows
         // that predate the switch, and a stepping chord would name the session
         // just landed on.
+        if shell.borrow().goal_entry_pending
+            && world.connection == Connection::Connected
+            && world.client().attach_phase() == Attach::Live
+            && world.transition.is_none()
+        {
+            shell.borrow_mut().goal_entry_pending = false;
+            let stopped = world.chat.borrow().goal.as_ref().is_some_and(|goal| {
+                matches!(
+                    goal.status,
+                    aj_agent::goal::GoalStatus::Paused
+                        | aj_agent::goal::GoalStatus::Blocked
+                        | aj_agent::goal::GoalStatus::UsageLimited
+                ) && crate::goal_ui::can_resume(goal)
+            });
+            if stopped && !world.client().working() {
+                let fill = crate::goal_ui::open_goal(
+                    shell.borrow().overlay_handles(),
+                    world.control.clone(),
+                    world.session().to_string(),
+                    Rc::clone(&world.chat),
+                    redraw_tx.clone(),
+                    true,
+                );
+                shell.borrow_mut().fills.push(fill);
+                app.post_app_event(UserEvent {
+                    name: REFOCUS_OVERLAY_EVENT.to_string(),
+                    data: None,
+                });
+                app.request_redraw();
+            }
+        }
         pending_fills.extend(shell.borrow_mut().fills.drain(..));
         if world.sync_working_directory() {
             shell.borrow_mut().rebind_working_directory(world);
@@ -8617,6 +8672,7 @@ fn format_remote_resume_hint(url: &str, session: &str) -> String {
 #[cfg(test)]
 mod tests {
     mod credential_changes;
+    mod goal_palette;
     mod presentation_saves;
     mod selector_parity;
     mod settings_parity;
@@ -18340,6 +18396,7 @@ mod tests {
             working: false,
             settings: world.client().settings().unwrap().clone(),
             oracle_settings: None,
+            goal: None,
             credential_warning: None,
         };
         let _ = world.directory.apply(frame);
@@ -28554,6 +28611,7 @@ mod tests {
                 verbosity: "default".into(),
             },
             oracle_settings: None,
+            goal: None,
             credential_warning: credential_warning.map(str::to_string),
         })
         .expect("a state frame")

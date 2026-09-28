@@ -44,11 +44,12 @@ pub enum PendingKind {
     Steering,
 }
 
-/// One agent's pending messages. The TUI keeps at most one entry
-/// across both slots; the `Vec` shape matches the `QueueUpdate` wire
-/// contract.
+/// One agent's pending context and user messages. The TUI keeps at most one
+/// user entry across steering and follow-up. Their `Vec` shape matches the
+/// `QueueUpdate` wire contract.
 #[derive(Default)]
 struct AgentQueues {
+    context: Option<String>,
     steering: Vec<String>,
     follow_up: Vec<String>,
 }
@@ -70,6 +71,16 @@ pub struct MessageQueues {
 }
 
 impl MessageQueues {
+    /// Replace or clear the pending context snapshot without creating wakeable
+    /// or editable user work. Only the latest snapshot is delivered.
+    pub fn set_context(&self, agent: AgentId, text: Option<String>) {
+        self.lock().entry(agent).or_default().context = text;
+    }
+
+    pub(crate) fn take_context(&self, agent: AgentId) -> Option<String> {
+        self.lock().get_mut(&agent).and_then(|q| q.context.take())
+    }
+
     /// Append `text` to `agent`'s pending message without changing its
     /// kind, creating a follow-up if nothing is pending. The plain
     /// Enter path: queueing more never escalates an existing message
@@ -119,9 +130,9 @@ impl MessageQueues {
         if text.is_empty() { None } else { Some(text) }
     }
 
-    /// Drop `agent`'s pending message without returning it.
+    /// Drop `agent`'s pending user input without discarding internal context.
     pub fn clear(&self, agent: AgentId) {
-        self.lock().remove(&agent);
+        let _ = self.take_pending(agent);
     }
 
     /// Take `agent`'s queued steering messages — the agent's mid-turn
@@ -245,6 +256,25 @@ mod tests {
     use super::*;
 
     const MAIN: AgentId = AgentId::Main;
+
+    #[test]
+    fn context_is_neither_user_work_nor_editable_input() {
+        let q = MessageQueues::default();
+        q.set_context(MAIN, Some("hint".into()));
+        assert!(!q.has_pending(MAIN));
+        assert!(q.queued_agents().is_empty());
+        assert_eq!(q.pending_counts(), (0, 0));
+        assert!(q.snapshot(MAIN).kind.is_none());
+        assert_eq!(q.take_pending(MAIN), None);
+        q.append_follow_up(MAIN, "user");
+        assert_eq!(q.take_pending(MAIN).as_deref(), Some("user"));
+        assert_eq!(q.take_context(MAIN).as_deref(), Some("hint"));
+        q.set_context(MAIN, Some("stale".into()));
+        q.append_steering(MAIN, "keep");
+        q.set_context(MAIN, None);
+        assert_eq!(q.take_context(MAIN), None);
+        assert_eq!(q.drain_steering(MAIN), vec!["keep"]);
+    }
 
     #[test]
     fn append_follow_up_coalesces_and_keeps_kind() {

@@ -207,6 +207,7 @@ fn router(state: Arc<ServerState>) -> Router {
         )
         .route("/v1/sessions/{id}/tasks/{task_id}/output", get(task_output))
         .route("/v1/sessions/{id}/tasks/{task_id}/kill", post(kill_task))
+        .route("/v1/sessions/{id}/goal", post(goal_command))
         .route("/v1/sessions/{id}/queue", post(queue_command))
         .route("/v1/sessions/{id}/tree", get(tree))
         .route("/v1/sessions/{id}/info", get(session_info))
@@ -343,6 +344,17 @@ async fn kill_task(
             .command(&session, Command::KillTask { task })
             .await?,
     )
+}
+
+async fn goal_command(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(request): Body<aj_wire::GoalRequest>,
+) -> Result<Response, ApiError> {
+    match state.host.command(&session, Command::Goal(request)).await? {
+        CommandOutcome::Goal(goal) => Ok(Json(aj_wire::GoalOutcome { goal }).into_response()),
+        outcome => accepted(outcome),
+    }
 }
 
 /// Withdraw one agent's pending message, or clear the session's queues.
@@ -784,7 +796,7 @@ fn accepted(outcome: CommandOutcome) -> Result<Response, ApiError> {
             }),
         )
             .into_response()),
-        CommandOutcome::Withdrawn(_) => Err(ApiError {
+        CommandOutcome::Withdrawn(_) | CommandOutcome::Goal(_) => Err(ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal",
             message: "the host returned data for a command that takes none".to_string(),

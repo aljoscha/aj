@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aj_agent::events::{AgentId, AgentSettings, CompactionPhase};
+use aj_agent::goal::{Goal, GoalStatus};
 use aj_agent::message::{TaskNotificationKind, TaskOutcome};
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
 use aj_agent::types::TokenUsage;
@@ -487,6 +488,11 @@ pub struct AgentEntry {
 /// The chat view's data model. Mutated only by [`crate::chat::reduce`]
 /// and the explicit setters here. Views read it at draw time.
 pub struct ChatState {
+    /// Authoritative branch-local Main goal from the host state snapshot.
+    pub goal: Option<Goal>,
+    /// Presentation-only origin for extrapolating an active Main goal between
+    /// host snapshots. Never written back to the goal or its persisted usage.
+    goal_clock: Option<Instant>,
     /// Per-agent transcripts. Main is always present, a `Sub(n)`
     /// transcript is created on `SubAgentStart`. A sub-agent's entries
     /// live in its own transcript. The parent transcript holds a
@@ -533,6 +539,8 @@ impl ChatState {
         let mut transcripts = HashMap::new();
         transcripts.insert(AgentId::Main, Transcript::default());
         Self {
+            goal: None,
+            goal_clock: None,
             transcripts,
             active_view: AgentId::Main,
             render: HashMap::new(),
@@ -543,6 +551,26 @@ impl ChatState {
             compaction_phase: HashMap::new(),
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    pub(crate) fn note_goal(&mut self, goal: Option<Goal>, working: bool) {
+        self.goal_clock = (working
+            && goal
+                .as_ref()
+                .is_some_and(|goal| goal.status == GoalStatus::Active))
+        .then(Instant::now);
+        self.goal = goal;
+    }
+
+    /// Display runtime at `now`, advancing only while Main is actively pursuing
+    /// the goal. Each host snapshot rebases the clock onto its reported subtotal.
+    pub fn goal_runtime_seconds(&self, now: Instant) -> u64 {
+        self.goal.as_ref().map_or(0, |goal| {
+            goal.time_used_seconds.saturating_add(
+                self.goal_clock
+                    .map_or(0, |start| now.saturating_duration_since(start).as_secs()),
+            )
+        })
     }
 
     /// Which incarnation of the model this is.
@@ -967,6 +995,8 @@ impl ChatState {
         self.render.clear();
         self.tasks.clear();
         self.queue = QueueState::default();
+        self.goal = None;
+        self.goal_clock = None;
         self.sub_boxes.clear();
         self.compaction_phase.clear();
         self.footers.retain_main();

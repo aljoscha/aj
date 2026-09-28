@@ -215,6 +215,13 @@ pub struct QueueRequest {
     pub agent: Option<AgentId>,
 }
 
+pub use aj_agent::goal::GoalRequest;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GoalOutcome {
+    pub goal: Option<aj_agent::goal::Goal>,
+}
+
 /// The text withdrawn by a queue mutation, when one was pending.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueOutcome {
@@ -1062,6 +1069,77 @@ mod request {
 
     request_body!(QueueRequest, QueueRequest, |request| request);
 
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictGoalRequest {
+        action: StrictGoalAction,
+        expected_goal_id: Option<String>,
+    }
+
+    // Empty struct variants enforce the closed request schema even for actions
+    // with no payload. Serde's internally tagged unit variants discard extras.
+    #[derive(Deserialize)]
+    #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+    enum StrictGoalAction {
+        Get {},
+        Create {
+            objective: String,
+            token_budget: Option<u64>,
+        },
+        Edit {
+            objective: String,
+        },
+        SetBudget {
+            token_budget: Option<u64>,
+        },
+        Replace {
+            objective: String,
+            token_budget: Option<u64>,
+        },
+        Pause {},
+        Resume {},
+        Clear {},
+        Complete {},
+        Block {},
+    }
+
+    request_body!(
+        GoalRequest,
+        StrictGoalRequest,
+        |request: StrictGoalRequest| {
+            use aj_agent::goal::GoalAction;
+            GoalRequest {
+                action: match request.action {
+                    StrictGoalAction::Get {} => GoalAction::Get,
+                    StrictGoalAction::Create {
+                        objective,
+                        token_budget,
+                    } => GoalAction::Create {
+                        objective,
+                        token_budget,
+                    },
+                    StrictGoalAction::Edit { objective } => GoalAction::Edit { objective },
+                    StrictGoalAction::SetBudget { token_budget } => {
+                        GoalAction::SetBudget { token_budget }
+                    }
+                    StrictGoalAction::Replace {
+                        objective,
+                        token_budget,
+                    } => GoalAction::Replace {
+                        objective,
+                        token_budget,
+                    },
+                    StrictGoalAction::Pause {} => GoalAction::Pause,
+                    StrictGoalAction::Resume {} => GoalAction::Resume,
+                    StrictGoalAction::Clear {} => GoalAction::Clear,
+                    StrictGoalAction::Complete {} => GoalAction::Complete,
+                    StrictGoalAction::Block {} => GoalAction::Block,
+                },
+                expected_goal_id: request.expected_goal_id,
+            }
+        }
+    );
+
     request_body!(CompactRequest, CompactRequest, |request| request);
 
     #[derive(Deserialize)]
@@ -1453,6 +1531,9 @@ pub enum Frame {
         /// Oracle settings staged for the next main turn. Absent when unresolved
         /// or when the host has no Oracle support.
         oracle_settings: Option<AgentSettings>,
+        /// Main's branch-local goal. Null clears it, and an absent field from
+        /// a host without goal support also decodes as no goal.
+        goal: Option<aj_agent::goal::Goal>,
         /// A problem with the host-side credentials for `settings.provider`,
         /// when the host could not confirm that inference can authenticate.
         /// Present on an attach block's opening state only. Live state updates
@@ -1635,6 +1716,7 @@ enum FrameRef<'a> {
         settings: &'a AgentSettings,
         #[serde(skip_serializing_if = "Option::is_none")]
         oracle_settings: Option<&'a AgentSettings>,
+        goal: Option<&'a aj_agent::goal::Goal>,
         #[serde(skip_serializing_if = "Option::is_none")]
         credential_warning: Option<&'a str>,
     },
@@ -1686,6 +1768,7 @@ impl Serialize for Frame {
                 working,
                 settings,
                 oracle_settings,
+                goal,
                 credential_warning,
             } => FrameRef::State {
                 session,
@@ -1694,6 +1777,7 @@ impl Serialize for Frame {
                 working: *working,
                 settings,
                 oracle_settings: oracle_settings.as_ref(),
+                goal: goal.as_ref(),
                 credential_warning: credential_warning.as_deref(),
             },
             Self::CaughtUp {
@@ -1793,6 +1877,7 @@ impl<'de> Deserialize<'de> for Frame {
                     working,
                     settings,
                     oracle_settings,
+                    goal,
                     credential_warning,
                 } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
                 Ok(Self::State {
@@ -1802,6 +1887,7 @@ impl<'de> Deserialize<'de> for Frame {
                     working,
                     settings,
                     oracle_settings,
+                    goal,
                     credential_warning,
                 })
             }
@@ -1872,6 +1958,8 @@ struct StateFrameFields {
     settings: AgentSettings,
     #[serde(default)]
     oracle_settings: Option<AgentSettings>,
+    #[serde(default)]
+    goal: Option<aj_agent::goal::Goal>,
     #[serde(default)]
     credential_warning: Option<String>,
 }
