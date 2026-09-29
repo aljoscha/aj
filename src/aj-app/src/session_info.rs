@@ -38,7 +38,6 @@ pub fn to_wire(stats: &SessionStats) -> aj_wire::SessionInfo {
             })
             .collect(),
         compaction_usage: stats.compaction_usage.clone(),
-        compactions_with_usage: stats.compactions_with_usage,
         settings: aj_wire::BranchSettings {
             oracle_model: stats
                 .settings
@@ -95,7 +94,6 @@ pub fn from_wire(info: aj_wire::SessionInfo) -> SessionStats {
             })
             .collect(),
         compaction_usage: info.compaction_usage,
-        compactions_with_usage: info.compactions_with_usage,
         settings: aj_session::SessionSettings {
             oracle_model: info
                 .settings
@@ -231,11 +229,6 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
         kv("log entries", &stats.total_entries.to_string()),
         InfoRow::Blank,
         InfoRow::Header("Usage".to_string()),
-    ]);
-    if stats.usage.incomplete {
-        rows.push(kv("status", "partial (recorded usage only)"));
-    }
-    rows.extend([
         kv("input", &stats.usage.input.to_string()),
         kv("output", &stats.usage.output.to_string()),
         kv("cache read", &stats.usage.cache_read.to_string()),
@@ -349,9 +342,6 @@ fn bucket_value(bucket: &UsageBucket) -> String {
     if bucket.unpriced_responses > 0 && bucket.unpriced_responses < bucket.responses {
         value.push_str(&format!(" · {} unpriced", bucket.unpriced_responses));
     }
-    if bucket.usage.incomplete {
-        value.push_str(" · partial");
-    }
     value
 }
 
@@ -360,30 +350,19 @@ fn bucket_value(bucket: &UsageBucket) -> String {
 ///
 /// Compaction is the one cost with no message behind it, so without a
 /// line of its own it is spend the reader cannot attribute to anything
-/// they remember doing. Runs whose spend was never recorded are named
-/// separately rather than folded in, because a subtotal that silently
-/// covers some of the runs reads as if it covered all of them.
+/// they remember doing.
 fn compaction_label(stats: &SessionStats) -> String {
     let runs = stats.compactions;
     if runs == 0 {
         return "(none)".to_string();
     }
     let plural = if runs == 1 { "run" } else { "runs" };
-    let missing = runs.saturating_sub(stats.compactions_with_usage);
-    if stats.compactions_with_usage == 0 {
-        return format!("{runs} {plural}, not recorded");
-    }
     let usage = &stats.compaction_usage;
-    let recorded = format!(
+    format!(
         "{runs} {plural}, {} tokens, {}",
         usage.total_tokens,
         cost_label(usage.cost.total)
-    );
-    if missing == 0 {
-        recorded
-    } else {
-        format!("{recorded} ({missing} not recorded)")
-    }
+    )
 }
 
 #[cfg(test)]
@@ -423,7 +402,6 @@ mod tests {
                     cache_write: 0.02,
                     total: 0.33,
                 },
-                incomplete: false,
             },
             usage_breakdown: vec![
                 UsageBucket {
@@ -443,7 +421,6 @@ mod tests {
                             cache_write: 0.02,
                             total: 0.30,
                         },
-                        incomplete: false,
                     },
                     responses: 12,
                     unpriced_responses: 0,
@@ -465,14 +442,12 @@ mod tests {
                             cache_write: 0.002,
                             total: 0.03,
                         },
-                        incomplete: false,
                     },
                     responses: 6,
                     unpriced_responses: 0,
                 },
             ],
             compaction_usage: Usage::default(),
-            compactions_with_usage: 0,
             settings: SessionSettings {
                 accounts: Default::default(),
                 model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
@@ -564,7 +539,7 @@ mod tests {
             RowView::Kv("cost".to_string(), "$0.3300".to_string()),
             RowView::Kv(
                 "of which compaction".to_string(),
-                "1 run, not recorded".to_string(),
+                "1 run, 0 tokens, $0.0000".to_string(),
             ),
             RowView::Kv(
                 "anthropic / claude-sonnet-4-5".to_string(),
@@ -662,14 +637,11 @@ mod tests {
         );
     }
 
-    /// The compaction line reports the recorded spend, and says how many
-    /// runs it does not cover rather than letting a partial subtotal
-    /// read as a complete one.
+    /// Compaction spend has no message behind it, so it gets its own line.
     #[test]
-    fn the_compaction_line_separates_recorded_runs_from_unrecorded_ones() {
+    fn the_compaction_line_reports_runs_and_their_spend() {
         let mut stats = sample_stats();
         stats.compactions = 3;
-        stats.compactions_with_usage = 2;
         stats.compaction_usage = Usage {
             total_tokens: 40_900,
             cost: UsageCost {
@@ -680,51 +652,13 @@ mod tests {
         };
         assert_eq!(
             value_of(&digest(&stats, None), "of which compaction"),
-            "3 runs, 40900 tokens, $0.2500 (1 not recorded)"
-        );
-
-        stats.compactions_with_usage = 3;
-        assert_eq!(
-            value_of(&digest(&stats, None), "of which compaction"),
-            "3 runs, 40900 tokens, $0.2500",
-            "nothing missing, nothing to qualify"
+            "3 runs, 40900 tokens, $0.2500"
         );
 
         stats.compactions = 0;
-        stats.compactions_with_usage = 0;
         assert_eq!(
             value_of(&digest(&stats, None), "of which compaction"),
             "(none)"
-        );
-    }
-
-    #[test]
-    fn partial_usage_is_explained_once_and_marks_only_affected_buckets() {
-        let mut stats = sample_stats();
-        stats.usage.incomplete = true;
-        stats.usage_breakdown[0].usage.incomplete = true;
-        let rows = digest(&stats, None);
-
-        let statuses: Vec<_> = rows
-            .iter()
-            .filter_map(|row| match row {
-                InfoRow::Kv { key, value } if key == "status" => Some(value.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(statuses, ["partial (recorded usage only)"]);
-        assert_eq!(
-            value_of(&rows, "anthropic / claude-sonnet-4-5"),
-            "2250 tokens · $0.3000 · partial"
-        );
-        assert_eq!(
-            value_of(&rows, "openai / gpt-5 (work)"),
-            "1500 tokens · $0.0300"
-        );
-        assert_eq!(
-            value_of(&rows, "of which compaction"),
-            "1 run, not recorded",
-            "the exact missing-compaction wording remains"
         );
     }
 

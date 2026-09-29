@@ -670,8 +670,6 @@ mod tests {
                 turn_cache_write: 4,
                 accumulated_cache_read: 5,
                 turn_cache_read: 6,
-                turn_incomplete: true,
-                accumulated_incomplete: false,
             }),
             summary: Some("did stuff".into()),
             error: None,
@@ -682,7 +680,6 @@ mod tests {
         assert_eq!(json["tokens_before"], 1200);
         assert_eq!(json["tokens_after"], 300);
         assert_eq!(json["usage"]["turn_input"], 20);
-        assert_eq!(json["usage"]["turn_incomplete"], true);
         let decoded: AgentEvent = serde_json::from_value(json.clone()).expect("usage decodes");
         assert_eq!(serde_json::to_value(decoded).unwrap(), json);
         assert_eq!(json["summary"], "did stuff");

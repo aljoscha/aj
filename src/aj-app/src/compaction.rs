@@ -212,7 +212,7 @@ pub async fn run_compaction(
             plan.retained_user_entry_ids.clone(),
             plan.tokens_before,
             Some(plan.file_ops.clone()),
-            Some(summarizer_usage.clone()),
+            summarizer_usage.clone(),
         ) {
             Ok(entry) => entry,
             Err(err) => {
@@ -1146,7 +1146,6 @@ mod tests {
             })
             .expect("a compaction checkpoint was written");
         let (usage, summary) = entry;
-        let usage = usage.expect("the checkpoint records the summarizer's usage");
 
         assert!(
             summary.contains("PREFIX"),
@@ -1261,7 +1260,7 @@ mod tests {
             .entries_in_order()
             .into_iter()
             .find_map(|entry| match &entry.entry {
-                ConversationEntryKind::Compaction { usage, .. } => usage.clone(),
+                ConversationEntryKind::Compaction { usage, .. } => Some(usage.clone()),
                 _ => None,
             })
             .expect("committed checkpoint usage");

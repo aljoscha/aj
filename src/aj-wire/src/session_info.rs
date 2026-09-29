@@ -35,8 +35,6 @@ pub struct SessionInfo {
     pub usage_breakdown: Vec<UsageBucket>,
     /// The compaction-summary share of total usage.
     pub compaction_usage: Usage,
-    /// Compaction entries with recorded usage, including explicitly zero usage.
-    pub compactions_with_usage: usize,
     /// Recorded settings at the active user branch head, without runtime defaults.
     pub settings: BranchSettings,
     /// Complete active-user-branch environment. None differs from a recorded empty map.

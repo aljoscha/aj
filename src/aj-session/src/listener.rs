@@ -1383,7 +1383,7 @@ mod tests {
                 Vec::new(),
                 100,
                 None,
-                None,
+                aj_models::types::Usage::default(),
             )
             .expect("append the compaction checkpoint");
         let _filed = handoff.file(checkpoint);
@@ -1514,7 +1514,7 @@ mod tests {
                 Vec::new(),
                 100,
                 None,
-                None,
+                aj_models::types::Usage::default(),
             )
             .expect("append the compaction checkpoint");
         let _filed = handoff.file(earlier);

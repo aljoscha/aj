@@ -274,7 +274,6 @@ mod tests {
                 cache_write: (6.25 / 1_000_000.0) * 73.0,
                 total: 0.00439125,
             },
-            incomplete: false,
         }
     }
 
@@ -284,7 +283,6 @@ mod tests {
         assert_eq!(actual.cache_read, expected.cache_read);
         assert_eq!(actual.cache_write, expected.cache_write);
         assert_eq!(actual.total_tokens, expected.total_tokens);
-        assert_eq!(actual.incomplete, expected.incomplete);
         for (actual, expected) in [
             (actual.cost.input, expected.cost.input),
             (actual.cost.output, expected.cost.output),

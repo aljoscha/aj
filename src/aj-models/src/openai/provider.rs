@@ -29,11 +29,9 @@ use openai_sdk::types::chat_completions::{
 use openai_sdk::types::common::ReasoningEffort;
 use serde_json::Value;
 
-use crate::cancel::{RequestSelectOutcome, SelectOutcome, select_cancel, select_request};
+use crate::cancel::{SelectOutcome, select_cancel};
 use crate::errors::classify_openai_finish_reason;
-use crate::openai::errors::{
-    account_for_client_error, classify_client_error, client_error_was_issued,
-};
+use crate::openai::errors::{account_for_client_error, classify_client_error};
 use crate::openai::responses::map_verbosity;
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
@@ -184,36 +182,20 @@ async fn run_stream_inner(
         }
     }
 
-    // The client request future's first poll is the issuance boundary.
-    // Cancellation before that poll remains complete zero. After it, the
-    // terminal carries only a recorded subtotal until final usage arrives.
     let mut state = StreamState::new_with_account(model, credential.account.clone());
-    let mut sse = match select_request(
+    let mut sse = match select_cancel(
         options.cancel.as_ref(),
         client.chat_completions_stream(request),
     )
     .await
     {
-        RequestSelectOutcome::Ready(Ok(sse)) => sse,
-        RequestSelectOutcome::Ready(Err(err)) => {
+        SelectOutcome::Ready(Ok(sse)) => sse,
+        SelectOutcome::Ready(Err(err)) => {
             let account = account_for_client_error(&err, credential.account.as_deref());
-            let error = classify_client_error(&err);
-            let terminal = if client_error_was_issued(&err) {
-                state.client_failed(error)
-            } else {
-                error_message(model, account, error)
-            };
-            producer.push(terminal);
+            producer.push(error_message(model, account, classify_client_error(&err)));
             return Ok(());
         }
-        RequestSelectOutcome::CancelledBeforePoll => {
-            producer.push(AssistantMessageEvent::aborted(empty_partial(
-                model,
-                credential.account.as_deref(),
-            )));
-            return Ok(());
-        }
-        RequestSelectOutcome::CancelledAfterPoll => {
+        SelectOutcome::Cancelled => {
             producer.push(state.cancelled());
             return Ok(());
         }
@@ -869,7 +851,6 @@ impl StreamState {
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
         partial.account = account;
-        partial.usage.incomplete = true;
         Self {
             partial,
             started: false,
@@ -1223,7 +1204,6 @@ impl StreamState {
     fn seal(&mut self) {
         if let Some(usage) = self.usage.as_ref() {
             apply_usage(&mut self.partial.usage, usage);
-            self.partial.usage.incomplete = false;
         }
         finalize_usage(&mut self.partial.usage, &self.cost);
     }
@@ -1991,10 +1971,6 @@ mod tests {
         // (byte stream dropped) must finalize as a retryable transient
         // error, preserving the partial text.
         let mut state = StreamState::new(&fake_model());
-        assert!(
-            state.partial.usage.incomplete,
-            "an issued provider stream starts without final usage evidence"
-        );
         let _ = state.process(delta_chunk(text_delta("partial")));
         assert!(!state.saw_terminal());
         let truncated = state.finalize_or_truncate();
@@ -2020,10 +1996,6 @@ mod tests {
         assert!(state.saw_terminal());
         let terminal = state.finalize_or_truncate();
         assert!(matches!(terminal, AssistantMessageEvent::Done { .. }));
-        assert!(
-            terminal.partial().usage.incomplete,
-            "finish_reason without trailing usage is a successful partial subtotal"
-        );
     }
 
     #[test]
@@ -2100,7 +2072,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_handshake_cancel_marks_the_issued_request_partial() {
+    async fn a_handshake_cancel_keeps_the_account_that_resolved() {
         let mut server =
             crate::provider_test_support::held_handshake_server("POST /v1/chat/completions").await;
         let mut model = fake_model();
@@ -2118,11 +2090,10 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
-    async fn cancellation_from_the_payload_callback_stays_pre_request_complete_zero() {
+    async fn cancellation_from_the_payload_callback_issues_nothing() {
         let server =
             crate::provider_test_support::openai_error_server("POST /v1/chat/completions").await;
         let mut model = fake_model();
@@ -2139,12 +2110,11 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(!terminal.usage.incomplete);
         assert_eq!(requests, 0, "cancellation precedes request issuance");
     }
 
     #[tokio::test]
-    async fn an_issued_http_error_keeps_chat_usage_partial() {
+    async fn an_http_error_keeps_the_account_whose_key_was_sent() {
         let server =
             crate::provider_test_support::openai_error_server("POST /v1/chat/completions").await;
         let mut model = fake_model();
@@ -2164,7 +2134,6 @@ mod tests {
         );
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(terminal.usage.total_tokens, 0);
-        assert!(terminal.usage.incomplete);
         assert_eq!(requests, 1, "one inference issues one HTTP request");
     }
 
@@ -2256,7 +2225,6 @@ mod tests {
         assert!(terminal.error.is_none());
         assert_eq!(message_text(&terminal), "complete");
         assert_eq!(terminal.usage.total_tokens, 0);
-        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
@@ -2286,7 +2254,6 @@ mod tests {
         assert!(terminal.error.is_none());
         assert_eq!(message_text(&terminal), "A");
         assert_eq!(terminal.usage.total_tokens, 120);
-        assert!(!terminal.usage.incomplete);
         let expected = 0.000_075 + 0.000_2 + 0.000_003_125;
         assert!((terminal.usage.cost.total - expected).abs() < 1e-12);
     }

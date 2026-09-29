@@ -1538,8 +1538,6 @@ mod tests {
             turn_cache_write: turn[2],
             accumulated_cache_read: 0,
             turn_cache_read: turn[3],
-            turn_incomplete: false,
-            accumulated_incomplete: false,
         }
     }
 
@@ -3379,58 +3377,6 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_usage_update_stays_measured_and_unmarked() {
-        let event: AgentEvent = serde_json::from_str(
-            r#"{"type":"usage_update","agent_id":"main","usage":{"accumulated_input":1,"turn_input":10,"accumulated_output":3,"turn_output":4,"accumulated_cache_write":5,"turn_cache_write":5,"accumulated_cache_read":7,"turn_cache_read":7}}"#,
-        )
-        .expect("frozen legacy usage event decodes");
-        let mut s = state();
-        let mut life = AgentLifecycle::default();
-        apply(&mut s, &mut life, event);
-
-        let EntryKind::TurnUsage(row) = &entries(&s, AgentId::Main)[0].kind else {
-            panic!("legacy event projected a usage row");
-        };
-        assert!(row.line().starts_with("Token Usage - "));
-        assert!(!row.line().contains("recorded minimum"));
-        let footer = crate::footer::context_usage_display(s.footers().context_usage(AgentId::Main))
-            .expect("main has a context window");
-        assert_eq!(footer.ratio, "22/200k");
-        assert_eq!(footer.percent.as_deref(), Some("(0.0%)"));
-    }
-
-    #[test]
-    fn usage_update_completeness_reaches_the_context_footer() {
-        let display = |incomplete| {
-            let mut state = ChatState::new(aj_agent::events::AgentSettings {
-                context_window: 20_000_000,
-                ..main_settings()
-            });
-            let mut lifecycle = AgentLifecycle::default();
-            let mut usage = token_usage([9_999, 0, 0, 0]);
-            usage.turn_incomplete = incomplete;
-            apply(
-                &mut state,
-                &mut lifecycle,
-                AgentEvent::UsageUpdate {
-                    agent_id: AgentId::Main,
-                    usage,
-                },
-            );
-            crate::footer::context_usage_display(state.footers().context_usage(AgentId::Main))
-                .expect("main has a context window")
-        };
-
-        let incomplete = display(true);
-        assert_eq!(incomplete.ratio, "≥10.0k/20M");
-        assert_eq!(incomplete.percent, None);
-
-        let complete = display(false);
-        assert_eq!(complete.ratio, "10.0k/20M");
-        assert!(complete.percent.is_some());
-    }
-
-    #[test]
     fn sub_agent_capacity_comes_from_its_snapshot_even_for_the_main_model() {
         let mut s = state();
         let mut life = AgentLifecycle::default();
@@ -3804,7 +3750,6 @@ mod tests {
             crate::footer::ContextUsage {
                 tokens: Some(1_000),
                 context_window: 400_000,
-                incomplete: false,
             },
             "and its occupancy accounting",
         );
@@ -4477,8 +4422,7 @@ mod tests {
             },
         );
         let entry = "e-checkpoint".to_string();
-        let mut checkpoint_usage = token_usage([900, 0, 0, 0]);
-        checkpoint_usage.turn_incomplete = true;
+        let checkpoint_usage = token_usage([900, 0, 0, 0]);
         let _ = reduce(
             &mut s,
             &mut life,
@@ -4502,7 +4446,6 @@ mod tests {
             crate::footer::ContextUsage {
                 tokens: Some(300),
                 context_window: 200_000,
-                incomplete: false,
             }
         );
 

@@ -20,8 +20,8 @@ use aj_agent::types::TokenUsage;
 use serde::Serialize;
 
 /// Snapshot describing how full the active model's context window is. A
-/// footer renders exact usage as `tokens/window (percent%)`, an incomplete
-/// nonzero subtotal as `≥tokens/window`, and incomplete zero as `?/window`.
+/// footer renders it as `tokens/window (percent%)`, coloring the percentage
+/// by occupancy.
 ///
 /// `tokens.None` means "not yet known" — typically a fresh session
 /// before the first assistant turn — and renders as `?`. A
@@ -31,9 +31,6 @@ use serde::Serialize;
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub context_window: u64,
-    /// Whether `tokens` is a recorded lower bound rather than an exact
-    /// provider disclosure.
-    pub incomplete: bool,
 }
 
 /// How urgently a footer should color the occupancy percentage.
@@ -47,10 +44,9 @@ pub enum UsageSeverity {
 }
 
 /// Display form of a [`ContextUsage`], split so a frontend can apply its own
-/// color to the percentage substring: `ratio` is the `12.3k/200k`,
-/// `≥12.3k/200k`, or `?/200k` prefix, `percent` the `(6.1%)` part (`None` when
-/// exact occupancy is unknown), and `severity` the threshold classification of
-/// that percentage.
+/// color to the percentage substring: `ratio` is the `12.3k/200k` or `?/200k`
+/// prefix, `percent` the `(6.1%)` part (`None` when the token count is
+/// unknown), and `severity` the threshold classification of that percentage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextUsageDisplay {
     pub ratio: String,
@@ -74,16 +70,6 @@ pub fn context_usage_display(usage: ContextUsage) -> Option<ContextUsageDisplay>
     match usage.tokens {
         None => Some(ContextUsageDisplay {
             ratio: format!("?/{window_str}"),
-            percent: None,
-            severity: UsageSeverity::Normal,
-        }),
-        Some(0) if usage.incomplete => Some(ContextUsageDisplay {
-            ratio: format!("?/{window_str}"),
-            percent: None,
-            severity: UsageSeverity::Normal,
-        }),
-        Some(tokens) if usage.incomplete => Some(ContextUsageDisplay {
-            ratio: format!("≥{}/{window_str}", format_tokens(tokens)),
             percent: None,
             severity: UsageSeverity::Normal,
         }),
@@ -175,8 +161,6 @@ struct AgentFooter {
     /// Prompt size of the agent's most recent turn, `None` until
     /// the first `UsageUpdate` arrives.
     last_turn_context_tokens: Option<u64>,
-    /// Whether the latest prompt size is only a recorded lower bound.
-    last_turn_incomplete: bool,
 }
 
 /// Per-agent footer store: the single source of truth for "what
@@ -203,7 +187,6 @@ impl AgentFooters {
             AgentFooter {
                 settings: main_settings,
                 last_turn_context_tokens: None,
-                last_turn_incomplete: false,
             },
         );
         Self { agents }
@@ -218,16 +201,11 @@ impl AgentFooters {
             .agents
             .get(&id)
             .and_then(|entry| entry.last_turn_context_tokens);
-        let last_turn_incomplete = self
-            .agents
-            .get(&id)
-            .is_some_and(|entry| entry.last_turn_incomplete);
         self.agents.insert(
             id,
             AgentFooter {
                 settings,
                 last_turn_context_tokens,
-                last_turn_incomplete,
             },
         );
     }
@@ -244,6 +222,9 @@ impl AgentFooters {
     /// prompt's "context occupancy" is what was sent in, not the
     /// response that came back.
     ///
+    /// A response that reported no prompt tokens, such as one aborted before
+    /// its usage arrived, leaves the previous occupancy in place.
+    ///
     /// A missing entry is created defensively with empty settings
     /// and an unknown window.
     pub fn record_turn_usage(&mut self, id: AgentId, usage: &TokenUsage) {
@@ -258,11 +239,11 @@ impl AgentFooters {
                 verbosity: String::new(),
             },
             last_turn_context_tokens: None,
-            last_turn_incomplete: false,
         });
-        entry.last_turn_context_tokens =
-            Some(usage.turn_input + usage.turn_cache_read + usage.turn_cache_write);
-        entry.last_turn_incomplete = usage.turn_incomplete;
+        let prompt = usage.turn_input + usage.turn_cache_read + usage.turn_cache_write;
+        if prompt > 0 {
+            entry.last_turn_context_tokens = Some(prompt);
+        }
     }
 
     /// Build a [`ContextUsage`] view for `id`, falling back to the
@@ -272,7 +253,6 @@ impl AgentFooters {
         ContextUsage {
             tokens: entry.last_turn_context_tokens,
             context_window: entry.settings.context_window,
-            incomplete: entry.last_turn_incomplete,
         }
     }
 
@@ -283,7 +263,6 @@ impl AgentFooters {
     pub fn set_context_tokens(&mut self, id: AgentId, tokens: u64) {
         if let Some(entry) = self.agents.get_mut(&id) {
             entry.last_turn_context_tokens = Some(tokens);
-            entry.last_turn_incomplete = false;
         }
     }
 
@@ -317,7 +296,6 @@ impl AgentFooters {
         self.agents.retain(|id, _| *id == AgentId::Main);
         if let Some(main) = self.agents.get_mut(&AgentId::Main) {
             main.last_turn_context_tokens = None;
-            main.last_turn_incomplete = false;
         }
     }
 
@@ -351,8 +329,6 @@ mod tests {
             turn_cache_write: cache_write,
             accumulated_cache_read: 0,
             turn_cache_read: cache_read,
-            turn_incomplete: false,
-            accumulated_incomplete: false,
         }
     }
 
@@ -427,35 +403,14 @@ mod tests {
     }
 
     #[test]
-    fn latest_turn_completeness_survives_settings_and_clears_on_new_evidence() {
+    fn a_response_without_prompt_usage_keeps_the_previous_occupancy() {
         let mut f = AgentFooters::new(aj_agent::events::AgentSettings {
             context_window: 200_000,
             ..settings("opus", "high")
         });
-        let mut partial = token_usage(20_000, 0, 0, 0);
-        partial.turn_incomplete = true;
-        f.record_turn_usage(AgentId::Main, &partial);
-        f.note_settings(
-            AgentId::Main,
-            aj_agent::events::AgentSettings {
-                context_window: 100_000,
-                ..settings("sonnet", "low")
-            },
-        );
-        assert_eq!(
-            context_usage_display(f.context_usage(AgentId::Main))
-                .expect("known window")
-                .ratio,
-            "≥20k/100k"
-        );
-
-        f.set_context_tokens(AgentId::Main, 3_000);
-        assert!(!f.context_usage(AgentId::Main).incomplete);
-
-        let complete = token_usage(4_000, 0, 0, 0);
-        f.record_turn_usage(AgentId::Main, &complete);
-        assert_eq!(f.context_usage(AgentId::Main).tokens, Some(4_000));
-        assert!(!f.context_usage(AgentId::Main).incomplete);
+        f.record_turn_usage(AgentId::Main, &token_usage(20_000, 0, 0, 0));
+        f.record_turn_usage(AgentId::Main, &token_usage(0, 0, 0, 0));
+        assert_eq!(f.context_usage(AgentId::Main).tokens, Some(20_000));
     }
 
     #[test]
@@ -521,7 +476,6 @@ mod tests {
         let d = context_usage_display(ContextUsage {
             tokens: None,
             context_window: 200_000,
-            incomplete: false,
         })
         .expect("non-empty window should render");
         assert_eq!(d.ratio, "?/200k");
@@ -530,42 +484,11 @@ mod tests {
     }
 
     #[test]
-    fn context_usage_display_marks_only_incomplete_nonzero_evidence() {
-        let zero = context_usage_display(ContextUsage {
-            tokens: Some(0),
-            context_window: 200_000,
-            incomplete: true,
-        })
-        .expect("known window");
-        assert_eq!(zero.ratio, "?/200k");
-        assert_eq!(zero.percent, None);
-
-        let complete = context_usage_display(ContextUsage {
-            tokens: Some(9_999),
-            context_window: 20_000_000,
-            incomplete: false,
-        })
-        .expect("known window");
-        assert_eq!(complete.ratio, "10.0k/20M");
-        assert!(complete.percent.is_some());
-
-        let incomplete = context_usage_display(ContextUsage {
-            tokens: Some(9_999),
-            context_window: 20_000_000,
-            incomplete: true,
-        })
-        .expect("known window");
-        assert_eq!(incomplete.ratio, "≥10.0k/20M");
-        assert_eq!(incomplete.percent, None);
-    }
-
-    #[test]
     fn context_usage_display_suppresses_zero_window() {
         assert!(
             context_usage_display(ContextUsage {
                 tokens: Some(1_000),
                 context_window: 0,
-                incomplete: false,
             })
             .is_none(),
             "a 0-token context window suppresses the indicator",
@@ -580,7 +503,6 @@ mod tests {
             context_usage_display(ContextUsage {
                 tokens: Some(tokens),
                 context_window: 200_000,
-                incomplete: false,
             })
             .expect("rendered")
             .severity
@@ -597,7 +519,6 @@ mod tests {
         let d = context_usage_display(ContextUsage {
             tokens: Some(20_000),
             context_window: 200_000,
-            incomplete: false,
         })
         .expect("rendered");
         assert_eq!(d.ratio, "20k/200k");

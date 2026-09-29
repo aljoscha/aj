@@ -304,13 +304,8 @@ fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
     let output_str = format_tokens(usage.accumulated_output, usage.turn_output);
     let cache_creation_str = format_tokens(usage.accumulated_cache_write, usage.turn_cache_write);
     let cache_read_str = format_tokens(usage.accumulated_cache_read, usage.turn_cache_read);
-    let title = if usage.turn_incomplete || usage.accumulated_incomplete {
-        "Token Usage (recorded minimum)"
-    } else {
-        "Token Usage"
-    };
     let body = format!(
-        "{title} - Input: {input_str} | Output: {output_str} | Cache Creation: {cache_creation_str} | Cache Read: {cache_read_str}",
+        "Token Usage - Input: {input_str} | Output: {output_str} | Cache Creation: {cache_creation_str} | Cache Read: {cache_read_str}",
     );
     match agent_id {
         AgentId::Main => body,
@@ -700,7 +695,7 @@ impl ChatState {
 
     /// Builds end-of-session usage from the latest per-agent usage events.
     pub fn usage_summary(&self) -> UsageSummary {
-        let (main_agent_usage, mut incomplete) = self.usage_for(AgentId::Main);
+        let main_agent_usage = self.usage_for(AgentId::Main);
         let mut sub_ids: Vec<usize> = self
             .transcripts
             .keys()
@@ -710,12 +705,10 @@ impl ChatState {
             })
             .collect();
         sub_ids.sort_unstable();
-        let mut sub_agent_usage = Vec::with_capacity(sub_ids.len());
-        for id in sub_ids {
-            let (usage, usage_incomplete) = self.usage_for(AgentId::Sub(id));
-            incomplete |= usage_incomplete;
-            sub_agent_usage.push(usage);
-        }
+        let sub_agent_usage: Vec<SubAgentUsage> = sub_ids
+            .into_iter()
+            .map(|id| self.usage_for(AgentId::Sub(id)))
+            .collect();
         let total_usage = sub_agent_usage.iter().fold(
             SubAgentUsage {
                 agent_id: None,
@@ -736,11 +729,10 @@ impl ChatState {
             main_agent_usage,
             sub_agent_usage,
             total_usage,
-            incomplete,
         }
     }
 
-    fn usage_for(&self, agent: AgentId) -> (SubAgentUsage, bool) {
+    fn usage_for(&self, agent: AgentId) -> SubAgentUsage {
         let usage = self.transcripts.get(&agent).and_then(|transcript| {
             transcript.entries.iter().rev().find_map(|entry| {
                 let EntryKind::TurnUsage(usage) = &entry.kind else {
@@ -749,24 +741,20 @@ impl ChatState {
                 Some(&usage.usage)
             })
         });
-        (
-            SubAgentUsage {
-                agent_id: match agent {
-                    AgentId::Main => None,
-                    AgentId::Sub(id) => Some(id),
-                },
-                input_tokens: usage.map_or(0, |usage| usage.accumulated_input + usage.turn_input),
-                output_tokens: usage
-                    .map_or(0, |usage| usage.accumulated_output + usage.turn_output),
-                cache_write_tokens: usage.map_or(0, |usage| {
-                    usage.accumulated_cache_write + usage.turn_cache_write
-                }),
-                cache_read_tokens: usage.map_or(0, |usage| {
-                    usage.accumulated_cache_read + usage.turn_cache_read
-                }),
+        SubAgentUsage {
+            agent_id: match agent {
+                AgentId::Main => None,
+                AgentId::Sub(id) => Some(id),
             },
-            usage.is_some_and(|usage| usage.accumulated_incomplete || usage.turn_incomplete),
-        )
+            input_tokens: usage.map_or(0, |usage| usage.accumulated_input + usage.turn_input),
+            output_tokens: usage.map_or(0, |usage| usage.accumulated_output + usage.turn_output),
+            cache_write_tokens: usage.map_or(0, |usage| {
+                usage.accumulated_cache_write + usage.turn_cache_write
+            }),
+            cache_read_tokens: usage.map_or(0, |usage| {
+                usage.accumulated_cache_read + usage.turn_cache_read
+            }),
+        }
     }
 
     /// Snapshot of every known agent for the agent picker: the main
@@ -1038,8 +1026,6 @@ mod tests {
             turn_cache_write: turn[2],
             accumulated_cache_read: already[3],
             turn_cache_read: turn[3],
-            turn_incomplete: false,
-            accumulated_incomplete: false,
         }
     }
 
@@ -1074,23 +1060,6 @@ mod tests {
         assert_eq!(
             line,
             "(sub agent 2) Token Usage - Input: 0+10 | Output: 0+5 | Cache Creation: 0+1 | Cache Read: 0",
-        );
-    }
-
-    #[test]
-    fn partial_turn_or_running_total_uses_the_recorded_minimum_title() {
-        let mut turn_partial = token_usage([10, 5, 1, 0], [0, 0, 0, 0]);
-        turn_partial.turn_incomplete = true;
-        assert_eq!(
-            format_turn_usage_line(AgentId::Main, &turn_partial),
-            "Token Usage (recorded minimum) - Input: 0+10 | Output: 0+5 | Cache Creation: 0+1 | Cache Read: 0"
-        );
-
-        let mut total_partial = token_usage([10, 5, 1, 0], [20, 8, 0, 2]);
-        total_partial.accumulated_incomplete = true;
-        assert!(
-            format_turn_usage_line(AgentId::Sub(2), &total_partial)
-                .starts_with("(sub agent 2) Token Usage (recorded minimum) - ")
         );
     }
 
@@ -1206,8 +1175,7 @@ mod tests {
     #[test]
     fn usage_summary_uses_event_derived_running_totals() {
         let mut chat = chat_state();
-        let mut main_usage = token_usage([10, 5, 2, 3], [100, 40, 20, 30]);
-        main_usage.accumulated_incomplete = true;
+        let main_usage = token_usage([10, 5, 2, 3], [100, 40, 20, 30]);
         chat.transcripts
             .get_mut(&AgentId::Main)
             .expect("main transcript")
@@ -1231,7 +1199,6 @@ mod tests {
         assert_eq!(usage.sub_agent_usage[0].agent_id, Some(2));
         assert_eq!(usage.total_usage.input_tokens, 117);
         assert_eq!(usage.total_usage.cache_read_tokens, 35);
-        assert!(usage.incomplete);
     }
 
     #[test]

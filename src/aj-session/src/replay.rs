@@ -1087,9 +1087,7 @@ impl ReplayState {
                         reason: CompactionReason::Manual,
                         tokens_before: *tokens_before,
                         tokens_after,
-                        usage: usage
-                            .as_ref()
-                            .map(|delta| self.account_usage(agent_id, delta)),
+                        usage: Some(self.account_usage(agent_id, usage)),
                         summary: Some(summary.clone()),
                         error: None,
                     },
@@ -1245,8 +1243,6 @@ impl ReplayState {
             turn_cache_write: delta.cache_write,
             accumulated_cache_read: accumulated.cache_read,
             turn_cache_read: delta.cache_read,
-            turn_incomplete: delta.incomplete,
-            accumulated_incomplete: accumulated.incomplete,
         };
         accumulated.accumulate(delta);
         usage
@@ -1727,7 +1723,7 @@ mod tests {
                 Vec::new(),
                 100,
                 None,
-                None,
+                aj_models::types::Usage::default(),
             )
             .unwrap();
         let sibling = ConversationView::user(&mut log)
@@ -2959,17 +2955,6 @@ mod tests {
         cache_read: u64,
         cache_write: u64,
     ) -> AgentMessage {
-        assistant_msg_with_usage_state(content, input, output, cache_read, cache_write, false)
-    }
-
-    fn assistant_msg_with_usage_state(
-        content: Vec<AssistantContent>,
-        input: u64,
-        output: u64,
-        cache_read: u64,
-        cache_write: u64,
-        incomplete: bool,
-    ) -> AgentMessage {
         AgentMessage::wire(Message::Assistant(AssistantMessage {
             content,
             usage: aj_models::types::Usage {
@@ -2977,7 +2962,6 @@ mod tests {
                 output,
                 cache_read,
                 cache_write,
-                incomplete,
                 ..aj_models::types::Usage::default()
             },
             ..AssistantMessage::empty()
@@ -2997,7 +2981,7 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create log");
         {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(assistant_msg_with_usage_state(
+            view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::Text(TextContent {
                     text: "first".into(),
                     text_signature: None,
@@ -3006,7 +2990,6 @@ mod tests {
                 50,
                 20,
                 5,
-                true,
             ))
             .expect("turn 1");
             view.add_message(assistant_msg_with_usage(
@@ -3048,8 +3031,6 @@ mod tests {
         assert_eq!(first.accumulated_output, 0);
         assert_eq!(first.accumulated_cache_read, 0);
         assert_eq!(first.accumulated_cache_write, 0);
-        assert!(first.turn_incomplete);
-        assert!(!first.accumulated_incomplete);
 
         let second = turn_usages[1];
         assert_eq!(second.turn_input, 200);
@@ -3063,13 +3044,10 @@ mod tests {
         assert_eq!(second.accumulated_output, 50);
         assert_eq!(second.accumulated_cache_read, 20);
         assert_eq!(second.accumulated_cache_write, 5);
-        assert!(!second.turn_incomplete);
-        assert!(second.accumulated_incomplete);
     }
 
-    /// A `Compaction` entry replays its reduced occupancy and only projects
-    /// usage when the checkpoint records it. A legacy `None` stays unknown;
-    /// the following priced checkpoint advances the pre-add accumulator once.
+    /// A `Compaction` entry replays its reduced occupancy and its summarizer
+    /// usage, advancing the pre-add accumulator once.
     #[test]
     fn replay_compaction_projects_reduced_occupancy_and_recorded_usage() {
         let dir = fresh_sessions_dir();
@@ -3108,29 +3086,19 @@ mod tests {
         };
         log.append_compaction(
             ThreadFilter::USER,
-            "LEGACY SUMMARY".into(),
-            first_kept.clone(),
-            Vec::new(),
-            100_000,
-            None,
-            None,
-        )
-        .expect("append legacy compaction");
-        log.append_compaction(
-            ThreadFilter::USER,
             "PRICED SUMMARY".into(),
             first_kept,
             Vec::new(),
             50_000,
             None,
-            Some(Usage {
+            Usage {
                 input: 7,
                 output: 11,
                 cache_write: 13,
                 cache_read: 17,
                 total_tokens: 48,
                 ..Usage::default()
-            }),
+            },
         )
         .expect("append priced compaction");
 
@@ -3176,18 +3144,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            updates.len(),
-            3,
-            "two assistants plus only the priced checkpoint"
-        );
-        assert!(
-            events.iter().any(|event| matches!(event,
-                AgentEvent::CompactionEnd { summary: Some(summary), usage: None, .. }
-                    if summary == "LEGACY SUMMARY"
-            )),
-            "legacy checkpoint usage remains unknown"
-        );
+        assert_eq!(updates.len(), 3, "two assistants plus the checkpoint");
         let checkpoint = updates.last().expect("checkpoint usage");
         assert_eq!(checkpoint.accumulated_input, 200_000);
         assert_eq!(checkpoint.accumulated_output, 20);
@@ -4545,7 +4502,7 @@ mod tests {
             Vec::new(),
             500,
             None,
-            None,
+            aj_models::types::Usage::default(),
         )
         .expect("compaction");
         let parent_head = log.head().cloned().expect("head present");

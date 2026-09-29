@@ -19,7 +19,7 @@ use anthropic_sdk::messages::{
 use futures::StreamExt;
 use serde_json::Value;
 
-use crate::cancel::{RequestSelectOutcome, SelectOutcome, select_cancel, select_request};
+use crate::cancel::{SelectOutcome, select_cancel};
 use crate::errors::{
     classify_anthropic_error, classify_anthropic_stop_reason, parse_retry_after, transport_error,
 };
@@ -178,32 +178,20 @@ async fn run_stream_inner(
         }
     }
 
-    // The client request future's first poll is the issuance boundary.
-    // Cancellation before that poll remains complete zero. After it, the
-    // terminal carries only a recorded subtotal until final usage arrives.
     let mut state = StreamState::new_with_account(model, credential.account.clone());
     let mut sse =
-        match select_request(options.cancel.as_ref(), client.messages_stream(request)).await {
-            RequestSelectOutcome::Ready(Ok(sse)) => sse,
-            RequestSelectOutcome::Ready(Err(err)) => {
+        match select_cancel(options.cancel.as_ref(), client.messages_stream(request)).await {
+            SelectOutcome::Ready(Ok(sse)) => sse,
+            SelectOutcome::Ready(Err(err)) => {
                 let account = account_for_client_error(&err, credential.account.as_deref());
-                let error = classify_client_error(&err);
-                let terminal = if client_error_was_issued(&err) {
-                    state.client_failed(error)
-                } else {
-                    error_before_state(model, account, error)
-                };
-                producer.push(terminal);
-                return Ok(());
-            }
-            RequestSelectOutcome::CancelledBeforePoll => {
-                producer.push(AssistantMessageEvent::aborted(empty_partial(
+                producer.push(error_before_state(
                     model,
-                    credential.account.as_deref(),
-                )));
+                    account,
+                    classify_client_error(&err),
+                ));
                 return Ok(());
             }
-            RequestSelectOutcome::CancelledAfterPoll => {
+            SelectOutcome::Cancelled => {
                 producer.push(state.cancelled());
                 return Ok(());
             }
@@ -363,10 +351,6 @@ fn account_for_client_error<'a>(err: &ClientError, account: Option<&'a str>) -> 
         ClientError::TransportError(err) if err.is_builder() => None,
         _ => account,
     }
-}
-
-fn client_error_was_issued(err: &ClientError) -> bool {
-    !matches!(err, ClientError::TransportError(err) if err.is_builder())
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,7 +1040,6 @@ impl StreamState {
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
         partial.account = account;
-        partial.usage.incomplete = true;
         Self {
             cost: model.cost.clone(),
             partial,
@@ -1299,7 +1282,6 @@ impl StreamState {
                 apply_usage_delta(&mut self.partial.usage, &usage);
                 self.seal();
                 if delta.stop_reason.is_some() {
-                    self.partial.usage.incomplete = false;
                     self.stop_reason = delta.stop_reason;
                 }
                 if let Some(AStopDetails::Refusal {
@@ -1371,18 +1353,6 @@ impl StreamState {
     fn cancelled(&mut self) -> AssistantMessageEvent {
         self.seal();
         AssistantMessageEvent::aborted(self.partial.clone())
-    }
-
-    /// Terminalize a request failure after the provider call was issued but
-    /// before an SSE stream was established.
-    fn client_failed(mut self, error: AssistantError) -> AssistantMessageEvent {
-        self.seal();
-        self.partial.stop_reason = StopReason::Error;
-        self.partial.error = Some(error);
-        AssistantMessageEvent::Error {
-            reason: ErrorReason::Error,
-            error: self.partial,
-        }
     }
 
     /// Build the stream's terminal event, classifying a stream that ended
@@ -1485,7 +1455,6 @@ fn into_unified_usage(au: &AUsage) -> Usage {
         // it when it seals.
         total_tokens: 0,
         cost: Default::default(),
-        incomplete: true,
     }
 }
 
@@ -1637,10 +1606,6 @@ mod tests {
             .expect("fixture server completes");
 
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(
-            terminal.usage.incomplete,
-            "message_stop without final message_delta leaves usage partial"
-        );
     }
 
     #[tokio::test]
@@ -1700,7 +1665,6 @@ mod tests {
             ),
             (12, 0, 4, 2, 18),
         );
-        assert!(terminal.usage.incomplete);
         let expected_cost = 0.000_036 + 0.000_001_2 + 0.000_007_5;
         assert!(
             (terminal.usage.cost.total - expected_cost).abs() < 1e-12,
@@ -1784,7 +1748,6 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Error);
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
@@ -1802,7 +1765,6 @@ mod tests {
             terminal.error.is_some(),
             "the malformed URL must fail locally"
         );
-        assert!(!terminal.usage.incomplete);
         assert_eq!(
             terminal.account, None,
             "no request left the process, so no credential served"
@@ -1822,11 +1784,10 @@ mod tests {
             .await
             .expect("provider stream terminates");
         assert_eq!(terminal.account, None);
-        assert!(!terminal.usage.incomplete);
     }
 
     #[tokio::test]
-    async fn cancellation_before_the_anthropic_request_poll_stays_complete_zero() {
+    async fn cancellation_before_the_anthropic_request_issues_nothing() {
         let server = crate::provider_test_support::openai_error_server("POST /v1/messages").await;
         let mut model = fake_model();
         model.base_url = server.base_url.clone();
@@ -1842,7 +1803,6 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(!terminal.usage.incomplete);
         assert_eq!(requests, 0, "cancellation precedes request issuance");
     }
 
@@ -1882,7 +1842,6 @@ mod tests {
         let _ = server.await;
 
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(terminal.usage.incomplete);
     }
 
     #[test]
@@ -2510,7 +2469,6 @@ mod tests {
         let _ = state.process(ServerSentEvent::MessageStart {
             message: empty_a_message(),
         });
-        assert!(state.partial.usage.incomplete);
         let _ = state.process(ServerSentEvent::ContentBlockStart {
             index: 0,
             content_block: AContentBlock::ToolUseBlock {
@@ -2871,10 +2829,6 @@ mod tests {
         assert_eq!(state.partial.usage.cache_write, 2);
         assert_eq!(state.partial.usage.output, 7);
         assert_eq!(state.partial.usage.total_tokens, 25);
-        assert!(
-            state.partial.usage.incomplete,
-            "a nonterminal delta is not final usage evidence"
-        );
         let expected = 0.000_036 + 0.000_105 + 0.000_001_2 + 0.000_007_5;
         assert!(
             (state.partial.usage.cost.total - expected).abs() < 1e-12,
@@ -2903,7 +2857,6 @@ mod tests {
         assert_eq!(state.partial.usage.input, 20);
         assert_eq!(state.partial.usage.output, 9);
         assert_eq!(state.partial.usage.total_tokens, 35);
-        assert!(!state.partial.usage.incomplete);
         let expected = 0.000_06 + 0.000_135 + 0.000_001_2 + 0.000_007_5;
         assert!(
             (state.partial.usage.cost.total - expected).abs() < 1e-12,
@@ -2911,36 +2864,6 @@ mod tests {
             state.partial.usage.cost.total
         );
         assert!(matches!(state.stop_reason, Some(AStopReason::EndTurn)));
-    }
-
-    #[test]
-    fn an_explicit_zero_final_usage_delta_is_complete() {
-        let mut message = empty_a_message();
-        message.usage = AUsage::default();
-        let mut state = StreamState::new(&fake_model());
-        let _ = state.process(ServerSentEvent::MessageStart { message });
-        let _ = state.process(ServerSentEvent::MessageDelta {
-            delta: MessageDelta {
-                stop_reason: Some(AStopReason::EndTurn),
-                stop_sequence: None,
-                container: None,
-                stop_details: None,
-            },
-            usage: AUsageDelta {
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-                input_tokens: None,
-                iterations: None,
-                output_tokens: 0,
-                server_tool_use: None,
-            },
-            context_management: None,
-        });
-        let _ = state.process(ServerSentEvent::MessageStop);
-
-        let terminal = state.finalize_or_truncate();
-        assert_eq!(terminal.partial().usage.total_tokens, 0);
-        assert!(!terminal.partial().usage.incomplete);
     }
 
     #[test]

@@ -33,11 +33,9 @@ use openai_sdk::types::responses::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cancel::{RequestSelectOutcome, SelectOutcome, select_cancel, select_request};
+use crate::cancel::{SelectOutcome, select_cancel};
 use crate::errors::classify_openai_stream_failure;
-use crate::openai::errors::{
-    account_for_client_error, classify_client_error, client_error_was_issued,
-};
+use crate::openai::errors::{account_for_client_error, classify_client_error};
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{
@@ -282,37 +280,25 @@ async fn run_stream_inner(
         }
     }
 
-    // The client request future's first poll is the issuance boundary.
-    // Cancellation before that poll remains complete zero. After it, the
-    // terminal carries only a recorded subtotal until final usage arrives.
     let mut state = StreamState::new_with_account(
         model,
         options.service_tier.clone(),
         credential.account.clone(),
     );
     let mut sse =
-        match select_request(options.cancel.as_ref(), client.responses_stream(request)).await {
-            RequestSelectOutcome::Ready(Ok(sse)) => sse,
-            RequestSelectOutcome::Ready(Err(err)) => {
+        match select_cancel(options.cancel.as_ref(), client.responses_stream(request)).await {
+            SelectOutcome::Ready(Ok(sse)) => sse,
+            SelectOutcome::Ready(Err(err)) => {
                 let account = account_for_client_error(&err, credential.account.as_deref());
-                let error = classify_client_error(&err);
-                let terminal = if client_error_was_issued(&err) {
-                    state.client_failed(error)
-                } else {
-                    error_message(API_NAME, model, account, error)
-                };
-                producer.push(terminal);
-                return Ok(());
-            }
-            RequestSelectOutcome::CancelledBeforePoll => {
-                producer.push(AssistantMessageEvent::aborted(empty_partial(
+                producer.push(error_message(
                     API_NAME,
                     model,
-                    credential.account.as_deref(),
-                )));
+                    account,
+                    classify_client_error(&err),
+                ));
                 return Ok(());
             }
-            RequestSelectOutcome::CancelledAfterPoll => {
+            SelectOutcome::Cancelled => {
                 producer.push(state.cancelled());
                 return Ok(());
             }
@@ -1109,7 +1095,6 @@ impl StreamState {
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
         partial.account = account;
-        partial.usage.incomplete = true;
         Self {
             partial,
             started: false,
@@ -1592,7 +1577,6 @@ impl StreamState {
         let multiplier = self.tier_multiplier();
         if let Some(usage) = self.final_response.as_ref().and_then(|r| r.usage.as_ref()) {
             apply_usage(&mut self.partial.usage, usage);
-            self.partial.usage.incomplete = false;
         }
         finalize_usage(&mut self.partial.usage, &self.cost, multiplier);
     }
@@ -2652,7 +2636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_issued_http_error_keeps_responses_usage_partial() {
+    async fn an_http_error_keeps_the_account_whose_key_was_sent() {
         let server = crate::provider_test_support::openai_error_server("POST /v1/responses").await;
         let mut model = fake_model(false);
         model.base_url = format!("{}/v1", server.base_url);
@@ -2671,12 +2655,11 @@ mod tests {
         );
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(terminal.usage.total_tokens, 0);
-        assert!(terminal.usage.incomplete);
         assert_eq!(requests, 1, "one inference issues one HTTP request");
     }
 
     #[tokio::test]
-    async fn cancellation_before_the_responses_request_poll_stays_complete_zero() {
+    async fn cancellation_before_the_responses_request_issues_nothing() {
         let server = crate::provider_test_support::openai_error_server("POST /v1/responses").await;
         let mut model = fake_model(false);
         model.base_url = format!("{}/v1", server.base_url);
@@ -2692,12 +2675,11 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(!terminal.usage.incomplete);
         assert_eq!(requests, 0, "cancellation precedes request issuance");
     }
 
     #[tokio::test]
-    async fn a_handshake_cancel_marks_the_issued_request_partial() {
+    async fn a_handshake_cancel_keeps_the_account_that_resolved() {
         let mut server =
             crate::provider_test_support::held_handshake_server("POST /v1/responses").await;
         let mut model = fake_model(false);
@@ -2715,7 +2697,6 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
@@ -2860,7 +2841,6 @@ mod tests {
         for (wire, stop_reason, category) in cases {
             let event = serde_json::from_value(wire).expect("lifecycle event");
             let mut state = StreamState::new(&fake_model(false), None);
-            assert!(state.partial.usage.incomplete);
             let _ = state.process(event);
             assert!(state.saw_terminal());
             let terminal = state.finalize_or_truncate();
@@ -2873,31 +2853,7 @@ mod tests {
                     .map(|error| error.category),
                 category
             );
-            assert!(
-                terminal.partial().usage.incomplete,
-                "a lifecycle terminal without response usage stays partial"
-            );
         }
-    }
-
-    #[test]
-    fn an_explicit_zero_terminal_usage_is_complete() {
-        let completed: ResponseStreamEvent = serde_json::from_value(serde_json::json!({
-            "type": "response.completed", "sequence_number": 1,
-            "response": {
-                "id": "resp_1", "object": "response", "created_at": 0.0,
-                "model": "gpt-5", "output": [], "parallel_tool_calls": true,
-                "tools": [], "status": "completed",
-                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-            }
-        }))
-        .expect("completed response with zero usage");
-        let mut state = StreamState::new(&fake_model(false), None);
-        let _ = state.process(completed);
-
-        let terminal = state.finalize_or_truncate();
-        assert_eq!(terminal.partial().usage.total_tokens, 0);
-        assert!(!terminal.partial().usage.incomplete);
     }
 
     #[test]

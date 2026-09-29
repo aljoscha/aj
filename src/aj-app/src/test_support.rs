@@ -866,8 +866,6 @@ mod tests {
                     turn_cache_write: 50,
                     accumulated_cache_read: 0,
                     turn_cache_read: 200,
-                    turn_incomplete: false,
-                    accumulated_incomplete: false,
                 },
             });
             apply(AgentEvent::ToolExecutionStart {
@@ -905,7 +903,6 @@ mod tests {
             ContextUsage {
                 tokens: Some(1_250),
                 context_window: 200_000,
-                incomplete: false,
             },
             "the model's context accounting remains observable",
         );

@@ -110,14 +110,6 @@ pub struct SessionStats {
     /// the conversation itself, summed from the compaction entries that
     /// recorded any.
     pub compaction_usage: Usage,
-    /// How many of `compactions` carried a recorded usage. Entries
-    /// written before compaction was accounted carry none, and their
-    /// spend is unknown rather than zero, so a caller comparing this
-    /// against `compactions` can tell a subtotal that is complete from
-    /// one that is an underestimate. Without the count the two are
-    /// indistinguishable, since a summarizer that legitimately reported
-    /// nothing also sums to zero.
-    pub compactions_with_usage: usize,
     /// Model, thinking, speed, and verbosity currently recorded on the user
     /// thread.
     pub settings: SessionSettings,
@@ -147,7 +139,6 @@ impl ConversationLog {
         let mut usage_buckets: HashMap<(String, String, Option<String>), UsageBucket> =
             HashMap::new();
         let mut compaction_usage = Usage::default();
-        let mut compactions_with_usage = 0;
         let mut last_activity: Option<DateTime<Utc>> = None;
         let mut per_tool: HashMap<String, usize> = HashMap::new();
 
@@ -194,17 +185,8 @@ impl ConversationLog {
                     usage: entry_usage, ..
                 } => {
                     compactions += 1;
-                    if let Some(u) = entry_usage {
-                        compactions_with_usage += 1;
-                        usage.accumulate(u);
-                        compaction_usage.accumulate(u);
-                    } else {
-                        // The checkpoint proves a summarizer ran without a
-                        // recorded subtotal. Keep the absent Option on disk,
-                        // and mark only the computed aggregates partial.
-                        usage.incomplete = true;
-                        compaction_usage.incomplete = true;
-                    }
+                    usage.accumulate(entry_usage);
+                    compaction_usage.accumulate(entry_usage);
                 }
                 _ => {}
             }
@@ -238,7 +220,6 @@ impl ConversationLog {
             usage,
             usage_breakdown,
             compaction_usage,
-            compactions_with_usage,
             settings,
             session_env: self.session_env().cloned(),
         }
@@ -451,7 +432,6 @@ mod tests {
                 cache_write: costs[3],
                 total: costs[4],
             },
-            incomplete: false,
         }
     }
 
@@ -470,7 +450,7 @@ mod tests {
     /// Build a log holding one assistant turn and one compaction
     /// checkpoint carrying `usage`, the shape a compacted session has on
     /// disk. Returns the log and the guard owning its directory.
-    fn log_with_compaction(usage: Option<Usage>) -> (tempfile::TempDir, ConversationLog) {
+    fn log_with_compaction(usage: Usage) -> (tempfile::TempDir, ConversationLog) {
         let dir = tempfile::tempdir().unwrap();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).unwrap();
@@ -509,8 +489,7 @@ mod tests {
             ..Usage::default()
         };
         usage.cost.total = 0.25;
-        usage.incomplete = true;
-        let (_dir, log) = log_with_compaction(Some(usage));
+        let (_dir, log) = log_with_compaction(usage);
 
         let stats = log.stats();
         assert_eq!(stats.compactions, 1, "the fixture must record a compaction");
@@ -543,19 +522,12 @@ mod tests {
             stats.compaction_usage.cost.total
         );
         assert_eq!(stats.compaction_usage.total_tokens, 40_900);
-        assert!(stats.usage.incomplete);
-        assert!(stats.compaction_usage.incomplete);
-        assert_eq!(stats.compactions_with_usage, 1, "its spend is known");
         assert_eq!(
             stats.usage_breakdown.len(),
             1,
             "compaction spend never creates a usage bucket"
         );
         let bucket = &stats.usage_breakdown[0];
-        assert!(
-            !bucket.usage.incomplete,
-            "unattributed compaction spend does not mark an assistant bucket"
-        );
         assert_eq!(
             (
                 bucket.provider.as_str(),
@@ -570,33 +542,6 @@ mod tests {
         );
     }
 
-    /// A compaction written before the spend was recorded carries no
-    /// usage. It must fold as nothing and leave the session total alone,
-    /// so an old log reads as unknown rather than as free.
-    #[test]
-    fn stats_treats_a_compaction_without_usage_as_unrecorded() {
-        let (_dir, log) = log_with_compaction(None);
-
-        let stats = log.stats();
-        assert_eq!(stats.compactions, 1);
-        // The distinction a zero subtotal cannot carry on its own: a
-        // summarizer that reported nothing sums to zero too, so the
-        // count is what separates unknown from free.
-        assert_eq!(
-            stats.compactions_with_usage, 0,
-            "an entry with no usage is not a recorded zero"
-        );
-        assert!(
-            (stats.usage.cost.total - 0.10).abs() < 1e-9,
-            "only the assistant turn contributes, got {}",
-            stats.usage.cost.total
-        );
-        assert_eq!(stats.compaction_usage.total_tokens, 0);
-        assert!(stats.usage.incomplete);
-        assert!(stats.compaction_usage.incomplete);
-        assert!(!stats.usage_breakdown[0].usage.incomplete);
-    }
-
     /// The digest sums token usage and dollar cost across every assistant
     /// message in the file.
     #[test]
@@ -609,18 +554,17 @@ mod tests {
         head.add_message(AgentMessage::wire(user("hi"))).unwrap();
         head.add_message(AgentMessage::wire(assistant_with_usage(100, 50, 0.10)))
             .unwrap();
-        let mut partial = Usage {
+        let mut second = Usage {
             input: 200,
             output: 80,
             total_tokens: 280,
-            incomplete: true,
             ..Usage::default()
         };
-        partial.cost.total = 0.25;
+        second.cost.total = 0.25;
         head.add_message(AgentMessage::wire(assistant_for(
             "anthropic",
             "claude-test",
-            partial,
+            second,
         )))
         .unwrap();
 
@@ -629,8 +573,6 @@ mod tests {
         assert_eq!(stats.usage.output, 130);
         assert_eq!(stats.usage.total_tokens, 430);
         assert!((stats.usage.cost.total - 0.35).abs() < 1e-9);
-        assert!(stats.usage.incomplete);
-        assert!(stats.usage_breakdown[0].usage.incomplete);
     }
 
     /// Usage buckets preserve each response's identity across user branches

@@ -45,7 +45,7 @@ const entries = [
         { type: 'tool_call', id: 'c9', name: 'read_file', arguments: { path: '/home/me/future.rs' } },
         { type: 'tool_call', id: 'c4', name: 'agent', arguments: { task: 'investigate' } },
       ],
-      usage: { input: 100, output: 50, cache_read: 0, cache_write: 0, total_tokens: 150, cost: { total: 0.01 }, incomplete: true },
+      usage: { input: 100, output: 50, cache_read: 0, cache_write: 0, total_tokens: 150, cost: { total: 0.01 } },
       stop_reason: 'ToolUse', timestamp: 0 } },
   { id: 'r1', parent_id: 'a1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:03Z',
     message: { role: 'tool_result', tool_call_id: 'c1', tool_name: 'read_file',
@@ -318,21 +318,6 @@ has('session id', 'smoke-session');
 has('token totals', '\u2191501');
 has('cost', '$0.2600');
 has('compactions counted', '2 compactions');
-check('usage status appears once', rendered.split('partial (recorded usage only)').length - 1 === 1);
-has('usage status label', '<span class="info-label">Usage:</span><span class="info-value">partial (recorded usage only)</span>');
-const completeData = JSON.parse(JSON.stringify(sessionData));
-delete completeData.entries.find((entry) => entry.id === 'a1').message.usage.incomplete;
-completeData.entries = completeData.entries.filter((entry) => entry.id !== 'k2');
-const completeElements = (await renderData(completeData)).elements;
-check('complete legacy header has no usage status', !completeElements['header-container'].innerHTML.includes('partial (recorded usage only)'));
-const explicitData = JSON.parse(JSON.stringify(sessionData));
-explicitData.entries = explicitData.entries.filter((entry) => entry.id !== 'k2');
-const explicitElements = (await renderData(explicitData)).elements;
-check('explicit incomplete usage marks the header', explicitElements['header-container'].innerHTML.includes('partial (recorded usage only)'));
-const missingCompactionData = JSON.parse(JSON.stringify(sessionData));
-delete missingCompactionData.entries.find((entry) => entry.id === 'a1').message.usage.incomplete;
-const missingCompactionElements = (await renderData(missingCompactionData)).elements;
-check('missing compaction usage marks the header', missingCompactionElements['header-container'].innerHTML.includes('partial (recorded usage only)'));
 has('system prompt', 'You are aj.');
 has('download JSONL button', 'download-json-btn');
 has('copy-link button', 'class="copy-link-btn"');

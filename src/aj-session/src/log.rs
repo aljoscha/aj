@@ -518,11 +518,8 @@ pub enum ConversationEntryKind {
         /// makes. This is out-of-band spend: the summarizer exchange is
         /// never a message entry, so the log has no other record of it,
         /// and a session's totals would omit it entirely.
-        ///
-        /// `None` on entries written before compaction was accounted,
-        /// and on those the spend is simply unknown rather than zero.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<aj_models::types::Usage>,
+        #[serde(default)]
+        usage: aj_models::types::Usage,
     },
 }
 
@@ -2298,7 +2295,7 @@ impl ConversationLog {
         retained_user_entry_ids: Vec<EntryId>,
         tokens_before: u64,
         details: Option<crate::compaction::CompactionDetails>,
-        usage: Option<aj_models::types::Usage>,
+        usage: aj_models::types::Usage,
     ) -> Result<EntryRef, ConversationError> {
         self.ensure_writable()?;
         if !self.core.entries.contains_key(&first_kept_entry_id) {
@@ -4939,7 +4936,7 @@ mod tests {
             Vec::new(),
             1_000,
             None,
-            None,
+            aj_models::types::Usage::default(),
         )
         .expect("append compaction");
 
@@ -5119,7 +5116,7 @@ mod tests {
             Vec::new(),
             100,
             None,
-            None,
+            aj_models::types::Usage::default(),
         )
         .expect("compact branch");
         let session_id = log.session_id().to_string();
@@ -5516,35 +5513,6 @@ mod tests {
     }
 
     #[test]
-    fn a_compaction_line_written_before_usage_was_recorded_still_parses() {
-        // Every log on disk predates the usage field. Reading one must
-        // yield None (the spend is unknown) rather than failing or
-        // inventing a zero, which downstream would render as free.
-        let line = r#"{"id":"00000001","parent_id":"00000000","timestamp":"2026-07-01T00:00:00Z","thread":"user","type":"compaction","summary":"older summary","first_kept_entry_id":"00000000","tokens_before":1234}"#;
-
-        let entry: ConversationEntry =
-            serde_json::from_str(line).expect("a pre-usage compaction line still parses");
-        match entry.entry {
-            ConversationEntryKind::Compaction {
-                summary,
-                tokens_before,
-                usage,
-                retained_user_entry_ids,
-                ..
-            } => {
-                assert_eq!(summary, "older summary");
-                assert_eq!(tokens_before, 1234);
-                assert!(retained_user_entry_ids.is_empty());
-                assert!(
-                    usage.is_none(),
-                    "an old entry records no spend, which is not the same as recording zero"
-                );
-            }
-            other => panic!("expected a Compaction entry, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn a_compaction_line_carrying_usage_parses_the_recorded_spend() {
         // The positive half, and the only test that pins the on-disk KEY.
         // A round-trip cannot: serde renames serializing and deserializing
@@ -5558,7 +5526,6 @@ mod tests {
             serde_json::from_str(line).expect("a compaction line with usage parses");
         match entry.entry {
             ConversationEntryKind::Compaction { usage, .. } => {
-                let usage = usage.expect("the usage key is read rather than orphaned");
                 // Each count by name: a rename inside `Usage` orphans the
                 // field it names just as silently as one on the outside.
                 assert_eq!(usage.input, 40_000);
@@ -5615,7 +5582,7 @@ mod tests {
                 vec![retained_user.clone()],
                 1234,
                 Some(details),
-                Some(usage),
+                usage,
             )
             .expect("append compaction");
 
@@ -5655,7 +5622,6 @@ mod tests {
                 // The durability edge: the summarizer's spend has no
                 // other record, so a field that does not survive the
                 // round trip loses it outright.
-                let usage = usage.as_ref().expect("compaction usage survives a resume");
                 assert_eq!(usage.total_tokens, 42_100);
                 assert!((usage.cost.total - 0.25).abs() < 1e-9);
                 let details = details.as_ref().expect("details present");
@@ -5684,7 +5650,7 @@ mod tests {
                 Vec::new(),
                 0,
                 None,
-                None,
+                aj_models::types::Usage::default(),
             )
             .expect_err("must reject unknown first_kept id");
         assert!(matches!(err, ConversationError::InvalidAppend(_)));
@@ -5725,7 +5691,7 @@ mod tests {
                     ids,
                     0,
                     None,
-                    None,
+                    aj_models::types::Usage::default(),
                 ),
                 Err(ConversationError::InvalidAppend(_))
             ));
@@ -5752,7 +5718,7 @@ mod tests {
                     ],
                     tokens_before: 0,
                     details: None,
-                    usage: None,
+                    usage: Default::default(),
                 },
             )
             .unwrap();
@@ -5791,7 +5757,7 @@ mod tests {
             Vec::new(),
             999,
             None,
-            None,
+            aj_models::types::Usage::default(),
         )
         .expect("compaction");
 
@@ -5867,7 +5833,7 @@ mod tests {
             Vec::new(),
             999,
             None,
-            None,
+            aj_models::types::Usage::default(),
         )
         .expect("compaction");
 
@@ -5965,7 +5931,7 @@ mod tests {
                 Vec::new(),
                 42,
                 None,
-                None,
+                aj_models::types::Usage::default(),
             )
             .expect("compaction"),
         );

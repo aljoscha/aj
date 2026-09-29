@@ -641,24 +641,18 @@
     s.tokens.cacheRead += usage.cache_read || 0;
     s.tokens.cacheWrite += usage.cache_write || 0;
     if (usage.cost) s.cost += usage.cost.total || 0;
-    if (usage.incomplete === true) s.incomplete = true;
   }
 
   function computeStats() {
     const s = {
       user: 0, assistant: 0, toolResults: 0, toolCalls: 0, compactions: 0,
       tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0,
-      incomplete: false,
       models: new Set(),
     };
     for (const e of entries) {
       if (e.type === 'compaction') {
         s.compactions++;
-        // Folded only when present: an entry written before compaction was
-        // accounted carries no usage, and folding that as zero would report
-        // the spend as free rather than as unknown.
         if (e.usage) foldUsage(s, e.usage);
-        else s.incomplete = true;
       }
       if (e.type !== 'message' || !e.message) continue;
       const m = e.message;
@@ -705,7 +699,6 @@
       infoItem('Tool calls', String(s.toolCalls)) +
       infoItem('Tokens', tokenParts.join(' ') || '0') +
       infoItem('Cost', '$' + s.cost.toFixed(4)) +
-      (s.incomplete ? infoItem('Usage', 'partial (recorded usage only)') : '') +
       '</div></div>';
 
     const sysEntry = entries.find((e) => e.type === 'system_prompt');

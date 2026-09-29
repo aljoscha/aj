@@ -42,7 +42,7 @@ use openai_sdk::types::responses::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::cancel::{RequestSelectOutcome, SelectOutcome, select_cancel, select_request};
+use crate::cancel::{SelectOutcome, select_cancel};
 use crate::oauth::openai::extract_account_id;
 use crate::provider::Provider;
 use crate::registry::{ModelInfo, validate_thinking_level};
@@ -60,9 +60,7 @@ use crate::types::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::types::ServiceTier;
 
-use super::errors::{
-    account_for_client_error, classify_client_error_with, client_error_was_issued,
-};
+use super::errors::{account_for_client_error, classify_client_error_with};
 use super::responses::{
     CostMultiplierFn, StreamState, convert_messages, empty_partial, error_message,
     map_service_tier, responses_reasoning_effort, verbosity_text_config,
@@ -242,9 +240,6 @@ async fn run_stream_inner(
         }
     }
 
-    // The client request future's first poll is the issuance boundary.
-    // Cancellation before that poll remains complete zero. After it, the
-    // terminal carries only a recorded subtotal until final usage arrives.
     let mut state = StreamState::new_with(
         API_NAME,
         model,
@@ -252,33 +247,24 @@ async fn run_stream_inner(
         CODEX_COST_MULTIPLIER,
         credential.account.clone(),
     );
-    let mut sse = match select_request(
+    let mut sse = match select_cancel(
         options.cancel.as_ref(),
         client.codex_responses_stream(request),
     )
     .await
     {
-        RequestSelectOutcome::Ready(Ok(sse)) => sse,
-        RequestSelectOutcome::Ready(Err(err)) => {
+        SelectOutcome::Ready(Ok(sse)) => sse,
+        SelectOutcome::Ready(Err(err)) => {
             let account = account_for_client_error(&err, credential.account.as_deref());
-            let error = classify_codex_client_error(&err);
-            let terminal = if client_error_was_issued(&err) {
-                state.client_failed(error)
-            } else {
-                error_message(API_NAME, model, account, error)
-            };
-            producer.push(terminal);
-            return Ok(());
-        }
-        RequestSelectOutcome::CancelledBeforePoll => {
-            producer.push(AssistantMessageEvent::aborted(empty_partial(
+            producer.push(error_message(
                 API_NAME,
                 model,
-                credential.account.as_deref(),
-            )));
+                account,
+                classify_codex_client_error(&err),
+            ));
             return Ok(());
         }
-        RequestSelectOutcome::CancelledAfterPoll => {
+        SelectOutcome::Cancelled => {
             producer.push(state.cancelled());
             return Ok(());
         }
@@ -946,11 +932,10 @@ mod tests {
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(terminal.usage.total_tokens, 0);
         assert_eq!(terminal.usage.cost.total, 0.0);
-        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
-    async fn a_handshake_cancel_marks_the_issued_request_partial() {
+    async fn a_handshake_cancel_keeps_the_account_that_resolved() {
         let mut server =
             crate::provider_test_support::held_handshake_server("POST /codex/responses").await;
         let mut model = fake_model("gpt-5.1", false);
@@ -968,11 +953,10 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(terminal.usage.incomplete);
     }
 
     #[tokio::test]
-    async fn cancellation_before_the_codex_request_poll_stays_complete_zero() {
+    async fn cancellation_before_the_codex_request_issues_nothing() {
         let server =
             crate::provider_test_support::openai_error_server("POST /codex/responses").await;
         let mut model = fake_model("gpt-5.1", false);
@@ -989,12 +973,11 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
-        assert!(!terminal.usage.incomplete);
         assert_eq!(requests, 0, "cancellation precedes request issuance");
     }
 
     #[tokio::test]
-    async fn an_issued_http_error_keeps_codex_usage_partial() {
+    async fn an_http_error_keeps_the_account_whose_key_was_sent() {
         let server =
             crate::provider_test_support::openai_error_server("POST /codex/responses").await;
         let mut model = fake_model("gpt-5.1", false);
@@ -1014,7 +997,6 @@ mod tests {
         );
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(terminal.usage.total_tokens, 0);
-        assert!(terminal.usage.incomplete);
         assert_eq!(requests, 1, "one inference issues one HTTP request");
     }
 
@@ -1059,7 +1041,6 @@ mod tests {
         assert_eq!(message_text(&terminal), "partial");
         assert_eq!(terminal.usage.total_tokens, 0);
         assert_eq!(terminal.usage.cost.total, 0.0);
-        assert!(terminal.usage.incomplete);
         let error = terminal.error.expect("transport error retained");
         assert_eq!(error.category, ErrorCategory::Transient);
         assert!(
@@ -1109,50 +1090,7 @@ mod tests {
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(message_text(&terminal), "complete");
         assert_eq!(terminal.usage.total_tokens, 2_000_000);
-        assert!(!terminal.usage.incomplete);
         assert!((terminal.usage.cost.total - 7.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn codex_terminal_usage_distinguishes_missing_from_reported_zero() {
-        fn terminal_event(usage: Option<serde_json::Value>) -> ResponseStreamEvent {
-            let mut response = serde_json::json!({
-                "id": "resp_1", "object": "response", "created_at": 0.0,
-                "model": "gpt-5.1", "output": [], "parallel_tool_calls": true,
-                "tools": [], "status": "completed"
-            });
-            if let Some(usage) = usage {
-                response["usage"] = usage;
-            }
-            serde_json::from_value(serde_json::json!({
-                "type": "response.done", "sequence_number": 1, "response": response
-            }))
-            .expect("Codex response.done")
-        }
-
-        let mut missing = StreamState::new_with(
-            API_NAME,
-            &fake_model("gpt-5.1", false),
-            None,
-            CODEX_COST_MULTIPLIER,
-            None,
-        );
-        let _ = missing.process(normalize_codex_event(terminal_event(None)));
-        assert!(missing.finalize_or_truncate().partial().usage.incomplete);
-
-        let mut reported_zero = StreamState::new_with(
-            API_NAME,
-            &fake_model("gpt-5.1", false),
-            None,
-            CODEX_COST_MULTIPLIER,
-            None,
-        );
-        let _ = reported_zero.process(normalize_codex_event(terminal_event(Some(
-            serde_json::json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
-        ))));
-        let terminal = reported_zero.finalize_or_truncate();
-        assert_eq!(terminal.partial().usage.total_tokens, 0);
-        assert!(!terminal.partial().usage.incomplete);
     }
 
     #[test]

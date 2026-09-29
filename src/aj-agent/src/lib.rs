@@ -2955,8 +2955,6 @@ impl SessionState {
             turn_cache_write: delta.cache_write,
             accumulated_cache_read: accumulated.cache_read,
             turn_cache_read: delta.cache_read,
-            turn_incomplete: delta.incomplete,
-            accumulated_incomplete: accumulated.incomplete,
         };
         inner.accumulated_usage.accumulate(delta);
         usage
@@ -4758,7 +4756,6 @@ mod event_protocol_tests {
             cache_read: 40,
             total_tokens: 100,
             cost: UsageCost::default(),
-            incomplete: false,
         };
         let agent = build_agent(vec![finalize_script(response)], Vec::new());
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -4805,8 +4802,6 @@ mod event_protocol_tests {
                 turn_cache_write: 3,
                 accumulated_cache_read: 0,
                 turn_cache_read: 4,
-                turn_incomplete: false,
-                accumulated_incomplete: false,
             }
         }
 
@@ -4892,7 +4887,6 @@ mod event_protocol_tests {
                 total: 0.5,
                 ..UsageCost::default()
             },
-            incomplete: false,
         };
         let second = Usage {
             input: 10,
@@ -4904,7 +4898,6 @@ mod event_protocol_tests {
                 total: 1.5,
                 ..UsageCost::default()
             },
-            incomplete: false,
         };
         let third = Usage {
             input: 100,
@@ -4916,7 +4909,6 @@ mod event_protocol_tests {
                 total: 2.5,
                 ..UsageCost::default()
             },
-            incomplete: false,
         };
 
         agent
@@ -4987,7 +4979,6 @@ mod event_protocol_tests {
                 total: 0.25,
                 ..UsageCost::default()
             },
-            incomplete: false,
         };
 
         let error = agent
@@ -5079,7 +5070,6 @@ mod event_protocol_tests {
                 total: 0.25,
                 ..UsageCost::default()
             },
-            incomplete: false,
         };
         let mut accounting = Box::pin(agent.account_usage(
             &delta,
@@ -7013,7 +7003,6 @@ mod event_protocol_tests {
         sub_report.usage.input = 7;
         sub_report.usage.output = 3;
         sub_report.usage.total_tokens = 10;
-        sub_report.usage.incomplete = true;
         let scripts = vec![
             finalize_script(finalize_tool_use("tu-1", "agent")),
             finalize_script(sub_report),
@@ -7122,7 +7111,6 @@ mod event_protocol_tests {
         let sub_usage = agent.sub_agent_usage();
         let usage = sub_usage.get(&1).expect("usage folded at drain");
         assert_eq!((usage.input, usage.output, usage.total_tokens), (7, 3, 10));
-        assert!(usage.incomplete);
 
         let notice_text = agent
             .messages()

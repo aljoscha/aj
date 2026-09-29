@@ -175,9 +175,6 @@ struct Usage {
     cache_write: u64,
     total_tokens: u64,
     cost: UsageCost,
-    /// The provider did not disclose complete final usage. Numeric fields are
-    /// still recorded facts, but together they form only a subtotal.
-    incomplete: bool,
 }
 
 struct UsageCost {
@@ -239,28 +236,10 @@ enum ErrorCategory {
 }
 ```
 
-`Usage::default()` is the complete-zero aggregate identity, and generic or
-provider-free assistant constructors retain that identity. Missing
-`incomplete` fields deserialize as `false`, and `false` is omitted when
-serializing, so legacy messages and explicit reported-zero usage keep their
-existing shape. `Usage::accumulate` sums every numeric field and ORs
-`incomplete`; a later complete response cannot clear an earlier disclosure
-gap.
-
-A provider request enters `incomplete: true` when its client request future
-receives its first poll, since that poll may issue the request upstream. A
-cancellation that wins before the first poll drops the unissued future and
-remains complete zero. Cancellation after the first poll remains partial,
-including cancellation while establishing the streaming response. A client
-error that establishes the request failed during local construction can still
-retain the complete-zero identity. Authentication and option validation also
-remain local complete-zero failures. Other transport and API failures after
-issuance remain partial. The marker clears only on that protocol's complete
-final usage evidence: the requested trailing usage chunk for Chat Completions,
-`response.usage` on the first Responses or Codex lifecycle terminal, or
-Anthropic's final usage-bearing `message_delta`. The presence of evidence, not
-nonzero token values, decides completeness. Missing usage never causes a poll,
-retry, or replacement estimate.
+Usage is a best-effort record of what the provider reported. Every terminal,
+including errors and cancellations, carries whatever usage arrived before it,
+priced at the call's rates. Usage that never reached the client is not
+estimated and is simply absent. `Usage::accumulate` sums every numeric field.
 
 ### 1.4 Tool Definition
 
@@ -1255,9 +1234,7 @@ Anthropic rejects the combination.
 `input + output + cache_read + cache_write`. Usage fields from `message_delta`
 should be merged defensively — only update a field when the event value is
 non-null. This preserves `message_start` values when proxies omit fields in
-`message_delta`. Initial `message_start` usage remains incomplete. A final
-usage-bearing `message_delta` clears the marker; `message_stop` without that
-evidence remains a successful response with partial accounting.
+`message_delta`.
 
 **Stop reason mapping:**
 - `end_turn` → `Stop`
@@ -1356,10 +1333,6 @@ conversations are never stored server-side even if the default changes.
   `completion_tokens_details.reasoning_tokens` separately.
 - `usage.total_tokens` = `input + output + cache_read + cache_write`
   (compute ourselves; don't trust the provider's `total_tokens`)
-- The request starts incomplete and clears only when the requested usage chunk
-  arrives. A prior `finish_reason` remains authoritative if the body then
-  fails, but its recorded usage stays partial. An explicit all-zero usage chunk
-  is complete.
 
 **Stop reason mapping:**
 - `stop` / `end` → `Stop`
@@ -1642,10 +1615,6 @@ Usage may arrive on the first terminal lifecycle response as
   `usage.cost.cache_write` will therefore always be 0 on this
   provider regardless of `ModelCost.cache_write`; cache-write cost
   is folded into `input` by OpenAI's pricing model.
-- Responses and Codex start incomplete and clear only when the first terminal
-  response contains `usage`. A terminal without it remains otherwise
-  authoritative and successful or failed according to its existing status.
-  An explicit all-zero object is complete.
 
 #### 7.3.8 Stop Reason Mapping
 

@@ -1675,7 +1675,6 @@ mod tests {
                     cache_write: 0.02,
                     total: 0.33,
                 },
-                incomplete: false,
             },
             usage_breakdown: vec![UsageBucket {
                 provider: "anthropic".to_string(),
@@ -1694,13 +1693,11 @@ mod tests {
                         cache_write: 0.02,
                         total: 0.33,
                     },
-                    incomplete: false,
                 },
                 responses: 18,
                 unpriced_responses: 0,
             }],
             compaction_usage: Usage::default(),
-            compactions_with_usage: 0,
             settings: SessionSettings {
                 model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
                 thinking: Some("medium".to_string()),

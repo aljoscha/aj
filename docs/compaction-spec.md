@@ -124,10 +124,9 @@ Compaction {
     /// when extraction found nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     details: Option<CompactionDetails>,
-    /// Priced usage summed across the successful summarizer calls. `None` on
-    /// legacy checkpoints means unknown spend, not zero spend.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    usage: Option<Usage>,
+    /// Priced usage summed across the successful summarizer calls.
+    #[serde(default)]
+    usage: Usage,
 },
 ```
 
@@ -254,7 +253,7 @@ pub fn append_compaction(
     retained_user_entry_ids: Vec<EntryId>,
     tokens_before: u64,
     details: Option<CompactionDetails>,
-    usage: Option<Usage>,
+    usage: Usage,
 ) -> Result<EntryRef, ConversationError>;
 ```
 
@@ -640,7 +639,7 @@ CompactionStart { agent_id: AgentId, reason: CompactionReason },
 /// notice). `summary` is the generated text so the renderer can show
 /// a compaction-summary row live (resume gets it from the log via
 /// replay, §8). A committed checkpoint carries its durable tag and
-/// optional cumulative usage, regenerated from the `Compaction` log entry.
+/// cumulative usage, regenerated from the `Compaction` log entry.
 /// An unsuccessful end is transient, with no usage. `error` is set when
 /// compaction failed (e.g. summarizer error) and nothing was written.
 CompactionEnd {
@@ -648,7 +647,7 @@ CompactionEnd {
     reason: CompactionReason,
     tokens_before: u64,
     tokens_after: u64,
-    /// Cumulative checkpoint spend. Absence means unknown, not zero.
+    /// Cumulative checkpoint spend, present on a committed checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     usage: Option<TokenUsage>,
     summary: Option<String>,
@@ -975,11 +974,8 @@ summary: Some(summary), error: None }`. Its `tokens_after` is
 compaction (the reduced projection's occupancy). The retained tail's usage
 is stale, so this keeps a resumed footer from showing pre-compaction occupancy.
 
-When the checkpoint's persisted `usage` is `Some`, the event's optional
-`TokenUsage` contains the replay accumulator before the compaction and the
-checkpoint delta, then replay advances that accumulator. A legacy checkpoint
-with `usage: None` projects `usage: None`, not fabricated zero spend, and leaves
-the preceding accounted source intact. Summary and usage share one durable tag
+The event's `TokenUsage` contains the replay accumulator before the compaction
+and the checkpoint delta, then replay advances that accumulator. Summary and usage share one durable tag
 in live delivery and replay, with no separate transient update.
 
 Crucially, replay's other arms are unaffected: the summarized prefix

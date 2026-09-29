@@ -6280,16 +6280,11 @@ async fn compaction_is_refused_while_busy() {
 struct CompactionAccountingSnapshot {
     log_len: usize,
     compactions: usize,
-    compactions_with_usage: usize,
     durable_usage: [u64; 4],
-    durable_usage_incomplete: bool,
     durable_compaction_usage: [u64; 4],
-    durable_compaction_usage_incomplete: bool,
-    live_rows: Vec<(Option<String>, [u64; 8], [bool; 2])>,
+    live_rows: Vec<(Option<String>, [u64; 8])>,
     live_total: [u64; 4],
-    live_incomplete: bool,
     host_total: [u64; 4],
-    host_incomplete: bool,
 }
 
 fn usage_dimensions(usage: &aj_models::types::Usage) -> [u64; 4] {
@@ -6320,13 +6315,12 @@ async fn compaction_accounting_snapshot(
         .local_handles(session)
         .await
         .expect("live session");
-    let (log_len, compactions, compactions_with_usage, durable_usage, durable_compaction_usage) = {
+    let (log_len, compactions, durable_usage, durable_compaction_usage) = {
         let log = handles.log.lock().await;
         let stats = log.stats();
         (
             log.len(),
             stats.compactions,
-            stats.compactions_with_usage,
             stats.usage,
             stats.compaction_usage,
         )
@@ -6350,7 +6344,6 @@ async fn compaction_accounting_snapshot(
                     row.usage.accumulated_cache_read,
                     row.usage.turn_cache_read,
                 ],
-                [row.usage.accumulated_incomplete, row.usage.turn_incomplete],
             )),
             _ => None,
         })
@@ -6366,16 +6359,11 @@ async fn compaction_accounting_snapshot(
     CompactionAccountingSnapshot {
         log_len,
         compactions,
-        compactions_with_usage,
         durable_usage: usage_dimensions(&durable_usage),
-        durable_usage_incomplete: durable_usage.incomplete,
         durable_compaction_usage: usage_dimensions(&durable_compaction_usage),
-        durable_compaction_usage_incomplete: durable_compaction_usage.incomplete,
         live_rows,
         live_total: summary_dimensions(&live),
-        live_incomplete: live.incomplete,
         host_total: summary_dimensions(&host),
-        host_incomplete: host.incomplete,
     }
 }
 
@@ -6619,8 +6607,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     let compacted_total = [11_110, 22_220, 33_330, 44_440];
     let later = [10, 1, 5, 70];
     let final_total = [11_120, 22_221, 33_335, 44_510];
-    let mut prefix_response = priced("PREFIX", prefix);
-    prefix_response.usage.incomplete = true;
+    let prefix_response = priced("PREFIX", prefix);
     let harness = Harness::new(vec![
         priced("first answer", normal_first),
         priced(
@@ -6700,8 +6687,6 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         ],
         compaction_total,
     );
-    assert!(usage.turn_incomplete);
-    assert!(!usage.accumulated_incomplete);
     assert!(
         !frames.iter().any(|frame| matches!(
             frame,
@@ -6723,9 +6708,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     let entry = entries.get(index).expect("an entry at that position");
     assert_eq!(entry.id, durability.entry_id);
     let (checkpoint_usage, checkpoint_summary) = match &entry.entry {
-        aj_session::ConversationEntryKind::Compaction { usage, summary, .. } => {
-            (usage.as_ref().expect("priced checkpoint"), summary)
-        }
+        aj_session::ConversationEntryKind::Compaction { usage, summary, .. } => (usage, summary),
         other => panic!("the tagged entry is the compaction checkpoint: {other:?}"),
     };
     assert!(
@@ -6741,7 +6724,6 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         ],
         compaction_total,
     );
-    assert!(checkpoint_usage.incomplete);
     let stats = log.stats();
     assert_eq!(
         [
@@ -6752,7 +6734,6 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         ],
         compaction_total,
     );
-    assert!(stats.compaction_usage.incomplete);
     assert_eq!(
         [
             stats.usage.input,
@@ -6762,12 +6743,10 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         ],
         compacted_total,
     );
-    assert!(stats.usage.incomplete);
     drop(log);
 
     let live_usage = client.chat.usage_summary();
     assert_eq!(summary_dimensions(&live_usage), compacted_total);
-    assert!(live_usage.incomplete);
     let host_usage = harness
         .host
         .usage(&session)
@@ -6775,7 +6754,6 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         .expect("usage read")
         .expect("live usage");
     assert_eq!(summary_dimensions(&host_usage), compacted_total);
-    assert!(host_usage.incomplete);
     let compacted_sources = usage_sources(&client.chat);
     assert_eq!(
         compacted_sources.len(),
@@ -6821,12 +6799,9 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
             _ => (id, usage),
         });
     let later_id = later_id.expect("the later assistant has durable identity");
-    let later_usage = later_usage.expect("the later assistant reports usage");
-    assert!(!later_usage.turn_incomplete);
-    assert!(later_usage.accumulated_incomplete);
+    assert!(later_usage.is_some(), "the later assistant reports usage");
     let final_live_usage = client.chat.usage_summary();
     assert_eq!(summary_dimensions(&final_live_usage), final_total);
-    assert!(final_live_usage.incomplete);
     let final_host_usage = harness
         .host
         .usage(&session)
@@ -6834,10 +6809,8 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         .expect("usage read")
         .expect("live usage");
     assert_eq!(summary_dimensions(&final_host_usage), final_total);
-    assert!(final_host_usage.incomplete);
     let final_stats = handles.log.lock().await.stats();
     assert_eq!(usage_dimensions(&final_stats.usage), final_total);
-    assert!(final_stats.usage.incomplete);
 
     let after_sources = usage_sources(&client.chat);
     assert_eq!(after_sources.len(), 4, "one usage row per accounted source");
@@ -6850,7 +6823,6 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     assert_eq!(compaction_rows(&client.chat), 1);
     let reattached_usage = client.chat.usage_summary();
     assert_eq!(summary_dimensions(&reattached_usage), final_total);
-    assert!(reattached_usage.incomplete);
 
     let stale_cursor = client.client.cursor().expect("old host cursor");
     harness.host.shutdown().await;
@@ -6861,7 +6833,6 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     assert_eq!(compaction_rows(&client.chat), 1);
     let replayed_usage = client.chat.usage_summary();
     assert_eq!(summary_dimensions(&replayed_usage), final_total);
-    assert!(replayed_usage.incomplete);
     revived.host.shutdown().await;
 }
 
@@ -7066,7 +7037,6 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         session_total,
         "filtering the duplicate checkpoint preserves the current total",
     );
-    assert!(!chat.usage_summary().incomplete);
 
     let usage_rows: Vec<_> = chat
         .transcript(AgentId::Main)
@@ -7093,7 +7063,6 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         checkpoint_total,
         "the backfilled checkpoint carries its spend",
     );
-    assert!(!checkpoint_rows[0].usage.turn_incomplete);
     let assistant = usage_rows
         .iter()
         .find(|row| row.source_entry.as_deref() == Some(later_id.as_str()))
@@ -7108,8 +7077,6 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         later,
         "the later assistant keeps its complete usage delta",
     );
-    assert!(!assistant.usage.turn_incomplete);
-    assert!(!assistant.usage.accumulated_incomplete);
     assert_eq!(
         chat.footers().context_usage(AgentId::Main).tokens,
         Some(later[0] + later[2] + later[3]),
@@ -7125,14 +7092,6 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         1,
         "the filtered duplicate does not append a second checkpoint row",
     );
-    let handles = harness
-        .host
-        .local_handles(&session)
-        .await
-        .expect("live session");
-    let stats = handles.log.lock().await.stats();
-    assert!(!stats.compaction_usage.incomplete);
-    assert!(!stats.usage.incomplete);
     let host_usage = harness
         .host
         .usage(&session)
@@ -7140,105 +7099,6 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         .expect("usage read")
         .expect("live usage");
     assert_eq!(summary_dimensions(&host_usage), session_total);
-    assert!(!host_usage.incomplete);
-    harness.host.shutdown().await;
-}
-
-/// Re-serving a terminal legacy checkpoint must not turn the preceding
-/// assistant's usage into invented checkpoint spend.
-#[tokio::test]
-async fn legacy_compaction_without_usage_stays_unknown_across_an_older_cursor() {
-    fn usage_sources(chat: &ChatState) -> Vec<Option<String>> {
-        chat.transcript(AgentId::Main)
-            .expect("main transcript")
-            .entries()
-            .iter()
-            .filter_map(|entry| match &entry.kind {
-                aj_app::chat::EntryKind::TurnUsage(usage) => Some(usage.source_entry.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    let harness = Harness::new(vec![finalized_text_message_with_usage("answer", 123)]);
-    let session = harness.create().await;
-    let mut warm = Client::attach(&harness.host, &session).await;
-    harness.prompt(&session, "question").await;
-    warm.pump_until_idle().await;
-
-    let handles = harness
-        .host
-        .local_handles(&session)
-        .await
-        .expect("live session");
-    let checkpoint = {
-        let mut log = handles.log.lock().await;
-        let first_kept = log
-            .entries_in_order()
-            .into_iter()
-            .find(|entry| {
-                matches!(
-                    &entry.entry,
-                    aj_session::ConversationEntryKind::Message { .. }
-                )
-            })
-            .expect("a retained message")
-            .id
-            .clone();
-        log.append_compaction(
-            ThreadFilter::USER,
-            "legacy summary".to_string(),
-            first_kept,
-            Vec::new(),
-            123,
-            None,
-            None,
-        )
-        .expect("append legacy checkpoint")
-    };
-
-    let mut client = Client::attach(&harness.host, &session).await;
-    let sources = usage_sources(&client.chat);
-    assert_eq!(sources.len(), 1, "only the assistant owns recorded usage");
-    assert!(
-        !sources
-            .iter()
-            .any(|source| source.as_deref() == Some(checkpoint.id.as_str())),
-        "legacy None does not create a checkpoint usage row",
-    );
-    assert_eq!(
-        client.chat.usage_summary().main_agent_usage.input_tokens,
-        123,
-    );
-
-    let epoch = client.client.cursor().expect("attached cursor").epoch;
-    let frames = client
-        .reattach(&harness.host, aj_wire::Cursor { epoch, seq: 0 })
-        .await;
-
-    assert!(frames.iter().any(|frame| matches!(
-        frame,
-        Frame::Event { durability: Some(seen), event, .. }
-            if seen.entry_id == checkpoint.id && matches!(event.known(),
-                Some(AgentEvent::CompactionEnd { summary: Some(_), usage: None, error: None, .. }))
-    )), "the legacy checkpoint remains a complete event with unknown spend");
-    assert_eq!(usage_sources(&client.chat), sources);
-    assert_eq!(
-        client.chat.usage_summary().main_agent_usage.input_tokens,
-        123,
-    );
-    assert_eq!(
-        client
-            .chat
-            .transcript(AgentId::Main)
-            .expect("main transcript")
-            .entries()
-            .iter()
-            .filter(|entry| matches!(&entry.kind, aj_app::chat::EntryKind::Compaction(_)))
-            .count(),
-        1,
-        "the re-served checkpoint updates its existing row",
-    );
     harness.host.shutdown().await;
 }
 

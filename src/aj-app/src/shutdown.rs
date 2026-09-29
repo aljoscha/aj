@@ -44,7 +44,6 @@ pub fn build_usage_summary_from_parts(main: &Usage, subs: &HashMap<usize, Usage>
     let mut total_sub_output = 0u64;
     let mut total_sub_cache_write = 0u64;
     let mut total_sub_cache_read = 0u64;
-    let mut incomplete = main.incomplete;
     for (agent_id, usage) in ordered {
         let row = SubAgentUsage {
             agent_id: Some(agent_id),
@@ -57,7 +56,6 @@ pub fn build_usage_summary_from_parts(main: &Usage, subs: &HashMap<usize, Usage>
         total_sub_output += row.output_tokens;
         total_sub_cache_write += row.cache_write_tokens;
         total_sub_cache_read += row.cache_read_tokens;
-        incomplete |= usage.incomplete;
         sub_agent_usage.push(row);
     }
 
@@ -73,7 +71,6 @@ pub fn build_usage_summary_from_parts(main: &Usage, subs: &HashMap<usize, Usage>
         main_agent_usage,
         sub_agent_usage,
         total_usage,
-        incomplete,
     }
 }
 
@@ -124,9 +121,7 @@ mod tests {
         // Insert out of order to verify sorting.
         subs.insert(3usize, usage(7, 3, 1, 2));
         subs.insert(1usize, usage(20, 10, 0, 4));
-        let mut partial = usage(30, 15, 2, 0);
-        partial.incomplete = true;
-        subs.insert(2usize, partial);
+        subs.insert(2usize, usage(30, 15, 2, 0));
         let summary = build_usage_summary_from_parts(&main, &subs);
 
         let ids: Vec<_> = summary
@@ -140,7 +135,6 @@ mod tests {
         assert_eq!(summary.total_usage.output_tokens, 50 + 10 + 15 + 3);
         assert_eq!(summary.total_usage.cache_write_tokens, 10 + 0 + 2 + 1);
         assert_eq!(summary.total_usage.cache_read_tokens, 5 + 4 + 0 + 2);
-        assert!(summary.incomplete);
     }
 
     #[test]

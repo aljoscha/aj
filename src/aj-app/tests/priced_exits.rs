@@ -161,7 +161,7 @@ fn log_with_compaction(responses: Vec<Message>, usage: Usage) -> (TempDir, Conve
         Vec::new(),
         1_000,
         None,
-        Some(usage),
+        usage,
     )
     .expect("compaction");
     (dir, log)

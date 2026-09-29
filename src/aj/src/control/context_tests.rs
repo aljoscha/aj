@@ -227,7 +227,6 @@ fn assert_usage(
     let usage = chat.footers().context_usage(agent);
     assert_eq!(usage.context_window, window);
     assert_eq!(usage.tokens, Some(tokens));
-    assert!(!usage.incomplete);
     let display = context_usage_display(usage).unwrap();
     assert_eq!(display.percent.as_deref(), Some(percent));
     assert_eq!(display.severity, severity);
