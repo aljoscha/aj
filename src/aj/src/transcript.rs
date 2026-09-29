@@ -1330,13 +1330,14 @@ fn build_task_notification(
     Bubble::entry(spans, Some(bg), styles.text)
 }
 
-/// The bubble tint for a task notification's outcome: success reads as
-/// a done tool cell, and every did-not-succeed outcome (failed or
-/// killed) reads as an errored one.
+/// The bubble tint for a task notification's outcome, matching the
+/// launching tool cell: a command that ran to completion reads as a done
+/// cell whatever its exit code, and only a task that broke or was killed
+/// reads as an errored one.
 fn task_notification_bg(outcome: &TaskOutcome, styles: &TranscriptStyles) -> Color {
     match outcome {
-        TaskOutcome::Succeeded => styles.tool_success_bg,
-        TaskOutcome::Failed { .. } | TaskOutcome::Killed => styles.tool_error_bg,
+        TaskOutcome::Succeeded | TaskOutcome::Failed { code: Some(_) } => styles.tool_success_bg,
+        TaskOutcome::Failed { code: None } | TaskOutcome::Killed => styles.tool_error_bg,
     }
 }
 
@@ -1345,8 +1346,9 @@ fn task_notification_bg(outcome: &TaskOutcome, styles: &TranscriptStyles) -> Col
 fn task_outcome_tag(outcome: &TaskOutcome) -> u8 {
     match outcome {
         TaskOutcome::Succeeded => 0,
-        TaskOutcome::Failed { .. } => 1,
+        TaskOutcome::Failed { code: None } => 1,
         TaskOutcome::Killed => 2,
+        TaskOutcome::Failed { code: Some(_) } => 3,
     }
 }
 
@@ -4144,9 +4146,11 @@ mod tests {
             let surface = build_task_notification(&entry, true, &s).draw(&ctx);
             crate::test_support::flatten(&surface)[0][0].style.bg
         };
-        // Distinct tints make a swapped outcome mapping observable.
+        // Distinct tints make a swapped outcome mapping observable. A
+        // non-zero exit is the command's answer and reads as done.
         assert_eq!(bg(TaskOutcome::Succeeded), s.tool_success_bg);
-        assert_eq!(bg(TaskOutcome::Failed { code: Some(1) }), s.tool_error_bg);
+        assert_eq!(bg(TaskOutcome::Failed { code: Some(1) }), s.tool_success_bg);
+        assert_eq!(bg(TaskOutcome::Failed { code: None }), s.tool_error_bg);
         assert_eq!(bg(TaskOutcome::Killed), s.tool_error_bg);
     }
 
@@ -6972,15 +6976,10 @@ mod tests {
     fn focused_task_outcomes_remain_visible_while_notification_bodies_are_folded() {
         for (outcome, indication) in [
             (TaskOutcome::Succeeded, None),
-            (
-                TaskOutcome::Failed { code: Some(1) },
-                Some("1 task failed: cargo test (exit 1)"),
-            ),
-            (
-                TaskOutcome::Failed { code: None },
-                Some("1 task failed: cargo test"),
-            ),
-            (TaskOutcome::Killed, Some("1 task stopped: cargo test")),
+            // A non-zero exit is the command's answer, not a failure.
+            (TaskOutcome::Failed { code: Some(1) }, None),
+            (TaskOutcome::Failed { code: None }, Some("1 task failed")),
+            (TaskOutcome::Killed, Some("1 task stopped")),
         ] {
             let chat = empty_chat();
             apply(
@@ -7001,7 +7000,11 @@ mod tests {
                 "{rows:?}"
             );
             if let Some(indication) = indication {
-                assert!(rows[header].contains(indication), "{rows:?}");
+                assert_eq!(
+                    rows[header].trim(),
+                    format!("▸ task results ×1 · {indication}"),
+                    "{rows:?}"
+                );
                 let cells = crate::test_support::flatten(&surface);
                 assert_eq!(cells[header][1].style.fg, view.styles.error.fg);
             } else {
@@ -7199,9 +7202,31 @@ mod tests {
                 bash("true", "good output", Some(0), None),
             ),
         );
+        // A call that did not work (here a timeout) is a failure. The
+        // completed `false` above exited 1, which is its answer, not one.
+        apply(&chat, &mut life, tool_start(AgentId::Main, "t", "bash"));
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: "t".into(),
+                tool: "bash".into(),
+                result: bash("sleep 999", "", None, None),
+                content: Vec::new().into(),
+                is_error: true,
+            },
+        );
+        let header = |text: &str| {
+            text.lines()
+                .find(|line| line.contains("bash ×"))
+                .expect("activity header")
+                .trim()
+                .to_owned()
+        };
         let text = transcript_text(&mut view, 100);
-        assert!(text.contains("bash ×2 · 1 failed: bash: exit 1"), "{text}");
-        click_activity(&mut view, &draw_ctx(100, 60), "bash ×2");
+        assert_eq!(header(&text), "▸ bash ×3 · 1 failed", "{text}");
+        click_activity(&mut view, &draw_ctx(100, 60), "bash ×3");
         apply(&chat, &mut life, tool_start(AgentId::Main, "c", "bash"));
         apply(
             &chat,
@@ -7232,8 +7257,9 @@ mod tests {
             assistant_message_end(text_message("Tests are running.")),
         );
         let text = transcript_text(&mut view, 120);
-        assert!(
-            text.contains("▾ bash ×3 · running: cargo test · 1 failed"),
+        assert_eq!(
+            header(&text),
+            "▾ bash ×4 · 1 failed · running: cargo test",
             "{text}"
         );
         assert!(
@@ -7248,12 +7274,11 @@ mod tests {
                 task_id: 7,
                 call_id: "c".into(),
                 label: "cargo test".into(),
-                status: TaskStatus::Exited(Some(0)),
+                status: TaskStatus::Exited(Some(1)),
             },
         );
         let text = transcript_text(&mut view, 120);
-        assert!(!text.contains("running: cargo test"), "{text}");
-        assert!(text.contains("▾ bash ×3 · 1 failed"), "{text}");
+        assert_eq!(header(&text), "▾ bash ×4 · 1 failed", "{text}");
     }
 
     #[test]

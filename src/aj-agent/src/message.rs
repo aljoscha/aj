@@ -219,8 +219,9 @@ pub enum TaskNotificationKind {
 pub enum TaskOutcome {
     /// Exited 0 (bash) or completed (agent).
     Succeeded,
-    /// Exited non-zero, or was signal-killed (`code: None`), or an
-    /// agent run failed.
+    /// A bash command ran to completion and exited non-zero (`code:
+    /// Some`), or the task broke (`code: None`): signal kill, output
+    /// capture failure, or a failed agent run.
     Failed { code: Option<i32> },
     /// Killed via `task_stop`, the TUI, or shutdown.
     Killed,

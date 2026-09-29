@@ -38,9 +38,9 @@ struct Group {
     open: bool,
     counts: Vec<(String, usize)>,
     running: Vec<String>,
-    failures: Vec<String>,
-    task_failures: Vec<String>,
-    stopped_tasks: Vec<String>,
+    failures: usize,
+    task_failures: usize,
+    stopped_tasks: usize,
 }
 
 impl Group {
@@ -61,20 +61,24 @@ impl Group {
         if fields.is_empty() {
             fields.push("Activity".into());
         }
-        if !self.running.is_empty() {
-            fields.push(format!("running: {}", self.running.join(", ")));
-        }
-        if let Some(first) = self.failures.first() {
-            fields.push(format!("{} failed: {first}", self.failures.len()));
+        // Outcomes are counts only. Their details are one expand away, and
+        // the header's error style already draws the eye to them.
+        if self.failures > 0 {
+            fields.push(format!("{} failed", self.failures));
         }
         for (outcome, tasks) in [
-            ("failed", &self.task_failures),
-            ("stopped", &self.stopped_tasks),
+            ("failed", self.task_failures),
+            ("stopped", self.stopped_tasks),
         ] {
-            if let Some(first) = tasks.first() {
-                let plural = if tasks.len() == 1 { "" } else { "s" };
-                fields.push(format!("{} task{plural} {outcome}: {first}", tasks.len()));
+            if tasks > 0 {
+                let plural = if tasks == 1 { "" } else { "s" };
+                fields.push(format!("{tasks} task{plural} {outcome}"));
             }
+        }
+        // Last, because it is the field that changes most while the group
+        // is live, and the stable fields should not shift around it.
+        if !self.running.is_empty() {
+            fields.push(format!("running: {}", self.running.join(", ")));
         }
         format!(
             "{} {}",
@@ -158,21 +162,7 @@ impl FocusedTranscript {
                     if crate::tool_cell::derive_status(tool, chat.tasks())
                         == crate::tool_cell::VisualStatus::Failed
                     {
-                        let detail = match task.map(|t| t.status) {
-                            Some(TaskStatus::Exited(Some(code))) => format!("exit {code}"),
-                            Some(TaskStatus::Exited(None)) => "terminated by signal".into(),
-                            Some(TaskStatus::CaptureFailed(_)) => "output capture failed".into(),
-                            Some(TaskStatus::Killed) => "stopped".into(),
-                            _ => match &tool.details {
-                                Some(ToolDetails::Text { summary, .. }) => short(summary),
-                                Some(ToolDetails::Bash {
-                                    exit_code: Some(code),
-                                    ..
-                                }) => format!("exit {code}"),
-                                _ => "failed".into(),
-                            },
-                        };
-                        g.failures.push(format!("{}: {detail}", short(&tool.tool)));
+                        g.failures += 1;
                     }
                     if g.open {
                         self.push(entry.id, Part::Body);
@@ -193,7 +183,7 @@ impl FocusedTranscript {
                         sub.status,
                         SubAgentStatus::Failed | SubAgentStatus::Truncated
                     ) {
-                        g.failures.push(short(&sub.task));
+                        g.failures += 1;
                     }
                     if g.open {
                         self.push(entry.id, Part::Body);
@@ -204,16 +194,12 @@ impl FocusedTranscript {
                     // A completion is a result, not another invocation of the
                     // launching tool. Keep its outcome distinct from tool failures.
                     g.count("task results");
+                    // A non-zero exit code is the command's answer, not a
+                    // broken task (see `tool_cell::VisualStatus::Exited`).
                     match notification.outcome {
-                        TaskOutcome::Succeeded => {}
-                        TaskOutcome::Failed { code } => {
-                            let label = short(&notification.label);
-                            g.task_failures.push(match code {
-                                Some(code) => format!("{label} (exit {code})"),
-                                None => label,
-                            });
-                        }
-                        TaskOutcome::Killed => g.stopped_tasks.push(short(&notification.label)),
+                        TaskOutcome::Succeeded | TaskOutcome::Failed { code: Some(_) } => {}
+                        TaskOutcome::Failed { code: None } => g.task_failures += 1,
+                        TaskOutcome::Killed => g.stopped_tasks += 1,
                     }
                     if g.open {
                         self.push(entry.id, Part::Body);
@@ -267,9 +253,9 @@ impl FocusedTranscript {
                 open,
                 counts: Vec::new(),
                 running: Vec::new(),
-                failures: Vec::new(),
-                task_failures: Vec::new(),
-                stopped_tasks: Vec::new(),
+                failures: 0,
+                task_failures: 0,
+                stopped_tasks: 0,
             }
         })
     }
@@ -288,9 +274,7 @@ impl FocusedTranscript {
                     && *id == g.id
                 {
                     *text = label;
-                    *failed = !g.failures.is_empty()
-                        || !g.task_failures.is_empty()
-                        || !g.stopped_tasks.is_empty();
+                    *failed = g.failures + g.task_failures + g.stopped_tasks > 0;
                     *selected = self.selected == Some(g.id);
                     break;
                 }

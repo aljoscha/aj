@@ -80,6 +80,12 @@ pub fn sub_agent_session_id(base: &str, agent_id: usize) -> String {
 /// None }`, while Bash keeps the exit-code mapping. Succeeded and Killed
 /// are shared.
 ///
+/// A code on `Failed` therefore means exactly "the command ran to
+/// completion and exited non-zero", which frontends read as an answer
+/// rather than a broken task. A capture failure broke the task whatever
+/// the exit code, so it carries none. The notice body still names the
+/// code.
+///
 /// Only reached for terminal notices, so `Running` should never occur.
 /// We fold it into `Failed { code: None }` defensively rather than
 /// panic: a stray non-terminal notice is a harmless "did not succeed",
@@ -92,12 +98,10 @@ fn task_outcome(kind: TaskNotificationKind, status: TaskStatus) -> TaskOutcome {
         (TaskNotificationKind::Bash, TaskStatus::Exited(Some(code))) => {
             TaskOutcome::Failed { code: Some(code) }
         }
-        (TaskNotificationKind::Bash, TaskStatus::CaptureFailed(code)) => TaskOutcome::Failed {
-            code: code.filter(|code| *code != 0),
-        },
-        (TaskNotificationKind::Bash, TaskStatus::Exited(None) | TaskStatus::Running) => {
-            TaskOutcome::Failed { code: None }
-        }
+        (
+            TaskNotificationKind::Bash,
+            TaskStatus::CaptureFailed(_) | TaskStatus::Exited(None) | TaskStatus::Running,
+        ) => TaskOutcome::Failed { code: None },
     }
 }
 
@@ -106,7 +110,7 @@ mod task_outcome_tests {
     use super::*;
 
     #[test]
-    fn capture_failure_never_maps_to_success() {
+    fn capture_failure_maps_to_a_codeless_failure() {
         assert_eq!(
             task_outcome(
                 TaskNotificationKind::Bash,
@@ -119,7 +123,7 @@ mod task_outcome_tests {
                 TaskNotificationKind::Bash,
                 TaskStatus::CaptureFailed(Some(7)),
             ),
-            TaskOutcome::Failed { code: Some(7) }
+            TaskOutcome::Failed { code: None }
         );
     }
 }

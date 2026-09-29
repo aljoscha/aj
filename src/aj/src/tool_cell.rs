@@ -82,23 +82,28 @@ pub(crate) fn expand_hint(more: usize, kind: HintKind) -> String {
 pub(crate) enum VisualStatus {
     Pending,
     Succeeded,
+    /// A command ran to completion with a non-zero exit code. That is an
+    /// answer (no matches, differences found, tests failed), not a broken
+    /// tool call, and only the model knows which outcome it expected.
+    Exited,
     Failed,
 }
 
 /// Decide which [`VisualStatus`] to paint the cell with.
 ///
-/// The agent's `is_error` flag is reserved for catastrophic failures
-/// (cancellation, timeout, schema errors). It deliberately does not
-/// fire for a successful invocation that returns a non-zero exit
-/// code, because the model reads `exit_code` from the structured
-/// payload and decides for itself. For the human viewer, though, an
-/// `[exit 1]` line under a green check reads wrong, so any explicit
-/// non-zero exit paints as failed regardless of the flag.
+/// Failure follows the agent's `is_error` flag, which is reserved for
+/// calls that did not work (cancellation, timeout, capture or schema
+/// errors). A bash command that ran to completion with a non-zero exit
+/// code is [`VisualStatus::Exited`] rather than a failure, so the cell
+/// neither claims success nor raises an error the caller may have
+/// expected.
 ///
-/// A tracked background task's terminal status overrides both: the
-/// launch call's own result only covers the spawn, and the badge's
-/// outcome is what the user actually cares about. Untracked ids
-/// (resumed cells, task still running) keep the base status.
+/// A tracked background task's terminal status overrides the launch
+/// call's own result, which only covers the spawn. A bash task that
+/// exited non-zero reads the same as a foreground one. An agent task
+/// has no process exit code, so any non-zero exit it reports is a failed
+/// run. Untracked ids (resumed cells, task still running) keep the base
+/// status.
 pub(crate) fn derive_status(entry: &ToolEntry, tasks: &BTreeMap<TaskId, TaskInfo>) -> VisualStatus {
     let base = match entry.status {
         ToolStatus::Running => VisualStatus::Pending,
@@ -107,19 +112,25 @@ pub(crate) fn derive_status(entry: &ToolEntry, tasks: &BTreeMap<TaskId, TaskInfo
             Some(ToolDetails::Bash {
                 exit_code: Some(code),
                 ..
-            }) if *code != 0 => VisualStatus::Failed,
+            }) if *code != 0 => VisualStatus::Exited,
             _ => VisualStatus::Succeeded,
         },
     };
     let Some(id) = badge_task_id(entry) else {
         return base;
     };
-    match tasks.get(&id).map(|info| info.status) {
-        Some(TaskStatus::Exited(Some(0))) => VisualStatus::Succeeded,
-        Some(TaskStatus::Exited(_))
-        | Some(TaskStatus::CaptureFailed(_))
-        | Some(TaskStatus::Killed) => VisualStatus::Failed,
-        Some(TaskStatus::Running) | None => base,
+    let Some(task) = tasks.get(&id) else {
+        return base;
+    };
+    match task.status {
+        TaskStatus::Running => base,
+        TaskStatus::Exited(Some(0)) => VisualStatus::Succeeded,
+        TaskStatus::Exited(Some(_)) if matches!(task.kind, TaskKind::Bash { .. }) => {
+            VisualStatus::Exited
+        }
+        TaskStatus::Exited(_) | TaskStatus::CaptureFailed(_) | TaskStatus::Killed => {
+            VisualStatus::Failed
+        }
     }
 }
 
@@ -418,7 +429,7 @@ fn details_body(details: &ToolDetails, expanded: bool, styles: &TranscriptStyles
             }
 
             if let Some(code) = exit_code {
-                let style = if *code == 0 { styles.dim } else { styles.error };
+                let style = if *code == 0 { styles.dim } else { styles.text };
                 lines.push(line(format!("[exit {code}]"), style));
             }
 
@@ -578,6 +589,7 @@ fn header_line(
     let glyph = match status {
         VisualStatus::Pending => span("…", styles.dim),
         VisualStatus::Succeeded => span("✓", styles.success),
+        VisualStatus::Exited => span("•", styles.dim),
         VisualStatus::Failed => span("✗", styles.error),
     };
     let mut spans = vec![
@@ -651,7 +663,7 @@ pub(crate) fn build_tool_cell(
 
     let bg = match status {
         VisualStatus::Pending => styles.tool_pending_bg,
-        VisualStatus::Succeeded => styles.tool_success_bg,
+        VisualStatus::Succeeded | VisualStatus::Exited => styles.tool_success_bg,
         VisualStatus::Failed => styles.tool_error_bg,
     };
 
@@ -973,15 +985,24 @@ mod tests {
 
     // ---- Status derivation ----------------------------------------------
 
+    /// A completed command's non-zero exit is neither a success nor a
+    /// failure: `rg` finding nothing exits 1 as a normal answer. Only a call
+    /// that did not work (`is_error`) paints as failed.
     #[test]
-    fn nonzero_bash_exit_paints_failed_even_without_is_error() {
-        let e = done_entry("bash", bash_details("", Some(1), None), false);
+    fn nonzero_bash_exit_is_neutral_and_is_error_fails() {
         let s = styles_with_distinct_tints();
+        let e = done_entry("bash", bash_details("", Some(1), None), false);
         let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &s, ImageRender::Disabled);
         let surface = draw(&mut cell, 40);
         let r = rows(&surface);
-        assert!(r[1].starts_with(" ✗"), "{r:?}");
+        assert!(r[1].starts_with(" •"), "{r:?}");
         assert!(r.iter().any(|l| l.contains("[exit 1]")), "{r:?}");
+        assert_eq!(flatten(&surface)[0][0].style.bg, s.tool_success_bg);
+
+        let e = done_entry("bash", bash_details("", None, None), true);
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &s, ImageRender::Disabled);
+        let surface = draw(&mut cell, 40);
+        assert!(rows(&surface)[1].starts_with(" ✗"));
         assert_eq!(flatten(&surface)[0][0].style.bg, s.tool_error_bg);
     }
 
@@ -1027,9 +1048,10 @@ mod tests {
             texts,
             vec!["$ make check", "out line", "STDERR:", "uh oh", "[exit 2]"],
         );
-        // The exit line is error-styled for a non-zero code, dim for
-        // zero.
-        assert_eq!(lines[4][0].style, s.error);
+        // A non-zero code is the command's answer, so its exit line reads
+        // as plain text rather than an error. Zero stays dim.
+        assert_ne!(s.text, s.error);
+        assert_eq!(lines[4][0].style, s.text);
         let ok = details_body(&bash_details("", Some(0), None), true, &s);
         let exit_line = ok.last().expect("exit line");
         assert_eq!(exit_line[0].text, "[exit 0]");
@@ -1681,11 +1703,13 @@ mod tests {
     fn agent_kind_task_gets_tint_override_but_no_badge() {
         // An agent-kind task's `entry.task` fallback must not badge
         // the cell (aj badges bash launches only), while the terminal
-        // task status still drives the tint.
+        // task status still drives the tint. An agent run has no process
+        // exit code, so the `Exited(Some(1))` it reports is a failed run,
+        // not a bash command's neutral non-zero answer.
         let s = styles_with_distinct_tints();
         let mut e = done_entry("bash", bash_details("", Some(0), None), false);
         e.task = Some(7);
-        let mut tasks = task_map(7, TaskStatus::Killed);
+        let mut tasks = task_map(7, TaskStatus::Exited(Some(1)));
         tasks.get_mut(&7).expect("task 7").kind = TaskKind::Agent {
             agent_id: 1,
             task: "investigate".into(),
@@ -1710,6 +1734,12 @@ mod tests {
             (
                 TaskStatus::Exited(Some(2)),
                 "[task #4 · exited 2]",
+                s.tool_success_bg,
+                " •",
+            ),
+            (
+                TaskStatus::CaptureFailed(Some(2)),
+                "[task #4 · capture failed, exited 2]",
                 s.tool_error_bg,
                 " ✗",
             ),
