@@ -914,8 +914,9 @@ already contain only filtered entries, so the load path does not
 re-filter.
 
 **Codex models are seeded by hand, not from models.dev.** The
-`openai-codex` provider's visible model list (`gpt-6-astra`, `gpt-5.2`,
-`gpt-5.5`, and the `gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna` family)
+`openai-codex` provider's visible model list (`gpt-6-astra`,
+`gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.5`, and the
+`gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna` family)
 is not exposed by models.dev. The refresh CLI (§3.4.5) preserves the
 existing Codex entries on every run: it filters them out of the upstream
 diff and re-emits them from a small seed list maintained alongside the
