@@ -35,11 +35,12 @@ pub(crate) const CLAUDE_CODE_IDENTITY_PROMPT: &str =
 /// as a recognized Claude Code client.
 ///
 /// If this drifts too far behind the real CLI, the server may reject the
-/// request as an unrecognized client (an auth/forbidden-class failure).
-/// That only affects OAuth mode, since API-key requests don't send this
-/// header. Bump it if OAuth turns start failing authorization for no
-/// other apparent reason.
-pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.251";
+/// request as an unrecognized client (an auth/forbidden-class failure),
+/// and newer models are gated on a minimum version. That only affects
+/// OAuth mode, since API-key requests don't send this header. Bump it if
+/// OAuth turns start failing authorization or the server reports that
+/// this version does not support a model.
+pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.280";
 
 /// Canonical tool names from Claude Code 2.x.
 ///
