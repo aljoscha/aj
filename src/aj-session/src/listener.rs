@@ -33,8 +33,7 @@
 //! entries are appended by the binary, which already holds the log
 //! handle and owns the run-config state they record. The binary
 //! additionally takes brief read locks to resolve the system
-//! prompt, snapshot the thread for replay, and display the final
-//! usage summary.
+//! prompt and snapshot the thread for replay.
 
 use std::sync::{Arc, Mutex as StdMutex};
 

@@ -83,14 +83,12 @@ pub struct SessionState {
     turn_counter: usize,                 // loop-private (mutated by execute_turn)
     accumulated_usage: Usage,            // folded by Agent::account_usage
     sub_agent_counter: usize,            // bumped by spawn_agent
-    sub_agent_usage: HashMap<usize, Usage>, // written by spawn_agent / notice drain
 }
 ```
 
 The fields tools touch through `ToolContext` are `working_directory`
-(read), `todo_list` (read/write), `sub_agent_counter` (bump via
-`next_sub_agent_id`), and `sub_agent_usage` (insert via
-`record_sub_agent_usage`). `turn_counter` is mutated by the run loop.
+(read), `todo_list` (read/write), and `sub_agent_counter` (bump via
+`next_sub_agent_id`). `turn_counter` is mutated by the run loop.
 `accumulated_usage` is folded only through the exclusive
 `Agent::account_usage(&mut self, ...)` transition used by successful assistant
 terminals and committed compactions.
@@ -119,8 +117,8 @@ operation.
   returns owned).
 - `get_todo_list(&self) -> Vec<TodoItem>` / `set_todo_list(&self, …)` —
   `set_*` drops its `&mut`.
-- `next_sub_agent_id(&self) -> usize`, `seed_sub_agent_counter(&self, …)`,
-  `record_sub_agent_usage(&self, …)` — all drop their `&mut`.
+- `next_sub_agent_id(&self) -> usize` and `seed_sub_agent_counter(&self, …)`
+  drop their `&mut`.
 - `turn_counter(&self) -> usize` plus a new `bump_turn_counter(&self)`
   to replace the direct `self.session_state.turn_counter += 1`
   (`lib.rs:1015`).
@@ -129,20 +127,14 @@ operation.
   accounting helper builds the pre-add `TokenUsage` payload and folds its delta
   under one lock. The public `Agent::account_usage` receiver is exclusive, which
   serializes that state transition with its awaited event delivery.
-- `sub_agent_usage(&self) -> HashMap<usize, Usage>` — **returns owned**
-  (was `&HashMap`).
 
 `std::sync::Mutex` (not `tokio::sync::Mutex`): accessors never await
 while holding the lock, matching the three sibling registries. The
 lock is per-handle and held only for trivial ops, so contention is a
 non-issue.
 
-`Agent` keeps a `SessionState` field; its public delegating accessors
-(`Agent::accumulated_usage`, `Agent::sub_agent_usage`) return owned values. The one
-external caller, `build_usage_summary_from_parts` in
-`src/aj-app/src/shutdown.rs`, takes the owned values by reference at the
-call site. Tests in `lib.rs` that call `agent.sub_agent_usage()` use the owned
-return.
+`Agent` keeps a `SessionState` field. Its public delegating accessor
+`Agent::accumulated_usage` returns an owned value.
 
 > NOTE: This puts `turn_counter` / `accumulated_usage` behind the same
 > lock even though only the loop touches them. That is deliberate — one
@@ -344,8 +336,7 @@ Unit (in `aj-agent`, `#[cfg(test)]`):
   group and all later groups) gets a `tool_result`, in order, none
   dangling, and the turn returns `Aborted`.
 - **Parallel foreground agents.** Two `agent` calls in one batch each
-  run a child to completion concurrently; both reports land, in order;
-  `sub_agent_usage` records both.
+  run a child to completion concurrently; both reports land, in order.
 
 Integration / regression:
 
@@ -358,7 +349,7 @@ Integration / regression:
 
 - `src/aj-agent/src/lib.rs`
   - `SessionState` → handle (`Arc<Mutex<SessionStateInner>>`), `&self`
-    accessors, owned returns for `accumulated_usage` / `sub_agent_usage`,
+    accessors, an owned return for `accumulated_usage`,
     `bump_turn_counter`, and the atomic `account_usage` fold.
   - `SessionContextWrapper.session_ctx` → owned `SessionState` handle;
     `spawn_agent` body uses the handle.
@@ -368,14 +359,12 @@ Integration / regression:
     (`&self`) for the side-effect-free half.
   - `max_tool_concurrency()` helper (env `AJ_MAX_TOOL_CONCURRENCY`,
     default 8).
-  - `Agent::accumulated_usage` / `Agent::sub_agent_usage` return owned.
+  - `Agent::accumulated_usage` returns owned.
 - `src/aj-agent/src/tool.rs` — `ExecutionMode` doc rewrite (contiguous
   grouping). Grouping reads `ErasedToolDefinition::execution_mode`,
   which already exists.
 - `src/aj-tools/src/tools/agent.rs` — description warning; fix stale
   module comment.
-- `src/aj-app/src/shutdown.rs` — consume the owned
-  `accumulated_usage` / `sub_agent_usage` returns.
 
 `futures` is already a dependency of `aj-agent` (`Cargo.toml:11`), so
 `stream::iter(...).buffered(...)` needs no new crate.

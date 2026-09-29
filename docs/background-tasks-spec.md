@@ -464,11 +464,7 @@ and running inline:
    `run_single_turn(task)`, then emits `SubAgentEnd` (unchanged
    contract: emitted regardless of success) and
    `events.finished(status, notice)` with the report (or error) as the
-   notice body. The driver also records the child's accumulated usage
-   on the task entry; the owner folds it into
-   `SessionState.sub_agent_usage` when the notice is drained — the
-   drain points hold `&mut self`, so usage accounting needs no shared
-   mutability.
+   notice body.
 3. Return `Started`. The tool result is
    `ToolDetails::Text { summary: "agent 2 started in background (task #5)" }`
    with matching wire content plus the "you will be notified" hint.

@@ -26,9 +26,8 @@
 //!   wrapping the projected [`AssistantMessage`], followed by an
 //!   [`AgentEvent::UsageUpdate`] carrying the per-turn `usage`
 //!   recorded on the assistant message and a running
-//!   accumulated total. Listeners (the TUI footer, end-of-session
-//!   summaries) therefore see the same shape on resume as on a
-//!   live turn. Renderers walk the finalized content blocks on
+//!   accumulated total. Listeners such as the TUI footer therefore
+//!   see the same shape on resume as on a live turn. Renderers walk the finalized content blocks on
 //!   `MessageEnd` to paint text/thinking/tool-call blocks; no
 //!   per-block streaming events are synthesized (replay has no
 //!   deltas to stream). Each tool_call updates an internal

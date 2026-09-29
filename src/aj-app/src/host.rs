@@ -49,7 +49,6 @@ use std::time::{Duration, Instant};
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::queue::MessageQueues;
 use aj_agent::tool::TaskId;
-use aj_agent::types::UsageSummary;
 use aj_agent::{BoxError, SubAgentRegistry, TaskRegistry};
 use aj_conf::{AgentEnv, Config, ConfigThinkingDisplay};
 use aj_models::ThinkingConfig;
@@ -1772,19 +1771,6 @@ impl SessionHost {
                 .collect(),
             head,
         })
-    }
-
-    /// The session's accumulated token usage, for an end-of-run report.
-    ///
-    /// `None` for a session that is not live: usage is per materialization, so a
-    /// session this host is not holding spent nothing that this host can still
-    /// account for. Locks the agent, so a turn in flight holds this up for the
-    /// length of that turn.
-    pub async fn usage(&self, session: &str) -> Result<Option<UsageSummary>, HostError> {
-        let Some(live) = self.live_or_cold(session).await? else {
-            return Ok(None);
-        };
-        Ok(Some(live.core.usage_summary().await))
     }
 
     /// Direct handles into a live session, for an in-process client. See

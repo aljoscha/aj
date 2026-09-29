@@ -645,14 +645,6 @@ impl Agent {
         delivered.map_err(TurnError::Fatal)
     }
 
-    /// Snapshot of the per-sub-agent accumulated [`Usage`] map. The
-    /// binary uses this to compute the end-of-session usage summary
-    /// (the agent does not render one — the binary owns
-    /// presentation).
-    pub fn sub_agent_usage(&self) -> HashMap<usize, Usage> {
-        self.session_state.sub_agent_usage()
-    }
-
     /// Borrow the agent's in-memory transcript. The binary uses
     /// this on shutdown to decide whether to print the resume hint
     /// (only when the agent observed at least one message) and on
@@ -1761,18 +1753,9 @@ impl Agent {
     async fn drain_task_notices(&mut self) -> Result<(), TurnError> {
         let notices = self.task_registry.drain_notices(self.agent_id);
         for notice in notices {
-            // An agent-backed task's detached driver parked the
-            // child's accumulated usage on the registry entry; fold
-            // it into session state here, where we hold `&mut self`,
-            // so no shared mutability is needed.
             let kind = match &notice.kind {
                 TaskKind::Bash { .. } => TaskNotificationKind::Bash,
-                TaskKind::Agent { agent_id, .. } => {
-                    if let Some(usage) = self.task_registry.usage(notice.task_id) {
-                        self.session_state.record_sub_agent_usage(*agent_id, usage);
-                    }
-                    TaskNotificationKind::Agent
-                }
+                TaskKind::Agent { .. } => TaskNotificationKind::Agent,
             };
             let outcome = task_outcome(kind, notice.status);
             let message = AgentMessage::task_notification(TaskNotification::new(
@@ -2263,11 +2246,6 @@ struct TaskEntry {
     /// flips the status via [`TaskRegistry::finish`].
     cancel: CancellationToken,
     output: Arc<dyn TaskOutputSource>,
-    /// Usage accumulated by an agent-backed task's run, recorded by
-    /// the driver at finish. The detached driver has no access to the
-    /// owner's `SessionState`, so the value parks here until the
-    /// completion notice drains and the owner folds it in.
-    usage: Option<Usage>,
 }
 
 /// Display snapshot of one task, for the picker and the footer.
@@ -2448,7 +2426,6 @@ impl TaskRegistry {
                 started_at: Instant::now(),
                 cancel: cancel.clone(),
                 output,
-                usage: None,
             },
         );
         (id, cancel)
@@ -2641,22 +2618,6 @@ impl TaskRegistry {
     pub fn agent_task_running(&self, n: usize) -> bool {
         self.latest_agent_task(n)
             .is_some_and(|(_, status)| status == TaskStatus::Running)
-    }
-
-    /// Record the usage accumulated by task `id`'s agent run. No-op
-    /// for unknown ids.
-    pub fn record_usage(&self, id: TaskId, usage: Usage) {
-        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
-        if let Some(entry) = inner.entries.get_mut(&id) {
-            entry.usage = Some(usage);
-        }
-    }
-
-    /// Usage recorded for task `id`, if any. `None` for unknown ids,
-    /// bash tasks, and agent tasks whose run hasn't finished.
-    pub fn usage(&self, id: TaskId) -> Option<Usage> {
-        let inner = self.inner.lock().expect("task registry mutex poisoned");
-        inner.entries.get(&id).and_then(|entry| entry.usage.clone())
     }
 
     /// Display snapshot of task `id`, `None` for unknown ids.
@@ -2869,7 +2830,7 @@ impl TaskRegistry {
 ///
 /// Crate-internal: the runtime owns this as a private [`Agent`] field
 /// and exposes only the read accessors the host needs
-/// (`turn_counter`, `accumulated_usage`, `sub_agent_usage` on
+/// (`turn_counter` and `accumulated_usage` on
 /// [`Agent`]), so the state itself never appears in the public API.
 #[derive(Clone)]
 pub(crate) struct SessionState {
@@ -2885,7 +2846,6 @@ struct SessionStateInner {
     turn_counter: usize,
     accumulated_usage: Usage,
     sub_agent_counter: usize,
-    sub_agent_usage: HashMap<usize, Usage>,
 }
 
 impl SessionState {
@@ -2897,7 +2857,6 @@ impl SessionState {
                 turn_counter: 0,
                 accumulated_usage: Usage::default(),
                 sub_agent_counter: 0,
-                sub_agent_usage: HashMap::new(),
             })),
             session_env: Arc::new(StdMutex::new(BTreeMap::new())),
         }
@@ -2972,14 +2931,6 @@ impl SessionState {
     /// with subagent subtrees already persisted in the log.
     fn seed_sub_agent_counter(&self, value: usize) {
         self.lock().sub_agent_counter = value;
-    }
-
-    fn record_sub_agent_usage(&self, agent_id: usize, usage: Usage) {
-        self.lock().sub_agent_usage.insert(agent_id, usage);
-    }
-
-    fn sub_agent_usage(&self) -> HashMap<usize, Usage> {
-        self.lock().sub_agent_usage.clone()
     }
 }
 
@@ -3664,7 +3615,6 @@ impl SessionContextWrapper<'_> {
                     task_id: id,
                     parent: self.agent_id,
                     parent_bus: self.parent_bus.clone(),
-                    registry: self.task_registry.clone(),
                     cancel,
                     events,
                     output,
@@ -3679,16 +3629,7 @@ impl SessionContextWrapper<'_> {
             // retained handle. The handle stays in the registry after
             // the run; the parent's tool result is still the first
             // report, so the `agent` tool contract is unchanged.
-            let (result, sub_agent_usage) = {
-                let mut guard = shared.lock().await;
-                let result = guard.run_single_turn(task).await;
-                let usage = guard.session_state.accumulated_usage();
-                (result, usage)
-            };
-
-            // Record the usage in the main session state
-            self.session_state
-                .record_sub_agent_usage(agent_id, sub_agent_usage);
+            let result = shared.lock().await.run_single_turn(task).await;
 
             // Emit `SubAgentEnd` regardless of success — listeners
             // need to clean up nested-transcript framing on errors
@@ -3882,16 +3823,14 @@ struct BackgroundAgentRun {
     task_id: TaskId,
     parent: AgentId,
     parent_bus: EventBus,
-    registry: TaskRegistry,
     cancel: CancellationToken,
     events: TaskEventSink,
     output: Arc<AgentTaskOutput>,
 }
 
 /// Drive a background agent spawn to completion: announce it with
-/// `TaskStart`, run the child's initial turn, park its usage on the
-/// registry entry, emit `SubAgentEnd`, and finish the task with the
-/// report as the notice body.
+/// `TaskStart`, run the child's initial turn, emit `SubAgentEnd`, and
+/// finish the task with the report as the notice body.
 async fn drive_background_agent(run: BackgroundAgentRun) {
     let BackgroundAgentRun {
         shared,
@@ -3901,7 +3840,6 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
         task_id,
         parent,
         parent_bus,
-        registry,
         cancel,
         events,
         output,
@@ -3909,16 +3847,7 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
 
     events.started(kind.clone()).await;
 
-    let (result, usage) = {
-        let mut guard = shared.lock().await;
-        let result = guard.run_single_turn(task).await;
-        let usage = guard.session_state.accumulated_usage();
-        (result, usage)
-    };
-    // The owner folds this into `SessionState.sub_agent_usage` when
-    // the completion notice drains; a detached driver has no `&mut`
-    // access to the owner's session state.
-    registry.record_usage(task_id, usage);
+    let result = shared.lock().await.run_single_turn(task).await;
 
     // Emit `SubAgentEnd` regardless of success — same contract as the
     // blocking path; listeners need to clean up nested-transcript
@@ -6988,24 +6917,19 @@ mod event_protocol_tests {
 
     /// A background spawn returns a `Started` result with both ids,
     /// retains the handle like a blocking spawn, still emits
-    /// `SubAgentEnd`, delivers the child's report as a completion
-    /// notice, and folds the child's usage into the parent's session
-    /// state when the notice drains.
+    /// `SubAgentEnd`, and delivers the child's report as a completion
+    /// notice.
     #[tokio::test]
-    async fn background_spawn_delivers_report_notice_and_folds_usage() {
+    async fn background_spawn_delivers_report_notice() {
         use crate::SubAgentRegistry;
 
         // Script consumption is deterministic: the stop-after-turn
         // hook ends the parent's turn right after the tool batch, so
         // only the detached child consumes script 1, and the wake
         // afterwards consumes script 2.
-        let mut sub_report = finalize_text("sub report");
-        sub_report.usage.input = 7;
-        sub_report.usage.output = 3;
-        sub_report.usage.total_tokens = 10;
         let scripts = vec![
             finalize_script(finalize_tool_use("tu-1", "agent")),
-            finalize_script(sub_report),
+            finalize_script(finalize_text("sub report")),
             finalize_script(finalize_text("reacted")),
         ];
 
@@ -7099,18 +7023,13 @@ mod event_protocol_tests {
         // renders for finished agent tasks.
         let (_, read) = tasks.read(1).expect("task readable");
         assert_eq!(read.report.as_deref(), Some("sub report"));
-        // Usage stays parked on the registry until the drain.
-        assert!(agent.sub_agent_usage().is_empty());
 
-        // Wake drains the notice into the transcript and folds usage.
+        // Wake drains the notice into the transcript.
         let outcome = agent
             .wake(CancellationToken::new())
             .await
             .expect("wake runs");
         assert_eq!(outcome, crate::WakeOutcome::Ran);
-        let sub_usage = agent.sub_agent_usage();
-        let usage = sub_usage.get(&1).expect("usage folded at drain");
-        assert_eq!((usage.input, usage.output, usage.total_tokens), (7, 3, 10));
 
         let notice_text = agent
             .messages()

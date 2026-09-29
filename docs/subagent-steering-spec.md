@@ -22,13 +22,13 @@ at the end for orchestration.
 
 `SessionContextWrapper::spawn_agent` (`src/aj-agent/src/lib.rs`) builds
 a fresh `Agent` on the stack, shares the parent's bus + a child
-cancellation token, runs it to completion via `run_single_turn`, reads
-its usage, emits `SubAgentEnd`, and returns `SpawnedAgent { agent_id,
+cancellation token, runs it to completion via `run_single_turn`, emits
+`SubAgentEnd`, and returns `SpawnedAgent { agent_id,
 report }`. The `Agent` is a local: once `spawn_agent` returns it is
 **dropped**. Nothing — not `SessionState`, not the parent, not the
 binary — retains a handle. The only survivors are the report string
-(handed to the parent model as the `agent` tool result), the persisted
-sub-thread on disk, and the recorded usage.
+(handed to the parent model as the `agent` tool result) and the
+persisted sub-thread on disk.
 
 The whole sub-agent run happens *inside* the parent's tool call:
 `execute_turn` → `execute_tool` → `spawn_agent().await`. While it runs,
@@ -195,13 +195,8 @@ Wiring:
   ```rust
   let shared: SharedAgent = Arc::new(TokioMutex::new(sub_agent));
   self.sub_agent_registry.insert(agent_id, Arc::clone(&shared));
-  let (result, usage) = {
-      let mut guard = shared.lock().await;
-      let result = guard.run_single_turn(task).await;
-      let usage = guard.session_state.accumulated_usage.clone();
-      (result, usage)
-  };
-  // ... record usage, emit SubAgentEnd, return SpawnedAgent as today.
+  let result = shared.lock().await.run_single_turn(task).await;
+  // ... emit SubAgentEnd, return SpawnedAgent as today.
   ```
 
   The handle stays in the registry after the initial run. The parent's
@@ -503,7 +498,7 @@ parent is the prior sub-thread leaf, not the parent-anchor).
   the running sub; switching to that sub shows its spinner. Correct
   under per-view scoping (§4.6).
 - **Quit with background turns running.** `turns.abort_all()` on
-  shutdown; end-of-session summary reads the main agent as today.
+  shutdown.
 
 ---
 

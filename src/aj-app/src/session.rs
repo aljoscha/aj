@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use aj_agent::bus::{EventSubscriptions, SubscriptionHandle};
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::queue::MessageQueues;
-use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TaskRegistry};
 use aj_conf::{AgentEnv, Config};
 use aj_models::ThinkingConfig;
@@ -523,13 +522,6 @@ impl SessionCore {
             AgentId::Main => Some(Arc::clone(&self.agent)),
             AgentId::Sub(n) => self.registry.get(n),
         }
-    }
-
-    /// Snapshot this session's accumulated token usage for the shutdown
-    /// banner. Locks the agent, so call only while no turn is in flight.
-    pub async fn usage_summary(&self) -> UsageSummary {
-        let agent = self.agent.lock().await;
-        crate::shutdown::build_usage_summary(&agent)
     }
 
     /// Decompose the core into an owned agent plus its shared log and

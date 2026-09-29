@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use aj_agent::events::{AgentId, AgentSettings, CompactionPhase};
 use aj_agent::message::{TaskNotificationKind, TaskOutcome};
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
-use aj_agent::types::{SubAgentUsage, TokenUsage, UsageSummary};
+use aj_agent::types::TokenUsage;
 use aj_models::types::{AssistantMessage, UserContent};
 use aj_wire::{AgentQueue, QueueState, TaskTable};
 use chrono::Utc;
@@ -693,70 +693,6 @@ impl ChatState {
         }
     }
 
-    /// Builds end-of-session usage from the latest per-agent usage events.
-    pub fn usage_summary(&self) -> UsageSummary {
-        let main_agent_usage = self.usage_for(AgentId::Main);
-        let mut sub_ids: Vec<usize> = self
-            .transcripts
-            .keys()
-            .filter_map(|agent| match agent {
-                AgentId::Main => None,
-                AgentId::Sub(id) => Some(*id),
-            })
-            .collect();
-        sub_ids.sort_unstable();
-        let sub_agent_usage: Vec<SubAgentUsage> = sub_ids
-            .into_iter()
-            .map(|id| self.usage_for(AgentId::Sub(id)))
-            .collect();
-        let total_usage = sub_agent_usage.iter().fold(
-            SubAgentUsage {
-                agent_id: None,
-                input_tokens: main_agent_usage.input_tokens,
-                output_tokens: main_agent_usage.output_tokens,
-                cache_write_tokens: main_agent_usage.cache_write_tokens,
-                cache_read_tokens: main_agent_usage.cache_read_tokens,
-            },
-            |mut total, usage| {
-                total.input_tokens += usage.input_tokens;
-                total.output_tokens += usage.output_tokens;
-                total.cache_write_tokens += usage.cache_write_tokens;
-                total.cache_read_tokens += usage.cache_read_tokens;
-                total
-            },
-        );
-        UsageSummary {
-            main_agent_usage,
-            sub_agent_usage,
-            total_usage,
-        }
-    }
-
-    fn usage_for(&self, agent: AgentId) -> SubAgentUsage {
-        let usage = self.transcripts.get(&agent).and_then(|transcript| {
-            transcript.entries.iter().rev().find_map(|entry| {
-                let EntryKind::TurnUsage(usage) = &entry.kind else {
-                    return None;
-                };
-                Some(&usage.usage)
-            })
-        });
-        SubAgentUsage {
-            agent_id: match agent {
-                AgentId::Main => None,
-                AgentId::Sub(id) => Some(id),
-            },
-            input_tokens: usage.map_or(0, |usage| usage.accumulated_input + usage.turn_input),
-            output_tokens: usage.map_or(0, |usage| usage.accumulated_output + usage.turn_output),
-            cache_write_tokens: usage.map_or(0, |usage| {
-                usage.accumulated_cache_write + usage.turn_cache_write
-            }),
-            cache_read_tokens: usage.map_or(0, |usage| {
-                usage.accumulated_cache_read + usage.turn_cache_read
-            }),
-        }
-    }
-
     /// Snapshot of every known agent for the agent picker: the main
     /// agent first, then each sub-agent in ascending index order with
     /// the task that spawned it and its run status.
@@ -1170,35 +1106,6 @@ mod tests {
         chat.replace_tasks(TaskTable::default());
         assert_eq!(badge(&chat, AgentId::Main), None);
         assert_eq!(badge(&chat, AgentId::Sub(1)), None);
-    }
-
-    #[test]
-    fn usage_summary_uses_event_derived_running_totals() {
-        let mut chat = chat_state();
-        let main_usage = token_usage([10, 5, 2, 3], [100, 40, 20, 30]);
-        chat.transcripts
-            .get_mut(&AgentId::Main)
-            .expect("main transcript")
-            .append(EntryKind::TurnUsage(TurnUsageEntry {
-                agent_id: AgentId::Main,
-                usage: main_usage,
-                source_entry: Some("main-message".into()),
-            }));
-        chat.transcripts
-            .entry(AgentId::Sub(2))
-            .or_default()
-            .append(EntryKind::TurnUsage(TurnUsageEntry {
-                agent_id: AgentId::Sub(2),
-                usage: token_usage([7, 4, 1, 2], [0, 0, 0, 0]),
-                source_entry: Some("sub-message".into()),
-            }));
-
-        let usage = chat.usage_summary();
-        assert_eq!(usage.main_agent_usage.input_tokens, 110);
-        assert_eq!(usage.sub_agent_usage.len(), 1);
-        assert_eq!(usage.sub_agent_usage[0].agent_id, Some(2));
-        assert_eq!(usage.total_usage.input_tokens, 117);
-        assert_eq!(usage.total_usage.cache_read_tokens, 35);
     }
 
     #[test]

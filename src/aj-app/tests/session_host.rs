@@ -5727,7 +5727,6 @@ struct DetachedEnding {
     box_status: aj_app::chat::SubAgentStatus,
     box_report: Option<String>,
     box_finished: bool,
-    parked_usage: Option<serde_json::Value>,
     /// Completion notices, `(outcome, body)` in transcript order.
     task_notices: Vec<(aj_agent::message::TaskOutcome, String)>,
     /// Plain notices per agent. A conclusion invented for one of the two
@@ -5814,21 +5813,12 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
     let state = client.canonical();
     let (box_status, box_finished) = sub_box(&state, 1);
     let details = harness.host.task(&session, task).await.expect("task read");
-    let handles = harness
-        .host
-        .local_handles(&session)
-        .await
-        .expect("live session");
     let ending = DetachedEnding {
         task: details.status,
         task_report: details.report,
         box_status,
         box_report: sub_report(&state, 1),
         box_finished,
-        parked_usage: handles
-            .task_registry
-            .usage(task)
-            .map(|usage| serde_json::to_value(usage).expect("usage serializes")),
         task_notices: task_notices(&state),
         notices: all_notices(&state),
         errors: errors(&only(frames, &session)),
@@ -5924,10 +5914,6 @@ fn assert_detached_sub_was_killed(ending: &DetachedEnding, parent: ParentTurn) {
         ending.box_report.as_deref(),
         Some("sub-agent failed: turn aborted by client"),
         "the box uses the same failed conclusion a task kill already shows: {ending:?}",
-    );
-    assert!(
-        ending.parked_usage.is_some(),
-        "the killed run parked its accumulated usage before concluding: {ending:?}",
     );
     assert_eq!(
         ending.task_notices,
@@ -6284,7 +6270,6 @@ struct CompactionAccountingSnapshot {
     durable_compaction_usage: [u64; 4],
     live_rows: Vec<(Option<String>, [u64; 8])>,
     live_total: [u64; 4],
-    host_total: [u64; 4],
 }
 
 fn usage_dimensions(usage: &aj_models::types::Usage) -> [u64; 4] {
@@ -6296,13 +6281,23 @@ fn usage_dimensions(usage: &aj_models::types::Usage) -> [u64; 4] {
     ]
 }
 
-fn summary_dimensions(summary: &aj_agent::types::UsageSummary) -> [u64; 4] {
-    [
-        summary.main_agent_usage.input_tokens,
-        summary.main_agent_usage.output_tokens,
-        summary.main_agent_usage.cache_write_tokens,
-        summary.main_agent_usage.cache_read_tokens,
-    ]
+/// Main's running total as its latest transcript usage row reports it.
+fn latest_row_total(chat: &ChatState) -> [u64; 4] {
+    chat.transcript(AgentId::Main)
+        .expect("main transcript")
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            aj_app::chat::EntryKind::TurnUsage(row) => Some([
+                row.usage.accumulated_input + row.usage.turn_input,
+                row.usage.accumulated_output + row.usage.turn_output,
+                row.usage.accumulated_cache_write + row.usage.turn_cache_write,
+                row.usage.accumulated_cache_read + row.usage.turn_cache_read,
+            ]),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 async fn compaction_accounting_snapshot(
@@ -6348,13 +6343,6 @@ async fn compaction_accounting_snapshot(
             _ => None,
         })
         .collect();
-    let live = client.chat.usage_summary();
-    let host = harness
-        .host
-        .usage(session)
-        .await
-        .expect("usage read")
-        .expect("live usage");
 
     CompactionAccountingSnapshot {
         log_len,
@@ -6362,8 +6350,7 @@ async fn compaction_accounting_snapshot(
         durable_usage: usage_dimensions(&durable_usage),
         durable_compaction_usage: usage_dimensions(&durable_compaction_usage),
         live_rows,
-        live_total: summary_dimensions(&live),
-        host_total: summary_dimensions(&host),
+        live_total: latest_row_total(&client.chat),
     }
 }
 
@@ -6415,7 +6402,6 @@ async fn prime_compaction_accounting_case(
     assert_eq!(before.live_rows.len(), 2, "two ordinary usage rows");
     assert_eq!(before.durable_usage, [110, 220, 330, 440]);
     assert_eq!(before.live_total, [110, 220, 330, 440]);
-    assert_eq!(before.host_total, [110, 220, 330, 440]);
     (harness, session, client, before)
 }
 
@@ -6564,8 +6550,82 @@ async fn unsuccessful_split_summary_leaves_every_usage_surface_unchanged() {
     }
 }
 
-/// Committed compaction spend reaches the live client and shutdown accumulator
-/// once, while the checkpoint remains its durable owner across reattachment.
+/// The info overlay reads the durable log, so its totals include every
+/// sub-agent's spend, blocking or background, not only Main's.
+#[tokio::test]
+async fn info_overlay_usage_includes_blocking_and_background_sub_agents() {
+    for (label, mut scripts) in [
+        ("blocking", sub_agent_turn()),
+        ("background", background_sub_turn()),
+    ] {
+        // Distinct powers of ten make every response's share visible in the
+        // total, whichever agent consumed it.
+        let mut expected = 0;
+        for (index, message) in scripts.iter_mut().enumerate() {
+            message.usage.input = 10u64.pow(u32::try_from(index).expect("few scripts"));
+            message.usage.total_tokens = message.usage.input;
+            expected += message.usage.input;
+        }
+        let harness = Harness::new(scripts);
+        let session = harness.create().await;
+        let mut stream = harness
+            .host
+            .attach(&[attach_request(&session)])
+            .await
+            .expect("attach");
+        frames_until(&mut stream, "caught_up", |frame| {
+            matches!(frame, Frame::CaughtUp { .. })
+        })
+        .await;
+        harness.prompt(&session, "delegate it").await;
+        until_idle(&mut stream).await;
+        settle(&harness, &session, &mut stream).await;
+
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let log = handles.log.lock().await;
+        let sub_agent_input: u64 = log
+            .entries_in_order()
+            .iter()
+            .filter(|entry| entry.thread == aj_session::ThreadKind::Subagent)
+            .filter_map(|entry| match &entry.entry {
+                aj_session::ConversationEntryKind::Message { message } => {
+                    match message.as_stored_wire() {
+                        Some(aj_models::types::Message::Assistant(assistant)) => {
+                            Some(assistant.usage.input)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .sum();
+        assert!(
+            sub_agent_input > 0,
+            "{label}: the fixture must bill the sub-agent's thread"
+        );
+        let rows = aj_app::session_info::digest(&log.stats(), None);
+        let input = rows.iter().find_map(|row| match row {
+            aj_app::session_info::InfoRow::Kv { key, value } if key == "input" => {
+                Some(value.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            input,
+            Some(expected.to_string()),
+            "{label}: the overlay counts Main and sub-agent responses alike"
+        );
+        drop(log);
+        harness.host.shutdown().await;
+    }
+}
+
+/// Committed compaction spend reaches the live client once, while the
+/// checkpoint remains its durable owner across reattachment.
 #[tokio::test]
 async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     fn priced(text: &str, usage: [u64; 4]) -> AssistantMessage {
@@ -6745,15 +6805,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     );
     drop(log);
 
-    let live_usage = client.chat.usage_summary();
-    assert_eq!(summary_dimensions(&live_usage), compacted_total);
-    let host_usage = harness
-        .host
-        .usage(&session)
-        .await
-        .expect("usage read")
-        .expect("live usage");
-    assert_eq!(summary_dimensions(&host_usage), compacted_total);
+    assert_eq!(latest_row_total(&client.chat), compacted_total);
     let compacted_sources = usage_sources(&client.chat);
     assert_eq!(
         compacted_sources.len(),
@@ -6800,15 +6852,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
         });
     let later_id = later_id.expect("the later assistant has durable identity");
     assert!(later_usage.is_some(), "the later assistant reports usage");
-    let final_live_usage = client.chat.usage_summary();
-    assert_eq!(summary_dimensions(&final_live_usage), final_total);
-    let final_host_usage = harness
-        .host
-        .usage(&session)
-        .await
-        .expect("usage read")
-        .expect("live usage");
-    assert_eq!(summary_dimensions(&final_host_usage), final_total);
+    assert_eq!(latest_row_total(&client.chat), final_total);
     let final_stats = handles.log.lock().await.stats();
     assert_eq!(usage_dimensions(&final_stats.usage), final_total);
 
@@ -6821,8 +6865,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     assert_eq!(checkpoint_events(&reattached), live_checkpoint);
     assert_eq!(usage_sources(&client.chat), after_sources);
     assert_eq!(compaction_rows(&client.chat), 1);
-    let reattached_usage = client.chat.usage_summary();
-    assert_eq!(summary_dimensions(&reattached_usage), final_total);
+    assert_eq!(latest_row_total(&client.chat), final_total);
 
     let stale_cursor = client.client.cursor().expect("old host cursor");
     harness.host.shutdown().await;
@@ -6831,8 +6874,7 @@ async fn compaction_usage_converges_live_shutdown_durable_and_replay() {
     assert_eq!(checkpoint_events(&replayed), live_checkpoint);
     assert_eq!(usage_sources(&client.chat), after_sources);
     assert_eq!(compaction_rows(&client.chat), 1);
-    let replayed_usage = client.chat.usage_summary();
-    assert_eq!(summary_dimensions(&replayed_usage), final_total);
+    assert_eq!(latest_row_total(&client.chat), final_total);
     revived.host.shutdown().await;
 }
 
@@ -7033,7 +7075,7 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         let _ = client.apply(&mut chat, frame);
     }
     assert_eq!(
-        summary_dimensions(&chat.usage_summary()),
+        latest_row_total(&chat),
         session_total,
         "filtering the duplicate checkpoint preserves the current total",
     );
@@ -7092,13 +7134,6 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         1,
         "the filtered duplicate does not append a second checkpoint row",
     );
-    let host_usage = harness
-        .host
-        .usage(&session)
-        .await
-        .expect("usage read")
-        .expect("live usage");
-    assert_eq!(summary_dimensions(&host_usage), session_total);
     harness.host.shutdown().await;
 }
 
@@ -7192,15 +7227,7 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         .await;
     client.pump_until_idle().await;
 
-    let before_rows = client.chat.usage_summary();
-    assert_eq!(summary_dimensions(&before_rows), before_total);
-    let before_host = harness
-        .host
-        .usage(&session)
-        .await
-        .expect("usage read")
-        .expect("live usage");
-    assert_eq!(summary_dimensions(&before_host), before_total);
+    assert_eq!(latest_row_total(&client.chat), before_total);
     let handles = harness
         .host
         .local_handles(&session)
@@ -7287,17 +7314,7 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         original_durable,
         "the session log stayed unchanged",
     );
-    assert_eq!(
-        summary_dimensions(&client.chat.usage_summary()),
-        before_total
-    );
-    let after_host = harness
-        .host
-        .usage(&session)
-        .await
-        .expect("usage read")
-        .expect("live usage");
-    assert_eq!(summary_dimensions(&after_host), before_total);
+    assert_eq!(latest_row_total(&client.chat), before_total);
     harness.host.shutdown().await;
 }
 
@@ -10571,18 +10588,6 @@ async fn the_reads_answer_tasks_tree_and_hello() {
             .is_empty(),
     );
 
-    let usage = harness
-        .host
-        .usage(&session)
-        .await
-        .expect("usage read")
-        .expect("a live session reports its usage");
-    assert_eq!(
-        usage.main_agent_usage.input_tokens, 1234,
-        "the turn's tokens are accounted for: {usage:?}",
-    );
-    assert_eq!(usage.total_usage.input_tokens, 1234);
-
     let tree = harness.host.tree(&session).await.expect("tree read");
     assert!(
         !tree.segments.is_empty(),
@@ -10744,10 +10749,6 @@ async fn reads_do_not_materialize_a_cold_session() {
             .is_empty(),
     );
     assert!(
-        revived.host.usage(&session).await.expect("usage").is_none(),
-        "usage is per process, so a session this host never held spent nothing",
-    );
-    assert!(
         !is_live().await.live,
         "neither read materialized the session",
     );
@@ -10762,7 +10763,6 @@ async fn reads_do_not_materialize_a_cold_session() {
     for err in [
         revived.host.tasks("not-a-session").await.err(),
         revived.host.queue("not-a-session").await.err(),
-        revived.host.usage("not-a-session").await.err(),
     ] {
         let err = err.expect("an unknown session is refused");
         assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");
