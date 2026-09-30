@@ -33423,9 +33423,7 @@ mod tests {
         let persistence = ConversationPersistence::new(left_dir.path().join("sessions"));
         let prompt = format!("{} distantneedle", "an old session prompt ".repeat(6));
         store_holding_a_prompt(&persistence, &prompt);
-        let target = persistence.list_session_previews(|_, _| {}).unwrap()[0]
-            .session_id
-            .clone();
+        let target = persistence.list_sessions().unwrap()[0].session_id.clone();
         for _ in 0..60 {
             seed_session(&persistence);
         }

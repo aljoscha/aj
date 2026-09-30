@@ -145,7 +145,6 @@ pub fn workspace_history_streaming(
     let mut remaining = max;
     collect_dir(
         persistence.sessions_dir(),
-        None,
         &mut seen,
         &mut remaining,
         cancel,
@@ -153,79 +152,13 @@ pub fn workspace_history_streaming(
     );
 }
 
-/// Collect submitted prompts across every project under `sessions_base`
-/// (`~/.aj/sessions`), deduplicated and each tagged with its project
-/// (subdirectory) label, newest-first and capped at `max`.
-///
-/// Projects are visited in reverse-lexicographic directory order and
-/// files within a project newest-first, so a prompt's tag reflects the
-/// first project (in that order) whose files contain it. The directory
-/// order is unrelated to recency. It exists only to make the dedup
-/// deterministic, so the tag on a prompt shared across projects is
-/// stable but not a "most recent workspace" guarantee.
-pub fn all_workspaces_history(sessions_base: &Path, max: usize) -> Vec<PromptEntry> {
-    let mut out = Vec::new();
-    all_workspaces_history_streaming(sessions_base, max, &|| false, &mut |batch| {
-        out.extend(batch)
-    });
-    out
-}
-
-/// Stream submitted prompts across every project under `sessions_base` to
-/// `emit`, one per-file batch at a time, in the same order, dedup, and
-/// `max`-cap as [`all_workspaces_history`]. See
-/// [`workspace_history_streaming`] for the batching contract.
-pub fn all_workspaces_history_streaming(
-    sessions_base: &Path,
-    max: usize,
-    cancel: &dyn Fn() -> bool,
-    emit: &mut dyn FnMut(Vec<PromptEntry>),
-) {
-    let read_dir = match std::fs::read_dir(sessions_base) {
-        Ok(rd) => rd,
-        Err(e) => {
-            tracing::debug!(
-                "could not read sessions base {}: {e}",
-                sessions_base.display()
-            );
-            return;
-        }
-    };
-
-    let mut projects: Vec<_> = read_dir
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    // Directory names are unrelated to recency, but a stable order keeps
-    // the dedup deterministic. Reverse lexicographic so the listing
-    // roughly mirrors the newest-first feel within a project.
-    projects.sort();
-    projects.reverse();
-
-    let mut seen = HashSet::new();
-    let mut remaining = max;
-    for dir in &projects {
-        if remaining == 0 || cancel() {
-            break;
-        }
-        let project = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string());
-        collect_dir(dir, project, &mut seen, &mut remaining, cancel, emit);
-    }
-}
-
 /// Walk every `*.jsonl` file in `dir`, newest file first, emitting each
 /// file's new prompts (newest-first, skipping bodies already in `seen`)
-/// as one batch through `emit`. `project` tags every entry. `remaining`
-/// is the shared budget, decremented as entries are produced. The walk
+/// as one batch through `emit`. `remaining` is the shared budget, decremented as entries are produced. The walk
 /// stops once it hits zero. A file that yields no new prompts emits
 /// nothing.
 fn collect_dir(
     dir: &Path,
-    project: Option<String>,
     seen: &mut HashSet<String>,
     remaining: &mut usize,
     cancel: &dyn Fn() -> bool,
@@ -270,7 +203,7 @@ fn collect_dir(
             if seen.insert(text.clone()) {
                 batch.push(PromptEntry {
                     text,
-                    project: project.clone(),
+                    project: None,
                 });
                 *remaining -= 1;
             }
@@ -308,13 +241,9 @@ fn load_file_prompts(path: &Path, cancel: &dyn Fn() -> bool) -> Vec<String> {
 /// Failure-isolation: an unreadable file yields no prompts, and
 /// non-UTF-8 or unparseable lines are skipped without aborting the rest
 /// of the file.
-pub fn scan_file_user_prompts(path: &Path) -> Vec<String> {
-    scan_file_user_prompts_cancellable(path, &|| false)
-}
-
-/// [`scan_file_user_prompts`] with cooperative cancellation for the
-/// blocking-pool scans. `cancel` is polled periodically while reading so a
-/// large file doesn't pin the scan after the consumer has gone away.
+///
+/// `cancel` is polled periodically while reading so a large file doesn't
+/// pin a blocking-pool scan after the consumer has gone away.
 fn scan_file_user_prompts_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Vec<String> {
     scan_file_recorded_prompts(path, cancel)
         .into_iter()
@@ -557,7 +486,7 @@ mod tests {
             "equal fallback timestamps keep newest-line-first order across scans"
         );
         assert_eq!(
-            scan_file_user_prompts(&path),
+            scan_file_user_prompts_cancellable(&path, &|| false),
             [" first \nsecond ", " ", "last"]
         );
     }
@@ -696,43 +625,6 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let entries = workspace_history(&persistence, 2, &|| false);
         assert_eq!(entries.len(), 2, "cap honored: {entries:?}");
-    }
-
-    #[test]
-    fn all_workspaces_history_tags_and_dedupes_across_projects() {
-        let base = scratch_dir("all-base");
-        let proj_a = base.path().join("proj-a");
-        let proj_b = base.path().join("proj-b");
-        std::fs::create_dir_all(&proj_a).unwrap();
-        std::fs::create_dir_all(&proj_b).unwrap();
-        write_jsonl(
-            &proj_a,
-            "2024-01-01-00-00-00",
-            &[user_line("shared prompt", "1"), user_line("only in a", "2")],
-        );
-        write_jsonl(
-            &proj_b,
-            "2024-01-01-00-00-00",
-            &[user_line("shared prompt", "1"), user_line("only in b", "2")],
-        );
-
-        let entries = all_workspaces_history(base.path(), 2000);
-        let by_text: std::collections::HashMap<&str, Option<&str>> = entries
-            .iter()
-            .map(|e| (e.text.as_str(), e.project.as_deref()))
-            .collect();
-        assert_eq!(by_text.get("only in a"), Some(&Some("proj-a")));
-        assert_eq!(by_text.get("only in b"), Some(&Some("proj-b")));
-        // `shared prompt` appears once (deduped across projects).
-        let shared_count = entries.iter().filter(|e| e.text == "shared prompt").count();
-        assert_eq!(shared_count, 1);
-    }
-
-    #[test]
-    fn all_workspaces_history_missing_base_is_empty() {
-        let base = scratch_dir("missing-base");
-        std::fs::remove_dir_all(&base).unwrap();
-        assert!(all_workspaces_history(base.path(), 2000).is_empty());
     }
 
     #[test]

@@ -122,8 +122,8 @@ use serde_json::Value;
 
 use crate::compaction::estimate_conversation_context;
 use crate::log::{
-    Conversation, ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, EntryRef,
-    LogSnapshot, SessionSettings, ThreadFilter, ThreadKind,
+    ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, EntryRef, LogSnapshot,
+    SessionSettings, ThreadFilter, ThreadKind,
 };
 use crate::tool_details::resolve_tool_details;
 
@@ -262,88 +262,12 @@ pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
     Replay::new(log.core()).map(|projected| projected.event)
 }
 
-/// Like [`replay`], but withholds every sub-agent's projected content
-/// events.
-///
-/// This is the full replay state machine with sub-agent content
-/// projection gated off. It runs the same bracketing as [`replay`], so
-/// it emits the identical sequence of [`AgentEvent::SubAgentStart`] /
-/// [`AgentEvent::SubAgentEnd`] events, with identical reports. The only
-/// difference: for an entry whose agent is a sub-agent it does not push
-/// the projected `MessageStart`/`End`, `ToolExecution*`, `UsageUpdate`,
-/// or `Notice` events. Typed `SubAgentSettings` updates remain visible so
-/// the box metadata converges without loading its transcript. Main-agent
-/// entries project exactly as in full replay. A caller reconstructs withheld
-/// content on demand with [`project_thread`].
-///
-/// This makes resuming a large session cheap. The projection clones
-/// every sub-agent message and tool payload into an event, and
-/// sub-agent threads dominate a big log, so deferring that work builds
-/// the main transcript and the sub-agent boxes without paying for
-/// transcripts the user is usually not looking at.
-pub fn replay_deferring_subs(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
-    Replay::deferring_subs(log.core()).map(|projected| projected.event)
-}
-
-/// Project one already-linearized sub-agent thread into that
-/// sub-agent's content events, with a fresh projection state.
-///
-/// `conv` must be the linearization of a single sub-agent thread
-/// (`log.linearize(head, ThreadFilter::subagent(n))`) and `agent` the
-/// matching [`AgentId::Sub`]. It emits that sub-agent's
-/// `MessageStart`/`End`, `ToolExecution*`, `UsageUpdate`, `Notice`, and
-/// `SubAgentSettings` events, equal in order and payload to what full
-/// [`replay`] emits for the same thread. It does not emit [`AgentEvent::SubAgentStart`] /
-/// [`AgentEvent::SubAgentEnd`] and does not bracket, because the box
-/// these events fill already exists.
-///
-/// Takes an owned [`Conversation`], not a `&ConversationLog`, so the
-/// caller can drop the log lock before projecting. This is sound
-/// because a sub-agent thread never carries a
-/// [`ConversationEntryKind::Compaction`] entry (compaction runs on the
-/// user thread only), which is the only projection step that needs the
-/// full log.
-pub fn project_thread(conv: &Conversation, agent: AgentId) -> Vec<AgentEvent> {
-    // A fresh state scoped to this thread reproduces full replay's
-    // per-agent projection: the usage accumulator and the
-    // state-notice gate are keyed per `AgentId`, and every entry on
-    // this thread is `agent`, so the `UsageUpdate` sequence and `Notice`
-    // gating match what full replay produces for this sub-agent.
-    debug_assert!(
-        matches!(agent, AgentId::Sub(_)),
-        "project_thread projects a sub-agent thread"
-    );
-    let mut state = ReplayState::default();
-    let mut out = VecDeque::new();
-    for entry in conv.entries() {
-        // No bracketing and no log handle: the box exists already, and
-        // a sub-agent thread carries no `Compaction` entry.
-        //
-        // Guard against a misrouted conversation: every entry that carries an
-        // agent id must be `agent`. Meta entries (settings, system prompt)
-        // carry none and are fine on any thread.
-        debug_assert!(
-            agent_id_for(entry).is_none_or(|id| id == agent),
-            "project_thread received an entry for a different agent"
-        );
-        // Advance the same settings fold as full replay, without emitting
-        // brackets for the box the caller already has.
-        state.bracket_subagent(entry, None, false, &BTreeSet::new(), &mut VecDeque::new());
-        state.project_entry(entry, None, None, &mut out);
-    }
-    out.into_iter().map(|projected| projected.event).collect()
-}
-
 struct Replay<'a> {
     log: &'a LogSnapshot,
     next_entry: usize,
     state: ReplayState,
     pending: VecDeque<TaggedEvent>,
     finished: bool,
-    /// When set, sub-agent content events are withheld (see
-    /// [`replay_deferring_subs`]). Bracketing and report capture are
-    /// unaffected.
-    defer_subs: bool,
     /// The entry ids to project: the active path from [`LogSnapshot::head`]
     /// plus the sub-agent threads anchored on it. Append-order entries
     /// outside this set are skipped, so sibling branches on disk don't
@@ -363,21 +287,12 @@ struct Replay<'a> {
 
 impl<'a> Replay<'a> {
     fn new(log: &'a LogSnapshot) -> Self {
-        Self::with_mode(log, false)
-    }
-
-    fn deferring_subs(log: &'a LogSnapshot) -> Self {
-        Self::with_mode(log, true)
-    }
-
-    fn with_mode(log: &'a LogSnapshot, defer_subs: bool) -> Self {
         Self {
             log,
             next_entry: 0,
             state: ReplayState::default(),
             pending: VecDeque::new(),
             finished: false,
-            defer_subs,
             included: included_entries(log),
             cursor: None,
             live_subs: BTreeSet::new(),
@@ -388,7 +303,7 @@ impl<'a> Replay<'a> {
         Self {
             cursor,
             live_subs,
-            ..Self::with_mode(log, false)
+            ..Self::new(log)
         }
     }
 }
@@ -511,24 +426,8 @@ impl Iterator for Replay<'_> {
                             &self.live_subs,
                             &mut projected,
                         );
-                        if self.defer_subs && matches!(agent_id_for(entry), Some(AgentId::Sub(_))) {
-                            // Deferred mode withholds a sub-agent's content
-                            // events but still advances the report that
-                            // `close_run` reads, so the `SubAgentEnd`
-                            // matches full replay byte for byte.
-                            self.state.capture_sub_report_from_entry(entry);
-                            if matches!(
-                                entry.entry,
-                                ConversationEntryKind::ModelChange { .. }
-                                    | ConversationEntryKind::ThinkingChange { .. }
-                            ) {
-                                self.state
-                                    .project_entry(entry, at, Some(self.log), &mut projected);
-                            }
-                        } else {
-                            self.state
-                                .project_entry(entry, at, Some(self.log), &mut projected);
-                        }
+                        self.state
+                            .project_entry(entry, at, Some(self.log), &mut projected);
                         if keep {
                             self.pending.append(&mut projected);
                         }
@@ -746,8 +645,8 @@ impl ReplayState {
         let Some(n) = current_sub else {
             return;
         };
-        // Metadata must advance even when content is deferred or this entry
-        // is below the cursor. Both cached starts can later reach the client.
+        // Metadata must advance even when this entry is below the cursor.
+        // Both cached starts can later reach the client.
         for start in self.spawned.get_mut(&n).into_iter().chain(
             self.open_runs
                 .get_mut(&n)
@@ -943,8 +842,7 @@ impl ReplayState {
     /// Translate one entry into zero or more events, appending them
     /// to `out`. `log` is consulted only for a `Compaction` entry, to
     /// estimate the post-compaction occupancy of the reduced
-    /// projection. Single-thread projection ([`project_thread`]) passes
-    /// `None`: a sub-agent thread never carries a `Compaction` entry.
+    /// projection.
     ///
     /// `at` is the entry's position, carried onto whichever single event
     /// of this entry is durable (see [`project_suffix`]).
@@ -1188,11 +1086,6 @@ impl ReplayState {
     /// stop reason (see [`conclusion_from_stop_reason`]). The report is
     /// bracket-scoped, so an interleaved run's box shows the report of its
     /// last bracket. A no-op unless `agent_id` names an open run.
-    ///
-    /// Split out from projection so deferred replay can advance the
-    /// report without cloning the sub-agent's messages into events. The
-    /// naive alternative, skipping sub-agent projection wholesale, would
-    /// also skip this and leave every resumed box with an empty report.
     fn capture_sub_report(
         &mut self,
         agent_id: AgentId,
@@ -1210,24 +1103,6 @@ impl ReplayState {
         }
         run.report = report;
         run.conclusion = conclusion_from_stop_reason(&assistant.stop_reason);
-    }
-
-    /// Advance the open sub-agent run's report from `entry` without
-    /// projecting its content events. Deferred replay calls this for
-    /// sub-agent entries: only an assistant message carries report
-    /// text, every other kind is a no-op here.
-    fn capture_sub_report_from_entry(&mut self, entry: &ConversationEntry) {
-        let Some(agent_id) = agent_id_for(entry) else {
-            return;
-        };
-        match &entry.entry {
-            ConversationEntryKind::Message { message } => {
-                if let Some(Message::Assistant(a)) = message.as_stored_wire() {
-                    self.capture_sub_report(agent_id, a);
-                }
-            }
-            _ => {}
-        }
     }
 
     /// Capture the pre-add totals and fold this operation for the next event.
@@ -2748,34 +2623,10 @@ mod tests {
         for grouped in [false, true] {
             let (_dir, log) = log_with_two_aborted_subs(grouped);
             let full: Vec<_> = replay(&log).collect();
-            let deferred: Vec<_> = replay_deferring_subs(&log).collect();
             assert_eq!(
                 final_conclusions(&full),
                 expected,
                 "full replay of the grouped={grouped} interleaving",
-            );
-            assert_eq!(
-                final_conclusions(&deferred),
-                expected,
-                "deferred replay of the grouped={grouped} interleaving",
-            );
-        }
-    }
-
-    /// Deferred replay withholds the sub's content but must still report
-    /// the same conclusion as full replay, since resume uses the deferred
-    /// path. Cover the two outcomes that differ from the default.
-    #[test]
-    fn deferred_replay_reconstructs_the_same_conclusion_as_full_replay() {
-        for stop_reason in [StopReason::Length, StopReason::Error] {
-            let label = format!("{stop_reason:?}");
-            let log = subagent_log_with_stop_reason(stop_reason);
-            let full: Vec<_> = replay(&log).collect();
-            let deferred: Vec<_> = replay_deferring_subs(&log).collect();
-            assert_eq!(
-                replayed_conclusion(&deferred),
-                replayed_conclusion(&full),
-                "deferred and full disagree for stop reason {label}",
             );
         }
     }
@@ -3749,9 +3600,7 @@ mod tests {
 
     /// Build a log with a main thread and one foreground sub-agent run
     /// that produces assistant text, a tool call, a tool result, and a
-    /// concluding report, then main resumes. The sub content is rich so
-    /// the deferred/`project_thread` parity checks exercise
-    /// `MessageStart`/`End`, `ToolExecution*`, and `UsageUpdate`.
+    /// concluding report, then main resumes.
     fn log_with_foreground_sub() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
@@ -3888,32 +3737,6 @@ mod tests {
         (dir, log)
     }
 
-    fn event_values<'a>(events: impl IntoIterator<Item = &'a AgentEvent>) -> Vec<Value> {
-        events
-            .into_iter()
-            .map(|e| serde_json::to_value(e).expect("event serializes"))
-            .collect()
-    }
-
-    fn bracket_events(events: &[AgentEvent]) -> Vec<Value> {
-        event_values(events.iter().filter(|e| {
-            matches!(
-                e,
-                AgentEvent::SubAgentStart { .. } | AgentEvent::SubAgentEnd { .. }
-            )
-        }))
-    }
-
-    /// Every event whose `agent_id()` is `Main`. Bracket events report
-    /// the parent, so this subsequence includes them.
-    fn main_subsequence(events: &[AgentEvent]) -> Vec<Value> {
-        event_values(
-            events
-                .iter()
-                .filter(|e| matches!(e.agent_id(), AgentId::Main)),
-        )
-    }
-
     fn sub_reports(events: &[AgentEvent]) -> Vec<String> {
         events
             .iter()
@@ -3924,165 +3747,23 @@ mod tests {
             .collect()
     }
 
-    /// Count of sub-agent-tagged events. Bracket events report the
-    /// parent, so every `Sub(_)`-tagged event is projected content.
-    fn sub_content_count(events: &[AgentEvent]) -> usize {
-        events
-            .iter()
-            .filter(|e| matches!(e.agent_id(), AgentId::Sub(_)))
-            .count()
-    }
-
-    /// Deferred replay is the full state machine with sub-agent content
-    /// gated off: identical bracket sequence, identical non-empty
-    /// reports, identical main subsequence, and zero sub-agent content
-    /// events (full replay emits some).
-    fn assert_deferred_matches_full(log: &ConversationLog) {
-        let full: Vec<AgentEvent> = replay(log).collect();
-        let deferred: Vec<AgentEvent> = replay_deferring_subs(log).collect();
-
-        assert_eq!(
-            bracket_events(&full),
-            bracket_events(&deferred),
-            "bracket sequence must be identical"
-        );
-
-        let reports = sub_reports(&full);
-        assert_eq!(reports, sub_reports(&deferred), "reports must be identical");
-        assert!(!reports.is_empty(), "the log has at least one sub run");
-        assert!(
-            reports.iter().all(|r| !r.is_empty()),
-            "reports must be non-empty, got {reports:?}"
-        );
-
-        assert_eq!(
-            sub_content_count(&deferred),
-            0,
-            "deferred mode withholds all sub content, got {deferred:#?}"
-        );
-        assert!(
-            sub_content_count(&full) > 0,
-            "full replay projects sub content"
-        );
-
-        assert_eq!(
-            main_subsequence(&full),
-            main_subsequence(&deferred),
-            "main-agent subsequence must be identical"
-        );
-    }
-
-    /// `project_thread` for `Sub(n)` reproduces exactly the
-    /// `Sub(n)`-tagged content events full replay emits for that thread
-    /// (bracket events report the parent, so they're already excluded).
-    fn assert_project_thread_matches_full(log: &ConversationLog, n: usize) {
-        let full: Vec<AgentEvent> = replay(log).collect();
-        let expected = event_values(
-            full.iter()
-                .filter(|e| matches!(e.agent_id(), AgentId::Sub(m) if m == n)),
-        );
-        assert!(
-            !expected.is_empty(),
-            "full replay produced Sub({n}) content"
-        );
-
-        let head = log
-            .latest_leaf(ThreadFilter::subagent(n))
-            .expect("sub leaf");
-        let conv = log.linearize(&head, ThreadFilter::subagent(n));
-        let projected = event_values(project_thread(&conv, AgentId::Sub(n)).iter());
-
-        assert_eq!(projected, expected, "project_thread parity for Sub({n})");
-    }
-
-    /// Deferred replay of a clean foreground sub run matches full replay
-    /// on brackets and reports and withholds all sub content. The
-    /// concrete report value pins the report-capture refactor, whose
-    /// naive form (skipping sub projection wholesale) yields an empty
-    /// report here.
+    /// A foreground sub run reports its final assistant text.
     #[test]
-    fn replay_deferring_subs_matches_full_for_foreground_sub() {
+    fn replay_reports_a_foreground_sub_runs_final_text() {
         let (_dir, log) = log_with_foreground_sub();
-        assert_deferred_matches_full(&log);
         let full: Vec<AgentEvent> = replay(&log).collect();
         assert_eq!(sub_reports(&full), vec!["final sub report".to_string()]);
     }
 
-    /// Same parity contract for a background sub whose entries interleave
-    /// with the parent's, so the bracket opens and closes twice.
+    /// A background sub whose entries interleave with the parent's opens
+    /// and closes its bracket twice, reporting per bracket.
     #[test]
-    fn replay_deferring_subs_matches_full_for_background_sub() {
+    fn replay_reports_each_bracket_of_an_interleaved_background_sub() {
         let (_dir, log) = log_with_background_sub();
-        assert_deferred_matches_full(&log);
         let full: Vec<AgentEvent> = replay(&log).collect();
         assert_eq!(
             sub_reports(&full),
             vec!["sub step one".to_string(), "bg final report".to_string()],
-        );
-    }
-
-    #[test]
-    fn project_thread_matches_full_replay_for_foreground_sub() {
-        let (_dir, log) = log_with_foreground_sub();
-        assert_project_thread_matches_full(&log, 1);
-    }
-
-    /// Parity relies on the sub's append order matching its `parent_id`
-    /// chain, which interleaving would break if `linearize` and replay
-    /// disagreed. This pins the interleaved case.
-    #[test]
-    fn project_thread_matches_full_replay_for_background_sub() {
-        let (_dir, log) = log_with_background_sub();
-        assert_project_thread_matches_full(&log, 1);
-    }
-
-    /// A legacy log with no `SubAgentSpawn` entry still yields a
-    /// `SubAgentStart` under `replay_deferring_subs`, synthesized by the
-    /// `bracket_subagent` fallback at the sub's first message. The resume
-    /// drain seeds `deferred_subs` from that event, so without the
-    /// synthesized start a legacy sub-agent would never be marked deferred
-    /// and never materialize on observe.
-    #[test]
-    fn replay_deferring_subs_emits_start_for_legacy_log() {
-        let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut log = ConversationLog::create(&persistence).expect("create log");
-        log.set_system_prompt("p".into()).expect("sp");
-
-        let user_head = {
-            let mut view = ConversationView::user(&mut log);
-            view.add_message(user_msg("hi")).expect("u");
-            view.head().cloned().expect("head present")
-        };
-        // No `append_subagent_spawn`: the sub thread leads straight with its
-        // task message, the legacy shape the fallback exists for.
-        {
-            let mut view = ConversationView::subagent(&mut log, user_head, 1);
-            view.add_message(user_msg("subtask")).expect("u");
-            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
-                text: "reply".into(),
-                text_signature: None,
-            })]))
-            .expect("a");
-        }
-
-        let deferred: Vec<AgentEvent> = replay_deferring_subs(&log).collect();
-        match deferred
-            .iter()
-            .find(|e| matches!(e, AgentEvent::SubAgentStart { .. }))
-            .expect("deferred replay synthesizes a SubAgentStart for the legacy sub")
-        {
-            AgentEvent::SubAgentStart { child, task, .. } => {
-                assert_eq!(*child, AgentId::Sub(1));
-                assert_eq!(task, "subtask");
-            }
-            _ => unreachable!(),
-        }
-        // Deferred mode still withholds the sub's content events.
-        assert_eq!(
-            sub_content_count(&deferred),
-            0,
-            "deferred mode withholds the legacy sub's content, got {deferred:#?}"
         );
     }
 
@@ -5606,26 +5287,6 @@ mod tests {
                     );
                     assert_eq!(wire(&tagged[0].event), wire(event));
                 }
-                let metadata = |event: &AgentEvent| {
-                    matches!(
-                        event,
-                        AgentEvent::SubAgentStart { .. }
-                            | AgentEvent::SubAgentEnd { .. }
-                            | AgentEvent::SubAgentSettings { .. }
-                    )
-                };
-                assert_eq!(
-                    replay_deferring_subs(&resumed)
-                        .filter(&metadata)
-                        .map(|e| wire(&e))
-                        .collect::<Vec<_>>(),
-                    full.iter()
-                        .map(|e| &e.event)
-                        .filter(|e| metadata(e))
-                        .map(wire)
-                        .collect::<Vec<_>>(),
-                    "deferred boxes have the same settings and reports",
-                );
                 for live_subs in [BTreeSet::new(), live([1])] {
                     let suffix: Vec<_> =
                         project_suffix(&snapshot, Some(thinking.seq), &live_subs).collect();
@@ -5642,20 +5303,6 @@ mod tests {
                         "a cursor-dropped edit must survive a synthetic start"
                     );
                 }
-                let conv = resumed.linearize(&resumed.latest_leaf(sub).unwrap(), sub);
-                let projected = project_thread(&conv, AgentId::Sub(1));
-                assert_eq!(
-                    projected
-                        .iter()
-                        .filter(|e| matches!(e, AgentEvent::SubAgentSettings { .. }))
-                        .map(wire)
-                        .collect::<Vec<_>>(),
-                    expected
-                        .iter()
-                        .map(|(_, event)| wire(event))
-                        .collect::<Vec<_>>(),
-                    "on-demand content agrees with full replay",
-                );
             }
         }
     }
@@ -5713,10 +5360,6 @@ mod tests {
         let after: Vec<_> = replay(&log).map(|e| wire(&e)).collect();
         assert_eq!(after[..before.len()], before);
         assert_eq!(after.len(), before.len() + 1);
-        assert_eq!(
-            wire(&replay_deferring_subs(&log).last().unwrap()),
-            wire(&suffix[0].event)
-        );
     }
 
     #[test]

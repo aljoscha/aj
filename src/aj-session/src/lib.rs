@@ -69,14 +69,9 @@ pub use log::{
     ThreadFilter, ThreadKind, validate_session_env,
 };
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview, SidecarMetadata};
-pub use prompt_history::{
-    PromptEntry, all_workspaces_history, all_workspaces_history_streaming, scan_file_user_prompts,
-    workspace_history, workspace_history_streaming,
-};
+pub use prompt_history::{PromptEntry, workspace_history, workspace_history_streaming};
 pub use repair::repair_interrupted_tool_uses;
-pub use replay::{
-    Backfill, TaggedEvent, project_suffix, project_thread, replay, replay_deferring_subs,
-};
+pub use replay::{Backfill, TaggedEvent, project_suffix, replay};
 pub use stats::{SessionStats, UsageBucket};
 pub use tag::{MAX_TAG_BYTES, TagError, normalize_tag};
 pub use tool_details::resolve_tool_details;

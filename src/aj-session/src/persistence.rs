@@ -7,7 +7,7 @@
 
 use aj_models::types::{Message, UserContent};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -330,62 +330,6 @@ impl ConversationPersistence {
         Ok(archived)
     }
 
-    /// The label of every tagged session in the store, keyed by session id.
-    ///
-    /// Driven by [`Self::enumerate_tags`], so the cost is one directory read
-    /// plus one small read per sidecar that exists. An untagged store has no
-    /// `meta/` directory and pays a single failed `read_dir` with no
-    /// per-session read at all, which is why this cannot be a loop
-    /// over the sessions asking each for its tag.
-    ///
-    /// A label that cannot be read is dropped rather than raised: a listing
-    /// carries labels as display metadata, and one unreadable sidecar must not
-    /// cost the caller its rows.
-    fn tags_by_session(&self) -> HashMap<String, String> {
-        let sidecars = match self.enumerate_tags() {
-            Ok(sidecars) => sidecars,
-            Err(err) => {
-                tracing::debug!(
-                    "could not enumerate tag sidecars in {}: {err}",
-                    self.meta_dir().display()
-                );
-                return HashMap::new();
-            }
-        };
-        sidecars
-            .into_iter()
-            .filter_map(|sidecar| {
-                let tag = self.read_tag(&sidecar.session_id).ok().flatten()?;
-                Some((sidecar.session_id, tag))
-            })
-            .collect()
-    }
-
-    /// The id of every archived session in the store.
-    ///
-    /// Driven by [`Self::enumerate_archived`], so the cost is one directory
-    /// read and nothing per session: the listing is the answer, since the
-    /// sidecar's existence is the bit.
-    ///
-    /// A directory that cannot be read reports nothing archived rather than
-    /// raising, for the reason [`Self::tags_by_session`] gives: the bit is
-    /// display metadata and must not cost a listing its rows.
-    fn archived_sessions(&self) -> HashSet<String> {
-        match self.enumerate_archived() {
-            Ok(sidecars) => sidecars
-                .into_iter()
-                .map(|sidecar| sidecar.session_id)
-                .collect(),
-            Err(err) => {
-                tracing::debug!(
-                    "could not enumerate archived sidecars in {}: {err}",
-                    self.meta_dir().display()
-                );
-                HashSet::new()
-            }
-        }
-    }
-
     /// Every `.jsonl` file in the sessions directory whose stem is a session
     /// id, latest first, with the facts a `stat` yields. Session contents are
     /// not opened or parsed.
@@ -532,137 +476,11 @@ impl ConversationPersistence {
         if cancel() {
             return Ok(None);
         }
-        // Sidecars have the listing's best-effort semantics.
+        // Sidecars are display metadata here: one that cannot be read leaves
+        // the preview unlabelled or unarchived rather than failing it.
         preview.tag = self.read_tag(session_id).ok().flatten();
         preview.archived = self.read_archived(session_id).unwrap_or(false);
         Ok(Some(preview))
-    }
-
-    /// List sessions with rich per-session previews — first user
-    /// message, message count, modified time, file size.
-    ///
-    /// Walks the sessions directory in the same latest-first order
-    /// as [`Self::list_sessions`], but for each file opens the JSONL
-    /// and scans line by line to count `Message` entries and capture
-    /// the first user-role textual block. `on_progress(loaded, total)`
-    /// fires once per file as previews complete so a caller showing
-    /// a "Loading X/Y" indicator can update incrementally. Malformed lines are
-    /// ignored, like a torn tail during resume.
-    ///
-    /// Note on streaming: this function returns the previews in one
-    /// `Vec` after every file has been scanned. The callback is the
-    /// streaming surface for progress reporting; callers that want to
-    /// render rows as they are scanned (rather than blocking on the
-    /// full walk) use [`Self::list_session_previews_streaming`]
-    /// instead.
-    pub fn list_session_previews(
-        &self,
-        mut on_progress: impl FnMut(usize, usize),
-    ) -> Result<Vec<SessionPreview>, ConversationError> {
-        let candidates = self.preview_candidates()?;
-        let mut tags = self.tags_by_session();
-        let archived = self.archived_sessions();
-        let total = candidates.len();
-        let mut previews = Vec::with_capacity(total);
-        for (i, (session_id, path)) in candidates.into_iter().enumerate() {
-            if let Some(mut preview) = read_preview(session_id, &path, &|| false) {
-                preview.tag = tags.remove(&preview.session_id);
-                preview.archived = archived.contains(&preview.session_id);
-                previews.push(preview);
-            }
-            // Tick progress for every file so the counter reaches `total`.
-            on_progress(i + 1, total);
-        }
-        Ok(previews)
-    }
-
-    /// Stream per-session previews to `emit`, one file's preview per
-    /// call, in the same latest-first order as
-    /// [`Self::list_session_previews`]. Each call carries a
-    /// single-element batch so a UI rendering the list incrementally
-    /// can append rows as the scan progresses rather than blocking on
-    /// the whole walk.
-    ///
-    /// Mirrors the failure tolerance of [`Self::list_session_previews`]: an
-    /// unreadable file is skipped (no row emitted), and a missing or unreadable
-    /// sessions directory emits nothing.
-    /// `cancel` is polled between files and periodically within a file so
-    /// the scan, which runs on the blocking pool and can't be aborted,
-    /// bails promptly once the consumer (the selector overlay) goes away.
-    /// It should be sticky: once it returns true the scan stops, and a file
-    /// interrupted mid-read is dropped rather than emitted as a partial row.
-    /// Pass `&|| false` for an uninterruptible scan.
-    pub fn list_session_previews_streaming(
-        &self,
-        cancel: &dyn Fn() -> bool,
-        emit: &mut dyn FnMut(Vec<SessionPreview>),
-    ) {
-        let candidates = match self.preview_candidates() {
-            Ok(c) => c,
-            Err(err) => {
-                tracing::debug!(
-                    "could not enumerate sessions dir {}: {err}",
-                    self.sessions_dir.display()
-                );
-                return;
-            }
-        };
-        // Read once up front rather than per file: both axes are a single
-        // directory read of `meta/` (see [`Self::tags_by_session`] and
-        // [`Self::archived_sessions`]), and the walk they annotate is the same
-        // snapshot of the store.
-        let mut tags = self.tags_by_session();
-        let archived = self.archived_sessions();
-        for (session_id, path) in candidates {
-            if cancel() {
-                break;
-            }
-            if let Some(mut preview) = read_preview(session_id, &path, cancel) {
-                // A mid-file cancel leaves `read_preview` with a partial
-                // count, so re-check before emitting: a sticky `cancel` is
-                // true here and we drop the partial rather than show a row
-                // with a truncated message count.
-                if cancel() {
-                    break;
-                }
-                preview.tag = tags.remove(&preview.session_id);
-                preview.archived = archived.contains(&preview.session_id);
-                emit(vec![preview]);
-            }
-        }
-    }
-
-    /// Enumerate the session files worth previewing, newest-first.
-    ///
-    /// Every session file is a candidate. Contents are opened only by the
-    /// per-file walk ([`read_session_preview_file`]).
-    fn preview_candidates(&self) -> Result<Vec<(String, PathBuf)>, ConversationError> {
-        Ok(self
-            .list_sessions()?
-            .into_iter()
-            .map(|metadata| {
-                let path = self.session_path(&metadata.session_id);
-                (metadata.session_id, path)
-            })
-            .collect())
-    }
-}
-
-/// Read a preview for `path`.
-///
-/// A read error (the file vanished or became unreadable between enumeration
-/// and the open) drops it from the preview listing.
-fn read_preview(
-    session_id: String,
-    path: &std::path::Path,
-    cancel: &dyn Fn() -> bool,
-) -> Option<SessionPreview> {
-    match read_session_preview_file(&session_id, path, cancel) {
-        Ok(preview) => Some(preview),
-        Err(err) => {
-            tracing::warn!("skipping unreadable session file {}: {err}", path.display());
-            None
-        }
     }
 }
 
@@ -726,10 +544,8 @@ impl SessionMetadata {
 /// Unlike [`SessionMetadata`] (which is purely a filesystem-stat
 /// payload), [`SessionPreview`] opens the JSONL and walks far enough
 /// to count `Message` entries and capture the first user-role text
-/// block. Producing one preview is therefore O(file size) per
-/// session; [`ConversationPersistence::list_session_previews`] streams
-/// progress through a callback so a UI rendering the list can show
-/// a `Loading X/Y` indicator while the walk completes.
+/// block. Producing one through [`ConversationPersistence::session_preview`]
+/// is therefore O(file size).
 #[derive(Debug, Clone)]
 pub struct SessionPreview {
     /// Filename stem of the session file (e.g.
@@ -773,16 +589,15 @@ pub struct SessionPreview {
     pub first_user_message: Option<String>,
     /// The label the session carries, `None` when it has none.
     ///
-    /// It lives in a tag sidecar rather than in the log, so the listing
-    /// fills it from one read of the sidecar directory (see
-    /// [`ConversationPersistence::list_session_previews_streaming`]) and the
-    /// per-file walk leaves it unset.
+    /// It lives in a tag sidecar rather than in the log, so
+    /// [`ConversationPersistence::session_preview`] fills it from the sidecar
+    /// and the per-file walk leaves it unset.
     pub tag: Option<String>,
     /// Whether the session is archived.
     ///
-    /// Its sidecar's existence is the bit, so the listing fills it from the
-    /// same directory read the labels come from and the per-file walk leaves
-    /// it false.
+    /// Its sidecar's existence is the bit, so
+    /// [`ConversationPersistence::session_preview`] fills it from a `stat` of
+    /// the sidecar and the per-file walk leaves it false.
     pub archived: bool,
 }
 
@@ -818,8 +633,8 @@ fn read_session_preview_file(
     for (lineno, line_res) in reader.lines().enumerate() {
         // Cooperative cancellation: this runs on the blocking pool, so we
         // poll `cancel` and stop reading once the consumer is gone. We may
-        // break with a partial count; the streaming caller re-checks
-        // `cancel` before emitting and drops it, so no truncated row shows.
+        // break with a partial count. `session_preview` re-checks `cancel`
+        // after the walk and drops it, so no truncated row shows.
         if lineno % crate::SCAN_CANCEL_CHECK_LINES == 0 && cancel() {
             break;
         }
@@ -876,7 +691,7 @@ fn read_session_preview_file(
         size_bytes,
         message_count,
         first_user_message,
-        // Not in the log: the listing fills these from the sidecars.
+        // Not in the log: `session_preview` fills these from the sidecars.
         tag: None,
         archived: false,
     })
@@ -932,8 +747,6 @@ fn first_user_text(content: &[UserContent]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use aj_agent::message::AgentMessage;
     use aj_models::types::{
         AssistantContent, AssistantMessage, Message, TextContent, ToolCall, ToolResultMessage,
@@ -1300,6 +1113,14 @@ mod tests {
         (dir, persistence)
     }
 
+    /// The uncancelled preview of `session_id`, which the test expects to exist.
+    fn preview_of(persistence: &ConversationPersistence, session_id: &str) -> SessionPreview {
+        persistence
+            .session_preview(session_id, &|| false)
+            .expect("read the preview")
+            .expect("an uncancelled read yields a preview")
+    }
+
     fn user_msg(text: &str) -> AgentMessage {
         AgentMessage::wire(Message::User(UserMessage::text(text)))
     }
@@ -1346,16 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn list_session_previews_returns_empty_when_dir_missing() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("missing");
-        let persistence = ConversationPersistence::new(path);
-        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
-        assert!(previews.is_empty());
-    }
-
-    #[test]
-    fn list_session_previews_captures_first_user_message_and_count() {
+    fn session_preview_captures_first_user_message_and_count() {
         let (_dir, persistence) = fixture();
 
         let mut log = ConversationLog::create(&persistence).expect("create");
@@ -1366,9 +1178,7 @@ mod tests {
         view.add_message(user_msg("follow-up"))
             .expect("append second user");
 
-        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
-        assert_eq!(previews.len(), 1);
-        let p = &previews[0];
+        let p = preview_of(&persistence, log.session_id());
         assert_eq!(p.session_id, log.session_id());
         assert_eq!(p.message_count, 3);
         assert_eq!(p.first_user_message.as_deref(), Some("hello world"));
@@ -1714,60 +1524,8 @@ mod tests {
             .expect("restore the read bit");
     }
 
-    #[test]
-    fn list_session_previews_emits_progress_callback_per_file() {
-        let (_dir, persistence) = fixture();
-        for i in 0..3 {
-            let mut log = ConversationLog::create(&persistence).expect("create");
-            append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
-            // Tiny sleep so the millisecond-resolution mint sees a
-            // fresh timestamp for each file.
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-
-        let progress = RefCell::new(Vec::<(usize, usize)>::new());
-        let previews = persistence
-            .list_session_previews(|loaded, total| progress.borrow_mut().push((loaded, total)))
-            .expect("list");
-        assert_eq!(previews.len(), 3);
-        let p = progress.into_inner();
-        assert_eq!(p, vec![(1, 3), (2, 3), (3, 3)]);
-    }
-
-    #[test]
-    fn list_session_previews_streaming_matches_batched_order() {
-        let (_dir, persistence) = fixture();
-        for i in 0..3 {
-            let mut log = ConversationLog::create(&persistence).expect("create");
-            append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-
-        // Each emit carries exactly one file's preview, in the same
-        // newest-first order the batched listing produces.
-        let mut batches = Vec::new();
-        persistence.list_session_previews_streaming(&|| false, &mut |b| batches.push(b));
-        assert!(
-            batches.iter().all(|b| b.len() == 1),
-            "expected one preview per batch, got {:?}",
-            batches.iter().map(Vec::len).collect::<Vec<_>>()
-        );
-        let streamed: Vec<String> = batches
-            .into_iter()
-            .flatten()
-            .map(|p| p.session_id)
-            .collect();
-        let batched: Vec<String> = persistence
-            .list_session_previews(|_, _| {})
-            .expect("list")
-            .into_iter()
-            .map(|p| p.session_id)
-            .collect();
-        assert_eq!(streamed, batched);
-    }
-
     /// A preview carries the label its session's sidecar holds, and only that
-    /// session's: the listing is one source for both the row and its label.
+    /// session's.
     #[test]
     fn previews_carry_the_labels_the_sidecars_hold() {
         let (_dir, persistence) = fixture();
@@ -1784,38 +1542,16 @@ mod tests {
             .write_tag(&ids[1], Some("fix-auth"))
             .expect("write");
 
-        let labelled = |previews: Vec<SessionPreview>| -> Vec<(String, Option<String>)> {
-            let mut rows: Vec<(String, Option<String>)> = previews
-                .into_iter()
-                .map(|preview| (preview.session_id, preview.tag))
-                .collect();
-            rows.sort();
-            rows
-        };
-        let expected = vec![
-            (ids[0].clone(), None),
-            (ids[1].clone(), Some("fix-auth".to_string())),
-            (ids[2].clone(), None),
-        ];
-        assert_eq!(
-            labelled(persistence.list_session_previews(|_, _| {}).expect("list")),
-            expected,
-        );
-
-        let mut streamed = Vec::new();
-        persistence.list_session_previews_streaming(&|| false, &mut |batch| {
-            streamed.extend(batch);
-        });
-        assert_eq!(
-            labelled(streamed),
-            expected,
-            "the streaming listing labels its rows the same way",
-        );
+        let labels: Vec<Option<String>> = ids
+            .iter()
+            .map(|id| preview_of(&persistence, id).tag)
+            .collect();
+        assert_eq!(labels, vec![None, Some("fix-auth".to_string()), None]);
     }
 
-    /// A preview carries the archived bit off the sidecar directory, on both
-    /// listings. It is the only place a local listing can learn the bit: the
-    /// per-file walk reads the log, which never held it.
+    /// A preview carries the archived bit off its session's sidecar. It is the
+    /// only place a preview can learn the bit: the per-file walk reads the
+    /// log, which never held it.
     #[test]
     fn previews_carry_the_archived_bit() {
         let (_dir, persistence) = fixture();
@@ -1828,54 +1564,15 @@ mod tests {
         }
         persistence.write_archived(&ids[1], true).expect("archive");
 
-        let filed = |previews: Vec<SessionPreview>| -> Vec<(String, bool)> {
-            let mut rows: Vec<(String, bool)> = previews
-                .into_iter()
-                .map(|preview| (preview.session_id, preview.archived))
-                .collect();
-            rows.sort();
-            rows
-        };
-        let expected = vec![(ids[0].clone(), false), (ids[1].clone(), true)];
-        assert_eq!(
-            filed(persistence.list_session_previews(|_, _| {}).expect("list")),
-            expected,
-        );
-
-        let mut streamed = Vec::new();
-        persistence.list_session_previews_streaming(&|| false, &mut |batch| {
-            streamed.extend(batch);
-        });
-        assert_eq!(
-            filed(streamed),
-            expected,
-            "the streaming listing files its rows the same way",
-        );
-    }
-
-    /// The labels come off one read of the sidecar directory, not off a
-    /// per-session question. A sidecar whose session has no log is therefore
-    /// still found, which a listing that asked each session for its tag could
-    /// not do, and which is what keeps an untagged store free.
-    #[test]
-    fn the_label_map_is_driven_by_the_sidecar_directory() {
-        let (_dir, persistence) = fixture();
-        assert!(
-            persistence.tags_by_session().is_empty(),
-            "an untagged store has no sidecar directory to read",
-        );
-
-        persistence
-            .write_tag("2024-01-01-00-00-00", Some("no-log-here"))
-            .expect("write");
-        assert_eq!(
-            persistence.tags_by_session().get("2024-01-01-00-00-00"),
-            Some(&"no-log-here".to_string()),
-        );
+        let archived: Vec<bool> = ids
+            .iter()
+            .map(|id| preview_of(&persistence, id).archived)
+            .collect();
+        assert_eq!(archived, vec![false, true]);
     }
 
     /// A sidecar body that reads as no label at all leaves the session
-    /// unlabelled rather than failing the listing, matching how the sidecar
+    /// unlabelled rather than failing the preview, matching how the sidecar
     /// read tolerates a hand-edited file.
     #[test]
     fn an_unusable_sidecar_leaves_the_session_unlabelled() {
@@ -1887,35 +1584,13 @@ mod tests {
         std::fs::create_dir_all(&meta).expect("meta");
         std::fs::write(meta.join(format!("{id}.tag")), "\n").expect("write");
 
-        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
-        assert_eq!(previews.len(), 1);
-        assert_eq!(previews[0].tag, None);
-    }
-
-    #[test]
-    fn list_session_previews_streaming_stops_when_cancelled() {
-        let (_dir, persistence) = fixture();
-        for i in 0..3 {
-            let mut log = ConversationLog::create(&persistence).expect("create");
-            append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-
-        // A predicate that trips after the first file leaves the walk: the
-        // between-files check must break before reading the rest.
-        let seen = std::cell::Cell::new(0usize);
-        let mut batches = Vec::new();
-        persistence.list_session_previews_streaming(&|| seen.get() > 0, &mut |b| {
-            seen.set(seen.get() + 1);
-            batches.push(b);
-        });
-        assert_eq!(batches.len(), 1, "cancel should stop after the first file");
+        assert_eq!(preview_of(&persistence, &id).tag, None);
     }
 
     #[test]
     fn read_session_preview_file_stops_mid_file() {
         // A single file larger than the in-file poll interval, so the check
-        // inside the read loop (not the between-files check) is what bails.
+        // inside the read loop is what bails.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("2024-01-01-00-00-00.jsonl");
         let n = crate::SCAN_CANCEL_CHECK_LINES * 3;
@@ -1959,16 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn list_session_previews_streaming_missing_dir_emits_nothing() {
-        let dir = TempDir::new().unwrap();
-        let persistence = ConversationPersistence::new(dir.path().join("missing"));
-        let mut batches = Vec::new();
-        persistence.list_session_previews_streaming(&|| false, &mut |b| batches.push(b));
-        assert!(batches.is_empty());
-    }
-
-    #[test]
-    fn list_session_previews_ignores_non_user_first_messages() {
+    fn session_preview_ignores_non_user_first_messages() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         // First message is a tool_result (not a user prompt). The
@@ -1979,42 +1645,24 @@ mod tests {
         )))
         .expect("append");
 
-        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
-        assert_eq!(previews.len(), 1);
-        assert!(previews[0].first_user_message.is_none());
-        assert_eq!(previews[0].message_count, 1);
+        let p = preview_of(&persistence, log.session_id());
+        assert!(p.first_user_message.is_none());
+        assert_eq!(p.message_count, 1);
     }
 
+    /// A log that is not valid UTF-8 still yields a preview, with nothing read
+    /// from it, rather than failing.
     #[test]
-    fn list_session_previews_keeps_malformed_sessions_and_counts_all_files() {
+    fn session_preview_keeps_a_malformed_session() {
         let (_dir, persistence) = fixture();
         let sessions_dir = persistence.sessions_dir().to_path_buf();
         std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
         std::fs::write(sessions_dir.join("old.jsonl"), [0xff, 0xfe, 0xff])
             .expect("write malformed session");
 
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        append_user_then_assistant(&mut log, "hello", "hi");
-
-        let progress = RefCell::new(Vec::<(usize, usize)>::new());
-        let previews = persistence
-            .list_session_previews(|loaded, total| progress.borrow_mut().push((loaded, total)))
-            .expect("list");
-
-        assert_eq!(previews.len(), 2, "every session yields a row");
-        let malformed = previews
-            .iter()
-            .find(|preview| preview.session_id == "old")
-            .expect("the malformed session");
+        let malformed = preview_of(&persistence, "old");
         assert_eq!(malformed.message_count, 0);
         assert!(malformed.first_user_message.is_none());
-        assert!(
-            previews
-                .iter()
-                .any(|preview| preview.session_id == log.session_id())
-        );
-        let progress = progress.into_inner();
-        assert_eq!(progress.last(), Some(&(2, 2)), "both files tick progress");
     }
 
     #[test]
@@ -2071,22 +1719,20 @@ mod tests {
     }
 
     #[test]
-    fn list_session_previews_populates_created_at_from_session_id() {
+    fn session_preview_populates_created_at_from_session_id() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hi", "ok");
         let session_id = log.session_id().to_string();
 
-        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
-        assert_eq!(previews.len(), 1);
-        let p = &previews[0];
+        let p = preview_of(&persistence, &session_id);
         let expected =
             super::parse_session_id_created_at(&session_id).expect("freshly-minted id parses");
         assert_eq!(p.created_at, expected);
     }
 
     #[test]
-    fn list_session_previews_counts_tool_result_entries() {
+    fn session_preview_counts_tool_result_entries() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         {
@@ -2107,14 +1753,12 @@ mod tests {
             .expect("tr");
         }
 
-        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
-        assert_eq!(previews.len(), 1);
         // Three wire-level messages: user, assistant, tool_result.
-        assert_eq!(previews[0].message_count, 3);
+        assert_eq!(preview_of(&persistence, log.session_id()).message_count, 3);
     }
 
     #[test]
-    fn list_session_previews_falls_back_to_modified_when_no_message_entries() {
+    fn session_preview_falls_back_to_modified_when_no_message_entries() {
         // Legacy on-disk shape: a session file containing only a
         // SystemPrompt entry, with no `Message` entries. New code
         // can't produce this layout (the system prompt buffers and
@@ -2138,15 +1782,13 @@ mod tests {
         });
         std::fs::write(&path, format!("{line}\n")).expect("write legacy file");
 
-        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
-        assert_eq!(previews.len(), 1);
-        let p = &previews[0];
+        let p = preview_of(&persistence, session_id);
         assert_eq!(p.message_count, 0);
         assert_eq!(p.last_message_at, p.modified);
     }
 
     #[test]
-    fn list_session_previews_uses_largest_message_timestamp() {
+    fn session_preview_uses_largest_message_timestamp() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "world");
@@ -2155,9 +1797,7 @@ mod tests {
         view.add_message(user_msg("follow-up"))
             .expect("append user2");
 
-        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
-        assert_eq!(previews.len(), 1);
-        let p = &previews[0];
+        let p = preview_of(&persistence, log.session_id());
         let min_expected = p.created_at + chrono::Duration::milliseconds(10);
         assert!(
             p.last_message_at >= min_expected,
