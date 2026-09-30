@@ -1207,8 +1207,6 @@ mod tests {
             id: id.to_string(),
             live: true,
             working: false,
-            queued: aj_wire::QueueCounts::default(),
-            tasks: 0,
             last_seq: Some(2),
             last_activity: Utc
                 .timestamp_opt(1_800_000_000, 0)

@@ -784,7 +784,8 @@ async fn settle(harness: &Harness, session: &str, stream: &mut Attachment) -> Ve
                 .sessions
                 .iter()
                 .find(|entry| entry.id == session)
-                .is_some_and(|entry| !entry.working && entry.tasks == 0);
+                .is_some_and(|entry| !entry.working)
+                && running_tasks(&harness.host, session).await == 0;
             if quiet {
                 out.extend(drained(stream));
                 return;
@@ -3610,6 +3611,18 @@ async fn summary(host: &SessionHost, session: &str) -> Option<aj_wire::SessionSu
     sessions.into_iter().find(|entry| entry.id == session)
 }
 
+/// How many of the session's background tasks the host's task table reports
+/// as still running.
+async fn running_tasks(host: &SessionHost, session: &str) -> usize {
+    host.tasks(session)
+        .await
+        .expect("task table")
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Running)
+        .count()
+}
+
 /// Panic unless every row carries a position exactly when it is live.
 fn assert_rows_well_formed(sessions: &[aj_wire::SessionSummary]) {
     for row in sessions {
@@ -3682,7 +3695,7 @@ async fn an_idle_unattached_session_is_released() {
         released.last_activity,
         live.last_activity,
     );
-    assert!(!released.working && released.tasks == 0);
+    assert!(!released.working);
     let lock = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
         .expect("try_acquire")
         .expect("the release freed the session's lock");
@@ -3983,8 +3996,7 @@ async fn live_work_and_queued_messages_hold_a_session_live() {
         .command(&session, Command::Queue(QueueOp::Clear))
         .await
         .expect("clearing the queue");
-    let released = until_released(&harness.host, &session).await;
-    assert_eq!(released.queued.follow_up, 0);
+    until_released(&harness.host, &session).await;
     harness.host.shutdown().await;
 }
 
@@ -4167,10 +4179,7 @@ async fn an_undelivered_task_notice_holds_a_session_live() {
     drop(client);
     stays_live(&harness.host, &session, 2).await;
     assert_eq!(
-        summary(&harness.host, &session)
-            .await
-            .expect("listed")
-            .tasks,
+        running_tasks(&harness.host, &session).await,
         0,
         "the task itself is finished: the queued notice is what holds it",
     );
@@ -5812,10 +5821,29 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
     }
     let state = client.canonical();
     let (box_status, box_finished) = sub_box(&state, 1);
-    let details = harness.host.task(&session, task).await.expect("task read");
+    let task_status = harness
+        .host
+        .tasks(&session)
+        .await
+        .expect("task table")
+        .tasks
+        .into_iter()
+        .find(|row| row.id == task)
+        .expect("the task is still in the table")
+        .status;
+    // The report reaches the model through the task tool, which reads it
+    // from the registry.
+    let (_, read) = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live")
+        .task_registry
+        .read(task)
+        .expect("the task is still registered");
     let ending = DetachedEnding {
-        task: details.status,
-        task_report: details.report,
+        task: task_status,
+        task_report: read.report,
         box_status,
         box_report: sub_report(&state, 1),
         box_finished,
@@ -6986,20 +7014,10 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
     let opening = bounded("the attach opening state", stream.recv())
         .await
         .expect("the block opens");
-    let (epoch, boundary) = match &opening {
-        Frame::State {
-            epoch, last_seq, ..
-        } => (epoch.clone(), *last_seq),
+    let epoch = match &opening {
+        Frame::State { epoch, .. } => epoch.clone(),
         other => panic!("attach block opened with {other:?}"),
     };
-    assert!(
-        checkpoint_seq <= boundary,
-        "the attach snapshot includes the checkpoint it must de-duplicate",
-    );
-    assert!(
-        later_seq <= boundary,
-        "the same snapshot includes the later assistant pair",
-    );
     let _ = client.apply(&mut chat, opening);
 
     // Reading only the opening frame leaves the capacity-one block producer
@@ -7024,6 +7042,20 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         matches!(frame, Frame::CaughtUp { .. })
     })
     .await;
+    let Some(Frame::CaughtUp {
+        last_seq: boundary, ..
+    }) = block.last()
+    else {
+        panic!("the block ends with its caught_up: {block:?}");
+    };
+    assert!(
+        checkpoint_seq <= *boundary,
+        "the attach snapshot includes the checkpoint it must de-duplicate",
+    );
+    assert!(
+        later_seq <= *boundary,
+        "the same snapshot includes the later assistant pair",
+    );
     for frame in &block {
         let _ = client.apply(&mut chat, frame.clone());
     }
@@ -9514,25 +9546,15 @@ async fn a_new_subscriber_is_served_a_directory_the_others_already_have() {
 
 /// A `list` frame's status fields are what the sidebar's glyphs and the
 /// client-side "needs attention" derivation hang on, so each one
-/// is asserted away from its default: a turn in flight, a pending
-/// follow-up, a live background task, and a last-activity stamp that moved.
+/// is asserted away from its default: a turn in flight, a last-activity stamp
+/// that moved, and a durable position.
 #[tokio::test]
-async fn list_frames_report_working_queued_and_live_tasks() {
+async fn list_frames_report_a_working_session() {
     let harness = Harness::with_provider(scripted(
-        vec![
-            calling(
-                "backgrounding it",
-                "call-bash",
-                "bash",
-                serde_json::json!({"command": "sleep 30", "run_in_background": true,
-                                   "description": "sleep"}),
-            ),
-            finalized_text_message("started it"),
-            finalized_text_message(
-                "an answer streamed one character at a time, long enough that the \
-                 directory tick fires several times while the turn runs",
-            ),
-        ],
+        vec![finalized_text_message(
+            "an answer streamed one character at a time, long enough that the \
+             directory tick fires several times while the turn runs",
+        )],
         1,
         Duration::from_millis(10),
     ));
@@ -9550,24 +9572,16 @@ async fn list_frames_report_working_queued_and_live_tasks() {
     })
     .await;
 
-    // The first turn leaves a background task behind, which outlives it.
-    harness.prompt(&session, "background something").await;
-    until_idle(&mut stream).await;
-
     let before = chrono::Utc::now();
     harness.prompt(&session, "now answer at length").await;
-    // Busy, so this queues instead of running.
-    harness.prompt(&session, "and this one later").await;
 
     // The turn keeps events flowing, so the directory tick keeps publishing
-    // while all three conditions hold at once.
+    // while it runs.
     let frames = frames_until(&mut stream, "a list frame for the busy session", |frame| {
         matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == session
                 && entry.live
-                && entry.working
-                && entry.queued.follow_up == 1
-                && entry.tasks == 1))
+                && entry.working))
     })
     .await;
     let summary = frames
@@ -9580,10 +9594,6 @@ async fn list_frames_report_working_queued_and_live_tasks() {
             _ => None,
         })
         .expect("filtered above");
-    assert_eq!(
-        summary.queued.steering, 0,
-        "a follow-up is not counted as steering: {summary:?}",
-    );
     assert!(
         summary.last_activity >= before,
         "the turn's appends moved the last-activity stamp: {summary:?}",
@@ -9593,13 +9603,6 @@ async fn list_frames_report_working_queued_and_live_tasks() {
         "and its durable position",
     );
 
-    // Withdraw the follow-up so no wake asks the exhausted script for one
-    // more inference.
-    harness
-        .host
-        .command(&session, Command::Queue(QueueOp::Clear))
-        .await
-        .expect("clear");
     until_idle(&mut stream).await;
     harness.host.shutdown().await;
 }
@@ -10632,53 +10635,6 @@ async fn the_reads_answer_tasks_tree_and_hello() {
         hello.host_id,
         "the host id is persisted in the session store",
     );
-    revived.host.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_task_detail_read_omits_host_paths_and_cold_tasks_are_unknown() {
-    let harness = Harness::new(vec![finalized_text_message("recorded")]);
-    let session = harness.create().await;
-    let mut client = Client::attach(&harness.host, &session).await;
-    harness.prompt(&session, "record this session").await;
-    client.pump_until_idle().await;
-    drop(client);
-    let handles = harness.host.local_handles(&session).await.expect("handles");
-    let (task, _cancel) = handles.task_registry.register_unowned_for_test(
-        AgentId::Main,
-        "call-1".into(),
-        TaskKind::Agent {
-            agent_id: 1,
-            task: "inspect".into(),
-        },
-        "inspect".into(),
-        Arc::new(FixedTaskOutput),
-    );
-    handles
-        .task_registry
-        .set_status(task, TaskStatus::Exited(Some(0)));
-
-    let details = harness.host.task(&session, task).await.expect("task read");
-    assert_eq!(details.status, TaskStatus::Exited(Some(0)));
-    assert_eq!(details.stdout_tail, "stdout tail");
-    assert_eq!(details.stderr_total_bytes, 12);
-    assert_eq!(details.report.as_deref(), Some("agent report"));
-    let encoded = serde_json::to_value(details).expect("task details serialize");
-    assert!(
-        encoded.get("spill_path").is_none(),
-        "a host path never crosses the transport boundary",
-    );
-    assert!(matches!(
-        harness.host.task(&session, task + 1).await,
-        Err(HostError::UnknownTask(_))
-    ));
-
-    harness.host.shutdown().await;
-    let revived = harness.revive(Vec::new());
-    assert!(matches!(
-        revived.host.task(&session, task).await,
-        Err(HostError::UnknownTask(_))
-    ));
     revived.host.shutdown().await;
 }
 

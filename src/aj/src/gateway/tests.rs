@@ -36,7 +36,7 @@ use super::*;
 use crate::gateway::naming::SessionAddress;
 use crate::remote::tests::{
     FakeWhois, HostHandles, addr, bounded, canned_server, counted_protocol_peer, history_event,
-    history_peer, history_update, history_value, scripted, scripted_host,
+    history_peer, history_update, history_updates, history_value, scripted, scripted_host,
 };
 use crate::remote::{IdentityGate, RemoteClient, RemoteCommand, RemoteEvents, RemoteServer};
 
@@ -2641,7 +2641,7 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
     assert_eq!(code, "host_unreachable");
     let history = configured
         .client
-        .prompt_history(None)
+        .stream_prompt_history(None, history_updates())
         .await
         .expect("all history");
     assert!(history.prompts.is_empty());
@@ -2661,7 +2661,7 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
     );
     let history = configured
         .client
-        .prompt_history(None)
+        .stream_prompt_history(None, history_updates())
         .await
         .expect("all history");
     assert!(history.prompts.is_empty());
@@ -2719,7 +2719,7 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
     assert!(recorded.contains("remembered"));
     let history = remembered
         .client
-        .prompt_history(None)
+        .stream_prompt_history(None, history_updates())
         .await
         .expect("all history");
     assert!(history.prompts.is_empty());
@@ -2740,7 +2740,7 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
     );
     let history = remembered
         .client
-        .prompt_history(None)
+        .stream_prompt_history(None, history_updates())
         .await
         .expect("all history");
     assert!(history.prompts.is_empty());
@@ -2753,7 +2753,7 @@ async fn protocol_one_hosts_never_become_reachable_or_receive_requests() {
 }
 
 #[tokio::test]
-async fn prompt_history_stream_workspace_forwards_without_buffering_and_cancels_upstream() {
+async fn prompt_history_workspace_forwards_without_buffering_and_cancels_upstream() {
     for cancel in [false, true] {
         let mut peer = history_peer("owner", "owner").await;
         let fixture = Fixture::over(
@@ -2813,7 +2813,7 @@ async fn prompt_history_stream_workspace_forwards_without_buffering_and_cancels_
 }
 
 #[tokio::test]
-async fn prompt_history_stream_all_merges_latest_snapshots_in_label_then_id_order() {
+async fn prompt_history_all_merges_latest_snapshots_in_label_then_id_order() {
     // Enrollment, snapshot arrival, and completion order all oppose merge order.
     let mut z = history_peer("first-id", "zulu").await;
     let mut b = history_peer("b", "alpha").await;
@@ -2876,7 +2876,7 @@ async fn prompt_history_stream_all_merges_latest_snapshots_in_label_then_id_orde
 }
 
 #[tokio::test]
-async fn prompt_history_stream_all_retains_failed_and_timed_out_host_snapshots() {
+async fn prompt_history_all_retains_failed_and_timed_out_host_snapshots() {
     let mut failed = history_peer("failed-id", "broken").await;
     let mut stalled = history_peer("stalled-id", "slow").await;
     let fixture = Fixture::tuned(
@@ -2950,7 +2950,7 @@ async fn prompt_history_stream_all_retains_failed_and_timed_out_host_snapshots()
 }
 
 #[tokio::test]
-async fn prompt_history_stream_all_cancellation_releases_every_upstream() {
+async fn prompt_history_all_cancellation_releases_every_upstream() {
     let mut a = history_peer("a", "a").await;
     let mut b = history_peer("b", "b").await;
     let fixture = Fixture::over(
@@ -5689,7 +5689,6 @@ async fn a_re_attach_after_a_withdrawal_is_refused_for_that_session_alone() {
     );
     let Some(Frame::Error {
         session,
-        epoch,
         code,
         message,
         ..
@@ -5701,10 +5700,6 @@ async fn a_re_attach_after_a_withdrawal_is_refused_for_that_session_alone() {
     };
     assert_eq!(session, "leaving:s-1", "named as the client named it");
     assert_eq!(code, "unknown_session");
-    assert_eq!(
-        *epoch, None,
-        "nothing resolved, so no epoch was ever minted for it here",
-    );
     assert!(
         message.contains("no host leaving is enrolled here"),
         "the refusal says why: {message}",
@@ -6726,8 +6721,6 @@ fn fake_row(id: &str) -> SessionSummary {
         id: id.to_string(),
         live: true,
         working: false,
-        queued: aj_wire::QueueCounts::default(),
-        tasks: 0,
         last_seq: Some(1),
         last_activity: chrono::DateTime::UNIX_EPOCH,
         tag: None,
@@ -6741,7 +6734,7 @@ fn fake_row(id: &str) -> SessionSummary {
 /// The frames of one attach block, as a host writes them.
 fn block(session: &str, epoch: &str, last_seq: u64) -> Vec<String> {
     vec![
-        state_frame(session, epoch, last_seq),
+        state_frame(session, epoch),
         caught_up_frame(session, epoch, last_seq),
     ]
 }
@@ -6757,7 +6750,7 @@ fn block(session: &str, epoch: &str, last_seq: u64) -> Vec<String> {
 /// block did not fit.
 fn deep_block(session: &str, epoch: &str, backfilled: u64) -> Vec<String> {
     let payload = "x".repeat(32768);
-    let mut frames = vec![state_frame(session, epoch, backfilled)];
+    let mut frames = vec![state_frame(session, epoch)];
     frames.extend(
         (1..=backfilled).map(|entry| warning_frame(session, epoch, &format!("{entry}:{payload}"))),
     );
@@ -6766,7 +6759,7 @@ fn deep_block(session: &str, epoch: &str, backfilled: u64) -> Vec<String> {
 }
 
 /// The `state` frame an attach block opens with.
-fn state_frame(session: &str, epoch: &str, last_seq: u64) -> String {
+fn state_frame(session: &str, epoch: &str) -> String {
     serde_json::to_string(&Frame::State {
         session: session.to_string(),
         epoch: epoch.to_string(),
@@ -6774,7 +6767,6 @@ fn state_frame(session: &str, epoch: &str, last_seq: u64) -> String {
         settings: fake_settings(),
         oracle_settings: None,
         credential_warning: None,
-        last_seq,
     })
     .expect("a state frame")
 }
@@ -6809,7 +6801,6 @@ fn warning_frame(session: &str, epoch: &str, text: &str) -> String {
 fn error_frame(session: &str, code: &str, message: &str) -> String {
     serde_json::to_string(&Frame::Error {
         session: session.to_string(),
-        epoch: None,
         code: code.to_string(),
         message: message.to_string(),
     })
@@ -7458,7 +7449,7 @@ async fn an_unknown_endpoint_answers_404() {
 
     let response = fixture
         .http
-        .get(format!("{}/v1/vms", fixture.server.url()))
+        .get(format!("{}/v1/no-such-endpoint", fixture.server.url()))
         .send()
         .await
         .expect("the request");

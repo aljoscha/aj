@@ -106,10 +106,9 @@ pub(crate) struct SessionStatus {
     /// Not the log's own `last_seq`: the driver advances this as it publishes,
     /// so it lags an append whose event has not reached the driver's event arm
     /// yet. The two marks share a name and surface differently: `caught_up`
-    /// and an attach block's `state` frame carry the log's mark (read under
-    /// its lock, so it covers everything on disk), while `list` frames and an
-    /// on-change `state` frame carry this one. A client is never harmed by the
-    /// lag, since a `list` position is glyph data and never a cursor.
+    /// carries the log's mark (read under its lock, so it covers everything on
+    /// disk), while `list` frames carry this one. A client is never harmed by
+    /// the lag, since a `list` position is glyph data and never a cursor.
     pub(crate) last_seq: u64,
     /// Whether the **main** agent has a turn in flight. Says nothing about
     /// sub-agents, whose liveness travels through lifecycle events.
@@ -186,7 +185,6 @@ impl SessionStatus {
             settings: self.settings.clone(),
             oracle_settings: self.oracle_settings.clone(),
             credential_warning: None,
-            last_seq: self.last_seq,
         }
     }
 }

@@ -99,13 +99,15 @@ fn durable(seq: u64) -> Frame {
     frame
 }
 
-fn state(last_seq: u64) -> Frame {
+/// A `state` snapshot, told apart from its neighbours by `revision`, which it
+/// carries as the context window.
+fn state(revision: u64) -> Frame {
     Frame::State {
         session: "left:s-1".into(),
         epoch: "epoch-1".into(),
         working: true,
         settings: AgentSettings {
-            context_window: 0,
+            context_window: revision,
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),
@@ -115,7 +117,6 @@ fn state(last_seq: u64) -> Frame {
         },
         oracle_settings: None,
         credential_warning: None,
-        last_seq,
     }
 }
 
@@ -175,7 +176,6 @@ fn snapshots() -> Vec<Frame> {
         sessions: vec![],
         hosts: vec![],
     });
-    frames.push(Frame::Vms { vms: vec![] });
     frames
 }
 
@@ -241,7 +241,6 @@ fn snapshots_drop_but_durable_reliable_and_unknown_frames_evict() {
         },
         Frame::Error {
             session: "s".into(),
-            epoch: None,
             code: "unknown_session".into(),
             message: "no session here".into(),
         },

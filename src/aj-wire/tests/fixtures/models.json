@@ -1,7 +1,7 @@
 {
   "hello": {
     "protocol": 1,
-    "capabilities": ["events", "vms"],
+    "capabilities": ["events", "task_output"],
     "app_version": "0.1.0",
     "host_id": "host-1",
     "working_directory": "/home/dev/work/project",
@@ -13,8 +13,6 @@
         "id": "session-1",
         "live": true,
         "working": false,
-        "queued": { "steering": 0, "follow_up": 1 },
-        "tasks": 0,
         "last_seq": 7,
         "last_activity": "2026-08-03T12:00:00Z",
         "tag": "fix-auth",
@@ -26,8 +24,6 @@
         "id": "session-0",
         "live": false,
         "working": false,
-        "queued": { "steering": 0, "follow_up": 0 },
-        "tasks": 0,
         "last_activity": "2026-08-02T09:30:00Z",
         "unreachable": false
       }
@@ -91,26 +87,6 @@
         "connected": false,
         "sessions": 0,
         "error": "connection refused"
-      }
-    ]
-  },
-  "vms": {
-    "vms": [
-      {
-        "id": "vm-2",
-        "name": "starting-worker",
-        "state": "provisioning"
-      },
-      {
-        "id": "vm-3",
-        "name": "failed-worker",
-        "state": "failed",
-        "message": "guest did not become ready"
-      },
-      {
-        "id": "vm-4",
-        "name": "old-worker",
-        "state": "destroyed"
       }
     ]
   },

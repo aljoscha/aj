@@ -566,7 +566,6 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use aj_wire::QueueCounts;
     use chrono::Duration;
 
     use super::*;
@@ -701,8 +700,6 @@ mod tests {
             id: id.to_string(),
             live: false,
             working: false,
-            queued: QueueCounts::default(),
-            tasks: 0,
             last_seq: None,
             last_activity: Utc::now() - age,
             tag: tag.map(str::to_string),

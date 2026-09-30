@@ -310,16 +310,6 @@ impl RemoteClient {
         self.get(&format!("/v1/sessions/{session}/tasks")).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn task(
-        &self,
-        session: &str,
-        task: TaskId,
-    ) -> Result<aj_wire::TaskDetails, RemoteError> {
-        self.get(&format!("/v1/sessions/{session}/tasks/{task}"))
-            .await
-    }
-
     pub(crate) async fn task_output(
         &self,
         session: &str,
@@ -367,25 +357,6 @@ impl RemoteClient {
             .http
             .get(format!("{}/v1/previews", self.base))
             .query(&query)
-            .timeout(REQUEST_TIMEOUT * 2)
-            .send()
-            .await?;
-        decode(refusal(response).await?).await
-    }
-
-    pub(crate) async fn prompt_history(
-        &self,
-        session: Option<&str>,
-    ) -> Result<aj_wire::PromptHistory, RemoteError> {
-        let path = match session {
-            Some(session) => format!("/v1/sessions/{session}/prompt-history"),
-            None => "/v1/prompt-history".to_string(),
-        };
-        // Leave room for a gateway's bounded parallel reads to return partial
-        // results before this client gives up on the entire response.
-        let response = self
-            .http
-            .get(format!("{}{path}", self.base))
             .timeout(REQUEST_TIMEOUT * 2)
             .send()
             .await?;

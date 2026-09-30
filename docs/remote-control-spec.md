@@ -193,7 +193,7 @@ internally tagged with `kind`:
   the host's runtime fallback or validation. It contains no environment values,
   credentials, or live-only thinking display. Live delivery and backfill supply
   the same context, including across compaction. Older hosts may omit the field.
-- `state`: `{kind, session, epoch, working, settings, oracle_settings?, last_seq}`.
+- `state`: `{kind, session, epoch, working, settings, oracle_settings?}`.
   `working` says whether the session's **main agent** has a turn in
   flight, `settings` is the active `AgentSettings` (`provider`,
   `model_id`, `thinking`, `thinking_display`, `speed`, `verbosity`, `context_window`),
@@ -211,9 +211,8 @@ internally tagged with `kind`:
   replaces that child's footer settings without clearing its measured usage.
   Replay and synthesized continuation starts preserve these changes. Main's
   footer settings come from `state`, not historical settings entries.
-  `last_seq` is the durable high-water mark. Sent at the start of every
-  attach block, before the backfill, and whenever `working` or
-  `settings` or `oracle_settings` changes, never for `last_seq` alone. The host publishes no
+  Sent at the start of every attach block, before the backfill, and
+  whenever `working` or `settings` or `oracle_settings` changes. The host publishes no
   "restored session" notice, a client renders one from the first
   attach's `state`. `working` applies on every `state` frame and
   self-heals a spinner left running by a missed `AgentEnd`. It says
@@ -225,7 +224,7 @@ internally tagged with `kind`:
   directory (section 5.8). `hosts` is present only from a gateway
   (section 6.1). Cumulative, the latest frame supersedes all earlier
   ones.
-- `error`: `{kind, session, epoch?, code, message}`.
+- `error`: `{kind, session, code, message}`.
   The error envelope (section 5.6) as a session-scoped stream frame.
   Every per-session resolution failure travels this way with its own
   code (`unknown_session`, `locked`, `persistence_failed`, ...). Only
@@ -578,9 +577,6 @@ side's limitation. Neither side's values fall back to the other's.
   label, status, started_at}]}`, the background task table with
   wall-clock timestamps. Clients replace their task table with this
   after `caught_up`, and ignore `TaskOutput` for unknown task ids.
-- `GET /v1/sessions/{id}/tasks/{task_id}`: `{id, status, stdout_tail,
-  stderr_tail, stdout_total_bytes, stderr_total_bytes, report?}`. Rolling
-  tails and an optional agent report, not the complete output.
 - `GET /v1/sessions/{id}/tasks/{task_id}/output?offset=N`: `TaskOutput` in
   `aj-wire`, `{id, status, offset, total_bytes, bytes}`. Reads the retained
   task's full interleaved spill output at the required unsigned byte offset.
@@ -674,13 +670,14 @@ side's limitation. Neither side's values fall back to the other's.
   hosts' rows. Owning hosts are read concurrently within one batch deadline,
   so stalled hosts do not delay healthy reads behind timeout waves.
   Capability `session_previews` (section 5.10).
-- `GET /v1/sessions/{id}/prompt-history`: submitted prompts from the focused
-  session's workspace on its owning host. A gateway forwards this read to that
-  host, not to the client's workspace.
-- `GET /v1/prompt-history`: submitted prompts from every workspace in the host's
-  sessions store. A gateway reads adopted, connected hosts concurrently and merges
-  their replies. Other enrolled hosts are named partial failures without receiving
-  a history request. Both history endpoints return `PromptHistory` in `aj-wire`:
+- `GET /v1/sessions/{id}/prompt-history/stream`: submitted prompts from the
+  focused session's workspace on its owning host. A gateway forwards this read
+  to that host, not to the client's workspace.
+- `GET /v1/prompt-history/stream`: submitted prompts from every workspace in the
+  host's sessions store. A gateway reads adopted, connected hosts concurrently
+  and merges their replies. Other enrolled hosts are named partial failures
+  without receiving a history request. Both history endpoints produce
+  `PromptHistory` values in `aj-wire`:
   `{prompts: [{text, project, timestamp}], incomplete: [{host, message}]}`.
   Text is the full trimmed prompt, joining user text blocks with newlines.
   Only top-level user-thread messages contribute, across all branches and
@@ -697,10 +694,9 @@ side's limitation. Neither side's values fall back to the other's.
   applied after ranking and deduplication, not by truncating a directory walk.
   A gateway keeps healthy results when another host fails or lacks the endpoint
   and names failures in `incomplete`. Reads do not materialize sessions or alter
-  their state. Capability `prompt_history` (section 5.10).
-- `GET /v1/sessions/{id}/prompt-history/stream` and
-  `GET /v1/prompt-history/stream`: finite SSE reads with the same scope and
-  ranking as the JSON resources. Named `snapshot` events carry complete
+  their state.
+
+  Both are finite SSE reads. Named `snapshot` events carry complete
   replacement `PromptHistory` values, coalesced as files finish scanning.
   A terminal `complete` event carries the final value, even when empty or
   unchanged. A terminal `error` event carries `{code, message}` and leaves
@@ -710,7 +706,8 @@ side's limitation. Neither side's values fall back to the other's.
   each host's latest snapshot as it arrives, ordered by host label and identity
   to break equal-time ties independently of arrival order. Slow hosts do not
   block healthy results. Failed or timed-out hosts retain their last available
-  prompts and contribute a named failure. Capability `prompt_history_stream`.
+  prompts and contribute a named failure. Capability `prompt_history`
+  (section 5.10).
 - `GET /v1/sessions/{id}/env`: a JSON object mapping strings to strings,
   the full environment map selected by the active branch. Values are
   unredacted on the trusted control port. Export-only redaction does not
@@ -742,9 +739,8 @@ Per-session row fields in `list` frames and `GET /v1/sessions`:
 - `id`: the session id (section 5.2).
 - `live`: materialized in the host, vs on-disk only.
 - `working`: the main agent has a turn in flight (section 5.3). Live
-  background sub-agents surface through `tasks`, not here.
-- `queued`: `{steering, follow_up}` counts of pending messages.
-- `tasks`: count of live background tasks.
+  background sub-agents surface through the tasks read (section 5.7), not
+  here.
 - `last_activity`: host-clock timestamp on every row. For a live row it
   is the last durable event the host observed, and a release hands that
   stamp to the cold row. The log's mtime stands in only where the host
@@ -871,8 +867,7 @@ Both ends of every connection are aj, but versions skew. Rules:
   | `provider_usage_reset` | `POST /v1/sessions/{id}/usage/reset` | hosts |
   | `session_info` | `GET /v1/sessions/{id}/info` | hosts |
   | `session_previews` | `GET /v1/previews` | hosts and gateways |
-  | `prompt_history` | Workspace and All prompt-history reads | hosts and gateways |
-  | `prompt_history_stream` | finite SSE Workspace and All prompt-history reads | hosts and gateways |
+  | `prompt_history` | finite SSE Workspace and All prompt-history reads | hosts and gateways |
   | `credentials` | `GET` and `POST /v1/sessions/{id}/credentials` (section 5.12) | hosts |
   | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
   | `host_config` | `GET` and `POST /v1/sessions/{id}/config`, `GET /v1/sessions/{id}/models`, and `settings.persist` | hosts |

@@ -87,7 +87,7 @@ impl Client {
         // projected event can carry: a bracket whose `AgentEnd` fell into
         // the disconnected window would otherwise leave a spinner running
         // forever. This host is idle, the turn having finished.
-        self.apply(state_frame(epoch, log.last_seq(), false));
+        self.apply(state_frame(epoch, false));
         for tagged in backfill.by_ref() {
             self.apply(event_frame(epoch, &tagged));
         }
@@ -136,7 +136,7 @@ fn event_frame(epoch: &str, tagged: &TaggedEvent) -> Frame {
     }
 }
 
-fn state_frame(epoch: &str, last_seq: u64, working: bool) -> Frame {
+fn state_frame(epoch: &str, working: bool) -> Frame {
     Frame::State {
         session: SESSION.to_string(),
         epoch: epoch.to_string(),
@@ -144,7 +144,6 @@ fn state_frame(epoch: &str, last_seq: u64, working: bool) -> Frame {
         settings: scripted_settings(),
         oracle_settings: None,
         credential_warning: None,
-        last_seq,
     }
 }
 

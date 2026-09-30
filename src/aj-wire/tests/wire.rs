@@ -7,10 +7,10 @@ use aj_wire::{
     CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame, DirectoryHost, EmptyRequest,
     EnrollHostRequest, EnvRequest, ErrorResponse, Frame, HeadRequest, Hello, HostList,
     HostNameError, HostSource, HostSummary, MAX_HOST_NAME_BYTES, MergedDirectory, ModelSelection,
-    PROTOCOL_VERSION, PromptInput, PromptRequest, QueueCounts, QueueOperation, QueueOutcome,
-    QueueRequest, QueueState, RawObject, RequestBody, SessionCreated, SessionList, SessionSettings,
-    SessionSummary, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
-    VmList, decode_request, normalize_host_name,
+    PROTOCOL_VERSION, PromptInput, PromptRequest, QueueOperation, QueueOutcome, QueueRequest,
+    QueueState, RawObject, RequestBody, SessionCreated, SessionList, SessionSettings,
+    SessionSummary, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskTable,
+    decode_request, normalize_host_name,
 };
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -51,7 +51,6 @@ const FRAME_KINDS: &[&str] = &[
     "error",
     "reset",
     "heartbeat",
-    "vms",
 ];
 
 #[test]
@@ -753,7 +752,7 @@ fn create_environment_is_optional_and_empty_is_not_absent() {
 }
 
 #[test]
-fn state_and_task_detail_models_pin_the_new_phase_two_fields() {
+fn state_frame_carries_display_settings_and_credential_warning() {
     let settings = AgentSettings {
         context_window: 0,
         provider: "openai".into(),
@@ -770,25 +769,10 @@ fn state_and_task_detail_models_pin_the_new_phase_two_fields() {
         settings,
         oracle_settings: None,
         credential_warning: Some("host credentials are missing".into()),
-        last_seq: 4,
     };
     let frame = serde_json::to_value(frame).unwrap();
     assert_eq!(frame["settings"]["thinking_display"], "detailed");
     assert_eq!(frame["credential_warning"], "host credentials are missing");
-
-    let detail: TaskDetails = serde_json::from_value(json!({
-        "id": 3,
-        "status": "running",
-        "stdout_tail": "out",
-        "stderr_tail": "err",
-        "stdout_total_bytes": 20,
-        "stderr_total_bytes": 4,
-        "report": null,
-        "future_field": "ignored"
-    }))
-    .unwrap();
-    assert_eq!(detail.id, 3);
-    assert_eq!(detail.stdout_total_bytes + detail.stderr_total_bytes, 24);
 }
 
 #[test]
@@ -819,7 +803,6 @@ fn state_round_trips_independent_oracle_settings() {
             settings: main.clone(),
             oracle_settings: oracle_settings.clone(),
             credential_warning: None,
-            last_seq: 0,
         };
         let encoded = serde_json::to_value(frame).unwrap();
         assert_eq!(
@@ -1108,7 +1091,6 @@ fn frame_decode_is_forward_compatible() {
             "speed": "standard",
             "verbosity": "default"
         },
-        "last_seq": 7,
         "added_later": true
     }))
     .expect("known frame with an extra field decodes");
@@ -1154,7 +1136,7 @@ fn decoded_frame_rejects_duplicate_known_fields() {
 #[test]
 fn decoded_frame_forwards_known_additions_exactly() {
     assert_decoded_round_trip::<DecodedFrame>(
-        r#"{"kind":"state","session":"session-1","epoch":"epoch-1","working":false,"settings":{"provider":"scripted","model_id":"scripted-model","thinking":"off","speed":"standard","verbosity":"default","future_setting":true},"last_seq":7,"added_later":{"n":18446744073709551616}}"#,
+        r#"{"kind":"state","session":"session-1","epoch":"epoch-1","working":false,"settings":{"provider":"scripted","model_id":"scripted-model","thinking":"off","speed":"standard","verbosity":"default","future_setting":true},"added_later":{"n":18446744073709551616}}"#,
     );
     assert_decoded_round_trip::<DecodedFrame>(
         r#"{"kind":"event","session":"session-1","epoch":"epoch-1","event":{"type":"notice","agent_id":"main","text":"hello","future_event_field":true},"future_frame_field":true}"#,
@@ -1171,7 +1153,7 @@ fn decoded_frame_forwards_unknown_numbers_exactly() {
 
 #[test]
 fn decoded_frame_rewrites_known_session_without_losing_additions() {
-    let input = r#"{"kind":"state","session":"old","epoch":"e","working":false,"settings":{"provider":"p","model_id":"m","thinking":"off","speed":"standard","verbosity":"default","future_setting":{"huge":1e400}},"last_seq":7,"future_number":18446744073709551616}"#;
+    let input = r#"{"kind":"state","session":"old","epoch":"e","working":false,"settings":{"provider":"p","model_id":"m","thinking":"off","speed":"standard","verbosity":"default","future_setting":{"huge":1e400}},"future_number":18446744073709551616}"#;
     let before: DecodedFrame = serde_json::from_str(input).unwrap();
     let mut after = before.clone();
 
@@ -1715,7 +1697,7 @@ fn a_list_frames_rows_are_read_as_their_host_wrote_them() {
     assert_eq!(live.get::<String>("id").expect("an id"), Some("s-1".into()));
     assert_eq!(
         serde_json::to_string(live).expect("a row re-serializes"),
-        r#"{"id":"s-1","live":true,"working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,"last_seq":7,"last_activity":"2026-08-03T12:00:00Z","unreachable":false,"preview":{"text":"hello","weight":18446744073709551616}}"#,
+        r#"{"id":"s-1","live":true,"working":false,"last_seq":7,"last_activity":"2026-08-03T12:00:00Z","unreachable":false,"preview":{"text":"hello","weight":18446744073709551616}}"#,
         "a row is re-emitted as it arrived, `preview` and its literal included",
     );
     assert_eq!(cold.get::<String>("id").expect("an id"), Some("s-0".into()));
@@ -1737,7 +1719,7 @@ fn a_row_takes_the_fields_a_gateway_owns_and_keeps_the_rest() {
 
     assert_eq!(
         serde_json::to_string(row).expect("a row re-serializes"),
-        r#"{"id":"left:s-1","live":true,"working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,"last_seq":7,"last_activity":"2026-08-03T12:00:00Z","unreachable":true,"preview":{"text":"hello","weight":18446744073709551616},"host":"left"}"#,
+        r#"{"id":"left:s-1","live":true,"working":false,"last_seq":7,"last_activity":"2026-08-03T12:00:00Z","unreachable":true,"preview":{"text":"hello","weight":18446744073709551616},"host":"left"}"#,
         "`id` and `unreachable` replaced where they sat, `host` appended, and a \
          payload the gateway never parsed",
     );
@@ -2054,7 +2036,7 @@ fn a_merged_directory_writes_the_read_and_the_frame_from_one_value() {
 
 /// A `list` frame with two rows: one from a host a version ahead, carrying a
 /// field this build has no type for and a number literal no float survives.
-const GATEWAY_ROWS: &str = r#"{"kind":"list","sessions":[{"id":"s-1","live":true,"working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,"last_seq":7,"last_activity":"2026-08-03T12:00:00Z","unreachable":false,"preview":{"text":"hello","weight":18446744073709551616}},{"id":"s-0","live":false,"working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,"last_activity":"2026-08-03T11:00:00Z","unreachable":false}]}"#;
+const GATEWAY_ROWS: &str = r#"{"kind":"list","sessions":[{"id":"s-1","live":true,"working":false,"last_seq":7,"last_activity":"2026-08-03T12:00:00Z","unreachable":false,"preview":{"text":"hello","weight":18446744073709551616}},{"id":"s-0","live":false,"working":false,"last_activity":"2026-08-03T11:00:00Z","unreachable":false}]}"#;
 
 /// One typed row, for the paths that have no wire JSON to start from.
 fn pinned_row() -> SessionSummary {
@@ -2253,8 +2235,7 @@ fn malformed_known_frame_is_not_downgraded_to_unknown() {
         "kind": "state",
         "session": "session-1",
         "epoch": "epoch-1",
-        "working": false,
-        "last_seq": 0
+        "working": false
     });
     assert!(serde_json::from_value::<DecodedFrame>(malformed).is_err());
 
@@ -2273,7 +2254,6 @@ fn non_event_wire_models_have_pinned_round_trip_fixtures() {
     assert_round_trip::<QueueState>(&fixtures["queue"]);
     assert_round_trip::<SessionTree>(&fixtures["tree"]);
     assert_round_trip::<HostList>(&fixtures["hosts"]);
-    assert_round_trip::<VmList>(&fixtures["vms"]);
     assert_round_trip::<ErrorResponse>(&fixtures["error"]);
 }
 
@@ -2434,8 +2414,6 @@ fn a_rows_tag_and_host_are_absent_rather_than_empty() {
         id: "session-2".to_string(),
         live: false,
         working: false,
-        queued: QueueCounts::default(),
-        tasks: 0,
         last_seq: None,
         last_activity: gateway.last_activity,
         tag: None,
@@ -2685,18 +2663,12 @@ fn a_tag_request_carries_one_string_and_defaults_to_clearing() {
 }
 
 /// The error frame is the error envelope with a session on it: the same
-/// `code` and `message` an error body carries, plus the
-/// epoch when the error is about one.
-///
-/// The epoch is an absent key rather than a null when there is none, in both
-/// directions, which is what an attach refusal writes: the session was never
-/// resolved, so there is no epoch it could be about. Additive fields ride
-/// along, and a client that does not know a `code` renders its `message`.
+/// `code` and `message` an error body carries. Additive fields ride along, and
+/// a client that does not know a `code` renders its `message`.
 #[test]
-fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
+fn an_error_frame_carries_the_envelope() {
     let refusal = Frame::Error {
         session: "session-1".to_string(),
-        epoch: None,
         code: "unknown_session".to_string(),
         message: "unknown session session-1".to_string(),
     };
@@ -2709,13 +2681,11 @@ fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
             "code": "unknown_session",
             "message": "unknown session session-1",
         }),
-        "an absent epoch is an absent key and never a null: {encoded}",
     );
 
     let scoped: Frame = serde_json::from_value(json!({
         "kind": "error",
         "session": "session-1",
-        "epoch": "epoch-1",
         "code": "stale_branch",
         "message": "that branch is gone",
         "added_later": {"entry": "entry-7"},
@@ -2723,18 +2693,13 @@ fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
     .expect("a newer peer's error frame decodes");
     let Frame::Error {
         session,
-        epoch,
         code,
         message,
-        ..
     } = &scoped
     else {
         panic!("expected an error frame, got {scoped:?}");
     };
-    assert_eq!(
-        (session.as_str(), epoch.as_deref()),
-        ("session-1", Some("epoch-1")),
-    );
+    assert_eq!(session, "session-1");
     assert_eq!(
         (code.as_str(), message.as_str()),
         ("stale_branch", "that branch is gone"),
@@ -2839,7 +2804,6 @@ fn frame_kind(frame: &Frame) -> &'static str {
         Frame::Error { .. } => "error",
         Frame::Reset { .. } => "reset",
         Frame::Heartbeat => "heartbeat",
-        Frame::Vms { .. } => "vms",
     }
 }
 
@@ -2856,7 +2820,7 @@ fn frame_carries_session(frame: &Frame) -> bool {
         | Frame::CaughtUp { .. }
         | Frame::Error { .. }
         | Frame::Reset { .. } => true,
-        Frame::List { .. } | Frame::Heartbeat | Frame::Vms { .. } => false,
+        Frame::List { .. } | Frame::Heartbeat => false,
     }
 }
 
@@ -2890,7 +2854,6 @@ fn local_frames() -> Vec<Frame> {
             },
             oracle_settings: None,
             credential_warning: None,
-            last_seq: 7,
         },
         Frame::CaughtUp {
             session: "old".to_string(),
@@ -2903,9 +2866,6 @@ fn local_frames() -> Vec<Frame> {
         },
         Frame::Error {
             session: "old".to_string(),
-            // The shape an attach refusal takes: the session was never
-            // resolved, so there is no epoch it could be about.
-            epoch: None,
             code: "unknown_session".to_string(),
             message: "unknown session old".to_string(),
         },
@@ -2913,7 +2873,6 @@ fn local_frames() -> Vec<Frame> {
             session: "old".to_string(),
         },
         Frame::Heartbeat,
-        Frame::Vms { vms: Vec::new() },
     ]
 }
 

@@ -468,12 +468,6 @@ impl Driver {
     /// Publish a `state` frame when `working` changed, which is the flag a
     /// client seeds its spinner from and the one that self-heals an
     /// `AgentEnd` it missed.
-    ///
-    /// The frame's `last_seq` also moves on every durable append, and we
-    /// deliberately do not re-emit for that: the durable frame carries the
-    /// same position, so a `state` per append would double the frame count
-    /// to tell a client something it just learned. The session list is
-    /// where a `last_seq` a client is not attached to surfaces.
     fn refresh_state(&self) {
         let working = self.turns.is_busy(&self.lifecycle, AgentId::Main);
         self.session.publish_state(&self.shared.fanout, |status| {
@@ -500,7 +494,6 @@ impl Driver {
                 follow_up,
             },
         );
-        self.shared.fanout.mark_list_dirty();
     }
 
     /// Publish everything already queued on the event stream.
@@ -729,7 +722,6 @@ impl Driver {
         }
         // Idempotent for a task that already finished: firing its completed
         // driver's token has no remaining observer.
-        self.shared.fanout.mark_list_dirty();
         Ok(CommandOutcome::Accepted)
     }
 
@@ -1310,10 +1302,8 @@ impl Driver {
     /// gone, and lets the idle sweeper reap this entry.
     async fn stop_for_persistence(&mut self, failure: PersistenceFailure) {
         self.session.start_draining();
-        let epoch = self.session.status().epoch.clone();
         self.shared.fanout.publish(Frame::Error {
             session: self.session.id().to_string(),
-            epoch: Some(epoch),
             code: PERSISTENCE_FAILED_CODE.to_string(),
             message: persistence_failure_message(&failure),
         });

@@ -197,8 +197,7 @@ impl MessageQueues {
     }
 
     /// Total pending messages across every agent, as
-    /// `(steering, follow_up)`. The session-wide counts a status line or
-    /// a session list shows.
+    /// `(steering, follow_up)`.
     pub fn pending_counts(&self) -> (usize, usize) {
         self.lock()
             .values()

@@ -507,8 +507,6 @@ fn reset(session: &str) -> DecodedFrame {
 fn refusal(unresolvable: Unresolvable) -> Frame {
     Frame::Error {
         session: unresolvable.session,
-        // Nothing resolved, so no epoch was ever minted for it here.
-        epoch: None,
         code: UNKNOWN_SESSION.to_string(),
         message: unresolvable.message,
     }
@@ -616,7 +614,6 @@ mod tests {
             outbound::channel(NonZeroUsize::new(4).expect("non-zero"), cancel.clone());
         let refusal = DecodedFrame::try_from(Frame::Error {
             session: "left:s-1".to_string(),
-            epoch: None,
             code: "locked".to_string(),
             message: "held".to_string(),
         })

@@ -543,14 +543,15 @@ mod tests {
         }
     }
 
-    /// A lossy frame: a cumulative snapshot a later one supersedes.
-    fn lossy(last_seq: u64) -> Frame {
+    /// A lossy frame: a cumulative snapshot a later one supersedes, told
+    /// apart from its neighbours by `revision`, carried as the context window.
+    fn lossy(revision: u64) -> Frame {
         Frame::State {
             session: SESSION.to_string(),
             epoch: EPOCH.to_string(),
             working: true,
             settings: AgentSettings {
-                context_window: 0,
+                context_window: revision,
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
@@ -560,7 +561,6 @@ mod tests {
             },
             oracle_settings: None,
             credential_warning: None,
-            last_seq,
         }
     }
 
@@ -576,7 +576,6 @@ mod tests {
     fn refusal(code: &str) -> Frame {
         Frame::Error {
             session: SESSION.to_string(),
-            epoch: None,
             code: code.to_string(),
             message: format!("no {code} here"),
         }
@@ -602,7 +601,7 @@ mod tests {
                     }
                     other => format!("event {other:?}"),
                 },
-                Frame::State { last_seq, .. } => format!("state {last_seq}"),
+                Frame::State { settings, .. } => format!("state {}", settings.context_window),
                 Frame::CaughtUp { last_seq, .. } => format!("caught_up {last_seq}"),
                 Frame::Error { code, .. } => format!("error {code}"),
                 Frame::Reset { .. } => "reset".to_string(),
@@ -656,8 +655,6 @@ mod tests {
             id: SESSION.to_string(),
             live: true,
             working: false,
-            queued: aj_wire::QueueCounts::default(),
-            tasks: 0,
             last_seq: Some(last_seq),
             last_activity: chrono::DateTime::UNIX_EPOCH,
             tag: None,
@@ -838,7 +835,7 @@ mod tests {
             | Frame::CaughtUp { session, .. }
             | Frame::Error { session, .. }
             | Frame::Reset { session } => OTHER.clone_into(session),
-            Frame::List { .. } | Frame::Heartbeat | Frame::Vms { .. } => {
+            Frame::List { .. } | Frame::Heartbeat => {
                 panic!("a host-level frame belongs to no session")
             }
         }

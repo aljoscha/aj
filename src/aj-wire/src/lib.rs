@@ -40,8 +40,7 @@ pub use session_info::{SessionInfo, UsageBucket};
 
 mod prompt_history;
 pub use prompt_history::{
-    HistoryPrompt, PROMPT_HISTORY_CAPABILITY, PROMPT_HISTORY_LIMIT,
-    PROMPT_HISTORY_STREAM_CAPABILITY, PromptHistory,
+    HistoryPrompt, PROMPT_HISTORY_CAPABILITY, PROMPT_HISTORY_LIMIT, PromptHistory,
 };
 
 /// The current remote-control protocol version.
@@ -660,21 +659,12 @@ pub fn normalize_host_name(name: &str) -> Result<Option<String>, HostNameError> 
     Ok(Some(trimmed.to_string()))
 }
 
-/// Counts of pending messages by delivery class.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueueCounts {
-    pub steering: usize,
-    pub follow_up: usize,
-}
-
 /// One session in the host or gateway directory.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
     pub live: bool,
     pub working: bool,
-    pub queued: QueueCounts,
-    pub tasks: usize,
     /// The session's durable high-water mark. A host sets it exactly when
     /// [`Self::live`] is set, and a reader may rely on that only as
     /// far as it trusts the host: nothing on this type enforces it, because
@@ -892,19 +882,6 @@ pub struct TaskOutput {
     pub offset: u64,
     pub total_bytes: u64,
     pub bytes: Vec<u8>,
-}
-
-/// Detailed status and remotely reachable output for one background task.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskDetails {
-    pub id: TaskId,
-    pub status: TaskStatus,
-    pub stdout_tail: String,
-    pub stderr_tail: String,
-    pub stdout_total_bytes: u64,
-    pub stderr_total_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub report: Option<String>,
 }
 
 /// Pending messages for one agent in a session.
@@ -1261,31 +1238,6 @@ pub struct HostList {
     pub hosts: Vec<HostSummary>,
 }
 
-/// Current provisioning state of a VM.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum VmStatus {
-    Provisioning,
-    Ready { address: String, host_id: String },
-    Failed { message: String },
-    Destroyed,
-}
-
-/// One VM managed by a gateway provisioner.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VmSummary {
-    pub id: String,
-    pub name: String,
-    #[serde(flatten)]
-    pub status: VmStatus,
-}
-
-/// The complete VM table returned by a gateway.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VmList {
-    pub vms: Vec<VmSummary>,
-}
-
 /// Structured body returned for an unsuccessful request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -1522,7 +1474,6 @@ pub enum Frame {
         /// Present on an attach block's opening state only. Live state updates
         /// omit it, and older hosts decode as `None`.
         credential_warning: Option<String>,
-        last_seq: u64,
     },
     CaughtUp {
         session: String,
@@ -1543,12 +1494,6 @@ pub enum Frame {
     /// is neither dropped as lossy nor treated as durable.
     Error {
         session: String,
-        /// The epoch the error is about, for a code that refers to one.
-        ///
-        /// Absent where the session has no epoch to speak of, which is what an
-        /// attach refusal carries: the session was never resolved, so nothing
-        /// minted one.
-        epoch: Option<String>,
         /// A stable snake_case token a client may branch on. A code this build
         /// does not know renders as its `message`.
         code: String,
@@ -1560,14 +1505,11 @@ pub enum Frame {
         session: String,
     },
     Heartbeat,
-    Vms {
-        vms: Vec<VmSummary>,
-    },
 }
 
 impl Frame {
     /// The session a session-scoped frame belongs to, `None` for the
-    /// host-level kinds (`list`, `heartbeat`, `vms`).
+    /// host-level kinds (`list`, `heartbeat`).
     pub fn session(&self) -> Option<&str> {
         match self {
             Self::Event { session, .. }
@@ -1575,7 +1517,7 @@ impl Frame {
             | Self::CaughtUp { session, .. }
             | Self::Error { session, .. }
             | Self::Reset { session } => Some(session),
-            Self::List { .. } | Self::Heartbeat | Self::Vms { .. } => None,
+            Self::List { .. } | Self::Heartbeat => None,
         }
     }
 
@@ -1610,7 +1552,7 @@ impl Frame {
                         | AgentEvent::TaskOutput { .. }
                 )
             ),
-            Self::State { .. } | Self::List { .. } | Self::Vms { .. } => true,
+            Self::State { .. } | Self::List { .. } => true,
             Self::CaughtUp { .. } | Self::Error { .. } | Self::Reset { .. } | Self::Heartbeat => {
                 false
             }
@@ -1677,7 +1619,7 @@ impl Frame {
             | Self::CaughtUp { session, .. }
             | Self::Error { session, .. }
             | Self::Reset { session } => session,
-            Self::List { .. } | Self::Heartbeat | Self::Vms { .. } => return false,
+            Self::List { .. } | Self::Heartbeat => return false,
         };
         replacement.clone_into(session);
         true
@@ -1703,7 +1645,6 @@ enum FrameRef<'a> {
         oracle_settings: Option<&'a AgentSettings>,
         #[serde(skip_serializing_if = "Option::is_none")]
         credential_warning: Option<&'a str>,
-        last_seq: u64,
     },
     CaughtUp {
         session: &'a str,
@@ -1717,8 +1658,6 @@ enum FrameRef<'a> {
     },
     Error {
         session: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        epoch: Option<&'a str>,
         code: &'a str,
         message: &'a str,
     },
@@ -1726,9 +1665,6 @@ enum FrameRef<'a> {
         session: &'a str,
     },
     Heartbeat,
-    Vms {
-        vms: &'a [VmSummary],
-    },
 }
 
 impl Serialize for Frame {
@@ -1756,7 +1692,6 @@ impl Serialize for Frame {
                 settings,
                 oracle_settings,
                 credential_warning,
-                last_seq,
             } => FrameRef::State {
                 session,
                 epoch,
@@ -1764,7 +1699,6 @@ impl Serialize for Frame {
                 settings,
                 oracle_settings: oracle_settings.as_ref(),
                 credential_warning: credential_warning.as_deref(),
-                last_seq: *last_seq,
             },
             Self::CaughtUp {
                 session,
@@ -1778,18 +1712,15 @@ impl Serialize for Frame {
             Self::List { sessions, hosts } => FrameRef::List { sessions, hosts },
             Self::Error {
                 session,
-                epoch,
                 code,
                 message,
             } => FrameRef::Error {
                 session,
-                epoch: epoch.as_deref(),
                 code,
                 message,
             },
             Self::Reset { session } => FrameRef::Reset { session },
             Self::Heartbeat => FrameRef::Heartbeat,
-            Self::Vms { vms } => FrameRef::Vms { vms },
         };
         frame.serialize(serializer)
     }
@@ -1862,7 +1793,6 @@ impl<'de> Deserialize<'de> for Frame {
                     settings,
                     oracle_settings,
                     credential_warning,
-                    last_seq,
                 } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
                 Ok(Self::State {
                     session,
@@ -1871,7 +1801,6 @@ impl<'de> Deserialize<'de> for Frame {
                     settings,
                     oracle_settings,
                     credential_warning,
-                    last_seq,
                 })
             }
             "caught_up" => {
@@ -1894,13 +1823,11 @@ impl<'de> Deserialize<'de> for Frame {
             "error" => {
                 let ErrorFrameFields {
                     session,
-                    epoch,
                     code,
                     message,
                 } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
                 Ok(Self::Error {
                     session,
-                    epoch,
                     code,
                     message,
                 })
@@ -1911,11 +1838,6 @@ impl<'de> Deserialize<'de> for Frame {
                 Ok(Self::Reset { session })
             }
             "heartbeat" => Ok(Self::Heartbeat),
-            "vms" => {
-                let VmsFrameFields { vms } =
-                    serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
-                Ok(Self::Vms { vms })
-            }
             _ => Err(D::Error::custom(format!("unknown frame kind {kind:?}"))),
         }
     }
@@ -1944,7 +1866,6 @@ struct StateFrameFields {
     oracle_settings: Option<AgentSettings>,
     #[serde(default)]
     credential_warning: Option<String>,
-    last_seq: u64,
 }
 
 #[derive(Deserialize)]
@@ -1964,8 +1885,6 @@ struct ListFrameFields {
 #[derive(Deserialize)]
 struct ErrorFrameFields {
     session: String,
-    #[serde(default)]
-    epoch: Option<String>,
     code: String,
     message: String,
 }
@@ -1973,11 +1892,6 @@ struct ErrorFrameFields {
 #[derive(Deserialize)]
 struct ResetFrameFields {
     session: String,
-}
-
-#[derive(Deserialize)]
-struct VmsFrameFields {
-    vms: Vec<VmSummary>,
 }
 
 #[derive(Default)]
@@ -2065,7 +1979,7 @@ impl DecodedFrame {
     /// session and is left alone.
     ///
     /// `false` says the frame has no top-level `session`, which makes it
-    /// host-scoped (`list`, `heartbeat`, `vms`, and any unknown kind that
+    /// host-scoped (`list`, `heartbeat`, and any unknown kind that
     /// carries no id). Such a frame is handed back untouched rather than
     /// re-serialized. A frame decoded from the wire decides on the JSON it
     /// will forward, a locally built one on its variant.
@@ -2440,6 +2354,6 @@ fn is_known_event_type(event_type: &str) -> bool {
 fn is_known_frame_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "event" | "state" | "caught_up" | "list" | "error" | "reset" | "heartbeat" | "vms"
+        "event" | "state" | "caught_up" | "list" | "error" | "reset" | "heartbeat"
     )
 }

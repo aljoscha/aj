@@ -91,6 +91,12 @@ pub(crate) fn addr(text: &str) -> SocketAddr {
     text.parse().expect("a socket address")
 }
 
+/// A snapshot sink for a prompt-history read whose caller wants only the
+/// final value.
+pub(crate) fn history_updates() -> tokio::sync::watch::Sender<aj_wire::PromptHistory> {
+    tokio::sync::watch::channel(aj_wire::PromptHistory::default()).0
+}
+
 /// One session to attach, with no cursor.
 fn attach(session: &str) -> AttachRequest {
     AttachRequest {
@@ -1847,10 +1853,11 @@ async fn the_reads_answer_tasks_queue_and_tree() {
     fixture.shutdown().await;
 }
 
-/// The per-task read is what backs the task-output overlay in connect mode:
-/// the host's spill file is not reachable remotely.
+/// A task kill is refused before dispatch when its body is malformed, 404s an
+/// unknown task, and accepts a blank body. A task path segment that is not an
+/// id answers the protocol's error shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_task_read_answers_a_live_task_and_404s_an_unknown_one() {
+async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
     let fixture = Fixture::new(background_task_turn()).await;
     let session = fixture.create().await;
     let mut remote = fixture.remote(&session).await;
@@ -1867,12 +1874,6 @@ async fn the_task_read_answers_a_live_task_and_404s_an_unknown_one() {
         .iter()
         .find(|task| task.status == aj_agent::tool::TaskStatus::Running)
         .expect("a live background task");
-    let details = fixture
-        .client
-        .task(&session, task.id)
-        .await
-        .expect("the task read");
-    assert_eq!(details.id, task.id);
 
     let response = reqwest::Client::new()
         .post(format!(
@@ -1891,21 +1892,17 @@ async fn the_task_read_answers_a_live_task_and_404s_an_unknown_one() {
     assert_eq!(
         fixture
             .client
-            .task(&session, task.id)
+            .tasks(&session)
             .await
-            .expect("the refused kill left the task readable")
+            .expect("the tasks read")
+            .tasks
+            .iter()
+            .find(|row| row.id == task.id)
+            .expect("the refused kill left the task listed")
             .status,
         aj_agent::tool::TaskStatus::Running,
         "a task-kill body was ignored after dispatch",
     );
-
-    let err = fixture
-        .client
-        .task(&session, 9999)
-        .await
-        .expect_err("an unknown task id");
-    assert_eq!(err.status(), Some(StatusCode::NOT_FOUND));
-    assert_eq!(err.code(), Some("unknown_task"));
 
     let err = fixture
         .client
@@ -1934,7 +1931,7 @@ async fn the_task_read_answers_a_live_task_and_404s_an_unknown_one() {
     // shape rather than the framework's own rejection.
     let response = reqwest::Client::new()
         .get(format!(
-            "{}/v1/sessions/{session}/tasks/not-a-number",
+            "{}/v1/sessions/{session}/tasks/not-a-number/output?offset=0",
             fixture.server.url()
         ))
         .send()
@@ -2654,7 +2651,7 @@ async fn an_unknown_session_answers_404_on_every_route() {
         fixture.client.tasks(missing).await.err(),
         fixture.client.queue(missing).await.err(),
         fixture.client.tree(missing).await.err(),
-        fixture.client.task(missing, 1).await.err(),
+        fixture.client.task_output(missing, 1, 0).await.err(),
     ];
     for command in [
         RemoteCommand::Prompt(PromptRequest {
@@ -3123,7 +3120,7 @@ async fn a_session_another_host_holds_answers_409_locked() {
         "and nothing queued",
     );
     let unknown = rival
-        .task(&session, 1)
+        .task_output(&session, 1, 0)
         .await
         .expect_err("and no task to read");
     assert_eq!(
@@ -3599,7 +3596,7 @@ pub(crate) async fn history_update(
 }
 
 #[tokio::test]
-async fn prompt_history_stream_delivers_before_completion_and_stops_at_complete() {
+async fn prompt_history_delivers_before_completion_and_stops_at_complete() {
     for session in [None, Some("workspace")] {
         let mut peer = history_peer("host", "host").await;
         let client = RemoteClient::new(&peer.url).unwrap();
@@ -3640,7 +3637,7 @@ async fn prompt_history_stream_delivers_before_completion_and_stops_at_complete(
 }
 
 #[tokio::test]
-async fn prompt_history_stream_failure_preserves_provisional_snapshot() {
+async fn prompt_history_failure_preserves_provisional_snapshot() {
     for terminal in ["eof", "truncated", "error"] {
         let mut peer = history_peer("host", "host").await;
         let client = RemoteClient::new(&peer.url).unwrap();
@@ -3688,7 +3685,7 @@ async fn prompt_history_stream_failure_preserves_provisional_snapshot() {
 }
 
 #[tokio::test]
-async fn prompt_history_stream_cancellation_closes_the_http_body() {
+async fn prompt_history_cancellation_closes_the_http_body() {
     let mut peer = history_peer("host", "host").await;
     let client = RemoteClient::new(&peer.url).unwrap();
     let (updates, mut observed) = tokio::sync::watch::channel(Default::default());
@@ -3713,7 +3710,7 @@ async fn prompt_history_stream_cancellation_closes_the_http_body() {
 }
 
 #[tokio::test]
-async fn prompt_history_stream_completes_empty_reads_and_reports_host_errors() {
+async fn prompt_history_completes_empty_reads_and_reports_host_errors() {
     let fixture = Fixture::new(vec![]).await;
     let session = fixture.create().await;
     for scope in [None, Some(session.as_str())] {
@@ -3968,7 +3965,7 @@ const PROBED_ROUTES: [&str; 20] = [
     "GET /v1/sessions",
     "POST /v1/sessions",
     "GET /v1/sessions/{id}/tasks",
-    "GET /v1/sessions/{id}/tasks/1",
+    "GET /v1/sessions/{id}/tasks/1/output",
     "GET /v1/sessions/{id}/queue",
     "GET /v1/sessions/{id}/tree",
     "GET /v1/sessions/{id}/env",
@@ -4125,9 +4122,11 @@ async fn probe_every_route(
         http.get(format!("{base}/v1/sessions/{session}/tasks"))
             .build()
             .expect("build the task-list probe"),
-        http.get(format!("{base}/v1/sessions/{session}/tasks/1"))
-            .build()
-            .expect("build the task probe"),
+        http.get(format!(
+            "{base}/v1/sessions/{session}/tasks/1/output?offset=0"
+        ))
+        .build()
+        .expect("build the task-output probe"),
         http.get(format!("{base}/v1/sessions/{session}/queue"))
             .build()
             .expect("build the queue probe"),
@@ -4262,7 +4261,7 @@ async fn an_authorized_peer_reaches_every_route() {
     assert_route_census(&probes);
     for probe in probes {
         let expected_error = match probe.route.as_str() {
-            "GET /v1/sessions/{id}/tasks/1" | "POST /v1/sessions/{id}/tasks/1/kill" => {
+            "GET /v1/sessions/{id}/tasks/1/output" | "POST /v1/sessions/{id}/tasks/1/kill" => {
                 Some("unknown_task")
             }
             "POST /v1/sessions/{id}/head" => Some("unknown_entry"),

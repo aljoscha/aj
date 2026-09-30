@@ -11,8 +11,8 @@
 //! [`ChatState`] stays outside the client. A frontend can hold it behind
 //! widgets it cannot repoint, so the fold takes it as a parameter.
 //!
-//! Host-level frames are deliberately not this type's business. `list`,
-//! `vms` and `heartbeat` carry no `session` field, so they belong to
+//! Host-level frames are deliberately not this type's business. `list`
+//! and `heartbeat` carry no `session` field, so they belong to
 //! whatever owns the session directory and the connection, not to one
 //! session's fold. Unknown frame kinds never arrive here at all:
 //! `aj-wire` decodes them into `DecodedFrame::Unknown`, which an endpoint
@@ -469,7 +469,7 @@ impl SessionClient {
                 self.owe_reattach();
                 Redraw(true)
             }
-            Frame::List { .. } | Frame::Heartbeat | Frame::Vms { .. } => Redraw(false),
+            Frame::List { .. } | Frame::Heartbeat => Redraw(false),
         }
     }
 
@@ -894,7 +894,6 @@ mod tests {
             settings,
             oracle_settings: None,
             credential_warning: credential_warning.map(str::to_string),
-            last_seq: 0,
         }
     }
 
@@ -970,7 +969,6 @@ mod tests {
             settings: settings(),
             oracle_settings,
             credential_warning: None,
-            last_seq: 0,
         };
         client.expect_attach();
         let _ = client.apply(&mut chat, state(SESSION, EPOCH, Some(oracle.clone())));
@@ -1155,7 +1153,6 @@ mod tests {
     fn refusal(session: &str, code: &str, message: &str) -> Frame {
         Frame::Error {
             session: session.to_string(),
-            epoch: None,
             code: code.to_string(),
             message: message.to_string(),
         }
@@ -1341,7 +1338,6 @@ mod tests {
                 sessions: Vec::new(),
                 hosts: Vec::new(),
             },
-            Frame::Vms { vms: Vec::new() },
         ] {
             assert!(!client.apply(&mut chat, frame).0);
         }

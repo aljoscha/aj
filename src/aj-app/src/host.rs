@@ -62,9 +62,9 @@ use aj_session::{
 };
 use aj_wire::{
     ARCHIVE_CAPABILITY, AgentQueue, COMPACTION_USAGE_CAPABILITY, Cursor, DurableEvent, Frame,
-    Hello, MAX_HOST_NAME_BYTES, ModelSelection, PROTOCOL_VERSION, QueueCounts, QueueState,
-    SessionList, SessionSettings, SessionSummary, SessionTree, TaskDetails, TaskSummary, TaskTable,
-    TreeSegment, normalize_host_name,
+    Hello, MAX_HOST_NAME_BYTES, ModelSelection, PROTOCOL_VERSION, QueueState, SessionList,
+    SessionSettings, SessionSummary, SessionTree, TaskSummary, TaskTable, TreeSegment,
+    normalize_host_name,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
@@ -886,7 +886,6 @@ impl SessionHost {
                 aj_wire::PROVIDER_USAGE_RESET_CAPABILITY.to_string(),
                 aj_wire::SESSION_PREVIEWS_CAPABILITY.to_string(),
                 aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
-                aj_wire::PROMPT_HISTORY_STREAM_CAPABILITY.to_string(),
                 aj_wire::SESSION_ENV_CAPABILITY.to_string(),
                 aj_wire::SESSION_ACCOUNTS_CAPABILITY.to_string(),
                 aj_wire::CREDENTIALS_CAPABILITY.to_string(),
@@ -1094,9 +1093,6 @@ impl SessionHost {
                     self.inner.shared.fanout.detach(id, &request.session);
                     serving.push(Serving::Refusal(Frame::Error {
                         session: request.session.clone(),
-                        // The session was never resolved, so there is no epoch
-                        // this could be about.
-                        epoch: None,
                         code: err.code().to_string(),
                         message: err.to_string(),
                     }));
@@ -1212,8 +1208,6 @@ impl SessionHost {
                         id: session.id,
                         live: false,
                         working: false,
-                        queued: QueueCounts::default(),
-                        tasks: 0,
                         // A cold row carries no durable position: the count
                         // is not recorded anywhere, so producing one would
                         // mean reading the log, and a list-observed seq is
@@ -1394,30 +1388,6 @@ impl SessionHost {
         Ok(TaskTable { tasks })
     }
 
-    /// Detailed, remotely reachable output for one background task.
-    ///
-    /// Cold sessions have no task registry, so every id is unknown. The host's
-    /// spill path is intentionally omitted from the returned wire model.
-    pub async fn task(&self, session: &str, task: TaskId) -> Result<TaskDetails, HostError> {
-        let Some(live) = self.live_or_cold(session).await? else {
-            return Err(HostError::UnknownTask(task));
-        };
-        let (status, read) = live
-            .core
-            .task_registry
-            .read(task)
-            .ok_or(HostError::UnknownTask(task))?;
-        Ok(TaskDetails {
-            id: task,
-            status,
-            stdout_tail: read.stdout_tail,
-            stderr_tail: read.stderr_tail,
-            stdout_total_bytes: read.stdout_total_bytes,
-            stderr_total_bytes: read.stderr_total_bytes,
-            report: read.report,
-        })
-    }
-
     /// Read at most `TASK_OUTPUT_CHUNK_BYTES` raw bytes from a retained task's
     /// spill file. The offset must not exceed its captured length. No task
     /// archive is consulted and rolling tails are never substituted for a file.
@@ -1536,12 +1506,13 @@ impl SessionHost {
 
     /// Read submitted prompts without materializing sessions. `Some(session)`
     /// selects its workspace, `None` selects every workspace in this host's
-    /// sessions store. Optional snapshots let a reader paint during the
-    /// scan. Dropping the future cancels the blocking reader.
+    /// sessions store. `updates` receives replacement snapshots during the
+    /// scan, so a reader can paint before it finishes. Dropping the future
+    /// cancels the blocking reader.
     pub async fn prompt_history(
         &self,
         session: Option<&str>,
-        updates: Option<tokio::sync::watch::Sender<aj_wire::PromptHistory>>,
+        updates: tokio::sync::watch::Sender<aj_wire::PromptHistory>,
     ) -> Result<aj_wire::PromptHistory, HostError> {
         if let Some(session) = session {
             validate_session_id(session)?;
@@ -1591,15 +1562,13 @@ impl SessionHost {
                         .into_iter()
                         .map(crate::prompt_history::to_wire)
                         .collect();
-                    if let Some(updates) = &updates {
-                        updates.send_if_modified(|current| {
-                            if *current == history {
-                                return false;
-                            }
-                            *current = history.clone();
-                            true
-                        });
-                    }
+                    updates.send_if_modified(|current| {
+                        if *current == history {
+                            return false;
+                        }
+                        *current = history.clone();
+                        true
+                    });
                 },
             ) {
                 history.incomplete.push(aj_wire::HostFailure {
@@ -2357,7 +2326,6 @@ impl SessionHost {
                 settings: settings_seen.clone(),
                 oracle_settings: oracle_settings_seen.clone(),
                 credential_warning,
-                last_seq: boundary,
             },
         )
         .await
@@ -2767,24 +2735,11 @@ fn log_modified_at(log: &ConversationLog) -> Option<DateTime<Utc>> {
 
 /// Project one live session onto its directory entry.
 fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
-    let (steering, follow_up) = session.core.message_queues.pending_counts();
-    let tasks = session
-        .core
-        .task_registry
-        .snapshot()
-        .into_iter()
-        .filter(|task| task.status == aj_agent::tool::TaskStatus::Running)
-        .count();
     let status = session.status();
     SessionSummary {
         id: session.id().to_string(),
         live: true,
         working: status.working,
-        queued: QueueCounts {
-            steering,
-            follow_up,
-        },
-        tasks,
         last_seq: Some(status.last_seq),
         last_activity: status.last_activity,
         tag: status.tag.clone(),

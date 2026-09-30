@@ -185,8 +185,7 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/hosts", get(hosts).post(enroll))
         .route("/v1/hosts/{id}", delete(withdraw))
         .route("/v1/sessions", get(sessions).post(create_session))
-        .route("/v1/prompt-history", get(prompt_history))
-        .route("/v1/prompt-history/stream", get(prompt_history_stream))
+        .route("/v1/prompt-history/stream", get(prompt_history))
         .route("/v1/previews", get(session_previews))
         // Everything about one session goes to the host that owns it, whether or
         // not this build knows the route. `{id}` on its own is here for the same
@@ -282,19 +281,15 @@ async fn session_previews(
     Json(merged)
 }
 
-async fn prompt_history(State(state): State<Arc<ServerState>>) -> Json<aj_wire::PromptHistory> {
-    Json(read_prompt_history(state, None).await)
-}
-
-async fn prompt_history_stream(State(state): State<Arc<ServerState>>) -> Response {
+async fn prompt_history(State(state): State<Arc<ServerState>>) -> Response {
     crate::remote::history::response(crate::remote::history::snapshots(
-        move |updates| async move { Ok(read_prompt_history(state, Some(updates)).await) },
+        move |updates| async move { Ok(read_prompt_history(state, updates).await) },
     ))
 }
 
 async fn read_prompt_history(
     state: Arc<ServerState>,
-    updates: Option<tokio::sync::watch::Sender<aj_wire::PromptHistory>>,
+    updates: tokio::sync::watch::Sender<aj_wire::PromptHistory>,
 ) -> aj_wire::PromptHistory {
     use futures::StreamExt;
     let directory = state.gateway.sessions();
@@ -333,24 +328,21 @@ async fn read_prompt_history(
                         .create_target(Some(id))
                         .map_err(|error| error.to_string())
                 });
-            let streaming = updates.is_some();
             crate::remote::history::snapshots(move |updates| async move {
                 let result = async {
                     let target = target?;
                     let client = crate::remote::RemoteClient::new(target.address.url())
                         .map_err(|e| e.to_string())?;
-                    let result = if streaming {
-                        client.stream_prompt_history(None, updates).await
-                    } else {
-                        client.prompt_history(None).await
-                    };
-                    result.map_err(|e| {
-                        if e.code() == Some("unknown_endpoint") {
-                            "prompt history is not supported by this host".to_string()
-                        } else {
-                            e.to_string()
-                        }
-                    })
+                    client
+                        .stream_prompt_history(None, updates)
+                        .await
+                        .map_err(|e| {
+                            if e.code() == Some("unknown_endpoint") {
+                                "prompt history is not supported by this host".to_string()
+                            } else {
+                                e.to_string()
+                            }
+                        })
                 };
                 tokio::time::timeout(timeout, result)
                     .await
@@ -381,15 +373,13 @@ async fn read_prompt_history(
         for history in &latest {
             aj_app::prompt_history::merge(&mut merged, history.clone());
         }
-        if let Some(updates) = &updates {
-            updates.send_if_modified(|current| {
-                if *current == merged {
-                    return false;
-                }
-                *current = merged.clone();
-                true
-            });
-        }
+        updates.send_if_modified(|current| {
+            if *current == merged {
+                return false;
+            }
+            *current = merged.clone();
+            true
+        });
     }
     merged
 }

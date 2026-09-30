@@ -1717,8 +1717,6 @@ mod tests {
             id: "session-1".to_string(),
             live: true,
             working,
-            queued: aj_wire::QueueCounts::default(),
-            tasks: 0,
             last_seq: Some(0),
             last_activity: chrono::Utc::now(),
             tag: None,

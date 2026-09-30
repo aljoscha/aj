@@ -960,7 +960,6 @@ mod tests {
                 settings: agent_settings(),
                 oracle_settings: None,
                 credential_warning: None,
-                last_seq: 0,
             },
         );
         let _ = client.apply(

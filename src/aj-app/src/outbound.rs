@@ -268,7 +268,6 @@ enum LossyKey {
     Task(String, TaskId),
     State(String),
     List,
-    Vms,
 }
 
 fn lossy_key(frame: &impl OutboundFrame) -> Option<LossyKey> {
@@ -287,7 +286,6 @@ fn lossy_key(frame: &impl OutboundFrame) -> Option<LossyKey> {
         },
         Frame::State { session, .. } => Some(LossyKey::State(session.clone())),
         Frame::List { .. } => Some(LossyKey::List),
-        Frame::Vms { .. } => Some(LossyKey::Vms),
         Frame::CaughtUp { .. } | Frame::Error { .. } | Frame::Reset { .. } | Frame::Heartbeat => {
             None
         }

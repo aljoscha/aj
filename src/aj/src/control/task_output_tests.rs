@@ -78,11 +78,7 @@ async fn task_output_adapters_read_bytes_append_completion_and_errors() {
         let remote = Control::remote(client);
         for control in [&local, &remote] {
             assert_ne!(
-                host.task(&session, task)
-                    .await
-                    .unwrap()
-                    .stdout_tail
-                    .as_bytes(),
+                registry.read(task).unwrap().1.stdout_tail.as_bytes(),
                 expected
             );
             let mut collected = Vec::new();

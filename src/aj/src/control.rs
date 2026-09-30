@@ -383,19 +383,14 @@ impl Control {
     pub(crate) async fn prompt_history(
         &self,
         session: Option<&str>,
-        updates: Option<tokio::sync::watch::Sender<aj_wire::PromptHistory>>,
+        updates: tokio::sync::watch::Sender<aj_wire::PromptHistory>,
     ) -> Result<aj_wire::PromptHistory, ControlError> {
         match self {
             Self::Local(local) => Ok(local.host.prompt_history(session, updates).await?),
-            Self::Remote(remote) => Ok(match updates {
-                Some(updates) => {
-                    remote
-                        .client
-                        .stream_prompt_history(session, updates)
-                        .await?
-                }
-                None => remote.client.prompt_history(session).await?,
-            }),
+            Self::Remote(remote) => Ok(remote
+                .client
+                .stream_prompt_history(session, updates)
+                .await?),
         }
     }
 
@@ -969,7 +964,9 @@ impl Stream {
 #[cfg(test)]
 pub(crate) mod history_tests {
     use super::*;
-    use crate::remote::tests::{HostHandles, addr, bounded, scripted, scripted_host};
+    use crate::remote::tests::{
+        HostHandles, addr, bounded, history_updates, scripted, scripted_host,
+    };
     use crate::remote::{IdentityGate, RemoteServer};
 
     pub(crate) fn write_prompts(dir: &std::path::Path, name: &str, prompts: &[(&str, i64)]) {
@@ -1026,23 +1023,19 @@ pub(crate) mod history_tests {
         let local = Control::local(host.clone());
         let remote = Control::remote(client);
         for session in [Some("a"), None] {
-            let left = bounded("local history", local.prompt_history(session, None))
-                .await
-                .unwrap();
-            let right = bounded("HTTP history", remote.prompt_history(session, None))
-                .await
-                .unwrap();
+            let left = bounded(
+                "local history",
+                local.prompt_history(session, history_updates()),
+            )
+            .await
+            .unwrap();
+            let right = bounded(
+                "HTTP history",
+                remote.prompt_history(session, history_updates()),
+            )
+            .await
+            .unwrap();
             assert_eq!(left, right);
-            for control in [&local, &remote] {
-                let (updates, _rx) = tokio::sync::watch::channel(aj_wire::PromptHistory::default());
-                let streamed = bounded(
-                    "streamed history",
-                    control.prompt_history(session, Some(updates)),
-                )
-                .await
-                .unwrap();
-                assert_eq!(streamed, right);
-            }
             assert!(right.incomplete.is_empty());
             if session.is_some() {
                 assert_eq!(
@@ -1073,8 +1066,18 @@ pub(crate) mod history_tests {
                 .iter()
                 .all(|row| !row.live)
         );
-        assert!(local.prompt_history(Some("missing"), None).await.is_err());
-        assert!(remote.prompt_history(Some("missing"), None).await.is_err());
+        assert!(
+            local
+                .prompt_history(Some("missing"), history_updates())
+                .await
+                .is_err()
+        );
+        assert!(
+            remote
+                .prompt_history(Some("missing"), history_updates())
+                .await
+                .is_err()
+        );
         host.shutdown().await;
         server.shutdown().await;
     }

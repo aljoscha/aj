@@ -185,9 +185,6 @@ async fn attempt(address: &HostAddress, directory: &Directory, recorder: &Record
                 | Frame::Error { .. }
                 | Frame::Reset { .. } => {}
                 Frame::Heartbeat => {}
-                // A gateway learns about VMs from its own provisioner, not from
-                // a host.
-                Frame::Vms { .. } => {}
             },
             // A kind from a newer host. Retained rather than read: forwarding it
             // to a client is what keeps an older gateway usable between newer

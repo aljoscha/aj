@@ -359,9 +359,8 @@ impl SessionDirectory {
                 let retired = self.retire_archived(&focused);
                 Redraw(changed || !retired.is_empty() || rejoined)
             }
-            // `vms` belongs to whatever renders VM state and `heartbeat` exists
-            // to keep the connection warm, so neither is the directory's to
-            // hold.
+            // `heartbeat` exists to keep the connection warm, so it is not the
+            // directory's to hold.
             _ => Redraw(false),
         }
     }
@@ -680,7 +679,6 @@ mod tests {
     use aj_agent::message::AgentMessage;
     use aj_agent::tool::TaskKind;
     use aj_models::types::{Message, UserMessage};
-    use aj_wire::QueueCounts;
     use chrono::DateTime;
 
     use super::*;
@@ -736,7 +734,6 @@ mod tests {
             settings: settings(),
             oracle_settings: None,
             credential_warning: None,
-            last_seq: 0,
         }
     }
 
@@ -775,8 +772,6 @@ mod tests {
             id: id.to_string(),
             live: true,
             working,
-            queued: QueueCounts::default(),
-            tasks: 0,
             last_seq: Some(last_seq),
             last_activity: DateTime::from_timestamp(0, 0).expect("a valid timestamp"),
             tag: None,
@@ -812,7 +807,6 @@ mod tests {
     fn refusal(session: &str, code: &str) -> Frame {
         Frame::Error {
             session: session.to_string(),
-            epoch: None,
             code: code.to_string(),
             message: format!("this peer will not serve {session}: {code}"),
         }
@@ -1053,11 +1047,9 @@ mod tests {
         let redraw = directory.apply(list(sessions));
         assert!(!redraw.0, "the same rows again are not");
 
-        // The other host-level kinds are nobody's business here.
-        for frame in [Frame::Heartbeat, Frame::Vms { vms: Vec::new() }] {
-            assert!(!directory.apply(frame).0);
-        }
-        assert_eq!(directory.rows().len(), 2, "and they leave the rows alone");
+        // The other host-level kind is nobody's business here.
+        assert!(!directory.apply(Frame::Heartbeat).0);
+        assert_eq!(directory.rows().len(), 2, "and it leaves the rows alone");
     }
 
     /// A gateway's `list` frame names the hosts it has enrolled beside the

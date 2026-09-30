@@ -5346,7 +5346,7 @@ fn spawn_history_scan(world: &World, fetch: HistoryFetch) -> HistoryFill {
         tokio::select! {
             _ = cancel.cancelled() => {},
             _ = tx.closed() => {},
-            result = control.prompt_history(session, Some(tx.clone())) => {
+            result = control.prompt_history(session, tx.clone()) => {
                 let history = match result {
                     Ok(history) => history,
                     Err(err) => {
@@ -9831,7 +9831,7 @@ mod tests {
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
             fold_ready_frames(world);
-            let quiet = world
+            let idle = world
                 .control
                 .sessions()
                 .await
@@ -9839,7 +9839,16 @@ mod tests {
                 .sessions
                 .iter()
                 .find(|entry| entry.id == world.session())
-                .is_some_and(|entry| !entry.working && entry.tasks == 0);
+                .is_some_and(|entry| !entry.working);
+            let quiet = idle
+                && world
+                    .control
+                    .tasks(world.session())
+                    .await
+                    .expect("the tasks read")
+                    .tasks
+                    .iter()
+                    .all(|task| task.status != aj_agent::tool::TaskStatus::Running);
             // The client's own view has to have caught up with the host's,
             // not just the host be idle: over a connection the frames of the
             // work that just finished can still be in flight (in process they
@@ -18836,7 +18845,6 @@ mod tests {
             settings: world.client().settings().unwrap().clone(),
             oracle_settings: None,
             credential_warning: None,
-            last_seq: 0,
         };
         let _ = world.directory.apply(frame);
         for action in [
@@ -20684,7 +20692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_history_stream_keeps_the_drawn_view_and_recalled_selection() {
+    async fn streamed_prompt_history_keeps_the_drawn_view_and_recalled_selection() {
         use crate::remote::tests::{history_event, history_peer, history_value};
 
         #[derive(Default)]
@@ -22401,7 +22409,16 @@ mod tests {
             .find(|entry| entry.id == outgoing)
             .expect("the outgoing session is still listed");
         assert!(live.live, "and the host still holds it");
-        assert_eq!(live.tasks, 1, "with its background task still running");
+        let running = world
+            .host()
+            .tasks(&outgoing)
+            .await
+            .expect("the outgoing task table")
+            .tasks
+            .iter()
+            .filter(|task| task.status == aj_agent::tool::TaskStatus::Running)
+            .count();
+        assert_eq!(running, 1, "with its background task still running");
         // The new session has its own registry, so the task is not visible
         // through the handles the frontend now holds.
         assert!(
@@ -28778,7 +28795,6 @@ mod tests {
             },
             oracle_settings: None,
             credential_warning: credential_warning.map(str::to_string),
-            last_seq: 0,
         })
         .expect("a state frame")
     }
@@ -30369,8 +30385,6 @@ mod tests {
         let script = vec![
             serde_json::to_string(&aj_wire::Frame::Error {
                 session: world.session().to_string(),
-                // The session was never resolved, so nothing minted one.
-                epoch: None,
                 code: "unknown_session".to_string(),
                 message: refusal.to_string(),
             })
@@ -30805,8 +30819,6 @@ mod tests {
             id: session.to_string(),
             live: true,
             working: false,
-            queued: aj_wire::QueueCounts::default(),
-            tasks: 0,
             last_seq: Some(0),
             last_activity: Utc::now(),
             tag: None,
@@ -30860,7 +30872,6 @@ mod tests {
     fn refusal_frame(session: &str, code: &str, message: &str) -> String {
         serde_json::to_string(&aj_wire::Frame::Error {
             session: session.to_string(),
-            epoch: None,
             code: code.to_string(),
             message: message.to_string(),
         })
@@ -30963,7 +30974,6 @@ mod tests {
         let refusal = |session: &str| {
             serde_json::to_string(&aj_wire::Frame::Error {
                 session: session.to_string(),
-                epoch: None,
                 code: "unknown_session".to_string(),
                 message: "no host serves this session any more".to_string(),
             })
@@ -32562,11 +32572,10 @@ mod tests {
                 finishing.set_status(id, TaskStatus::Killed);
             });
             assert!(
-                !remote
-                    .host
-                    .task(&session, id)
-                    .await
+                !registry
+                    .read(id)
                     .unwrap()
+                    .1
                     .stdout_tail
                     .contains("EARLY-SCROLLBACK")
             );
@@ -33190,7 +33199,11 @@ mod tests {
                 .unwrap(),
             );
             if through_gateway {
-                let history = world.control.prompt_history(None, None).await.unwrap();
+                let history = world
+                    .control
+                    .prompt_history(None, crate::remote::tests::history_updates())
+                    .await
+                    .unwrap();
                 assert_eq!(history.incomplete.len(), 1);
                 let wire = serde_json::to_string(&history).unwrap();
                 assert!(!wire.contains("history-user") && !wire.contains("history-password"));
@@ -33317,7 +33330,7 @@ mod tests {
         );
         let workspace = world
             .control
-            .prompt_history(Some(&target), None)
+            .prompt_history(Some(&target), crate::remote::tests::history_updates())
             .await
             .unwrap();
         assert_eq!(
@@ -33328,7 +33341,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [prompt.as_str(), "shared"]
         );
-        let merged = world.control.prompt_history(None, None).await.unwrap();
+        let merged = world
+            .control
+            .prompt_history(None, crate::remote::tests::history_updates())
+            .await
+            .unwrap();
         assert!(merged.incomplete.is_empty());
         let wire = serde_json::to_string(&merged).unwrap();
         assert!(!wire.contains("history-user") && !wire.contains("history-password"));
