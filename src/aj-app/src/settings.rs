@@ -10,16 +10,14 @@
 //! thin wrappers over [`Config::persist_changed`] and
 //! [`ConfigLayer::persist`].
 //!
-//! The confirm cores return the data a frontend needs to reconcile its
-//! own view (the new footer settings, whether the change applied, a row
-//! correction) without this module ever touching a rendering backend.
-//! Overlay construction and the pump/view reconcile stay in each
-//! frontend.
+//! The confirm cores return a [`ConfirmOutcome`] without touching a
+//! rendering backend. Clients learn the new settings from the host's
+//! `state` frame.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aj_agent::events::{AgentId, AgentSettings};
+use aj_agent::events::AgentId;
 use aj_conf::{
     Config, ConfigLayer, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity,
 };
@@ -638,123 +636,8 @@ pub fn persist_axis(
     }
 }
 
-/// New footer identity a frontend should surface after a main-agent
-/// settings change, plus its context-window denominator. The frontend
-/// notes it so the footer's model line and context gauge reflect the
-/// change immediately rather than waiting for the next turn.
-pub struct FooterUpdate {
-    pub settings: AgentSettings,
-    pub context_window: u64,
-}
-
-/// Result of a main or Oracle thinking or model confirm.
-///
-/// `footer` is `Some` when the change applied and the frontend should
-/// refresh the Main footer entry. It is `None` when the change did not
-/// apply (a provider rebuild failure) and the footer is left as-is.
-pub struct ModelConfirm {
-    pub footer: Option<FooterUpdate>,
-    /// The confirmation line on its own, which is also what the log
-    /// entry's projection renders.
-    pub notice: String,
-    /// Problems that do not belong on the durable settings notice: a
-    /// failed config write, a failed log record. A frontend joins them
-    /// onto the confirmation with [`Confirmation::message`]; a host
-    /// publishes them separately, because a backfill regenerates the
-    /// projected notice and nothing else.
-    pub notes: Vec<String>,
-    /// The settings entry the change appended, absent when the append
-    /// failed. A host tags the projected notice with it.
-    pub entry: Option<EntryRef>,
-}
-
-/// Result of a main-agent speed confirm.
-///
-/// Speed rebuilds the provider bundle, which can fail (e.g. a provider
-/// not in the registry). On failure nothing is staged and the frontend
-/// reverts the settings row to `previous`.
-pub enum SpeedConfirm {
-    /// The rebuild succeeded: the change is staged and logged. Carries
-    /// the new footer identity and the confirmation notice.
-    Applied {
-        footer: FooterUpdate,
-        notice: String,
-        notes: Vec<String>,
-        entry: Option<EntryRef>,
-    },
-    /// The rebuild failed: nothing staged. The frontend should revert
-    /// the speed row to `previous` and show `notice`.
-    Failed { previous: String, notice: String },
-}
-
-/// Result of a sub-agent thinking or model confirm.
-///
-/// `applied` is true only when the change was staged into the sub's
-/// override map (the target was promptable and any validation passed),
-/// which is the signal for the frontend to refresh the target's footer
-/// entry. On the not-promptable and validation-rejected paths it is
-/// false and nothing was staged.
-pub struct SubConfirm {
-    pub notice: String,
-    pub notes: Vec<String>,
-    /// The settings entry the change appended on the sub-agent's thread.
-    pub entry: Option<EntryRef>,
-    pub applied: bool,
-}
-
-/// Result of the main-agent verbosity confirm, which neither rebuilds the
-/// provider bundle nor moves the footer.
-pub struct VerbosityConfirm {
-    pub notice: String,
-    pub notes: Vec<String>,
-    pub entry: Option<EntryRef>,
-}
-
-/// A settings confirm's user-facing text: the confirmation plus whatever
-/// went wrong beside it.
-pub trait Confirmation {
-    fn notice(&self) -> &str;
-    fn notes(&self) -> &[String];
-
-    /// The confirmation with its notes appended, space-separated. What a
-    /// frontend folding one line shows.
-    fn message(&self) -> String {
-        let mut out = self.notice().to_string();
-        for note in self.notes() {
-            out.push(' ');
-            out.push_str(note);
-        }
-        out
-    }
-}
-
-macro_rules! confirmation {
-    ($ty:ty) => {
-        impl Confirmation for $ty {
-            fn notice(&self) -> &str {
-                &self.notice
-            }
-
-            fn notes(&self) -> &[String] {
-                &self.notes
-            }
-        }
-    };
-}
-
-confirmation!(ModelConfirm);
-confirmation!(SubConfirm);
-confirmation!(VerbosityConfirm);
-
-/// What a settings confirm amounts to for a caller that does not render a
-/// footer: whether the change applied, the entry it appended, and the text
-/// beside it.
-///
-/// One shape for every axis, because the axis-specific confirms each say
-/// "this did not apply" differently (a `None` footer, an `applied` flag, a
-/// `Failed` variant). A caller that destructured two of three fields would
-/// silently treat a refused change as an accepted one, which is what this
-/// exists to prevent.
+/// What a settings confirm amounts to: whether the change applied, the entry
+/// it appended, and the text beside it. Every axis answers in this one shape.
 pub struct ConfirmOutcome {
     /// False when nothing was staged: the target has no live handle, the
     /// provider bundle could not be rebuilt, validation rejected the
@@ -763,6 +646,9 @@ pub struct ConfirmOutcome {
     /// The confirmation line, which is also what the entry's projection
     /// renders, or the refusal when `applied` is false.
     pub notice: String,
+    /// Problems that do not belong on the durable settings notice: a failed
+    /// config write, a failed log record. A host publishes them separately,
+    /// because a backfill regenerates the projected notice and nothing else.
     pub notes: Vec<String>,
     /// The settings entry the change appended, absent when the change
     /// applied but the append failed (a note carries the reason) and when
@@ -770,69 +656,9 @@ pub struct ConfirmOutcome {
     pub entry: Option<EntryRef>,
 }
 
-impl From<ModelConfirm> for ConfirmOutcome {
-    fn from(confirm: ModelConfirm) -> Self {
-        Self {
-            applied: confirm.footer.is_some(),
-            notice: confirm.notice,
-            notes: confirm.notes,
-            entry: confirm.entry,
-        }
-    }
-}
-
-impl From<SubConfirm> for ConfirmOutcome {
-    fn from(confirm: SubConfirm) -> Self {
-        Self {
-            applied: confirm.applied,
-            notice: confirm.notice,
-            notes: confirm.notes,
-            entry: confirm.entry,
-        }
-    }
-}
-
-impl From<VerbosityConfirm> for ConfirmOutcome {
-    fn from(confirm: VerbosityConfirm) -> Self {
-        Self {
-            // Verbosity stages a plain field: nothing to rebuild, nothing
-            // to validate, so it cannot be refused.
-            applied: true,
-            notice: confirm.notice,
-            notes: confirm.notes,
-            entry: confirm.entry,
-        }
-    }
-}
-
-impl From<SpeedConfirm> for ConfirmOutcome {
-    fn from(confirm: SpeedConfirm) -> Self {
-        match confirm {
-            SpeedConfirm::Applied {
-                notice,
-                notes,
-                entry,
-                ..
-            } => Self {
-                applied: true,
-                notice,
-                notes,
-                entry,
-            },
-            SpeedConfirm::Failed { notice, .. } => Self {
-                applied: false,
-                notice,
-                notes: Vec::new(),
-                entry: None,
-            },
-        }
-    }
-}
-
 /// Apply a confirmed thinking pick to the selected model: stage it into the
 /// run config, record it on the session log's user thread, and persist
-/// it per `persist`. Returns the new footer identity and the notice.
-/// The frontend applies the border tint and footer note.
+/// it per `persist`.
 pub async fn confirm_thinking(
     target: ModelTarget,
     level: Option<ThinkingConfig>,
@@ -841,18 +667,14 @@ pub async fn confirm_thinking(
     config: &Arc<Mutex<Config>>,
     layers: &Arc<Mutex<ConfigLayers>>,
     core: &SessionCore,
-) -> ModelConfirm {
+) -> ConfirmOutcome {
     // Stage the new thinking effort into the loop-side snapshot; the
     // next turn applies it. Never locks the agent, so it's safe while
     // a turn is running (the in-flight turn keeps its effort; the
-    // change takes effect next turn). Read the rest of the settings
-    // identity back for the footer entry.
-    let (settings, context_window) = {
-        let mut run = run_config.lock().expect("run config mutex poisoned");
-        let cfg = target.model_mut(&mut run);
-        cfg.thinking = level.clone();
-        (cfg.settings(), cfg.model_info.context_window)
-    };
+    // change takes effect next turn).
+    target
+        .model_mut(&mut run_config.lock().expect("run config mutex poisoned"))
+        .thinking = level.clone();
     let name = thinking_level_name(&level);
     // Record the change on the session log's user thread so a later
     // resume restores this level.
@@ -873,11 +695,8 @@ pub async fn confirm_thinking(
         persist,
         &target.axis(crate::host::SettingsAxis::Thinking(level)),
     );
-    ModelConfirm {
-        footer: Some(FooterUpdate {
-            settings,
-            context_window,
-        }),
+    ConfirmOutcome {
+        applied: true,
         notice: target.notice(format!("Thinking effort set to {name}.")),
         notes: [save_note, log_note].into_iter().flatten().collect(),
         entry,
@@ -916,14 +735,14 @@ pub async fn confirm_thinking_for_sub(
     n: usize,
     tracked_model: Option<Arc<ModelInfo>>,
     core: &SessionCore,
-) -> SubConfirm {
+) -> ConfirmOutcome {
     let target = AgentId::Sub(n);
     if core.resolve_agent(target).is_none() {
-        return SubConfirm {
+        return ConfirmOutcome {
+            applied: false,
             notice: "This agent can't be prompted.".to_string(),
             notes: Vec::new(),
             entry: None,
-            applied: false,
         };
     }
     let name = thinking_level_name(&level);
@@ -948,11 +767,11 @@ pub async fn confirm_thinking_for_sub(
     if let Some(info) = target_info
         && let Err(msg) = validate_thinking_level(&info, &wire)
     {
-        return SubConfirm {
+        return ConfirmOutcome {
+            applied: false,
             notice: format!("Can't set thinking level {name:?} for agent {n}: {msg}"),
             notes: Vec::new(),
             entry: None,
-            applied: false,
         };
     }
     // Stage the standing choice; the sub's next turn applies it.
@@ -968,7 +787,7 @@ pub async fn confirm_thinking_for_sub(
         let mut log = core.log.lock().await;
         record(log.append_thinking_change(ThreadFilter::subagent(n), name))
     };
-    SubConfirm {
+    ConfirmOutcome {
         notice: format!("Thinking effort set to {name} for agent {n}."),
         notes: log_note.into_iter().collect(),
         entry,
@@ -979,8 +798,7 @@ pub async fn confirm_thinking_for_sub(
 /// Apply a confirmed model pick to the selected model: rebuild the bundle,
 /// stage it into the run config, record it on the session log's user
 /// thread, and (per `persist`) write or clear the choice in a config
-/// layer as the default for new sessions. Returns the new footer
-/// identity (or `None` on a rebuild failure) and the notice.
+/// layer as the default for new sessions. A rebuild failure stages nothing.
 pub async fn confirm_model(
     target: ModelTarget,
     info: ModelInfo,
@@ -990,7 +808,7 @@ pub async fn confirm_model(
     config: &Arc<Mutex<Config>>,
     layers: &Arc<Mutex<ConfigLayers>>,
     core: &SessionCore,
-) -> ModelConfirm {
+) -> ConfirmOutcome {
     let previous = {
         let run = run_config.lock().expect("run config mutex poisoned");
         target.model(&run).clone()
@@ -1011,18 +829,12 @@ pub async fn confirm_model(
         Ok(mut model) => {
             // Never lock the agent here. A running turn retains its bundle,
             // while the next main turn takes these staged choices.
-            let settings = {
+            {
                 let mut run = run_config.lock().expect("run config mutex poisoned");
                 run.accounts
                     .install(&mut model.stream_options, auth, &model.model_info.provider);
-                let settings = model.settings();
                 *target.model_mut(&mut run) = model;
-                settings
-            };
-            // Record the new settings identity so the footer's model
-            // line and context-window denominator reflect the swap
-            // immediately rather than waiting for the next turn.
-            let context_window = info.context_window;
+            }
             // Record the change on the session log's user thread so a
             // later resume restores this model.
             let (entry, log_note) = {
@@ -1048,11 +860,8 @@ pub async fn confirm_model(
                 persist,
                 &target.axis(crate::host::SettingsAxis::Model(info.clone())),
             );
-            ModelConfirm {
-                footer: Some(FooterUpdate {
-                    settings,
-                    context_window,
-                }),
+            ConfirmOutcome {
+                applied: true,
                 notice: target.notice(format!(
                     "Model set to {} ({}/{}).",
                     info.name, info.provider, info.id
@@ -1061,8 +870,8 @@ pub async fn confirm_model(
                 entry,
             }
         }
-        Err(err) => ModelConfirm {
-            footer: None,
+        Err(err) => ConfirmOutcome {
+            applied: false,
             notice: target.notice(format!("Failed to switch to {}: {err}", info.name)),
             notes: Vec::new(),
             entry: None,
@@ -1084,14 +893,14 @@ pub async fn confirm_model_for_sub(
     auth: &AuthStorage,
     recorded_speed: Option<Speed>,
     core: &SessionCore,
-) -> SubConfirm {
+) -> ConfirmOutcome {
     let target = AgentId::Sub(n);
     if core.resolve_agent(target).is_none() {
-        return SubConfirm {
+        return ConfirmOutcome {
+            applied: false,
             notice: "This agent can't be prompted.".to_string(),
             notes: Vec::new(),
             entry: None,
-            applied: false,
         };
     }
     let effective_speed = core
@@ -1152,7 +961,7 @@ pub async fn confirm_model_for_sub(
                     info.context_window,
                 ))
             };
-            SubConfirm {
+            ConfirmOutcome {
                 notice: format!(
                     "Model set to {} ({}/{}) for agent {n}.",
                     info.name, info.provider, info.id
@@ -1162,11 +971,11 @@ pub async fn confirm_model_for_sub(
                 applied: true,
             }
         }
-        Err(err) => SubConfirm {
+        Err(err) => ConfirmOutcome {
+            applied: false,
             notice: format!("Failed to switch to {}: {err}", info.name),
             notes: Vec::new(),
             entry: None,
-            applied: false,
         },
     }
 }
@@ -1175,10 +984,9 @@ pub async fn confirm_model_for_sub(
 /// onto the run config's stream options, persist per `persist`, and
 /// record it on the session log's user thread. Verbosity is a plain
 /// stream-option field (no headers, no bundle rebuild), so unlike
-/// [`confirm_speed`] this neither rebuilds the provider nor
-/// touches the footer. Providers gate the field on per-model support,
-/// so on a model that ignores verbosity this records the preference
-/// without changing what's sent. Returns the user-facing notice.
+/// [`confirm_speed`] this never rebuilds the provider. Providers gate the
+/// field on per-model support, so on a model that ignores verbosity this
+/// records the preference without changing what's sent.
 pub async fn confirm_verbosity(
     target: ModelTarget,
     verbosity: Option<ConfigVerbosity>,
@@ -1187,7 +995,7 @@ pub async fn confirm_verbosity(
     config: &Arc<Mutex<Config>>,
     layers: &Arc<Mutex<ConfigLayers>>,
     core: &SessionCore,
-) -> VerbosityConfirm {
+) -> ConfirmOutcome {
     let unified = verbosity.map(config_verbosity_to_unified);
     let name = verbosity_name(unified);
     {
@@ -1209,7 +1017,9 @@ pub async fn confirm_verbosity(
         persist,
         &target.axis(crate::host::SettingsAxis::Verbosity(verbosity)),
     );
-    VerbosityConfirm {
+    ConfirmOutcome {
+        // Verbosity stages a plain field, so it cannot be refused.
+        applied: true,
         notice: target.notice(format!(
             "Output verbosity set to {name}. Takes effect next turn."
         )),
@@ -1254,8 +1064,7 @@ pub fn confirm_thinking_display_for_main(
 /// at the current model so the speed-derived headers are re-stamped,
 /// stage it into the run config, persist per `persist`, and record on
 /// the session log's user thread. On a rebuild failure (e.g. scripted
-/// mode, whose provider isn't in the registry) nothing is staged and
-/// the caller reverts the settings row via [`SpeedConfirm::Failed`].
+/// mode, whose provider isn't in the registry) nothing is staged.
 pub async fn confirm_speed(
     target: ModelTarget,
     speed: Option<Speed>,
@@ -1265,14 +1074,13 @@ pub async fn confirm_speed(
     config: &Arc<Mutex<Config>>,
     layers: &Arc<Mutex<ConfigLayers>>,
     core: &SessionCore,
-) -> SpeedConfirm {
+) -> ConfirmOutcome {
     let name = speed_name(speed);
-    let (model_info, prev_speed, display, verbosity) = {
+    let (model_info, display, verbosity) = {
         let run = run_config.lock().expect("run config mutex poisoned");
         let cfg = target.model(&run);
         (
             (*cfg.model_info).clone(),
-            cfg.speed,
             cfg.thinking_display,
             cfg.stream_options.verbosity,
         )
@@ -1289,7 +1097,7 @@ pub async fn confirm_speed(
             stream_options.verbosity = verbosity;
             // Stage into the loop-side snapshot; the next turn applies
             // it. Never locks the agent, so it's safe mid-turn.
-            let (settings, context_window) = {
+            {
                 let mut run = run_config.lock().expect("run config mutex poisoned");
                 let accounts = run.accounts.clone();
                 let cfg = target.model_mut(&mut run);
@@ -1298,8 +1106,7 @@ pub async fn confirm_speed(
                 cfg.stream_options = stream_options;
                 cfg.speed = speed;
                 accounts.install(&mut cfg.stream_options, auth, &cfg.model_info.provider);
-                (cfg.settings(), cfg.model_info.context_window)
-            };
+            }
             // Record the change on the session log's user thread so a
             // later resume restores this speed.
             let (entry, log_note) = {
@@ -1315,19 +1122,18 @@ pub async fn confirm_speed(
                 persist,
                 &target.axis(crate::host::SettingsAxis::Speed(speed)),
             );
-            SpeedConfirm::Applied {
-                footer: FooterUpdate {
-                    settings,
-                    context_window,
-                },
+            ConfirmOutcome {
+                applied: true,
                 notice: target.notice(format!("Speed set to {name}. Takes effect next turn.")),
                 notes: [save_note, log_note].into_iter().flatten().collect(),
                 entry,
             }
         }
-        Err(err) => SpeedConfirm::Failed {
-            previous: speed_name(prev_speed).to_string(),
+        Err(err) => ConfirmOutcome {
+            applied: false,
             notice: target.notice(format!("Failed to set speed {name}: {err}")),
+            notes: Vec::new(),
+            entry: None,
         },
     }
 }

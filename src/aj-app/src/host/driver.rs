@@ -794,17 +794,18 @@ impl Driver {
             (
                 SettingsAxis::Thinking(level) | SettingsAxis::OracleThinking(level),
                 AgentId::Main,
-            ) => crate::settings::confirm_thinking(
-                target,
-                level,
-                persist,
-                &core.run_config,
-                &shared.config,
-                &shared.layers,
-                core,
-            )
-            .await
-            .into(),
+            ) => {
+                crate::settings::confirm_thinking(
+                    target,
+                    level,
+                    persist,
+                    &core.run_config,
+                    &shared.config,
+                    &shared.layers,
+                    core,
+                )
+                .await
+            }
             (SettingsAxis::Thinking(level), AgentId::Sub(n)) => {
                 let tracked = self.sub_settings(n).await.model.and_then(|key| {
                     self.shared
@@ -814,9 +815,7 @@ impl Driver {
                         .cloned()
                         .map(Arc::new)
                 });
-                crate::settings::confirm_thinking_for_sub(level, n, tracked, core)
-                    .await
-                    .into()
+                crate::settings::confirm_thinking_for_sub(level, n, tracked, core).await
             }
             (SettingsAxis::ThinkingDisplay(display), AgentId::Main) => {
                 transient_confirmation = true;
@@ -840,7 +839,6 @@ impl Driver {
                     core,
                 )
                 .await
-                .into()
             }
             (SettingsAxis::Model(info), AgentId::Sub(n)) => {
                 let speed = self
@@ -850,9 +848,7 @@ impl Driver {
                     .as_deref()
                     .and_then(aj_models::speed_from_name)
                     .flatten();
-                crate::settings::confirm_model_for_sub(&info, n, &shared.auth, speed, core)
-                    .await
-                    .into()
+                crate::settings::confirm_model_for_sub(&info, n, &shared.auth, speed, core).await
             }
             (SettingsAxis::Speed(speed) | SettingsAxis::OracleSpeed(speed), AgentId::Main) => {
                 crate::settings::confirm_speed(
@@ -866,22 +862,22 @@ impl Driver {
                     core,
                 )
                 .await
-                .into()
             }
             (
                 SettingsAxis::Verbosity(verbosity) | SettingsAxis::OracleVerbosity(verbosity),
                 AgentId::Main,
-            ) => crate::settings::confirm_verbosity(
-                target,
-                verbosity,
-                persist,
-                &core.run_config,
-                &shared.config,
-                &shared.layers,
-                core,
-            )
-            .await
-            .into(),
+            ) => {
+                crate::settings::confirm_verbosity(
+                    target,
+                    verbosity,
+                    persist,
+                    &core.run_config,
+                    &shared.config,
+                    &shared.layers,
+                    core,
+                )
+                .await
+            }
             (
                 SettingsAxis::OracleModel(_)
                 | SettingsAxis::OracleThinking(_)
