@@ -244,7 +244,7 @@ impl ThemeColor {
         }
     }
 
-    /// Full closed enumeration. Used by [`Theme::from_json`] to
+    /// Full closed enumeration. Used by [`Theme::from_json_with_mode`] to
     /// iterate the schema keys when populating the resolved map.
     fn all() -> &'static [ThemeColor] {
         &[
@@ -356,7 +356,7 @@ impl ThemeBg {
         }
     }
 
-    /// Full closed enumeration. Used by [`Theme::from_json`] to
+    /// Full closed enumeration. Used by [`Theme::from_json_with_mode`] to
     /// iterate the schema keys when populating the resolved map.
     fn all() -> &'static [ThemeBg] {
         &[
@@ -698,14 +698,6 @@ impl Theme {
         self.bg.get(&token).copied().unwrap_or(ThemeRgb::Default)
     }
 
-    /// Parse a JSON theme document. The default [`ColorMode`] is
-    /// detected from the environment; pass a specific mode via
-    /// [`Theme::from_json_with_mode`] from tests so output stays
-    /// deterministic.
-    pub fn from_json(label: &str, json: &str) -> Result<Self, ThemeError> {
-        Self::from_json_with_mode(label, json, ColorMode::detect())
-    }
-
     /// Parse a JSON theme document with an explicit color mode.
     pub fn from_json_with_mode(
         label: &str,
@@ -747,23 +739,10 @@ impl Theme {
         })
     }
 
-    /// Load the theme `name`. The lookup order is:
-    /// 1. The bundled catalog (`dark`, `light`).
-    /// 2. `~/.aj/themes/<name>.json` if the file exists.
-    ///
-    /// User themes can override built-ins by living in the user
-    /// themes dir under the same name. On parse error this falls
-    /// back to the bundled `dark` palette so the binary always
-    /// comes up with a working theme.
-    pub fn load(name: &str) -> Theme {
-        Self::load_with_mode(name, ColorMode::detect())
-    }
-
-    /// Like [`Theme::load`] but with an explicit [`ColorMode`]. A
-    /// frontend that resolves the terminal's true-color capability
-    /// after startup (e.g. from an async DA1 probe) uses this to load
-    /// the palette at the detected boundary instead of the env-based
-    /// [`ColorMode::detect`] guess.
+    /// Load the theme `name` at `mode`. `~/.aj/themes/<name>.json` wins
+    /// when it exists, so user themes can override the bundled catalog by
+    /// name. On any load error this falls back to the bundled `dark`
+    /// palette so the binary always comes up with a working theme.
     pub fn load_with_mode(name: &str, mode: ColorMode) -> Theme {
         match Self::load_strict_with_mode(name, mode) {
             Ok(theme) => theme,
@@ -774,15 +753,8 @@ impl Theme {
         }
     }
 
-    /// Like [`Theme::load`] but returns the error instead of
-    /// falling back. Tests use this so a malformed bundle fails
-    /// noisily; production code uses [`Theme::load`] for
-    /// resilience.
-    pub fn load_strict(name: &str) -> Result<Theme, ThemeError> {
-        Self::load_strict_with_mode(name, ColorMode::detect())
-    }
-
-    /// Like [`Theme::load_strict`] but with an explicit [`ColorMode`].
+    /// Like [`Theme::load_with_mode`] but returns the error instead of
+    /// falling back.
     pub fn load_strict_with_mode(name: &str, mode: ColorMode) -> Result<Theme, ThemeError> {
         // User dir wins so a user can override the bundled themes
         // by name. We still need to fail open: a missing user
@@ -822,21 +794,9 @@ impl Theme {
             .expect("bundled light.json must parse cleanly")
     }
 
-    /// The bundled `dark` palette at the detected color mode. Used as
-    /// the safe fallback when a named theme fails to load.
-    pub fn bundled_dark() -> Theme {
-        Self::bundled_dark_with_mode(ColorMode::detect())
-    }
-
-    /// The bundled `light` palette at the detected color mode.
-    pub fn bundled_light() -> Theme {
-        Self::bundled_light_with_mode(ColorMode::detect())
-    }
-
     /// List the theme names known to the loader: every built-in
-    /// plus every `*.json` file in the user themes directory. Used
-    /// by future `/theme` selector autocomplete; the loader doesn't
-    /// otherwise care about discovery.
+    /// plus every `*.json` file in the user themes directory, for the
+    /// settings window's theme picker.
     pub fn available() -> Vec<String> {
         let mut names: Vec<String> = vec![
             "dark".to_string(),
@@ -1189,20 +1149,20 @@ mod tests {
 
     #[test]
     fn load_bundled_names() {
-        // `Theme::load` consults the user dir first; absent any
+        // `Theme::load_with_mode` consults the user dir first; absent any
         // file there it falls back to the bundled name. We test
         // the success path: both bundled names yield themes.
-        let dark = Theme::load("dark");
+        let dark = Theme::load_with_mode("dark", ColorMode::Truecolor);
         assert_eq!(dark.name(), "dark");
-        let light = Theme::load("light");
+        let light = Theme::load_with_mode("light", ColorMode::Truecolor);
         assert_eq!(light.name(), "light");
     }
 
     #[test]
     fn load_unknown_name_falls_back_to_dark() {
-        // The user-friendly `load` swallows errors and uses dark
+        // The user-friendly load swallows errors and uses dark
         // so the binary never fails to come up due to a typo.
-        let theme = Theme::load("definitely-not-a-real-theme-name");
+        let theme = Theme::load_with_mode("definitely-not-a-real-theme-name", ColorMode::Truecolor);
         assert_eq!(theme.name(), "dark");
     }
 
@@ -1290,9 +1250,9 @@ mod tests {
 
     #[test]
     fn theme_handle_name_tracks_replacement() {
-        let handle = ThemeHandle::new(Theme::bundled_dark());
+        let handle = ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor));
         assert_eq!(handle.name(), "dark");
-        handle.replace(Theme::bundled_light());
+        handle.replace(Theme::bundled_light_with_mode(ColorMode::Truecolor));
         assert_eq!(handle.name(), "light");
     }
 

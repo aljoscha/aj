@@ -432,16 +432,6 @@ fn format_numbered_lines(lines: &[&str], first_line: usize) -> String {
         .join("\n")
 }
 
-/// Formats a slice beginning at source line one with the display body's
-/// established final newline.
-pub fn format_for_display(lines: &[&str]) -> String {
-    let mut body = format_numbered_lines(lines, 1);
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    body
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{BufWriter, Write};
@@ -554,11 +544,6 @@ mod tests {
         assert!(display.contains("    1: line 1"), "display: {display:?}");
         assert!(display.contains("   10: line 10"), "display: {display:?}");
         assert_display_is_content_plus_newline(&outcome);
-        assert_eq!(
-            format_for_display(&["a", "b"]),
-            "    1: a\n    2: b\n",
-            "the public line-one formatter keeps its established output",
-        );
     }
 
     #[tokio::test]

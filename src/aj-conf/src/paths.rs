@@ -220,16 +220,6 @@ impl Config {
         Ok(logs_dir.join("aj.log"))
     }
 
-    /// Path to the base directory holding every project's sessions
-    /// subdirectory: `~/.aj/sessions`. Each immediate subdirectory is
-    /// one project (named via `path_to_dir_name`). The prompt-history
-    /// "all workspaces" search walks these. Unlike
-    /// [`Self::get_sessions_dir_path`] this does not create or descend
-    /// into a per-project directory. It just resolves the base path.
-    pub fn get_sessions_base_dir_path() -> Result<PathBuf, ConfigError> {
-        Ok(Self::get_config_dir()?.join("sessions"))
-    }
-
     /// Path to `~/.aj/gateway.toml`, the gateway's static configuration.
     ///
     /// Creates the `~/.aj` directory but not the file: a gateway with no

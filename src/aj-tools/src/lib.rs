@@ -21,12 +21,7 @@ pub mod testing;
 pub mod tools;
 pub mod truncate;
 
-/// Compatibility path for terminal-output sanitization.
-pub mod sanitize {
-    pub use aj_agent::sanitize_terminal_output;
-}
-
-pub use sanitize::sanitize_terminal_output;
+pub use aj_agent::sanitize_terminal_output;
 
 use std::path::PathBuf;
 
@@ -71,7 +66,7 @@ impl Default for BuiltinToolOptions {
 
 /// Build the catalog of every builtin tool, unfiltered.
 ///
-/// Most callers want [`builtin_tools`], which applies the user's
+/// Most callers want [`builtin_tools_for_model`], which applies the user's
 /// disabled-tools set. This raw catalog is for callers that need the
 /// full list regardless of config (e.g. argument-name completion).
 pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefinition> {
@@ -95,8 +90,10 @@ pub fn uses_apply_patch(family: Option<&str>) -> bool {
     family.is_some_and(|family| family == "gpt" || family.starts_with("gpt-"))
 }
 
-/// Build the builtin catalog for a model family and apply the user's
-/// disabled-tools set.
+/// Build the builtin catalog for a model family with the user's
+/// `disabled_tools` names filtered out, ready for `Agent::with_provider`.
+/// Sub-agents inherit the filtered list (minus the `agent` and `oracle`
+/// tools) by cloning.
 ///
 /// GPT-family models get the Codex-style patch tool. Other families keep
 /// the string-replacement and whole-file editors they are trained to use.
@@ -118,22 +115,6 @@ pub fn builtin_tools_for_model(
     filter_disabled(tools, disabled)
 }
 
-/// Build the builtin tool catalog with the user's disabled tools
-/// filtered out, ready for `Agent::with_provider`.
-///
-/// `disabled` is the `disabled_tools` name set from
-/// `~/.aj/config.toml`. Filtering behind this one seam keeps the
-/// name-set contract in a single place rather than re-applied at each
-/// frontend's call site. The agent never advertises a filtered tool
-/// to the model; sub-agents inherit the filtered list (minus the
-/// `agent` and `oracle` tools) by cloning.
-pub fn builtin_tools(
-    options: &BuiltinToolOptions,
-    disabled: &[String],
-) -> Vec<ErasedToolDefinition> {
-    filter_disabled(get_builtin_tools(options), disabled)
-}
-
 fn filter_disabled(
     mut tools: Vec<ErasedToolDefinition>,
     disabled: &[String],
@@ -150,37 +131,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_compatibility_path_matches_root_export() {
-        assert_eq!(
-            sanitize::sanitize_terminal_output("\x1b[31mtext\x1b[0m"),
-            sanitize_terminal_output("\x1b[31mtext\x1b[0m")
-        );
-    }
-
-    #[test]
-    fn builtin_tools_empty_disabled_is_full_catalog() {
-        let opts = BuiltinToolOptions::default();
-        let all = get_builtin_tools(&opts).len();
-        assert_eq!(builtin_tools(&opts, &[]).len(), all);
-    }
-
-    #[test]
-    fn builtin_tools_drops_disabled_names() {
+    fn builtin_tools_drop_disabled_names() {
         let opts = BuiltinToolOptions::default();
         let disabled = vec!["bash".to_string(), "write_file".to_string()];
-        let tools = builtin_tools(&opts, &disabled);
+        let tools = builtin_tools_for_model(&opts, &disabled, None);
         assert!(
             tools.iter().all(|t| !disabled.contains(&t.name)),
             "disabled tools must not appear in the catalog"
         );
-        assert_eq!(tools.len(), get_builtin_tools(&opts).len() - disabled.len());
+        assert_eq!(
+            tools.len(),
+            builtin_tools_for_model(&opts, &[], None).len() - disabled.len()
+        );
     }
 
     #[test]
     fn builtin_tools_ignores_unknown_disabled_names() {
         let opts = BuiltinToolOptions::default();
-        let tools = builtin_tools(&opts, &["no_such_tool".to_string()]);
-        assert_eq!(tools.len(), get_builtin_tools(&opts).len());
+        let tools = builtin_tools_for_model(&opts, &["no_such_tool".to_string()], None);
+        assert_eq!(tools.len(), builtin_tools_for_model(&opts, &[], None).len());
     }
 
     #[test]

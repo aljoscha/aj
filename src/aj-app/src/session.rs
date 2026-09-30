@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_agent::bus::{EventSubscriptions, SubscriptionHandle};
-use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+use aj_agent::events::{AgentId, AgentSettings};
 use aj_agent::queue::MessageQueues;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TaskRegistry};
 use aj_conf::{AgentEnv, Config};
@@ -416,9 +416,8 @@ impl SessionCore {
 
         // Bus subscriptions: the persistence listener writes events into
         // the log. Seeding never emits bus events, so subscription order
-        // relative to it is immaterial. A frontend adds its own sink
-        // through [`Self::subscribe_channel`], and a session host swaps
-        // the listener for the tagging forwarder (see
+        // relative to it is immaterial. A session host swaps the
+        // listener for the tagging forwarder (see
         // [`Self::install_persisting_forwarder`]).
         let session_id = log.session_id().to_string();
 
@@ -460,26 +459,6 @@ impl SessionCore {
             .lock()
             .expect("recovery notice mutex poisoned")
             .take()
-    }
-
-    /// Subscribe a channel sink to the session's event bus.
-    ///
-    /// The returned handle owns the subscription: dropping it detaches the
-    /// sink. Goes through the retained subscription handle, so it needs no agent
-    /// lock and is safe to call while a turn holds the agent.
-    pub fn subscribe_channel(&self) -> (SubscriptionHandle, UnboundedReceiver<AgentEvent>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = self
-            .subscriptions
-            .subscribe(aj_agent::bus::listener_from_sync(
-                move |event: &AgentEvent| {
-                    // A hung-up receiver is the consumer losing interest, not
-                    // an agent-level error: dropping the event keeps the turn
-                    // making progress.
-                    let _ = tx.send(event.clone());
-                },
-            ));
-        (handle, rx)
     }
 
     /// Replace the plain persistence listener with the tagging forwarder and

@@ -28,8 +28,8 @@ pub enum LaunchEnvError {
 
 /// Top-level CLI for the `aj` binary.
 ///
-/// Construct this type through [`Args::parse`], [`Args::parse_from`],
-/// [`Args::try_parse`], or [`Args::try_parse_from`]. The `clap::Args` trait is
+/// Construct this type through [`Args::parse`], [`Args::parse_from`], or
+/// [`Args::try_parse_from`]. The `clap::Args` trait is
 /// an implementation detail used to flatten these fields into the private root
 /// parser. It is not a supported construction boundary because clap's
 /// `ArgMatches` representation has already discarded outer occurrences of
@@ -232,12 +232,6 @@ impl Args {
     /// `--allow` occurrence across subcommand boundaries.
     pub fn parse() -> Self {
         Self::parse_from(std::env::args_os())
-    }
-
-    /// Parse the process command line, returning clap's normal diagnostic on
-    /// failure.
-    pub fn try_parse() -> Result<Self, clap::Error> {
-        Self::try_parse_from(std::env::args_os())
     }
 
     /// Parse `argv`, exiting with clap's normal diagnostic on failure.

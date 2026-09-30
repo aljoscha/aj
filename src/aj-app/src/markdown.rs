@@ -4,9 +4,7 @@
 //! each row is a sequence of [`StyledSpan`]s tagged with a semantic
 //! [`SpanKind`] and a set of [`Emphasis`] bits. Styling (the concrete
 //! colors and SGR attributes) is left to the consuming frontend, which
-//! keeps this crate free of any TUI backend while both frontends render
-//! the same markdown shape. This mirrors the neutral-output pattern used
-//! by [`crate::diff`].
+//! keeps this crate free of any TUI backend.
 //!
 //! Why a flat role-tagged model. A terminal frontend ultimately paints
 //! rows of styled cells, so the shared layer does all the layout work
