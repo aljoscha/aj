@@ -1280,8 +1280,8 @@ impl Driver {
             .expect("sub overrides mutex poisoned")
             .clear();
         // Terminal entries and undelivered notices of the branch being
-        // left. A client refetches the table after `caught_up` and would
-        // otherwise be handed the other branch's tasks.
+        // left. The re-attach's `caught_up` carries the table and would
+        // otherwise hand a client the other branch's tasks.
         self.session.core.task_registry.clear();
     }
 

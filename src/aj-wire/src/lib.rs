@@ -1475,10 +1475,15 @@ pub enum Frame {
         /// omit it, and older hosts decode as `None`.
         credential_warning: Option<String>,
     },
+    /// Ends an attach block. Carries the session's background tasks and
+    /// pending messages as of the block, because neither is in the log and a
+    /// backfill cannot regenerate them.
     CaughtUp {
         session: String,
         epoch: String,
         last_seq: u64,
+        tasks: TaskTable,
+        queues: QueueState,
     },
     List {
         sessions: Vec<SessionSummary>,
@@ -1650,6 +1655,8 @@ enum FrameRef<'a> {
         session: &'a str,
         epoch: &'a str,
         last_seq: u64,
+        tasks: &'a [TaskSummary],
+        queues: &'a [AgentQueue],
     },
     List {
         sessions: &'a [SessionSummary],
@@ -1704,10 +1711,14 @@ impl Serialize for Frame {
                 session,
                 epoch,
                 last_seq,
+                tasks,
+                queues,
             } => FrameRef::CaughtUp {
                 session,
                 epoch,
                 last_seq: *last_seq,
+                tasks: &tasks.tasks,
+                queues: &queues.queues,
             },
             Self::List { sessions, hosts } => FrameRef::List { sessions, hosts },
             Self::Error {
@@ -1808,11 +1819,15 @@ impl<'de> Deserialize<'de> for Frame {
                     session,
                     epoch,
                     last_seq,
+                    tasks,
+                    queues,
                 } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
                 Ok(Self::CaughtUp {
                     session,
                     epoch,
                     last_seq,
+                    tasks: TaskTable { tasks },
+                    queues: QueueState { queues },
                 })
             }
             "list" => {
@@ -1873,6 +1888,8 @@ struct CaughtUpFrameFields {
     session: String,
     epoch: String,
     last_seq: u64,
+    tasks: Vec<TaskSummary>,
+    queues: Vec<AgentQueue>,
 }
 
 #[derive(Deserialize)]

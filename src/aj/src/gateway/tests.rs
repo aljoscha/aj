@@ -6777,6 +6777,8 @@ fn caught_up_frame(session: &str, epoch: &str, last_seq: u64) -> String {
         session: session.to_string(),
         epoch: epoch.to_string(),
         last_seq,
+        tasks: Default::default(),
+        queues: Default::default(),
     })
     .expect("a caught_up frame")
 }

@@ -616,7 +616,8 @@ impl ChatState {
         &self.tasks
     }
 
-    /// Replaces the background-task model from the authoritative task read.
+    /// Replaces the background-task model from an authoritative table, the
+    /// one an attach block's `caught_up` carries.
     pub fn replace_tasks(&mut self, table: TaskTable) {
         let wall_now = Utc::now();
         let now = Instant::now();
@@ -653,8 +654,8 @@ impl ChatState {
     /// A live client badges a cell from `TaskStart`, which is transient: a
     /// client that attached after the launch never sees it, so without this
     /// its launch cell would stay unbadged even though it knows the task
-    /// exists. The read is authoritative for the whole session, so a badge
-    /// naming a task the read does not list is stale and goes.
+    /// exists. The table is authoritative for the whole session, so a badge
+    /// naming a task it does not list is stale and goes.
     fn rebadge_launch_cells(&mut self) {
         let badges: HashMap<(AgentId, &str), TaskId> = self
             .tasks
@@ -675,7 +676,8 @@ impl ChatState {
         &self.queue
     }
 
-    /// Replaces the queue model from the authoritative queue read.
+    /// Replaces the queue model from an authoritative snapshot, the one an
+    /// attach block's `caught_up` carries.
     pub fn replace_queue(&mut self, queue: QueueState) {
         self.queue = queue;
     }
@@ -1067,9 +1069,9 @@ mod tests {
         }
     }
 
-    /// The badge a live client gets from `TaskStart` is re-derived from the
-    /// task read, so a client that attached after the launch renders the same
-    /// cell. A badge the read does not account for is stale and goes.
+    /// The badge a live client gets from `TaskStart` is re-derived from a
+    /// replaced task table, so a client that attached after the launch renders
+    /// the same cell. A badge the table does not account for is stale and goes.
     #[test]
     fn replacing_the_task_table_rebadges_the_launch_cells() {
         let mut chat = chat_state();

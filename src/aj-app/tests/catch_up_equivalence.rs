@@ -152,6 +152,8 @@ fn caught_up_frame(epoch: &str, last_seq: u64) -> Frame {
         session: SESSION.to_string(),
         epoch: epoch.to_string(),
         last_seq,
+        tasks: Default::default(),
+        queues: Default::default(),
     }
 }
 

@@ -44,7 +44,31 @@
     "kind": "caught_up",
     "session": "session-1",
     "epoch": "epoch-1",
-    "last_seq": 7
+    "last_seq": 7,
+    "tasks": [
+      {
+        "id": 1,
+        "owner": "main",
+        "call_id": "call-2",
+        "kind": { "bash": { "command": "printf hi" } },
+        "label": "printf hi",
+        "status": { "exited": 0 },
+        "started_at": "2026-01-02T03:04:05Z"
+      }
+    ],
+    "queues": [
+      {
+        "agent_id": "main",
+        "steering": [
+          {
+            "role": "user",
+            "content": [{ "type": "text", "text": "steer" }],
+            "timestamp": 12
+          }
+        ],
+        "follow_up": []
+      }
+    ]
   },
   {
     "kind": "list",

@@ -30,8 +30,8 @@ use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{
     AccountList, AccountRequest, ArchiveRequest, CancelRequest, CompactRequest,
     CreateSessionRequest, EnvRequest, Frame, HeadRequest, ModelSelection, PromptInput,
-    PromptRequest, QueueOperation, QueueRequest, QueueState, SessionList, SessionSettings,
-    SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskTable,
+    PromptRequest, QueueOperation, QueueRequest, SessionList, SessionSettings, SessionTree,
+    SettingsRequest, SteerRequest, TagRequest,
 };
 use futures::{FutureExt, StreamExt};
 use reqwest::StatusCode;
@@ -471,13 +471,6 @@ impl Control {
         }
     }
 
-    pub(crate) async fn tasks(&self, session: &str) -> Result<TaskTable, ControlError> {
-        match self {
-            Self::Local(local) => Ok(local.host.tasks(session).await?),
-            Self::Remote(remote) => Ok(remote.client.tasks(session).await?),
-        }
-    }
-
     /// The host's non-secret account choices for a provider and this session's pin.
     pub(crate) async fn accounts(
         &self,
@@ -487,13 +480,6 @@ impl Control {
         match self {
             Self::Local(local) => Ok(local.host.accounts(session, provider).await?),
             Self::Remote(remote) => Ok(remote.client.accounts(session, provider).await?),
-        }
-    }
-
-    pub(crate) async fn queue(&self, session: &str) -> Result<QueueState, ControlError> {
-        match self {
-            Self::Local(local) => Ok(local.host.queue(session).await?),
-            Self::Remote(remote) => Ok(remote.client.queue(session).await?),
         }
     }
 

@@ -235,6 +235,8 @@ fn snapshots_drop_but_durable_reliable_and_unknown_frames_evict() {
             session: "s".into(),
             epoch: "e".into(),
             last_seq: 1,
+            tasks: Default::default(),
+            queues: Default::default(),
         },
         Frame::Reset {
             session: "s".into(),

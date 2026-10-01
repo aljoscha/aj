@@ -742,6 +742,8 @@ mod tests {
             session: session.to_string(),
             epoch: EPOCH.to_string(),
             last_seq,
+            tasks: Default::default(),
+            queues: Default::default(),
         }
     }
 

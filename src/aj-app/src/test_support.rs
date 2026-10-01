@@ -643,7 +643,7 @@ fn agent_order(id: AgentId) -> (u8, usize) {
 ///
 /// Sorted rather than taken as given, because the two sources of a client's
 /// queue disagree on order: `QueueUpdate` frames arrive in mutation order
-/// and the queue read answers main first.
+/// and `caught_up` lists main first.
 fn canonical_queue(queue: &QueueState) -> Vec<CanonicalQueue> {
     let mut queues: Vec<CanonicalQueue> = queue
         .queues
@@ -968,6 +968,8 @@ mod tests {
                 session: session.to_string(),
                 epoch: epoch.to_string(),
                 last_seq: 0,
+                tasks: Default::default(),
+                queues: Default::default(),
             },
         );
         let _ = client.apply(

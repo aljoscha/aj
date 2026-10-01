@@ -193,10 +193,9 @@ fn router(state: Arc<ServerState>) -> Router {
             "/v1/sessions/{id}/prompt-history/stream",
             get(prompt_history),
         )
-        .route("/v1/sessions/{id}/tasks", get(tasks))
         .route("/v1/sessions/{id}/tasks/{task_id}/output", get(task_output))
         .route("/v1/sessions/{id}/tasks/{task_id}/kill", post(kill_task))
-        .route("/v1/sessions/{id}/queue", get(queue).post(queue_command))
+        .route("/v1/sessions/{id}/queue", post(queue_command))
         .route("/v1/sessions/{id}/tree", get(tree))
         .route("/v1/sessions/{id}/info", get(session_info))
         .route("/v1/sessions/{id}/export", get(export_html))
@@ -304,13 +303,6 @@ async fn create_session(
     Ok(Json(created).into_response())
 }
 
-async fn tasks(
-    State(state): State<Arc<ServerState>>,
-    Path(session): Path<String>,
-) -> Result<Response, ApiError> {
-    Ok(Json(state.host.tasks(&session).await?).into_response())
-}
-
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskOutputQuery {
@@ -339,13 +331,6 @@ async fn kill_task(
             .command(&session, Command::KillTask { task })
             .await?,
     )
-}
-
-async fn queue(
-    State(state): State<Arc<ServerState>>,
-    Path(session): Path<String>,
-) -> Result<Response, ApiError> {
-    Ok(Json(state.host.queue(&session).await?).into_response())
 }
 
 /// Withdraw one agent's pending message, or clear the session's queues.

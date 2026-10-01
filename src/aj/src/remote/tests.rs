@@ -52,8 +52,8 @@ use aj_session::ConversationPersistence;
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedFrame,
     ErrorResponse, Frame, HeadRequest, ModelSelection, PROTOCOL_VERSION, PromptInput,
-    PromptRequest, QueueOperation, QueueRequest, QueueState, SessionSettings, SessionSummary,
-    SettingsRequest, SteerRequest, TagRequest, TaskTable,
+    PromptRequest, QueueOperation, QueueRequest, SessionSettings, SessionSummary, SettingsRequest,
+    SteerRequest, TagRequest,
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -881,9 +881,9 @@ impl Fixture {
 
 /// How one client reaches the host: in process, or over HTTP.
 ///
-/// Both arms carry the attach path and the two reads a client owes after
-/// `caught_up`, which is what lets one fold run against either
-/// transport and be compared against the other.
+/// Both arms carry the attach path and the session row a settling client
+/// reads, which is what lets one fold run against either transport and be
+/// compared against the other.
 enum Transport {
     Local(SessionHost),
     Remote(RemoteClient),
@@ -908,20 +908,6 @@ impl Transport {
             Self::Remote(client) => {
                 Source::Remote(client.events(&requests).await.expect("attach over http"))
             }
-        }
-    }
-
-    async fn tasks(&self, session: &str) -> TaskTable {
-        match self {
-            Self::Local(host) => host.tasks(session).await.expect("the tasks read"),
-            Self::Remote(client) => client.tasks(session).await.expect("the tasks read"),
-        }
-    }
-
-    async fn queue(&self, session: &str) -> QueueState {
-        match self {
-            Self::Local(host) => host.queue(session).await.expect("the queue read"),
-            Self::Remote(client) => client.queue(session).await.expect("the queue read"),
         }
     }
 
@@ -1041,7 +1027,7 @@ impl Attached {
             };
             let stop = done(&frame);
             seen.push(frame.clone());
-            self.apply(frame).await;
+            self.apply(frame);
             if stop {
                 return seen;
             }
@@ -1056,7 +1042,7 @@ impl Attached {
     async fn pump_frames(&mut self, count: usize) -> usize {
         for folded in 0..count {
             match tokio::time::timeout(QUIET, self.source.recv()).await {
-                Ok(Some(frame)) => self.apply(frame).await,
+                Ok(Some(frame)) => self.apply(frame),
                 Ok(None) | Err(_) => return folded,
             }
         }
@@ -1140,7 +1126,7 @@ impl Attached {
     async fn fold_one(&mut self, what: &str) -> bool {
         match tokio::time::timeout(QUIET, self.source.recv()).await {
             Ok(Some(frame)) => {
-                self.apply(frame).await;
+                self.apply(frame);
                 true
             }
             Ok(None) => {
@@ -1150,7 +1136,7 @@ impl Attached {
         }
     }
 
-    async fn apply(&mut self, frame: Frame) {
+    fn apply(&mut self, frame: Frame) {
         match &frame {
             // A block delivers whole and says so at its own mark.
             Frame::CaughtUp { last_seq, .. } => self.delivered = Some(*last_seq),
@@ -1161,22 +1147,6 @@ impl Attached {
             _ => {}
         }
         let _ = self.client.apply(&mut self.chat, frame);
-        // Neither task events nor queue updates are replayable, so every
-        // `caught_up` leaves both reads outstanding. A real
-        // client discharges them right there, and so does this one.
-        self.discharge().await;
-    }
-
-    async fn discharge(&mut self) {
-        let session = self.client.session().to_string();
-        if self.client.needs_task_refetch() {
-            let tasks = self.transport.tasks(&session).await;
-            self.client.set_tasks(&mut self.chat, tasks);
-        }
-        if self.client.needs_queue_refetch() {
-            let queue = self.transport.queue(&session).await;
-            self.client.set_queue(&mut self.chat, queue);
-        }
     }
 
     fn canonical(&self) -> CanonicalState {
@@ -1768,33 +1738,13 @@ async fn a_model_change_resolves_against_the_host_catalog() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_reads_answer_tasks_queue_and_tree() {
+async fn the_tree_read_and_the_queue_withdrawal_answer() {
     let fixture = Fixture::new(vec![finalized_text_message("answered")]).await;
     let session = fixture.create().await;
     let mut remote = fixture.remote(&session).await;
     fixture.prompt(&session, "hi").await;
     remote.settle().await;
 
-    assert!(
-        fixture
-            .client
-            .tasks(&session)
-            .await
-            .expect("the tasks read")
-            .tasks
-            .is_empty(),
-        "this turn started no background task",
-    );
-    assert!(
-        fixture
-            .client
-            .queue(&session)
-            .await
-            .expect("the queue read")
-            .queues
-            .is_empty(),
-        "nothing is pending",
-    );
     let tree = fixture.client.tree(&session).await.expect("the tree read");
     assert!(!tree.segments.is_empty(), "the log has a branch tree");
 
@@ -1807,12 +1757,10 @@ async fn the_reads_answer_tasks_queue_and_tree() {
         .await
         .expect("live session");
     handles.queues.append_follow_up(AgentId::Main, "leftover");
-    let pending = fixture
-        .client
-        .queue(&session)
-        .await
-        .expect("the queue read");
-    assert_eq!(pending.queues.len(), 1, "the read sees the pending message");
+    assert!(
+        handles.queues.has_pending(AgentId::Main),
+        "the host holds the pending message",
+    );
 
     let response = reqwest::Client::new()
         .post(format!(
@@ -1825,13 +1773,7 @@ async fn the_reads_answer_tasks_queue_and_tree() {
         .expect("queue clear with an unknown field");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(
-        !fixture
-            .client
-            .queue(&session)
-            .await
-            .expect("the queue after refusal")
-            .queues
-            .is_empty(),
+        handles.queues.has_pending(AgentId::Main),
         "the queue was cleared before its unknown field was refused",
     );
 
@@ -1864,22 +1806,18 @@ async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
     fixture.prompt(&session, "background something").await;
     remote.settle().await;
 
-    let table = fixture
-        .client
-        .tasks(&session)
-        .await
-        .expect("the tasks read");
-    let task = table
-        .tasks
+    let task = remote
+        .chat
+        .tasks()
         .iter()
-        .find(|task| task.status == aj_agent::tool::TaskStatus::Running)
+        .find(|(_, task)| task.status == aj_agent::tool::TaskStatus::Running)
+        .map(|(id, _)| *id)
         .expect("a live background task");
 
     let response = reqwest::Client::new()
         .post(format!(
-            "{}/v1/sessions/{session}/tasks/{}/kill",
+            "{}/v1/sessions/{session}/tasks/{task}/kill",
             fixture.server.url(),
-            task.id,
         ))
         .json(&serde_json::json!({"future": true}))
         .send()
@@ -1891,16 +1829,13 @@ async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
     assert_eq!(error.message, "malformed request body");
     assert_eq!(
         fixture
-            .client
-            .tasks(&session)
+            .host
+            .local_handles(&session)
             .await
-            .expect("the tasks read")
-            .tasks
-            .iter()
-            .find(|row| row.id == task.id)
-            .expect("the refused kill left the task listed")
-            .status,
-        aj_agent::tool::TaskStatus::Running,
+            .expect("live session")
+            .task_registry
+            .status(task),
+        Some(aj_agent::tool::TaskStatus::Running),
         "a task-kill body was ignored after dispatch",
     );
 
@@ -1914,9 +1849,8 @@ async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
 
     let response = reqwest::Client::new()
         .post(format!(
-            "{}/v1/sessions/{session}/tasks/{}/kill",
+            "{}/v1/sessions/{session}/tasks/{task}/kill",
             fixture.server.url(),
-            task.id,
         ))
         .send()
         .await
@@ -2648,8 +2582,6 @@ async fn an_unknown_session_answers_404_on_every_route() {
     let missing = "no-such-session";
 
     let mut refusals = vec![
-        fixture.client.tasks(missing).await.err(),
-        fixture.client.queue(missing).await.err(),
         fixture.client.tree(missing).await.err(),
         fixture.client.task_output(missing, 1, 0).await.err(),
     ];
@@ -2687,7 +2619,7 @@ async fn an_unknown_session_answers_404_on_every_route() {
     // request, so its refusal is a frame and lives in
     // `a_stream_refuses_one_session_and_serves_the_rest`.
 
-    assert_eq!(refusals.len(), 12, "every session-scoped route is covered");
+    assert_eq!(refusals.len(), 10, "every session-scoped route is covered");
     for refusal in refusals {
         let err = refusal.expect("an unknown session is refused");
         assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "got {err}");
@@ -2771,7 +2703,7 @@ async fn a_traversal_id_is_refused_at_the_wire_boundary() {
     for id in ["..%2Felsewhere%2Freachable", "sneaky.jsonl", "host-id."] {
         let err = fixture
             .client
-            .tasks(id)
+            .task_output(id, 1, 0)
             .await
             .err()
             .unwrap_or_else(|| panic!("{id:?} was served"));
@@ -2784,7 +2716,7 @@ async fn a_traversal_id_is_refused_at_the_wire_boundary() {
     // on an endpoint that does not exist. Also 404, and it reaches no store.
     let err = fixture
         .client
-        .tasks("../elsewhere/reachable")
+        .task_output("../elsewhere/reachable", 1, 0)
         .await
         .err()
         .expect("a traversal path is served by nothing");
@@ -3098,31 +3030,13 @@ async fn a_session_another_host_holds_answers_409_locked() {
         assert_eq!(err.code(), Some("locked"), "got {err}");
     }
 
-    // The reads that do not materialize answer instead, for a session that is
-    // cold as far as this host is concerned. A lock refusal here
-    // would be wrong: nothing about them takes the log.
-    assert!(
-        rival
-            .tasks(&session)
-            .await
-            .expect("the tasks read answers")
-            .tasks
-            .is_empty(),
-        "a session this host does not hold has no tasks",
-    );
-    assert!(
-        rival
-            .queue(&session)
-            .await
-            .expect("the queue read answers")
-            .queues
-            .is_empty(),
-        "and nothing queued",
-    );
+    // The task-output read does not materialize, so it answers instead, for a
+    // session that is cold as far as this host is concerned. A lock refusal
+    // here would be wrong: nothing about it takes the log.
     let unknown = rival
         .task_output(&session, 1, 0)
         .await
-        .expect_err("and no task to read");
+        .expect_err("a session this host does not hold has no task to read");
     assert_eq!(
         unknown.status(),
         Some(StatusCode::NOT_FOUND),
@@ -3960,13 +3874,11 @@ fn a_base_url_has_to_be_absolute_http() {
 // The identity gate over HTTP
 // ---------------------------------------------------------------------------
 
-const PROBED_ROUTES: [&str; 20] = [
+const PROBED_ROUTES: [&str; 18] = [
     "GET /v1/hello",
     "GET /v1/sessions",
     "POST /v1/sessions",
-    "GET /v1/sessions/{id}/tasks",
     "GET /v1/sessions/{id}/tasks/1/output",
-    "GET /v1/sessions/{id}/queue",
     "GET /v1/sessions/{id}/tree",
     "GET /v1/sessions/{id}/env",
     "GET /v1/events",
@@ -4119,17 +4031,11 @@ async fn probe_every_route(
             .json(&CreateSessionRequest::default())
             .build()
             .expect("build the create probe"),
-        http.get(format!("{base}/v1/sessions/{session}/tasks"))
-            .build()
-            .expect("build the task-list probe"),
         http.get(format!(
             "{base}/v1/sessions/{session}/tasks/1/output?offset=0"
         ))
         .build()
         .expect("build the task-output probe"),
-        http.get(format!("{base}/v1/sessions/{session}/queue"))
-            .build()
-            .expect("build the queue probe"),
         http.get(format!("{base}/v1/sessions/{session}/tree"))
             .build()
             .expect("build the tree probe"),
@@ -4351,8 +4257,8 @@ async fn an_http_client_converges_with_an_in_process_oracle() {
     }
 }
 
-/// The task table is not replayable, so a client owes the tasks read after
-/// every `caught_up`. A joiner that arrives after the task
+/// The task table is not replayable, so `caught_up` carries it. A joiner
+/// that arrives after the task
 /// started has to end up with the table a client that watched it start has,
 /// and with the same launch cell: badge, structured body and wire content.
 ///
@@ -4372,7 +4278,7 @@ async fn an_http_client_converges_with_an_in_process_oracle() {
 /// included. Whoever changes what that snapshot carries breaks this test, and
 /// the fix is here rather than in the ordering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_joiner_refetches_the_task_table_after_caught_up() {
+async fn a_joiner_takes_the_task_table_from_caught_up() {
     let fixture = Fixture::new(background_task_turn()).await;
     let session = fixture.create().await;
     let mut oracle = fixture.oracle(&session).await;
@@ -4390,7 +4296,7 @@ async fn a_joiner_refetches_the_task_table_after_caught_up() {
     assert_eq!(
         joiner.chat.tasks().len(),
         1,
-        "the joiner's table came from the read: a backfill carries no task events",
+        "the joiner's table came from caught_up: a backfill carries no task events",
     );
     let launch = joiner
         .canonical()
@@ -4406,7 +4312,7 @@ async fn a_joiner_refetches_the_task_table_after_caught_up() {
     assert_eq!(
         launch.0,
         Some(1),
-        "the tasks read badged the joiner's launch cell",
+        "the table on caught_up badged the joiner's launch cell",
     );
     assert_eq!(
         launch.1.as_ref().map(|details| &details["task_id"]),
@@ -4869,6 +4775,67 @@ async fn a_cut_with_a_tool_and_a_sub_agent_running_converges() {
         "and the slow call finished: {state:?}",
     );
     assert_converged(&remote, &oracle, "a cut with a tool and a sub in flight");
+    fixture.shutdown().await;
+}
+
+/// The named sharp edge: a background task that ended while the client was
+/// away reads as ended from the re-attach's `caught_up` alone. Its `TaskEnd` is
+/// reliable-transient and went to no stream, and a block carries no task
+/// events, so the table on `caught_up` is the only thing that can say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_that_ended_while_away_reads_as_ended_from_caught_up() {
+    let mut script = background_task_turn();
+    // The kill's completion notice wakes the agent for one more turn.
+    script.push(finalized_text_message("noted the kill"));
+    let fixture = Fixture::new(script).await;
+    let session = fixture.create().await;
+    let mut remote = fixture.remote(&session).await;
+    fixture.prompt(&session, "background something").await;
+    remote.settle().await;
+    let task = remote
+        .chat
+        .tasks()
+        .iter()
+        .find(|(_, task)| task.status == aj_agent::tool::TaskStatus::Running)
+        .map(|(id, _)| *id)
+        .expect("the client saw the task start");
+    let cursor = remote.client.cursor().expect("a committed cursor");
+    remote.cut();
+
+    let registry = fixture
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session")
+        .task_registry;
+    fixture
+        .client
+        .command(&session, &RemoteCommand::KillTask(task))
+        .await
+        .expect("the kill is accepted");
+    let ended = bounded("the task to end", registry.wait_terminal(task))
+        .await
+        .expect("the task is registered");
+
+    let block = remote.reattach().await;
+    assert_eq!(
+        remote.client.cursor().map(|cursor| cursor.epoch),
+        Some(cursor.epoch),
+        "a same-epoch re-attach, which keeps the client's state",
+    );
+    assert!(
+        !block
+            .iter()
+            .any(|frame| matches!(frame, Frame::Event { event, .. }
+            if matches!(event.known(), Some(AgentEvent::TaskEnd { .. })))),
+        "the block carried the task's end as an event, so caught_up is not what \
+         this measures",
+    );
+    assert_eq!(
+        remote.chat.tasks().get(&task).map(|task| task.status),
+        Some(ended),
+        "the task reads as ended the moment the block lands",
+    );
     fixture.shutdown().await;
 }
 

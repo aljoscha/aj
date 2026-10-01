@@ -1359,35 +1359,6 @@ impl SessionHost {
         scanned.map_err(|err| HostError::Internal(Box::new(err)))
     }
 
-    /// The session's background-task table, with wall-clock timestamps: the
-    /// in-memory registry keeps `Instant`s, which mean nothing off-process.
-    ///
-    /// A session that is not live answers empty rather than being
-    /// materialized for the read: a cold session has no tasks by
-    /// definition, and paying a resume, an agent rebuild and the advisory
-    /// lock to learn that would be perverse.
-    pub async fn tasks(&self, session: &str) -> Result<TaskTable, HostError> {
-        let Some(live) = self.live_or_cold(session).await? else {
-            return Ok(TaskTable::default());
-        };
-        let tasks = live
-            .core
-            .task_registry
-            .snapshot()
-            .into_iter()
-            .map(|task| TaskSummary {
-                id: task.id,
-                owner: task.owner,
-                call_id: task.call_id,
-                kind: task.kind,
-                label: task.label,
-                status: task.status,
-                started_at: wall_clock(self.inner.clock_anchor, task.started_at),
-            })
-            .collect();
-        Ok(TaskTable { tasks })
-    }
-
     /// Read at most `TASK_OUTPUT_CHUNK_BYTES` raw bytes from a retained task's
     /// spill file. The offset must not exceed its captured length. No task
     /// archive is consulted and rolling tails are never substituted for a file.
@@ -1447,31 +1418,6 @@ impl SessionHost {
         })
         .await
         .map_err(|err| HostError::Internal(Box::new(err)))?
-    }
-
-    /// The session's pending steering and follow-up messages. Empty, and no
-    /// materialization, for a session that is not live (see [`Self::tasks`]).
-    pub async fn queue(&self, session: &str) -> Result<QueueState, HostError> {
-        let Some(live) = self.live_or_cold(session).await? else {
-            return Ok(QueueState::default());
-        };
-        let mut agents = live.core.message_queues.queued_agents();
-        agents.sort_by_key(|agent| match agent {
-            AgentId::Main => (0, 0),
-            AgentId::Sub(n) => (1, *n),
-        });
-        let queues = agents
-            .into_iter()
-            .map(|agent| {
-                let (steering, follow_up) = live.core.message_queues.event_messages(agent);
-                AgentQueue {
-                    agent_id: agent,
-                    steering,
-                    follow_up,
-                }
-            })
-            .collect();
-        Ok(QueueState { queues })
     }
 
     /// Scan the named stored logs without materializing or locking them. An
@@ -2239,6 +2185,27 @@ impl SessionHost {
             .map_err(|err| HostError::Internal(Box::new(err)))
     }
 
+    /// The session's background-task table, with wall-clock timestamps: the
+    /// in-memory registry keeps `Instant`s, which mean nothing off-process.
+    fn task_table(&self, session: &LiveSession) -> TaskTable {
+        let tasks = session
+            .core
+            .task_registry
+            .snapshot()
+            .into_iter()
+            .map(|task| TaskSummary {
+                id: task.id,
+                owner: task.owner,
+                call_id: task.call_id,
+                kind: task.kind,
+                label: task.label,
+                status: task.status,
+                started_at: wall_clock(self.inner.clock_anchor, task.started_at),
+            })
+            .collect();
+        TaskTable { tasks }
+    }
+
     /// Serve one session's attach block on `id`'s stream.
     async fn serve_block(
         &self,
@@ -2427,6 +2394,16 @@ impl SessionHost {
                 return false;
             }
         }
+        // Neither table is in the log, so `caught_up` carries both. Taken after
+        // this stream's subscriber was registered, which is why no change can
+        // be missed: the registry and the queues change before the event
+        // announcing it is emitted, so an event published before registration
+        // is already reflected here, and one published after is held behind
+        // this block and replays after `caught_up`. Replaying one the snapshot
+        // already reflects is harmless: `TaskStart` and `TaskEnd` update a
+        // known task in place, and `QueueUpdate` overwrites its agent's queue.
+        let tasks = self.task_table(session);
+        let queues = queue_state(&session.core.message_queues);
         if !send_block_frame(
             block,
             stopped,
@@ -2434,6 +2411,8 @@ impl SessionHost {
                 session: session.id().to_string(),
                 epoch: epoch.clone(),
                 last_seq: boundary,
+                tasks,
+                queues,
             },
         )
         .await
@@ -2750,6 +2729,28 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
         // session's lock for as long as it is live.
         locked: false,
     }
+}
+
+/// Every agent's pending steering and follow-up messages, main first. An
+/// agent with nothing queued has no entry.
+fn queue_state(queues: &MessageQueues) -> QueueState {
+    let mut agents = queues.queued_agents();
+    agents.sort_by_key(|agent| match agent {
+        AgentId::Main => (0, 0),
+        AgentId::Sub(n) => (1, *n),
+    });
+    let queues = agents
+        .into_iter()
+        .map(|agent| {
+            let (steering, follow_up) = queues.event_messages(agent);
+            AgentQueue {
+                agent_id: agent,
+                steering,
+                follow_up,
+            }
+        })
+        .collect();
+    QueueState { queues }
 }
 
 /// Project a monotonic `Instant` onto wall clock through `anchor`, a pair of

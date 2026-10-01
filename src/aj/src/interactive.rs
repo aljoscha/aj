@@ -156,10 +156,6 @@ struct World {
     /// absence explicit lets a focus gesture close the prior stream before it
     /// asks for the selected target, without manufacturing a placeholder stream.
     stream: Option<Stream>,
-    /// Paces the retry of the reads an attach block obliges, so a peer that
-    /// fails them cannot make the loop spend every iteration in a request
-    /// (see [`refresh_client_reads`]).
-    reads_retry: Retry,
     /// Direct handles into the focused session, for the reads no frame
     /// carries: the log the tree and export walks read, the run config the
     /// startup credential check names, the task registry behind the footer's
@@ -290,8 +286,8 @@ fn startup_session(
 ///
 /// The host owns session assembly now, so what happens here is the client
 /// half: attach, fold the block the host serves (which is what replaces the
-/// startup replay), discharge the reads the block obliges, then fold the
-/// startup notices so the first frame shows them.
+/// startup replay), then fold the startup notices so the first frame shows
+/// them.
 async fn build_world(
     args: &Args,
     layers: ConfigLayers,
@@ -370,7 +366,6 @@ async fn build_world(
         control,
         directory,
         stream: Some(stream),
-        reads_retry: Retry::default(),
         local: Some(handles),
         working_directory: env.working_directory.clone(),
         working_directory_follows_focus: false,
@@ -508,7 +503,7 @@ fn startup_diagnostic_events(
 ///
 /// The handshake and the session selection already happened (see
 /// [`crate::connect`]), so what is left is the client half: attach, fold the
-/// block, discharge the reads it obliges, then the startup notices. The
+/// block, then the startup notices. The
 /// restored-settings summary is rendered here from the first attach's own
 /// `state` frame rather than published by the host, which is what keeps it
 /// from repeating on every reconnect.
@@ -543,7 +538,6 @@ async fn build_connect_world(
         control,
         directory,
         stream: Some(stream),
-        reads_retry: Retry::default(),
         local: None,
         // The host's directory, not ours: the session runs there, and its
         // `@file` completions and tool output all name paths on that machine.
@@ -1117,59 +1111,6 @@ impl Block {
 #[cfg(test)]
 async fn fold_attach_block(world: &mut World) -> CatchUp {
     Block::open(world).fold_through(world).await
-}
-
-/// Discharge the reads an attach block obliges: neither the task table nor
-/// the pending-message queues are replayable, so a backfill regenerates
-/// neither.
-///
-/// Both reads land in the shared chat model, which is what every frontend
-/// renders from, so the local and the remote path stay one path.
-///
-/// A failed read leaves the obligation standing and paces the retry
-/// (`world.reads_retry`): the loop calls this every iteration and each call
-/// awaits a request, so a peer that stopped answering would otherwise put a
-/// request that times out into every iteration.
-async fn refresh_client_reads(world: &mut World) {
-    if !world.reads_retry.ready() {
-        return;
-    }
-    let mut failed = false;
-    if world.client().needs_task_refetch() {
-        match world.control.tasks(world.session()).await {
-            Ok(tasks) => {
-                let mut chat = world.chat.borrow_mut();
-                world.directory.client_mut().set_tasks(&mut chat, tasks);
-            }
-            Err(err) => {
-                failed = true;
-                tracing::warn!("could not read the session's task table: {err}");
-            }
-        }
-    }
-    if world.client().needs_queue_refetch() {
-        match world.control.queue(world.session()).await {
-            Ok(queue) => {
-                let mut chat = world.chat.borrow_mut();
-                world.directory.client_mut().set_queue(&mut chat, queue);
-            }
-            Err(err) => {
-                failed = true;
-                tracing::warn!("could not read the session's message queues: {err}");
-            }
-        }
-    }
-    if failed {
-        world.reads_retry.failed();
-    } else {
-        world.reads_retry.clear();
-    }
-}
-
-/// Whether the client still owes the reads an attach block obliged, which is
-/// what decides if the loop has to wake for their paced retry.
-fn owes_client_reads(world: &World) -> bool {
-    world.client().needs_task_refetch() || world.client().needs_queue_refetch()
 }
 
 /// The label the peer's directory carries for `session`, `None` for an
@@ -1968,7 +1909,6 @@ async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<Catch
     world.stream = Some(open_stream(&world.control, &mut world.directory).await?);
     refresh_local_handles(world, shell).await?;
     let caught = fold_attach_block(world).await;
-    refresh_client_reads(world).await;
     // Adopting an epoch restarts the transcript under the view, so the view
     // state that named positions in the old one goes with it: the scroll
     // offset, a selection anchored in entries that no longer exist, an
@@ -3237,8 +3177,8 @@ fn view_busy(world: &World, view: AgentId) -> bool {
 /// refuse-while-busy gestures the host re-checks anyway.
 ///
 /// The tasks come off the chat model, which every client keeps from the task
-/// events plus the tasks read, rather than off a live registry no
-/// remote client has.
+/// events plus the table `caught_up` carries, rather than off a live registry
+/// no remote client has.
 fn running_work(world: &World) -> (usize, usize) {
     let chat = world.chat.borrow();
     running_work_counts(
@@ -7718,8 +7658,7 @@ const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 ///
 /// Every failure doubles the delay up to [`RETRY_BACKOFF_MAX`], so a peer that
 /// stopped answering cannot make the loop spend each iteration in a request
-/// that will fail. Nothing here is aware of what is being retried: the pacing
-/// is the same whether the failing thing is an attach, a read, or a poll.
+/// that will fail. Nothing here is aware of what is being retried.
 struct Retry {
     /// How long the next failure waits. Doubles per failure, back to
     /// [`RETRY_BACKOFF_MIN`] whenever the pacing is dropped.
@@ -7755,11 +7694,6 @@ impl Retry {
         self.due = Some(Instant::now() + self.delay);
         self.delay = (self.delay * 2).min(RETRY_BACKOFF_MAX);
     }
-
-    /// Drop the pacing: whatever comes next is due at once.
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
 }
 
 /// Where a client stands in getting its frame stream back.
@@ -7771,9 +7705,8 @@ impl Retry {
 ///
 /// The catch-up is loop state rather than an await: its [`Block`] is fed from
 /// the `select!`'s own frame arm, so a backfill of any length keeps painting and
-/// keeps reading the keyboard. The steps themselves are still awaited from the
-/// loop's body, and the open and the post-block reads park it for as long as
-/// their own request timeouts allow.
+/// keeps reading the keyboard. The open is still awaited from the loop's body
+/// and parks it for as long as its own request timeout allows.
 ///
 /// What the loop owes such a state is the wake [`Self::due`] asks for: a block
 /// that stops arriving ends in silence, and nothing is guaranteed to bring the
@@ -7942,7 +7875,6 @@ async fn advance_resume(world: &mut World, state: Resume) -> ResumeAdvance {
                 Some(caught) => caught,
                 None => world.abandon_attach_block(),
             };
-            refresh_client_reads(world).await;
             ResumeAdvance::Settled { state, caught }
         }
     }
@@ -8139,18 +8071,14 @@ async fn drive(
         // requests the clearing repaint, so each toast vanishes exactly on
         // time even while others stay live.
         let toast_deadline = crate::toasts::earliest_toast_deadline(&shell.borrow().toasts);
-        // Re-attach and client-read retries need a timer to wake the loop.
+        // Re-attach retries need a timer to wake the loop.
         let resume_deadline = resume.as_ref().map(Resume::due);
         let task_view = active_task_view(shell);
-        let reads_deadline = owes_client_reads(world)
-            .then(|| world.reads_retry.due())
-            .flatten();
         let deadline = [
             tick_deadline,
             frame_deadline,
             toast_deadline,
             resume_deadline,
-            reads_deadline,
         ]
         .into_iter()
         .flatten()
@@ -8789,9 +8717,6 @@ async fn drive(
             world.connection = Connection::Reconnecting;
             app.request_redraw();
         }
-        // The attach block a re-attach served may have obliged the reads
-        // again.
-        refresh_client_reads(world).await;
         // One status sync per iteration, whatever the arm did. On the
         // idle-to-animating edge, post the loader wake: widgets can only
         // schedule ticks from an event handler, so the host hands the
@@ -9840,20 +9765,20 @@ mod tests {
                 .iter()
                 .find(|entry| entry.id == world.session())
                 .is_some_and(|entry| !entry.working);
-            let quiet = idle
-                && world
-                    .control
-                    .tasks(world.session())
-                    .await
-                    .expect("the tasks read")
-                    .tasks
-                    .iter()
-                    .all(|task| task.status != aj_agent::tool::TaskStatus::Running);
+            // Background tasks are judged from the client's own table, which
+            // `TaskStart` and `TaskEnd` keep current: every task a turn launched
+            // announces itself before the turn ends.
+            let tasks_done = world
+                .chat
+                .borrow()
+                .tasks()
+                .values()
+                .all(|task| task.status != aj_agent::tool::TaskStatus::Running);
             // The client's own view has to have caught up with the host's,
             // not just the host be idle: over a connection the frames of the
             // work that just finished can still be in flight (in process they
             // are already queued, so this converges at once).
-            if quiet && !world.client().working() {
+            if idle && tasks_done && !world.client().working() {
                 fold_ready_frames(world);
                 return;
             }
@@ -9862,35 +9787,28 @@ mod tests {
         }
     }
 
-    /// Discharge the task and queue reads into the client model, the way an
-    /// attach block obliges: neither is replayable, so no backfill regenerates
-    /// them.
+    /// Re-attach and fold the focused session's block, so the client model
+    /// learns host-side state from its `caught_up`.
     ///
     /// Tests that stage host-side state through the live handles need it: a
     /// direct enqueue or task registration publishes no frame, so the model
-    /// (which every client renders from) would not learn about it. A real
-    /// client learns the same state from these two reads.
-    async fn read_host_state(world: &mut World) {
-        let tasks = world
-            .control
-            .tasks(world.session())
-            .await
-            .expect("the tasks read");
-        let queue = world
-            .control
-            .queue(world.session())
-            .await
-            .expect("the queue read");
-        let mut chat = world.chat.borrow_mut();
-        world.directory.client_mut().set_tasks(&mut chat, tasks);
-        world.directory.client_mut().set_queue(&mut chat, queue);
+    /// (which every client renders from) would not learn about it otherwise.
+    /// An attach is how a real client learns the task table and queues it did
+    /// not see change.
+    async fn reattach_for_host_state(world: &mut World) {
+        world.stream = Some(
+            open_stream(&world.control, &mut world.directory)
+                .await
+                .expect("re-attach"),
+        );
+        assert_eq!(fold_attach_block(world).await, CatchUp::Caught);
     }
 
     /// Queue a follow-up for `agent` on the host and let the client model see
     /// it, which is the two halves of what a real enqueue does.
     async fn stage_pending(world: &mut World, agent: AgentId, text: &str) {
         world.handles().queues.append_follow_up(agent, text);
-        read_host_state(world).await;
+        reattach_for_host_state(world).await;
     }
 
     /// Drive one scripted turn to completion so the session's log lands on disk
@@ -13456,10 +13374,9 @@ mod tests {
     /// Run the real drive loop over `world` until `stop` resolves, answering how
     /// the loop exited and what `stop` observed.
     ///
-    /// Recovery and pacing have two halves, and calling `advance_resume` or
-    /// `refresh_client_reads` directly reaches only one:
-    /// the other is the loop's gate on when each may run and the wake deadline
-    /// that brings the loop back for one. The tests below drive an otherwise
+    /// Recovery and pacing have two halves, and calling `advance_resume`
+    /// directly reaches only one: the other is the loop's gate on when it may
+    /// run and the wake deadline that brings the loop back for it. The tests below drive an otherwise
     /// quiet session, so an attempt that happens at all is one the merged
     /// deadline woke the loop for, and its timing is what the gate let through.
     ///
@@ -13499,15 +13416,14 @@ mod tests {
     }
 
     /// Bring a freshly built world to where the drive loop's first iterations
-    /// take it: the launch's block folded and committed, its reads discharged,
-    /// its startup rows on top of the history. For tests that act on a world
+    /// take it: the launch's block folded and committed, its startup rows on
+    /// top of the history. For tests that act on a world
     /// without driving its loop.
     async fn launched(mut world: World) -> World {
         let mut resume = world.resume.take().expect("a launch arms a block");
         let block = resume.block_mut().expect("a launch opens its block");
         let caught = block.fold_through(&mut world).await;
         assert_eq!(caught, CatchUp::Caught, "the launch's block did not land");
-        refresh_client_reads(&mut world).await;
         world.sync_working_directory();
         world.connection = Connection::Connected;
         let session = world.session().to_string();
@@ -13617,80 +13533,14 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// The loop's half of pacing the reads an attach block obliges: with nothing
-    /// else going on, a retry only happens if the loop wakes itself for it.
-    ///
-    /// The recorded delay is the observable: it doubles once per failed attempt,
-    /// so what it holds when the loop stops says how many attempts the loop got
-    /// around to.
-    #[tokio::test]
-    async fn the_loop_paces_the_reads_an_attach_obliged() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        run_prompt(&mut world, "seed").await;
-
-        // Attach without discharging the reads, which is the state every
-        // `caught_up` leaves the client in.
-        world.stream = Some(
-            open_stream(&world.control, &mut world.directory)
-                .await
-                .expect("re-attach"),
-        );
-        assert_eq!(
-            fold_attach_block(&mut world).await,
-            CatchUp::Caught,
-            "the block completed",
-        );
-        assert!(owes_client_reads(&world), "the block obliged both reads");
-        assert!(
-            !world.client().needs_reattach(),
-            "and nothing else is owed alongside them",
-        );
-        // Wait the host's `list` coalescing out and drain, so the
-        // stream the loop parks on has nothing left to say. A frame would wake
-        // the loop for free and the retry would ride along on it.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        fold_ready_frames(&mut world);
-
-        // Point the world at a session the host does not have, so every read is
-        // refused.
-        world
-            .directory
-            .rename_focused("no-such-session".to_string());
-
-        // Room for well over the first three attempts (at once, then 200ms, then
-        // a further 400ms), so a busy machine still gets through them.
-        let window = RETRY_BACKOFF_MIN * 15;
-        let (exit, ()) = drive_until(&mut world, &shell, |writer| async move {
-            tokio::time::sleep(window).await;
-            drop(writer);
-        })
-        .await;
-
-        assert!(matches!(exit, Ok(SessionExit::Quit)));
-        assert!(
-            owes_client_reads(&world),
-            "a failed read keeps the obligation",
-        );
-        // Three attempts leave `RETRY_BACKOFF_MIN << 3`. Anything less is a loop
-        // that stopped coming back for the retry.
-        assert!(
-            world.reads_retry.delay >= RETRY_BACKOFF_MIN * 8,
-            "the reads paced out to {:?} over a {window:?} window, so the loop \
-             woke for fewer than three attempts",
-            world.reads_retry.delay,
-        );
-        shut_down(&world).await;
-    }
-
-    /// An attach block obliges the task and queue reads (neither is
-    /// replayable), and the loop discharges them.
+    /// An attach block's `caught_up` carries the task table and the queues
+    /// (neither is replayable), and the client model takes both from it.
     ///
     /// The local views read the live handles, so nothing on screen depends on
     /// this. The client's own model does, and it is the fold connect mode
     /// uses, so leaving it stale would leave the two paths unequal.
     #[tokio::test]
-    async fn an_attach_discharges_the_task_and_queue_reads() {
+    async fn an_attach_carries_the_task_table_and_queues() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
@@ -13703,20 +13553,12 @@ mod tests {
         // Re-attach the focused session, the way the branch path does.
         reattach(&mut world, &shell).await.expect("re-attach");
 
-        assert!(
-            !world.client().needs_task_refetch(),
-            "the task read is discharged",
-        );
-        assert!(
-            !world.client().needs_queue_refetch(),
-            "and the queue read too",
-        );
         {
             let chat = world.chat.borrow();
             assert_eq!(
                 chat.tasks().keys().copied().collect::<Vec<_>>(),
                 vec![task],
-                "the task table came off the read",
+                "the task table came off caught_up",
             );
             assert_eq!(chat.queue().queues.len(), 1);
             assert_eq!(
@@ -19633,9 +19475,8 @@ mod tests {
     /// Register a running background bash task and return its id.
     ///
     /// A registration made straight on the registry publishes no `TaskStart`,
-    /// so the tasks read is discharged afterwards: that is how a client learns
-    /// about a task it did not see start, and it is what the frontend's task
-    /// table is built from.
+    /// so the world re-attaches afterwards: `caught_up` is how a client learns
+    /// about a task it did not see start.
     async fn register_bash_task(world: &mut World, command: &str) -> aj_agent::tool::TaskId {
         let (id, cancel, driver) = world.handles().task_registry.register_driver(
             AgentId::Main,
@@ -19649,7 +19490,7 @@ mod tests {
         driver.spawn(async move {
             cancel.cancelled().await;
         });
-        read_host_state(world).await;
+        reattach_for_host_state(world).await;
         id
     }
 
@@ -20443,8 +20284,8 @@ mod tests {
             .task_registry
             .set_status(id, aj_agent::tool::TaskStatus::Killed);
         // A real run learns the flip from the task's own `TaskEnd`; a status
-        // set straight on the registry publishes none, so the read stands in.
-        read_host_state(&mut world).await;
+        // set straight on the registry publishes none, so a re-attach stands in.
+        reattach_for_host_state(&mut world).await;
         apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(id)).await;
         apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(9_999)).await;
 
@@ -22411,10 +22252,11 @@ mod tests {
         assert!(live.live, "and the host still holds it");
         let running = world
             .host()
-            .tasks(&outgoing)
+            .local_handles(&outgoing)
             .await
-            .expect("the outgoing task table")
-            .tasks
+            .expect("the outgoing session is live")
+            .task_registry
+            .snapshot()
             .iter()
             .filter(|task| task.status == aj_agent::tool::TaskStatus::Running)
             .count();
@@ -22425,6 +22267,92 @@ mod tests {
             world.handles().task_registry.status(task).is_none(),
             "the focused session's task table is its own",
         );
+        shut_down(&world).await;
+    }
+
+    /// A backgrounded session's task table and queues come from its own
+    /// `caught_up`, not only the focused session's: every session in the
+    /// attach set is served a block and takes both from it.
+    ///
+    /// The state is staged straight on the host's handles, which publishes no
+    /// frame, so the block's `caught_up` is the only thing that can carry it.
+    #[tokio::test]
+    async fn a_backgrounded_session_takes_its_tables_from_caught_up() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "in the first session").await;
+        let first = world.session().to_string();
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert_ne!(world.session(), first, "the focus moved");
+        assert!(world.directory.is_attached(&first));
+
+        let handles = world
+            .host()
+            .local_handles(&first)
+            .await
+            .expect("the backgrounded session is live");
+        let (task, cancel, driver) = handles.task_registry.register_driver(
+            AgentId::Main,
+            "parked-call".to_string(),
+            aj_agent::tool::TaskKind::Bash {
+                command: "sleep 100".to_string(),
+            },
+            "sleep 100".to_string(),
+            Arc::new(NoOutput),
+        );
+        driver.spawn(async move {
+            cancel.cancelled().await;
+        });
+        handles.queues.append_follow_up(AgentId::Main, "parked");
+        let parked = world.directory.chat_for(&first).expect("a parked chat");
+        assert!(
+            parked.borrow().tasks().is_empty() && parked.borrow().queue().queues.is_empty(),
+            "the staging published nothing, or this measures nothing",
+        );
+
+        // Reopen the stream over the same attach set, as any reconnect does.
+        world.stream = Some(
+            open_stream(&world.control, &mut world.directory)
+                .await
+                .expect("re-attach"),
+        );
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while parked.borrow().tasks().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the backgrounded session never learned its task table",
+            );
+            fold_ready_frames(&mut world);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        {
+            let chat = parked.borrow();
+            assert_eq!(
+                chat.tasks()
+                    .iter()
+                    .map(|(id, info)| (*id, info.status))
+                    .collect::<Vec<_>>(),
+                vec![(task, aj_agent::tool::TaskStatus::Running)],
+            );
+            assert_eq!(chat.queue().queues.len(), 1);
+            assert_eq!(chat.queue().queues[0].agent_id, AgentId::Main);
+            assert_eq!(chat.queue().queues[0].follow_up.len(), 1);
+            assert!(
+                world.chat.borrow().queue().queues.is_empty(),
+                "the focused session's queue is its own",
+            );
+        }
+        handles.task_registry.kill(task);
         shut_down(&world).await;
     }
 
@@ -28290,8 +28218,14 @@ mod tests {
                 .sessions
                 .iter()
                 .any(|row| row.id == session && !row.working);
-            let table = remote.host.tasks(&session).await.expect("task table");
-            let sub_running = table.tasks.iter().any(|task| {
+            let tasks = remote
+                .host
+                .local_handles(&session)
+                .await
+                .expect("live session")
+                .task_registry
+                .snapshot();
+            let sub_running = tasks.iter().any(|task| {
                 matches!(task.kind, aj_agent::tool::TaskKind::Agent { .. })
                     && task.status == aj_agent::tool::TaskStatus::Running
             });
@@ -28474,8 +28408,8 @@ mod tests {
             "the cut stream reports the loss"
         );
 
-        // Recover through the helper: re-attach with the client's cursor,
-        // fold the block, discharge the reads.
+        // Recover through the helper: re-attach with the client's cursor and
+        // fold the block.
         drive_resume(&mut world, &shell)
             .await
             .expect("a connection's re-attach is never fatal");
@@ -28641,11 +28575,11 @@ mod tests {
                             }
                         }
                         let request = String::from_utf8_lossy(&request).to_string();
-                        // A block that lands obliges the task and queue reads.
-                        // A peer that left those hanging would park
-                        // the caller in a request rather than in the fold, which
-                        // is a different failure than the one under test, so they
-                        // are answered with the wire types' own empty values.
+                        // Every other request is a command, answered as
+                        // accepted with an empty JSON body. A peer that left
+                        // one hanging would park the caller in a request rather
+                        // than in the fold, which is a different failure than
+                        // the one under test.
                         if !request.contains("/v1/events") {
                             if request.contains("/prompt ") {
                                 prompts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -28656,13 +28590,7 @@ mod tests {
                             if request.contains("/head ") {
                                 heads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
-                            let body = if request.contains("/queue") {
-                                serde_json::to_string(&aj_wire::QueueState::default())
-                                    .expect("a queue state")
-                            } else {
-                                serde_json::to_string(&aj_wire::TaskTable::default())
-                                    .expect("a task table")
-                            };
+                            let body = "{}";
                             let answer = format!(
                                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
                                  content-length: {}\r\n\r\n{body}",
@@ -28849,6 +28777,8 @@ mod tests {
             session: session.to_string(),
             epoch: epoch.to_string(),
             last_seq,
+            tasks: Default::default(),
+            queues: Default::default(),
         })
         .expect("a caught_up frame")
     }
@@ -31063,71 +30993,6 @@ mod tests {
         let addr = listener.local_addr().expect("the bound address");
         drop(listener);
         format!("http://{addr}")
-    }
-
-    /// A read the host fails leaves the obligation standing and paces the
-    /// retry.
-    ///
-    /// The loop discharges these reads at the bottom of every iteration and
-    /// each call awaits a request, so an unpaced retry puts a request that
-    /// fails into every iteration for as long as the host stays quiet.
-    #[tokio::test]
-    async fn a_failing_client_read_is_paced() {
-        let dir = TempDir::new().expect("tempdir");
-        let remote = RemoteHost::start(&dir, "streaming-text").await;
-        let mut world = connect_world(&dir, &remote, &[]).await;
-
-        // Attach without discharging the reads, which is the state every
-        // `caught_up` leaves the client in.
-        world.stream = Some(
-            open_stream(&world.control, &mut world.directory)
-                .await
-                .expect("re-attach"),
-        );
-        assert_eq!(
-            fold_attach_block(&mut world).await,
-            CatchUp::Caught,
-            "the block completed",
-        );
-        assert!(
-            world.client().needs_task_refetch() && world.client().needs_queue_refetch(),
-            "the block obliged both reads",
-        );
-
-        // Point the client at a peer that is not there.
-        world.control =
-            Control::remote(crate::remote::RemoteClient::new(&dead_url().await).expect("a client"));
-
-        refresh_client_reads(&mut world).await;
-        assert!(
-            world.client().needs_task_refetch() && world.client().needs_queue_refetch(),
-            "a failed read keeps the obligation",
-        );
-        assert!(!world.reads_retry.ready(), "the next attempt is held back");
-        let due = world
-            .reads_retry
-            .due()
-            .expect("a paced retry has a due time");
-
-        // A call inside the delay attempts nothing: an attempt would fail and
-        // pace again, moving the due time out.
-        refresh_client_reads(&mut world).await;
-        assert_eq!(
-            world.reads_retry.due(),
-            Some(due),
-            "the read was re-issued inside its own delay",
-        );
-
-        // And once the delay is out it does try again, backing off further.
-        tokio::time::sleep_until(due.into()).await;
-        refresh_client_reads(&mut world).await;
-        let grown = world.reads_retry.due().expect("a second failure paces too");
-        assert!(
-            grown > due,
-            "the retry is not abandoned, and a repeated failure backs off",
-        );
-
-        remote.shutdown().await;
     }
 
     /// The local production gesture opens the shared usage page.

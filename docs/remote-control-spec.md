@@ -217,9 +217,17 @@ internally tagged with `kind`:
   attach's `state`. `working` applies on every `state` frame and
   self-heals a spinner left running by a missed `AgentEnd`. It says
   nothing about sub-agents, whose liveness comes from lifecycle events.
-- `caught_up`: `{kind, session, epoch, last_seq}`. Ends a backfill
-  (section 5.5). A client must not commit a cursor from a `caught_up` it
-  did not ask for.
+- `caught_up`: `{kind, session, epoch, last_seq, tasks, queues}`. Ends
+  a backfill (section 5.5). A client must not commit a cursor, or take
+  the tables, from a `caught_up` it did not ask for. `tasks` is the
+  session's background task table, `[{id, owner, call_id, kind, label,
+  status, started_at}]` with wall-clock `started_at`, running and
+  retained finished tasks alike. `queues` is the pending messages per
+  agent, `[{agent_id, steering, follow_up}]`, main first, listing only
+  agents with something pending. Neither is in the log, so a backfill
+  cannot regenerate them and the block carries them here instead. The
+  client replaces its task table and queues with them, and ignores
+  `TaskOutput` for task ids the table does not list.
 - `list`: `{kind, sessions: [...], hosts?: [...]}`. The full session
   directory (section 5.8). `hosts` is present only from a gateway
   (section 6.1). Cumulative, the latest frame supersedes all earlier
@@ -329,6 +337,14 @@ a stale snapshot after the durable frame that superseded it would
 resurrect transient state. A cursor beyond the session's current
 `last_seq` is treated as an epoch mismatch.
 
+The task table and queues on `caught_up` are read after the
+subscription is registered, and the host changes either before it
+publishes the event announcing the change. So every change is either in
+those tables or announced by a `TaskStart`, `TaskEnd` or `QueueUpdate`
+that follows `caught_up`. Applying such an event over tables that
+already reflect it changes nothing: a task event updates a known task in
+place, and a `QueueUpdate` replaces its agent's queue.
+
 Sessions not named in the request produce nothing on the stream except
 their rows in `list` frames, so a client is never evicted over traffic
 it did not ask for. Changing the attach set means reopening the stream
@@ -399,10 +415,11 @@ Client application rules:
   identity on the event itself, so the client hands the frame's
   `entry_id` to its reducer. A durable `SubAgentStart` names a spawn
   root, minted once per run, so re-serving one never resurrects a
-  conclusion. After `caught_up` the client refetches the task table and
-  the pending-message queues (section 5.7), because neither is
-  replayable. A client may instead discard the session's state and
-  rebuild from a full backfill, which must produce the same result.
+  conclusion. On `caught_up` the client replaces its task table and
+  pending-message queues with the ones the frame carries, because
+  neither is replayable. This holds for every session in the attach
+  set, focused or not. A client may instead discard the session's state
+  and rebuild from a full backfill, which must produce the same result.
 - On `reset`, the client re-attaches, offering its cursor. The server
   serves an incremental suffix if the epoch still matches, or a full
   backfill if not. A `reset` received mid-attach-block abandons the
@@ -573,10 +590,6 @@ side's limitation. Neither side's values fall back to the other's.
   does, except for the tree, environment, account, and session-info reads, which parse the log
   and materialize like a command. This is the discovery surface, there is
   no separate on-disk listing.
-- `GET /v1/sessions/{id}/tasks`: `{tasks: [{id, owner, call_id, kind,
-  label, status, started_at}]}`, the background task table with
-  wall-clock timestamps. Clients replace their task table with this
-  after `caught_up`, and ignore `TaskOutput` for unknown task ids.
 - `GET /v1/sessions/{id}/tasks/{task_id}/output?offset=N`: `TaskOutput` in
   `aj-wire`, `{id, status, offset, total_bytes, bytes}`. Reads the retained
   task's full interleaved spill output at the required unsigned byte offset.
@@ -593,8 +606,6 @@ side's limitation. Neither side's values fall back to the other's.
   Reads use bounded allocation and blocking-pool file I/O. Running and completed
   tasks are readable while retained by the live registry, with no persistent
   task archive. Capability `task_output` (section 5.10).
-- `GET /v1/sessions/{id}/queue`: `{queues: [{agent_id, steering,
-  follow_up}]}`, the pending messages per agent.
 - `GET /v1/sessions/{id}/tree`: `{segments, head?}`, the
   segment-collapsed branch tree for the tree view and head switching.
   `head` is the current head entry id, absent only while the log has no
@@ -739,7 +750,7 @@ Per-session row fields in `list` frames and `GET /v1/sessions`:
 - `id`: the session id (section 5.2).
 - `live`: materialized in the host, vs on-disk only.
 - `working`: the main agent has a turn in flight (section 5.3). Live
-  background sub-agents surface through the tasks read (section 5.7), not
+  background sub-agents surface through the task table (section 5.3), not
   here.
 - `last_activity`: host-clock timestamp on every row. For a live row it
   is the last durable event the host observed, and a release hands that
@@ -1147,10 +1158,10 @@ list space, and scrollbars do not select or edit settings.
 
 ### 8.1 Connect mode
 
-`aj connect <url>` runs the TUI against a remote server. Queue state is
-fed from `QueueUpdate` frames and the queue read, the task table from
-the tasks read (section 5.7), footer settings and the restore notice
-from `state` frames.
+`aj connect <url>` runs the TUI against a remote server. Queue state and
+the task table come from `caught_up` (section 5.3) and the live
+`QueueUpdate`, `TaskStart` and `TaskEnd` events after it, footer settings
+and the restore notice from `state` frames.
 
 Session selection asks for one of three things:
 
@@ -1355,10 +1366,12 @@ Sharp edges, each pinned by a test: attach cut between a tool's
 `ToolExecutionEnd` and its durable `MessageEnd`, reconnect while a tool
 and a sub-agent are running, attach mid-sub-run, reconnect where zero
 durable entries follow the cursor but an open sub concluded in the gap,
-head switch refused while busy, stale-epoch frames dropped, task-table
-refetch after `caught_up`, queue enqueue visibility on a second client,
-slow-client eviction and recovery, settings visibility for a mid-session
-joiner, seq non-contiguity, per-session attach refusal while the same
+head switch refused while busy, stale-epoch frames dropped, a task that
+ended while the client was away reading as ended from `caught_up` alone,
+a backgrounded session's task table and queues on re-attach, queue
+enqueue visibility on a second client, slow-client eviction and
+recovery, settings visibility for a mid-session joiner, seq
+non-contiguity, per-session attach refusal while the same
 stream's other sessions serve (through a gateway included), every
 gateway `reset` edge (host lost, host returned, enrollment withdrawn,
 identity replaced) scoped to the attaching client's sessions,

@@ -64,7 +64,7 @@ fn committed_compaction_usage_is_protocol_generation_three() {
 /// with an escape, and number literals no float survives.
 const FORWARDED_FRAMES: &[&str] = &[
     r#"{"kind":"reset","session":"session-1"}"#,
-    r#"{"kind":"caught_up","session":"session-1","epoch":"e","last_seq":3,"future":1e400}"#,
+    r#"{"kind":"caught_up","session":"session-1","epoch":"e","last_seq":3,"tasks":[],"queues":[],"future":1e400}"#,
     r#"{"kind":"heartbeat"}"#,
     r#"{"kind":"future_frame","session":"session-1"}"#,
     r#"{"kind":"future_frame","host_scoped":true}"#,
@@ -1394,8 +1394,7 @@ fn the_session_key_is_matched_after_json_unescaping() {
 /// retained JSON, so the two must not drift apart.
 #[test]
 fn a_rewritten_frame_can_be_rewritten_again() {
-    let input =
-        r#"{"kind":"caught_up","session":"old","epoch":"e","last_seq":3,"added_later":true}"#;
+    let input = r#"{"kind":"caught_up","session":"old","epoch":"e","last_seq":3,"tasks":[],"queues":[],"added_later":true}"#;
     let mut frame: DecodedFrame = serde_json::from_str(input).unwrap();
 
     assert!(frame.rewrite_session("first:old").unwrap());
@@ -2859,6 +2858,8 @@ fn local_frames() -> Vec<Frame> {
             session: "old".to_string(),
             epoch: "epoch-1".to_string(),
             last_seq: 7,
+            tasks: Default::default(),
+            queues: Default::default(),
         },
         Frame::List {
             sessions: Vec::new(),

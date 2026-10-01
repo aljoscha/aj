@@ -1818,7 +1818,7 @@ async fn an_id_that_is_not_a_session_id_never_reaches_the_store() {
 
         let err = harness
             .host
-            .tasks(id)
+            .task_output(id, 1, 0)
             .await
             .err()
             .expect("a read names no path");
@@ -1855,7 +1855,7 @@ async fn an_id_that_is_not_a_session_id_never_reaches_the_store() {
     let session = harness.create().await;
     harness
         .host
-        .tasks(&session)
+        .tree(&session)
         .await
         .expect("a well-formed id is served");
     harness.host.shutdown().await;
@@ -2993,13 +2993,9 @@ async fn a_head_switch_is_refused_while_work_is_live() {
     let mut stream = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "background something").await;
     stream.pump_until_idle().await;
-    let tasks = harness.host.tasks(&session).await.expect("task table");
     assert!(
-        tasks
-            .tasks
-            .iter()
-            .any(|task| task.status == aj_agent::tool::TaskStatus::Running),
-        "a background task is live: {tasks:?}",
+        running_tasks(&harness.host, &session).await > 0,
+        "a background task is live",
     );
 
     let err = harness
@@ -3302,13 +3298,7 @@ async fn a_head_switch_forgets_the_abandoned_branch() {
         "the background sub-agent is retained and promptable",
     );
     assert!(
-        !harness
-            .host
-            .tasks(&session)
-            .await
-            .expect("tasks")
-            .tasks
-            .is_empty(),
+        !handles.task_registry.snapshot().is_empty(),
         "and its run is in the task table",
     );
     let (head, entries_before) = {
@@ -3343,13 +3333,7 @@ async fn a_head_switch_forgets_the_abandoned_branch() {
         "the abandoned branch's sub-agents are no longer promptable",
     );
     assert!(
-        harness
-            .host
-            .tasks(&session)
-            .await
-            .expect("tasks")
-            .tasks
-            .is_empty(),
+        handles.task_registry.snapshot().is_empty(),
         "and its finished tasks left the table",
     );
     let err = harness
@@ -3552,17 +3536,10 @@ async fn requests_after_shutdown_are_refused() {
             .to_string(),
         harness
             .host
-            .tasks(&session)
+            .task_output(&session, 1, 0)
             .await
             .err()
-            .expect("tasks")
-            .to_string(),
-        harness
-            .host
-            .queue(&session)
-            .await
-            .err()
-            .expect("queue")
+            .expect("task output")
             .to_string(),
         harness
             .host
@@ -3611,13 +3588,14 @@ async fn summary(host: &SessionHost, session: &str) -> Option<aj_wire::SessionSu
     sessions.into_iter().find(|entry| entry.id == session)
 }
 
-/// How many of the session's background tasks the host's task table reports
-/// as still running.
+/// How many of a live session's background tasks the host's task registry
+/// reports as still running.
 async fn running_tasks(host: &SessionHost, session: &str) -> usize {
-    host.tasks(session)
+    host.local_handles(session)
         .await
-        .expect("task table")
-        .tasks
+        .expect("live session")
+        .task_registry
+        .snapshot()
         .iter()
         .filter(|task| task.status == TaskStatus::Running)
         .count()
@@ -4992,8 +4970,9 @@ async fn every_queue_mutation_publishes_an_update() {
 ///
 /// Both agents are made busy first, through commands, because that is the
 /// only way the command surface can reach a queued message at all: an idle
-/// agent runs a prompt instead of queueing it. The queue read is
-/// asserted here for the same reason, against state the host itself built.
+/// agent runs a prompt instead of queueing it. The queues a joiner's
+/// `caught_up` carries are asserted here for the same reason, against state
+/// the host itself built.
 #[tokio::test]
 async fn clearing_the_queue_empties_every_agent() {
     let mut script = sub_agent_turn();
@@ -5060,9 +5039,10 @@ async fn clearing_the_queue_empties_every_agent() {
         (vec!["for main".to_string()], Vec::new()),
     );
 
-    // The queue read answers the same state, one entry per agent that has
-    // something queued, main first.
-    let queue = harness.host.queue(&session).await.expect("queue read");
+    // A client attaching now learns the same state from its `caught_up`
+    // alone, one entry per agent that has something queued, main first.
+    let joiner = Client::attach(&harness.host, &session).await;
+    let queue = joiner.chat.queue();
     assert_eq!(
         queue
             .queues
@@ -5071,9 +5051,14 @@ async fn clearing_the_queue_empties_every_agent() {
             .collect::<Vec<_>>(),
         vec![AgentId::Main, AgentId::Sub(1)],
     );
-    assert_eq!(queue.queues[0].steering.len(), 1);
-    assert!(queue.queues[0].follow_up.is_empty());
-    assert_eq!(queue.queues[1].follow_up.len(), 1);
+    assert_eq!(
+        queued(&joiner, AgentId::Main),
+        (vec!["for main".to_string()], Vec::new()),
+    );
+    assert_eq!(
+        queued(&joiner, AgentId::Sub(1)),
+        (Vec::new(), vec!["for the sub".to_string()]),
+    );
 
     harness
         .host
@@ -5099,14 +5084,15 @@ async fn clearing_the_queue_empties_every_agent() {
         vec![AgentId::Main, AgentId::Sub(1)],
         "one update per agent that had something queued",
     );
-    assert!(
+    assert_eq!(
         harness
             .host
-            .queue(&session)
+            .local_handles(&session)
             .await
-            .expect("queue read")
+            .expect("live session")
             .queues
-            .is_empty(),
+            .pending_counts(),
+        (0, 0),
         "and the session holds nothing pending afterwards",
     );
     for agent in [AgentId::Main, AgentId::Sub(1)] {
@@ -5823,10 +5809,11 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
     let (box_status, box_finished) = sub_box(&state, 1);
     let task_status = harness
         .host
-        .tasks(&session)
+        .local_handles(&session)
         .await
-        .expect("task table")
-        .tasks
+        .expect("live")
+        .task_registry
+        .snapshot()
         .into_iter()
         .find(|row| row.id == task)
         .expect("the task is still in the table")
@@ -5866,10 +5853,11 @@ async fn end_detached_sub(gesture: EndDetached, parent: ParentTurn) -> DetachedE
 async fn running_agent_task(harness: &Harness, session: &str) -> Option<aj_agent::tool::TaskId> {
     harness
         .host
-        .tasks(session)
+        .local_handles(session)
         .await
-        .expect("task table")
-        .tasks
+        .expect("live session")
+        .task_registry
+        .snapshot()
         .iter()
         .find(|row| {
             matches!(row.kind, TaskKind::Agent { agent_id: 1, .. })
@@ -7403,15 +7391,16 @@ async fn killing_a_task_is_accepted_or_a_miss() {
         .expect_err("unknown tasks are refused");
     assert!(matches!(err, HostError::UnknownTask(_)), "got {err:?}");
 
-    let table = harness.host.tasks(&session).await.expect("task table");
-    let live = table
-        .tasks
+    let live = client
+        .chat
+        .tasks()
         .iter()
-        .find(|task| task.status == aj_agent::tool::TaskStatus::Running)
+        .find(|(_, task)| task.status == aj_agent::tool::TaskStatus::Running)
+        .map(|(id, _)| *id)
         .expect("a live task");
     harness
         .host
-        .command(&session, Command::KillTask { task: live.id })
+        .command(&session, Command::KillTask { task: live })
         .await
         .expect("killing a live task is accepted");
     harness.host.shutdown().await;
@@ -10541,11 +10530,11 @@ async fn the_host_declares_its_additive_capabilities() {
 // 15. Reads
 // ---------------------------------------------------------------------------
 
-/// The reads answer the task table (with wall-clock timestamps), the
-/// session's usage, the branch tree, and hello with a `host_id` that
-/// survives a restart.
+/// An attach's `caught_up` answers the task table (with wall-clock
+/// timestamps), and the reads answer the branch tree and hello with a
+/// `host_id` that survives a restart.
 #[tokio::test]
-async fn the_reads_answer_tasks_tree_and_hello() {
+async fn caught_up_answers_tasks_and_the_reads_answer_tree_and_hello() {
     let harness = Harness::with_provider(scripted(
         vec![
             calling(
@@ -10568,7 +10557,18 @@ async fn the_reads_answer_tasks_tree_and_hello() {
     client.pump_until_idle().await;
 
     let before = chrono::Utc::now();
-    let tasks = harness.host.tasks(&session).await.expect("task table");
+    let mut joiner = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    let block = frames_until(&mut joiner, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    let Some(Frame::CaughtUp { tasks, queues, .. }) = block.last() else {
+        panic!("the block ends with caught_up: {block:?}");
+    };
     let task = tasks.tasks.first().expect("a task");
     assert_eq!(task.owner, AgentId::Main);
     assert!(!task.call_id.is_empty(), "the launching call is recorded");
@@ -10578,18 +10578,10 @@ async fn the_reads_answer_tasks_tree_and_hello() {
         task.started_at,
     );
 
-    // An idle session has nothing queued, so the queue read is asserted where
+    // An idle session has nothing queued, so the queues are asserted where
     // queue state can be built through commands, in
     // `clearing_the_queue_empties_every_agent`.
-    assert!(
-        harness
-            .host
-            .queue(&session)
-            .await
-            .expect("queue read")
-            .queues
-            .is_empty(),
-    );
+    assert!(queues.queues.is_empty());
 
     let tree = harness.host.tree(&session).await.expect("tree read");
     assert!(
@@ -10638,10 +10630,10 @@ async fn the_reads_answer_tasks_tree_and_hello() {
     revived.host.shutdown().await;
 }
 
-/// The task, queue and usage reads answer a session that is not live
-/// without materializing it, and the directory carries its row
-/// with the stamp its log file bears. The tree read is the one exception: it
-/// has to parse the log, so it materializes.
+/// The task-output read answers a session that is not live without
+/// materializing it, and the directory carries its row with the stamp its log
+/// file bears. The tree read is the exception: it has to parse the log, so it
+/// materializes.
 #[tokio::test]
 async fn reads_do_not_materialize_a_cold_session() {
     let harness = Harness::new(vec![finalized_text_message("on the record")]);
@@ -10686,43 +10678,30 @@ async fn reads_do_not_materialize_a_cold_session() {
         "and its stamp is the log file's modification time",
     );
 
-    assert!(
-        revived
-            .host
-            .tasks(&session)
-            .await
-            .expect("tasks")
-            .tasks
-            .is_empty(),
-    );
-    assert!(
-        revived
-            .host
-            .queue(&session)
-            .await
-            .expect("queue")
-            .queues
-            .is_empty(),
-    );
+    let err = revived
+        .host
+        .task_output(&session, 1, 0)
+        .await
+        .expect_err("a cold session has no tasks");
+    assert!(matches!(err, HostError::UnknownTask(1)), "got {err:?}");
     assert!(
         !is_live().await.live,
-        "neither read materialized the session",
+        "the read did not materialize the session",
     );
     assert!(
         SessionLock::try_acquire(&revived.persistence, &session, "a-rival-writer")
             .expect("try_acquire")
             .is_some(),
-        "and neither took its advisory lock",
+        "and did not take its advisory lock",
     );
 
-    // An unknown session is still a 404 rather than an empty answer.
-    for err in [
-        revived.host.tasks("not-a-session").await.err(),
-        revived.host.queue("not-a-session").await.err(),
-    ] {
-        let err = err.expect("an unknown session is refused");
-        assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");
-    }
+    // An unknown session is still a 404 rather than a missing task.
+    let err = revived
+        .host
+        .task_output("not-a-session", 1, 0)
+        .await
+        .expect_err("an unknown session is refused");
+    assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");
 
     // The tree read parses the log, so it materializes like a command.
     assert!(
@@ -10914,13 +10893,17 @@ async fn shutdown_cancels_gracefully_and_flushes() {
     harness
         .prompt(&session, "do this after the current turn")
         .await;
-    let queue = harness.host.queue(&session).await.expect("queue read");
-    assert!(
-        queue
-            .queues
-            .iter()
-            .any(|queue| { queue.agent_id == AgentId::Main && queue.follow_up.len() == 1 }),
-        "the queued follow-up must be present or the draining-wake assertion measures nothing: {queue:?}"
+    let (_, follow_up) = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session")
+        .queues
+        .event_messages(AgentId::Main);
+    assert_eq!(
+        follow_up.len(),
+        1,
+        "the queued follow-up must be present or the draining-wake assertion measures nothing",
     );
     let log_path = harness
         .persistence
@@ -12989,7 +12972,7 @@ async fn branch_draft_refusals_leave_live_and_durable_state_unchanged() {
     handles
         .queues
         .append_follow_up(AgentId::Main, "keep queued draft");
-    let queue = serde_json::to_value(harness.host.queue(&session).await.unwrap()).unwrap();
+    let queue = serde_json::to_value(handles.queues.event_messages(AgentId::Main)).unwrap();
     let epoch = attached_epoch(&harness.host, &session).await;
     let live = handles.run_config.lock().unwrap().clone();
     let before = serde_json::to_value(handles.log.lock().await.entries_in_order()).unwrap();
@@ -13090,7 +13073,7 @@ async fn branch_draft_refusals_leave_live_and_durable_state_unchanged() {
             before
         );
         assert_eq!(
-            serde_json::to_value(harness.host.queue(&session).await.unwrap()).unwrap(),
+            serde_json::to_value(handles.queues.event_messages(AgentId::Main)).unwrap(),
             queue
         );
         assert_eq!(harness.host.environment(&session).await.unwrap(), env);

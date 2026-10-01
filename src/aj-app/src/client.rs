@@ -22,7 +22,7 @@
 //! no operation here returns a `Result`.
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
-use aj_wire::{AgentQueue, Cursor, DecodedAgentEvent, Frame, QueueState, TaskTable};
+use aj_wire::{AgentQueue, Cursor, DecodedAgentEvent, Frame};
 
 use crate::chat::{ChatState, Redraw, reduce};
 use crate::host::PERSISTENCE_FAILED_CODE;
@@ -175,8 +175,6 @@ pub struct SessionClient {
     /// noise than help; explicit account actions report their own outcome.
     first_attach_credential_warning: Option<String>,
     saw_first_attach: bool,
-    needs_task_refetch: bool,
-    needs_queue_refetch: bool,
     needs_reattach: bool,
     /// Present after an accepted Head command until its authoritative attach
     /// block is caught up. While present, every block opening resets the chat
@@ -215,8 +213,6 @@ impl SessionClient {
             first_attach_settings: None,
             first_attach_credential_warning: None,
             saw_first_attach: false,
-            needs_task_refetch: false,
-            needs_queue_refetch: false,
             needs_reattach: false,
             forward_reset: None,
             refusal_error: None,
@@ -370,6 +366,8 @@ impl SessionClient {
                 session,
                 epoch,
                 last_seq,
+                tasks,
+                queues,
             } => {
                 // Only the block this client asked for ends here. A
                 // `caught_up` outside one names a position whose entries the
@@ -393,10 +391,12 @@ impl SessionClient {
                 // interrupted after State is replaced by the retry's answer,
                 // so its settings and credential warning cannot go stale.
                 self.saw_first_attach = true;
-                // Neither task events nor queue updates are replayable, so
-                // both tables have to come from their reads.
-                self.needs_task_refetch = true;
-                self.needs_queue_refetch = true;
+                // Neither task events nor queue updates are replayable, so the
+                // block's own tables replace whatever the client held. An event
+                // racing the host's snapshot arrives after this and re-applies
+                // idempotently.
+                chat.replace_tasks(tasks);
+                chat.replace_queue(queues);
                 if self
                     .forward_reset
                     .as_ref()
@@ -549,39 +549,6 @@ impl SessionClient {
     /// the host's own flag.
     pub fn working(&self) -> bool {
         self.working
-    }
-
-    /// Replace the queue snapshot from the queue read, which is
-    /// how a mid-session joiner learns about messages queued before it
-    /// attached. Clears [`Self::needs_queue_refetch`].
-    pub fn set_queue(&mut self, chat: &mut ChatState, queue: QueueState) {
-        chat.replace_queue(queue);
-        self.needs_queue_refetch = false;
-    }
-
-    /// Replace the task table from the tasks read, clearing
-    /// [`Self::needs_task_refetch`].
-    pub fn set_tasks(&mut self, chat: &mut ChatState, tasks: TaskTable) {
-        chat.replace_tasks(tasks);
-        self.needs_task_refetch = false;
-    }
-
-    /// Whether the task table is stale and the caller owes the tasks read.
-    ///
-    /// Set by every `caught_up`, because task events are not replayable
-    /// and a backfill can carry none of them.
-    pub fn needs_task_refetch(&self) -> bool {
-        self.needs_task_refetch
-    }
-
-    /// Whether the queue snapshot is stale and the caller owes the queue
-    /// read.
-    ///
-    /// Set by every `caught_up`, for the same reason as the task table:
-    /// `QueueUpdate` is reliable-transient, so a backfill regenerates none
-    /// of it and a joiner would show no pending messages at all.
-    pub fn needs_queue_refetch(&self) -> bool {
-        self.needs_queue_refetch
     }
 
     /// Whether continuity was broken and the caller owes a re-attach.
@@ -834,7 +801,7 @@ mod tests {
         AssistantContent, AssistantMessage as WireAssistantMessage, Message, StopReason,
         TextContent, Usage, UserMessage,
     };
-    use aj_wire::TaskSummary;
+    use aj_wire::{QueueState, TaskSummary, TaskTable};
     use chrono::Utc;
 
     use crate::chat::{EntryKind, NoticeLevel};
@@ -898,10 +865,16 @@ mod tests {
     }
 
     fn caught_up(epoch: &str, last_seq: u64) -> Frame {
+        caught_up_with(epoch, last_seq, TaskTable::default(), QueueState::default())
+    }
+
+    fn caught_up_with(epoch: &str, last_seq: u64, tasks: TaskTable, queues: QueueState) -> Frame {
         Frame::CaughtUp {
             session: SESSION.to_string(),
             epoch: epoch.to_string(),
             last_seq,
+            tasks,
+            queues,
         }
     }
 
@@ -1592,7 +1565,6 @@ mod tests {
     fn stale_epoch_frames_are_dropped_outside_an_attach_block() {
         let (mut client, mut chat) = attached();
         let _ = client.apply(&mut chat, durable(EPOCH, 2, "entry-2", notice("ours")));
-        client.set_tasks(&mut chat, TaskTable::default());
         let cursor = client.cursor();
 
         let mut abandoned = settings();
@@ -1602,15 +1574,25 @@ mod tests {
             durable("epoch-0", 9, "entry-9", notice("from an abandoned branch")),
         );
         let _ = client.apply(&mut chat, state_with("epoch-0", true, abandoned));
-        let _ = client.apply(&mut chat, caught_up("epoch-0", 99));
+        let _ = client.apply(
+            &mut chat,
+            caught_up_with(
+                "epoch-0",
+                99,
+                TaskTable {
+                    tasks: vec![task_summary(7)],
+                },
+                QueueState::default(),
+            ),
+        );
 
         assert_eq!(notices(&chat), vec!["ours"]);
         assert_eq!(client.cursor(), cursor);
         assert_eq!(client.settings(), Some(&settings()));
         assert!(!client.working());
         assert!(
-            !client.needs_task_refetch(),
-            "a dropped caught_up ends no block",
+            chat.tasks().is_empty(),
+            "a dropped caught_up replaces no task table",
         );
     }
 
@@ -1884,64 +1866,92 @@ mod tests {
         );
     }
 
+    /// Neither task nor queue events are replayable, so `caught_up` carries
+    /// both tables and a same-epoch re-attach replaces what the client held:
+    /// a task that ended while it was away reads as ended, and an agent whose
+    /// queue drained in the gap shows nothing pending. Events that raced the
+    /// host's snapshot replay after it without undoing it.
     #[test]
-    fn caught_up_flags_a_task_refetch_that_set_tasks_clears() {
+    fn caught_up_replaces_the_task_table_and_queues() {
         let (mut client, mut chat) = attached();
-        assert!(
-            client.needs_task_refetch(),
-            "task events are not replayable",
-        );
-
-        client.set_tasks(
+        let _ = client.apply(
             &mut chat,
-            TaskTable {
-                tasks: vec![task_summary(7)],
-            },
+            live(
+                EPOCH,
+                AgentEvent::TaskStart {
+                    agent_id: AgentId::Main,
+                    task_id: 7,
+                    call_id: "call-1".into(),
+                    kind: TaskKind::Bash {
+                        command: "sleep 1".into(),
+                    },
+                    label: "sleep 1".into(),
+                },
+            ),
+        );
+        let _ = client.apply(
+            &mut chat,
+            live(
+                EPOCH,
+                AgentEvent::QueueUpdate {
+                    agent_id: AgentId::Sub(1),
+                    steering: vec![queued("drained in the gap")],
+                    follow_up: Vec::new(),
+                },
+            ),
+        );
+        assert_eq!(chat.tasks()[&7].status, TaskStatus::Running);
+        assert_eq!(chat.queue().queues.len(), 1);
+
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(
+            &mut chat,
+            caught_up_with(
+                EPOCH,
+                0,
+                TaskTable {
+                    tasks: vec![TaskSummary {
+                        status: TaskStatus::Exited(Some(0)),
+                        ..task_summary(7)
+                    }],
+                },
+                QueueState {
+                    queues: vec![AgentQueue {
+                        agent_id: AgentId::Main,
+                        steering: Vec::new(),
+                        follow_up: vec![queued("queued in the gap")],
+                    }],
+                },
+            ),
         );
 
-        assert!(!client.needs_task_refetch());
-        assert_eq!(chat.tasks().len(), 1);
-        assert_eq!(
-            chat.tasks().get(&7).map(|task| task.call_id.as_str()),
-            Some("call-1"),
-            "the read replaces the task model the reducer and footer use",
-        );
+        assert_eq!(chat.tasks()[&7].status, TaskStatus::Exited(Some(0)));
+        assert_eq!(chat.queue().queues.len(), 1);
+        assert_eq!(chat.queue().queues[0].agent_id, AgentId::Main);
 
-        // In the interim between `caught_up` and the read landing, a
-        // snapshot for a task the client does not know is inert: the
-        // reducer freezes output for an untracked task, so the client needs
-        // no filter of its own.
+        // A `TaskStart` published before the snapshot replays after it and
+        // must not reopen the task.
+        let _ = client.apply(
+            &mut chat,
+            live(
+                EPOCH,
+                AgentEvent::TaskStart {
+                    agent_id: AgentId::Main,
+                    task_id: 7,
+                    call_id: "call-1".into(),
+                    kind: TaskKind::Bash {
+                        command: "sleep 1".into(),
+                    },
+                    label: "sleep 1".into(),
+                },
+            ),
+        );
+        assert_eq!(chat.tasks()[&7].status, TaskStatus::Exited(Some(0)));
+        // Output for a task the table does not list is inert: the reducer
+        // freezes output for an untracked task.
         assert!(!client.apply(&mut chat, live(EPOCH, task_output(9))).0);
         assert_eq!(chat.tasks().len(), 1, "the unknown task was ignored");
-    }
-
-    /// The queue read is owed after every block too: `QueueUpdate` is
-    /// reliable-transient, so a backfill regenerates none of it and a joiner
-    /// would show no pending messages at all.
-    #[test]
-    fn caught_up_flags_a_queue_refetch_that_set_queue_clears() {
-        let (mut client, mut chat) = attached();
-        assert!(client.needs_queue_refetch());
-        assert!(chat.queue().queues.is_empty());
-
-        client.set_queue(
-            &mut chat,
-            QueueState {
-                queues: vec![AgentQueue {
-                    agent_id: AgentId::Main,
-                    steering: Vec::new(),
-                    follow_up: vec![queued("from the read")],
-                }],
-            },
-        );
-
-        assert!(!client.needs_queue_refetch());
-        assert_eq!(chat.queue().queues.len(), 1);
-        assert_eq!(
-            chat.queue().queues[0].follow_up.len(),
-            1,
-            "the read replaces the queue model the pending box renders",
-        );
     }
 
     /// A re-attach seeds the main agent's mark and leaves the sub-agents'
@@ -2087,9 +2097,6 @@ mod tests {
         assert_eq!(chat.queue().queues.len(), 1);
         assert_eq!(chat.queue().queues[0].steering.len(), 1);
         assert!(chat.queue().queues[0].follow_up.is_empty());
-
-        client.set_queue(&mut chat, QueueState::default());
-        assert!(chat.queue().queues.is_empty());
     }
 
     #[test]
