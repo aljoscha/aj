@@ -81,7 +81,6 @@ mod prompt_history;
 mod quit_hint;
 mod remote;
 mod scroll;
-mod selection_copied;
 mod serve;
 mod session_env;
 mod session_selector;

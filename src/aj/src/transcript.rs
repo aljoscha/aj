@@ -52,7 +52,6 @@ use vaxis::vxfw::{
 use crate::bubble::{Bubble, BubbleBorder, PADDING_X};
 use crate::image_store::{ImageRender, ImageStore};
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
-use crate::selection_copied::SelectionCopied;
 use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
 use crate::terminal::TerminalCaps;
 use crate::tool_cell::{
@@ -1861,10 +1860,8 @@ pub struct TranscriptView {
     /// Recent press metadata used to derive double and triple clicks because
     /// terminal mouse protocols provide neither click counts nor timestamps.
     last_click: Option<LastClick>,
-    /// The last select-to-copy record. Written on the release that copies a
-    /// real range. The drive loop edge-detects fresh records and raises the
-    /// copy toast.
-    selection_copied: Rc<std::cell::Cell<Option<SelectionCopied>>>,
+    /// The shell's toast stack, which a select-to-copy reports to directly.
+    toasts: crate::toasts::ToastStack,
     /// Viewport size the last completed [`draw`](Widget::draw) laid out
     /// against. The mouse handlers run between draws with no `DrawContext`, so
     /// they read the geometry back from here to map widget-local coordinates
@@ -2052,7 +2049,7 @@ impl TranscriptView {
         theme: &Theme,
         focused: Rc<std::cell::Cell<bool>>,
         branch_armed: Rc<RefCell<Option<crate::branch::BranchDraft>>>,
-        selection_copied: Rc<std::cell::Cell<Option<SelectionCopied>>>,
+        toasts: crate::toasts::ToastStack,
         image_store: Rc<RefCell<ImageStore>>,
         display: Rc<RefCell<TranscriptDisplay>>,
     ) -> TranscriptView {
@@ -2124,7 +2121,7 @@ impl TranscriptView {
             selection_origin: None,
             selection_unit: SelectionUnit::Character,
             last_click: None,
-            selection_copied,
+            toasts,
             last_view: Size {
                 width: 0,
                 height: 0,
@@ -3464,10 +3461,7 @@ impl TranscriptView {
                             // Report the copy to the toast. Count graphemes, so
                             // a multi-byte character (or an emoji) reads as one.
                             let chars = text.graphemes(true).count();
-                            self.selection_copied.set(Some(SelectionCopied {
-                                chars,
-                                at: Instant::now(),
-                            }));
+                            crate::toasts::push_copy_toast(&self.toasts, chars);
                             ctx.copy_to_clipboard(text);
                         }
                     }
@@ -4679,7 +4673,7 @@ mod tests {
             &theme,
             Rc::new(std::cell::Cell::new(false)),
             Rc::new(RefCell::new(None)),
-            Rc::new(std::cell::Cell::new(None)),
+            Rc::default(),
             Rc::new(RefCell::new(ImageStore::default())),
             Rc::default(),
         )
@@ -6112,7 +6106,7 @@ mod tests {
             &theme,
             Rc::new(std::cell::Cell::new(false)),
             Rc::clone(&branch_armed),
-            Rc::new(std::cell::Cell::new(None)),
+            Rc::default(),
             Rc::new(RefCell::new(ImageStore::default())),
             Rc::default(),
         );
@@ -6554,7 +6548,7 @@ mod tests {
             &theme,
             Rc::new(std::cell::Cell::new(false)),
             Rc::new(RefCell::new(None)),
-            Rc::new(std::cell::Cell::new(None)),
+            Rc::default(),
             Rc::new(RefCell::new(ImageStore::default())),
             Rc::default(),
         );
@@ -7065,7 +7059,7 @@ mod tests {
             view.handle_event(&mut EventContext::new(), &mouse(col, row, kind));
         }
         assert!(
-            view.selection_copied.get().is_some(),
+            !crate::toasts::toast_texts(&view.toasts).is_empty(),
             "drag copies visible activity text"
         );
         assert!(transcript_text(&mut view, 80).contains("first body"));
@@ -9477,19 +9471,19 @@ mod tests {
         assert_eq!(copied, Some("row 1"));
     }
 
-    /// A select-to-copy release records the copied character count in the
-    /// shared cell the toast reads, while a plain click records nothing.
+    /// A select-to-copy release raises the copy toast with the copied
+    /// character count, while a plain click raises nothing.
     #[test]
-    fn release_records_the_copied_character_count() {
+    fn release_toasts_the_copied_character_count() {
         let chat = chat_with_notices(20);
         let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
-        let selection_copied = Rc::new(std::cell::Cell::new(None));
+        let toasts: crate::toasts::ToastStack = Rc::default();
         let mut view = TranscriptView::new(
             Rc::clone(&chat),
             &theme,
             Rc::new(std::cell::Cell::new(false)),
             Rc::new(RefCell::new(None)),
-            Rc::clone(&selection_copied),
+            Rc::clone(&toasts),
             Rc::new(RefCell::new(ImageStore::default())),
             Rc::default(),
         );
@@ -9504,8 +9498,8 @@ mod tests {
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Release));
         assert!(
-            selection_copied.get().is_none(),
-            "a plain click records no copy"
+            crate::toasts::toast_texts(&toasts).is_empty(),
+            "a plain click copies nothing"
         );
 
         // Select " row 1" (entry 1, screen row 2): press at col 0, drag to
@@ -9517,8 +9511,11 @@ mod tests {
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(6, 2, mouse::Type::Release));
 
-        let rec = selection_copied.get().expect("release records a copy");
-        assert_eq!(rec.chars, 5, "five characters copied (\"row 1\")");
+        assert_eq!(
+            crate::toasts::toast_texts(&toasts),
+            vec!["5 characters copied to clipboard".to_string()],
+            "five characters copied (\"row 1\")",
+        );
     }
 
     /// Select-to-copy on a transcript shorter than the viewport. Bottom-anchoring

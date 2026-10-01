@@ -1790,7 +1790,7 @@ mod tests {
             &theme,
             std::rc::Rc::new(std::cell::Cell::new(false)),
             std::rc::Rc::new(std::cell::RefCell::new(None)),
-            std::rc::Rc::new(std::cell::Cell::new(None)),
+            std::rc::Rc::default(),
             std::rc::Rc::new(std::cell::RefCell::new(
                 crate::image_store::ImageStore::default(),
             )),

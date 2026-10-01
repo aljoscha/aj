@@ -93,7 +93,6 @@ use crate::pending::PendingBox;
 use crate::prompt_history::{HistoryFetch, HistoryScope, open_prompt_history};
 use crate::quit_hint::QuitHint;
 use crate::remote::RemoteError;
-use crate::selection_copied::SelectionCopied;
 use crate::session_env::open_session_env;
 use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
 use crate::session_tag::{TagEdit, open_session_tag};
@@ -5805,7 +5804,6 @@ struct SessionView {
     footer: Rc<RefCell<FooterLine>>,
     focus_mode: Rc<Cell<bool>>,
     branch_anchor: Rc<RefCell<Option<crate::branch::BranchDraft>>>,
-    selection_copied: Rc<Cell<Option<SelectionCopied>>>,
     submitted: Rc<RefCell<Option<String>>>,
     image_store: Rc<RefCell<ImageStore>>,
     image_generation: Cell<u64>,
@@ -5818,6 +5816,7 @@ impl SessionView {
         status: Rc<RefCell<StatusState>>,
         theme: &ThemeHandle,
         display: &Rc<RefCell<TranscriptDisplay>>,
+        toasts: &ToastStack,
         header: String,
         id: &str,
         cwd: PathBuf,
@@ -5838,7 +5837,6 @@ impl SessionView {
         editor.borrow_mut().set_autocomplete_max_visible(20);
         let focus_mode = Rc::new(Cell::new(false));
         let branch_anchor = Rc::new(RefCell::new(None));
-        let selection_copied = Rc::new(Cell::new(None));
         let image_store = Rc::new(RefCell::new(ImageStore::default()));
         let image_generation = Cell::new(chat.borrow().generation());
         let t = theme.read();
@@ -5848,7 +5846,7 @@ impl SessionView {
             &t,
             Rc::clone(&focus_mode),
             Rc::clone(&branch_anchor),
-            Rc::clone(&selection_copied),
+            Rc::clone(toasts),
             Rc::clone(&image_store),
             Rc::clone(display),
         )));
@@ -5906,7 +5904,6 @@ impl SessionView {
             footer,
             focus_mode,
             branch_anchor,
-            selection_copied,
             submitted,
             image_store,
             image_generation,
@@ -6106,11 +6103,13 @@ impl Shell {
         // Defaults until the run loop seeds it from config, like
         // `show_frame_stats` below.
         let display = Rc::new(RefCell::new(TranscriptDisplay::default()));
+        let toasts: ToastStack = Rc::new(RefCell::new(Vec::new()));
         let view = Rc::new(SessionView::new(
             Rc::clone(&chat),
             status,
             &theme,
             &display,
+            &toasts,
             header,
             session_id,
             cwd,
@@ -6127,7 +6126,6 @@ impl Shell {
                 Rc::new(RefCell::new(OverlayChrome::from_theme(&t))),
             )
         };
-        let toasts: ToastStack = Rc::new(RefCell::new(Vec::new()));
         let busy = Rc::new(Cell::new(false));
         let quit_hint_warning: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let quit_hint = RefCell::new(QuitHint::new(
@@ -6713,6 +6711,7 @@ impl Shell {
                     Rc::new(RefCell::new(StatusState::default())),
                     &self.theme,
                     &self.display,
+                    &self.toasts,
                     format!("{APP_TITLE} - session {}", world.session()),
                     world.session(),
                     world.working_directory.clone(),
@@ -7468,25 +7467,6 @@ fn block_mouse(mut surface: Surface, transcript: &Rc<RefCell<TranscriptView>>) -
     surface
 }
 
-/// Fold a fresh select-to-copy record into the toast stack.
-///
-/// The transcript writes the shared `selection_copied` cell (the unified toast
-/// stack deliberately leaves it in place), so the drive loop edge-detects fresh
-/// records here by their timestamp: each new copy pushes exactly one toast
-/// with the copy-toast look and its own timer. Returns whether a toast was
-/// pushed, so the caller requests the showing repaint.
-fn fold_selection_copied_record(shell: &Shell, seen: &mut Option<Instant>) -> bool {
-    let Some(copied) = shell.view().selection_copied.get() else {
-        return false;
-    };
-    if *seen == Some(copied.at) {
-        return false;
-    }
-    *seen = Some(copied.at);
-    crate::toasts::push_copy_toast(&shell.toasts, copied.chars);
-    true
-}
-
 /// Anchor a corner box flush to the right edge with its bottom at `bottom`,
 /// pushing it onto `inner` at `z` (1 over the base layout like the
 /// autocomplete popup, 3 over an open modal for the toast stack). Returns the
@@ -7790,13 +7770,6 @@ async fn drive(
     // quit is armed. We refresh the hint's running-work warning on each edge
     // (set it on arm, clear it on disarm).
     let mut quit_was_armed = false;
-    // Edge tracker for the transcript's select-to-copy record: the transcript
-    // writes the shared cell (it stays the cell's single writer), and the
-    // per-iteration fold below pushes each fresh record onto the toast stack.
-    // Seeded from the current record so a copy already reported by a previous
-    // session's drive loop isn't re-toasted.
-    let mut selection_copied_seen: Option<Instant> =
-        shell.borrow().view().selection_copied.get().map(|c| c.at);
     // Window reads and saves run here without blocking input. Each fill owns
     // its opening window, so replies can arrive after closing or switching
     // sessions. Unfinished fills return to the shell when this drive exits.
@@ -8652,19 +8625,11 @@ async fn drive(
             app.request_redraw();
         }
         quit_was_armed = quit_armed;
-        // Fold a fresh select-to-copy into the toast stack (the transcript
-        // wrote the shared record during dispatch), then prune expired toasts
-        // so the repaint the earliest-deadline wake scheduled clears exactly
-        // the boxes whose time is up. Other raise sites request their own
-        // redraws.
-        {
-            let shell = shell.borrow();
-            if fold_selection_copied_record(&shell, &mut selection_copied_seen) {
-                app.request_redraw();
-            }
-            if crate::toasts::prune_expired(&shell.toasts) {
-                app.request_redraw();
-            }
+        // Prune expired toasts so the repaint the earliest-deadline wake
+        // scheduled clears exactly the boxes whose time is up. Raise sites
+        // request their own redraws.
+        if crate::toasts::prune_expired(&shell.borrow().toasts) {
+            app.request_redraw();
         }
     };
 
@@ -12338,93 +12303,6 @@ mod tests {
         );
     }
 
-    /// A fresh select-to-copy record folds into the toast stack (the drive
-    /// loop's `fold_selection_copied_record`) and shows in `Shell::draw`; the
-    /// same record folds only once.
-    #[test]
-    fn copy_toast_shows_when_a_copy_is_folded() {
-        let shell = test_shell_with_chat(empty_chat());
-        let ctx = draw_ctx(100, 30);
-
-        let before = shell.borrow_mut().draw(&ctx);
-        assert!(
-            !crate::test_support::rows(&before)
-                .join("\n")
-                .contains("copied to clipboard"),
-            "no toast without a copy",
-        );
-
-        shell
-            .borrow()
-            .view()
-            .selection_copied
-            .set(Some(SelectionCopied {
-                chars: 7,
-                at: Instant::now(),
-            }));
-        let mut seen = None;
-        assert!(
-            fold_selection_copied_record(&shell.borrow(), &mut seen),
-            "a fresh record pushes a toast"
-        );
-        assert!(
-            !fold_selection_copied_record(&shell.borrow(), &mut seen),
-            "the same record folds only once"
-        );
-        let after = shell.borrow_mut().draw(&ctx);
-        let body = crate::test_support::rows(&after).join("\n");
-        assert!(body.contains("7 characters copied to clipboard"), "{body}");
-        assert_eq!(
-            crate::toasts::toast_texts(&shell.borrow().toasts).len(),
-            1,
-            "exactly one toast on the stack"
-        );
-    }
-
-    /// The drive loop seeds `selection_copied_seen` from the restored record's
-    /// `at` before its first iteration, so a record carried over from a
-    /// previous session folds NO toast. A fresh record (a new `at`) still
-    /// toasts once.
-    #[test]
-    fn preseeded_copy_record_does_not_retoast() {
-        let shell = test_shell_with_chat(empty_chat());
-        let at = Instant::now();
-        shell
-            .borrow()
-            .view()
-            .selection_copied
-            .set(Some(SelectionCopied { chars: 7, at }));
-
-        // The loop-start seed: `seen` already holds the record's timestamp.
-        let mut seen = Some(at);
-        assert!(
-            !fold_selection_copied_record(&shell.borrow(), &mut seen),
-            "the seeded record folds no toast"
-        );
-        assert!(
-            crate::toasts::toast_texts(&shell.borrow().toasts).is_empty(),
-            "no toast for a previous session's copy"
-        );
-
-        shell
-            .borrow()
-            .view()
-            .selection_copied
-            .set(Some(SelectionCopied {
-                chars: 9,
-                at: at + std::time::Duration::from_millis(1),
-            }));
-        assert!(
-            fold_selection_copied_record(&shell.borrow(), &mut seen),
-            "a fresh record still toasts"
-        );
-        assert_eq!(
-            crate::toasts::toast_texts(&shell.borrow().toasts).len(),
-            1,
-            "exactly one toast for the fresh record"
-        );
-    }
-
     /// A raised toast shows in `Shell::draw`; without one there is no box.
     /// Several live toasts stack, oldest closest to the bottom.
     #[test]
@@ -12684,7 +12562,7 @@ mod tests {
             &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
             Rc::new(std::cell::Cell::new(false)),
             Rc::new(std::cell::RefCell::new(None)),
-            Rc::new(std::cell::Cell::new(None)),
+            Rc::default(),
             Rc::new(std::cell::RefCell::new(
                 crate::image_store::ImageStore::default(),
             )),
@@ -25811,14 +25689,13 @@ mod tests {
             let end_row = i16::try_from(end_row).unwrap();
             app.handle_input(left_mouse_at(end_row, col + 8, Type::Drag));
             app.handle_input(left_mouse_at(end_row, col + 8, Type::Release));
-            let copied = shell
-                .borrow()
-                .view()
-                .selection_copied
-                .get()
+            let toasts = crate::toasts::toast_texts(&shell.borrow().toasts);
+            let copied: usize = toasts
+                .last()
+                .and_then(|text| text.split(' ').next()?.parse().ok())
                 .expect("release after scrolling copies the selection");
             assert!(
-                copied.chars > 4,
+                copied > 4,
                 "continued dragging extended the initial four-character range"
             );
         }
@@ -25868,7 +25745,7 @@ mod tests {
         );
         app.handle_input(left_mouse_at(-10, 0, Type::Release));
         assert!(
-            shell.borrow().view().selection_copied.get().is_some(),
+            !crate::toasts::toast_texts(&shell.borrow().toasts).is_empty(),
             "release outside completes and copies the owned selection"
         );
         assert!(shell.borrow().take_session_request().is_none());
