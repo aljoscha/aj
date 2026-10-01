@@ -30,20 +30,30 @@
 //! `reset` safe to send: a client attached across several hosts keeps its stream
 //! and every other host's sessions through it, and the directory, where the
 //! withdrawn host's rows and its group are gone, confirms what the refusal said.
+//!
+//! Every session a client names is answered: its host's block, or an `error`.
+//! A session whose host this gateway cannot reach right now, because it holds
+//! no link to it or the dial failed, is answered `host_unreachable`, which a
+//! client keeps its cursor through, and the host's return is announced with
+//! `reset`. Each host is served by a task of its own, started before the client
+//! has its response head, so a host that is slow, hung or gone delays and fails
+//! nothing but its own sessions.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aj_app::client::HOST_UNREACHABLE_CODE;
+use aj_app::host::AttachRequest;
 use aj_app::outbound::{self, Offered, Sender};
 use aj_wire::{DecodedFrame, Frame, MergedDirectory};
 use tokio::sync::watch;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
+use crate::gateway::Tuning;
 use crate::gateway::config::HostAddress;
 use crate::gateway::directory::{AttachGroup, AttachPlan, Unresolvable};
 use crate::gateway::naming::SessionAddress;
-use crate::gateway::{GatewayError, Tuning};
 use crate::remote::{RemoteClient, RemoteError, RemoteEvents};
 
 /// What one client stream writes next.
@@ -83,92 +93,44 @@ pub(crate) struct Splice {
 }
 
 impl Splice {
-    /// Open the upstream stream of every host in `plan`, and hold the refusal
-    /// owed to every session in it this gateway could not resolve.
+    /// Serve every host in `plan` on a task of its own ([`attend`]), and hold
+    /// the refusal owed to every session in it this gateway could not resolve.
     ///
-    /// Returning means every upstream that could be opened is open and its
-    /// attach block is already on its way, so a failure of the request itself
-    /// is an HTTP status rather than something a client would have to look for
-    /// among the frames. What is wrong with one named session is not that: it
-    /// travels as that session's own `error` frame. A host this
-    /// gateway holds no link to contributes no upstream at all (see
-    /// [`AttachGroup::dial`]), and so does one withdrawn while this was dialing
-    /// it.
+    /// Returns at once, without waiting on any host, so the client has its
+    /// response head while the hosts are still being dialed. What becomes of
+    /// each named session travels as that session's own frames.
     ///
     /// `shutdown` is the serving gateway's own token, and this splice's is a
     /// child of it: a client that stopped reading never observes a shutdown,
     /// because its stream is only polled when there is room to write to it, and
     /// its upstreams have to end anyway.
-    pub(crate) async fn open(
+    pub(crate) fn open(
         plan: AttachPlan,
         reachable: watch::Receiver<Arc<BTreeSet<String>>>,
         directory: watch::Receiver<Arc<MergedDirectory>>,
         tuning: Tuning,
         shutdown: &CancellationToken,
-    ) -> Result<Self, GatewayError> {
+    ) -> Self {
         let AttachPlan { groups, refused } = plan;
         let cancel = shutdown.child_token();
-        // Taken before anything is spawned, so an upstream that will not open
-        // takes the ones that already did down with it on the way out.
         let guard = cancel.clone().drop_guard();
         let (sender, frames) = outbound::channel(tuning.outbound_queue, cancel.clone());
-        let mut watched = Vec::new();
-        let mut opened = Vec::new();
         for group in groups {
-            watched.push(HostReturn {
-                sessions: group.namespaced(),
-                // What the watcher compares against: a host that was there when
-                // its upstream opened has broken nothing, and one that was not
-                // is a client waiting for it to come back.
-                up: group.dial.is_some(),
-                host_id: group.host_id.clone(),
-            });
-            let Some(address) = group.dial.clone() else {
-                continue;
-            };
-            // Raced against the withdrawal, because a dial is bounded by
-            // `upstream_timeout` and the dials are sequential: waiting one out on
-            // a host that is no longer this gateway's would hold up every other
-            // host on this stream, answer the client after the withdrawal already
-            // has, and end in a timeout, which is a 503 for the whole stream
-            // rather than the "contributes no upstream" a withdrawn host owes it.
-            let events = tokio::select! {
-                _ = group.serving.cancelled() => continue,
-                events = dial(&address, &group, tuning.upstream_timeout) => events?,
-            };
-            opened.push((
-                Upstream {
-                    host_id: group.host_id,
-                    address,
-                    sessions: group
-                        .attach
-                        .iter()
-                        .map(|request| request.session.clone())
-                        .collect(),
-                    serving: group.serving,
-                },
-                events,
+            tokio::spawn(attend(
+                group,
+                reachable.clone(),
+                sender.clone(),
+                cancel.clone(),
+                tuning.upstream_timeout,
             ));
         }
-        // Pumped only once every dial is done. The dials are sequential and each
-        // one is bounded by `upstream_timeout`, so a pump started inside that
-        // loop would forward one host's frames into a queue for a client that
-        // has not been handed its response head yet, and a busy session would
-        // evict a client that never saw a frame. Until then the frames wait in
-        // the upstream connection, which is where backpressure belongs.
-        for (upstream, events) in opened {
-            tokio::spawn(pump(upstream, events, sender.clone(), cancel.clone()));
-        }
-        if !watched.is_empty() {
-            tokio::spawn(returns(watched, reachable, sender, cancel.clone()));
-        }
-        Ok(Self {
+        Self {
             frames,
             directory,
             opened: false,
             refused: refused.into_iter().map(refusal).collect(),
             _cancel: guard,
-        })
+        }
     }
 
     /// The next frame for this client, `None` once the stream is over.
@@ -239,16 +201,123 @@ enum Woken {
     Over,
 }
 
-/// One host's spliced stream, as the task pumping it knows it.
-struct Upstream {
-    /// The namespace this host's session ids appear under downstream.
-    host_id: String,
-    /// Where the stream was opened, for the log line when it ends.
-    address: HostAddress,
-    /// The sessions this stream attached, in the host's own vocabulary.
-    sessions: Vec<String>,
-    /// Cancelled when this host's enrollment is withdrawn.
-    serving: CancellationToken,
+/// Everything one client stream is owed about one host's sessions.
+///
+/// Each session is answered with its upstream block, or with `host_unreachable`
+/// when there is no upstream to be had: this gateway holds no link to the host,
+/// or the dial failed or did not answer within `answer_within`. Then the first
+/// of three things ends the task with a `reset` for every session: the
+/// upstream ending, the host's return as the control link reports it, or the
+/// host's withdrawal.
+///
+/// One task writes every frame about this host's sessions on this stream, into
+/// one FIFO queue, which is what orders them: a `host_unreachable` is queued
+/// before the task starts watching for the return whose `reset` follows it.
+async fn attend(
+    group: AttachGroup,
+    reachable: watch::Receiver<Arc<BTreeSet<String>>>,
+    queue: Sender<DecodedFrame>,
+    cancel: CancellationToken,
+    answer_within: Duration,
+) {
+    let sessions = group.namespaced();
+    let ended = tokio::select! {
+        _ = cancel.cancelled() => return,
+        _ = group.serving.cancelled() => "its host's enrollment was withdrawn".to_string(),
+        ended = follow(&group, reachable, &queue, answer_within) => match ended {
+            Some(ended) => ended,
+            // The client this was for went away, and a client that is gone is
+            // owed nothing.
+            None => return,
+        },
+    };
+    tracing::info!(
+        "host {}'s sessions on a client stream end: {ended}",
+        group.host_id
+    );
+    // Continuity is broken for exactly this host's sessions, and this gateway
+    // does not resume them itself (see the module docs).
+    for session in &sessions {
+        if queue.offer(reset(session)) == Offered::Evicted {
+            return;
+        }
+    }
+}
+
+/// Answer `group`'s sessions and follow them until something ends that,
+/// answering what did, or `None` once the client is gone.
+async fn follow(
+    group: &AttachGroup,
+    mut reachable: watch::Receiver<Arc<BTreeSet<String>>>,
+    queue: &Sender<DecodedFrame>,
+    answer_within: Duration,
+) -> Option<String> {
+    let not_reachable = format!("host {} is not reachable from this gateway", group.host_id);
+    let reason = match &group.dial {
+        Some(address) => match dial(address, &group.attach, answer_within).await {
+            Ok(events) => {
+                let sessions: Vec<String> = group
+                    .attach
+                    .iter()
+                    .map(|request| request.session.clone())
+                    .collect();
+                // A link that dropped and came back while this upstream stayed
+                // open is a return all the same: the host may have restarted
+                // behind it.
+                return tokio::select! {
+                    ended = carry(&group.host_id, &sessions, events, queue) => ended,
+                    () = returned(&mut reachable, &group.host_id, true) => {
+                        Some("its host's link came back".to_string())
+                    }
+                };
+            }
+            Err(err) => {
+                tracing::info!("could not open the spliced stream to {address}: {err}");
+                format!("{not_reachable}: {err}")
+            }
+        },
+        None => not_reachable,
+    };
+    for session in group.namespaced() {
+        let unreachable = DecodedFrame::try_from(Frame::Error {
+            session,
+            code: HOST_UNREACHABLE_CODE.to_string(),
+            message: reason.clone(),
+        })
+        .expect("an error frame carries nothing that could fail validation");
+        // Paced, as the block it stands in for would be.
+        if !queue.send_paced(unreachable).await {
+            return None;
+        }
+    }
+    // A dial that failed on a link that reads up says the link is not the whole
+    // story, so any later reading of the host as up is taken as its return.
+    returned(&mut reachable, &group.host_id, false).await;
+    Some("its host came back".to_string())
+}
+
+/// Wait for `host_id`'s control link to report it up after it was not, `up`
+/// being what the caller last knew. Pending for good once the gateway is gone.
+///
+/// Only an edge this observes: `watch` coalesces, so a flap that lands entirely
+/// between two wakes presents as no change at all. That is a flap during which
+/// an open upstream is the authority, and one that broke with it is reported
+/// by its own end.
+async fn returned(
+    reachable: &mut watch::Receiver<Arc<BTreeSet<String>>>,
+    host_id: &str,
+    mut up: bool,
+) {
+    loop {
+        if reachable.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        let now = reachable.borrow_and_update().contains(host_id);
+        if now && !up {
+            return;
+        }
+        up = now;
+    }
 }
 
 /// Open one host's upstream stream with the client's own attach set.
@@ -258,108 +327,38 @@ struct Upstream {
 /// the client offered it.
 ///
 /// `answer_within` bounds the response head only. The body stays open for as
-/// long as the client is attached, and silence on an open stream is what the
-/// client notices (two missed heartbeats). Without the bound a host that took
-/// the request and said nothing would hold a client of this gateway waiting on
-/// its own stream request for as long as it cared to.
+/// long as the client is attached, and silence on an open stream is the
+/// upstream's own failure (two missed heartbeats).
 async fn dial(
     address: &HostAddress,
-    group: &AttachGroup,
+    attach: &[AttachRequest],
     answer_within: Duration,
-) -> Result<RemoteEvents, GatewayError> {
-    let client = RemoteClient::new(address.url())
-        .map(|client| client.with_open_timeout(answer_within))
-        .map_err(|err| unreachable(address, err))?;
-    client.events(&group.attach).await.map_err(|err| match err {
-        // The host's own answer to a client's attach: a session it does not
-        // hold, a lock conflict. It travels back with its status and its body,
-        // exactly as a proxied refusal does, because the client asked this
-        // question and the owning host answered it.
-        RemoteError::Status {
-            status,
-            message,
-            body,
-            ..
-        } => GatewayError::AttachRefused {
-            status,
-            host_id: group.host_id.clone(),
-            message,
-            body,
-        },
-        // Not a refusal: a host this gateway believed was there did not answer.
-        // Carrying its sessions silently would leave a client watching frames
-        // that never come, and nothing has marked them unreachable, so this is
-        // the 503 a gateway answers for a host it cannot reach.
-        err => unreachable(address, err),
-    })
-}
-
-fn unreachable(address: &HostAddress, source: RemoteError) -> GatewayError {
-    GatewayError::Unreachable {
-        address: address.clone(),
-        source,
-    }
-}
-
-/// Forward one host's frames to one client until the stream ends.
-///
-/// However it ends, the sessions it carried are owed a `reset`: continuity for
-/// them is over whether the host dropped the stream or its enrollment was
-/// withdrawn under it, and only the re-attach that `reset` asks for tells the
-/// two apart (see the module docs).
-///
-/// The whole loop races the withdrawal, not just the read: a pump pacing an
-/// attach block is parked on the client's queue, and a signal it only saw
-/// between frames would never reach it.
-async fn pump(
-    upstream: Upstream,
-    mut events: RemoteEvents,
-    queue: Sender<DecodedFrame>,
-    cancel: CancellationToken,
-) {
-    let ended = tokio::select! {
-        _ = upstream.serving.cancelled() => Some("its host's enrollment was withdrawn".to_string()),
-        ended = carry(&upstream, &mut events, &queue, &cancel) => ended,
-    };
-    // `None` is the client this stream was for going away, and a client that is
-    // gone is owed nothing.
-    let Some(ended) = ended else {
-        return;
-    };
-    tracing::info!("the spliced stream to {} ended: {ended}", upstream.address);
-    // Continuity is broken for exactly the sessions this stream carried, and
-    // this gateway does not resume them itself (see the module docs).
-    for session in &upstream.sessions {
-        let namespaced = SessionAddress::new(&upstream.host_id, session).to_string();
-        if queue.offer(reset(&namespaced)) == Offered::Evicted {
-            return;
-        }
-    }
+) -> Result<RemoteEvents, RemoteError> {
+    RemoteClient::new(address.url())?
+        .with_open_timeout(answer_within)
+        .events(attach)
+        .await
 }
 
 /// Forward frames until the upstream ends, answering why it did, or `None` once
 /// the client this was for is gone.
 async fn carry(
-    upstream: &Upstream,
-    events: &mut RemoteEvents,
+    host_id: &str,
+    sessions: &[String],
+    mut events: RemoteEvents,
     queue: &Sender<DecodedFrame>,
-    cancel: &CancellationToken,
 ) -> Option<String> {
     // The sessions whose attach block is still being written. Their frames are
     // paced rather than measured against the client's bound, see
     // [`Sender::send_paced`].
-    let mut attaching: HashSet<String> = upstream.sessions.iter().cloned().collect();
+    let mut attaching: HashSet<String> = sessions.iter().cloned().collect();
     loop {
-        let next = tokio::select! {
-            _ = cancel.cancelled() => return None,
-            next = events.recv_decoded() => next,
-        };
-        let frame = match next {
+        let frame = match events.recv_decoded().await {
             None => return Some("the host closed the stream".to_string()),
             Some(Err(err)) => return Some(err.to_string()),
             Some(Ok(frame)) => frame,
         };
-        if !forward(&upstream.host_id, frame, &mut attaching, queue).await {
+        if !forward(host_id, frame, &mut attaching, queue).await {
             return None;
         }
     }
@@ -434,62 +433,6 @@ fn ends_a_block(frame: &DecodedFrame) -> bool {
     )
 }
 
-/// One host a client's stream is waiting on, and what it last knew about it.
-struct HostReturn {
-    host_id: String,
-    /// The namespaced ids of that client's sessions on this host.
-    sessions: Vec<String>,
-    up: bool,
-}
-
-/// Emit `reset` for a host's sessions when this gateway's link to it returns.
-///
-/// The control link is the reachability oracle: it redials on its own, and its
-/// return is what makes an upstream attach succeed again. A client learns of
-/// that only by attaching, and `reset` is how it is asked to.
-///
-/// Only the edge from down to up, and only one this stream observed. Emitting at
-/// open would spin a client whose host is down (attach, reset, re-attach, reset),
-/// and a host that was up all along has broken nothing for this stream.
-///
-/// The edge can be one `reset` more than continuity strictly needed: a host whose
-/// return follows a drop the pump already reported earns one, and so does a
-/// control link that flapped while the spliced stream survived, when the watcher
-/// saw both sides of the flap. It can also be none of those, because `watch`
-/// coalesces: a flap that lands entirely between two wakes presents as no change
-/// at all. Both are deliberate. A `reset` costs a re-attach that resumes
-/// incrementally, and a flap this misses is one where the stream was open, so a
-/// stream that broke with it is reported by its own pump.
-async fn returns(
-    mut hosts: Vec<HostReturn>,
-    mut reachable: watch::Receiver<Arc<BTreeSet<String>>>,
-    queue: Sender<DecodedFrame>,
-    cancel: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            changed = reachable.changed() => if changed.is_err() {
-                return;
-            },
-        }
-        let now = Arc::clone(&reachable.borrow_and_update());
-        for host in &mut hosts {
-            let up = now.contains(&host.host_id);
-            let returned = up && !host.up;
-            host.up = up;
-            if !returned {
-                continue;
-            }
-            for session in &host.sessions {
-                if queue.offer(reset(session)) == Offered::Evicted {
-                    return;
-                }
-            }
-        }
-    }
-}
-
 /// A `reset` for one namespaced session.
 fn reset(session: &str) -> DecodedFrame {
     DecodedFrame::try_from(Frame::Reset {
@@ -520,87 +463,7 @@ const UNKNOWN_SESSION: &str = "unknown_session";
 mod tests {
     use std::num::NonZeroUsize;
 
-    use futures::FutureExt;
-
     use super::*;
-    use crate::remote::RemoteClient;
-    use crate::remote::tests::{addr, bounded};
-
-    /// How many times the tie is played out.
-    ///
-    /// Both arms of [`pump`]'s `select!` are ready on its first poll here, and
-    /// `select!` resolves that at random, so the round in which the upstream arm
-    /// wins is the one the guard after the loop exists for. Enough rounds that
-    /// missing it is 2^-64.
-    const ROUNDS: usize = 64;
-
-    /// An upstream that ended in the very poll its host was withdrawn in sends
-    /// its `reset` all the same.
-    ///
-    /// Both are true at once here, which is a state the enrollment reaches for
-    /// real: the pump is spawned only after every dial, so a withdrawal during
-    /// the dials plus a host that has already closed the stream presents `pump`
-    /// with both on its first poll. Whichever arm wins, continuity for the
-    /// sessions this stream carried is over, so the client is asked to re-attach
-    /// and its re-attach is answered per session (see the module docs, which own
-    /// that decision). The tie is what would make the two arms disagree, so it is
-    /// played out rather than reasoned about.
-    ///
-    /// The fixture leaves `select!` as the only decider: the stream is driven to
-    /// its end first, so `carry` completes on its first poll without yielding,
-    /// and the token is cancelled before `pump` is polled at all.
-    #[tokio::test]
-    async fn an_upstream_that_ended_as_it_was_withdrawn_sends_its_reset_anyway() {
-        let (address, host) = host_with_no_frames().await;
-        let client = RemoteClient::new(address.url()).expect("a client");
-        bounded("the withdrawal to race the end of the stream", async {
-            for round in 0..ROUNDS {
-                let mut events = client.events(&[]).await.expect("a stream");
-                assert!(
-                    events.recv_decoded().await.is_none(),
-                    "round {round}: the stream has to be over before the pump runs, \
-                     or this measures an ordinary read instead of the tie",
-                );
-                let serving = CancellationToken::new();
-                serving.cancel();
-                let cancel = CancellationToken::new();
-                let (queue, mut frames) =
-                    outbound::channel(NonZeroUsize::new(8).expect("non-zero"), cancel.clone());
-
-                pump(
-                    Upstream {
-                        host_id: "left".to_string(),
-                        address: address.clone(),
-                        sessions: vec!["s-1".to_string()],
-                        serving,
-                    },
-                    events,
-                    queue,
-                    cancel,
-                )
-                .await;
-
-                let carried: Vec<DecodedFrame> =
-                    std::iter::from_fn(|| frames.recv().now_or_never().flatten()).collect();
-                assert_eq!(
-                    carried.len(),
-                    1,
-                    "round {round}: the arm that won decided whether this client \
-                     was told its sessions need re-attaching: {carried:?}",
-                );
-                assert!(
-                    matches!(
-                        &carried[0],
-                        DecodedFrame::Known(known)
-                            if matches!(known.value(), Frame::Reset { session } if session == "left:s-1"),
-                    ),
-                    "round {round}: {carried:?}",
-                );
-            }
-        })
-        .await;
-        host.abort();
-    }
 
     /// The merged directory is the literal first frame even when a spliced
     /// refusal is already queued.
@@ -688,33 +551,5 @@ mod tests {
             "the raw rewrite re-encoded away an additive field: {}",
             raw.get(),
         );
-    }
-
-    /// A host whose event stream is over as soon as it opens.
-    ///
-    /// What makes `carry` complete without yielding: [`RemoteEvents`] marks
-    /// itself done at the end of the stream, so every read after that answers on
-    /// the spot.
-    async fn host_with_no_frames() -> (HostAddress, tokio::task::JoinHandle<()>) {
-        use axum::response::sse::{Event, Sse};
-        use axum::routing::get;
-
-        let app = axum::Router::new().route(
-            "/v1/events",
-            get(|| async {
-                Sse::new(futures::stream::empty::<
-                    Result<Event, std::convert::Infallible>,
-                >())
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
-            .await
-            .expect("bind a loopback port");
-        let bound = listener.local_addr().expect("local addr");
-        let serving = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        let address = HostAddress::parse(&format!("http://{bound}")).expect("an address");
-        (address, serving)
     }
 }

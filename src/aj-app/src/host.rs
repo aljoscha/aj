@@ -1005,10 +1005,6 @@ impl SessionHost {
     /// client every healthy session it named. What does fail the request is
     /// what is wrong with the request rather than with a session: a session
     /// named twice, and a host that is shut down.
-    ///
-    /// Returning successfully means every session [`Attachment::attached`]
-    /// names will have its block written, which is what a client arms its
-    /// fold from.
     pub async fn attach(&self, requests: &[AttachRequest]) -> Result<Attachment, HostError> {
         self.alive()?;
         // One block per named session is the client contract, and
@@ -1035,7 +1031,6 @@ impl SessionHost {
         // Resolved up front, so that returning means every block this stream
         // owes can be written.
         let mut serving = Vec::with_capacity(requests.len());
-        let mut attached = Vec::with_capacity(requests.len());
         for request in requests {
             match self.live(&request.session).await {
                 Ok(session) => {
@@ -1058,7 +1053,6 @@ impl SessionHost {
                             .into(),
                         });
                     }
-                    attached.push(request.session.clone());
                     serving.push(Serving::Block(request.clone(), session));
                 }
                 Err(err) => {
@@ -1085,7 +1079,6 @@ impl SessionHost {
             id,
             live_frames,
             cancelled.clone(),
-            attached,
             Arc::clone(&self.inner.shared.fanout),
         );
         // Registered above before any block is projected: from here on every
@@ -2264,6 +2257,7 @@ impl SessionHost {
             Frame::State {
                 session: session.id().to_string(),
                 epoch: epoch.clone(),
+                opens_block: true,
                 working: working_seen,
                 settings: settings_seen.clone(),
                 oracle_settings: oracle_settings_seen.clone(),

@@ -181,6 +181,7 @@ impl SessionStatus {
         Frame::State {
             session: session.to_string(),
             epoch: self.epoch.clone(),
+            opens_block: false,
             working: self.working,
             settings: self.settings.clone(),
             oracle_settings: self.oracle_settings.clone(),

@@ -6,6 +6,7 @@ use aj_wire::TASK_OUTPUT_CHUNK_BYTES;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 struct Spill(Option<PathBuf>);
 

@@ -950,12 +950,12 @@ mod tests {
             ..agent_settings()
         });
         let mut client = SessionClient::new(session.to_string());
-        client.expect_attach();
         let _ = client.apply(
             &mut chat,
             Frame::State {
                 session: session.to_string(),
                 epoch: epoch.to_string(),
+                opens_block: true,
                 working: false,
                 settings: agent_settings(),
                 oracle_settings: None,

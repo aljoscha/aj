@@ -424,9 +424,9 @@ pub(crate) struct AttachGroup {
     ///
     /// A host that is not there contributes no upstream rather than failing the
     /// client's whole stream, which would punish the sessions of every other
-    /// host on it. Those sessions read `unreachable` in the list, which is what
-    /// tells the client they carry nothing, and the host's return prompts the
-    /// `reset` that makes it attach them again.
+    /// host on it. Its sessions are answered `host_unreachable` one by one, and
+    /// the host's return prompts the `reset` that makes the client attach them
+    /// again.
     pub(crate) dial: Option<HostAddress>,
     /// The attach set as the owning host names it: de-namespaced ids, the
     /// client's cursors untouched.

@@ -27,9 +27,10 @@
 //! even when a frontend retains that cell for a later visit.
 //!
 //! Attaching is not this type's job: it owns no stream and does no IO. The
-//! caller attaches the set [`SessionDirectory::attach_requests`] names and arms
-//! the folds the peer served, and a session dropped from the working set is
-//! detached by that same reopen leaving it unnamed.
+//! caller attaches the set [`SessionDirectory::attach_requests`] names and
+//! reports the open ([`SessionDirectory::attach_requested`]), and a session
+//! dropped from the working set is detached by that same reopen leaving it
+//! unnamed.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -61,10 +62,17 @@ pub const WITHHELD_NOTICE: &str = "Nothing is following this session now. It re-
 pub const WITHHELD_LOCKED_NOTICE: &str = "In use by another process. Nothing is following this \
     session now. Select it again to retry.";
 
+/// What a session whose host a gateway cannot reach is waiting for. The
+/// gateway announces the host's return, and the session picks up from where
+/// this client left it.
+pub const WITHHELD_UNREACHABLE_NOTICE: &str =
+    "The session's host is unreachable. It resumes when the host returns.";
+
 /// What to tell the user about a refusal, which is what will end it.
 fn withheld_notice(refusal: Refusal) -> &'static str {
     match refusal {
         Refusal::Locked => WITHHELD_LOCKED_NOTICE,
+        Refusal::Unreachable => WITHHELD_UNREACHABLE_NOTICE,
         Refusal::Other => WITHHELD_NOTICE,
     }
 }
@@ -283,12 +291,12 @@ impl SessionDirectory {
         // can be raised on the transition rather than latched beside it. A flag
         // recording "already said" is a second copy of this fact, and it drifts
         // from it on every path that resumes asking without an edge firing: a
-        // reconnect arms the session, a `reset` sends it back, and a refusal
+        // reconnect asks for the session, a `reset` sends it back, and a refusal
         // after either of those would find the flag still set and say nothing.
         let asked_before = attached.client.withheld();
         let mut chat = attached.chat.borrow_mut();
         let mut redraw = attached.client.apply(&mut chat, frame);
-        // The client raises this when it drops an attachment, so this asks the
+        // The client raises this when a refusal lands, so this asks the
         // one place that decides what a refusal is rather than matching the
         // frame kind a second time.
         let asked_now = attached.client.withheld();
@@ -606,21 +614,24 @@ impl SessionDirectory {
             .any(|attached| attached.client.needs_reattach())
     }
 
-    /// Arm every session the peer reports it served, for the attach blocks a
-    /// freshly opened stream carries.
+    /// Record that a stream was opened over [`Self::attach_requests`], which
+    /// discharges every re-attach that stream asked for
+    /// ([`SessionClient::attach_requested`]).
     ///
-    /// `served` is the peer's own answer, never the request we sent: an arm for
-    /// a block that never arrives strands that session's fold, and a session
-    /// the peer did attach but we left unarmed folds its block as live frames
-    /// (see [`SessionClient::expect_attach`]). Arming the whole set in one call
-    /// is what keeps those two failures out of reach of a caller loop that
-    /// covers only some of it.
-    pub fn expect_attach(&mut self, served: impl Fn(&str) -> bool) {
+    /// Covers exactly the set the requests named, in one call, so a caller
+    /// cannot discharge a session it did not ask for.
+    pub fn attach_requested(&mut self) {
         for attached in self.attached.iter_mut() {
-            if served(&attached.session) {
-                attached.client.expect_attach();
+            if Self::requested(attached) {
+                attached.client.attach_requested();
             }
         }
+    }
+
+    /// Whether a stream opened now names `attached`. Locked refusals are left
+    /// off until an explicit retry.
+    fn requested(attached: &Attached) -> bool {
+        attached.client.withheld() != Some(Refusal::Locked)
     }
 
     /// The working set's eligible attach requests, each offering its own cursor.
@@ -634,7 +645,7 @@ impl SessionDirectory {
     pub fn attach_requests(&self) -> Vec<AttachRequest> {
         self.attached
             .iter()
-            .filter(|attached| attached.client.withheld() != Some(Refusal::Locked))
+            .filter(|attached| Self::requested(attached))
             .map(|attached| AttachRequest {
                 session: attached.session.clone(),
                 cursor: attached.client.cursor(),
@@ -726,10 +737,12 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn state(session: &str) -> Frame {
+    /// The `state` an attach block opens with.
+    fn opening(session: &str) -> Frame {
         Frame::State {
             session: session.to_string(),
             epoch: EPOCH.to_string(),
+            opens_block: true,
             working: false,
             settings: settings(),
             oracle_settings: None,
@@ -866,10 +879,9 @@ mod tests {
 
         directory.focus(OTHER, chat);
         directory.focus(FOCUSED, || panic!("already attached"));
-        directory.expect_attach(|_| true);
 
         for session in [FOCUSED, OTHER] {
-            let _ = directory.apply(state(session));
+            let _ = directory.apply(opening(session));
             let _ = directory.apply(caught_up(session, 0));
         }
         directory
@@ -1286,58 +1298,6 @@ mod tests {
         );
     }
 
-    /// Arming follows the peer's answer, not our request. A session the peer
-    /// did not serve must stay unarmed, or its fold waits for a block that
-    /// never comes and stops advancing its cursor.
-    #[test]
-    fn arming_covers_the_set_the_peer_served_and_no_more() {
-        let mut directory = two_sessions();
-        let cursor = |directory: &SessionDirectory, session: &str| {
-            directory
-                .attach_requests()
-                .into_iter()
-                .find(|request| request.session == session)
-                .expect("attached")
-                .cursor
-                .map(|cursor| cursor.seq)
-        };
-        // Both sessions are past their first block and folding live frames.
-        let _ = directory.apply(durable(FOCUSED, 1, "foreground"));
-        let _ = directory.apply(durable(OTHER, 1, "background"));
-
-        // A reopened stream that served only the focused session.
-        directory.expect_attach(|session| session == FOCUSED);
-
-        // The armed fold is in the block phase, so it honours the block's
-        // `caught_up` and takes its high-water mark.
-        let _ = directory.apply(state(FOCUSED));
-        let _ = directory.apply(caught_up(FOCUSED, 9));
-        assert_eq!(
-            cursor(&directory, FOCUSED),
-            Some(9),
-            "the armed session took the block's high-water mark",
-        );
-
-        // The session left out was not armed, so the same shape of frames
-        // folds as live traffic and its `caught_up` is ignored. An arm that
-        // covered the whole set regardless of what the peer served would move
-        // this cursor.
-        let before = cursor(&directory, OTHER);
-        let _ = directory.apply(state(OTHER));
-        let _ = directory.apply(caught_up(OTHER, 5));
-        assert_eq!(
-            cursor(&directory, OTHER),
-            before,
-            "an unarmed session must not take a block's high-water mark",
-        );
-
-        // Arming the rest of the set then covers the one left out.
-        directory.expect_attach(|_| true);
-        let _ = directory.apply(state(OTHER));
-        let _ = directory.apply(caught_up(OTHER, 5));
-        assert_eq!(cursor(&directory, OTHER), Some(5));
-    }
-
     /// Visiting past the bound detaches exactly the least recently focused
     /// session, and never the focused one. Browsing must not
     /// leave a live driver and a held lock behind per session visited.
@@ -1398,8 +1358,7 @@ mod tests {
             retained.borrow_mut().show_token_usage = false;
             let mut directory = SessionDirectory::new(FOCUSED.into(), Rc::clone(&retained));
             assert!(Rc::ptr_eq(&directory.chat(), &retained));
-            directory.expect_attach(|_| true);
-            let _ = directory.apply(state(FOCUSED));
+            let _ = directory.apply(opening(FOCUSED));
             let _ = directory.apply(caught_up(FOCUSED, 0));
             let _ = directory.apply(durable(FOCUSED, 1, "retained history"));
             for event in [
@@ -1501,8 +1460,7 @@ mod tests {
                 requests[0].cursor.is_none(),
                 "detached data needs a full backfill"
             );
-            directory.expect_attach(|session| session == FOCUSED);
-            let _ = directory.apply(state(FOCUSED));
+            let _ = directory.apply(opening(FOCUSED));
             let _ = directory.apply(durable(FOCUSED, 1, "reconstructed history"));
             let _ = directory.apply(caught_up(FOCUSED, 1));
             assert_eq!(notices(&retained.borrow()), vec!["reconstructed history"]);
@@ -1715,6 +1673,11 @@ mod tests {
         for (code, expected, wrong) in [
             ("locked", WITHHELD_LOCKED_NOTICE, WITHHELD_NOTICE),
             ("unknown_session", WITHHELD_NOTICE, WITHHELD_LOCKED_NOTICE),
+            (
+                "host_unreachable",
+                WITHHELD_UNREACHABLE_NOTICE,
+                WITHHELD_NOTICE,
+            ),
         ] {
             let mut directory = SessionDirectory::new(FOCUSED.to_string(), chat());
             let _ = directory.apply(refusal(FOCUSED, code));
@@ -1759,6 +1722,36 @@ mod tests {
         }
         // Retrying the selected session does not retry the background one.
         directory.client_mut().owe_reattach();
+        let requests = directory.attach_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].session, OTHER);
+    }
+
+    /// Opening a stream discharges what that stream asked for and nothing
+    /// else: a locked session it left off stays withheld, so the next stream
+    /// leaves it off too.
+    #[test]
+    fn a_stream_open_discharges_only_the_sessions_it_asked_for() {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string(), chat());
+        directory.focus(OTHER, chat);
+        let _ = directory.apply(refusal(FOCUSED, "locked"));
+        let _ = directory.apply(Frame::Reset {
+            session: OTHER.into(),
+        });
+        assert!(
+            directory.needs_reattach(),
+            "the premise: a re-attach is owed"
+        );
+
+        directory.attach_requested();
+
+        assert!(!directory.needs_reattach());
+        assert_eq!(
+            directory
+                .client_for(FOCUSED)
+                .and_then(SessionClient::withheld),
+            Some(Refusal::Locked),
+        );
         let requests = directory.attach_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].session, OTHER);

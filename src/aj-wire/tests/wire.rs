@@ -765,6 +765,7 @@ fn state_frame_carries_display_settings_and_credential_warning() {
     let frame = Frame::State {
         session: "session-1".into(),
         epoch: "epoch-1".into(),
+        opens_block: true,
         working: false,
         settings,
         oracle_settings: None,
@@ -799,6 +800,7 @@ fn state_round_trips_independent_oracle_settings() {
         let frame = Frame::State {
             session: "session-1".into(),
             epoch: "epoch-1".into(),
+            opens_block: false,
             working: false,
             settings: main.clone(),
             oracle_settings: oracle_settings.clone(),
@@ -1877,7 +1879,7 @@ fn raw_objects_compare_on_the_text_they_would_emit() {
 /// either, for the host that reported one.
 #[test]
 fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
-    let frame: DecodedFrame = serde_json::from_value(fixture("frames")[5].clone())
+    let frame: DecodedFrame = serde_json::from_value(fixture("frames")[6].clone())
         .expect("the pinned gateway list frame decodes");
     let DecodedFrame::Known(known) = &frame else {
         panic!("a list frame is a known kind");
@@ -1928,7 +1930,7 @@ fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
     .expect("it serializes");
     assert_eq!(
         written["hosts"],
-        fixture("frames")[5]["hosts"],
+        fixture("frames")[6]["hosts"],
         "an absent id is an absent key and never a null or an address: {written}",
     );
 
@@ -2841,6 +2843,7 @@ fn local_frames() -> Vec<Frame> {
         Frame::State {
             session: "old".to_string(),
             epoch: "epoch-1".to_string(),
+            opens_block: false,
             working: true,
             settings: AgentSettings {
                 context_window: 0,

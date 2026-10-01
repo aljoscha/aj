@@ -105,6 +105,7 @@ fn state(revision: u64) -> Frame {
     Frame::State {
         session: "left:s-1".into(),
         epoch: "epoch-1".into(),
+        opens_block: false,
         working: true,
         settings: AgentSettings {
             context_window: revision,

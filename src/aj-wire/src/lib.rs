@@ -1413,6 +1413,11 @@ pub enum Frame {
     State {
         session: String,
         epoch: String,
+        /// Whether this frame opens an attach block, which is how a client tells
+        /// a block's opening from the `state` a host sends whenever `working` or
+        /// the settings change: the frame says so itself. An opening is part of
+        /// its block, so it is reliable rather than lossy.
+        opens_block: bool,
         working: bool,
         settings: AgentSettings,
         /// Oracle settings staged for the next main turn. Absent when unresolved
@@ -1506,7 +1511,8 @@ impl Frame {
                         | AgentEvent::TaskOutput { .. }
                 )
             ),
-            Self::State { .. } | Self::List { .. } => true,
+            Self::State { opens_block, .. } => !opens_block,
+            Self::List { .. } => true,
             Self::CaughtUp { .. } | Self::Error { .. } | Self::Reset { .. } | Self::Heartbeat => {
                 false
             }
@@ -1593,6 +1599,8 @@ enum FrameRef<'a> {
     State {
         session: &'a str,
         epoch: &'a str,
+        #[serde(skip_serializing_if = "unset")]
+        opens_block: bool,
         working: bool,
         settings: &'a AgentSettings,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1644,6 +1652,7 @@ impl Serialize for Frame {
             Self::State {
                 session,
                 epoch,
+                opens_block,
                 working,
                 settings,
                 oracle_settings,
@@ -1651,6 +1660,7 @@ impl Serialize for Frame {
             } => FrameRef::State {
                 session,
                 epoch,
+                opens_block: *opens_block,
                 working: *working,
                 settings,
                 oracle_settings: oracle_settings.as_ref(),
@@ -1749,6 +1759,7 @@ impl<'de> Deserialize<'de> for Frame {
                 let StateFrameFields {
                     session,
                     epoch,
+                    opens_block,
                     working,
                     settings,
                     oracle_settings,
@@ -1757,6 +1768,7 @@ impl<'de> Deserialize<'de> for Frame {
                 Ok(Self::State {
                     session,
                     epoch,
+                    opens_block,
                     working,
                     settings,
                     oracle_settings,
@@ -1824,6 +1836,8 @@ struct EventFrameFields {
 struct StateFrameFields {
     session: String,
     epoch: String,
+    #[serde(default)]
+    opens_block: bool,
     working: bool,
     settings: AgentSettings,
     #[serde(default)]

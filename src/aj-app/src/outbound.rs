@@ -284,7 +284,15 @@ fn lossy_key(frame: &impl OutboundFrame) -> Option<LossyKey> {
             }
             _ => None,
         },
-        Frame::State { session, .. } => Some(LossyKey::State(session.clone())),
+        // An opening `state` belongs to its block and is never superseded.
+        Frame::State {
+            session,
+            opens_block: false,
+            ..
+        } => Some(LossyKey::State(session.clone())),
+        Frame::State {
+            opens_block: true, ..
+        } => None,
         Frame::List { .. } => Some(LossyKey::List),
         Frame::CaughtUp { .. } | Frame::Error { .. } | Frame::Reset { .. } | Frame::Heartbeat => {
             None

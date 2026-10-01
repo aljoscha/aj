@@ -896,15 +896,7 @@ impl Transport {
             cursor,
         }];
         match self {
-            Self::Local(host) => {
-                let attachment = host.attach(&requests).await.expect("attach");
-                assert_eq!(
-                    attachment.attached(),
-                    [session.to_string()],
-                    "the host reports the block it will serve",
-                );
-                Source::Local(attachment)
-            }
+            Self::Local(host) => Source::Local(host.attach(&requests).await.expect("attach")),
             Self::Remote(client) => {
                 Source::Remote(client.events(&requests).await.expect("attach over http"))
             }
@@ -983,7 +975,6 @@ impl Attached {
             }),
             delivered: None,
         };
-        this.client.expect_attach();
         this.apply_block().await;
         this
     }
@@ -1000,7 +991,6 @@ impl Attached {
         self.source = Source::Cut;
         let session = self.client.session().to_string();
         self.source = self.transport.attach(&session, cursor).await;
-        self.client.expect_attach();
         // The block that follows re-delivers from the offered cursor, so what
         // was delivered before it says nothing about where this client is now.
         self.delivered = None;
@@ -3237,6 +3227,77 @@ async fn an_idle_stream_heartbeats_with_a_real_frame() {
     })
     .await;
     assert_eq!(heartbeats, 2, "the idle timer restarts after each write");
+    fixture.shutdown().await;
+}
+
+/// A stream whose attach block stops arriving sends no heartbeat, so the stall
+/// reads as a dead stream and the client's ordinary recovery re-attaches.
+///
+/// The stall is a block waiting on its session's log lock, held here, after
+/// another session's block on the same stream completed. A heartbeat in that
+/// window would tell the client the stream is healthy while the block it
+/// waits for never comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_block_withholds_the_heartbeat() {
+    let fixture = Fixture::build(
+        scripted(Vec::new(), 0, Duration::ZERO),
+        IdentityGate::local(),
+        Duration::from_millis(80),
+    )
+    .await;
+    let served = fixture.create().await;
+    let stalled = fixture.create().await;
+    let log = fixture
+        .host
+        .local_handles(&stalled)
+        .await
+        .expect("live session")
+        .log;
+    let held = log.lock().await;
+    let client = fixture.client().with_silence(Duration::from_millis(600));
+    let both = [attach(&served), attach(&stalled)];
+    let mut events = client.events(&both).await.expect("attach");
+
+    let mut caught = Vec::new();
+    let mut heartbeats = 0;
+    let err = bounded("the stalled stream to fall silent", async {
+        loop {
+            match events.recv().await {
+                Some(Ok(Frame::CaughtUp { session, .. })) => caught.push(session),
+                Some(Ok(Frame::Heartbeat)) => heartbeats += 1,
+                Some(Ok(_)) => {}
+                Some(Err(err)) => return err,
+                None => panic!("the stream ended instead of going silent"),
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        caught,
+        vec![served.clone()],
+        "the first block is served whole"
+    );
+    assert_eq!(heartbeats, 0, "the host heartbeat over an incomplete block");
+    assert!(matches!(err, RemoteError::Silent(_)), "got {err:?}");
+
+    // The stall clears, and the re-attach a lost stream earns serves both.
+    drop(held);
+    let mut events = client.events(&both).await.expect("re-attach");
+    let mut caught = Vec::new();
+    bounded("both blocks on the re-attach", async {
+        while caught.len() < 2 {
+            match events.recv().await {
+                Some(Ok(Frame::CaughtUp { session, .. })) => caught.push(session),
+                Some(Ok(_)) => {}
+                other => panic!("the re-attach failed: {other:?}"),
+            }
+        }
+    })
+    .await;
+    caught.sort();
+    let mut expected = vec![served, stalled];
+    expected.sort();
+    assert_eq!(caught, expected);
     fixture.shutdown().await;
 }
 

@@ -26,7 +26,9 @@ mod server;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub(crate) use client::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents, SILENCE};
+#[cfg(test)]
+pub(crate) use client::SILENCE;
+pub(crate) use client::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents};
 pub(crate) use identity::{IdentityError, IdentityGate, IdentityMode, TailscaleWhois};
 pub(crate) use server::RemoteServer;
 

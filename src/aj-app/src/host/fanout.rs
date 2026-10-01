@@ -372,7 +372,6 @@ pub struct Attachment {
     live: LiveReceiver,
     block_complete: AttachBlockCompletion,
     cancelled: CancellationToken,
-    attached: Vec<String>,
     fanout: Arc<Fanout>,
 }
 
@@ -408,7 +407,6 @@ impl Attachment {
         id: SubscriberId,
         live: LiveReceiver,
         cancelled: CancellationToken,
-        attached: Vec<String>,
         fanout: Arc<Fanout>,
     ) -> (Self, Sender<Frame>, AttachBlockCompletion) {
         let (block_tx, block) = channel(1);
@@ -420,20 +418,19 @@ impl Attachment {
             live,
             block_complete: block_complete.clone(),
             cancelled,
-            attached,
             fanout,
         };
         (attachment, block_tx, block_complete)
     }
 
-    /// The sessions this stream was served an attach block for.
+    /// Whether the host is still writing an attach block this stream owes.
     ///
-    /// A client arms its fold from this rather than from what it asked for:
-    /// a session the attach could not resolve is answered with an `error`
-    /// frame instead of a block, so it is not here, and arming for
-    /// a block that never comes strands that session's fold.
-    pub fn attached(&self) -> &[String] {
-        &self.attached
+    /// True from the start until every block has been written in full. A
+    /// transport that keeps an idle stream warm withholds its keep-alive while
+    /// this holds, so a block that stops arriving reads as a silent stream
+    /// rather than as a healthy one with nothing to say.
+    pub fn serving_blocks(&self) -> bool {
+        !self.block_done && !self.block_complete.is_finished()
     }
 
     /// The next frame, or `None` once the host closed the stream.
@@ -549,6 +546,7 @@ mod tests {
         Frame::State {
             session: SESSION.to_string(),
             epoch: EPOCH.to_string(),
+            opens_block: false,
             working: true,
             settings: AgentSettings {
                 context_window: revision,
@@ -1015,13 +1013,8 @@ mod tests {
     fn attachment_is_producer_paced_and_reads_the_block_before_live() {
         let fanout = Arc::new(Fanout::default());
         let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
-        let (mut attachment, block_tx, block_complete) = Attachment::new(
-            id,
-            live,
-            cancelled,
-            vec![SESSION.to_string()],
-            Arc::clone(&fanout),
-        );
+        let (mut attachment, block_tx, block_complete) =
+            Attachment::new(id, live, cancelled, Arc::clone(&fanout));
         block_tx.try_send(lossy(1)).expect("first block frame");
         // The channel is the attachment's own, so this measures the depth a
         // real attach runs with rather than one the test chose.
@@ -1111,13 +1104,8 @@ mod tests {
         let fanout = Arc::new(Fanout::default());
         let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
         let block_stop = live.block_stop_token();
-        let (attachment, _block_tx, _block_complete) = Attachment::new(
-            id,
-            live,
-            cancelled,
-            vec![SESSION.to_string()],
-            Arc::clone(&fanout),
-        );
+        let (attachment, _block_tx, _block_complete) =
+            Attachment::new(id, live, cancelled, Arc::clone(&fanout));
         assert_eq!(fanout.lock().subscribers.len(), 1);
 
         drop(attachment);

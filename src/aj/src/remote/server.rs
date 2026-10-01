@@ -814,21 +814,30 @@ fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, Ap
 }
 
 /// One SSE `data:` line per frame, with a heartbeat frame whenever the
-/// writer has been idle for `idle`.
+/// writer has been idle for `idle` and no attach block is still being written.
 ///
 /// Each poll starts a fresh timeout, so any frame written restarts the idle
 /// clock. Dropping the response drops this stream and with it the
 /// [`Attachment`], which deregisters the subscriber.
+///
+/// The heartbeat is withheld while a block is incomplete because it is a claim
+/// that the stream is healthy, and a block that stopped arriving is not. The
+/// stream then goes silent and the client's ordinary stream-loss recovery
+/// re-attaches. A block's only waits are the session's log lock, which appends
+/// hold briefly, and the client reading it, which is not silence on its side.
 fn frame_stream(
     attachment: Attachment,
     idle: Duration,
 ) -> impl Stream<Item = Result<Event, aj_agent::BoxError>> {
     futures::stream::unfold(Some(attachment), move |state| async move {
         let mut attachment = state?;
-        let frame = match tokio::time::timeout(idle, attachment.recv()).await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return None,
-            Err(_) => Frame::Heartbeat,
+        let frame = loop {
+            match tokio::time::timeout(idle, attachment.recv()).await {
+                Ok(Some(frame)) => break frame,
+                Ok(None) => return None,
+                Err(_) if attachment.serving_blocks() => continue,
+                Err(_) => break Frame::Heartbeat,
+            }
         };
         match serde_json::to_string(&frame) {
             Ok(json) => Some((Ok(Event::default().data(json)), Some(attachment))),

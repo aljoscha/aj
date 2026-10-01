@@ -16,7 +16,6 @@
 //! either way, a re-attach with a cursor.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use aj_agent::events::AgentId;
 use aj_agent::tool::TaskId;
@@ -36,7 +35,7 @@ use aj_wire::{
 use futures::{FutureExt, StreamExt};
 use reqwest::StatusCode;
 
-use crate::remote::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents, SILENCE};
+use crate::remote::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents};
 
 /// Why a control operation did not do what was asked.
 ///
@@ -650,11 +649,9 @@ impl Control {
     ///
     /// One stream per client, not one per session: the ordering guarantees are
     /// per stream, and changing the attach set means reopening it.
-    /// The attach is all-or-nothing, so a refusal for any session leaves the
-    /// caller with the stream it already had.
-    ///
-    /// Every session on the stream has to be armed before reading, each against
-    /// what the peer reports it attached (see [`Stream::attached`]).
+    /// A failure of the request itself leaves the caller with the stream it
+    /// already had. What becomes of each named session arrives on the stream:
+    /// its attach block, whose opening `state` says it is one, or an `error`.
     pub(crate) async fn attach_all(
         &self,
         requests: &[AttachRequest],
@@ -664,10 +661,6 @@ impl Control {
             Self::Remote(remote) => Ok(Stream::Remote {
                 events: remote.client.events(requests).await?,
                 lost: None,
-                attached: requests
-                    .iter()
-                    .map(|request| request.session.clone())
-                    .collect(),
             }),
         }
     }
@@ -809,20 +802,6 @@ pub(crate) enum Stream {
         /// A failure `try_recv` saw. The next [`Stream::recv`] reports it, so
         /// a drain never swallows a lost stream.
         lost: Option<RemoteError>,
-        /// The sessions this stream was opened for, which is what
-        /// [`Stream::attached`] answers from.
-        ///
-        /// The request, because the protocol gives a client no per-session
-        /// answer at attach time. A stream request never fails wholesale over
-        /// one bad session, and what becomes of each named session
-        /// arrives afterwards, in one of three shapes: its attach block, a
-        /// session-scoped `error` frame, or, for a session on a host a gateway
-        /// cannot currently reach, nothing at all beyond the `unreachable` mark
-        /// on its `list` row.
-        ///
-        /// So this says which sessions the peer was asked about and nothing
-        /// about which it will serve. Whoever folds a block owes it a deadline.
-        attached: Vec<String>,
     },
 }
 
@@ -841,39 +820,6 @@ pub(crate) enum ControlFrame {
 }
 
 impl Stream {
-    /// Whether the peer reports it will serve `session`'s attach block, which
-    /// is what a client arms its fold from.
-    ///
-    /// False for a session this stream does not carry, so a caller holding
-    /// several streams can ask any of them about any session.
-    pub(crate) fn attached(&self, session: &str) -> bool {
-        let names = match self {
-            Self::Local(attachment) => attachment.attached(),
-            Self::Remote { attached, .. } => attached.as_slice(),
-        };
-        names.iter().any(|name| name == session)
-    }
-
-    /// How long this stream may be silent before it counts as dead.
-    ///
-    /// A connection answers the tolerance it was built with, which is what lets
-    /// a caller tune it ([`RemoteClient::with_silence`]). An in-process stream
-    /// has no transport to fall silent and answers the same span, so that a
-    /// caller has one number to reach for in either mode.
-    ///
-    /// The protocol scopes this to the stream: two missed heartbeats, and
-    /// heartbeats are host-level. So a caller bounding a wait for one *session* is
-    /// borrowing a scale rather than reading a budget the protocol defines for
-    /// it, and inherits a minute of patience by doing so. Whether that is the
-    /// right patience for a session-scoped wait is a live question, see the
-    /// beads behind [`crate::interactive`]'s catch-up.
-    pub(crate) fn silence(&self) -> Duration {
-        match self {
-            Self::Local(_) => SILENCE,
-            Self::Remote { events, .. } => events.silence(),
-        }
-    }
-
     /// The next frame, awaiting one.
     pub(crate) async fn recv(&mut self) -> ControlFrame {
         match self {
@@ -952,6 +898,7 @@ pub(crate) mod history_tests {
         HostHandles, addr, bounded, history_updates, scripted, scripted_host,
     };
     use crate::remote::{IdentityGate, RemoteServer};
+    use std::time::Duration;
 
     pub(crate) fn write_prompts(dir: &std::path::Path, name: &str, prompts: &[(&str, i64)]) {
         use std::io::Write;
@@ -1064,6 +1011,7 @@ mod preview_tests {
     use super::*;
     use crate::remote::tests::{HostHandles, addr, bounded, scripted, scripted_host};
     use crate::remote::{IdentityGate, RemoteServer};
+    use std::time::Duration;
 
     async fn collect(control: &Control) -> Vec<aj_wire::SessionPreview> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

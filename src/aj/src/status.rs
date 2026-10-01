@@ -48,6 +48,9 @@ pub(crate) enum Connection {
     CatchingUp,
     /// The peer explicitly refused to serve the selected session.
     Refused,
+    /// A gateway cannot reach the selected session's host. The session resumes
+    /// on its own when the host returns.
+    Unreachable,
     /// The selected session's attach block stopped before `caught_up`.
     Stalled,
 }
@@ -166,6 +169,9 @@ impl StatusLine {
             Connection::Refused => {
                 return "Attach refused. Select this session again to retry.".to_string();
             }
+            Connection::Unreachable => {
+                return "Host unreachable. This session resumes when it returns.".to_string();
+            }
             Connection::Stalled => return "The selected session's attach stalled.".to_string(),
             Connection::Connected => {}
         }
@@ -239,7 +245,7 @@ impl Widget for StatusLine {
         // the spinner sits flush under the transcript the same way the
         // collapsed idle slot lets the chat sit flush above the editor.
         let marker = match self.status.borrow().connection {
-            Connection::Refused | Connection::Stalled => "×",
+            Connection::Refused | Connection::Unreachable | Connection::Stalled => "×",
             _ => Self::frame(started),
         };
         let spans = vec![
@@ -347,6 +353,10 @@ mod tests {
             (
                 Connection::Refused,
                 " × Attach refused. Select this session again to retry.",
+            ),
+            (
+                Connection::Unreachable,
+                " × Host unreachable. This session resumes when it returns.",
             ),
             (
                 Connection::Stalled,

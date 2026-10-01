@@ -28,11 +28,18 @@ use crate::chat::{ChatState, Redraw, reduce};
 use crate::host::PERSISTENCE_FAILED_CODE;
 use crate::session::AgentLifecycle;
 
+/// The `error` code a gateway answers for a session whose host it cannot
+/// reach. Transient: the host's return is announced with `reset`.
+pub const HOST_UNREACHABLE_CODE: &str = "host_unreachable";
+
 /// Why a session is withheld and what can ask for it again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// A rival writer holds the session. Only an explicit user retry reopens it.
     Locked,
+    /// The gateway cannot reach the session's host. The `reset` it sends when
+    /// the host returns asks again, and the attachment is kept for that.
+    Unreachable,
     /// Other codes, including unknown ones, recover when the row leaves and returns.
     Other,
 }
@@ -40,10 +47,10 @@ pub enum Refusal {
 impl Refusal {
     /// Classify a peer refusal. Unknown codes use directory-return recovery.
     pub fn from_code(code: &str) -> Self {
-        if code == "locked" {
-            Self::Locked
-        } else {
-            Self::Other
+        match code {
+            "locked" => Self::Locked,
+            HOST_UNREACHABLE_CODE => Self::Unreachable,
+            _ => Self::Other,
         }
     }
 }
@@ -51,17 +58,15 @@ impl Refusal {
 /// Where the client stands relative to an attach block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attach {
-    /// No attach outstanding. Every frame is a live one.
+    /// Outside any block. Every frame is a live one.
     ///
     /// Where a block ends, whether its `caught_up` committed it or a refusal
-    /// replaced it, and where one that was never armed starts. So this says
-    /// nothing on its own about whether the client holds an attachment.
+    /// answered instead, and where a client starts. So this says nothing on its
+    /// own about whether the client holds an attachment.
     Live,
-    /// The client asked for an attach. The next `state` frame for this
-    /// session opens the block it asked for.
-    Requested,
-    /// Inside the block. Durable frames apply without advancing the
-    /// cursor, because the block is atomic: its `caught_up` commits it.
+    /// Inside a block, from the `state` frame that opens it. Durable frames
+    /// apply without advancing the cursor, because the block is atomic: its
+    /// `caught_up` commits it.
     Applying,
 }
 
@@ -75,8 +80,8 @@ pub struct SessionClient {
     session: String,
     lifecycle: AgentLifecycle,
     /// The epoch adopted from the last attach block, `None` until the
-    /// first one arrives. Session-scoped frames from any other epoch are
-    /// dropped.
+    /// first one arrives and again after a refusal that drops the attachment.
+    /// Session-scoped frames from any other epoch are dropped.
     epoch: Option<String>,
     /// The seq offered on re-attach. It lags `applied` by one durable
     /// frame, because a log entry can project trailing untagged events (an
@@ -105,12 +110,12 @@ pub struct SessionClient {
     /// Refused, and nothing is asking again yet, carrying the reason so the
     /// directory knows which edge re-asks.
     ///
-    /// Set by [`Self::drop_attachment`], which is the one place that learns a
-    /// refusal happened, and cleared by [`Self::owe_reattach`]. Held here rather
-    /// than derived from the epoch and the arm because a refusal after an earlier
-    /// one moves neither: the client is already following nothing, so there is no
-    /// transition left to read, and a session refused twice would look attached
-    /// to anything watching for one.
+    /// Set by the `error` arm of [`Self::apply`], which is the one place that
+    /// learns a refusal happened, and cleared by [`Self::owe_reattach`] and
+    /// [`Self::attach_requested`]. Held here rather than derived from the epoch
+    /// because a refusal after an earlier one moves nothing else: the client is
+    /// already following nothing, so there is no transition left to read, and a
+    /// session refused twice would look attached to anything watching for one.
     withheld: Option<Refusal>,
 }
 
@@ -141,37 +146,13 @@ impl SessionClient {
         &self.session
     }
 
-    /// Arm the client for the attach block it is about to request.
+    /// Record that a stream naming this session was opened.
     ///
-    /// The client is the one that asks for an attach, so the request is
-    /// what identifies the block's opening `state` frame. Nothing in the
-    /// frame itself can: the host re-emits `state` whenever any of it
-    /// changes, and an on-change re-emission must neither adopt
-    /// an epoch nor quiesce.
-    ///
-    /// Contract: arm only once the attach has been served, from what the
-    /// server reports it attached (`Attachment::attached` in process). An
-    /// arm for a block that never arrives is what makes the next on-change
-    /// `state` frame look like one: the fold would quiesce, enter the block
-    /// phase, and stop advancing its cursor until a `caught_up` that never
-    /// comes.
-    ///
-    /// Over a connection there is nothing better than the request to arm from:
-    /// the protocol gives a client no per-session answer at attach time, only
-    /// frames afterwards. So a remote arm is a guess that the peer will serve
-    /// what it was asked for, and whoever folds the block owes it a deadline
-    /// (see [`Self::abandon_attach`]).
-    ///
-    /// Every session the server did attach has to be armed. An unarmed
-    /// session's block folds as live frames instead: its `caught_up` is
-    /// ignored and its durable frames advance the cursor in projection
-    /// order, which is not seq order.
-    ///
-    /// Arming also satisfies [`Self::needs_reattach`], and ends a withheld
-    /// state: an arm is something asking again, which is the one condition
-    /// [`Self::withheld`] tracks.
-    pub fn expect_attach(&mut self) {
-        self.attach = Attach::Requested;
+    /// Satisfies [`Self::needs_reattach`] and ends a withheld state, since this
+    /// is something asking again, which is the one condition [`Self::withheld`]
+    /// tracks. It changes nothing about how frames fold: the peer answers with
+    /// a block whose opening `state` says it is one, or with an `error`.
+    pub fn attach_requested(&mut self) {
         self.needs_reattach = false;
         self.withheld = None;
     }
@@ -249,17 +230,19 @@ impl SessionClient {
             Frame::State {
                 session,
                 epoch,
+                opens_block,
                 working,
                 settings,
                 oracle_settings,
                 credential_warning,
-                ..
             } => {
                 if !self.is_ours(&session) {
                     return Redraw(false);
                 }
-                let opens_block = self.attach == Attach::Requested;
-                if self.attach == Attach::Requested {
+                // Only the frame says whether it opens a block. The host sends
+                // `state` on every change as well, and one of those must
+                // neither adopt an epoch nor quiesce.
+                if opens_block {
                     self.open_attach_block(chat, epoch);
                 } else if !self.epoch_matches(&epoch) {
                     return Redraw(false);
@@ -285,10 +268,9 @@ impl SessionClient {
                 tasks,
                 queues,
             } => {
-                // Only the block this client asked for ends here. A
-                // `caught_up` outside one names a position whose entries the
-                // client never applied, and committing it would silently
-                // skip them.
+                // Only an opened block ends here. A `caught_up` outside one
+                // names a position whose entries the client never applied, and
+                // committing it would silently skip them.
                 if !self.is_ours(&session)
                     || !self.epoch_matches(&epoch)
                     || self.attach != Attach::Applying
@@ -328,20 +310,30 @@ impl SessionClient {
                 // filter applies to frames that carry state under one, and
                 // a refusal for a session the server cannot resolve names none.
                 //
-                // Every error frame drops the attachment, whatever its code,
-                // which is what the two that exist are (a host's unresolvable
-                // session, a gateway's withdrawn host) and what a rival's hold
-                // is too. The code decides only which edge asks again, never
-                // whether to let go: a refused client is following nothing
-                // either way, and a code this build has never heard of has to
-                // behave like the refusals it knows, codes being additive.
-                //
+                // An error answers in place of a block, so no block is open
+                // after it whatever the code.
+                self.attach = Attach::Live;
+                let refusal = Refusal::from_code(&code);
+                if refusal == Refusal::Unreachable {
+                    // Nothing was said about the session, only that its host
+                    // is out of reach for now, so the epoch and the cursor
+                    // stay: the host's return then costs an incremental
+                    // catch-up rather than a full backfill. The gateway's
+                    // `reset` for that return is what asks again.
+                    self.needs_reattach = false;
+                    self.withheld = Some(refusal);
+                } else {
+                    // Every other code drops the attachment, a code this build
+                    // has never heard of included, codes being additive. The
+                    // code decides only which edge asks again: a refused client
+                    // is following nothing either way.
+                    self.drop_attachment(refusal, message.clone());
+                }
                 // A materialization that ended over a fused log is the one
                 // code that owes no waiting: the host rebuilds the session
                 // from disk on the next ask, so the obligation is
                 // taken back at once instead of waiting for a directory edge
                 // the row may never show (a durable session stays listed).
-                self.drop_attachment(Refusal::from_code(&code), message.clone());
                 if code == PERSISTENCE_FAILED_CODE {
                     self.owe_reattach();
                 }
@@ -364,8 +356,8 @@ impl SessionClient {
                 }
                 // Continuity is broken, but the cursor stays valid to
                 // offer: the server decides whether it can resume from it.
-                // An armed attach stays armed, so a `reset` that overtakes
-                // the block the client already asked for cannot disarm it.
+                // A block cut short stays open: its cursor never advanced, and
+                // the next block's opening replaces it.
                 //
                 // A link reset does not retry an attachment the user must
                 // explicitly request. Other sessions still recover normally.
@@ -462,18 +454,8 @@ impl SessionClient {
         self.needs_reattach
     }
 
-    /// Where this client stands on an attach block.
-    ///
-    /// This is what a caller folding a block waits on, and it is the client's
-    /// own arm rather than a frame kind, which is what makes the wait end on
-    /// everything that ends a block: the `caught_up` that commits it, and the
-    /// refusal that replaces it for a session the server cannot resolve (spec
-    /// 6.5). A peer that answers with neither is covered by nothing here, so a
-    /// caller still owes the wait a deadline of its own.
-    ///
-    /// The two outstanding phases are worth telling apart, because waiting for a
-    /// block to begin and waiting for one already arriving are different
-    /// questions: nothing has been applied before the opening `state` frame.
+    /// Where this client stands on an attach block: inside one from its opening
+    /// `state` until the `caught_up` that commits it or a refusal.
     pub fn attach_phase(&self) -> Attach {
         self.attach
     }
@@ -508,37 +490,16 @@ impl SessionClient {
         self.withheld = None;
     }
 
-    /// Give up on an attach block that never arrived, re-owing the re-attach.
-    ///
-    /// [`Self::expect_attach`] discharges [`Self::needs_reattach`] on the
-    /// promise that the block it arms for is served. A block that stopped
-    /// arriving breaks that promise, and the obligation has to come back: the
-    /// arm is the only record that one is outstanding, so a caller that dropped
-    /// the wait without this would leave the session armed for a block nobody
-    /// is bringing, and nothing anywhere would ask for it again.
-    ///
-    /// The epoch and the cursor stay. Nothing said this session is gone, only
-    /// that this attempt did not finish, so the next attach still offers what
-    /// this client has: the opposite of what a refusal does (see
-    /// [`Self::apply`]'s `error` arm).
-    pub fn abandon_attach(&mut self) {
-        self.attach = Attach::Live;
-        self.owe_reattach();
-    }
-
     /// Drop the attachment for a session the server refused.
     ///
     /// Everything the fold holds about the session comes from an attach block
     /// that is not coming: the epoch it applied under and the cursor it would
     /// offer describe a history the server says it cannot resolve, so keeping
-    /// either would have the client ask for one nobody has. The arm goes too, or
-    /// the next `state` frame to arrive would be taken for the block this
-    /// refusal replaced.
+    /// either would have the client ask for one nobody has.
     ///
     /// A locked refusal waits for an explicit retry. Other refusals wait for
     /// directory-return evidence. Neither immediately retries the failed attach.
     fn drop_attachment(&mut self, refusal: Refusal, message: String) {
-        self.attach = Attach::Live;
         self.epoch = None;
         self.committed = None;
         self.applied = None;
@@ -547,8 +508,8 @@ impl SessionClient {
         self.withheld = Some(refusal);
     }
 
-    /// Adopt the epoch of the attach block this client asked for, and
-    /// prepare `chat` for the backfill that follows.
+    /// Adopt the epoch of the attach block a `state` frame opens, and prepare
+    /// `chat` for the backfill that follows.
     fn open_attach_block(&mut self, chat: &mut ChatState, epoch: String) {
         if let Some(error) = self.refusal_error.take() {
             // Refusal deliberately keeps the last-known transcript visible but
@@ -665,22 +626,42 @@ mod tests {
     fn attached() -> (SessionClient, ChatState) {
         let mut client = SessionClient::new(SESSION.to_string());
         let mut chat = chat();
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
         let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
         (client, chat)
     }
 
+    /// An on-change `state`, as a host sends whenever `working` or the
+    /// settings move.
     fn state(epoch: &str, working: bool) -> Frame {
         state_with(epoch, working, settings())
     }
 
     fn state_with(epoch: &str, working: bool, settings: AgentSettings) -> Frame {
-        state_with_warning(epoch, working, settings, None)
+        state_frame(epoch, false, working, settings, None)
     }
 
-    fn state_with_warning(
+    /// The `state` an attach block opens with.
+    fn opening(epoch: &str, working: bool) -> Frame {
+        opening_with(epoch, working, settings())
+    }
+
+    fn opening_with(epoch: &str, working: bool, settings: AgentSettings) -> Frame {
+        opening_with_warning(epoch, working, settings, None)
+    }
+
+    fn opening_with_warning(
         epoch: &str,
+        working: bool,
+        settings: AgentSettings,
+        credential_warning: Option<&str>,
+    ) -> Frame {
+        state_frame(epoch, true, working, settings, credential_warning)
+    }
+
+    fn state_frame(
+        epoch: &str,
+        opens_block: bool,
         working: bool,
         settings: AgentSettings,
         credential_warning: Option<&str>,
@@ -688,6 +669,7 @@ mod tests {
         Frame::State {
             session: SESSION.to_string(),
             epoch: epoch.to_string(),
+            opens_block,
             working,
             settings,
             oracle_settings: None,
@@ -719,8 +701,7 @@ mod tests {
             "context_window": 100_000
         }))
         .unwrap();
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state_with(EPOCH, false, host_settings));
+        let _ = client.apply(&mut chat, opening_with(EPOCH, false, host_settings));
         let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
         assert_eq!(
             chat.footers().context_usage(AgentId::Main).context_window,
@@ -749,8 +730,7 @@ mod tests {
             "thinking": "off", "speed": "standard", "verbosity": "default"
         }))
         .unwrap();
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state_with("new-epoch", false, legacy));
+        let _ = client.apply(&mut chat, opening_with("new-epoch", false, legacy));
         let _ = client.apply(&mut chat, caught_up("new-epoch", 0));
         assert!(
             display(&chat).is_none(),
@@ -766,16 +746,18 @@ mod tests {
         let mut oracle = settings();
         oracle.model_id = "oracle-model".into();
         oracle.thinking = "high".into();
-        let state = |session: &str, epoch: &str, oracle_settings| Frame::State {
+        let frame = |session: &str, epoch: &str, opens_block, oracle_settings| Frame::State {
             session: session.into(),
             epoch: epoch.into(),
+            opens_block,
             working: false,
             settings: settings(),
             oracle_settings,
             credential_warning: None,
         };
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(SESSION, EPOCH, Some(oracle.clone())));
+        let opening = |session, epoch, oracle| frame(session, epoch, true, oracle);
+        let state = |session, epoch, oracle| frame(session, epoch, false, oracle);
+        let _ = client.apply(&mut chat, opening(SESSION, EPOCH, Some(oracle.clone())));
         let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
         assert_eq!(client.oracle_settings(), Some(&oracle));
         assert_eq!(client.settings(), Some(&settings()));
@@ -787,8 +769,7 @@ mod tests {
         let _ = client.apply(&mut chat, state(SESSION, EPOCH, Some(oracle.clone())));
         assert_eq!(client.oracle_settings(), Some(&oracle));
         assert_eq!(client.settings(), Some(&settings()));
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(SESSION, "new-epoch", None));
+        let _ = client.apply(&mut chat, opening(SESSION, "new-epoch", None));
         assert!(
             client.oracle_settings().is_none(),
             "older hosts cannot inherit cached Oracle settings"
@@ -1044,30 +1025,48 @@ mod tests {
         );
     }
 
-    /// A refusal answers the attach the client asked for, so it disarms it.
-    /// Left armed, the next `state` frame to arrive would be taken for the
-    /// block this refusal replaced, and the fold would silently resume on a
-    /// session it was told is gone.
+    /// A `state` without the opening marker never opens a block, however the
+    /// client stands: waiting on a re-attach it just asked for, or refused.
+    ///
+    /// The host sends `state` on every change as well as at a block's start,
+    /// so reading one as an opening would adopt its epoch, quiesce, and freeze
+    /// the cursor until a `caught_up` nobody is sending.
     #[test]
-    fn a_refusal_disarms_the_attach_it_answered() {
-        let mut client = SessionClient::new(SESSION.to_string());
-        let mut chat = chat();
-        client.expect_attach();
+    fn an_on_change_state_never_opens_a_block() {
+        let (mut client, mut chat) = attached();
+        let _ = client.apply(&mut chat, durable(EPOCH, 1, "entry-1", notice("one")));
+        // Asked again, so a block is on its way, and the on-change frame
+        // overtakes it.
+        client.attach_requested();
+        let _ = client.apply(&mut chat, live(EPOCH, streaming_text("half a sen")));
+        let _ = client.apply(&mut chat, state(EPOCH, true));
+        let _ = client.apply(&mut chat, state("epoch-2", true));
+        assert_eq!(client.attach_phase(), Attach::Live);
+        assert!(streaming(&chat), "an on-change state quiesced");
+        let _ = client.apply(&mut chat, durable(EPOCH, 2, "entry-2", notice("two")));
+        let _ = client.apply(&mut chat, durable(EPOCH, 3, "entry-3", notice("three")));
+        assert_eq!(
+            client.cursor(),
+            Some(Cursor {
+                epoch: EPOCH.into(),
+                seq: 2
+            }),
+            "live frames under the adopted epoch kept committing",
+        );
+        assert_eq!(notices(&chat), vec!["one", "two", "three"]);
 
+        // Refused, the client follows nothing, and a stray on-change frame does
+        // not bring it back.
         let _ = client.apply(
             &mut chat,
             refusal(SESSION, "unknown_session", "unknown session session-1"),
         );
-
-        // What a stray `state` frame would do to an armed client: adopt its
-        // epoch and open a block.
         let _ = client.apply(&mut chat, state("epoch-2", false));
         assert!(
             !client
                 .apply(&mut chat, durable("epoch-2", 1, "entry-1", notice("stray")))
                 .0
         );
-        assert_eq!(notices(&chat), Vec::<String>::new());
         assert_eq!(client.cursor(), None);
     }
 
@@ -1145,8 +1144,7 @@ mod tests {
         // The host restarted, so it serves the whole history under a fresh
         // epoch. Entry 1 is below the old high-water mark and would be
         // dropped as a duplicate if adoption had not reset the cursor.
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state("epoch-2", false));
+        let _ = client.apply(&mut chat, opening("epoch-2", false));
         let _ = client.apply(
             &mut chat,
             durable("epoch-2", 1, "entry-1", notice("under the new epoch")),
@@ -1178,14 +1176,12 @@ mod tests {
             durable(EPOCH, 1, "old-branch", notice("old branch only")),
         );
         let reason = "another writer held this session";
-        client.expect_attach();
         let _ = client.apply(&mut chat, refusal(SESSION, "locked", reason));
         assert_eq!(notices(&chat), vec!["old branch only"]);
         assert_eq!(errors(&chat), vec![reason]);
 
         client.owe_reattach();
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state("new-branch", false));
+        let _ = client.apply(&mut chat, opening("new-branch", false));
         let _ = client.apply(
             &mut chat,
             durable("new-branch", 1, "new-branch", notice("new branch only")),
@@ -1303,8 +1299,7 @@ mod tests {
         // the client claims only entry 5.
         assert_eq!(client.cursor().map(|cursor| cursor.seq), Some(5));
 
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
         let _ = client.apply(&mut chat, caught_up(EPOCH, 12));
 
         assert_eq!(
@@ -1326,8 +1321,7 @@ mod tests {
     fn a_block_keeps_a_frame_that_came_out_below_an_earlier_one() {
         let (mut client, mut chat) = attached();
 
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
         let _ = client.apply(&mut chat, durable(EPOCH, 9, "entry-9", notice("nine")));
         let _ = client.apply(&mut chat, durable(EPOCH, 5, "entry-5", notice("five")));
         let _ = client.apply(&mut chat, caught_up(EPOCH, 9));
@@ -1380,8 +1374,7 @@ mod tests {
         assert!(streaming(&chat), "the fold has transient detail");
         assert!(client.lifecycle().is_compacting(AgentId::Main));
 
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
 
         assert!(!streaming(&chat), "the block's opening state quiesced");
         assert!(!client.lifecycle().is_compacting(AgentId::Main));
@@ -1421,8 +1414,7 @@ mod tests {
         let mut local = AgentLifecycle::default();
         let _ = reduce(&mut chat, &mut local, streaming_text("local"), None);
 
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
 
         assert!(streaming(&chat));
     }
@@ -1444,8 +1436,7 @@ mod tests {
         // The stream died before the turn's `AgentEnd`, and no projected
         // event carries a lifecycle bracket, so without the seed this
         // spinner would run forever.
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
         let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
 
         assert!(!client.lifecycle().is_running(AgentId::Main));
@@ -1457,8 +1448,7 @@ mod tests {
         let mut client = SessionClient::new(SESSION.to_string());
         let mut chat = chat();
 
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, true));
+        let _ = client.apply(&mut chat, opening(EPOCH, true));
         let _ = client.apply(&mut chat, caught_up(EPOCH, 3));
 
         assert!(client.lifecycle().is_running(AgentId::Main));
@@ -1469,10 +1459,9 @@ mod tests {
     fn first_attach_settings_are_available_once_without_reconnect_duplication() {
         let mut client = SessionClient::new(SESSION.to_string());
         let mut chat = chat();
-        client.expect_attach();
         let _ = client.apply(
             &mut chat,
-            state_with_warning(
+            opening_with_warning(
                 EPOCH,
                 false,
                 settings(),
@@ -1493,10 +1482,9 @@ mod tests {
         );
         assert!(client.take_first_attach_credential_warning().is_none());
 
-        client.expect_attach();
         let _ = client.apply(
             &mut chat,
-            state_with_warning(
+            opening_with_warning(
                 EPOCH,
                 false,
                 settings(),
@@ -1520,19 +1508,17 @@ mod tests {
     fn an_interrupted_first_attach_keeps_the_successful_blocks_presentation() {
         let mut client = SessionClient::new(SESSION.to_string());
         let mut chat = chat();
-        client.expect_attach();
         let _ = client.apply(
             &mut chat,
-            state_with_warning(EPOCH, false, settings(), Some("stale warning")),
+            opening_with_warning(EPOCH, false, settings(), Some("stale warning")),
         );
-        client.abandon_attach();
-
+        // The stream carrying that block was lost before its `caught_up`, and
+        // the retry's block opens over it.
         let mut current = settings();
         current.model_id = "current-model".into();
-        client.expect_attach();
         let _ = client.apply(
             &mut chat,
-            state_with_warning(EPOCH, false, current, Some("current warning")),
+            opening_with_warning(EPOCH, false, current, Some("current warning")),
         );
         let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
 
@@ -1586,8 +1572,7 @@ mod tests {
         assert_eq!(chat.tasks()[&7].status, TaskStatus::Running);
         assert_eq!(chat.queue().queues.len(), 1);
 
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
         let _ = client.apply(
             &mut chat,
             caught_up_with(
@@ -1654,8 +1639,7 @@ mod tests {
 
         // The main turn ended in the gap, so the block reports idle. The
         // background sub is still going.
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
         let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
 
         assert!(!client.lifecycle().is_running(AgentId::Main));
@@ -1692,7 +1676,6 @@ mod tests {
              otherwise this test measures nothing",
         );
 
-        client.expect_attach();
         let _ = client.apply(
             &mut chat,
             live(
@@ -1702,7 +1685,7 @@ mod tests {
                 },
             ),
         );
-        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, opening(EPOCH, false));
         let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
 
         assert!(
@@ -1713,29 +1696,6 @@ mod tests {
             client.lifecycle().is_running(AgentId::Sub(1)),
             "the synthesized bracket marks the inherited sub running",
         );
-    }
-
-    /// An attach that was never served must arm nothing: the host's next
-    /// on-change `state` frame would otherwise be mistaken for a block, and
-    /// the fold would quiesce and stop advancing its cursor until a
-    /// `caught_up` that never comes.
-    #[test]
-    fn an_unarmed_client_treats_state_frames_as_live() {
-        let (mut client, mut chat) = attached();
-        let _ = client.apply(&mut chat, durable(EPOCH, 3, "entry-3", notice("one")));
-        let _ = client.apply(&mut chat, live(EPOCH, streaming_text("half a sen")));
-
-        // The attach was refused, so nothing was armed.
-        let _ = client.apply(&mut chat, state(EPOCH, true));
-
-        assert!(streaming(&chat), "no quiesce");
-        let _ = client.apply(&mut chat, durable(EPOCH, 4, "entry-4", notice("two")));
-        assert_eq!(
-            client.cursor().map(|cursor| cursor.seq),
-            Some(3),
-            "durable frames keep advancing the cursor",
-        );
-        assert_eq!(notices(&chat), vec!["one", "two"]);
     }
 
     #[test]
@@ -1807,7 +1767,7 @@ mod tests {
         );
         assert_eq!(notices(&chat), vec!["one", "two"]);
 
-        client.expect_attach();
+        client.attach_requested();
         assert!(
             !client.needs_reattach(),
             "asking for the attach discharges it",

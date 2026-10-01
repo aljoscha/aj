@@ -142,7 +142,9 @@ characters, which a reader enforces itself. Absent means the reader
 falls back to the id.
 
 SSE streams send a `heartbeat` frame after 30 seconds of idleness, and
-clients treat 60 seconds of silence as a dead stream. Error responses
+clients treat 60 seconds of silence as a dead stream. A host sends no
+heartbeat on a stream while an attach block it owes that stream is
+incomplete (section 5.5). Error responses
 carry `{code, message}` (section 5.6 for the envelope rules):
 
 | Status | Code | Meaning |
@@ -155,10 +157,9 @@ carry `{code, message}` (section 5.6 for the envelope rules):
 | 409 | `locked` | A rival writer holds the session's lock (section 4). |
 | 409 | `unsupported` | Well formed and unconflicting, but this host cannot serve it: a model it has no credentials for, a settings change for an agent that is not live. |
 | 500 | `internal` | Host or gateway failure. |
-| 503 | `host_unreachable` | Gateway only: the owning host's control connection is down. |
+| 503 | `host_unreachable` | Gateway only, on a proxied command, read or create: the owning host's control connection is down or the host did not answer in time. On the event stream the same code is a per-session `error` frame instead (section 5.3). |
 
-A gateway adds its enrollment codes (section 6.1) and relays a host
-refusal whose body is not an envelope as `host_refused`.
+A gateway adds its enrollment codes (section 6.1).
 
 ### 5.2 Sessions and addressing
 
@@ -193,7 +194,11 @@ internally tagged with `kind`:
   the host's runtime fallback or validation. It contains no environment values,
   credentials, or live-only thinking display. Live delivery and backfill supply
   the same context, including across compaction. Older hosts may omit the field.
-- `state`: `{kind, session, epoch, working, settings, oracle_settings?}`.
+- `state`: `{kind, session, epoch, opens_block?, working, settings, oracle_settings?}`.
+  `opens_block: true` marks the `state` that opens an attach block
+  (section 5.5), absent reads false. It is the only thing that tells a
+  block's opening from an on-change `state`, so a client reads it off the
+  frame and never infers it from having asked.
   `working` says whether the session's **main agent** has a turn in
   flight, `settings` is the active `AgentSettings` (`provider`,
   `model_id`, `thinking`, `thinking_display`, `speed`, `verbosity`, `context_window`),
@@ -211,8 +216,9 @@ internally tagged with `kind`:
   replaces that child's footer settings without clearing its measured usage.
   Replay and synthesized continuation starts preserve these changes. Main's
   footer settings come from `state`, not historical settings entries.
-  Sent at the start of every attach block, before the backfill, and
-  whenever `working` or `settings` or `oracle_settings` changes. The host publishes no
+  Sent at the start of every attach block, before the backfill and marked
+  `opens_block`, and unmarked whenever `working` or `settings` or
+  `oracle_settings` changes. The host publishes no
   "restored session" notice, a client renders one from the first
   attach's `state`. `working` applies on every `state` frame and
   self-heals a spinner left running by a missed `AgentEnd`. It says
@@ -235,9 +241,13 @@ internally tagged with `kind`:
 - `error`: `{kind, session, code, message}`.
   The error envelope (section 5.6) as a session-scoped stream frame.
   Every per-session resolution failure travels this way with its own
-  code (`unknown_session`, `locked`, `persistence_failed`, ...). Only
-  failures of the request itself (a session named twice, a shut-down
-  server, a malformed cursor) fail the request.
+  code (`unknown_session`, `locked`, `persistence_failed`,
+  `host_unreachable`, ...). Only failures of the request itself (a
+  session named twice, a shut-down server, a malformed cursor) fail the
+  request. `host_unreachable` comes only from a gateway: the session's
+  host cannot be reached now, which says nothing about the session
+  itself, and the gateway announces the host's return with `reset`
+  (section 6.1).
 - `reset`: `{kind, session}`. Continuity for this session is broken
   (head switch, or a gateway lost or regained its host). The client
   re-attaches, offering its cursor (section 5.5).
@@ -274,10 +284,11 @@ Every frame is in exactly one class:
   omit that field and leave spend unknown, not zero.
 - **Lossy** frames are the three cumulative-snapshot events,
   `MessageUpdate` (keyed by agent id), `ToolExecutionUpdate` (keyed by
-  call id), `TaskOutput` (keyed by task id), plus the `list` and `state`
-  frame kinds (each its own key). They may be coalesced or dropped under
-  pressure, the newest one or a later durable frame supersedes. New
-  frame kinds declare their class when introduced.
+  call id), `TaskOutput` (keyed by task id), plus the `list` frame kind
+  and the on-change `state` frame (each its own key). A `state` marked
+  `opens_block` is part of its block and reliable-transient. They may be
+  coalesced or dropped under pressure, the newest one or a later durable
+  frame supersedes. New frame kinds declare their class when introduced.
 - **Reliable-transient** frames are everything else: tool start/end,
   sub-agent end, task start/end, notices, warnings, errors, lifecycle
   brackets, usage updates, queue updates, compaction progress,
@@ -320,12 +331,15 @@ may contain a colon. Attaching nothing is legal: that stream carries
 A stream request never fails wholesale over one bad session: each named
 session either gets its attach block or a session-scoped `error` frame
 carrying the failure's own code (section 5.3), and the rest are served.
-Any error frame ends that attachment, and the dropped cursor costs only
-a full backfill later. For each resolvable session the server,
-atomically with respect to that session's event flow, registers the
-subscription, projects the durable suffix, and emits in order on the
-stream: a `state` frame, the backfill (projected events for entries
-after the cursor, or from the beginning when the cursor is absent or its
+A `reset` for the session may supersede either at any point, and asks
+for a re-attach as always. An error frame ends that attachment, and
+except for `host_unreachable` the client drops its epoch and cursor with
+it, which costs only a full backfill later. For each resolvable session
+the server, atomically with respect to that session's event flow,
+registers the subscription, projects the durable suffix, and emits in
+order on the stream: a `state` frame marked `opens_block`, the backfill
+(projected events for entries after the cursor, or from the beginning
+when the cursor is absent or its
 epoch does not match), and `caught_up`. Live frames for that session
 follow. Because subscription and projection are atomic and the stream is
 FIFO, no durable event can be missed or delivered below the backfill
@@ -344,6 +358,17 @@ those tables or announced by a `TaskStart`, `TaskEnd` or `QueueUpdate`
 that follows `caught_up`. Applying such an event over tables that
 already reflect it changes nothing: a task event updates a known task in
 place, and a `QueueUpdate` replaces its agent's queue.
+
+A client recognizes a block by its opening frame alone and needs no
+record of what it asked for: a `state` marked `opens_block` opens one,
+the matching `caught_up` ends it, and an unmarked `state` never does.
+Because every named session is answered, a client waits for that answer
+with no deadline of its own. A block that stops arriving is a stream
+failure: a host sends no `heartbeat` on a stream while any block it owes
+that stream is incomplete, so a stalled block turns into stream silence
+and the ordinary stream-loss recovery re-attaches. A block only waits on
+its session's log lock, which appends hold briefly, and on the client
+reading it.
 
 Sessions not named in the request produce nothing on the stream except
 their rows in `list` frames, so a client is never evicted over traffic
@@ -376,9 +401,9 @@ Backfill projection rules, which differ from dead-log replay:
 
 Client application rules:
 
-- **Epoch adoption**: an attach block the client itself requested
-  establishes the session's current epoch: the client adopts the epoch
-  of the block's opening `state` frame and applies the block under it,
+- **Epoch adoption**: an attach block establishes the session's current
+  epoch: the client adopts the epoch of the block's opening `state` frame
+  and applies the block under it,
   which is how a stale cursor (head switch, host restart) accepts the
   full backfill served under the new epoch.
 - **Epoch filter**: outside an attach block the client drops any
@@ -441,6 +466,11 @@ Client application rules:
     if the client held no rows. Explicit selection also retries.
   - `persistence_failed`: re-ask immediately when the frame folds. The host
     treats the failed materialization as absent and rebuilds from disk.
+  - `host_unreachable`: keep the epoch and the cursor, and the cached
+    transcript, and show that the host is unreachable and the session
+    resumes when it returns. Re-ask on the gateway's `reset` for the
+    session, so the host's return costs an incremental catch-up. Explicit
+    selection also retries.
 
 ### 5.6 Commands
 
@@ -939,20 +969,32 @@ marking. Client event streams are **spliced**: for each attached session
 the gateway opens the upstream stream with the client's own cursor and
 forwards frames with ids rewritten. It holds no session logs and no
 cursors of its own. Commands and reads are proxied to the owning host
-with method, query, and body carried unread. An unreachable owning host
-is 503 `host_unreachable`.
+with method, query, and body carried unread. A proxied request to an
+unreachable owning host is 503 `host_unreachable`.
 
-`reset` is emitted on two edges, for exactly the sessions a client
-attached: the gateway lost its link to the host, and the link came back.
-The gateway never re-opens an upstream attachment itself, since only the
-client has a current cursor. While the link is down the host's rows are
-marked `unreachable`. A client that attaches sessions on an unreachable
-host is **not** refused: those sessions contribute no upstream while
-every other host's sessions on that stream are served. A host believed
-reachable that does not answer an attach is the ordinary 503. Removing
-an enrollment closes the upstream connections, removes the host's
-sessions from the merged list, and ends its splices with `reset`. The
-client's re-attach is then refused per session with an `error` frame,
+A client stream's response head never waits on a host. Each host's
+sessions are served on their own: the gateway dials that host's
+upstream, bounded by its upstream timeout, while the other hosts are
+served, and every named session gets its block or an `error` frame. A
+session whose host cannot be reached gets `host_unreachable`: the
+gateway holds no link to the host, or the dial failed, timed out, or
+was refused. One hung host therefore delays and fails nothing but its
+own sessions.
+
+`reset` is emitted for exactly the sessions a client attached on a
+host, when continuity for them breaks: the upstream ended (including
+one that fell silent mid-block), the gateway's link to the host came
+back after being down, or the host was withdrawn. After a
+`host_unreachable` the next reading of that host as reachable is its
+return. The gateway writes every frame about one host's sessions on a
+client stream from one place, into that stream's FIFO queue, so a
+`host_unreachable` always precedes the `reset` announcing that host's
+return. The gateway never re-opens an upstream attachment itself, since
+only the client has a current cursor. While the link is down the host's
+rows are marked `unreachable`. Removing an enrollment closes the
+upstream connections, removes the host's sessions from the merged list,
+and ends its splices with `reset`, including one still dialing. The
+client's re-attach is then refused per session with `unknown_session`,
 its stream and other hosts' sessions untouched.
 
 A gateway's `list` frames and `GET /v1/sessions` carry the enrolled
@@ -1338,7 +1380,11 @@ a backgrounded session's task table and queues on re-attach, queue
 enqueue visibility on a second client, slow-client eviction and
 recovery, settings visibility for a mid-session joiner, seq
 non-contiguity, per-session attach refusal while the same
-stream's other sessions serve (through a gateway included), every
+stream's other sessions serve (through a gateway included), an
+on-change `state` never opening a block, a stalled block withholding
+the heartbeat, `host_unreachable` for a downed or hung host without
+delaying the other hosts' blocks, an incremental resume from the cursor
+kept through `host_unreachable`, every
 gateway `reset` edge (host lost, host returned, enrollment withdrawn,
 identity replaced) scoped to the attaching client's sessions,
 incompatible peers neither recorded nor routed to, the identity gate in

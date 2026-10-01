@@ -70,7 +70,6 @@ impl Client {
     /// conclusion sweep the host runs for every sub-agent it knows to be
     /// idle.
     fn reattach(&mut self, log: &LogSnapshot, epoch: &str) {
-        self.client.expect_attach();
         // A real client names its cursor in the stream request. A cursor
         // from another epoch says nothing about this one, so the server
         // serves everything instead.
@@ -136,10 +135,12 @@ fn event_frame(epoch: &str, tagged: &TaggedEvent) -> Frame {
     }
 }
 
+/// The `state` an attach block opens with.
 fn state_frame(epoch: &str, working: bool) -> Frame {
     Frame::State {
         session: SESSION.to_string(),
         epoch: epoch.to_string(),
+        opens_block: true,
         working,
         settings: scripted_settings(),
         oracle_settings: None,

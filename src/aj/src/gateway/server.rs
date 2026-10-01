@@ -529,43 +529,12 @@ async fn events(
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, aj_agent::BoxError>>>, Response> {
     let attach = attach_requests(&params).map_err(IntoResponse::into_response)?;
-    let splice = state
-        .gateway
-        .splice(&attach, &state.shutdown)
-        .await
-        .map_err(refused)?;
+    let splice = state.gateway.splice(&attach, &state.shutdown);
     Ok(Sse::new(client_stream(
         splice,
         state.heartbeat,
         state.shutdown.clone(),
     )))
-}
-
-/// Why a client's stream could not be opened.
-///
-/// A refusal the owning host wrote travels back as that host wrote it, with the
-/// session ids in it namespaced and nothing else touched, which is the path a
-/// proxied refusal takes: the client asked this question and the host answered
-/// it, so its own fields are what a capable client composes its wording from.
-/// A body this gateway cannot read that way, and everything that is
-/// the gateway's own answer, goes through [`ApiError`].
-fn refused(err: GatewayError) -> Response {
-    if let GatewayError::AttachRefused {
-        status,
-        host_id,
-        body,
-        ..
-    } = &err
-        && let Some(body) = namespaced_error(body.as_bytes(), host_id)
-    {
-        return Answer {
-            status: *status,
-            content_type: Some(header::HeaderValue::from_static("application/json")),
-            body,
-        }
-        .into_response();
-    }
-    ApiError::from(err).into_response()
 }
 
 /// Parse the stream's repeatable `session=<id>[@<epoch>:<seq>]` parameters.
@@ -1039,20 +1008,6 @@ impl From<GatewayError> for ApiError {
                 (StatusCode::SERVICE_UNAVAILABLE, "host_unreachable")
             }
             GatewayError::Directory(err) => directory_status(err),
-            // A refusal whose body is not an envelope at all: an HTML page from
-            // something in front of the host, nothing. The gateway names it
-            // itself, because the host named nothing, and carries the host's own
-            // words. A body that *is* an envelope never reaches here (see
-            // [`refused`]), because every field of one is the host's to keep.
-            GatewayError::AttachRefused {
-                status, message, ..
-            } => {
-                return Self {
-                    status: *status,
-                    code: "host_refused",
-                    message: message.clone(),
-                };
-            }
             // A gateway that cannot write down what it was told is not a client's
             // fault, and the enrollment did not stick.
             GatewayError::State(_) | GatewayError::Http(_) => {

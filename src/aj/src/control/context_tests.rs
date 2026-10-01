@@ -12,6 +12,7 @@ use aj_models::registry::ModelInfo;
 use aj_models::types::{AssistantContent, StopReason, ToolCall, UserContent};
 use aj_wire::{DecodedAgentEvent, PersistAction};
 use std::sync::Arc;
+use std::time::Duration;
 
 const HOST_WINDOW: u64 = 32_000;
 const CHANGED_WINDOW: u64 = 64_000;
@@ -153,7 +154,6 @@ impl Client {
             }])
             .await
             .unwrap();
-        assert!(stream.attached(session));
         let mut client = Self {
             stream,
             fold: SessionClient::new(session.into()),
@@ -175,7 +175,6 @@ impl Client {
                 .context_window,
             seed_window
         );
-        client.fold.expect_attach();
         client
             .pump_until("attach block", |f| matches!(f, Frame::CaughtUp { .. }))
             .await;

@@ -932,13 +932,6 @@ impl Client {
             }),
             stream,
         };
-        // Armed from what the attach reports it served, which is the
-        // contract on `expect_attach`: an arm for a block that never
-        // arrives freezes the fold's cursor.
-        for served in this.stream.attached() {
-            assert_eq!(served, session, "one block, for the session asked for");
-        }
-        this.client.expect_attach();
         this.apply_block().await;
         this
     }
@@ -969,7 +962,6 @@ impl Client {
             }])
             .await
             .expect("re-attach");
-        self.client.expect_attach();
         self.apply_block().await
     }
 
@@ -1861,32 +1853,13 @@ async fn an_id_that_is_not_a_session_id_never_reaches_the_store() {
     harness.host.shutdown().await;
 }
 
-/// An attach reports the sessions it served, and one named twice is a
-/// malformed request: the client contract is one block per named session,
-/// and the second block would open a phase the client is not
-/// expecting and quiesce state it just applied.
+/// A session named twice is a malformed request: the client contract is one
+/// block per named session, and the second block would open a phase the
+/// client is not expecting and quiesce state it just applied.
 #[tokio::test]
-async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
+async fn an_attach_refuses_a_duplicate() {
     let harness = Harness::new(Vec::new());
     let first = harness.create().await;
-    let second = harness.create().await;
-
-    let stream = harness
-        .host
-        .attach(&[
-            AttachRequest {
-                session: first.clone(),
-                cursor: None,
-            },
-            AttachRequest {
-                session: second.clone(),
-                cursor: None,
-            },
-        ])
-        .await
-        .expect("attach");
-    assert_eq!(stream.attached(), [first.clone(), second.clone()]);
-    drop(stream);
 
     let err = harness
         .host
@@ -1906,8 +1879,7 @@ async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
     assert!(matches!(err, HostError::Invalid(_)), "got {err:?}");
 
     // A session the host cannot resolve is refused on the stream rather than
-    // as the request, and it is not among what was served, so a
-    // client has nothing to arm its fold with.
+    // as the request.
     let mut stream = harness
         .host
         .attach(&[AttachRequest {
@@ -1916,7 +1888,6 @@ async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
         }])
         .await
         .expect("a stream naming only an unknown session still opens");
-    assert_eq!(stream.attached(), Vec::<String>::new());
     let refusal = frames_until(&mut stream, "the refusal", |frame| {
         matches!(frame, Frame::Error { .. })
     })
@@ -1962,12 +1933,6 @@ async fn an_attach_refuses_a_session_it_cannot_resolve_and_serves_the_rest() {
         .await
         .expect("the stream opens");
 
-    assert_eq!(
-        stream.attached(),
-        [first.clone(), second.clone()],
-        "a client arms its fold from what was served, never from what it asked \
-         for",
-    );
     let frames = frames_until(
         &mut stream,
         "the last session's block",
@@ -1977,7 +1942,12 @@ async fn an_attach_refuses_a_session_it_cannot_resolve_and_serves_the_rest() {
     let answers: Vec<(&str, &str)> = frames
         .iter()
         .filter_map(|frame| match frame {
-            Frame::State { session, .. } => Some(("state", session.as_str())),
+            // Each block says it opens: that is how a client recognizes one.
+            Frame::State {
+                session,
+                opens_block: true,
+                ..
+            } => Some(("state", session.as_str())),
             Frame::CaughtUp { session, .. } => Some(("caught_up", session.as_str())),
             Frame::Error { session, code, .. } => Some((code.as_str(), session.as_str())),
             _ => None,
@@ -2060,10 +2030,6 @@ async fn a_refused_session_stays_off_the_streams_attach_set() {
         panic!("a locked session is refused on the stream: {refusal:?}");
     };
     assert_eq!(code, "locked", "{message}");
-    assert!(
-        refused.attached().is_empty(),
-        "a refused session is not one the client may arm its fold for",
-    );
 
     // The rival lets go, so the very session that was refused is now one this
     // host can hold. A second client takes it, and its frames must reach that
@@ -2379,7 +2345,6 @@ async fn an_attach_refuses_an_ungrammatical_id_without_asking_the_store() {
         lookups,
         "a refusal off the id's own shape put no question to the store",
     );
-    assert!(stream.attached().is_empty());
     let refused = frames_until(
         &mut stream,
         "one refusal per id",
@@ -6998,7 +6963,6 @@ async fn compaction_usage_crosses_the_real_attach_hold_and_release_boundary() {
         context_window: 200_000,
         ..settings()
     });
-    client.expect_attach();
     let opening = bounded("the attach opening state", stream.recv())
         .await
         .expect("the block opens");
@@ -8335,7 +8299,6 @@ async fn an_attach_block_opens_the_bracket_of_a_live_sub() {
         context_window: 200_000,
         ..settings()
     });
-    joiner.expect_attach();
     for frame in frames {
         let _ = joiner.apply(&mut chat, frame);
     }

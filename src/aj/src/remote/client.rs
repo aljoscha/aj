@@ -698,11 +698,6 @@ impl RemoteEvents {
         }
     }
 
-    /// How long this stream may be silent before it counts as dead.
-    pub(crate) fn silence(&self) -> Duration {
-        self.silence
-    }
-
     /// The next frame, `None` once the stream ended.
     ///
     /// An unknown frame kind is skipped: an endpoint client discards those.

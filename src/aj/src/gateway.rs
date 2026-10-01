@@ -43,7 +43,6 @@ use aj_app::cli::args::{Args, Command, DEFAULT_LISTEN_ADDRESS};
 use aj_app::host::AttachRequest;
 use aj_wire::{Hello, HostList, HostSource, HostSummary, MergedDirectory, PROTOCOL_VERSION};
 use anyhow::{Context, Result, bail};
-use reqwest::StatusCode;
 
 use crate::gateway::config::{AddressError, GatewayConfig, HostAddress};
 use crate::gateway::directory::{
@@ -149,22 +148,6 @@ pub(crate) enum GatewayError {
     },
     #[error(transparent)]
     Directory(#[from] DirectoryError),
-    /// The host that owns an attached session refused it, in its own words: a
-    /// session it does not hold, a lock conflict. Carried rather than
-    /// interpreted, so a client of a gateway reads a host's refusal exactly as a
-    /// client of that host would.
-    #[error("the host answered {status}: {message}")]
-    AttachRefused {
-        status: StatusCode,
-        /// The host whose refusal this is, which is the namespace the session ids
-        /// in its body appear under downstream.
-        host_id: String,
-        /// The host's own sentence, for this gateway's own log and for the
-        /// envelope it mints when the host sent none.
-        message: String,
-        /// The refusal body as the host wrote it, which is what travels back.
-        body: String,
-    },
     #[error(transparent)]
     State(#[from] EnrollmentError),
     /// The gateway's own HTTP stack would not start, which only happens before
@@ -446,11 +429,7 @@ impl Gateway {
     ///
     /// `shutdown` is the serving port's own token: it ends the splice's upstreams
     /// whether or not the client is still reading (see [`Splice::open`]).
-    pub(crate) async fn splice(
-        &self,
-        attach: &[AttachRequest],
-        shutdown: &CancellationToken,
-    ) -> Result<Splice, GatewayError> {
+    pub(crate) fn splice(&self, attach: &[AttachRequest], shutdown: &CancellationToken) -> Splice {
         // Subscribed before the grouping, so a host that comes up in between is
         // still a change this stream is woken for: the groups are the state the
         // splice compares against, and they are the newer of the two.
@@ -463,7 +442,6 @@ impl Gateway {
             self.inner.tuning,
             shutdown,
         )
-        .await
     }
 
     /// The client the proxy forwards with.

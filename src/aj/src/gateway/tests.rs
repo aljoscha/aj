@@ -4905,78 +4905,31 @@ async fn more_dead_ids_than_the_bound_do_not_evict_the_client_that_named_them() 
     right.stop().await;
 }
 
-/// The owning host's refusal of an attach travels back, code and all: the client
-/// asked the question and the host answered it.
+/// A host that refuses the whole upstream request costs only its own sessions:
+/// each is answered `host_unreachable` on a stream that stays open, carrying
+/// the host's own words.
+///
+/// A host refuses a stream only for what is wrong with the request or with
+/// itself (shutting down), never per session, so to a client of this gateway
+/// it is a host that cannot serve now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hosts_own_attach_refusal_travels_back() {
+async fn a_hosts_refusal_of_the_whole_stream_answers_each_session() {
     let fake = FakeHost::start("fake", Script::Refuse).await;
     let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
     fixture.until_connected("fake").await;
 
-    let Err(err) = fixture.client.events(&[attach("fake:s-1")]).await else {
-        panic!("the host refuses this attach");
-    };
-
-    assert_eq!(err.status(), Some(StatusCode::CONFLICT), "got {err:?}");
-    assert_eq!(
-        err.code(),
-        Some("locked"),
-        "the host's own code, which this gateway has no vocabulary of its own for",
-    );
-    assert!(
-        err.to_string().contains("another writer"),
-        "and the host's own words: {err}",
-    );
-
-    fixture.shutdown().await;
-    fake.stop();
-}
-
-/// A refusal an owning host wrote reaches the client whole.
-///
-/// Three things about the same body: an envelope carrying only a `message` is a
-/// complete error, so the message is the host's sentence and not the JSON it
-/// arrived in; the session it names is named in the one vocabulary a client of
-/// this gateway has; and a field this build has no name for is still there for a
-/// client that does. The proxy carries a host's error bodies whole, and this is
-/// the same rule on the path that does not go through it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hosts_own_attach_refusal_travels_back_whole() {
-    let fake = FakeHost::start(
-        "fake",
-        Script::RefuseRaw(
-            r#"{"message":"the session is held by another writer","session":"s-1","holder":"pid 42"}"#,
-        ),
-    )
-    .await;
-    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
-    fixture.until_connected("fake").await;
-
-    let response = fixture
-        .http
-        .get(format!(
-            "{}/v1/events?session=fake:s-1",
-            fixture.server.url()
-        ))
-        .send()
+    let mut events = fixture
+        .client
+        .events(&[attach("fake:s-1")])
         .await
-        .expect("the stream request");
+        .expect("the stream opens whatever one host answers");
+    let (session, code, message) = refused_session(&mut events).await;
 
-    let status = response.status();
-    let body: serde_json::Value = response.json().await.expect("a JSON body");
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        body["message"], "the session is held by another writer",
-        "the host's own sentence rather than the body it arrived in: {body}",
-    );
-    assert_eq!(
-        body["session"], "fake:s-1",
-        "named in the only vocabulary a client of this gateway has: {body}",
-    );
-    assert_eq!(
-        body["holder"], "pid 42",
-        "and a field this gateway has no name for is still there for a client \
-         that has: {body}",
+    assert_eq!(session, "fake:s-1");
+    assert_eq!(code, "host_unreachable");
+    assert!(
+        message.contains("another writer"),
+        "the host's own words travel in the message: {message}",
     );
 
     fixture.shutdown().await;
@@ -5209,13 +5162,13 @@ async fn a_gateway_does_not_reopen_an_upstream_it_lost() {
 /// A re-attach while the host is still down does not fail the stream, does not
 /// spin on `reset`, and is told when the host comes back.
 ///
-/// Unreachable is **pending**, and the contrast with an id this gateway cannot
-/// resolve is what the same stream carries here: the unresolvable one is
-/// refused with an `error` frame, the unreachable one gets none and is held.
-/// Collapsing the two would either drop a client's attachment over a flap that
-/// is about to heal, or leave it waiting for frames that can never come.
+/// Every session is answered: the reachable host's with its block, promptly,
+/// the downed host's with `host_unreachable`, and an id nothing here resolves
+/// with `unknown_session`. The `host_unreachable` comes before the `reset` that
+/// announces the host's return, because a client that read them the other way
+/// round would re-ask, then settle on "unreachable" for a host that is back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reattach_while_a_host_is_down_waits_for_it_to_return() {
+async fn a_reattach_while_a_host_is_down_is_answered_and_told_of_its_return() {
     let mut down = Upstream::start().await;
     let mut up = Upstream::start().await;
     let waiting = down.create().await;
@@ -5233,33 +5186,40 @@ async fn a_reattach_while_a_host_is_down_waits_for_it_to_return() {
                 .map(|_| ())
         })
         .await;
-    // An id nothing here resolves, on the same stream, so that "no refusal for
-    // the unreachable one" measures the distinction rather than a gateway that
-    // refuses nothing at all.
     let gone = "0123456789abcdef:whatever";
 
     let mut events = fixture
         .attach(&[attach(&waiting), attach(&watched), attach(gone)])
         .await;
 
-    // The healthy host's session is served, which is what failing the whole
-    // stream over its neighbour would have cost.
-    let opened = frames_until(&mut events, "the healthy session's block", is_caught_up).await;
-    assert!(
-        named_sessions(&opened).contains(&watched.as_str()),
-        "the session on the host that is there was served: {opened:?}",
+    let mut answered = BTreeMap::new();
+    let opened = frames_until(&mut events, "every session's answer", |frame| {
+        match frame {
+            Frame::CaughtUp { session, .. } => {
+                answered.insert(session.clone(), "caught_up".to_string());
+            }
+            Frame::Error { session, code, .. } => {
+                answered.insert(session.clone(), code.clone());
+            }
+            _ => {}
+        }
+        answered.len() == 3
+    })
+    .await;
+    assert_eq!(
+        answered,
+        BTreeMap::from([
+            (watched.clone(), "caught_up".to_string()),
+            (waiting.clone(), "host_unreachable".to_string()),
+            (gone.to_string(), "unknown_session".to_string()),
+        ]),
+        "{opened:?}",
     );
     let quiet = frames_within(&mut events, QUIET).await;
     assert!(
         resets(&quiet).is_empty(),
         "a session whose host is known to be down waits rather than being reset \
          over and over: {quiet:?}",
-    );
-    assert_eq!(
-        refused_sessions(opened.iter().chain(quiet.iter())),
-        vec![gone],
-        "an unreachable host's session is pending and is owed no refusal, while \
-         an id this gateway cannot resolve is owed one: {opened:?} {quiet:?}",
     );
 
     down.restart().await;
@@ -5273,10 +5233,6 @@ async fn a_reattach_while_a_host_is_down_waits_for_it_to_return() {
         vec![waiting.clone()],
         "the host came back, so its sessions are asked to attach again: {returned:?}",
     );
-    // And the window a second `reset` would have arrived in. Which reset comes
-    // first is the order of a map over host ids, so reading until the first one
-    // says nothing about the session that never lost continuity: being asked to
-    // re-attach that one costs the client a backfill it did not need.
     let others = frames_within(&mut events, QUIET).await;
     assert!(
         !resets(&others).contains(&watched),
@@ -5385,6 +5341,128 @@ async fn a_reattach_after_a_reset_resumes_incrementally_when_the_epoch_survived(
         "a client matches a reset against the id it attached: {again:?}",
     );
 
+    fixture.shutdown().await;
+    bridge.stop();
+    host.stop().await;
+}
+
+/// A client folding a gateway stream keeps its cursor through
+/// `host_unreachable`, and the host's return costs it the suffix it missed
+/// rather than the whole history.
+///
+/// The real fold is what this measures: the gateway forwards the client's own
+/// cursor, so whether the resume is incremental is decided by what the client
+/// kept when it was told the host could not be reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_resumes_incrementally_after_its_host_was_unreachable() {
+    use aj_app::chat::ChatState;
+    use aj_app::client::{Refusal, SessionClient};
+
+    let mut host = Upstream::start().await;
+    let session = host.create().await;
+    let bridge = Bridge::to(&host).await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![bridge.address.clone()],
+    )
+    .await;
+    let id = host.namespaced(&session);
+    fixture.row(&id).await;
+    let before = host.durable_seq(&session).await;
+    fixture
+        .client
+        .command(&id, &prompt("first"))
+        .await
+        .expect("the prompt is accepted");
+    settled(&host, &session, before + 1).await;
+
+    let mut client = SessionClient::new(id.clone());
+    let mut chat = ChatState::new(fake_settings());
+    let mut fold = |client: &mut SessionClient, frames: Vec<Frame>| {
+        for frame in frames {
+            let _ = client.apply(&mut chat, frame);
+        }
+    };
+    let attach_with = |client: &mut SessionClient| {
+        client.attach_requested();
+        AttachRequest {
+            session: id.clone(),
+            cursor: client.cursor(),
+        }
+    };
+
+    let request = attach_with(&mut client);
+    let mut events = fixture.attach(&[request]).await;
+    fold(
+        &mut client,
+        frames_until(&mut events, "the first block", is_caught_up).await,
+    );
+    let kept = client.cursor().expect("the first block committed a cursor");
+
+    // The link goes, and the client's re-attach finds the host unreachable.
+    bridge.cut();
+    fold(
+        &mut client,
+        frames_until(&mut events, "the reset for the cut link", |frame| {
+            matches!(frame, Frame::Reset { .. })
+        })
+        .await,
+    );
+    assert!(client.needs_reattach());
+    fixture
+        .until("the host's row to read unreachable", |list| {
+            list.sessions
+                .iter()
+                .find(|row| row.id == id && row.unreachable)
+                .map(|_| ())
+        })
+        .await;
+    drop(events);
+    let request = attach_with(&mut client);
+    let mut events = fixture.attach(&[request]).await;
+    let answered = frames_until(&mut events, "the unreachable answer", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    fold(&mut client, answered);
+    assert_eq!(client.withheld(), Some(Refusal::Unreachable));
+    assert_eq!(
+        client.cursor(),
+        Some(kept.clone()),
+        "host_unreachable cost the client its cursor",
+    );
+
+    // The host runs on while the gateway cannot see it, then comes back.
+    host.prompt(&session, "second").await;
+    settled(&host, &session, kept.seq + 1).await;
+    let reached = host.durable_seq(&session).await;
+    bridge.heal();
+    fold(
+        &mut client,
+        frames_until(&mut events, "the reset for the host's return", |frame| {
+            matches!(frame, Frame::Reset { .. })
+        })
+        .await,
+    );
+    assert!(client.needs_reattach(), "the return asks the client again");
+
+    drop(events);
+    let request = attach_with(&mut client);
+    assert_eq!(request.cursor.as_ref(), Some(&kept));
+    let mut events = fixture.attach(&[request]).await;
+    let resumed = frames_until(&mut events, "the resumed block", is_caught_up).await;
+    assert_eq!(epoch_of(&resumed), kept.epoch, "{resumed:?}");
+    assert!(
+        durable_seqs(&resumed).iter().all(|seq| *seq > kept.seq),
+        "a full backfill rather than the suffix: {:?} against a cursor at {}",
+        durable_seqs(&resumed),
+        kept.seq,
+    );
+    assert_eq!(assistant_text(&resumed), vec!["done".to_string()]);
+    fold(&mut client, resumed);
+    assert_eq!(client.cursor().map(|cursor| cursor.seq), Some(reached));
+
+    drop(events);
     fixture.shutdown().await;
     bridge.stop();
     host.stop().await;
@@ -5783,8 +5861,8 @@ async fn a_withdrawal_stops_the_control_link_of_the_host_it_withdraws() {
 ///
 /// A host holding its attach response head must not cost the client its healthy
 /// sessions when that host is withdrawn. The held dial must end without waiting
-/// for its timeout or failing the whole stream, and the other host must serve
-/// its block whether its dial starts before or after the withdrawal.
+/// for its timeout or failing the whole stream, its session is sent the `reset`
+/// every withdrawal owes, and the other host serves its block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_interrupts_the_dial_of_the_host_it_withdraws() {
     // Never notified: this host takes the attach and never answers its head.
@@ -5836,10 +5914,12 @@ async fn a_withdrawal_interrupts_the_dial_of_the_host_it_withdraws() {
              out a dial to a host it had already forgotten: {err:?}"
         )
     });
+    // The two hosts are attended independently, so the staying host's block
+    // and the withdrawn host's reset arrive in either order.
     let carried = carried_until(
         &mut events,
-        "the block of the host that stayed",
-        |carried| !carried.caught_up.is_empty(),
+        "the staying host's block and the withdrawn host's reset",
+        |carried| !carried.caught_up.is_empty() && !carried.resets.is_empty(),
     )
     .await;
     assert_eq!(
@@ -5847,11 +5927,13 @@ async fn a_withdrawal_interrupts_the_dial_of_the_host_it_withdraws() {
         vec!["staying:s-9".to_string()],
         "the sessions of the host that stayed are served as usual: {carried:?}",
     );
-    assert!(
-        carried.resets.is_empty() && carried.events("leaving:s-1") == 0,
-        "and the withdrawn host contributes no upstream and no re-attach, the \
-         same as a host this gateway cannot reach: {carried:?}",
+    assert_eq!(
+        carried.resets,
+        vec!["leaving:s-1".to_string()],
+        "the withdrawn host's session is asked to re-attach, where it is refused \
+         as unknown: {carried:?}",
     );
+    assert_eq!(carried.events("leaving:s-1"), 0, "{carried:?}");
 
     drop(events);
     fixture.shutdown().await;
@@ -6494,45 +6576,70 @@ async fn a_slow_attach_does_not_lose_another_hosts_block() {
     slow.stop();
 }
 
-/// A host that takes a stream request and never answers it is a 503, not a hang:
-/// a client of a gateway must not be held open for as long as a host cares to
-/// stay silent.
+/// A host that takes a stream request and never answers it neither fails nor
+/// delays the rest of the stream: the response head comes at once, the other
+/// host's block arrives before the hung host's dial gives up, and the hung
+/// host's session is then answered `host_unreachable` on the same stream.
 ///
-/// This bounds the response *head* only. Once the stream is open, silence is the
-/// client's own business (two missed heartbeats).
+/// The hung host sorts first, so a gateway that dialed its hosts one after the
+/// other would hold the healthy block behind the whole dial budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_that_never_answers_an_attach_becomes_a_503() {
-    let fake = FakeHost::start("fake", Script::Mute).await;
+async fn a_hung_host_costs_only_its_own_sessions() {
+    let hung = FakeHost::start("aaa", Script::Mute).await;
+    let healthy = FakeHost::start("zzz", Script::Frames(block("s-9", "epoch-9", 0))).await;
+    let budget = Duration::from_secs(3);
     let fixture = Fixture::tuned(
         TempDir::new().expect("tempdir"),
-        vec![fake.address.clone()],
+        vec![hung.address.clone(), healthy.address.clone()],
         Tuning {
-            upstream_timeout: Duration::from_millis(300),
+            upstream_timeout: budget,
             ..tuning()
         },
     )
     .await;
-    fixture.until_connected("fake").await;
+    fixture.until_connected("aaa").await;
+    fixture.until_connected("zzz").await;
 
     let started = std::time::Instant::now();
-    let Err(err) = fixture.client.events(&[attach("fake:s-1")]).await else {
-        panic!("a host that answers nothing cannot serve an attach");
-    };
-
-    assert_eq!(
-        err.status(),
-        Some(StatusCode::SERVICE_UNAVAILABLE),
-        "got {err:?}",
-    );
-    assert_eq!(err.code(), Some("host_unreachable"));
-    let took = started.elapsed();
+    let mut events = fixture
+        .client
+        .events(&[attach("aaa:s-1"), attach("zzz:s-9")])
+        .await
+        .expect("the stream opens whatever one host does");
+    let head = started.elapsed();
     assert!(
-        took < Duration::from_secs(5),
-        "the splice waited {took:?} on a host it had bounded",
+        head < budget,
+        "the response head waited {head:?} on a host that never answers",
+    );
+
+    let frames = frames_until(&mut events, "the hung host's answer", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    let healthy_block = frames
+        .iter()
+        .position(|frame| matches!(frame, Frame::CaughtUp { session, .. } if session == "zzz:s-9"));
+    assert!(
+        healthy_block.is_some(),
+        "the healthy host's block waited for the hung host's dial: {frames:?}",
+    );
+    assert!(
+        matches!(
+            frames.last(),
+            Some(Frame::Error { session, code, .. })
+                if session == "aaa:s-1" && code == "host_unreachable"
+        ),
+        "{frames:?}",
+    );
+    let quiet = frames_within(&mut events, QUIET).await;
+    assert!(
+        resets(&quiet).is_empty(),
+        "the stream stays open and quiet: {quiet:?}",
     );
 
     fixture.shutdown().await;
-    fake.stop();
+    hung.stop();
+    healthy.stop();
 }
 
 /// A client that goes away releases the upstream streams opened for it, so a
@@ -6761,6 +6868,7 @@ fn state_frame(session: &str, epoch: &str) -> String {
     serde_json::to_string(&Frame::State {
         session: session.to_string(),
         epoch: epoch.to_string(),
+        opens_block: true,
         working: false,
         settings: fake_settings(),
         oracle_settings: None,
@@ -6845,10 +6953,6 @@ enum Script {
     },
     /// Not a stream at all: the host's own refusal of the attach.
     Refuse,
-    /// A refusal whose body the test writes, for the error shapes the protocol
-    /// admits and this build has no type for: an envelope carrying only a
-    /// `message`, fields a newer host adds to one.
-    RefuseRaw(&'static str),
     /// Nothing at all, not even a response head: the host took the request and
     /// went quiet.
     Mute,
@@ -7098,14 +7202,6 @@ impl FakeHost {
                                 )
                                     .into_response();
                             }
-                            if !control && let Script::RefuseRaw(body) = &script {
-                                return (
-                                    StatusCode::CONFLICT,
-                                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                                    *body,
-                                )
-                                    .into_response();
-                            }
                             if !control && matches!(script, Script::Mute) {
                                 std::future::pending::<()>().await;
                             }
@@ -7163,7 +7259,7 @@ impl FakeHost {
                                         },
                                         guard,
                                     ),
-                                    Script::Refuse | Script::RefuseRaw(_) | Script::Mute => {
+                                    Script::Refuse | Script::Mute => {
                                         unreachable!("answered above")
                                     }
                                     Script::Cued { first, cue, then } => (
