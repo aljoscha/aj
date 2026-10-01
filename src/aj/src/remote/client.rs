@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use aj_agent::tool::TaskId;
-use aj_app::host::{AttachRequest, CommandOutcome};
+use aj_app::host::{AttachRequest, CommandOutcome, ListFrames};
 use aj_wire::{
     AccountList, AccountRequest, ArchiveRequest, CancelRequest, CompactRequest,
     CreateSessionRequest, DecodedFrame, EnvRequest, Frame, HeadRequest, Hello, PROTOCOL_VERSION,
@@ -525,7 +525,16 @@ impl RemoteClient {
         &self,
         attach: &[AttachRequest],
     ) -> Result<RemoteEvents, RemoteError> {
-        let query: Vec<(&str, String)> = attach
+        self.events_with(attach, ListFrames::Included).await
+    }
+
+    /// [`Self::events`], choosing whether the stream carries `list` frames.
+    pub(crate) async fn events_with(
+        &self,
+        attach: &[AttachRequest],
+        list: ListFrames,
+    ) -> Result<RemoteEvents, RemoteError> {
+        let mut query: Vec<(&str, String)> = attach
             .iter()
             .map(|request| {
                 let value = match &request.cursor {
@@ -535,6 +544,9 @@ impl RemoteClient {
                 ("session", value)
             })
             .collect();
+        if list == ListFrames::Omitted {
+            query.push(("list", "none".to_string()));
+        }
         // The request-level timeout would cover the body too, and this body is
         // open for as long as the client is attached, so the head is bounded
         // here instead. An open that never answers is a peer this client has

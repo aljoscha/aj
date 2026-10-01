@@ -48,11 +48,11 @@ const DEADLINE: Duration = Duration::from_secs(20);
 /// coalesced, so a test can tell "nothing more is coming" from "not yet".
 const LIST_SETTLE: Duration = Duration::from_millis(600);
 
-/// The host's `list` coalescing window, which is private to the host.
+/// The `list` coalescing window every host in this file is built with.
 ///
-/// Only used to turn a measured burst duration into how many frames that
-/// burst is allowed to produce, so a host that lengthens its window still
-/// passes and one that shortens it has to move this too.
+/// Shorter than the production default so that waiting out a window stays
+/// cheap. Also used to turn a measured burst duration into how many frames
+/// that burst is allowed to produce.
 const LIST_WINDOW: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
@@ -198,6 +198,7 @@ impl Harness {
             name: None,
             idle_grace,
             live_capacity,
+            list_coalesce: Some(LIST_WINDOW),
         })
         .expect("host");
         Self {
@@ -257,6 +258,7 @@ impl Harness {
             name: None,
             idle_grace,
             live_capacity: None,
+            list_coalesce: Some(LIST_WINDOW),
         })
         .expect("host");
         Harness {
@@ -2471,6 +2473,7 @@ async fn the_host_id_is_claimed_not_written_over() {
         name: None,
         idle_grace: None,
         live_capacity: None,
+        list_coalesce: Some(LIST_WINDOW),
     })
     .err()
     .expect("a blank host id is refused");
@@ -2518,6 +2521,7 @@ async fn a_host_reports_the_name_it_was_given_or_derives_one() {
             name: name.map(str::to_string),
             idle_grace: None,
             live_capacity: None,
+            list_coalesce: Some(LIST_WINDOW),
         })
         .expect("a host over the claimed store")
     };
@@ -8945,6 +8949,80 @@ async fn list_frames_carry_the_directory_and_not_one_per_event() {
     harness.host.shutdown().await;
 }
 
+/// A streaming reply between durable appends leaves every row field where it
+/// was, so its deltas do not wake the list publisher at all, let alone send a
+/// frame.
+#[tokio::test]
+async fn streaming_deltas_alone_do_not_wake_the_list_publisher() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message(
+            &"streamed one character at a time ".repeat(3),
+        )],
+        1,
+        Duration::from_millis(15),
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    harness.prompt(&session, "hi").await;
+    frames_until(&mut stream, "the reply to start streaming", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::MessageUpdate { .. }))
+        )
+    })
+    .await;
+    // Whatever the prompt's own durable appends and the busy flip marked has
+    // been composed by the end of one window.
+    let settle = Instant::now() + LIST_SETTLE;
+    while let Ok(Some(_)) = tokio::time::timeout_at(settle.into(), stream.recv()).await {}
+    let before = harness.host.list_builds();
+    let window = Instant::now() + LIST_WINDOW * 2;
+    let mut measured = Vec::new();
+    while let Ok(Some(frame)) = tokio::time::timeout_at(window.into(), stream.recv()).await {
+        measured.push(frame);
+    }
+    let after = harness.host.list_builds();
+
+    let updates = events(&measured)
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::MessageUpdate { .. }))
+        .count();
+    let durable = measured.iter().any(|frame| {
+        matches!(
+            frame,
+            Frame::Event {
+                durability: Some(_),
+                ..
+            }
+        )
+    });
+    assert!(
+        updates >= 5 && !durable,
+        "the measured window must hold streaming deltas and no durable event, \
+         or it measures nothing: {updates} updates, durable {durable}",
+    );
+    assert_eq!(
+        after - before,
+        0,
+        "{updates} streaming deltas woke the list publisher",
+    );
+    until_idle(&mut stream).await;
+    harness.host.shutdown().await;
+}
+
 /// How many labels [`distinct_directories_inside_one_window_reach_a_client_as_one_frame`]
 /// sets, one directory change each.
 ///
@@ -12779,6 +12857,7 @@ async fn branch_restore_harness() -> (Harness, String, String, String) {
         name: None,
         idle_grace: None,
         live_capacity: None,
+        list_coalesce: Some(LIST_WINDOW),
     })
     .unwrap();
     host.local_handles(&session).await.unwrap();

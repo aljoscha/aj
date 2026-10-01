@@ -1412,6 +1412,7 @@ pub fn compose_host(
         name,
         idle_grace,
         live_capacity: None,
+        list_coalesce: None,
     })?;
     Ok(ComposedHost {
         host,

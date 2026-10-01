@@ -1026,6 +1026,7 @@ async fn retained_oracle_settings_use_child_identity_and_preserve_its_speed_on_t
             name: None,
             idle_grace: None,
             live_capacity: None,
+            list_coalesce: None,
         })
         .unwrap();
         let session = host.create().await.unwrap();

@@ -329,7 +329,10 @@ an optional cursor: `GET /v1/events?session=<id>[@<epoch>:<seq>]`
 (repeatable). The cursor is split off at the first `@`, so session ids
 never contain one, and the cursor splits at its last `:`, so an epoch
 may contain a colon. Attaching nothing is legal: that stream carries
-`list` frames and heartbeats only.
+`list` frames and heartbeats only. A host also takes `list=none`, which
+opens a stream that is never sent a `list` frame, for a consumer that
+gets its directory elsewhere (section 6.1). Any other `list` value is
+400 `invalid_request`.
 
 A stream request never fails wholesale over one bad session: each named
 session either gets its attach block or a session-scoped `error` frame
@@ -736,7 +739,8 @@ side's limitation. Neither side's values fall back to the other's.
   their state.
 
   Both are finite SSE reads. Named `snapshot` events carry complete
-  replacement `PromptHistory` values, coalesced as files finish scanning.
+  replacement `PromptHistory` values, coalesced as files finish scanning:
+  the first file's at once, later ones at most about ten times a second.
   A terminal `complete` event carries the final value, even when empty or
   unchanged. A terminal `error` event carries `{code, message}` and leaves
   earlier results available. EOF without either terminal event is a failed
@@ -813,10 +817,14 @@ entire unseen window fell inside a disconnect and went cold before
 reconnect shows no glyph until opened, and a never-viewed session reads
 as having nothing unseen.
 
-`list` frames are lossy (section 5.4) and debounced on a short tick, so
-`last_seq` churn never produces a frame per event. A snapshot a
-subscriber has already accepted (queued or delivered) is not sent to it
-again.
+`list` frames are lossy (section 5.4) and debounced on a one-second
+tick, so `last_seq` churn never produces a frame per event. A host
+recomposes the directory only when something a row shows may have
+changed, which transient events such as streaming deltas never do. A
+row, and with it a sidebar's working flag and unseen glyph, may trail
+the host by up to a second, while an attached session's `state` frames
+travel at once. A snapshot a subscriber has
+already accepted (queued or delivered) is not sent to it again.
 
 ### 5.9 Flow control
 
@@ -978,6 +986,7 @@ The gateway keeps one **control connection** per enrolled host (its
 directory from it: namespaced ids, merged `list` frames, `unreachable`
 marking. Client event streams are **spliced**: for each attached session
 the gateway opens the upstream stream with the client's own cursor and
+`list=none`, since its directory comes from the control connection, and
 forwards frames with ids rewritten. It holds no session logs and no
 cursors of its own. Commands and reads are proxied to the owning host
 with method, query, and body carried unread. A proxied request to an

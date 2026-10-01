@@ -192,6 +192,7 @@ impl Store {
             name: None,
             idle_grace: None,
             live_capacity: None,
+            list_coalesce: None,
         })
         .unwrap()
     }

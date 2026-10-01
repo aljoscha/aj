@@ -42,7 +42,7 @@ mod store;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -86,12 +86,16 @@ pub use fanout::Attachment;
 use fanout::Fanout;
 
 /// How long the list publisher coalesces directory changes before emitting
-/// a frame.
+/// a frame, unless [`HostSetup::list_coalesce`] says otherwise.
 ///
-/// `last_seq` churns on every durable event of a busy turn, and one `list`
-/// frame per event would swamp every client's queue for data that is
-/// cumulative anyway.
-const LIST_COALESCE: Duration = Duration::from_millis(200);
+/// `last_seq` churns on every durable event of a busy turn, and every frame
+/// carries the whole directory to every subscriber, so a busy host pays for
+/// each tick in proportion to its store. The cost of a longer tick is lag in
+/// what only a row shows: a sidebar's working flag and unseen glyph, and a
+/// fresh subscriber's first directory, may trail the host by up to this much.
+/// An attached session is unaffected, since its `state` frames travel at
+/// once.
+pub const DEFAULT_LIST_COALESCE: Duration = Duration::from_secs(1);
 
 /// How long a session stays live with nothing running and nobody attached
 /// before the host releases it.
@@ -318,6 +322,12 @@ pub struct HostSetup {
     /// Tuning, not policy: the bound governs live fan-out only, and eviction
     /// and its recovery behave the same at any value.
     pub live_capacity: Option<NonZeroUsize>,
+    /// How long the list publisher coalesces directory changes, `None` for
+    /// [`DEFAULT_LIST_COALESCE`].
+    ///
+    /// Tuning, not policy: frames carry the whole directory, so a shorter tick
+    /// only spends more of them on the same answer.
+    pub list_coalesce: Option<Duration>,
 }
 
 /// The name a host reports when nothing named it: its working directory,
@@ -502,6 +512,17 @@ pub struct AttachRequest {
     pub cursor: Option<Cursor>,
 }
 
+/// Whether a stream carries the host's `list` frames.
+///
+/// A stream that composes its directory elsewhere, a gateway's spliced
+/// upstream, has no use for them, and every frame carries the whole directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListFrames {
+    Included,
+    /// The stream is never offered a `list` frame.
+    Omitted,
+}
+
 /// What one attached stream owes one of the sessions it named: the block it
 /// asked for, or the refusal it gets instead.
 ///
@@ -627,6 +648,10 @@ struct HostInner {
     /// store's contents.
     cold: ColdSessions<ConversationPersistence>,
     idle_grace: Duration,
+    list_coalesce: Duration,
+    /// How many directories the list publisher has composed, see
+    /// [`SessionHost::list_builds`].
+    list_builds: AtomicU64,
     /// Set by [`SessionHost::shutdown`], and never cleared: a host is torn
     /// down once. Every operation refuses afterwards (see
     /// [`SessionHost::alive`]).
@@ -692,6 +717,7 @@ impl SessionHost {
             name,
             idle_grace,
             live_capacity,
+            list_coalesce,
         } = setup;
         let host_id = resolve_host_id(persistence.sessions_dir())?;
         // A startup fact like the id. Derived per hello instead, it could
@@ -721,6 +747,8 @@ impl SessionHost {
             sessions: TokioMutex::new(HashMap::new()),
             clock_anchor: (Utc::now(), Instant::now()),
             idle_grace: idle_grace.unwrap_or(DEFAULT_IDLE_GRACE),
+            list_coalesce: list_coalesce.unwrap_or(DEFAULT_LIST_COALESCE),
+            list_builds: AtomicU64::new(0),
             shut_down: AtomicBool::new(false),
             shutdown: StdMutex::new(ShutdownState::default()),
             shutdown_changed: tokio::sync::Notify::new(),
@@ -1006,6 +1034,15 @@ impl SessionHost {
     /// what is wrong with the request rather than with a session: a session
     /// named twice, and a host that is shut down.
     pub async fn attach(&self, requests: &[AttachRequest]) -> Result<Attachment, HostError> {
+        self.attach_with(requests, ListFrames::Included).await
+    }
+
+    /// [`Self::attach`], choosing whether the stream carries `list` frames.
+    pub async fn attach_with(
+        &self,
+        requests: &[AttachRequest],
+        list: ListFrames,
+    ) -> Result<Attachment, HostError> {
         self.alive()?;
         // One block per named session is the client contract, and
         // a duplicate would be served two: the second would open a block
@@ -1026,7 +1063,7 @@ impl SessionHost {
         // an attach in flight as use from the first instant.
         // Materializing first would leave a window where an idle session could
         // be released out from under a block about to be served from it.
-        let (id, live_frames, cancelled) = self.inner.shared.fanout.register(&names);
+        let (id, live_frames, cancelled) = self.inner.shared.fanout.register(&names, list);
         let stopped = live_frames.block_stop_token();
         // Resolved up front, so that returning means every block this stream
         // owes can be written.
@@ -1210,6 +1247,15 @@ impl SessionHost {
             sessions,
             hosts: Vec::new(),
         }
+    }
+
+    /// How many times the list publisher has woken to compose the directory.
+    ///
+    /// An unchanged directory publishes no frame, so frames cannot show a
+    /// wake that was spent on nothing. This can.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn list_builds(&self) -> u64 {
+        self.inner.list_builds.load(Ordering::Relaxed)
     }
 
     /// How many times the host has read its session store's directory.
@@ -2930,10 +2976,11 @@ fn spawn_lock_probe(inner: &Arc<HostInner>) {
 fn spawn_list_publisher(inner: &Arc<HostInner>) {
     let weak = Arc::downgrade(inner);
     let fanout = Arc::clone(&inner.shared.fanout);
+    let coalesce = inner.list_coalesce;
     tokio::spawn(async move {
         loop {
             fanout.list_dirty().notified().await;
-            tokio::time::sleep(LIST_COALESCE).await;
+            tokio::time::sleep(coalesce).await;
             let Some(inner) = weak.upgrade() else { return };
             let host = SessionHost { inner };
             // A shut-down host has drained its session map, so a directory
@@ -2944,6 +2991,7 @@ fn spawn_list_publisher(inner: &Arc<HostInner>) {
             if host.alive().is_err() {
                 return;
             }
+            host.inner.list_builds.fetch_add(1, Ordering::Relaxed);
             fanout.publish_list(host.directory().await.sessions);
         }
     });

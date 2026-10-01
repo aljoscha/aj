@@ -221,7 +221,10 @@ async fn one_sigterm_closes_an_attached_stream_without_spending_the_server_grace
         stream.status().is_success(),
         "the fixture has a live stream for server shutdown to join"
     );
-    let first = tokio::time::timeout(Duration::from_secs(1), stream.chunk())
+    // The first frame is the directory, published on the host's next list
+    // tick after the attach.
+    let opens_within = aj_app::host::DEFAULT_LIST_COALESCE.saturating_add(Duration::from_secs(1));
+    let first = tokio::time::timeout(opens_within, stream.chunk())
         .await
         .expect("the event stream begins")
         .expect("read the first event chunk")

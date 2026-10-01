@@ -256,12 +256,12 @@ impl Driver {
             _ => None,
         };
         self.apply_lifecycle(&event);
+        // Both calls mark the list dirty for what they change on the row.
         self.publish_event(
             entry.map(|entry| super::durable_event(entry, branch_settings)),
             event,
         );
         self.refresh_state();
-        self.shared.fanout.mark_list_dirty();
         if !self.session.is_draining()
             && let Some((owner, conditional)) = trigger
             && (!conditional
@@ -445,6 +445,7 @@ impl Driver {
                 entry.seq,
             );
         }
+        let durable = entry.is_some();
         let (epoch, durability) = {
             let mut status = self.session.status();
             if let Some(entry) = &entry {
@@ -463,18 +464,31 @@ impl Driver {
             durability,
             event: event.into(),
         });
+        // A durable event moves the row's `last_seq` and `last_activity`. A
+        // transient one, every streaming delta included, moves no row field,
+        // so it does not wake the list publisher to rebuild an unchanged
+        // directory. `working` is marked where it changes, in
+        // `refresh_state`, and the remaining fields by their own commands.
+        if durable {
+            self.shared.fanout.mark_list_dirty();
+        }
     }
 
-    /// Publish a `state` frame when `working` changed, which is the flag a
-    /// client seeds its spinner from and the one that self-heals an
-    /// `AgentEnd` it missed.
+    /// Publish a `state` frame and mark the list dirty when `working` changed,
+    /// which is the flag a client seeds its spinner from and the one that
+    /// self-heals an `AgentEnd` it missed.
     fn refresh_state(&self) {
         let working = self.turns.is_busy(&self.lifecycle, AgentId::Main);
+        let mut changed = false;
         self.session.publish_state(&self.shared.fanout, |status| {
-            let changed = status.working != working;
+            changed = status.working != working;
             status.working = working;
             changed
         });
+        // The flag is a row field too, and a wake flips it without an event.
+        if changed {
+            self.shared.fanout.mark_list_dirty();
+        }
     }
 
     fn publish_state(&self) {
@@ -1095,6 +1109,7 @@ impl Driver {
                     status.last_seq = status.last_seq.max(entry.seq);
                     status.note_activity();
                 }
+                self.shared.fanout.mark_list_dirty();
                 self.publish_event(
                     None,
                     AgentEvent::Notice {

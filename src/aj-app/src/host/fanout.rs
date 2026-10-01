@@ -18,6 +18,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio_util::sync::CancellationToken;
 
+use super::ListFrames;
 use crate::outbound::{self, Offered};
 
 /// Enough burst room for normal clients while bounding a stalled stream.
@@ -51,10 +52,20 @@ struct Subscriber {
     /// graceful shutdown so a completed block can still drain live frames.
     block_stop: CancellationToken,
     attached: HashMap<String, AttachState>,
-    /// Whether this subscriber's queue accepted the fan-out's latest directory.
-    /// A fresh subscriber and one whose full queue dropped the frame stay false,
-    /// so the next refresh offers the current snapshot to them.
-    list_current: bool,
+    list: ListState,
+}
+
+/// Where one subscriber stands with the fan-out's latest directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListState {
+    /// The subscriber asked for no `list` frames, and is never offered one.
+    Unwanted,
+    /// Its queue has not accepted the latest directory. A fresh subscriber and
+    /// one whose full queue dropped the frame are here, so the next refresh
+    /// offers the current snapshot to them.
+    Stale,
+    /// Its queue accepted the latest directory.
+    Current,
 }
 
 impl Subscriber {
@@ -167,9 +178,12 @@ impl Fanout {
     /// makes an attach atomic with respect to the session's event flow:
     /// every frame published from here on is either queued behind the block or
     /// filtered against its boundary, so none can be missed.
+    ///
+    /// `list` says whether the subscriber is offered `list` frames at all.
     pub(crate) fn register(
         &self,
         sessions: &[String],
+        list: ListFrames,
     ) -> (SubscriberId, LiveReceiver, CancellationToken) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancelled = CancellationToken::new();
@@ -194,7 +208,10 @@ impl Fanout {
                     live,
                     block_stop,
                     attached,
-                    list_current: false,
+                    list: match list {
+                        ListFrames::Included => ListState::Stale,
+                        ListFrames::Omitted => ListState::Unwanted,
+                    },
                 },
             );
         }
@@ -260,13 +277,15 @@ impl Fanout {
         if state.current_list.as_deref() != Some(&sessions) {
             state.current_list = Some(sessions);
             for subscriber in state.subscribers.values_mut() {
-                subscriber.list_current = false;
+                if subscriber.list == ListState::Current {
+                    subscriber.list = ListState::Stale;
+                }
             }
         }
-        if state
+        if !state
             .subscribers
             .values()
-            .all(|subscriber| subscriber.list_current)
+            .any(|subscriber| subscriber.list == ListState::Stale)
         {
             return;
         }
@@ -280,12 +299,12 @@ impl Fanout {
             hosts: Vec::new(),
         };
         state.subscribers.retain(|_, subscriber| {
-            if subscriber.list_current {
+            if subscriber.list != ListState::Stale {
                 return true;
             }
             match subscriber.deliver(&frame) {
                 Offered::Queued => {
-                    subscriber.list_current = true;
+                    subscriber.list = ListState::Current;
                     true
                 }
                 // The next refresh retries the current directory only for this
@@ -617,7 +636,8 @@ mod tests {
     #[test]
     fn an_attach_transition_filters_the_bounded_live_queue() {
         let fanout = Fanout::default();
-        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
 
         fanout.publish(durable(3));
         fanout.publish(reliable("held"));
@@ -638,7 +658,8 @@ mod tests {
     #[test]
     fn a_live_stream_filters_durable_frames_at_or_below_its_boundary() {
         let fanout = Fanout::default();
-        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.finish_block(id, SESSION, 5);
 
         fanout.publish(durable(4));
@@ -670,7 +691,8 @@ mod tests {
     #[test]
     fn an_unchanged_directory_is_not_offered_twice() {
         let fanout = Fanout::default();
-        let (_id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (_id, mut rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
 
         fanout.publish_list(directory(1));
         fanout.publish_list(directory(1));
@@ -687,7 +709,7 @@ mod tests {
     #[test]
     fn a_dropped_directory_is_offered_again() {
         let fanout = Fanout::new(NonZeroUsize::new(2));
-        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.finish_block(id, SESSION, 0);
 
         // The client is not reading, so its queue fills with frames that may
@@ -726,7 +748,8 @@ mod tests {
     #[test]
     fn a_restore_is_compared_against_the_latest_accepted_directory() {
         let fanout = Fanout::default();
-        let (_id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (_id, mut rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
 
         let free = directory(1);
         let held = directory(2);
@@ -759,11 +782,13 @@ mod tests {
     #[test]
     fn a_fresh_subscriber_is_offered_a_directory_the_others_have() {
         let fanout = Fanout::default();
-        let (_settled, mut settled_rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (_settled, mut settled_rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.publish_list(directory(1));
         assert_eq!(drained(&mut settled_rx), vec!["list"]);
 
-        let (_fresh, mut fresh_rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (_fresh, mut fresh_rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.publish_list(directory(1));
         assert_eq!(
             drained(&mut fresh_rx),
@@ -782,7 +807,7 @@ mod tests {
     #[test]
     fn an_unattached_session_produces_nothing_but_the_list() {
         let fanout = Fanout::default();
-        let (_id, mut rx, _cancelled) = fanout.register(&[]);
+        let (_id, mut rx, _cancelled) = fanout.register(&[], ListFrames::Included);
 
         fanout.publish(durable(1));
         fanout.publish(reliable("dropped"));
@@ -805,7 +830,10 @@ mod tests {
     #[test]
     fn one_stream_gates_each_attached_session_separately() {
         let fanout = Fanout::default();
-        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        let (id, mut rx, _cancelled) = fanout.register(
+            &[SESSION.to_string(), OTHER.to_string()],
+            ListFrames::Included,
+        );
 
         // Two live sessions with different boundaries, which is the case a
         // shared one gets wrong.
@@ -855,7 +883,10 @@ mod tests {
     #[test]
     fn a_detached_session_leaves_nothing_of_itself_on_the_stream() {
         let fanout = Fanout::default();
-        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        let (id, mut rx, _cancelled) = fanout.register(
+            &[SESSION.to_string(), OTHER.to_string()],
+            ListFrames::Included,
+        );
         fanout.finish_block(id, SESSION, 0);
         fanout.finish_block(id, OTHER, 0);
         // Live before the attach that named it got as far as refusing it.
@@ -886,10 +917,13 @@ mod tests {
     #[test]
     fn detaching_a_session_everywhere_keeps_what_was_queued_and_admits_nothing_later() {
         let fanout = Fanout::default();
-        let (live, mut live_rx, _c1) = fanout.register(&[SESSION.to_string()]);
+        let (live, mut live_rx, _c1) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.finish_block(live, SESSION, 0);
-        let (attaching, mut attaching_rx, _c2) =
-            fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        let (attaching, mut attaching_rx, _c2) = fanout.register(
+            &[SESSION.to_string(), OTHER.to_string()],
+            ListFrames::Included,
+        );
         fanout.finish_block(attaching, OTHER, 0);
         fanout.publish(refusal("persistence_failed"));
 
@@ -918,7 +952,8 @@ mod tests {
     #[test]
     fn a_refusal_is_neither_dropped_during_an_attach_nor_at_the_bound() {
         let fanout = Fanout::default();
-        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.publish(refusal("unknown_session"));
 
         fanout.finish_block(id, SESSION, 0);
@@ -930,7 +965,7 @@ mod tests {
         );
 
         let fanout = Fanout::new(NonZeroUsize::new(2));
-        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.finish_block(id, SESSION, 0);
         fanout.publish(reliable("one"));
         fanout.publish(reliable("two"));
@@ -948,7 +983,8 @@ mod tests {
     #[test]
     fn a_reset_during_an_attach_is_delivered_behind_the_block() {
         let fanout = Fanout::default();
-        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.publish(reliable("held"));
         fanout.publish(Frame::Reset {
             session: SESSION.to_string(),
@@ -964,7 +1000,8 @@ mod tests {
     #[test]
     fn lossy_replacement_moves_to_the_queue_tail() {
         let fanout = Fanout::new(NonZeroUsize::new(3));
-        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.finish_block(id, SESSION, 0);
 
         fanout.publish(reliable("before"));
@@ -983,7 +1020,7 @@ mod tests {
     #[test]
     fn live_overflow_drops_lossy_and_evicts_on_reliable() {
         let fanout = Fanout::new(NonZeroUsize::new(2));
-        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()], ListFrames::Included);
         let block_stop = rx.block_stop_token();
         fanout.finish_block(id, SESSION, 0);
         fanout.publish(reliable("one"));
@@ -1012,7 +1049,7 @@ mod tests {
     #[test]
     fn attachment_is_producer_paced_and_reads_the_block_before_live() {
         let fanout = Arc::new(Fanout::default());
-        let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, live, cancelled) = fanout.register(&[SESSION.to_string()], ListFrames::Included);
         let (mut attachment, block_tx, block_complete) =
             Attachment::new(id, live, cancelled, Arc::clone(&fanout));
         block_tx.try_send(lossy(1)).expect("first block frame");
@@ -1044,7 +1081,8 @@ mod tests {
     #[tokio::test]
     async fn a_parked_stream_is_woken_by_a_frame_and_ended_by_a_close() {
         let fanout = Arc::new(Fanout::default());
-        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
         fanout.finish_block(id, SESSION, 0);
 
         // Published from another task, after this one has parked on `recv`: the
@@ -1085,7 +1123,8 @@ mod tests {
         let fanout = Fanout::default();
         fanout.close();
 
-        let (_id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (_id, mut rx, _cancelled) =
+            fanout.register(&[SESSION.to_string()], ListFrames::Included);
 
         assert!(
             fanout.lock().subscribers.is_empty(),
@@ -1102,7 +1141,7 @@ mod tests {
     #[test]
     fn dropping_an_attachment_deregisters_it() {
         let fanout = Arc::new(Fanout::default());
-        let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (id, live, cancelled) = fanout.register(&[SESSION.to_string()], ListFrames::Included);
         let block_stop = live.block_stop_token();
         let (attachment, _block_tx, _block_complete) =
             Attachment::new(id, live, cancelled, Arc::clone(&fanout));

@@ -19,7 +19,7 @@ use aj_agent::events::AgentId;
 use aj_agent::tool::TaskId;
 use aj_app::host::{
     AttachRequest, Attachment, Command, CommandOutcome, CreateError, HeadTarget, HostError,
-    QueueOp, SessionHost, SettingsAxis, SettingsChange,
+    ListFrames, QueueOp, SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::thinking_display_from_name;
 use aj_conf::ConfigVerbosity;
@@ -751,7 +751,10 @@ async fn events(
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, aj_agent::BoxError>>>, ApiError> {
     let requests = attach_requests(&params)?;
-    let attachment = state.host.attach(&requests).await?;
+    let attachment = state
+        .host
+        .attach_with(&requests, list_frames(&params)?)
+        .await?;
     Ok(Sse::new(frame_stream(attachment, state.heartbeat)))
 }
 
@@ -823,6 +826,27 @@ fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, Ap
         });
     }
     Ok(requests)
+}
+
+/// Whether the stream asked to go without `list` frames, with `list=none`.
+///
+/// A value other than `none` is refused rather than ignored: a client that
+/// spelled the opt-out wrong would otherwise be sent every directory it meant
+/// to decline, and nothing on the stream would tell it so.
+fn list_frames(params: &[(String, String)]) -> Result<ListFrames, ApiError> {
+    let mut list = ListFrames::Included;
+    for (key, value) in params {
+        if key != "list" {
+            continue;
+        }
+        if value != "none" {
+            return Err(ApiError::invalid(format!(
+                "list={value:?}: the only value is \"none\""
+            )));
+        }
+        list = ListFrames::Omitted;
+    }
+    Ok(list)
 }
 
 /// One SSE `data:` line per frame, with a heartbeat frame whenever the

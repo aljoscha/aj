@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_models::types::{Message, UserContent};
@@ -56,9 +57,21 @@ pub fn retain_recent(prompts: &mut Vec<RecordedPrompt>, max: usize) {
     prompts.truncate(max);
 }
 
+/// How often [`recent_history_streaming`] emits a provisional snapshot.
+///
+/// Each one is the whole history so far, up to `max` prompts, and a store
+/// holds thousands of small logs, so one per file would cost the consumer far
+/// more than its readers can see. Readers already paint at about this rate.
+const EMIT_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Scan every file, emitting provisional newest-first snapshots capped at `max`.
 /// A file's name or traversal position cannot exclude a newer prompt in another
 /// file. Cancellation is cooperative, including within large logs.
+///
+/// The first file's snapshot is emitted at once and later ones at most every
+/// [`EMIT_INTERVAL`]. A scan that is not cancelled ends on the snapshot of
+/// everything it read, also when it fails partway. A cancelled one emits
+/// nothing further.
 pub fn recent_history_streaming(
     dir: &Path,
     all: bool,
@@ -69,6 +82,58 @@ pub fn recent_history_streaming(
     if max == 0 || cancel() {
         return Ok(());
     }
+    let mut recent = Vec::new();
+    let mut paced = Paced {
+        emit,
+        last: None,
+        pending: false,
+    };
+    let scanned = scan_recent(dir, all, max, cancel, &mut recent, &mut paced);
+    if !cancel() {
+        paced.flush(&recent);
+    }
+    scanned
+}
+
+/// An emitter that holds back snapshots offered within [`EMIT_INTERVAL`] of
+/// the last one it passed on.
+struct Paced<'a> {
+    emit: &'a mut dyn FnMut(Vec<RecordedPrompt>),
+    last: Option<Instant>,
+    /// Whether a snapshot was held back since the last emit.
+    pending: bool,
+}
+
+impl Paced<'_> {
+    fn offer(&mut self, recent: &[RecordedPrompt]) {
+        if self.last.is_some_and(|last| last.elapsed() < EMIT_INTERVAL) {
+            self.pending = true;
+            return;
+        }
+        self.send(recent);
+    }
+
+    fn flush(&mut self, recent: &[RecordedPrompt]) {
+        if self.pending {
+            self.send(recent);
+        }
+    }
+
+    fn send(&mut self, recent: &[RecordedPrompt]) {
+        self.pending = false;
+        self.last = Some(Instant::now());
+        (self.emit)(recent.to_vec());
+    }
+}
+
+fn scan_recent(
+    dir: &Path,
+    all: bool,
+    max: usize,
+    cancel: &dyn Fn() -> bool,
+    recent: &mut Vec<RecordedPrompt>,
+    paced: &mut Paced<'_>,
+) -> std::io::Result<()> {
     let mut dirs = if all {
         std::fs::read_dir(dir)?
             .filter_map(Result::ok)
@@ -79,7 +144,6 @@ pub fn recent_history_streaming(
         vec![dir.to_path_buf()]
     };
     dirs.sort();
-    let mut recent: Vec<RecordedPrompt> = Vec::new();
     for dir in dirs {
         if cancel() {
             return Ok(());
@@ -108,8 +172,8 @@ pub fn recent_history_streaming(
                 prompt.entry.project = project.clone();
             }
             recent.extend(prompts.into_iter().rev());
-            retain_recent(&mut recent, max);
-            emit(recent.clone());
+            retain_recent(recent, max);
+            paced.offer(recent);
         }
     }
     Ok(())
@@ -505,6 +569,38 @@ mod tests {
         .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0][0].entry.text, "first");
+    }
+
+    /// A store of many logs costs its consumer a handful of snapshots rather
+    /// than one per file: the first at once, the last complete.
+    #[test]
+    fn recent_history_paces_snapshots_and_ends_complete() {
+        const FILES: usize = 64;
+        let dir = scratch_dir("ranked-paced");
+        for index in 0..FILES {
+            let text = format!("prompt {index}");
+            write_jsonl(dir.path(), &format!("{index:03}"), &[user_line(&text, "1")]);
+        }
+        let mut batches: Vec<Vec<RecordedPrompt>> = Vec::new();
+        recent_history_streaming(dir.path(), false, 2000, &|| false, &mut |p| batches.push(p))
+            .unwrap();
+        // Scanning this store takes a few milliseconds. The bound leaves room
+        // for a machine a hundred times slower.
+        assert!(
+            batches.len() < FILES / 4,
+            "{} snapshots for {FILES} files: the scan emits per file",
+            batches.len(),
+        );
+        assert_eq!(
+            batches.first().map(Vec::len),
+            Some(1),
+            "the first file's snapshot is not held back",
+        );
+        assert_eq!(
+            batches.last().map(Vec::len),
+            Some(FILES),
+            "the final snapshot holds every file's prompt",
+        );
     }
 
     #[test]

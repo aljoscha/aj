@@ -72,9 +72,15 @@ const DEADLINE: Duration = Duration::from_secs(20);
 
 /// How long a settled stream has to prove it is not settled after all.
 ///
-/// Longer than the host's own coalescing ticks (the `list` publisher's is
-/// 200ms), short enough that a comparison at quiescence stays cheap.
-const QUIET: Duration = Duration::from_millis(300);
+/// Longer than the host's own coalescing ticks (the `list` publisher's,
+/// [`LIST_COALESCE`] on every host these tests build, is the longest), short
+/// enough that a comparison at quiescence stays cheap.
+const QUIET: Duration = LIST_COALESCE.saturating_add(Duration::from_millis(100));
+
+/// The `list` coalescing tick of every host [`host_setup`] builds. Shorter
+/// than the production default, which would put a second into every wait for
+/// a quiet stream.
+const LIST_COALESCE: Duration = Duration::from_millis(200);
 
 /// Await `future`, failing the test rather than hanging.
 pub(crate) async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
@@ -600,6 +606,7 @@ pub(crate) fn host_setup(
         name: name.map(str::to_string),
         idle_grace: None,
         live_capacity: None,
+        list_coalesce: Some(LIST_COALESCE),
     }
 }
 
@@ -1724,6 +1731,20 @@ async fn a_model_change_resolves_against_the_host_catalog() {
             matches!(frame, Frame::State { settings, .. } if settings.model_id == "gpt-catalog")
         })
         .await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_value_the_host_does_not_know_is_refused() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let response = reqwest::get(format!("{}/v1/events?list=all", fixture.server.url()))
+        .await
+        .expect("the stream request");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a misspelt opt-out would otherwise be served every directory",
+    );
     fixture.shutdown().await;
 }
 

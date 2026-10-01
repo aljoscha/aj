@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aj_app::client::HOST_UNREACHABLE_CODE;
-use aj_app::host::AttachRequest;
+use aj_app::host::{AttachRequest, ListFrames};
 use aj_app::outbound::{self, Offered, Sender};
 use aj_wire::{DecodedFrame, Frame, MergedDirectory};
 use tokio::sync::watch;
@@ -336,7 +336,9 @@ async fn dial(
 ) -> Result<RemoteEvents, RemoteError> {
     RemoteClient::new(address.url())?
         .with_open_timeout(answer_within)
-        .events(attach)
+        // The merged directory comes from the control link, so this stream
+        // has no use for the host's own.
+        .events_with(attach, ListFrames::Omitted)
         .await
 }
 
@@ -388,9 +390,11 @@ async fn forward(
     let Some(session) = session else {
         // Host-scoped. The merged `list` is this gateway's own composition from
         // its control links, so a host's own would put ids no client
-        // here can address on the stream, and a heartbeat belongs to the
-        // connection it was written on rather than to what rides it. Everything
-        // else travels, an unknown kind that names no session included.
+        // here can address on the stream. [`dial`] asks for none, and one
+        // that arrives anyway is still not forwarded. A heartbeat belongs to
+        // the connection it was written on rather than to what rides it.
+        // Everything else travels, an unknown kind that names no session
+        // included.
         if matches!(
             &frame,
             DecodedFrame::Known(known)

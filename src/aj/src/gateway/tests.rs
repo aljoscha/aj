@@ -328,6 +328,114 @@ impl Bridge {
     }
 }
 
+/// A loopback relay in front of a host that keeps every byte each connection
+/// carried, both ways.
+///
+/// What a host writes on a stream the gateway consumes is invisible from the
+/// gateway's client, which only sees what the gateway forwards. This sees it.
+struct Tap {
+    address: HostAddress,
+    connections: Arc<StdMutex<Vec<Arc<StdMutex<Tapped>>>>>,
+    accepting: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct Tapped {
+    request: Vec<u8>,
+    response: Vec<u8>,
+}
+
+impl Tap {
+    async fn to(upstream: &Upstream) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Copy `from` into `to`, keeping a copy of every byte with `keep`.
+        async fn relay(
+            mut from: tokio::net::tcp::OwnedReadHalf,
+            mut to: tokio::net::tcp::OwnedWriteHalf,
+            keep: impl Fn(&[u8]),
+        ) {
+            let mut buffer = [0u8; 8192];
+            loop {
+                let read = match from.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                keep(&buffer[..read]);
+                if to.write_all(&buffer[..read]).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+            .await
+            .expect("bind a tap port");
+        let bound = listener.local_addr().expect("local addr");
+        let target = upstream.addr;
+        let connections: Arc<StdMutex<Vec<Arc<StdMutex<Tapped>>>>> = Arc::default();
+        let accepting = tokio::spawn({
+            let connections = Arc::clone(&connections);
+            async move {
+                let mut piping = tokio::task::JoinSet::new();
+                while let Ok((inbound, _)) = listener.accept().await {
+                    let Ok(outbound) = tokio::net::TcpStream::connect(target).await else {
+                        continue;
+                    };
+                    let tapped = Arc::new(StdMutex::new(Tapped::default()));
+                    connections
+                        .lock()
+                        .expect("the tap mutex is poisoned")
+                        .push(Arc::clone(&tapped));
+                    let (inbound_read, inbound_write) = inbound.into_split();
+                    let (outbound_read, outbound_write) = outbound.into_split();
+                    let requests = Arc::clone(&tapped);
+                    piping.spawn(relay(inbound_read, outbound_write, move |bytes| {
+                        let mut tapped = requests.lock().expect("the tap mutex is poisoned");
+                        tapped.request.extend_from_slice(bytes);
+                    }));
+                    piping.spawn(relay(outbound_read, inbound_write, move |bytes| {
+                        let mut tapped = tapped.lock().expect("the tap mutex is poisoned");
+                        tapped.response.extend_from_slice(bytes);
+                    }));
+                }
+            }
+        });
+        Self {
+            address: HostAddress::parse(&format!("http://{bound}")).expect("an address"),
+            connections,
+            accepting,
+        }
+    }
+
+    /// How many `list` frames the host wrote on each event stream through the
+    /// tap, keyed by the stream's request line.
+    fn lists_per_stream(&self) -> Vec<(String, usize)> {
+        let connections = self.connections.lock().expect("the tap mutex is poisoned");
+        connections
+            .iter()
+            .filter_map(|tapped| {
+                let tapped = tapped.lock().expect("the tap mutex is poisoned");
+                let request = String::from_utf8_lossy(&tapped.request);
+                // A pooled connection can carry other requests first, and an
+                // event stream holds its connection for good, so it is the last.
+                let line = request
+                    .lines()
+                    .rfind(|line| line.starts_with("GET /v1/events"))?
+                    .to_string();
+                let lists = String::from_utf8_lossy(&tapped.response)
+                    .matches(r#""kind":"list""#)
+                    .count();
+                Some((line, lists))
+            })
+            .collect()
+    }
+
+    fn stop(self) {
+        self.accepting.abort();
+    }
+}
+
 /// A gateway over a temp state directory, bound on loopback, plus a client for
 /// it.
 struct Fixture {
@@ -4592,6 +4700,80 @@ async fn a_spliced_turn_reaches_a_client_with_its_ids_namespaced() {
     );
 
     fixture.shutdown().await;
+    host.stop().await;
+}
+
+/// A spliced upstream carries no `list` frames, while a direct client of the
+/// same host and the gateway's own control link still do.
+///
+/// The gateway composes its directory from the control link alone, so a list
+/// on a splice is the whole directory spent on a stream that drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spliced_upstream_carries_no_list_frames() {
+    let mut host = Upstream::start().await;
+    let session = host.create().await;
+    let tap = Tap::to(&host).await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![tap.address.clone()]).await;
+    let id = host.namespaced(&session);
+    fixture.row(&id).await;
+
+    let mut spliced = fixture.attach(&[attach(&id)]).await;
+    frames_until(&mut spliced, "the spliced attach block", is_caught_up).await;
+    let mut direct = RemoteClient::new(&host.address())
+        .expect("client")
+        .events(&[attach(&session)])
+        .await
+        .expect("a direct stream");
+    frames_until(&mut direct, "the direct attach block", is_caught_up).await;
+
+    let before = host.durable_seq(&session).await;
+    fixture
+        .client
+        .command(&id, &prompt("go"))
+        .await
+        .expect("the prompt is accepted");
+    frames_until(
+        &mut direct,
+        "a directory showing the finished turn",
+        |frame| {
+            matches!(frame, Frame::List { sessions, .. }
+            if sessions.iter().any(|row| {
+                row.id == session && !row.working && row.last_seq.is_some_and(|seq| seq > before)
+            }))
+        },
+    )
+    .await;
+    // The host offered that directory to every stream that takes lists in one
+    // pass, so anything it queued on the splice is ahead of a later turn's
+    // frames there, and through the tap by the time the client sees them.
+    fixture
+        .client
+        .command(&id, &prompt("again"))
+        .await
+        .expect("the second prompt is accepted");
+    let mut answers = 0;
+    frames_until(&mut spliced, "both answers", |frame| {
+        answers += assistant_text(std::slice::from_ref(frame)).len();
+        answers == 2
+    })
+    .await;
+
+    let streams = tap.lists_per_stream();
+    let (splices, links): (Vec<_>, Vec<_>) = streams
+        .iter()
+        .partition(|(line, _)| line.contains("session="));
+    assert!(
+        !splices.is_empty() && links.iter().any(|(_, lists)| *lists > 0),
+        "the tap saw the splice and a control link carrying lists, or it \
+         measures nothing: {streams:?}",
+    );
+    assert!(
+        splices.iter().all(|(_, lists)| *lists == 0),
+        "a spliced upstream carried list frames: {streams:?}",
+    );
+
+    fixture.shutdown().await;
+    tap.stop();
     host.stop().await;
 }
 
