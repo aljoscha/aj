@@ -45,8 +45,8 @@ use aj_models::registry::ModelInfo;
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::streaming::AssistantMessageEventStream;
 use aj_models::types::{
-    AssistantContent, AssistantMessage, Context, SimpleStreamOptions, StopReason, StreamOptions,
-    ToolCall,
+    AssistantContent, AssistantMessage, Context, Message, SimpleStreamOptions, StopReason,
+    StreamOptions, ToolCall,
 };
 use aj_session::ConversationPersistence;
 use aj_wire::{
@@ -3227,6 +3227,86 @@ async fn an_idle_stream_heartbeats_with_a_real_frame() {
     })
     .await;
     assert_eq!(heartbeats, 2, "the idle timer restarts after each write");
+    fixture.shutdown().await;
+}
+
+/// A burst of streaming snapshots reaches a client that keeps up as a few
+/// coalesced frames, ending on the final one, with the reliable frame behind
+/// the burst still after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_streaming_burst_reaches_the_client_coalesced() {
+    // One delta per character, about a millisecond apart: far more snapshots
+    // than pacing windows, and slow enough that an unpaced writer keeps up.
+    const DELTAS: usize = 300;
+    let reply = "x".repeat(DELTAS);
+    let fixture = Fixture::with_provider(scripted(
+        vec![finalized_text_message(&reply)],
+        1,
+        Duration::from_millis(1),
+    ))
+    .await;
+    let session = fixture.create().await;
+    let mut events = fixture
+        .client
+        .events(&[attach(&session)])
+        .await
+        .expect("attach");
+    bounded("the attach block", async {
+        while !matches!(events.recv().await, Some(Ok(Frame::CaughtUp { .. }))) {}
+    })
+    .await;
+    fixture.prompt(&session, "stream something").await;
+
+    // Every snapshot up to the assistant's `MessageEnd`, then any after it
+    // up to the turn's `AgentEnd`, of which there must be none.
+    let mut updates = Vec::new();
+    let mut final_message = None;
+    let mut late = 0;
+    bounded("the end of the turn", async {
+        loop {
+            let frame = match events.recv().await {
+                Some(Ok(frame)) => frame,
+                other => panic!("the stream failed: {other:?}"),
+            };
+            let Frame::Event { event, .. } = frame else {
+                continue;
+            };
+            match event.known() {
+                Some(AgentEvent::MessageUpdate { event, .. }) if final_message.is_none() => {
+                    updates.push(event.partial().clone());
+                }
+                Some(AgentEvent::MessageUpdate { .. }) => late += 1,
+                Some(AgentEvent::MessageEnd { message, .. }) => {
+                    if let Some(Message::Assistant(message)) = message.as_stored_wire() {
+                        final_message = Some(message.clone());
+                    }
+                }
+                Some(AgentEvent::AgentEnd {
+                    agent_id: AgentId::Main,
+                    ..
+                }) => return,
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    let final_message = final_message.expect("the assistant's MessageEnd arrived");
+    assert!(
+        updates.len() * 4 < DELTAS,
+        "{} snapshots of {DELTAS} deltas reached the client, so they were not coalesced",
+        updates.len(),
+    );
+    let last = updates.last().expect("at least one snapshot arrived");
+    assert_eq!(
+        serde_json::to_value(last).unwrap(),
+        serde_json::to_value(&final_message).unwrap(),
+        "the last snapshot delivered is the final one",
+    );
+    assert_eq!(
+        late, 0,
+        "a snapshot arrived after the MessageEnd published behind it"
+    );
     fixture.shutdown().await;
 }
 

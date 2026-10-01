@@ -53,6 +53,18 @@ use crate::remote::identity::{IdentityError, IdentityGate};
 /// "the transport buffered something", and only a frame reaches its decoder.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
+/// How long an event stream holds off after writing a lossy frame.
+///
+/// A provider streams a reply as many small deltas, and every one becomes a
+/// cumulative snapshot of the whole message so far. Written as they come, a
+/// client that keeps up receives every snapshot, and the bytes grow with the
+/// square of the reply's length. Holding the writer this long lets newer
+/// snapshots replace the queued one, so a reply costs one snapshot per
+/// window. The price is up to one window of added latency on streaming text,
+/// and on a reliable frame that happens to follow a lossy one. Short enough
+/// that streaming still reads as continuous.
+const LOSSY_PACE: Duration = Duration::from_millis(50);
+
 /// How long [`RemoteServer::shutdown`] waits for in-flight streams.
 ///
 /// An attached stream ends when the host closes it, so the ordinary teardown
@@ -825,12 +837,22 @@ fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, Ap
 /// stream then goes silent and the client's ordinary stream-loss recovery
 /// re-attaches. A block's only waits are the session's log lock, which appends
 /// hold briefly, and the client reading it, which is not silence on its side.
+///
+/// After a lossy frame the writer holds off for [`LOSSY_PACE`] before reading
+/// the next one. Holding outside [`Attachment::recv`] is what coalesces: the
+/// frames published meanwhile wait in the outbound queue, where a newer
+/// snapshot replaces the queued one of its key. Attach blocks carry no lossy
+/// frames, so a block is never held.
 fn frame_stream(
     attachment: Attachment,
     idle: Duration,
 ) -> impl Stream<Item = Result<Event, aj_agent::BoxError>> {
-    futures::stream::unfold(Some(attachment), move |state| async move {
-        let mut attachment = state?;
+    let start = (attachment, None);
+    futures::stream::unfold(Some(start), move |state| async move {
+        let (mut attachment, held_until) = state?;
+        if let Some(deadline) = held_until {
+            tokio::time::sleep_until(deadline).await;
+        }
         let frame = loop {
             match tokio::time::timeout(idle, attachment.recv()).await {
                 Ok(Some(frame)) => break frame,
@@ -839,8 +861,14 @@ fn frame_stream(
                 Err(_) => break Frame::Heartbeat,
             }
         };
+        let held_until = frame
+            .is_lossy()
+            .then(|| tokio::time::Instant::now() + LOSSY_PACE);
         match serde_json::to_string(&frame) {
-            Ok(json) => Some((Ok(Event::default().data(json)), Some(attachment))),
+            Ok(json) => Some((
+                Ok(Event::default().data(json)),
+                Some((attachment, held_until)),
+            )),
             // A frame this host built that will not serialize is a host bug.
             // Ending the stream makes the client reconnect and re-sync,
             // which is the only honest answer: skipping it would silently

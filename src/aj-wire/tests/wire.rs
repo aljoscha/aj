@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
-use aj_models::types::{ImageContent, TextContent, UserContent};
+use aj_agent::message::{AgentMessage, AgentMessageKind};
+use aj_models::streaming::AssistantMessageEvent;
+use aj_models::types::{
+    AssistantContent, AssistantMessage, ImageContent, Message, TextContent, UserContent,
+};
 use aj_wire::{
     AccountList, AccountRequest, AccountSelection, ArchiveRequest, CancelRequest, CompactRequest,
     CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame, DirectoryHost, EmptyRequest,
@@ -874,16 +878,80 @@ fn every_agent_event_has_a_pinned_round_trip_fixture() {
 
     for expected in fixtures {
         let encoded = serde_json::to_string(&expected).unwrap();
-        let event: AgentEvent = serde_json::from_str(&encoded)
+        let decoded: DecodedAgentEvent = serde_json::from_str(&encoded)
             .unwrap_or_else(|error| panic!("failed to decode {expected}: {error}"));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), expected);
+        let event = decoded.known().expect("a known event").clone();
         assert_eq!(agent_event_type(&event), expected["type"]);
-        let actual = serde_json::to_value(event).expect("event re-serializes");
-        assert_eq!(actual, expected);
+        let typed = DecodedAgentEvent::from(event.clone());
+        assert_eq!(serde_json::to_value(typed).unwrap(), expected);
 
-        let decoded: DecodedAgentEvent = serde_json::from_str(&encoded).unwrap();
-        assert!(matches!(decoded, DecodedAgentEvent::Known(_)));
-        assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+        // The in-process form, which print mode writes, is the wire form
+        // except that a `MessageUpdate` also carries its partial as `message`.
+        let mut in_process = serde_json::to_value(&event).expect("event serializes");
+        if let AgentEvent::MessageUpdate { .. } = event {
+            let message = in_process
+                .as_object_mut()
+                .unwrap()
+                .remove("message")
+                .expect("an in-process MessageUpdate carries its message");
+            let mut partial = expected["event"]["partial"].clone();
+            partial["role"] = json!("assistant");
+            assert_eq!(message, partial);
+        }
+        assert_eq!(in_process, expected);
     }
+}
+
+/// A `MessageUpdate` crosses the wire without its duplicate `message`, and
+/// the receiver rebuilds it from `event.partial`.
+#[test]
+fn message_update_omits_its_duplicate_message_on_the_wire() {
+    let mut partial = AssistantMessage::empty();
+    partial.content.push(AssistantContent::Text(TextContent {
+        text: "streamed so far".into(),
+        text_signature: None,
+    }));
+    let original = AgentEvent::MessageUpdate {
+        agent_id: AgentId::Sub(3),
+        message: AgentMessage::wire(Message::Assistant(partial.clone())),
+        event: AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "far".into(),
+            partial,
+        },
+    };
+    let frame = Frame::Event {
+        session: "session-1".into(),
+        epoch: "e".into(),
+        durability: None,
+        event: original.clone().into(),
+    };
+
+    let encoded = serde_json::to_value(&frame).unwrap();
+    assert!(encoded["event"].get("message").is_none(), "{encoded}");
+    assert_eq!(
+        encoded["event"]["event"]["partial"]["content"][0]["text"],
+        "streamed so far"
+    );
+
+    let decoded: Frame = serde_json::from_value(encoded).unwrap();
+    let Frame::Event { event, .. } = decoded else {
+        panic!("an event frame");
+    };
+    let event = event.known().expect("a known event");
+    assert_eq!(
+        serde_json::to_value(event).unwrap(),
+        serde_json::to_value(&original).unwrap(),
+    );
+    let AgentEvent::MessageUpdate { message, .. } = event else {
+        panic!("a MessageUpdate");
+    };
+    assert!(matches!(
+        message.kind,
+        AgentMessageKind::Wire(Message::Assistant(_))
+    ));
+    assert!(!message.id().is_empty(), "a rebuilt message has an id");
 }
 
 #[test]

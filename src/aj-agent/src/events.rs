@@ -592,6 +592,10 @@ mod tests {
         assert_eq!(json["event"]["type"], "text_delta");
         assert_eq!(json["event"]["delta"], "abc");
         assert_eq!(json["event"]["content_index"], 0);
+        // The cumulative message rides alongside the provider event here.
+        // Only the remote-control wire omits it as a duplicate.
+        assert_eq!(json["message"]["role"], "assistant");
+        assert_eq!(json["message"]["model"], json["event"]["partial"]["model"]);
 
         // The flattened `AgentSettings` keeps the four settings
         // fields at the top level of the SubAgentStart object, not

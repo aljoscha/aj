@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::message::AgentMessage;
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
-use aj_models::types::{ImageContent, TextContent, UserContent};
+use aj_models::streaming::AssistantMessageEvent;
+use aj_models::types::{ImageContent, Message, TextContent, UserContent};
 use chrono::{DateTime, Utc};
 use serde::de::{DeserializeOwned, Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::ser::{Error as _, SerializeMap};
@@ -1364,15 +1365,25 @@ impl DecodedAgentEvent {
     }
 }
 
+/// The wire form of an event is its in-process serde form, except
+/// `MessageUpdate`: its `message` is the cumulative `event.partial` again, so
+/// the wire omits it and the decoder rebuilds it. Sending both would double
+/// the bytes of the stream's highest-volume event for no information.
 impl Serialize for DecodedAgentEvent {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         match self {
-            Self::Known(event) => match &event.raw {
-                Some(raw) => raw.serialize(serializer),
-                None => event.value.serialize(serializer),
+            Self::Known(event) => match (&event.raw, &event.value) {
+                (Some(raw), _) => raw.serialize(serializer),
+                (
+                    None,
+                    AgentEvent::MessageUpdate {
+                        agent_id, event, ..
+                    },
+                ) => MessageUpdateWire { agent_id, event }.serialize(serializer),
+                (None, value) => value.serialize(serializer),
             },
             Self::Unknown { raw, .. } => raw.serialize(serializer),
         }
@@ -1386,13 +1397,32 @@ impl<'de> Deserialize<'de> for DecodedAgentEvent {
     {
         let raw = Box::<RawValue>::deserialize(deserializer)?;
         let EventTag { event_type } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
-        if is_known_event_type(&event_type) {
+        if event_type == "message_update" {
+            let MessageUpdateWire::<AgentId, AssistantMessageEvent> { agent_id, event } =
+                serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+            // Wrapped exactly as the agent wraps the partial it emits.
+            let message = AgentMessage::wire(Message::Assistant(event.partial().clone()));
+            let event = AgentEvent::MessageUpdate {
+                agent_id,
+                message,
+                event,
+            };
+            Ok(Self::Known(DecodedKnown::from_wire(event, raw)))
+        } else if is_known_event_type(&event_type) {
             let event = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
             Ok(Self::Known(DecodedKnown::from_wire(event, raw)))
         } else {
             Ok(Self::Unknown { event_type, raw })
         }
     }
+}
+
+/// `AgentEvent::MessageUpdate` without its duplicate `message`.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename = "message_update")]
+struct MessageUpdateWire<A, E> {
+    agent_id: A,
+    event: E,
 }
 
 #[derive(Deserialize)]

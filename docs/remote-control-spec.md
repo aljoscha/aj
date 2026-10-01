@@ -181,7 +181,10 @@ reaches any path or URL construction or store lookup, on both roles.
 internally tagged with `kind`:
 
 - `event`: `{kind, session, epoch, seq?, entry_id?, branch_settings?, event}` where
-  `event` is a serialized `AgentEvent`. `seq` and `entry_id` are present
+  `event` is a serialized `AgentEvent`, except that a `message_update`
+  omits the in-process event's `message`: it repeats `event.partial`,
+  so the receiver rebuilds it as that partial wrapped as an assistant
+  message. `seq` and `entry_id` are present
   if and only if the event is durable (section 5.4). The envelope's
   semantics apply whether or not the nested event type is known to the
   receiver. Durable main-thread user-message ends carry `branch_settings`:
@@ -832,6 +835,14 @@ never be silently dropped for a connected client.
   never by in-place substitution, which would reorder content across a
   queued durable boundary. A lossy frame that meets a full queue with no
   older frame to replace is dropped.
+- A host's HTTP stream paces lossy frames: after writing one it writes
+  no further frame for about 50 ms, and same-key snapshots arriving
+  meanwhile coalesce in the queue as above. A fast client therefore
+  receives a streaming reply as a handful of snapshots rather than one
+  per provider delta. A reliable frame may wait up to one such window,
+  never longer, and keeps its order. Attach blocks hold no lossy frames
+  and are unaffected. A gateway's downstream inherits the pacing of its
+  upstream streams.
 - Durable and reliable-transient frames are never dropped. If a client's
   bounded queue overflows with them, the server disconnects that client.
   Recovery is the ordinary re-attach with cursor plus reconciliation
