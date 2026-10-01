@@ -15,21 +15,16 @@ impl SessionHost {
         let auth = &self.inner.shared.auth;
         let mut stored = std::collections::BTreeMap::new();
         for provider in auth.list().await.map_err(|_| credential_read_error())? {
-            use aj_models::auth::StoredProviderCredentials;
-            use aj_wire::StoredCredentialMetadata;
-            let metadata = match auth
-                .stored_credentials(&provider)
+            let Some(set) = auth
+                .accounts(&provider)
                 .await
                 .map_err(|_| credential_read_error())?
-            {
-                Some(StoredProviderCredentials::Bare(_)) => StoredCredentialMetadata::Bare,
-                Some(StoredProviderCredentials::Accounts(set)) => {
-                    StoredCredentialMetadata::Accounts {
-                        default: set.default,
-                        accounts: set.accounts.into_iter().map(|(label, _)| label).collect(),
-                    }
-                }
-                None => continue,
+            else {
+                continue;
+            };
+            let metadata = aj_wire::StoredCredentialMetadata {
+                default: set.default,
+                accounts: set.accounts.into_iter().map(|(label, _)| label).collect(),
             };
             stored.insert(provider, metadata);
         }
@@ -73,10 +68,9 @@ impl SessionHost {
                 target: CredentialStore::Replace { label },
                 credentials,
             } => {
-                auth.store_replacement_login(&provider, label.as_deref(), credentials)
+                auth.store_replacement_login(&provider, &label, credentials)
                     .await
             }
-            CredentialMutation::LogoutBare { provider } => auth.remove_bare(&provider).await,
             CredentialMutation::Logout {
                 provider,
                 account_label,

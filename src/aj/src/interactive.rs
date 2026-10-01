@@ -2174,14 +2174,6 @@ fn credential_provider_name(
     provider: &str,
     account: Option<&str>,
 ) -> String {
-    let account = if matches!(
-        overview.stored.get(provider),
-        Some(StoredCredentialMetadata::Bare)
-    ) {
-        None
-    } else {
-        account
-    };
     // Stored rows follow runtime overrides. Pickers name the stored account,
     // not the override that may currently mask it.
     overview
@@ -2231,84 +2223,49 @@ fn credential_picker_rows(
                         summary
                     }),
                 });
-                match stored {
-                    Some(StoredCredentialMetadata::Bare) => rows.push(AuthRow {
-                        request: AuthPickerAction::Login {
-                            provider_id: id.clone(),
-                            provider_name: name.clone(),
-                            target: LoginTarget::ExistingAccount(None),
-                        },
-                        label: format!(
-                            "{} · Unnamed account",
-                            credential_provider_name(&overview, id, None)
-                        ),
-                        filter_key: format!(
-                            "{id} {name} Unnamed account existing credential reauthenticate"
-                        ),
+                let accounts = stored.map(|stored| stored.accounts).unwrap_or_default();
+                rows.extend(accounts.into_iter().map(|account_label| {
+                    let shown = account_label_text(&account_label);
+                    let shown_name = credential_provider_name(&overview, id, Some(&account_label));
+                    let request = AuthPickerAction::Login {
+                        provider_id: id.clone(),
+                        provider_name: name.clone(),
+                        target: LoginTarget::ExistingAccount(account_label),
+                    };
+                    AuthRow {
+                        request,
+                        label: format!("{shown_name} · {shown}"),
+                        filter_key: format!("{id} {name} {shown} reauthenticate"),
                         summary: Some("log in again and replace this account".to_string()),
-                    }),
-                    Some(StoredCredentialMetadata::Accounts { accounts, .. }) => {
-                        rows.extend(accounts.into_iter().map(|account_label| {
-                            let shown = account_label_text(&account_label);
-                            let shown_name =
-                                credential_provider_name(&overview, id, Some(&account_label));
-                            let request = AuthPickerAction::Login {
-                                provider_id: id.clone(),
-                                provider_name: name.clone(),
-                                target: LoginTarget::ExistingAccount(Some(account_label)),
-                            };
-                            AuthRow {
-                                request,
-                                label: format!("{shown_name} · {shown}"),
-                                filter_key: format!("{id} {name} {shown} reauthenticate"),
-                                summary: Some("log in again and replace this account".to_string()),
-                            }
-                        }));
                     }
-                    None => {}
-                }
+                }));
             }
             (rows, "No OAuth providers are available to log in to.")
         }
         CommandAction::OpenLogoutSelector => {
             let mut rows = Vec::new();
-            for (id, stored) in &overview.stored {
-                match stored.clone() {
-                    StoredCredentialMetadata::Bare => rows.push(AuthRow {
-                        request: AuthPickerAction::LogoutBare {
-                            provider_id: id.clone(),
-                        },
+            for (id, StoredCredentialMetadata { default, accounts }) in &overview.stored {
+                rows.extend(accounts.iter().map(|account_label| {
+                    let shown = account_label_text(account_label);
+                    let suffix = if account_label == default {
+                        "default account"
+                    } else {
+                        "account"
+                    };
+                    let action = AccountAction::Logout {
+                        provider_id: id.clone(),
+                        account_label: account_label.clone(),
+                    };
+                    AuthRow {
+                        request: AuthPickerAction::ApplyAccount(action),
                         label: format!(
-                            "{} · Unnamed account",
-                            credential_provider_name(&overview, id, None)
+                            "{} · {shown}",
+                            credential_provider_name(&overview, id, Some(account_label))
                         ),
-                        filter_key: format!("{id} Unnamed account bare credential"),
-                        summary: Some("remove the stored credential".to_string()),
-                    }),
-                    StoredCredentialMetadata::Accounts { default, accounts } => {
-                        rows.extend(accounts.into_iter().map(|account_label| {
-                            let shown = account_label_text(&account_label);
-                            let suffix = if account_label == default {
-                                "default account"
-                            } else {
-                                "account"
-                            };
-                            let action = AccountAction::Logout {
-                                provider_id: id.clone(),
-                                account_label: account_label.clone(),
-                            };
-                            AuthRow {
-                                request: AuthPickerAction::ApplyAccount(action),
-                                label: format!(
-                                    "{} · {shown}",
-                                    credential_provider_name(&overview, id, Some(&account_label))
-                                ),
-                                filter_key: format!("{id} {shown}"),
-                                summary: Some(format!("remove this {suffix}")),
-                            }
-                        }));
+                        filter_key: format!("{id} {shown}"),
+                        summary: Some(format!("remove this {suffix}")),
                     }
-                }
+                }));
             }
             (
                 rows,
@@ -2317,14 +2274,10 @@ fn credential_picker_rows(
         }
         CommandAction::OpenDefaultAccountSelector => {
             let mut rows = Vec::new();
-            for (id, stored) in &overview.stored {
-                let (default, accounts) = match stored.clone() {
-                    StoredCredentialMetadata::Bare => (String::new(), vec![String::new()]),
-                    StoredCredentialMetadata::Accounts { default, accounts } => (default, accounts),
-                };
-                rows.extend(accounts.into_iter().map(|account_label| {
+            for (id, StoredCredentialMetadata { default, accounts }) in &overview.stored {
+                rows.extend(accounts.iter().map(|account_label| {
                     let is_current = account_label == default;
-                    let shown = account_label_text(&account_label);
+                    let shown = account_label_text(account_label);
                     let action = AccountAction::SetDefault {
                         provider_id: id.clone(),
                         account_label: account_label.clone(),
@@ -2333,7 +2286,7 @@ fn credential_picker_rows(
                         request: AuthPickerAction::ApplyAccount(action),
                         label: format!(
                             "{} · {shown}",
-                            credential_provider_name(&overview, id, Some(&account_label))
+                            credential_provider_name(&overview, id, Some(account_label))
                         ),
                         filter_key: format!("{id} {shown}"),
                         summary: is_current.then(|| "provider default".to_string()),
@@ -2491,8 +2444,7 @@ fn default_logout_rows(
     provider_id: String,
     account_label: String,
 ) -> Vec<AuthRow> {
-    let Some(StoredCredentialMetadata::Accounts { default, accounts }) =
-        overview.stored.remove(&provider_id)
+    let Some(StoredCredentialMetadata { default, accounts }) = overview.stored.remove(&provider_id)
     else {
         return Vec::new();
     };
@@ -2791,21 +2743,13 @@ async fn start_auth_request(
                 return;
             }
             let (provider, mutation, success, removed) = match request {
-                AuthPickerAction::LogoutBare { provider_id } => (
-                    provider_id.clone(),
-                    CredentialMutation::LogoutBare {
-                        provider: provider_id.clone(),
-                    },
-                    format!("Logged out of {provider_id} (Unnamed account)."),
-                    true,
-                ),
                 AuthPickerAction::ApplyAccount(action) => match action {
                     AccountAction::Logout {
                         provider_id,
                         account_label,
                     } => {
                         let success = format!(
-                            "Logged out of {provider_id} account {}.",
+                            "Logged out of {provider_id} ({}).",
                             account_label_text(&account_label)
                         );
                         (
@@ -2842,7 +2786,7 @@ async fn start_auth_request(
                         new_default,
                     } => {
                         let success = format!(
-                            "Logged out of {provider_id} account {}. {provider_id} default account: {}.",
+                            "Logged out of {provider_id} ({}). {provider_id} default account: {}.",
                             account_label_text(&account_label),
                             account_label_text(&new_default)
                         );
@@ -2969,10 +2913,9 @@ fn finish_login(
         Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied))) => {
             let detail = match target {
                 LoginTarget::NewAccount { .. } => "Account added.".to_string(),
-                LoginTarget::ExistingAccount(label) => format!(
-                    "Replaced {}.",
-                    account_label_text(label.as_deref().unwrap_or("")),
-                ),
+                LoginTarget::ExistingAccount(label) => {
+                    format!("Replaced {}.", account_label_text(&label),)
+                }
             };
             fold_notice(world, &format!("Logged in to {provider_name}. {detail}"));
         }
@@ -14741,8 +14684,9 @@ mod tests {
             .expect("OAuth provider");
         world
             .auth
-            .insert_bare(
+            .insert_account(
                 provider,
+                "",
                 AuthCredential::OAuth(OAuthCredentials::new(
                     "fake-refresh",
                     "fake-access",
@@ -14770,8 +14714,7 @@ mod tests {
             let unnamed = statuses
                 .iter()
                 .find(|status| {
-                    status.provider_id == provider
-                        && status.account_label.as_deref().is_none_or(str::is_empty)
+                    status.provider_id == provider && status.account_label.as_deref() == Some("")
                 })
                 .unwrap();
             assert_eq!(unnamed.summary, "subscription");
@@ -14795,7 +14738,6 @@ mod tests {
                 if grown {
                     assert!(painted.contains("Anthropic · work"), "{painted}");
                 }
-                assert!(!painted.contains("bare credential"), "{painted}");
                 press(&mut app, &mut writer, b"\x1b").await;
                 assert_eq!(shell.borrow().overlays.borrow().depth(), 0);
             }
@@ -15318,16 +15260,18 @@ mod tests {
             let client_dir = TempDir::new().unwrap();
             let right_dir = TempDir::new().unwrap();
             let (left, auth) = credential_fixture(&host_dir).await;
-            auth.insert_bare(
+            auth.insert_account(
                 "credential-fake",
+                "",
                 AuthCredential::ApiKey {
                     key: "host-old-secret".into(),
                 },
             )
             .await
             .unwrap();
-            auth.insert_bare(
+            auth.insert_account(
                 "host-sentinel",
+                "",
                 AuthCredential::ApiKey {
                     key: "host-sentinel-secret".into(),
                 },
@@ -15365,8 +15309,9 @@ mod tests {
             .await;
             world
                 .auth
-                .insert_bare(
+                .insert_account(
                     "client-sentinel",
+                    "",
                     AuthCredential::ApiKey {
                         key: "client-only-secret".into(),
                     },
@@ -15656,8 +15601,9 @@ mod tests {
         register_controlled_oauth(&world, "credential-fake", "new-access", LoginGate::Ready).await;
         world
             .auth
-            .insert_bare(
+            .insert_account(
                 "client-sentinel",
+                "",
                 AuthCredential::ApiKey {
                     key: "client-only-secret".into(),
                 },
@@ -15709,9 +15655,10 @@ mod tests {
             session: world.session().to_string(),
             host: credential_host(&world),
         }
-        .request(AuthPickerAction::LogoutBare {
+        .request(AuthPickerAction::ApplyAccount(AccountAction::Logout {
             provider_id: "client-sentinel".into(),
-        });
+            account_label: String::new(),
+        }));
         apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
         assert!(
             main_notices(&world)
@@ -15918,8 +15865,9 @@ mod tests {
             init_app_with_world(&dir, "streaming-text").await;
         world
             .auth
-            .insert_bare(
+            .insert_account(
                 "anthropic",
+                "",
                 AuthCredential::OAuth(OAuthCredentials::new("r", "a", 0)),
             )
             .await
@@ -15963,7 +15911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_bare_logout_request_cannot_delete_a_concurrently_promoted_set() {
+    async fn stale_unnamed_logout_request_cannot_delete_a_concurrently_grown_set() {
         use aj_models::auth::AuthCredential;
 
         let dir = TempDir::new().expect("tempdir");
@@ -15971,7 +15919,13 @@ mod tests {
             init_app_with_world(&dir, "streaming-text").await;
         world
             .auth
-            .insert_bare("anthropic", AuthCredential::ApiKey { key: "bare".into() })
+            .insert_account(
+                "anthropic",
+                "",
+                AuthCredential::ApiKey {
+                    key: "unnamed".into(),
+                },
+            )
             .await
             .unwrap();
 
@@ -15980,20 +15934,22 @@ mod tests {
             ActionEffect::OpenedOverlay
         ));
         focus_overlay(&mut app, &root);
-        writer.write_all(b"\r").expect("select bare credential");
+        writer.write_all(b"\r").expect("select the unnamed account");
         let event = app.next_input().await.expect("picker event");
         app.handle_input(event);
         let request = shell
             .borrow()
             .take_auth_request()
-            .expect("bare logout request");
+            .expect("unnamed logout request");
         assert!(matches!(
             &request.action,
-            AuthPickerAction::LogoutBare { provider_id } if provider_id == "anthropic"
+            AuthPickerAction::ApplyAccount(AccountAction::Logout { provider_id, account_label })
+                if provider_id == "anthropic" && account_label.is_empty()
         ));
 
         // A sibling adds an account after selection but before the host drains
-        // the parked request, promoting the exact bare credential.
+        // the parked request, so the unnamed account is now a default with a
+        // sibling.
         world
             .auth
             .insert_account(
@@ -16691,8 +16647,9 @@ mod tests {
         register_controlled_oauth(&world, provider_id, "work-access", LoginGate::Ready).await;
         world
             .auth
-            .insert_bare(
+            .insert_account(
                 provider_id,
+                "",
                 AuthCredential::ApiKey {
                     key: "personal-key".to_string(),
                 },
@@ -30884,8 +30841,9 @@ mod tests {
             assert_eq!(world.session(), opening);
             world
                 .auth
-                .insert_bare(
+                .insert_account(
                     "openai-codex",
+                    "",
                     aj_models::auth::AuthCredential::ApiKey {
                         key: "client-secret-sentinel".into(),
                     },

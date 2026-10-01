@@ -949,22 +949,22 @@ nor takes its writer lock.
 - `GET` returns `CredentialOverview`: the host's OAuth providers (id and
   display name), one safe status row per provider account (`provider_id`,
   `provider_name`, optional label, default and configured flags, summary,
-  optional detail), and a `stored` map from provider id to `{kind:"bare"}` or
-  `{kind:"accounts", default, accounts:[labels...]}`. No keys or tokens are
-  returned and the read never refreshes anything. `provider_name` follows the
+  optional detail), and a `stored` map from provider id to
+  `{default, accounts:[labels...]}`, where the empty label is the unnamed
+  account. No keys or tokens are returned and the read never refreshes
+  anything. `provider_name` follows the
   usage report naming and empty-string compatibility rules (section 5.7).
   The summary describes
   method/source without repeating the provider name. A runtime override has
-  its own API-key row and does not hide stored bare or labeled credentials.
+  its own API-key row and does not hide stored accounts.
   Rows are sorted by provider ID and account label, with the runtime override
   before stored credentials for that provider.
 - `POST` takes one `CredentialMutation`, tagged by `action`:
-  `store {provider, target, credentials}`, `logout_bare {provider}`,
-  `logout {provider, account_label}`, `set_default {provider,
-  account_label}`, `logout_with_new_default {provider, account_label,
-  new_default}`, or `logout_all {provider, expected_accounts}`. Unknown
+  `store {provider, target, credentials}`, `logout {provider,
+  account_label}`, `set_default {provider, account_label}`,
+  `logout_with_new_default {provider, account_label, new_default}`, or `logout_all {provider, expected_accounts}`. Unknown
   fields are refused before anything is written. The host applies the store's
-  own exact-label, storage-shape and lock-time checks. The answer is tagged by
+  own exact-label and lock-time checks. The answer is tagged by
   `outcome`: `applied`, `removing_default {provider, account_label}` (the
   frontend offers a replacement default or removal of the whole set), or
   `failed {code, message}`.
@@ -972,10 +972,11 @@ nor takes its writer lock.
 Login is the client's work up to the last step. The browser is where the user
 sits, so the client runs the provider's OAuth flow itself, exactly as a local
 run does, and then sends the finished credentials as a `store` mutation. Its
-`target` is `{kind:"new", label}` (`null` for a provider's first, bare
-credential, a string to add an account) or `{kind:"replace", label}` (`null`
-for the bare credential, a string for that exact account). A duplicate label
-is refused on the client before the browser opens. Cancelling during
+`target` is `{kind:"new", label}` or `{kind:"replace", label}`. For `new`,
+`null` is a provider's first login, stored as the unnamed account and refused
+if the provider gained a credential meanwhile, and a string adds that account.
+For `replace`, the string names the exact account, with `""` for the unnamed
+account. A duplicate label is refused on the client before the browser opens. Cancelling during
 authorization stores nothing anywhere. A transport failure after the store
 request left is an uncertain write: the client says so and never retries on
 its own.

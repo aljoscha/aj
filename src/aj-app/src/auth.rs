@@ -24,7 +24,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aj_models::auth::{AuthCredential, AuthStorage, StoredProviderCredentials, find_env_keys};
+use aj_models::auth::{AuthCredential, AuthStorage, find_env_keys};
 use aj_models::oauth::OAuthAuthInfo;
 
 mod login;
@@ -164,7 +164,7 @@ fn stored_status(
 /// Build status rows for every provider worth showing: the [`KNOWN_PROVIDERS`]
 /// set, every registered OAuth provider, and any provider with a stored
 /// `auth.json` entry. A provider contributes its provider-level source when one
-/// exists and one row per stored bare credential or labeled account. Rows are
+/// exists and one row per stored account. Rows are
 /// sorted by provider id, then account label, with overrides before stored rows.
 pub async fn collect_statuses(auth: &AuthStorage) -> Vec<ProviderAuthStatus> {
     let oauth = auth.oauth_provider_ids().await;
@@ -194,11 +194,8 @@ pub async fn collect_statuses(auth: &AuthStorage) -> Vec<ProviderAuthStatus> {
         if has_override {
             out.push(provider_status(auth, &id, name).await);
         }
-        match auth.stored_credentials(&id).await {
-            Ok(Some(StoredProviderCredentials::Bare(credential))) => {
-                out.push(stored_status(&id, None, false, credential, name));
-            }
-            Ok(Some(StoredProviderCredentials::Accounts(set))) => {
+        match auth.accounts(&id).await {
+            Ok(Some(set)) => {
                 let default = set.default;
                 out.extend(set.accounts.into_iter().map(|(label, credential)| {
                     let is_default = label == default;
@@ -505,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_names_follow_credential_kind_and_preserve_stored_bare_under_override() {
+    async fn host_names_follow_credential_kind_and_preserve_the_stored_account_under_override() {
         let dir = TempDir::new().unwrap();
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         auth.register_oauth_provider(std::sync::Arc::new(CustomOAuth))
@@ -519,8 +516,9 @@ mod tests {
             ("openai-codex", "OpenAI Codex subscription"),
             ("openrouter", "Team subscription"),
         ] {
-            auth.insert_bare(
+            auth.insert_account(
                 id,
+                "",
                 AuthCredential::OAuth(OAuthCredentials::new("secret-refresh", "secret-access", 0)),
             )
             .await

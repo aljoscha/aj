@@ -1722,8 +1722,9 @@ mod tests {
     #[tokio::test]
     async fn anthropic_source_reports_unsupported_for_api_key() {
         let (_dir, auth) = scratch_storage("api-key");
-        auth.insert_bare(
+        auth.insert_account(
             "anthropic",
+            "",
             crate::auth::AuthCredential::ApiKey {
                 key: "sk-ant-api-key".into(),
             },

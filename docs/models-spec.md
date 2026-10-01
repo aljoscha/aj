@@ -2004,9 +2004,18 @@ enum AuthCredential {
     },
 }
 
+// One provider's value, written as
+// `{"type": "accounts", "default": "...", "accounts": {...}}`.
+// The empty label is the unnamed account. A bare `AuthCredential` value
+// reads as `{default: "", accounts: {"": credential}}`.
+struct AccountSet {
+    default: String,
+    accounts: HashMap<String, AuthCredential>,
+}
+
 struct AuthStorage {
     // Keyed by provider name
-    credentials: HashMap<String, AuthCredential>,
+    credentials: HashMap<String, AccountSet>,
 }
 ```
 

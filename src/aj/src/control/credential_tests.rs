@@ -221,8 +221,9 @@ async fn credentials_real_adapters_overview_mutations_and_stored_login() {
     let client_dir = tempfile::tempdir().unwrap();
     let client_auth = AuthStorage::new(client_dir.path().join("auth.json"));
     client_auth
-        .insert_bare(
+        .insert_account(
             "fake",
+            "",
             AuthCredential::ApiKey {
                 key: "client-only-secret".into(),
             },
@@ -233,8 +234,9 @@ async fn credentials_real_adapters_overview_mutations_and_stored_login() {
     for (control, session) in &fixture.controls {
         fixture
             .auth
-            .insert_bare(
+            .insert_account(
                 "fake",
+                "",
                 AuthCredential::ApiKey {
                     key: "host-api-secret".into(),
                 },
@@ -248,7 +250,10 @@ async fn credentials_real_adapters_overview_mutations_and_stored_login() {
         let overridden = control.credential_overview(session).await.unwrap();
         assert_eq!(
             overridden.stored.get("fake"),
-            Some(&aj_wire::StoredCredentialMetadata::Bare)
+            Some(&aj_wire::StoredCredentialMetadata {
+                default: DEFAULT_ACCOUNT_LABEL.into(),
+                accounts: vec![DEFAULT_ACCOUNT_LABEL.into()],
+            })
         );
         assert!(
             overridden
@@ -284,7 +289,7 @@ async fn credentials_real_adapters_overview_mutations_and_stored_login() {
                 .login(
                     control,
                     session,
-                    LoginTarget::ExistingAccount(Some("work".into())),
+                    LoginTarget::ExistingAccount("work".into()),
                     &replacement
                 )
                 .await,
@@ -407,7 +412,7 @@ async fn credentials_real_adapters_overview_mutations_and_stored_login() {
                 .login(
                     control,
                     session,
-                    LoginTarget::ExistingAccount(None),
+                    LoginTarget::ExistingAccount(DEFAULT_ACCOUNT_LABEL.into()),
                     &callbacks
                 )
                 .await,
@@ -417,13 +422,22 @@ async fn credentials_real_adapters_overview_mutations_and_stored_login() {
             control
                 .mutate_credentials(
                     session,
-                    Mutation::LogoutBare {
-                        provider: "fake".into()
+                    Mutation::Logout {
+                        provider: "fake".into(),
+                        account_label: DEFAULT_ACCOUNT_LABEL.into()
                     }
                 )
                 .await
                 .unwrap(),
             Outcome::Applied
+        );
+        assert!(
+            control
+                .credential_overview(session)
+                .await
+                .unwrap()
+                .stored
+                .is_empty()
         );
     }
     assert_eq!(std::fs::read(client_auth.path()).unwrap(), client_before);
@@ -435,7 +449,7 @@ async fn credentials_http_and_gateway_refuse_unknown_fields_and_unknown_sessions
     let fixture = Fixture::new().await;
     fixture
         .auth
-        .insert_bare("fake", AuthCredential::ApiKey { key: "keep".into() })
+        .insert_account("fake", "", AuthCredential::ApiKey { key: "keep".into() })
         .await
         .unwrap();
     let before = std::fs::read(fixture.auth.path()).unwrap();
@@ -445,8 +459,9 @@ async fn credentials_http_and_gateway_refuse_unknown_fields_and_unknown_sessions
             control
                 .mutate_credentials(
                     "absent",
-                    Mutation::LogoutBare {
-                        provider: "fake".into()
+                    Mutation::Logout {
+                        provider: "fake".into(),
+                        account_label: DEFAULT_ACCOUNT_LABEL.into()
                     }
                 )
                 .await
@@ -456,7 +471,9 @@ async fn credentials_http_and_gateway_refuse_unknown_fields_and_unknown_sessions
             continue;
         };
         for body in [
-            serde_json::json!({"action":"logout_bare", "provider":"fake", "unknown":true}),
+            serde_json::json!({
+                "action":"logout", "provider":"fake", "account_label":"", "unknown":true
+            }),
             serde_json::json!({
                 "action":"store", "provider":"fake",
                 "target":{"kind":"new", "label":null, "unknown":true},
@@ -528,8 +545,9 @@ async fn credentials_cold_and_locked_anchors_never_resume_or_repair_logs() {
                 control
                     .mutate_credentials(
                         routed,
-                        Mutation::LogoutBare {
-                            provider: "fake".into()
+                        Mutation::Logout {
+                            provider: "fake".into(),
+                            account_label: DEFAULT_ACCOUNT_LABEL.into()
                         }
                     )
                     .await

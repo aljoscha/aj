@@ -903,10 +903,8 @@ pub(crate) enum AuthPickerAction {
         provider_name: String,
         target: LoginTarget,
     },
-    /// Apply an action to one or more labeled accounts.
+    /// Apply an action to one or more stored accounts.
     ApplyAccount(AccountAction),
-    /// Remove a provider's bare credential.
-    LogoutBare { provider_id: String },
 }
 
 /// One auth picker row with separate render, search, and action identity.

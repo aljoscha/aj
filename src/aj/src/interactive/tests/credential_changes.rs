@@ -46,9 +46,10 @@ async fn credential_writes_and_logout_refresh_keep_the_drive_responsive() {
         );
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let request = if logout {
-            AuthPickerAction::LogoutBare {
+            AuthPickerAction::ApplyAccount(AccountAction::Logout {
                 provider_id: "anthropic".into(),
-            }
+                account_label: String::new(),
+            })
         } else {
             AuthPickerAction::ApplyAccount(AccountAction::SetDefault {
                 provider_id: "anthropic".into(),

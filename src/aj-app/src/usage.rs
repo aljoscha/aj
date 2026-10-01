@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use chrono::{Datelike, Local, TimeZone, Utc};
 
-use aj_models::auth::{AuthStorage, StoredProviderCredentials};
+use aj_models::auth::AuthStorage;
 #[cfg(test)]
 use aj_models::usage::ProviderUsage;
 use aj_models::usage::{UsageError, UsageReport, UsageSource, default_usage_sources};
@@ -105,11 +105,11 @@ fn usage_error_message(error: UsageError) -> String {
 const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openrouter"];
 
 /// Fetch usage for every provider account concurrently: one status per
-/// stored account label, or one bare status when the provider has no labeled
-/// accounts. A runtime `--api-key` override also collapses the provider to one
-/// bare status, because the store serves the override for every label and
-/// labeled rows would all show the same numbers. Source-less known providers
-/// get `NoSource` rows the same way. Statuses are sorted by provider id, then
+/// stored account label, or one provider-level status when the provider has
+/// no stored accounts. A runtime `--api-key` override also collapses the
+/// provider to one provider-level status, because the store serves the
+/// override for every label and labeled rows would all show the same numbers.
+/// Source-less known providers get `NoSource` rows the same way. Statuses are sorted by provider id, then
 /// account, for a stable display order.
 pub async fn collect_usage(auth: &AuthStorage) -> Vec<ProviderUsageStatus> {
     collect_usage_from_sources(auth, default_usage_sources(), SOURCE_TIMEOUT).await
@@ -219,11 +219,11 @@ async fn account_names(
     provider_id: &str,
     timeout: std::time::Duration,
 ) -> Result<Vec<(Option<String>, String)>, String> {
-    let bare = || vec![(None, api_provider_name(provider_id).to_string())];
+    let provider_level = || vec![(None, api_provider_name(provider_id).to_string())];
     if auth.has_runtime_override(provider_id).await {
-        return Ok(bare());
+        return Ok(provider_level());
     }
-    let stored = match tokio::time::timeout(timeout, auth.stored_credentials(provider_id)).await {
+    let stored = match tokio::time::timeout(timeout, auth.accounts(provider_id)).await {
         Ok(Ok(stored)) => stored,
         Ok(Err(err)) => return Err(usage_error_message(err.into())),
         Err(_) => return Err("timed out".to_string()),
@@ -236,14 +236,13 @@ async fn account_names(
     let name =
         |credential: &_| credential_provider_name(provider_id, credential, oauth_name).to_string();
     Ok(match stored {
-        Some(StoredProviderCredentials::Bare(credential)) => vec![(None, name(&credential))],
-        Some(StoredProviderCredentials::Accounts(set)) if set.accounts.is_empty() => bare(),
-        Some(StoredProviderCredentials::Accounts(set)) => set
+        Some(set) if set.accounts.is_empty() => provider_level(),
+        Some(set) => set
             .accounts
             .into_iter()
             .map(|(label, credential)| (Some(label), name(&credential)))
             .collect(),
-        None => bare(),
+        None => provider_level(),
     })
 }
 
@@ -559,7 +558,7 @@ mod tests {
                     reset_credits: None,
                 })),
                 None => Ok(UsageReport::Unsupported {
-                    reason: "bare credential".to_string(),
+                    reason: "provider-level source".to_string(),
                 }),
                 Some(other) => panic!("unexpected account {other}"),
             }
@@ -644,7 +643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_runtime_override_collapses_the_provider_to_one_bare_row() {
+    async fn a_runtime_override_collapses_the_provider_to_one_provider_level_row() {
         let dir = TempDir::with_prefix("aj-usage-override-").expect("create temp dir");
         let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
         seed_accounts(&auth, "anthropic").await;
@@ -664,7 +663,7 @@ mod tests {
         assert_eq!(labels(&anthropic), vec![None]);
         assert!(matches!(
             &anthropic[0].outcome,
-            UsageOutcome::Unsupported { reason } if reason == "bare credential"
+            UsageOutcome::Unsupported { reason } if reason == "provider-level source"
         ));
         assert_eq!(*calls.lock().unwrap(), vec![None]);
     }

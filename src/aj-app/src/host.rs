@@ -1647,14 +1647,11 @@ impl SessionHost {
         let provider = provider.as_str();
         let auth = &self.inner.shared.auth;
         let (default, accounts) = match auth
-            .stored_credentials(provider)
+            .accounts(provider)
             .await
             .map_err(|err| HostError::Internal(err.into()))?
         {
-            Some(aj_models::auth::StoredProviderCredentials::Bare(_)) => {
-                (Some(String::new()), vec![String::new()])
-            }
-            Some(aj_models::auth::StoredProviderCredentials::Accounts(set)) => (
+            Some(set) => (
                 Some(set.default),
                 set.accounts.into_iter().map(|(label, _)| label).collect(),
             ),

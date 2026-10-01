@@ -5,7 +5,6 @@
 //! the host is this process or a remote one. Only the finished credentials
 //! travel, as a `store` mutation the host commits under its own lock.
 
-use aj_models::auth::DEFAULT_ACCOUNT_LABEL;
 use aj_models::oauth::{OAuthCallbacks, OAuthError, OAuthProvider};
 use aj_wire::{CredentialMutation, CredentialStore, StoredCredentialMetadata};
 use async_trait::async_trait;
@@ -17,20 +16,17 @@ pub enum LoginTarget {
     /// for the provider (see [`LoginTarget::new_account`]); a label is asked
     /// for when there are any.
     NewAccount { existing: Vec<String> },
-    /// Replace the selected bare credential or exact labeled account.
-    ExistingAccount(Option<String>),
+    /// Replace the selected exact account. An empty label is the unnamed
+    /// account.
+    ExistingAccount(String),
 }
 
 impl LoginTarget {
-    /// A new account next to whatever the host currently holds. A bare
-    /// credential occupies the unnamed label.
+    /// A new account next to whatever the host currently holds.
     pub fn new_account(stored: Option<&StoredCredentialMetadata>) -> Self {
-        let existing = match stored {
-            None => Vec::new(),
-            Some(StoredCredentialMetadata::Bare) => vec![DEFAULT_ACCOUNT_LABEL.to_string()],
-            Some(StoredCredentialMetadata::Accounts { accounts, .. }) => accounts.clone(),
-        };
-        Self::NewAccount { existing }
+        Self::NewAccount {
+            existing: stored.map_or_else(Vec::new, |stored| stored.accounts.clone()),
+        }
     }
 }
 
@@ -133,7 +129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_login_is_bare_and_later_ones_are_labelled() {
+    async fn first_login_is_unlabelled_and_later_ones_are_labelled() {
         let provider = Provider {
             logins: Mutex::new(0),
         };
@@ -150,8 +146,11 @@ mod tests {
         ));
         assert!(cb.prompted.lock().unwrap().is_empty());
 
-        let bare = StoredCredentialMetadata::Bare;
-        let second = login(&provider, LoginTarget::new_account(Some(&bare)), &cb)
+        let unnamed = StoredCredentialMetadata {
+            default: String::new(),
+            accounts: vec![String::new()],
+        };
+        let second = login(&provider, LoginTarget::new_account(Some(&unnamed)), &cb)
             .await
             .unwrap();
         assert!(matches!(
@@ -159,21 +158,14 @@ mod tests {
             CredentialMutation::Store { target: CredentialStore::New { label: Some(label) }, .. }
                 if label == "work"
         ));
-        assert_eq!(
-            *cb.prompted.lock().unwrap(),
-            [vec![DEFAULT_ACCOUNT_LABEL.to_string()]]
-        );
+        assert_eq!(*cb.prompted.lock().unwrap(), [vec![String::new()]]);
 
-        let replace = login(
-            &provider,
-            LoginTarget::ExistingAccount(Some("work".into())),
-            &cb,
-        )
-        .await
-        .unwrap();
+        let replace = login(&provider, LoginTarget::ExistingAccount("work".into()), &cb)
+            .await
+            .unwrap();
         assert!(matches!(
             replace,
-            CredentialMutation::Store { target: CredentialStore::Replace { label: Some(label) }, .. }
+            CredentialMutation::Store { target: CredentialStore::Replace { label }, .. }
                 if label == "work"
         ));
         assert_eq!(cb.prompted.lock().unwrap().len(), 1);
@@ -185,7 +177,7 @@ mod tests {
         let provider = Provider {
             logins: Mutex::new(0),
         };
-        let stored = StoredCredentialMetadata::Accounts {
+        let stored = StoredCredentialMetadata {
             default: "work".into(),
             accounts: vec!["work".into(), "home".into()],
         };

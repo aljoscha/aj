@@ -10,14 +10,12 @@ pub struct CredentialOverview {
     pub stored: std::collections::BTreeMap<String, StoredCredentialMetadata>,
 }
 
+/// The account labels a provider stores, never their credentials. An empty
+/// label is the unnamed account.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum StoredCredentialMetadata {
-    Bare,
-    Accounts {
-        default: String,
-        accounts: Vec<String>,
-    },
+pub struct StoredCredentialMetadata {
+    pub default: String,
+    pub accounts: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,7 +32,8 @@ pub struct CredentialStatus {
     /// Host display label. Clients use `provider_id` when this is empty.
     #[serde(default)]
     pub provider_name: String,
-    /// Exact account identity. None denotes a bare credential or provider source.
+    /// Exact stored account identity. None denotes a provider-level source
+    /// such as a runtime override, an environment key, or nothing configured.
     pub account_label: Option<String>,
     /// Whether this account is the store default.
     pub is_default: bool,
@@ -46,7 +45,7 @@ pub struct CredentialStatus {
 }
 
 /// A mutation of the host's credential store. Every variant retains the
-/// store's exact-label and storage-shape checks at lock time.
+/// store's exact-label checks at lock time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialMutation {
@@ -56,9 +55,6 @@ pub enum CredentialMutation {
         provider: String,
         target: CredentialStore,
         credentials: OAuthCredentials,
-    },
-    LogoutBare {
-        provider: String,
     },
     Logout {
         provider: String,
@@ -85,11 +81,12 @@ pub enum CredentialMutation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialStore {
-    /// `None` is a provider's first, bare credential. `Some(label)` adds an
-    /// account, including the unnamed account for `Some("")`.
+    /// `None` is a provider's first login, stored as the unnamed account and
+    /// refused if the provider gained a credential meanwhile. `Some(label)`
+    /// adds an account, including the unnamed account for `Some("")`.
     New { label: Option<String> },
-    /// `None` replaces the bare credential, `Some(label)` that exact account.
-    Replace { label: Option<String> },
+    /// Replace that exact account. An empty label is the unnamed account.
+    Replace { label: String },
 }
 
 /// A storage refusal is an outcome, distinct from a failed transport whose
