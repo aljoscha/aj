@@ -8,7 +8,7 @@
 //! because nothing downstream of the adapter knows the rates.
 
 use aj_agent::message::AgentMessage;
-use aj_app::session_info::{InfoRow, digest};
+use aj_app::session_info::{InfoRow, digest, to_wire};
 use aj_models::anthropic::provider::replay_sse_events;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
 use aj_models::types::{AssistantMessage, Message, Usage, UserMessage};
@@ -220,7 +220,7 @@ fn a_truncated_turn_contributes_tokens_and_dollars() {
 fn the_overlay_token_rows_sum_to_the_total_it_prints() {
     let (_dir, log) = log_with(vec![completed_turn(), truncated_turn(), completed_turn()]);
     let stats = log.stats();
-    let rows = digest(&stats, None);
+    let rows = digest(&to_wire(&stats), None);
 
     let parts = number(&rows, "input")
         + number(&rows, "output")
@@ -253,7 +253,7 @@ fn the_overlay_token_rows_sum_when_a_compaction_spent() {
     let turn_tokens = summarizer.total_tokens;
     let (_dir, log) = log_with_compaction(vec![completed_turn()], summarizer);
     let stats = log.stats();
-    let rows = digest(&stats, None);
+    let rows = digest(&to_wire(&stats), None);
 
     let total = number(&rows, "total tokens");
     // The compaction's spend has to be IN the total, or the rows sum

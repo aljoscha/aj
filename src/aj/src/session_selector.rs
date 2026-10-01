@@ -29,7 +29,7 @@ use std::rc::{Rc, Weak};
 
 use aj_app::keybindings::{ACTION_SESSION_TOGGLE_ARCHIVED, action_shortcut};
 use aj_app::session::SessionRequest;
-use aj_session::SessionPreview;
+use aj_wire::SessionPreview;
 use aj_wire::{DirectoryHost, SessionSummary};
 use chrono::{DateTime, Datelike, Utc};
 use vaxis::vxfw::{

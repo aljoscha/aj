@@ -7,7 +7,7 @@
 //! as free.
 
 use aj_agent::message::AgentMessage;
-use aj_app::session_info::{InfoRow, digest};
+use aj_app::session_info::{InfoRow, digest, to_wire};
 use aj_models::registry::{ModelCost, calculate_cost};
 use aj_models::types::{
     AssistantContent, AssistantMessage, Message, StopReason, TextContent, Usage, UserMessage,
@@ -148,7 +148,7 @@ fn a_mixed_model_session_totals_the_sum_of_its_per_response_costs() {
 
     let (_dir, log) = log_with(vec![on_dear, on_cheap]);
     let stats = log.stats();
-    let rows = digest(&stats, None);
+    let rows = digest(&to_wire(&stats), None);
 
     assert_eq!(
         row(&rows, "cost"),
@@ -201,7 +201,7 @@ fn a_session_that_burned_tokens_never_reports_zero_cost() {
         ),
     ]);
     let stats = log.stats();
-    let rows = digest(&stats, None);
+    let rows = digest(&to_wire(&stats), None);
 
     let tokens = row(&rows, "total tokens");
     assert_ne!(

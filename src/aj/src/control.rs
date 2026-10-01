@@ -237,12 +237,7 @@ impl Control {
                     .map(|provider| provider.id.as_str()),
             )
             .chain(settings.accounts.keys().map(String::as_str))
-            .chain(
-                settings
-                    .model
-                    .as_ref()
-                    .map(|(provider, _)| provider.as_str()),
-            )
+            .chain(settings.model.as_ref().map(|model| model.api.as_str()))
             .chain(additional_providers.iter().map(String::as_str))
             .collect();
         // One read per provider, all in flight at once. Results keep the
@@ -370,12 +365,12 @@ impl Control {
     pub(crate) async fn session_info(
         &self,
         session: &str,
-    ) -> Result<aj_session::SessionStats, ControlError> {
+    ) -> Result<aj_wire::SessionInfo, ControlError> {
         match self {
-            Self::Local(local) => Ok(local.host.session_info(session).await?),
-            Self::Remote(remote) => Ok(aj_app::session_info::from_wire(
-                remote.client.session_info(session).await?,
+            Self::Local(local) => Ok(aj_app::session_info::to_wire(
+                &local.host.session_info(session).await?,
             )),
+            Self::Remote(remote) => Ok(remote.client.session_info(session).await?),
         }
     }
 
@@ -510,9 +505,7 @@ impl Control {
     pub(crate) async fn session_previews(
         &self,
         ids: Vec<String>,
-        tx: tokio::sync::mpsc::UnboundedSender<
-            Result<Vec<aj_session::SessionPreview>, ControlError>,
-        >,
+        tx: tokio::sync::mpsc::UnboundedSender<Result<Vec<aj_wire::SessionPreview>, ControlError>>,
     ) {
         // Batches start in the order given so the first rows fill first. A few
         // in flight let healthy hosts make progress beside a slow one.
@@ -524,22 +517,21 @@ impl Control {
                         .host
                         .session_previews_for(&batch)
                         .await
-                        .map(|previews| (previews, Vec::new()))
+                        .map(|previews| {
+                            (
+                                previews
+                                    .iter()
+                                    .map(aj_app::session_preview::to_wire)
+                                    .collect(),
+                                Vec::new(),
+                            )
+                        })
                         .map_err(ControlError::from),
                     Self::Remote(remote) => remote
                         .client
                         .session_previews(&batch)
                         .await
-                        .map(|answer| {
-                            (
-                                answer
-                                    .previews
-                                    .into_iter()
-                                    .map(aj_app::session_preview::from_wire)
-                                    .collect(),
-                                answer.incomplete,
-                            )
-                        })
+                        .map(|answer| (answer.previews, answer.incomplete))
                         .map_err(ControlError::from),
                 }
             })
@@ -1015,12 +1007,7 @@ mod preview_tests {
         bounded("preview scan", control.session_previews(ids.to_vec(), tx)).await;
         let mut rows = Vec::new();
         while let Some(batch) = rx.recv().await {
-            rows.extend(
-                batch
-                    .expect("preview batch")
-                    .iter()
-                    .map(aj_app::session_preview::to_wire),
-            );
+            rows.extend(batch.expect("preview batch"));
         }
         rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         rows

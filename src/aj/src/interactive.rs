@@ -51,7 +51,8 @@ use aj_models::oauth::OAuthError;
 use aj_models::registry::ModelInfo;
 use aj_models::types::UserContent;
 use aj_models::{ThinkingConfig, thinking_config_from_name};
-use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter};
+use aj_session::{ConversationPersistence, PromptEntry, ThreadFilter};
+use aj_wire::SessionPreview;
 use aj_wire::{
     CredentialMutation, CredentialOutcome, CredentialOverview, StoredCredentialMetadata,
 };
@@ -18429,7 +18430,7 @@ mod tests {
                 .await
                 .unwrap()
                 .settings,
-            world.handles().log.lock().await.stats().settings,
+            aj_app::session_info::to_wire(&world.handles().log.lock().await.stats()).settings,
             "session info reports recorded facts, not runtime defaults"
         );
         apply_command(

@@ -35,8 +35,8 @@ use aj_app::keybindings::{
 };
 use aj_app::theme::{Theme, ThemeColor};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
-use aj_session::SessionStats;
 use aj_wire::CredentialStatus;
+use aj_wire::SessionInfo;
 use unicode_segmentation::UnicodeSegmentation;
 use vaxis::cell::{Segment, Style};
 use vaxis::key::{Key, Modifiers};
@@ -764,7 +764,7 @@ pub(crate) fn usage_rows(
 /// are split into numbered continuation rows before they reach [`RichText`](vaxis::vxfw::RichText).
 /// This keeps every valid pair distinguishable and terminal-inert while
 /// bounding the work and height of each unbounded [`ListView`] child.
-pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<Row> {
+pub(crate) fn session_info_rows(stats: &SessionInfo, tag: Option<&str>) -> Vec<Row> {
     let tag = tag.map(one_line);
     let rows = aj_app::session_info::digest(stats, tag.as_deref());
     let key_width = rows
@@ -860,7 +860,7 @@ mod tests {
     use aj_app::keybindings::ACTION_PALETTE_OPEN;
     use aj_app::theme::ColorMode;
     use aj_models::types::{Usage, UsageCost};
-    use aj_session::{SessionSettings, UsageBucket};
+    use aj_wire::{BranchSettings, RecordedModel, UsageBucket};
     use vaxis::cell::Color;
     use vaxis::gwidth::Method;
 
@@ -1647,8 +1647,8 @@ mod tests {
         assert!(terminal_cells(&row_text(&rows[0]), Method::Unicode) < 512);
     }
 
-    fn sample_stats() -> SessionStats {
-        SessionStats {
+    fn sample_stats() -> SessionInfo {
+        SessionInfo {
             session_id: "2026-06-19-14-22-03-512".to_string(),
             path: PathBuf::from("/home/u/.aj/sessions/home-u-proj/2026-06-19-14-22-03-512.jsonl"),
             created_at: None,
@@ -1698,16 +1698,13 @@ mod tests {
                 unpriced_responses: 0,
             }],
             compaction_usage: Usage::default(),
-            settings: SessionSettings {
-                model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
+            settings: BranchSettings {
+                model: Some(RecordedModel {
+                    api: "anthropic".to_string(),
+                    name: "claude-sonnet-4-5".to_string(),
+                }),
                 thinking: Some("medium".to_string()),
-                speed: None,
-                verbosity: None,
-                accounts: Default::default(),
-                oracle_model: None,
-                oracle_thinking: None,
-                oracle_speed: None,
-                oracle_verbosity: None,
+                ..BranchSettings::default()
             },
             session_env: None,
         }

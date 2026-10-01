@@ -1,11 +1,12 @@
 //! Frontend-agnostic session-info digest.
 //!
-//! Turns a [`SessionStats`] into an ordered list of [`InfoRow`]s:
+//! Turns an [`aj_wire::SessionInfo`] into an ordered list of [`InfoRow`]s:
 //! labelled sections, key/value pairs, and blank spacers between
 //! sections. The frontend renders these rows as styled spans; keeping
 //! the digest here keeps its content independent of how it is drawn.
 
-use aj_session::{SessionStats, UsageBucket};
+use aj_session::SessionStats;
+use aj_wire::{SessionInfo, UsageBucket};
 use chrono::{DateTime, Utc};
 
 /// Copy all recorded session facts into their wire representation.
@@ -64,54 +65,6 @@ pub fn to_wire(stats: &SessionStats) -> aj_wire::SessionInfo {
     }
 }
 
-/// Recover all recorded session facts without resolving defaults or rendering values.
-pub fn from_wire(info: aj_wire::SessionInfo) -> SessionStats {
-    SessionStats {
-        session_id: info.session_id,
-        path: info.path,
-        created_at: info.created_at,
-        last_activity: info.last_activity,
-        size_bytes: info.size_bytes,
-        total_entries: info.total_entries,
-        user_messages: info.user_messages,
-        assistant_messages: info.assistant_messages,
-        tool_results: info.tool_results,
-        tool_calls: info.tool_calls,
-        tool_call_counts: info.tool_call_counts,
-        subagents: info.subagents,
-        compactions: info.compactions,
-        usage: info.usage,
-        usage_breakdown: info
-            .usage_breakdown
-            .into_iter()
-            .map(|bucket| UsageBucket {
-                provider: bucket.provider,
-                model: bucket.model,
-                account: bucket.account,
-                usage: bucket.usage,
-                responses: bucket.responses,
-                unpriced_responses: bucket.unpriced_responses,
-            })
-            .collect(),
-        compaction_usage: info.compaction_usage,
-        settings: aj_session::SessionSettings {
-            oracle_model: info
-                .settings
-                .oracle_model
-                .map(|model| (model.api, model.name)),
-            oracle_thinking: info.settings.oracle_thinking,
-            oracle_speed: info.settings.oracle_speed,
-            oracle_verbosity: info.settings.oracle_verbosity,
-            model: info.settings.model.map(|model| (model.api, model.name)),
-            accounts: info.settings.accounts,
-            thinking: info.settings.thinking,
-            speed: info.settings.speed,
-            verbosity: info.settings.verbosity,
-        },
-        session_env: info.session_env,
-    }
-}
-
 /// One digest row: a section header, an ordinary key/value pair, a raw
 /// environment pair, or a blank spacer between sections.
 ///
@@ -140,7 +93,7 @@ fn kv(key: &str, value: &str) -> InfoRow {
 ///
 /// `tag` is the label the session carries, which lives beside the log rather
 /// than in it, so the caller supplies it.
-pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
+pub fn digest(stats: &SessionInfo, tag: Option<&str>) -> Vec<InfoRow> {
     let total_messages = stats.user_messages + stats.assistant_messages + stats.tool_results;
 
     let mut rows: Vec<InfoRow> = vec![
@@ -172,7 +125,7 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
                 .settings
                 .oracle_model
                 .as_ref()
-                .map(|(provider, model)| format!("{provider} / {model}"))
+                .map(|model| format!("{} / {}", model.api, model.name))
                 .unwrap_or_else(|| "(not recorded)".to_string()),
         ),
         kv(
@@ -262,7 +215,7 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
 /// Project name = the per-project sessions directory the file lives in
 /// (`~/.aj/sessions/<project>/<id>.jsonl`). Derived from the path since
 /// the log itself does not carry it.
-fn project_name(stats: &SessionStats) -> String {
+fn project_name(stats: &SessionInfo) -> String {
     stats
         .path
         .parent()
@@ -272,9 +225,9 @@ fn project_name(stats: &SessionStats) -> String {
         .to_string()
 }
 
-fn model_label(stats: &SessionStats) -> String {
+fn model_label(stats: &SessionInfo) -> String {
     match &stats.settings.model {
-        Some((provider, model_id)) => format!("{provider} / {model_id}"),
+        Some(model) => format!("{} / {}", model.api, model.name),
         None => "(unset)".to_string(),
     }
 }
@@ -303,7 +256,7 @@ fn cost_label(total: f64) -> String {
     format!("${total:.4}")
 }
 
-fn session_cost_label(stats: &SessionStats) -> String {
+fn session_cost_label(stats: &SessionInfo) -> String {
     let mut label = cost_label(stats.usage.cost.total);
     let responses: usize = stats.usage_breakdown.iter().map(|b| b.responses).sum();
     let unpriced: usize = stats
@@ -351,7 +304,7 @@ fn bucket_value(bucket: &UsageBucket) -> String {
 /// Compaction is the one cost with no message behind it, so without a
 /// line of its own it is spend the reader cannot attribute to anything
 /// they remember doing.
-fn compaction_label(stats: &SessionStats) -> String {
+fn compaction_label(stats: &SessionInfo) -> String {
     let runs = stats.compactions;
     if runs == 0 {
         return "(none)".to_string();
@@ -370,7 +323,7 @@ mod tests {
     use std::path::PathBuf;
 
     use aj_models::types::{Usage, UsageCost};
-    use aj_session::SessionSettings;
+    use aj_session::{SessionSettings, UsageBucket};
 
     use super::*;
 
@@ -487,7 +440,7 @@ mod tests {
 
     #[test]
     fn digest_sections_values_and_spacers_in_order() {
-        let rows = view(&digest(&sample_stats(), Some("fix-auth")));
+        let rows = view(&digest(&to_wire(&sample_stats()), Some("fix-auth")));
 
         // The section headers appear in order, each preceded by a blank
         // spacer once the first section is done.
@@ -565,7 +518,7 @@ mod tests {
         stats.settings.oracle_speed = Some("fast".into());
         stats.settings.oracle_verbosity = Some("default".into());
 
-        let rows = view(&digest(&stats, None));
+        let rows = view(&digest(&to_wire(&stats), None));
         let oracle = rows
             .iter()
             .position(|row| row == &RowView::Header("Oracle settings".into()))
@@ -586,7 +539,7 @@ mod tests {
     /// with no environment record keeps the prior digest shape.
     #[test]
     fn digest_lists_the_recorded_environment_only_when_it_exists() {
-        let without_env = view(&digest(&sample_stats(), None));
+        let without_env = view(&digest(&to_wire(&sample_stats()), None));
         assert!(
             !without_env
                 .iter()
@@ -596,7 +549,7 @@ mod tests {
 
         let mut stats = sample_stats();
         stats.session_env = Some(std::collections::BTreeMap::new());
-        let empty = view(&digest(&stats, None));
+        let empty = view(&digest(&to_wire(&stats), None));
         let env = empty
             .iter()
             .position(|row| row == &RowView::Header("Env".to_string()))
@@ -611,7 +564,7 @@ mod tests {
             ("BEADS_ACTOR".to_string(), "azurite".to_string()),
             ("WORKTREE".to_string(), "/home/ubuntu/work/aj-1".to_string()),
         ]));
-        let rows = view(&digest(&stats, None));
+        let rows = view(&digest(&to_wire(&stats), None));
         let settings = rows
             .iter()
             .position(|row| row == &RowView::Header("Settings".to_string()))
@@ -651,13 +604,13 @@ mod tests {
             ..Usage::default()
         };
         assert_eq!(
-            value_of(&digest(&stats, None), "of which compaction"),
+            value_of(&digest(&to_wire(&stats), None), "of which compaction"),
             "3 runs, 40900 tokens, $0.2500"
         );
 
         stats.compactions = 0;
         assert_eq!(
-            value_of(&digest(&stats, None), "of which compaction"),
+            value_of(&digest(&to_wire(&stats), None), "of which compaction"),
             "(none)"
         );
     }
@@ -670,7 +623,7 @@ mod tests {
         stats.usage_breakdown[1].usage.cost = UsageCost::default();
         stats.usage_breakdown[1].unpriced_responses = 6;
 
-        let rows = digest(&stats, None);
+        let rows = digest(&to_wire(&stats), None);
 
         assert_eq!(
             value_of(&rows, "cost"),
@@ -699,7 +652,7 @@ mod tests {
     /// shape does not depend on whether a label happens to be set.
     #[test]
     fn an_untagged_session_reads_as_none() {
-        let rows = view(&digest(&sample_stats(), None));
+        let rows = view(&digest(&to_wire(&sample_stats()), None));
         assert!(
             rows.contains(&RowView::Kv("tag".to_string(), "(none)".to_string())),
             "{rows:?}",

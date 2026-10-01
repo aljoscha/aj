@@ -6592,7 +6592,7 @@ async fn info_overlay_usage_includes_blocking_and_background_sub_agents() {
             sub_agent_input > 0,
             "{label}: the fixture must bill the sub-agent's thread"
         );
-        let rows = aj_app::session_info::digest(&log.stats(), None);
+        let rows = aj_app::session_info::digest(&aj_app::session_info::to_wire(&log.stats()), None);
         let input = rows.iter().find_map(|row| match row {
             aj_app::session_info::InfoRow::Kv { key, value } if key == "input" => {
                 Some(value.clone())
