@@ -805,10 +805,11 @@ fn fingerprint_into(entry: &Entry, chat: &ChatState, hasher: &mut DefaultHasher)
             notice_level_tag(n.level).hash(hasher);
             n.text.hash(hasher);
         }
-        // Turn-usage rows are immutable after append, so the id and width
-        // already distinguish them. The discriminant is defence in depth.
-        EntryKind::TurnUsage(_) => {
+        // A usage row is rewritten in place when its source's usage is
+        // re-applied, so the rendered line itself is hashed.
+        EntryKind::TurnUsage(u) => {
             6u8.hash(hasher);
+            u.line().hash(hasher);
         }
         EntryKind::TaskNotification(n) => {
             7u8.hash(hasher);
@@ -7499,6 +7500,42 @@ mod tests {
         let after = crate::test_support::rows(&view.draw(&ctx)).join("\n");
         assert!(after.contains("bad") && after.contains("yay"), "{after}");
         assert!(!after.contains("old") && !after.contains("new"), "{after}");
+    }
+
+    /// A re-applied usage update rewrites its row in place, and the rewrite
+    /// can keep the line's length, so the cached render must still refresh.
+    #[test]
+    fn rewritten_usage_row_renders_the_new_numbers() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        let assistant = assistant_message_end(text_message("answer"));
+        let usage = |input| AgentEvent::UsageUpdate {
+            agent_id: AgentId::Main,
+            usage: aj_agent::types::TokenUsage {
+                accumulated_input: 0,
+                turn_input: input,
+                accumulated_output: 0,
+                turn_output: 0,
+                accumulated_cache_write: 0,
+                turn_cache_write: 0,
+                accumulated_cache_read: 0,
+                turn_cache_read: 0,
+            },
+        };
+        apply(&chat, &mut life, assistant.clone());
+        apply(&chat, &mut life, usage(100));
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(80, 24);
+        let _ = view.draw(&ctx);
+        let first = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(first.contains("0+100"), "{first}");
+        assert!(view.cache.borrow().hits > 0, "usage row warmed");
+
+        apply(&chat, &mut life, assistant);
+        apply(&chat, &mut life, usage(200));
+        let after = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(after.contains("0+200"), "{after}");
+        assert!(!after.contains("0+100"), "one row, rewritten: {after}");
     }
 
     /// Assistant text growth changes the fingerprint, so the second render
