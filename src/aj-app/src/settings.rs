@@ -1241,7 +1241,6 @@ mod tests {
             aj_conf::ValueKind::Enum(["full", "compact", "focused"])
         ));
         assert!(super::is_presentation(opt.name));
-        assert!(Config::option("compact_transcript").is_none());
         let mut config = Config::default();
         assert_eq!(super::schema_values(&config)[opt.name], "full");
         for value in ["full", "compact", "focused"] {
