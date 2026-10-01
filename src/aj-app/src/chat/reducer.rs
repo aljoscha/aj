@@ -136,12 +136,24 @@ pub fn reduce(
             // need no identity.
             let message_id = match &message.kind {
                 AgentMessageKind::Wire(Message::User(_) | Message::Assistant(_))
-                | AgentMessageKind::TaskNotification(_) => durable_id(message.id()),
-                AgentMessageKind::Wire(Message::ToolResult(_))
-                | AgentMessageKind::InternalContext(_) => None,
+                | AgentMessageKind::TaskNotification(_)
+                | AgentMessageKind::InternalContext(_) => durable_id(message.id()),
+                AgentMessageKind::Wire(Message::ToolResult(_)) => None,
             };
             match message.kind {
-                AgentMessageKind::InternalContext(_) => Redraw(false),
+                AgentMessageKind::InternalContext(context) => {
+                    let Some(notice) = context.notice else {
+                        return Redraw(false);
+                    };
+                    record_notice(
+                        state,
+                        agent_id,
+                        NoticeLevel::Info,
+                        notice,
+                        message_id.as_deref(),
+                    );
+                    Redraw(true)
+                }
                 AgentMessageKind::Wire(Message::User(user)) => reduce_user_end(
                     state,
                     agent_id,

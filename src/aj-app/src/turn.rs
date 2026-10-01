@@ -571,7 +571,11 @@ pub async fn drive_turn(
             .await;
             return Ok(());
         }
-        TurnStart::Goal(text) => agent.prompt_context(text, cancel.clone()).await,
+        TurnStart::Goal(text) => {
+            agent
+                .prompt_context(text, Some("Continuing goal".into()), cancel.clone())
+                .await
+        }
         TurnStart::Prompt(text) => agent.prompt(text, cancel.clone()).await,
         TurnStart::Content(content) => agent.prompt_with_content(content, cancel.clone()).await,
         TurnStart::Wake => agent.wake(cancel.clone()).await.map(|_| ()),

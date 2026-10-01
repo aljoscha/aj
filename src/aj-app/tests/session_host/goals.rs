@@ -1013,6 +1013,86 @@ async fn goal_clear_supersedes_historical_instructions_live_and_after_reopen() {
 }
 
 #[tokio::test]
+async fn goal_idle_continuation_notice_is_visible_live_and_after_reopen() {
+    let (h, provider) = recorded(vec![
+        calling(
+            "setting goal",
+            "create",
+            "create_goal",
+            json!({"objective":"Verify the entire requested change"}),
+        ),
+        finalized_text_message("first part done"),
+        calling(
+            "verified everything",
+            "done",
+            "update_goal",
+            json!({"status":"complete"}),
+        ),
+        finalized_text_message("all done"),
+        finalized_text_message("ordinary answer"),
+    ]);
+    let session = h.create().await;
+    let mut live = Client::attach(&h.host, &session).await;
+    let cursor = live.client.cursor().unwrap().clone();
+    h.prompt(&session, "Set a goal to verify the entire requested change")
+        .await;
+    wait_goal(&h, &session, GoalStatus::Complete).await;
+    let frames = frames_until(&mut live.stream, "completed goal", |frame| {
+        matches!(frame, Frame::State { working: false, goal: Some(goal), .. }
+            if goal.status == GoalStatus::Complete)
+    })
+    .await;
+    for frame in frames {
+        let _ = live.client.apply(&mut live.chat, frame);
+    }
+    h.prompt(&session, "Explain the result without resuming")
+        .await;
+    live.pump_until_idle().await;
+
+    let assert_notice = |client: &Client| {
+        use aj_app::test_support::CanonicalEntry;
+        let state = client.canonical();
+        assert_eq!(
+            all_notices(&state),
+            vec![(AgentId::Main, "Continuing goal".into())],
+            "only idle pursuit is announced, not ordinary goal-state updates"
+        );
+        let rows = &state.agent(AgentId::Main).unwrap().entries;
+        let position = |text: &str| {
+            rows.iter()
+                .position(|row| match row {
+                    CanonicalEntry::Notice { text: notice, .. } => notice == text,
+                    CanonicalEntry::Assistant { message, .. } => message.to_string().contains(text),
+                    _ => false,
+                })
+                .unwrap()
+        };
+        assert!(position("first part done") < position("Continuing goal"));
+        assert!(position("Continuing goal") < position("verified everything"));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, CanonicalEntry::User { .. }))
+                .count(),
+            2,
+            "the continuation is not editable user input"
+        );
+    };
+    assert_notice(&live);
+    assert!(provider.contexts.lock().unwrap().iter().all(|context| {
+        !serde_json::to_string(context)
+            .unwrap()
+            .contains("Continuing goal")
+    }));
+    live.reattach(&h.host, cursor).await;
+    assert_notice(&live);
+    h.host.shutdown().await;
+    let revived = h.revive(Vec::new());
+    let replay = Client::attach(&revived.host, &session).await;
+    assert_notice(&replay);
+    revived.host.shutdown().await;
+}
+
+#[tokio::test]
 async fn goal_tools_continue_across_turns_and_account_only_the_goal_work() {
     let (h, provider) = recorded(vec![
         used(

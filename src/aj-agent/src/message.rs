@@ -99,11 +99,17 @@ impl AgentMessage {
 
     /// Application steering, distinct from editable user input.
     pub fn internal_context(text: String) -> Self {
+        Self::internal_context_with_notice(text, None)
+    }
+
+    /// Host context with an optional transcript notice, separate from model input.
+    pub fn internal_context_with_notice(text: String, notice: Option<String>) -> Self {
         Self {
             id: format!("{:032x}", rand::random::<u128>()),
             kind: AgentMessageKind::InternalContext(InternalContext {
                 tag: ContextTag::InternalContext,
                 text,
+                notice,
             }),
         }
     }
@@ -281,6 +287,7 @@ mod tests {
         assert!(!message.id().is_empty());
         let json = serde_json::to_value(&message).unwrap();
         assert_eq!(json["role"], "internal_context");
+        assert!(json.get("notice").is_none());
         let restored: AgentMessage = serde_json::from_value(json).unwrap();
         assert!(matches!(
             restored.kind,
@@ -291,6 +298,26 @@ mod tests {
             restored.to_projected_wire(),
             Some(Message::User(_))
         ));
+    }
+
+    #[test]
+    fn internal_context_notice_is_persisted_but_not_projected_to_the_model() {
+        let message = AgentMessage::internal_context_with_notice(
+            "host hint".into(),
+            Some("Continuing goal".into()),
+        );
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["notice"], "Continuing goal");
+        let restored: AgentMessage = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(&restored.kind, AgentMessageKind::InternalContext(context)
+            if context.notice.as_deref() == Some("Continuing goal"))
+        );
+        let Some(Message::User(user)) = restored.to_projected_wire() else {
+            panic!("context projects as user-role model input")
+        };
+        assert!(matches!(user.content.as_slice(), [UserContent::Text(text)]
+            if text.text == "host hint"));
     }
 
     #[test]
@@ -482,6 +509,9 @@ pub struct InternalContext {
     #[serde(rename = "role")]
     tag: ContextTag,
     pub text: String,
+    /// Display-only text. Without a notice, context stays hidden in the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

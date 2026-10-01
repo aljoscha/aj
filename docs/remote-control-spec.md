@@ -511,6 +511,10 @@ Goal state and usage persist on the user branch. Reopening a session or
 switching heads does not automatically pursue a restored goal. Explicit
 resume is required. Cancelling Main pauses pursuit. Reconnecting to a still
 live session does not pause it. Goal commands do not cancel a turn or its tools.
+Each idle-driven goal turn records internal context with a display-only `notice`
+field. The transcript renders it as a dim "Continuing goal" row, live and on
+replay, rather than as editable user input. Ordinary goal-state context stays
+hidden. The notice is not included in model input.
 Explicit pause, block and completion close goal accounting, whether requested
 by the user or the model. Later reporting and descendant results are outside
 that subtotal. Clearing a goal also stops its accounting and continuations.

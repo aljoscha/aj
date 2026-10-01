@@ -981,14 +981,18 @@ impl Agent {
     }
 
     /// Run a normal turn with host context instead of user-authored input.
+    /// An optional notice is shown in the transcript but not sent to the model.
     pub async fn prompt_context(
         &mut self,
         text: String,
+        notice: Option<String>,
         cancel: CancellationToken,
     ) -> Result<(), TurnError> {
         self.cancellation = cancel;
-        self.run_top_level_turn(Some(AgentMessage::internal_context(text)))
-            .await
+        self.run_top_level_turn(Some(AgentMessage::internal_context_with_notice(
+            text, notice,
+        )))
+        .await
     }
 
     /// Install the main-agent application capability. It is never inherited.
@@ -5600,7 +5604,7 @@ mod event_protocol_tests {
             .message_queues
             .append_follow_up(AgentId::Main, "new user request");
         agent
-            .prompt_context("continue goal".into(), CancellationToken::new())
+            .prompt_context("continue goal".into(), None, CancellationToken::new())
             .await
             .unwrap();
         let messages = recorded.lock().unwrap();
