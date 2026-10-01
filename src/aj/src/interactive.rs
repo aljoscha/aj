@@ -1690,16 +1690,15 @@ impl TransitionFailure {
         }
     }
 
-    fn refusal(&self) -> Option<(&str, Refusal)> {
-        match self {
-            Self::Attach(CatchUp::Refused { reason, refusal }) => Some((reason, *refusal)),
-            _ => None,
-        }
+    /// Whether the peer refused the attach. Its error frame already painted
+    /// the reason into the chat, so a refusal needs no warning row of its own.
+    fn refused(&self) -> bool {
+        matches!(self, Self::Attach(CatchUp::Refused { .. }))
     }
 }
 
-/// Present one failed user transition and preserve any action-local facts that
-/// a later authoritative Head projection must restore.
+/// Present one failed user transition. Recovery from the failure is the
+/// generic one for its outcome, whatever the transition was.
 fn fail_pending_transition(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
@@ -1717,7 +1716,7 @@ fn fail_pending_transition(
             if let Some(partial) = &partial {
                 fold_warning(world, partial);
             }
-            if failure.refusal().is_none() {
+            if !failure.refused() {
                 fold_warning(
                     world,
                     &format!("This client could not follow the created session: {reason}"),
@@ -1730,7 +1729,7 @@ fn fail_pending_transition(
             ));
         }
         PendingTransition::Switch { session, tag, .. } => {
-            if failure.refusal().is_none() {
+            if !failure.refused() {
                 fold_warning(
                     world,
                     &format!("This client could not follow the selected session: {reason}"),
@@ -1757,26 +1756,15 @@ fn fail_pending_transition(
             if restored_prompt {
                 toast.push_str(" Your message is back in the editor.");
             }
-            let (error, warning) = match failure.refusal() {
-                Some((reason, Refusal::Locked)) => (
-                    Some(reason.to_string()),
-                    aj_app::directory::WITHHELD_LOCKED_NOTICE.to_string(),
-                ),
-                Some((reason, Refusal::Other)) => (
-                    Some(reason.to_string()),
-                    aj_app::directory::WITHHELD_NOTICE.to_string(),
-                ),
-                None => {
-                    let warning = format!(
+            // The warning lands on the abandoned branch, which stays on screen
+            // until a block for the new epoch replaces it.
+            if !failure.refused() {
+                fold_warning(
+                    world,
+                    &format!(
                         "The branch changed, but this client did not catch up to it: {reason}"
-                    );
-                    fold_warning(world, &warning);
-                    (None, warning)
-                }
-            };
-            world.client_mut().recover_committed_head(error, warning);
-            if world.client().withheld() != Some(Refusal::Locked) {
-                world.client_mut().owe_reattach();
+                    ),
+                );
             }
             shell.borrow().show_toast(toast);
         }
@@ -1859,9 +1847,15 @@ async fn branch_focused_session(
     shell.borrow().disarm_branch();
     // Head is authoritative once accepted. Close the old epoch's stream and
     // recover forward in the drive loop. The prompt remains client-owned until
-    // that committed epoch reaches Caught, so a failed follow cannot submit it
+    // the new branch reaches Caught, so a failed follow cannot submit it
     // against a projection the user has not reached.
-    world.client_mut().prepare_committed_head();
+    //
+    // The chat is not reset here. Whatever block comes next replaces it: the
+    // host minted a fresh epoch with the switch, so the client's old epoch
+    // mismatches, and a refusal in between leaves its own reset-on-rejoin. Until
+    // then the abandoned branch stays visible, which is where a failure to
+    // follow the switch is reported.
+    world.client_mut().owe_reattach();
     world.stream.take();
     world.connection = Connection::Reconnecting;
     world.resume = Some(Resume::new());
@@ -8671,9 +8665,10 @@ async fn drive(
                             TransitionFailure::Attach(refused),
                         );
                         world.connection = Connection::Refused;
-                        // Locked refusals require explicit selection, including
-                        // after a Head command. Other refusals retain their
-                        // directory-return or forward-recovery behavior.
+                        // A refusal ends the attempt (spec 5.5). Only a code the
+                        // fold already re-owed (`persistence_failed`) keeps
+                        // recovery going. The others wait for their directory
+                        // edge or for the user to select the session again.
                         if world.client().needs_reattach() {
                             state.failed();
                             resume = Some(state);
@@ -29692,11 +29687,22 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// Once Head is accepted, recovery only moves forward. A late refusal keeps
-    /// the branch prompt unsent and restores it to the editor. Explicit retry
-    /// replaces the stale projection without delayed branch success or submit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_accepted_head_failure_recovers_forward_without_submitting() {
+    async fn an_accepted_head_locked_follow_recovers_forward_without_submitting() {
+        accepted_head_refused_follow_recovers_forward("locked", Refusal::Locked).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_accepted_head_unknown_follow_recovers_forward_without_submitting() {
+        accepted_head_refused_follow_recovers_forward("unknown_session", Refusal::Other).await;
+    }
+
+    /// Once Head is accepted, a refused follow keeps the branch prompt unsent and
+    /// restores it to the editor, leaving the abandoned branch on screen under
+    /// the peer's error. Like any refusal it is not retried on a timer (spec
+    /// 5.5). Selecting the session again shows the new branch alone, with no
+    /// delayed branch success or submit.
+    async fn accepted_head_refused_follow_recovers_forward(code: &str, expected: Refusal) {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
@@ -29774,7 +29780,7 @@ mod tests {
             vec![
                 vec![
                     serde_json::to_string(&aj_wire::Frame::Heartbeat).expect("a heartbeat"),
-                    refusal_frame(&session, "locked", reason),
+                    refusal_frame(&session, code, reason),
                 ],
                 vec![
                     block_opening(&session, "authoritative-head"),
@@ -29808,18 +29814,28 @@ mod tests {
             .set_text("newer draft");
         assert!(matches!(
             settle_pending_transition(&mut app, &shell, &mut world).await,
-            CatchUp::Refused {
-                refusal: Refusal::Locked,
-                ..
-            }
+            CatchUp::Refused { refusal, .. } if refusal == expected
         ));
         assert_eq!(world.connection, Connection::Refused);
         assert_eq!(
             peer.opens(),
             1,
-            "the locked Head follow retried automatically"
+            "the refused Head follow retried automatically"
         );
-        assert!(world.resume.is_none());
+        assert!(
+            world.resume.is_none() && !world.directory.needs_reattach(),
+            "the refused Head follow left a retry pending",
+        );
+        assert_eq!(
+            user_messages(&world),
+            vec!["branch source"],
+            "the refusal did not leave the abandoned branch visible",
+        );
+        assert!(
+            main_notices(&world).iter().any(|notice| notice == reason),
+            "the refusal was not reported over the abandoned branch: {:?}",
+            main_notices(&world),
+        );
 
         apply_focus_request(
             &mut app,
@@ -29859,7 +29875,7 @@ mod tests {
                 .borrow()
                 .get(AgentId::Main, stale_image_entry),
             None,
-            "the forced Head replacement retained the abandoned projection's image id",
+            "the rejoin retained the abandoned projection's image id",
         );
         assert_eq!(shell.borrow().view().editor.borrow().text(), prompt);
         assert!(
@@ -29896,17 +29912,24 @@ mod tests {
             "passive recovery emitted delayed action success: {:?}",
             toast_lines(&shell),
         );
-        for expected in [
-            reason,
-            aj_app::directory::WITHHELD_LOCKED_NOTICE,
-            "authoritative branch recovered",
-        ] {
-            assert!(
-                main_notices(&world).iter().any(|notice| notice == expected),
-                "recovery lost {expected:?}: {:?}",
-                main_notices(&world),
-            );
-        }
+        // The refusal's own error row is the one local row a rejoin keeps.
+        // Everything else on screen is the new branch.
+        assert_eq!(
+            main_notices(&world),
+            vec![reason, "authoritative branch recovered"],
+            "the rejoin did not replace the abandoned branch",
+        );
+        assert_eq!(
+            world
+                .chat
+                .borrow()
+                .transcript(AgentId::Main)
+                .expect("main transcript")
+                .entries()
+                .len(),
+            2,
+            "rows of the abandoned branch survived the rejoin",
+        );
     }
 
     /// A block fold gives up on a peer that keeps its connection warm and never

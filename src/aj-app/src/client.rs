@@ -48,84 +48,6 @@ impl Refusal {
     }
 }
 
-/// Action-local rows that must survive each attempt to project an accepted
-/// head switch.
-#[derive(Clone, Debug, Default)]
-struct RecoveryRows {
-    peer_error: Option<String>,
-    warning: Option<String>,
-}
-
-impl RecoveryRows {
-    fn restore(&self, chat: &mut ChatState, lifecycle: &mut AgentLifecycle) {
-        if let Some(text) = &self.peer_error {
-            let _ = reduce(
-                chat,
-                lifecycle,
-                AgentEvent::Error {
-                    agent_id: AgentId::Main,
-                    text: text.clone(),
-                },
-                None,
-            );
-        }
-        if let Some(text) = &self.warning {
-            let _ = reduce(
-                chat,
-                lifecycle,
-                AgentEvent::Warning {
-                    agent_id: AgentId::Main,
-                    text: text.clone(),
-                },
-                None,
-            );
-        }
-    }
-}
-
-/// A head switch whose authoritative attach block still has to replace the
-/// current projection.
-///
-/// The phase prevents an unrelated `caught_up` from discharging the reset. A
-/// refusal or interrupted block returns it to `Awaiting`, preserving its rows
-/// for the next attempt, and only a caught-up block opened under `Applying`
-/// completes it.
-#[derive(Debug)]
-enum ForwardReset {
-    Awaiting(RecoveryRows),
-    Applying(RecoveryRows),
-}
-
-impl ForwardReset {
-    fn rows(&self) -> &RecoveryRows {
-        match self {
-            Self::Awaiting(rows) | Self::Applying(rows) => rows,
-        }
-    }
-
-    fn rows_mut(&mut self) -> &mut RecoveryRows {
-        match self {
-            Self::Awaiting(rows) | Self::Applying(rows) => rows,
-        }
-    }
-
-    fn start_applying(&mut self) {
-        if let Self::Awaiting(rows) = self {
-            *self = Self::Applying(std::mem::take(rows));
-        }
-    }
-
-    fn retry(&mut self) {
-        if let Self::Applying(rows) = self {
-            *self = Self::Awaiting(std::mem::take(rows));
-        }
-    }
-
-    fn is_applying(&self) -> bool {
-        matches!(self, Self::Applying(_))
-    }
-}
-
 /// Where the client stands relative to an attach block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attach {
@@ -176,11 +98,6 @@ pub struct SessionClient {
     first_attach_credential_warning: Option<String>,
     saw_first_attach: bool,
     needs_reattach: bool,
-    /// Present after an accepted Head command until its authoritative attach
-    /// block is caught up. While present, every block opening resets the chat
-    /// even when a refusal cleared `epoch`, and restores action-local recovery
-    /// rows before durable backfill starts.
-    forward_reset: Option<ForwardReset>,
     /// A refusal cleared the epoch while leaving last-known chat visible. The
     /// next block replaces that cache and restores this exact local error ahead
     /// of the new authoritative backfill.
@@ -214,7 +131,6 @@ impl SessionClient {
             first_attach_credential_warning: None,
             saw_first_attach: false,
             needs_reattach: false,
-            forward_reset: None,
             refusal_error: None,
             withheld: None,
         }
@@ -397,16 +313,6 @@ impl SessionClient {
                 // idempotently.
                 chat.replace_tasks(tasks);
                 chat.replace_queue(queues);
-                if self
-                    .forward_reset
-                    .as_ref()
-                    .is_some_and(ForwardReset::is_applying)
-                {
-                    // Only a block opened as the forced replacement can
-                    // discharge it. The restored rows stay in this projection,
-                    // but no later epoch reset should resurrect them.
-                    self.forward_reset = None;
-                }
                 Redraw(true)
             }
             Frame::Error {
@@ -503,8 +409,8 @@ impl SessionClient {
     ///
     /// A block into the epoch already applied re-projects only the suffix past
     /// the cursor, so the transcript on screen stays and grows. A first attach,
-    /// a new epoch, and the block after a refusal or an accepted Head all reset
-    /// the chat at their opening `state` and replay the whole history, and until
+    /// a new epoch (which an accepted Head mints), and the block after a refusal
+    /// all reset the chat at their opening `state` and replay the whole history, and until
     /// their `caught_up` commits, the projection is partial. A view that paints
     /// between frames reads this to keep a partial history off the screen.
     pub fn rebuilding(&self) -> bool {
@@ -554,46 +460,6 @@ impl SessionClient {
     /// Whether continuity was broken and the caller owes a re-attach.
     pub fn needs_reattach(&self) -> bool {
         self.needs_reattach
-    }
-
-    /// Record that a Head command took and the current projection is now
-    /// necessarily behind the session.
-    ///
-    /// The next attach block replaces the chat even if a refusal clears the
-    /// client's epoch before that block arrives. The obligation remains across
-    /// refused and interrupted attempts until one forced block is caught up.
-    pub fn prepare_committed_head(&mut self) {
-        self.forward_reset = Some(ForwardReset::Awaiting(RecoveryRows::default()));
-        self.owe_reattach();
-    }
-
-    /// Retain the local rows explaining why an accepted Head command is not yet
-    /// reflected by the projection.
-    ///
-    /// `peer_error` is the peer's exact text when the failed follow produced an
-    /// error frame. `None` preserves any exact error retained by an earlier
-    /// attempt. `warning` is the frontend's action-level explanation. The rows
-    /// are restored, in that order, whenever the pending replacement resets the
-    /// chat and before its durable backfill is folded.
-    ///
-    /// This is inert without a pending accepted Head command. It only retains
-    /// rows, so the caller still folds the warning into the current projection
-    /// when reporting the failure.
-    pub fn recover_committed_head(&mut self, peer_error: Option<String>, warning: String) {
-        let Some(reset) = &mut self.forward_reset else {
-            return;
-        };
-        if peer_error.is_some() {
-            // The one-shot action handler is transferring this refusal into the
-            // forward-reset rows. A later value in `refusal_error` then really
-            // is a newer passive recovery answer.
-            self.refusal_error = None;
-        }
-        let rows = reset.rows_mut();
-        if let Some(peer_error) = peer_error {
-            rows.peer_error = Some(peer_error);
-        }
-        rows.warning = Some(warning);
     }
 
     /// Where this client stands on an attach block.
@@ -657,9 +523,6 @@ impl SessionClient {
     /// [`Self::apply`]'s `error` arm).
     pub fn abandon_attach(&mut self) {
         self.attach = Attach::Live;
-        if let Some(reset) = &mut self.forward_reset {
-            reset.retry();
-        }
         self.owe_reattach();
     }
 
@@ -679,9 +542,6 @@ impl SessionClient {
         self.epoch = None;
         self.committed = None;
         self.applied = None;
-        if let Some(reset) = &mut self.forward_reset {
-            reset.retry();
-        }
         self.refusal_error = Some(message);
         self.needs_reattach = false;
         self.withheld = Some(refusal);
@@ -690,36 +550,7 @@ impl SessionClient {
     /// Adopt the epoch of the attach block this client asked for, and
     /// prepare `chat` for the backfill that follows.
     fn open_attach_block(&mut self, chat: &mut ChatState, epoch: String) {
-        if let Some(reset) = &mut self.forward_reset
-            && let Some(latest_refusal) = self.refusal_error.take()
-        {
-            // Action presentation is one-shot, while forward recovery may be
-            // refused repeatedly. The authoritative replacement retains the
-            // latest peer answer even after the pending action was consumed.
-            reset.rows_mut().peer_error = Some(latest_refusal);
-            // The old guidance may describe a different refusal class. Without
-            // an action context to word the new one, retaining only the exact
-            // latest peer answer is safer than restoring stale advice.
-            reset.rows_mut().warning = None;
-        }
-        let forced_recovery = self.forward_reset.as_mut().map(|reset| {
-            reset.start_applying();
-            reset.rows().clone()
-        });
-        if let Some(recovery) = forced_recovery {
-            // An accepted Head command is stronger evidence than the local
-            // epoch. In particular, a refusal clears that epoch without making
-            // the projection current again, so the authoritative block must
-            // still replace everything the abandoned branch built.
-            chat.reset(&mut self.lifecycle);
-            self.committed = None;
-            self.applied = None;
-            self.refusal_error = None;
-            // These rows explain the action that caused the replacement. They
-            // are local rather than durable, so a reset has to put them back
-            // before replay starts or an interrupted retry would erase them.
-            recovery.restore(chat, &mut self.lifecycle);
-        } else if let Some(error) = self.refusal_error.take() {
+        if let Some(error) = self.refusal_error.take() {
             // Refusal deliberately keeps the last-known transcript visible but
             // clears its epoch. The next full block can name another branch, so
             // first-attach append semantics would merge two authoritative
@@ -1091,22 +922,6 @@ mod tests {
         notices_at(chat, NoticeLevel::Info)
     }
 
-    /// Every Main notice row in projection order.
-    fn notice_rows(chat: &ChatState) -> Vec<(NoticeLevel, String)> {
-        chat.transcript(AgentId::Main)
-            .map(|transcript| {
-                transcript
-                    .entries()
-                    .iter()
-                    .filter_map(|entry| match &entry.kind {
-                        EntryKind::Notice(notice) => Some((notice.level, notice.text.clone())),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// Whether an unfinalized streaming row is open in the Main
     /// transcript.
     fn streaming(chat: &ChatState) -> bool {
@@ -1352,111 +1167,6 @@ mod tests {
         );
     }
 
-    /// An accepted Head command is authoritative even if its first follow is
-    /// refused and clears the epoch. Each later attempt replaces the abandoned
-    /// branch, puts the action-local failure rows back before replay, and keeps
-    /// that obligation until one whole block commits.
-    #[test]
-    fn an_accepted_head_replaces_after_refusal_and_keeps_recovery_rows_through_retry() {
-        const HEAD_EPOCH: &str = "epoch-after-head";
-        const PEER_ERROR: &str = "session session-1 is temporarily unavailable";
-        const WARNING: &str =
-            "The branch switch was not served through. Reconnecting to the switched branch.";
-
-        let (mut client, mut chat) = attached();
-        let _ = client.apply(
-            &mut chat,
-            durable(EPOCH, 3, "old-entry", notice("the abandoned branch")),
-        );
-
-        client.prepare_committed_head();
-        assert!(
-            client.needs_reattach(),
-            "accepting Head makes its authoritative projection owed",
-        );
-        client.expect_attach();
-        let _ = client.apply(&mut chat, refusal(SESSION, "unknown_session", PEER_ERROR));
-        assert_eq!(client.cursor(), None, "the refusal cleared the epoch");
-        assert_eq!(notices(&chat), vec!["the abandoned branch"]);
-
-        // The refusal frame already painted the peer's exact error. The
-        // frontend paints its warning and retains both so a later replacement
-        // can reconstruct these local, non-durable rows.
-        client.recover_committed_head(Some(PEER_ERROR.to_string()), WARNING.to_string());
-        let _ = client.apply_local(
-            &mut chat,
-            AgentEvent::Warning {
-                agent_id: AgentId::Main,
-                text: WARNING.to_string(),
-            },
-        );
-
-        // The directory edge says the refusal may now succeed. Despite the
-        // missing epoch, the Head obligation makes this a replacement rather
-        // than a first attach that appends to the abandoned branch.
-        client.owe_reattach();
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(HEAD_EPOCH, false));
-        assert_eq!(notices(&chat), Vec::<String>::new());
-        assert_eq!(errors(&chat), vec![PEER_ERROR]);
-        assert_eq!(notices_at(&chat, NoticeLevel::Warning), vec![WARNING]);
-
-        let _ = client.apply(
-            &mut chat,
-            durable(HEAD_EPOCH, 1, "partial", notice("partial attempt")),
-        );
-        let _ = client.apply(
-            &mut chat,
-            Frame::Reset {
-                session: SESSION.to_string(),
-            },
-        );
-        client.abandon_attach();
-        // This interruption supplied no peer error of its own. Retaining its
-        // warning must not erase the exact refusal text from the earlier try.
-        client.recover_committed_head(None, WARNING.to_string());
-
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state(HEAD_EPOCH, false));
-        assert_eq!(
-            notice_rows(&chat),
-            vec![
-                (NoticeLevel::Error, PEER_ERROR.to_string()),
-                (NoticeLevel::Warning, WARNING.to_string()),
-            ],
-            "the retry discarded partial backfill and restored each recovery row once",
-        );
-
-        let _ = client.apply(
-            &mut chat,
-            durable(HEAD_EPOCH, 2, "committed", notice("the switched branch")),
-        );
-        let _ = client.apply(&mut chat, caught_up(HEAD_EPOCH, 2));
-        assert_eq!(
-            notice_rows(&chat),
-            vec![
-                (NoticeLevel::Error, PEER_ERROR.to_string()),
-                (NoticeLevel::Warning, WARNING.to_string()),
-                (NoticeLevel::Info, "the switched branch".to_string()),
-            ],
-            "recovery rows precede the committed branch's durable backfill",
-        );
-        assert_eq!(
-            client.cursor(),
-            Some(Cursor {
-                epoch: HEAD_EPOCH.to_string(),
-                seq: 2,
-            }),
-            "the authoritative branch landed and committed",
-        );
-
-        // CaughtUp discharges the forward reset and its retained rows. A later
-        // ordinary epoch replacement must not restore them.
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state("later-epoch", false));
-        assert_eq!(notice_rows(&chat), Vec::new());
-    }
-
     /// A refusal leaves last-known chat visible, but clears the epoch. The next
     /// full block may represent a branch another writer selected, so it replaces
     /// that cache and restores only the local refusal ahead of new history.
@@ -1498,33 +1208,6 @@ mod tests {
                 epoch: "new-branch".to_string(),
                 seq: 1,
             }),
-        );
-    }
-
-    /// Forward recovery outlives action presentation. If a later attempt is
-    /// refused too, the final replacement carries the latest peer answer rather
-    /// than restoring an older cached reason.
-    #[test]
-    fn accepted_head_recovery_retains_a_later_refusal_after_the_action_settles() {
-        let (mut client, mut chat) = attached();
-        client.prepare_committed_head();
-        client.recover_committed_head(None, "recovering the accepted Head".to_string());
-
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state("first-recovery", false));
-        let latest = "the later recovery attempt was refused";
-        let _ = client.apply(&mut chat, refusal(SESSION, "locked", latest));
-
-        client.owe_reattach();
-        client.expect_attach();
-        let _ = client.apply(&mut chat, state("final-recovery", false));
-        let _ = client.apply(&mut chat, caught_up("final-recovery", 0));
-
-        assert_eq!(errors(&chat), vec![latest]);
-        assert_eq!(
-            notices_at(&chat, NoticeLevel::Warning),
-            Vec::<String>::new(),
-            "guidance from the earlier failure survived a later refusal",
         );
     }
 
