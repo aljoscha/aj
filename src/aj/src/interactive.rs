@@ -608,15 +608,6 @@ fn connect_url(world: &World) -> String {
     world.control.base_url().unwrap_or_default().to_string()
 }
 
-/// The settings a local session's next main turn runs against.
-fn local_settings_seed(handles: &LocalHandles) -> AgentSettings {
-    let cfg = handles
-        .run_config
-        .lock()
-        .expect("run config mutex poisoned");
-    cfg.settings()
-}
-
 /// The settings placeholder a connect-mode chat model starts on, replaced by
 /// the attach block's opening `state` frame before the first paint.
 ///
@@ -4416,8 +4407,13 @@ async fn dispatch_selector_activity(
                 }
                 // Session-scoped: the selectors leave `config.toml` alone and
                 // rely on the session log's record to survive a resume.
-                if let Some(notice) =
-                    confirm_thinking(world, &owner, target, PersistAction::None, level).await
+                if let Some(notice) = confirm_setting(
+                    &owner,
+                    target,
+                    PersistAction::None,
+                    SettingsAxis::Thinking(level),
+                )
+                .await
                 {
                     fold_notice(world, &notice);
                 }
@@ -4433,8 +4429,13 @@ async fn dispatch_selector_activity(
                     shell.borrow().show_toast(notice);
                     continue;
                 }
-                if let Some(notice) =
-                    confirm_model(world, &owner, target, PersistAction::None, *info).await
+                if let Some(notice) = confirm_setting(
+                    &owner,
+                    target,
+                    PersistAction::None,
+                    SettingsAxis::Model(*info),
+                )
+                .await
                 {
                     fold_notice(world, &notice);
                 }
@@ -4554,30 +4555,6 @@ async fn apply_selector_activity(
     changed
 }
 
-/// Record the main agent's settings identity into the chat model so the
-/// footer's model line and context gauge reflect a change without waiting for
-/// the next turn.
-///
-/// Read off the focused session's run config, which is what the host just
-/// staged and what its refreshed `state` frame reports. The footer widget
-/// reads the chat model's footer table rather than the client's settings, so
-/// the change has to be noted there.
-///
-/// A connection has no run config to read: the refreshed `state` frame is on
-/// its way and the fold notes the footer from it, which is the same value one
-/// round trip later.
-fn note_main_footer(world: &World) {
-    let Some(handles) = world.local.as_ref() else {
-        return;
-    };
-    let settings = local_settings_seed(handles);
-    world
-        .chat
-        .borrow_mut()
-        .footers_mut()
-        .note_settings(AgentId::Main, settings);
-}
-
 /// Send a settings change to the host, returning the note to fold when it
 /// applied and the refusal to fold when it did not.
 ///
@@ -4605,46 +4582,17 @@ async fn command_settings(
     }
 }
 
-/// Apply a confirmed thinking pick and reconcile the footer entry it moved.
-async fn confirm_thinking(
-    world: &World,
+/// Apply a confirmed selector pick, returning the note or refusal to fold.
+/// The footer follows from the host's refreshed `state` frame.
+async fn confirm_setting(
     owner: &SettingsOwner,
     target: AgentId,
     persist: PersistAction,
-    level: Option<ThinkingConfig>,
+    axis: SettingsAxis,
 ) -> Option<String> {
-    let note = match command_settings(owner, target, persist, SettingsAxis::Thinking(level)).await {
-        Ok(note) => note,
-        Err(refusal) => return Some(refusal),
-    };
-    if owner.session != world.session() {
-        return note;
-    }
-    if target == AgentId::Main {
-        note_main_footer(world);
-    }
-    note
-}
-
-/// Apply a confirmed model pick and reconcile the footer entry it moved.
-async fn confirm_model(
-    world: &World,
-    owner: &SettingsOwner,
-    target: AgentId,
-    persist: PersistAction,
-    info: ModelInfo,
-) -> Option<String> {
-    let note = match command_settings(owner, target, persist, SettingsAxis::Model(info)).await {
-        Ok(note) => note,
-        Err(refusal) => return Some(refusal),
-    };
-    if owner.session != world.session() {
-        return note;
-    }
-    if target == AgentId::Main {
-        note_main_footer(world);
-    }
-    note
+    command_settings(owner, target, persist, axis)
+        .await
+        .unwrap_or_else(Some)
 }
 
 /// Persist a skills-window toggle into `disabled_skills` (user layer). Only
@@ -4967,9 +4915,6 @@ async fn apply_owned_setting_change(
         }
         None
     } else {
-        if owner.session == world.session() {
-            note_main_footer(world);
-        }
         notice
     }
 }
@@ -11795,6 +11740,7 @@ mod tests {
             }],
         )
         .await;
+        fold_ready_frames(&mut world);
         sync_editor_chrome(&world, &shell);
         let minimal = editor_border_fg(&shell);
         assert_eq!(
@@ -11816,6 +11762,7 @@ mod tests {
             }],
         )
         .await;
+        fold_ready_frames(&mut world);
         sync_editor_chrome(&world, &shell);
         let xhigh = editor_border_fg(&shell);
         assert_eq!(
@@ -18299,9 +18246,14 @@ mod tests {
             .expect("host catalog offers a reasoning model");
         let owner = SettingsOwner::capture(world, shell, Arc::clone(&world.catalog));
         assert!(
-            confirm_model(world, &owner, AgentId::Main, PersistAction::None, info)
-                .await
-                .is_none()
+            confirm_setting(
+                &owner,
+                AgentId::Main,
+                PersistAction::None,
+                SettingsAxis::Model(info)
+            )
+            .await
+            .is_none()
         );
         assert_eq!(reattach(world, shell).await.unwrap(), CatchUp::Caught);
     }
@@ -18674,6 +18626,9 @@ mod tests {
         assert_eq!(activity.len(), 1, "confirm parked one thinking change");
         let mut watch = inert_theme_watch();
         apply_selector_activity(&mut world, &shell, &mut watch, activity).await;
+        // The host's refreshed `state` is queued by the time the command
+        // returns, and the drive loop folds it in the same iteration.
+        fold_ready_frames(&mut world);
 
         // The footer reflects the pick immediately.
         assert_eq!(
@@ -18743,6 +18698,7 @@ mod tests {
             }],
         )
         .await;
+        fold_ready_frames(&mut world);
 
         let settings = world
             .chat
@@ -19393,6 +19349,7 @@ mod tests {
             }],
         )
         .await;
+        fold_ready_frames(&mut world);
         fold_event(
             &mut world,
             AgentEvent::SubAgentStart {
@@ -21055,7 +21012,7 @@ mod tests {
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", layers).await;
         run_prompt(&mut world, "original").await;
-        let original = local_settings_seed(world.handles());
+        let original = world.handles().run_config.lock().unwrap().settings();
         let (message, old_head) = {
             let log = world.handles().log.lock().await;
             let message = log.entries_in_order().into_iter().find(|entry| matches!(&entry.entry,
@@ -21083,7 +21040,10 @@ mod tests {
             branch_settings(&shell).unwrap().thinking.as_deref(),
             Some("high")
         );
-        assert_eq!(local_settings_seed(world.handles()), original);
+        assert_eq!(
+            world.handles().run_config.lock().unwrap().settings(),
+            original
+        );
         assert!(
             std::fs::read_to_string(&project_path)
                 .unwrap()
@@ -21149,7 +21109,10 @@ mod tests {
         );
         assert!(ctx.consume_event);
         assert!(branch_settings(&shell).is_none());
-        assert_eq!(local_settings_seed(world.handles()), original);
+        assert_eq!(
+            world.handles().run_config.lock().unwrap().settings(),
+            original
+        );
         assert_eq!(
             shell.borrow().view().editor.borrow().text(),
             "keep my prompt"
@@ -21586,12 +21549,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            confirm_thinking(
-                &world,
+            confirm_setting(
                 &SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog)),
                 AgentId::Main,
                 PersistAction::None,
-                Some(ThinkingConfig::Low),
+                SettingsAxis::Thinking(Some(ThinkingConfig::Low)),
             )
             .await;
             run_prompt(&mut world, "original prompt").await;
@@ -21620,12 +21582,11 @@ mod tests {
                 })
                 .unwrap()
                 .clone();
-            confirm_thinking(
-                &world,
+            confirm_setting(
                 &SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog)),
                 AgentId::Main,
                 PersistAction::None,
-                Some(ThinkingConfig::High),
+                SettingsAxis::Thinking(Some(ThinkingConfig::High)),
             )
             .await;
             let original = handles.run_config.lock().unwrap().settings();
@@ -31964,12 +31925,11 @@ mod tests {
             id: "no-such-model".to_string(),
             ..aj_app::test_support::scripted_model_info()
         };
-        let notice = confirm_model(
-            &world,
+        let notice = confirm_setting(
             &SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog)),
             AgentId::Main,
             PersistAction::None,
-            unservable,
+            SettingsAxis::Model(unservable),
         )
         .await
         .expect("the host refuses a model it cannot serve");
