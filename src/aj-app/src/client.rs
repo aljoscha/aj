@@ -314,6 +314,7 @@ impl SessionClient {
                 // after it whatever the code.
                 self.attach = Attach::Live;
                 let refusal = Refusal::from_code(&code);
+                let was_attached = self.holds_attachment();
                 if refusal == Refusal::Unreachable {
                     // Nothing was said about the session, only that its host
                     // is out of reach for now, so the epoch and the cursor
@@ -329,12 +330,13 @@ impl SessionClient {
                     // is following nothing either way.
                     self.drop_attachment(refusal, message.clone());
                 }
-                // A materialization that ended over a fused log is the one
-                // code that owes no waiting: the host rebuilds the session
-                // from disk on the next ask, so the obligation is
-                // taken back at once instead of waiting for a directory edge
-                // the row may never show (a durable session stays listed).
-                if code == PERSISTENCE_FAILED_CODE {
+                // A followed session whose log failed is asked for once more
+                // straight away: the host rebuilds it from disk, so the user
+                // sees what was saved without waiting for a directory edge the
+                // row may never show. A re-ask answered the same way arrives
+                // with no attachment held and settles like any refusal, which
+                // keeps a broken disk from turning into a retry loop.
+                if code == PERSISTENCE_FAILED_CODE && was_attached {
                     self.owe_reattach();
                 }
                 // The message verbatim: an error's message is always a
@@ -997,22 +999,23 @@ mod tests {
         );
     }
 
-    /// A materialization that ended over a fused log drops the attachment
-    /// like any refusal, but owes the re-ask at once: the host
-    /// rebuilds the session from disk on that ask, and the row stays listed
-    /// throughout, so no directory edge would ever fire.
+    /// A followed session whose log failed drops its attachment and owes one
+    /// re-ask at once: the host rebuilds the session from disk on that ask,
+    /// and the row stays listed throughout, so no directory edge would ever
+    /// fire. If that re-ask is answered the same way it settles like any
+    /// refusal, so a disk that stays broken never becomes a retry loop.
     #[test]
-    fn a_persistence_failure_re_asks_at_once() {
+    fn a_persistence_failure_re_asks_once() {
         let (mut client, mut chat) = attached();
-
-        let _ = client.apply(
-            &mut chat,
+        let failure = || {
             refusal(
                 SESSION,
                 PERSISTENCE_FAILED_CODE,
                 "Saving this session failed: no space left on device.",
-            ),
-        );
+            )
+        };
+
+        let _ = client.apply(&mut chat, failure());
 
         assert!(client.needs_reattach(), "the re-ask is owed immediately");
         assert_eq!(client.cursor(), None, "the failed epoch is let go of");
@@ -1022,6 +1025,14 @@ mod tests {
                 .any(|text| text.starts_with("Saving this session failed:")),
             "the message reaches the transcript: {:?}",
             errors(&chat)
+        );
+
+        client.attach_requested();
+        let _ = client.apply(&mut chat, failure());
+
+        assert!(
+            !client.needs_reattach(),
+            "a re-ask refused the same way waits for the user",
         );
     }
 

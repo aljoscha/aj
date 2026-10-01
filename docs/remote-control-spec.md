@@ -470,8 +470,11 @@ Client application rules:
     session's row is absent from one folded `list` and present in the next.
     These transitions are set-wide and include the first list after a refusal
     if the client held no rows. Explicit selection also retries.
-  - `persistence_failed`: re-ask immediately when the frame folds. The host
-    treats the failed materialization as absent and rebuilds from disk.
+  - `persistence_failed`: for a session the client was following, re-ask
+    once, immediately, when the frame folds. The host treats the failed
+    materialization as absent and rebuilds from disk, so the user sees what
+    was saved. A re-ask answered with `persistence_failed` again settles
+    like any refusal and waits for the user to select the session.
   - `host_unreachable`: keep the epoch and the cursor, and the cached
     transcript, and show that the host is unreachable and the session
     resumes when it returns. Re-ask on the gateway's `reset` for the

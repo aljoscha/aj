@@ -8572,16 +8572,10 @@ async fn drive(
                             TransitionFailure::Attach(refused),
                         );
                         world.connection = refused_connection(refusal);
-                        // A refusal ends the attempt (spec 5.5). Only a code the
-                        // fold already re-owed (`persistence_failed`) keeps
-                        // recovery going. The others wait for the edge their
-                        // code names or for the user to select the session again.
-                        if world.client().needs_reattach() {
-                            state.failed();
-                            resume = Some(state);
-                        } else {
-                            resume = None;
-                        }
+                        // A refusal ends the attempt (spec 5.5). The session
+                        // waits for the edge its code names or for the user to
+                        // select it again.
+                        resume = None;
                     }
                     stalled @ CatchUp::Stalled(_) => {
                         let reason = attach_failure_reason(&stalled);
@@ -17956,10 +17950,6 @@ mod tests {
                     match &caught {
                         CatchUp::Refused { .. } => {
                             world.connection = Connection::Refused;
-                            if world.client().needs_reattach() {
-                                state.failed();
-                                world.resume = Some(state);
-                            }
                         }
                         CatchUp::Stalled(_) => {
                             world.connection = Connection::Stalled;
