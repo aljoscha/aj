@@ -190,15 +190,6 @@ impl Fixture {
         })
         .await;
         assert_ne!(session, routed);
-        assert!(
-            remote
-                .hello()
-                .await
-                .unwrap()
-                .capabilities
-                .iter()
-                .any(|s| s == aj_wire::CREDENTIALS_CAPABILITY)
-        );
         let controls = vec![
             (Control::local(host.clone()), session.clone()),
             (Control::remote(remote), session),

@@ -452,7 +452,6 @@ mod tests {
     fn the_banner_leads_with_the_name_and_keeps_the_id() {
         let mut hello = Hello {
             protocol: 1,
-            capabilities: Vec::new(),
             app_version: "0.1.0".to_string(),
             host_id: "c6b6667d8f73e75d".to_string(),
             working_directory: None,

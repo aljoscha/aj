@@ -2,7 +2,7 @@ use super::*;
 use crate::remote::tests::{HostHandles, addr, bounded, scripted, scripted_host};
 use crate::remote::{IdentityGate, RemoteServer};
 use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
-use aj_wire::{TASK_OUTPUT_CAPABILITY, TASK_OUTPUT_CHUNK_BYTES};
+use aj_wire::TASK_OUTPUT_CHUNK_BYTES;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,15 +65,6 @@ async fn task_output_adapters_read_bytes_append_completion_and_errors() {
             .await
             .unwrap();
         let client = RemoteClient::new(&server.url()).unwrap();
-        assert!(
-            client
-                .hello()
-                .await
-                .unwrap()
-                .capabilities
-                .iter()
-                .any(|c| c == TASK_OUTPUT_CAPABILITY)
-        );
         let local = Control::local(host.clone());
         let remote = Control::remote(client);
         for control in [&local, &remote] {

@@ -196,16 +196,6 @@ async fn provider_usage_local_and_remote_adapters_preserve_facts_and_reset_failu
     assert_eq!(report.reset_providers, vec!["openai-codex"]);
     let facts = serde_json::to_string(&report).unwrap();
     assert!(!facts.contains("secret"));
-    assert!(
-        host.hello()
-            .capabilities
-            .contains(&aj_wire::PROVIDER_USAGE_CAPABILITY.into())
-    );
-    assert!(
-        host.hello()
-            .capabilities
-            .contains(&aj_wire::PROVIDER_USAGE_RESET_CAPABILITY.into())
-    );
     let malformed = reqwest::Client::new()
         .post(format!(
             "{}/v1/sessions/{session}/usage/reset",

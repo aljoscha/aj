@@ -3406,7 +3406,7 @@ pub(crate) async fn history_peer(id: &str, name: &str) -> HistoryPeer {
 
     let hello = serde_json::json!({
         "protocol": PROTOCOL_VERSION, "app_version": "0", "host_id": id,
-        "name": name, "capabilities": [aj_wire::PROMPT_HISTORY_CAPABILITY],
+        "name": name,
     });
     let (chunks, receiver) = tokio::sync::mpsc::channel::<String>(8);
     let receiver = Arc::new(StdMutex::new(Some(receiver)));
@@ -3699,7 +3699,6 @@ pub(crate) async fn counted_protocol_peer(
 
     let hello = serde_json::json!({
         "protocol": protocol,
-        "capabilities": [],
         "app_version": "0",
         "host_id": host_id,
     });
@@ -3737,7 +3736,6 @@ async fn a_protocol_this_build_does_not_speak_fails_the_handshake() {
     let (url, serving) = canned_server(
         serde_json::json!({
             "protocol": PROTOCOL_VERSION + 1,
-            "capabilities": ["something-new"],
             "app_version": "9.9.9",
             "host_id": "future",
         }),
@@ -3762,8 +3760,7 @@ async fn a_protocol_this_build_does_not_speak_fails_the_handshake() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_frame_kind_is_skipped_and_a_malformed_known_one_errors() {
     let (url, serving) = canned_server(
-        serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
-                           "app_version": "0", "host_id": "canned"}),
+        serde_json::json!({"protocol": PROTOCOL_VERSION, "app_version": "0", "host_id": "canned"}),
         vec![
             // A kind from a newer peer: discarded by an endpoint client.
             r#"{"kind":"something_newer","session":"s","payload":{"a":1}}"#.to_string(),
@@ -3804,8 +3801,7 @@ async fn an_unknown_frame_kind_is_skipped_and_a_malformed_known_one_errors() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_decoded_stream_keeps_an_unknown_frame_whole() {
     let (url, serving) = canned_server(
-        serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
-                           "app_version": "0", "host_id": "canned"}),
+        serde_json::json!({"protocol": PROTOCOL_VERSION, "app_version": "0", "host_id": "canned"}),
         vec![
             r#"{"kind":"something_newer","session":"s","payload":{"a":1}}"#.to_string(),
             r#"{"kind":"heartbeat"}"#.to_string(),
@@ -5022,16 +5018,6 @@ async fn frames_from_a_stale_epoch_are_dropped_until_a_reattach() {
 async fn environment_reads_and_edits_are_equal_through_both_control_arms() {
     let fixture = Fixture::new(Vec::new()).await;
     let session = fixture.create().await;
-    assert!(
-        fixture
-            .client
-            .hello()
-            .await
-            .unwrap()
-            .capabilities
-            .iter()
-            .any(|cap| cap == aj_wire::SESSION_ENV_CAPABILITY)
-    );
     let controls = [
         Control::local(fixture.host.clone()),
         Control::remote(fixture.client()),

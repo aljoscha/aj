@@ -61,10 +61,9 @@ use aj_session::{
     PersistenceFailure, SessionLock, normalize_tag, project_suffix, validate_session_env,
 };
 use aj_wire::{
-    ARCHIVE_CAPABILITY, AgentQueue, COMPACTION_USAGE_CAPABILITY, Cursor, DurableEvent, Frame,
-    Hello, MAX_HOST_NAME_BYTES, ModelSelection, PROTOCOL_VERSION, QueueState, SessionList,
-    SessionSettings, SessionSummary, SessionTree, TaskSummary, TaskTable, TreeSegment,
-    normalize_host_name,
+    AgentQueue, Cursor, DurableEvent, Frame, Hello, MAX_HOST_NAME_BYTES, ModelSelection,
+    PROTOCOL_VERSION, QueueState, SessionList, SessionSettings, SessionSummary, SessionTree,
+    TaskSummary, TaskTable, TreeSegment, normalize_host_name,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
@@ -865,34 +864,10 @@ impl SessionHost {
         }
     }
 
-    /// Protocol identity and capabilities, the reachability and identity probe.
-    ///
-    /// The list names the routes this host serves past the protocol-1
-    /// baseline: every endpoint added after that baseline arrives with a
-    /// capability string. It is self-description and not a gate: what a peer
-    /// does with it is the peer's business, and a client that simply attempts
-    /// a route and reads the refusal is equally well behaved.
+    /// Protocol identity, the reachability and identity probe.
     pub fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
-            capabilities: vec![
-                aj_wire::HOST_CONFIG_CAPABILITY.to_string(),
-                aj_wire::HOST_SKILLS_CAPABILITY.to_string(),
-                ARCHIVE_CAPABILITY.to_string(),
-                COMPACTION_USAGE_CAPABILITY.to_string(),
-                aj_wire::SESSION_INFO_CAPABILITY.to_string(),
-                aj_wire::SESSION_EXPORT_CAPABILITY.to_string(),
-                aj_wire::PROVIDER_USAGE_CAPABILITY.to_string(),
-                aj_wire::PROVIDER_USAGE_RESET_CAPABILITY.to_string(),
-                aj_wire::SESSION_PREVIEWS_CAPABILITY.to_string(),
-                aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
-                aj_wire::SESSION_ENV_CAPABILITY.to_string(),
-                aj_wire::SESSION_ACCOUNTS_CAPABILITY.to_string(),
-                aj_wire::CREDENTIALS_CAPABILITY.to_string(),
-                aj_wire::BRANCH_SETTINGS_CAPABILITY.to_string(),
-                aj_wire::TRANSCRIPT_SETTINGS_CAPABILITY.to_string(),
-                aj_wire::TASK_OUTPUT_CAPABILITY.to_string(),
-            ],
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.host_id.clone(),
             working_directory: Some(self.inner.working_directory.clone()),

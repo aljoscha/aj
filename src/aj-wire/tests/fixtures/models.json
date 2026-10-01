@@ -1,7 +1,6 @@
 {
   "hello": {
-    "protocol": 1,
-    "capabilities": ["events", "task_output"],
+    "protocol": 4,
     "app_version": "0.1.0",
     "host_id": "host-1",
     "working_directory": "/home/dev/work/project",

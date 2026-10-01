@@ -126,8 +126,8 @@ records no environment. Gateways forward it without interpreting its contents.
 
 A current-protocol host lacking this field refuses it under strict request decoding,
 before minting a session. Mismatched protocol versions are refused at hello. Clients do not
-retry after stripping the map, and no environment echo, proof exchange, or
-capability pre-gate is needed. Successful creation keeps the ordinary
+retry after stripping the map, and no environment echo or proof exchange is
+needed. Successful creation keeps the ordinary
 `SessionCreated` response and existing partial-create behavior.
 
 ## Host and wire boundary
@@ -148,8 +148,8 @@ those edits. Arming a branch does not read environment values.
 POST `/v1/sessions/{id}/env` accepts a `key` and a `value`. A string value sets the
 key, including an empty string. A null or omitted value removes it. Unknown
 request fields are refused before dispatch. Gateways forward both operations to
-the owning host. Hosts advertise the `session_env` capability, which is not a
-client-side precondition for trying the operation.
+the owning host. A client tries either operation and shows a notice when the
+host answers `unknown_endpoint`.
 
 The read is requested when the editor opens, not during directory enumeration.
 Environment values do not enter directory rows or `state` frames. Live notices

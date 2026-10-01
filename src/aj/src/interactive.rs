@@ -17569,12 +17569,6 @@ mod tests {
             aj_app::export::render_session_html(&log)
         };
         let host = local_world.control.host().unwrap().clone();
-        assert!(
-            host.hello()
-                .capabilities
-                .iter()
-                .any(|c| c == aj_wire::SESSION_EXPORT_CAPABILITY)
-        );
         let server = crate::remote::RemoteServer::bind(
             host.clone(),
             "127.0.0.1:0".parse().unwrap(),
@@ -23985,9 +23979,8 @@ mod tests {
     }
 
     /// A peer that does not know the archive endpoint is told about by name,
-    /// not left silent. Capabilities are declared-only and a gateway cannot
-    /// speak for the hosts behind it, so probing the endpoint is the sanctioned
-    /// check, and this is what the probe finds.
+    /// not left silent. A client learns what a peer supports by attempting
+    /// the route, and this is what the attempt finds.
     ///
     /// The peer here is a real host reached at a path it does not serve, which
     /// is the same 404 and the same `unknown_endpoint` code an older host

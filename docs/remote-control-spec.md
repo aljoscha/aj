@@ -130,9 +130,9 @@ no correlation ids. All routes live under `/v1/`. Unknown query
 parameters are ignored.
 
 `GET /v1/hello` is the reachability and identity probe: `{protocol,
-capabilities, app_version, host_id, working_directory?, name?}`. A
-gateway omits `working_directory` and `name`, which is how a client
-tells the two roles apart (section 5.10 for its capabilities).
+app_version, host_id, working_directory?, name?}`. A gateway omits
+`working_directory` and `name`, which is how a client tells the two
+roles apart.
 
 A host's `name` is display metadata, never an address, and may collide.
 The host states it at startup (`--name` or `AJ_NAME`, else its working
@@ -150,7 +150,7 @@ carry `{code, message}` (section 5.6 for the envelope rules):
 | 400 | `invalid_request` | Malformed request: bad JSON, unknown field, bad cursor, a body naming two settings axes, an empty prompt, a session named twice in one attach. |
 | 403 | `forbidden` | The identity gate refused the peer (section 5.11). The message never says why. |
 | 404 | `unknown_session`, `unknown_task`, `unknown_entry` | The named thing does not exist. A syntactically invalid session id is `unknown_session`. |
-| 404 | `unknown_endpoint` | No such route on this peer. The answer a capability probe reads (section 5.10). |
+| 404 | `unknown_endpoint` | No such route on this peer. A client reads it as the peer lacking the feature (section 5.10). |
 | 409 | `conflict` | Well formed but refused by session state: a turn running, tasks live, a running mark with no owning turn or task. |
 | 409 | `locked` | A rival writer holds the session's lock (section 4). |
 | 409 | `unsupported` | Well formed and unconflicting, but this host cannot serve it: a model it has no credentials for, a settings change for an agent that is not live. |
@@ -462,11 +462,11 @@ agent" locally take an optional `agent` field (default: the main agent).
 | `.../{id}/cancel` | `{agent?}` | Cancel the targeted agent through the mechanism that owns its run: its driven turn, a detached sub-agent's background task, or the foreground-sub-agent-cancels-main cascade. A running mark with no owning turn or task is 409 `conflict`. An idle or completed target is accepted. |
 | `.../{id}/queue` | `{op: "remove", agent?}` or `{op: "clear"}` | Withdraw one agent's pending message, or clear the session's queues. A withdrawal answers 200 `{text?}` with the text it took, which is what makes the dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index. A clear answers 202. |
 | `.../{id}/compact` | `{instructions?}` | Manual compaction. |
-| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, `oracle_model`, `oracle_thinking`, `oracle_speed`, `oracle_verbosity`, optional `agent`, `persist` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. `persist` defaults to `none`, or is `user`, `project_set`, or `project_clear`, and also writes the value into that host config layer. Oracle axes reject sub-agent targets. Persistence is main-agent only. Capability `host_config`. |
-| `.../{id}/account` | `{provider, account?}` | Select an account for this session and provider from the host-local auth store. Missing or null `account` resets to Provider default, `""` pins the unnamed account, any other string pins that exact label. Does not change the provider's auth-store default. Read the result through `accounts`. Capability `session_accounts` (section 5.10). |
-| `.../{id}/env` | `{key, value}` | Set one session environment value, including the empty string. Null or an absent `value` removes the key from the map, not from the inherited process environment. Idle-only: 409 `conflict` while a turn or background task is live. Validates before mutation and persists the full resulting active-branch map. Capability `session_env` (section 5.10). |
+| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, `oracle_model`, `oracle_thinking`, `oracle_speed`, `oracle_verbosity`, optional `agent`, `persist` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. `persist` defaults to `none`, or is `user`, `project_set`, or `project_clear`, and also writes the value into that host config layer. Oracle axes reject sub-agent targets. Persistence is main-agent only. |
+| `.../{id}/account` | `{provider, account?}` | Select an account for this session and provider from the host-local auth store. Missing or null `account` resets to Provider default, `""` pins the unnamed account, any other string pins that exact label. Does not change the provider's auth-store default. Read the result through `accounts`. |
+| `.../{id}/env` | `{key, value}` | Set one session environment value, including the empty string. Null or an absent `value` removes the key from the map, not from the inherited process environment. Idle-only: 409 `conflict` while a turn or background task is live. Validates before mutation and persists the full resulting active-branch map. |
 | `.../{id}/tag` | `{tag}`, empty or absent clears | Set the session's tag (section 5.8): one trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
-| `.../{id}/archive` | `{archived: bool}`, absent reads false | Set or clear the archived bit (section 5.8). Materializes like any command, so a rival's lock refuses it. Nothing else refuses it: a session working through a turn takes it and goes on working. Capability `archive` (section 5.10). |
+| `.../{id}/archive` | `{archived: bool}`, absent reads false | Set or clear the archived bit (section 5.8). Materializes like any command, so a rival's lock refuses it. Nothing else refuses it: a session working through a turn takes it and goes on working. |
 | `.../{id}/head` | `{entry, changes?}` or `{before: <entry_id>, changes?}` | Switch the session head. 409 `conflict` while working or tasks live. Clears queues, new epoch, `reset` frame. `before` resolves the named entry to its parent server-side, atomically with the switch. An unknown entry is 404 `unknown_entry`, an entry with no parent is refused. Exactly one target. Optional `changes` applies session-scoped overrides to its inherited baseline (see below). |
 | `.../{id}/tasks/{task_id}/kill` | `{}` (absent or blank is equivalent) | Kill a background task. Any field or non-object value is refused before the task is touched. |
 
@@ -489,8 +489,8 @@ The environment editor reads the selected branch point only when opened
 (section 5.7). Submission resolves
 inheritance and validates the requested combination on the host.
 
-Capability `branch_settings` covers head overrides. Empty
-`changes` is omitted on the wire so ordinary head requests remain compatible.
+Empty `changes` is omitted on the wire so ordinary head requests remain
+compatible.
 Nonempty changes must travel to the server: an older server's closed head schema
 rejects them rather than silently switching without the requested overrides.
 
@@ -521,9 +521,8 @@ code.
 
 Two things can hold a setting: the running session, which the settings
 command changes, and the host's config files, which seed every new session.
-Capability `host_config` covers the second: `GET` and `POST
-/v1/sessions/{id}/config`, plus `persist` on the settings command for the
-common "apply and save" gesture. The session id routes to the owning host
+`GET` and `POST /v1/sessions/{id}/config` read and edit the second, plus
+`persist` on the settings command for the common "apply and save" gesture. The session id routes to the owning host
 and must name a session in its store. Reading does not materialize it.
 
 A read returns `HostConfig`: the `user` layer and the `effective` merge as
@@ -533,7 +532,7 @@ the host's `models`, `tools`, and `skills` catalogs. Nothing from the auth
 store, environment, or arbitrary config-file keys. Connections are trusted,
 so complete model and catalog URLs round-trip without masking. The
 standalone model and thinking selectors read the same model catalog through
-`GET /v1/sessions/{id}/models`, a model array under `host_config`. This read
+`GET /v1/sessions/{id}/models`, a model array. This read
 does not discover skills or read config layers. Selectors show a notice if
 it fails, never the client's catalog.
 
@@ -550,9 +549,9 @@ waits for the branch. A save succeeds or fails as a whole and the host's
 effective config only ever reflects what reached disk, so a same-value retry
 after a failed save writes again.
 
-Capability `host_skills` adds `GET /v1/sessions/{id}/skills`, returning
-discovered `{name, description, path, enabled, disable_model_invocation}`
-metadata, and `POST /v1/sessions/{id}/skills` with `{name, disable}`.
+`GET /v1/sessions/{id}/skills` returns discovered `{name, description,
+path, enabled, disable_model_invocation}` metadata, and `POST
+/v1/sessions/{id}/skills` takes `{name, disable}`.
 Discovery uses the host's working directory and user skill roots. A toggle
 needs a discovered name and edits `disabled_skills` in the host's user config
 for new sessions. Running sessions keep their prompt's skill listing.
@@ -605,7 +604,7 @@ side's limitation. Neither side's values fall back to the other's.
   File paths come only from the session task registry, not the request.
   Reads use bounded allocation and blocking-pool file I/O. Running and completed
   tasks are readable while retained by the live registry, with no persistent
-  task archive. Capability `task_output` (section 5.10).
+  task archive.
 - `GET /v1/sessions/{id}/tree`: `{segments, head?}`, the
   segment-collapsed branch tree for the tree view and head switching.
   `head` is the current head entry id, absent only while the log has no
@@ -619,7 +618,6 @@ side's limitation. Neither side's values fall back to the other's.
   `null` meaning unrecorded and `{}` meaning recorded empty. The response's
   `session_id` is the host-local log identity, not a gateway routing id.
   Clients render the facts and fetch only when the info overlay opens.
-  Capability `session_info` (section 5.10).
 - `GET /v1/sessions/{id}/export`: `SessionExport` in `aj-wire`, `{html}`.
   The host renders the complete log with the ordinary HTML exporter, including
   all threads and branches and its export redaction and tool-detail resolution.
@@ -627,8 +625,7 @@ side's limitation. Neither side's values fall back to the other's.
   no host export file. Clients save the returned document to
   `~/.aj/exports/aj-session-<id>.html` on the client, using the requested session
   id (including a gateway prefix), and report that local path in the notice.
-  Capability `session_export` (section 5.10). Clients attempt the endpoint
-  without capability gating and explain when the host does not support it.
+  Clients attempt the endpoint and explain when the host does not support it.
 - `GET /v1/sessions/{id}/usage`: host provider-account plan usage, not the
   session's token totals. Returns `ProviderUsageReport` in `aj-wire`, with
   `statuses` sorted by provider and exact account label, and `reset_providers`
@@ -649,7 +646,6 @@ side's limitation. Neither side's values fall back to the other's.
   Naming alone never refreshes a token.
   A runtime credential override collapses its provider to one unlabeled row.
   The host reads credentials and performs any OAuth refresh and writeback.
-  Capability `provider_usage` (section 5.10).
 - `POST /v1/sessions/{id}/usage/reset`: `{target, idempotency_key}`. The target
   is copied unchanged from a report's `reset_credits.target`, containing
   `provider_id`, nullable exact `account`, and `upstream_account_id`. It is an
@@ -663,7 +659,7 @@ side's limitation. Neither side's values fall back to the other's.
   `{"Ok":"NothingToReset"}`, or `{"Ok":"NoCredit"}`. Provider failures are
   `{"Err":"StaleTarget"}` (refresh required) or `{"Err":{"Error":"message"}}`
   (retryable). These are HTTP 200 results. Session and transport refusals use
-  the ordinary error envelope. Capability `provider_usage_reset` (section 5.10).
+  the ordinary error envelope.
   Both endpoints validate the session before touching host credentials and do
   not materialize it. The session address selects exactly one host through the
   gateway's wildcard route, with no gateway-wide aggregation. No provider keys,
@@ -680,7 +676,6 @@ side's limitation. Neither side's values fall back to the other's.
   it could not read once in `incomplete` `[{host, message}]`, keeping the other
   hosts' rows. Owning hosts are read concurrently within one batch deadline,
   so stalled hosts do not delay healthy reads behind timeout waves.
-  Capability `session_previews` (section 5.10).
 - `GET /v1/sessions/{id}/prompt-history/stream`: submitted prompts from the
   focused session's workspace on its owning host. A gateway forwards this read
   to that host, not to the client's workspace.
@@ -717,21 +712,18 @@ side's limitation. Neither side's values fall back to the other's.
   each host's latest snapshot as it arrives, ordered by host label and identity
   to break equal-time ties independently of arrival order. Slow hosts do not
   block healthy results. Failed or timed-out hosts retain their last available
-  prompts and contribute a named failure. Capability `prompt_history`
-  (section 5.10).
+  prompts and contribute a named failure.
 - `GET /v1/sessions/{id}/env`: a JSON object mapping strings to strings,
   the full environment map selected by the active branch. Values are
   unredacted on the trusted control port. Export-only redaction does not
   apply. This reads the session overlay, not the host process environment.
-  Capability `session_env` (section 5.10).
 - `GET /v1/sessions/{id}/env/before/{entry}`: the same map at the named entry's
   parent, with the same target validation as `head.before`. An unknown entry is
   404 `unknown_entry`, and a parentless entry or invalid parent head is refused.
   This read can materialize a session and is available while work is live. It
   changes neither the head nor runtime state. The entry is one URL-encoded path
   segment. A host without this resource returns `unknown_endpoint`, rather than
-  ignoring a target query and returning the live map. Capability
-  `transcript_settings` (section 5.10).
+  ignoring a target query and returning the live map.
 - `GET /v1/sessions/{id}/accounts?provider=...`: `{provider, selected,
   default, accounts, override_active, source}` from the host-local auth store.
   `provider` is URL-encoded by clients. Omitting it selects the session's
@@ -741,7 +733,6 @@ side's limitation. Neither side's values fall back to the other's.
   including `""` for the unnamed account. `override_active` reports whether a
   credential override is active, and `source` describes the credential source
   without exposing a secret. No keys, tokens, or credential contents travel.
-  Capability `session_accounts` (section 5.10).
 
 ### 5.8 Status model
 
@@ -820,15 +811,11 @@ never be silently dropped for a connected client.
 
 Both ends of every connection are aj, but versions skew. Rules:
 
-- `GET /v1/hello` carries `protocol` and `capabilities`. Protocol 1 is
-  the generation whose servers ignore unknown request fields. Protocol 2
-  requires strict commands. Protocol 3 also combines committed compaction and
-  its optional usage in one durable `compaction_end` event. Removing the
-  separate usage event changes semantics, so this requires a protocol bump
-  rather than additive decoding. The exact version check is the boundary:
-  a protocol-3 client sends no create or command after a mismatched hello,
-  and a gateway opens no link to a host whose checked hello failed. Mixed generations are
-  unavailable rather than degraded. Hosts and gateways roll before clients.
+- `GET /v1/hello` carries `protocol`, and the current protocol is 4.
+  Peers check it for exact equality: a client sends no create or command
+  after a mismatched hello, and a gateway opens no link to a host whose
+  checked hello failed. Mixed generations are unavailable rather than
+  degraded. Hosts and gateways roll before clients.
 - Every protocol-defined JSON command has a closed schema. The component
   that owns the command's effect rejects unknown fields recursively
   (nested settings, model selections, prompt content included) before
@@ -862,33 +849,12 @@ Both ends of every connection are aj, but versions skew. Rules:
   and a host's refusal travels back intact apart from the session-id
   rewrite. Gateway-owned commands such as enrollment are strict at the
   gateway.
-- New endpoints, frame kinds, and event types arrive with a capability
-  string. Protocol 1 implies the whole section 5 surface at first
-  release, and capabilities exist for what came after. The registry:
-
-  | Capability | Covers | Advertised by |
-  |---|---|---|
-  | `archive` | `POST /v1/sessions/{id}/archive` | hosts |
-  | `branch_settings` | `head.changes` | hosts |
-  | `transcript_settings` | user-message `branch_settings` and `GET /v1/sessions/{id}/env/before/{entry}` | hosts |
-  | `session_env` | `GET` and `POST /v1/sessions/{id}/env` | hosts |
-  | `session_export` | `GET /v1/sessions/{id}/export` | hosts |
-  | `task_output` | `GET /v1/sessions/{id}/tasks/{task_id}/output?offset=N` | hosts |
-  | `provider_usage` | `GET /v1/sessions/{id}/usage` | hosts |
-  | `provider_usage_reset` | `POST /v1/sessions/{id}/usage/reset` | hosts |
-  | `session_info` | `GET /v1/sessions/{id}/info` | hosts |
-  | `session_previews` | `GET /v1/previews` | hosts and gateways |
-  | `prompt_history` | finite SSE Workspace and All prompt-history reads | hosts and gateways |
-  | `credentials` | `GET` and `POST /v1/sessions/{id}/credentials` (section 5.12) | hosts |
-  | `session_accounts` | `GET /v1/sessions/{id}/accounts`, `POST /v1/sessions/{id}/account`, and creation `settings.account` | hosts |
-  | `host_config` | `GET` and `POST /v1/sessions/{id}/config`, `GET /v1/sessions/{id}/models`, and `settings.persist` | hosts |
-  | `host_skills` | `GET` and `POST /v1/sessions/{id}/skills` | hosts |
-  | `compaction_usage` | optional cumulative `usage` on durable `compaction_end`, identified by the frame's `entry_id` | hosts |
-
-  A capability is self-description, never a gate: probing an endpoint
-  (404 `unknown_endpoint` vs 2xx) is a valid fallback check. A gateway's
-  `hello` advertises only its own features, not those of hosts that need
-  not agree. A client attempts the route through it and reads the refusal.
+- A peer does not advertise which endpoints it serves. A client attempts
+  a feature's route and, when the peer answers 404 `unknown_endpoint`,
+  shows the user a clear notice that this host lacks the feature. It
+  does not hide or disable features up front. The answer comes from
+  whoever owns the route, so it holds the same for a host reached
+  directly and one reached through a gateway.
 
 ### 5.11 Securing the control port
 
@@ -926,7 +892,7 @@ credential-free, protection is layered around it:
 `/v1/sessions/{id}/credentials` addresses the credential store of the
 session's owning host, so a gateway routes it like any session request. The
 session is only an address: the host checks it exists and neither resumes it
-nor takes its writer lock. Capability `credentials`.
+nor takes its writer lock.
 
 - `GET` returns `CredentialOverview`: the host's OAuth providers (id and
   display name), one safe status row per provider account (`provider_id`,
@@ -1016,7 +982,7 @@ Enrollment routes, strict at the gateway (section 5.10):
 | Route | Body | Semantics |
 |---|---|---|
 | `GET /v1/hosts` | | `{hosts: [{id?, address, source, connected, sessions, error?}]}`. `source` is `config` or `dynamic`. |
-| `POST /v1/hosts` | `{address}`, `<host>:<port>` or an `http(s)://` URL | Enroll a host dynamically. Completes a checked protocol-3 hello before adding or recording it. Answers 200 with the host's row. 409 `already_enrolled` for an address already enrolled, 409 `duplicate_host` for an id another enrollment holds, 409 `unusable_host_id` for an id that cannot namespace sessions. |
+| `POST /v1/hosts` | `{address}`, `<host>:<port>` or an `http(s)://` URL | Enroll a host dynamically. Completes a checked hello before adding or recording it. Answers 200 with the host's row. 409 `already_enrolled` for an address already enrolled, 409 `duplicate_host` for an id another enrollment holds, 409 `unusable_host_id` for an id that cannot namespace sessions. |
 | `DELETE /v1/hosts/{id}` | | Withdraw a dynamic enrollment. 204. 404 `unknown_host`, 409 `static_host` for a configured host, which is removed from the file instead. |
 
 Static host addresses come from the config file (`--config <file>`,
@@ -1024,7 +990,7 @@ default `~/.aj/gateway.toml`, which need not exist). Dynamic enrollments
 and the gateway's own id live under `~/.aj/gateway/`. An unreachable or
 incompatible hello leaves a configured or remembered enrollment in place
 but disconnected: nothing is marked connected, published as reachable,
-or routed to until a protocol-3 hello succeeds.
+or routed to until a checked hello succeeds.
 
 ### 6.2 Process supervision
 
@@ -1232,7 +1198,7 @@ again. Updates paint at most ten times per second, skipping unchanged
 snapshots without delaying the first results.
 Closing or changing scope cancels the outstanding client read. No history cache
 or journal is persisted, and no history read belongs to directory or sidebar polling.
-Unsupported endpoints produce a notice rather than a capability pre-gate.
+Unsupported endpoints produce a notice (section 5.10).
 The up-arrow ring is independent, retaining local bootstrap behavior and only
 this run's submissions over a connection.
 
@@ -1241,7 +1207,7 @@ address when opened. It renders that host's reports, offers eligible provider
 accounts with nonzero credits and a host reset adapter, confirms the exact
 account, and retains its target and idempotency key on retry. Completion offers
 a user-paced refresh against the same captured address, even if focus changes.
-It attempts both endpoints without capability pre-gating and renders a clear
+It attempts both endpoints and renders a clear
 notice on `unknown_endpoint`, with no fallback to client credentials.
 The report supports line scrolling, Home/End, and viewport-sized pages with
 the same context overlap as read-only content overlays. Provider, confirmation,
@@ -1385,7 +1351,7 @@ cancel, compact, kill, or dispatch inference.
 - A full backfill projects the whole log. Deferring sub-thread
   projection would break the "cursor = applied prefix of one seq space"
   invariant, so the cost is paid once at first attach. A thread-scoped
-  backfill is cleanly additive as a capability if a real session hurts.
+  backfill is cleanly additive as a new endpoint if a real session hurts.
 - `list` frames are cumulative over the whole store (about 60 KB at 400
   sessions). Debouncing bounds the rate, not the size. A row cap or
   delta encoding is the follow-up if a store gets big enough to hurt.

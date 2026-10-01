@@ -30,42 +30,14 @@ pub use provider_usage::{
     UsageResetResponse,
 };
 
-/// The capability for host provider usage at a session address.
-pub const PROVIDER_USAGE_CAPABILITY: &str = "provider_usage";
-/// The capability for spending host provider reset credits.
-pub const PROVIDER_USAGE_RESET_CAPABILITY: &str = "provider_usage_reset";
-
 mod session_info;
 pub use session_info::{SessionInfo, UsageBucket};
 
 mod prompt_history;
-pub use prompt_history::{
-    HistoryPrompt, PROMPT_HISTORY_CAPABILITY, PROMPT_HISTORY_LIMIT, PromptHistory,
-};
+pub use prompt_history::{HistoryPrompt, PROMPT_HISTORY_LIMIT, PromptHistory};
 
 /// The current remote-control protocol version.
-pub const PROTOCOL_VERSION: u32 = 3;
-
-/// The capability a host declares when it serves `POST
-/// /v1/sessions/{id}/archive`.
-///
-/// Honest self-description, not a gate: a client attempts the route and reads
-/// a 404 as "this host does not archive", because a gateway's own hello cannot
-/// speak for the hosts behind it.
-pub const ARCHIVE_CAPABILITY: &str = "archive";
-
-/// The capability a host declares when compaction spend is published through
-/// optional cumulative `usage` on the durable `compaction_end` event.
-pub const COMPACTION_USAGE_CAPABILITY: &str = "compaction_usage";
-
-/// The capability for reading and editing a session's active-branch environment.
-pub const SESSION_ENV_CAPABILITY: &str = "session_env";
-
-/// The capability for `GET /v1/sessions/{id}/info` session facts.
-pub const SESSION_INFO_CAPABILITY: &str = "session_info";
-
-/// The capability for `GET /v1/sessions/{id}/export` full-session HTML.
-pub const SESSION_EXPORT_CAPABILITY: &str = "session_export";
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Host-rendered full-session HTML, saved by the requesting client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,31 +45,12 @@ pub struct SessionExport {
     pub html: String,
 }
 
-/// The capability for `GET /v1/previews?session=…` batched log previews.
-pub const SESSION_PREVIEWS_CAPABILITY: &str = "session_previews";
-
 /// One host a fan-out read could not include, named for the user.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFailure {
     pub host: String,
     pub message: String,
 }
-
-/// The capability for reading and selecting provider-local session accounts.
-pub const SESSION_ACCOUNTS_CAPABILITY: &str = "session_accounts";
-
-/// The capability for session-scoped head overrides.
-pub const BRANCH_SETTINGS_CAPABILITY: &str = "branch_settings";
-
-/// The capability for recorded message settings and targeted environment reads.
-pub const TRANSCRIPT_SETTINGS_CAPABILITY: &str = "transcript_settings";
-
-/// The capability for host config reads and edits, and for `persist` on the
-/// settings command.
-pub const HOST_CONFIG_CAPABILITY: &str = "host_config";
-
-/// The capability for host skill discovery and user-default toggles.
-pub const HOST_SKILLS_CAPABILITY: &str = "host_skills";
 
 /// A creator-selected model, resolved against the receiving host's catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -560,11 +513,10 @@ where
     T::decode(body).map_err(|source| RequestDecodeError { source })
 }
 
-/// Server identity and supported protocol features.
+/// Server identity and protocol version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol: u32,
-    pub capabilities: Vec<String>,
     pub app_version: String,
     pub host_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -865,9 +817,6 @@ pub struct TaskSummary {
 pub struct TaskTable {
     pub tasks: Vec<TaskSummary>,
 }
-
-/// Hosts supporting bounded reads of retained task spill files.
-pub const TASK_OUTPUT_CAPABILITY: &str = "task_output";
 
 /// Maximum number of raw output bytes returned by one task-output read.
 pub const TASK_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;

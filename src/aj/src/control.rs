@@ -130,13 +130,11 @@ impl ControlError {
     /// wire's 404 `unknown_endpoint`).
     ///
     /// Told apart from an unknown entry because it says nothing about the
-    /// session: the peer is older than the feature being asked for. A
-    /// capability is self-description, never a gate, so probing an endpoint
-    /// is a valid fallback check, which is what a caller reading this is
-    /// doing. It is the fallback and not the first choice
-    /// because the endpoint's capability string reaches a client only in the
-    /// peer's own hello, and a gateway's hello cannot speak for the hosts
-    /// behind it.
+    /// session: the peer does not serve the feature being asked for. This is
+    /// how a client learns what a peer supports. It attempts the route and,
+    /// on this answer, shows the user a notice that the host lacks the
+    /// feature. Asking per request is what lets one answer hold for a host
+    /// behind a gateway as well as for a direct peer.
     pub(crate) fn unknown_endpoint(&self) -> bool {
         match self {
             // A host in this process has every endpoint this process knows.
@@ -998,14 +996,6 @@ pub(crate) mod history_tests {
             .await
             .unwrap();
         let client = RemoteClient::new(&server.url()).unwrap();
-        assert!(
-            client
-                .hello()
-                .await
-                .unwrap()
-                .capabilities
-                .contains(&aj_wire::PROMPT_HISTORY_CAPABILITY.to_string())
-        );
         let local = Control::local(host.clone());
         let remote = Control::remote(client);
         for session in [Some("a"), None] {
@@ -1132,15 +1122,6 @@ mod preview_tests {
             .await
             .expect("server");
         let client = RemoteClient::new(&server.url()).expect("client");
-        assert!(
-            client
-                .hello()
-                .await
-                .expect("hello")
-                .capabilities
-                .iter()
-                .any(|c| c == aj_wire::SESSION_PREVIEWS_CAPABILITY)
-        );
         let before = host.sessions().await.expect("directory");
         assert_eq!(before.sessions.len(), 2);
         assert!(before.sessions.iter().all(|row| !row.live));

@@ -54,8 +54,8 @@ const FRAME_KINDS: &[&str] = &[
 ];
 
 #[test]
-fn committed_compaction_usage_is_protocol_generation_three() {
-    assert_eq!(PROTOCOL_VERSION, 3);
+fn the_current_hello_is_protocol_generation_four() {
+    assert_eq!(PROTOCOL_VERSION, 4);
 }
 
 /// Frames in the shapes that make the session reader's and the rewrite's rules

@@ -997,7 +997,7 @@ async fn a_preview_batch_returns_healthy_hosts_without_timeout_waves() {
                     let path = request.split_whitespace().nth(1).expect("request path");
                     let body = match path {
                         "/v1/hello" => serde_json::json!({
-                            "protocol": PROTOCOL_VERSION, "capabilities": [], "app_version": "0",
+                            "protocol": PROTOCOL_VERSION, "app_version": "0",
                             "host_id": format!("h{index:02}"), "name": format!("host-{index:02}")
                         }),
                         "/v1/events" => {
@@ -3002,8 +3002,7 @@ async fn prompt_history_all_cancellation_releases_every_upstream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_id_this_gateway_cannot_namespace_with_is_refused_at_enrollment() {
     let (url, serving) = canned_server(
-        serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
-                           "app_version": "0", "host_id": "with:colon"}),
+        serde_json::json!({"protocol": PROTOCOL_VERSION, "app_version": "0", "host_id": "with:colon"}),
         Vec::new(),
     )
     .await;
@@ -4219,8 +4218,8 @@ async fn a_control_create_environment_reaches_the_owning_host_log() {
     host.stop().await;
 }
 
-/// A current-protocol create envelope without env. The host, not a capability
-/// gate in either intermediary, owns rejection of unknown top-level fields.
+/// A current-protocol create envelope without env. The host, not either
+/// intermediary, owns rejection of unknown top-level fields.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnvlessCreateRequest {
@@ -4356,7 +4355,6 @@ impl Recorder {
         let minted = Arc::new(AtomicUsize::new(0));
         let hello = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
-            "capabilities": [],
             "app_version": "0",
             "host_id": host_id,
         });
@@ -7051,7 +7049,6 @@ impl FakeHost {
                         async move {
                             axum::Json(serde_json::json!({
                                 "protocol": PROTOCOL_VERSION,
-                                "capabilities": [],
                                 "app_version": "0",
                                 "host_id": host_id,
                             }))
@@ -7460,7 +7457,7 @@ async fn an_unknown_endpoint_answers_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(
         code, "unknown_endpoint",
-        "probing an endpoint is a valid capability check",
+        "a client reads this code as the peer lacking the feature",
     );
 
     fixture.shutdown().await;
@@ -7475,8 +7472,7 @@ async fn an_unknown_endpoint_answers_404() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_kind_the_gateway_does_not_know_does_not_break_its_link() {
     let (url, serving) = canned_server(
-        serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
-                           "app_version": "9.9.9", "host_id": "canned"}),
+        serde_json::json!({"protocol": PROTOCOL_VERSION, "app_version": "9.9.9", "host_id": "canned"}),
         vec![
             r#"{"kind":"something_newer","session":"s","payload":{"a":1}}"#.to_string(),
             r#"{"kind":"list","sessions":[{"id":"2026-01-01-00-00-00-000","live":true,
@@ -7552,8 +7548,8 @@ async fn wedged_host() -> (
 
     let requested = Arc::new(tokio::sync::Notify::new());
     let notify = Arc::clone(&requested);
-    let hello = serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
-                                   "app_version": "0", "host_id": "wedged"});
+    let hello =
+        serde_json::json!({"protocol": PROTOCOL_VERSION, "app_version": "0", "host_id": "wedged"});
     let list = r#"{"kind":"list","sessions":[{"id":"2026-01-01-00-00-00-000","live":true,
         "working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,
         "last_activity":"2026-01-01T00:00:00Z"}]}"#;
@@ -7637,8 +7633,7 @@ async fn hanging_up_host(dials: Arc<AtomicUsize>) -> (String, tokio::task::JoinH
     use axum::response::sse::{Event, Sse};
     use axum::routing::get;
 
-    let hello = serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
-                                   "app_version": "0", "host_id": "flapping"});
+    let hello = serde_json::json!({"protocol": PROTOCOL_VERSION, "app_version": "0", "host_id": "flapping"});
     let app = axum::Router::new()
         .route(
             "/v1/hello",

@@ -305,20 +305,13 @@ impl Gateway {
         Ok(gateway)
     }
 
-    /// Protocol identity and capabilities.
+    /// Protocol identity.
     ///
     /// No working directory: a gateway serves none of its own, and that absence
-    /// is how a client tells the two roles apart. Capabilities describe the
-    /// gateway's own features. A gateway cannot answer for hosts that need
-    /// not agree with each other. A client that wants a route attempts it and
-    /// reads the refusal.
+    /// is how a client tells the two roles apart.
     pub(crate) fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
-            capabilities: vec![
-                aj_wire::PROMPT_HISTORY_CAPABILITY.to_string(),
-                aj_wire::SESSION_PREVIEWS_CAPABILITY.to_string(),
-            ],
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.id.clone(),
             working_directory: None,

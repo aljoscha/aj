@@ -10506,26 +10506,6 @@ async fn an_unreadable_sidecar_does_not_cost_a_live_session_its_archived_bit() {
     harness.host.shutdown().await;
 }
 
-/// The host advertises each additive protocol-1 behavior it serves.
-#[tokio::test]
-async fn the_host_declares_its_additive_capabilities() {
-    let harness = Harness::new(Vec::new());
-    let hello = harness.host.hello();
-    let capabilities = &hello.capabilities;
-    for expected in [
-        aj_wire::ARCHIVE_CAPABILITY,
-        aj_wire::COMPACTION_USAGE_CAPABILITY,
-        aj_wire::BRANCH_SETTINGS_CAPABILITY,
-        aj_wire::TRANSCRIPT_SETTINGS_CAPABILITY,
-    ] {
-        assert!(
-            capabilities.iter().any(|capability| capability == expected),
-            "missing {expected:?}: {capabilities:?}",
-        );
-    }
-    harness.host.shutdown().await;
-}
-
 // ---------------------------------------------------------------------------
 // 15. Reads
 // ---------------------------------------------------------------------------

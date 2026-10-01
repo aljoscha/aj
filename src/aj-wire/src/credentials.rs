@@ -2,8 +2,6 @@
 use aj_models::oauth::OAuthCredentials;
 use serde::{Deserialize, Serialize};
 
-pub const CREDENTIALS_CAPABILITY: &str = "credentials";
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialOverview {
     pub oauth_providers: Vec<OAuthProviderInfo>,

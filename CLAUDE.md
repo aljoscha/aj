@@ -52,9 +52,9 @@ is a detail behind that seam, so the interactive UI never reads host files
 directly. Tests for backend equivalence run against the real local and remote
 adapters.
 
-Servers advertise what they support. Clients try a feature and show a clear
-notice if the server lacks it, rather than hiding or disabling features up
-front. We keep every deployment current, so that is enough.
+Clients try a feature and show a clear notice if the server lacks it, rather
+than hiding or disabling features up front. We keep every deployment current,
+so that is enough.
 
 ## Runtime contracts
 
