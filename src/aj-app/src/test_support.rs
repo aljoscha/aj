@@ -195,6 +195,7 @@ pub fn build_tagged_test_agent(
         Arc::clone(&log),
         AppendHandoff::default(),
         tx,
+        aj_session::PersistenceFence::default(),
     ));
     (agent, log, handle, rx)
 }

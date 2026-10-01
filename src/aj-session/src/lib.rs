@@ -55,10 +55,7 @@ pub use compaction::{
     prepare_compaction, should_compact,
 };
 pub use id::is_valid_session_id;
-pub use listener::{
-    AppendHandoff, PersistenceFence, fenced_persisting_forwarder, persistence_listener,
-    persisting_forwarder,
-};
+pub use listener::{AppendHandoff, PersistenceFence, persistence_listener, persisting_forwarder};
 pub use lock::{LockHolder, LockMetadata, SessionLock};
 #[cfg(any(test, feature = "test-support"))]
 pub use log::test_support::{AppendFault, AppendFaultFixture};

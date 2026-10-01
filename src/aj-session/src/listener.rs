@@ -252,30 +252,14 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 /// send under the log lock and stall every append in the session (spec
 /// 6.9). Flow control belongs on the per-client queues downstream of the
 /// consumer, never here.
+///
+/// `fence` lets a session release its advisory lock only once in-flight
+/// writes have drained: a listener that finds it closed persists nothing.
 pub fn persisting_forwarder(
     log: Arc<TokioMutex<ConversationLog>>,
     handoff: AppendHandoff,
     sink: UnboundedSender<TaggedEvent>,
-) -> Listener {
-    persisting_forwarder_inner(log, handoff, sink, None)
-}
-
-/// Build a persisting forwarder whose in-flight writes can be fenced before a
-/// session releases its advisory lock.
-pub fn fenced_persisting_forwarder(
-    log: Arc<TokioMutex<ConversationLog>>,
-    handoff: AppendHandoff,
-    sink: UnboundedSender<TaggedEvent>,
     fence: PersistenceFence,
-) -> Listener {
-    persisting_forwarder_inner(log, handoff, sink, Some(fence))
-}
-
-fn persisting_forwarder_inner(
-    log: Arc<TokioMutex<ConversationLog>>,
-    handoff: AppendHandoff,
-    sink: UnboundedSender<TaggedEvent>,
-    fence: Option<PersistenceFence>,
 ) -> Listener {
     Arc::new(move |event: &AgentEvent| {
         let log = Arc::clone(&log);
@@ -284,12 +268,8 @@ fn persisting_forwarder_inner(
         let fence = fence.clone();
         let event = event.clone();
         Box::pin(async move {
-            let _permit = match fence {
-                Some(fence) => match fence.enter() {
-                    Some(permit) => Some(permit),
-                    None => return Ok(()),
-                },
-                None => None,
+            let Some(_permit) = fence.enter() else {
+                return Ok(());
             };
             if appends(&event) {
                 // The send happens under the guard that did the append, so
@@ -452,10 +432,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
 
-    use super::{
-        AppendHandoff, PersistenceFence, fenced_persisting_forwarder, persistence_listener,
-        persisting_forwarder,
-    };
+    use super::{AppendHandoff, PersistenceFence, persistence_listener, persisting_forwarder};
     use crate::log::{
         ConversationEntry, ConversationEntryKind, ConversationLog, ConversationView, EntryRef,
         SessionSettings, ThreadFilter,
@@ -500,7 +477,7 @@ mod tests {
         let (_dir, log) = fresh_log();
         let fence = PersistenceFence::default();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let listener = fenced_persisting_forwarder(
+        let listener = persisting_forwarder(
             Arc::clone(&log),
             AppendHandoff::default(),
             tx,
@@ -576,8 +553,7 @@ mod tests {
         let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
         let (failure_signal, mut failures) = tokio::sync::oneshot::channel();
         log.lock().await.install_failure_signal(failure_signal);
-        let listener =
-            fenced_persisting_forwarder(Arc::clone(&log), AppendHandoff::default(), tx, fence);
+        let listener = persisting_forwarder(Arc::clone(&log), AppendHandoff::default(), tx, fence);
         let event = AgentEvent::MessageEnd {
             agent_id: AgentId::Main,
             message: user_msg("fails partially"),
@@ -1186,6 +1162,7 @@ mod tests {
                 Arc::clone(&log),
                 AppendHandoff::default(),
                 tx,
+                PersistenceFence::default(),
             ));
             let mut initial = SessionSettings::default();
             if seeded {
@@ -1339,7 +1316,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handoff = AppendHandoff::default();
         let bus = EventBus::new();
-        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), handoff.clone(), tx));
+        let _h = bus.subscribe(persisting_forwarder(
+            Arc::clone(&log),
+            handoff.clone(),
+            tx,
+            PersistenceFence::default(),
+        ));
 
         let user = user_msg("hi");
         bus.emit(AgentEvent::MessageEnd {
@@ -1490,7 +1472,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let handoff = AppendHandoff::default();
         let bus = EventBus::new();
-        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), handoff.clone(), tx));
+        let _h = bus.subscribe(persisting_forwarder(
+            Arc::clone(&log),
+            handoff.clone(),
+            tx,
+            PersistenceFence::default(),
+        ));
 
         bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Main,
@@ -1594,6 +1581,7 @@ mod tests {
             Arc::clone(&log),
             AppendHandoff::default(),
             tx,
+            PersistenceFence::default(),
         ));
 
         bus.emit(AgentEvent::MessageEnd {
@@ -1664,6 +1652,7 @@ mod tests {
             Arc::clone(&log),
             AppendHandoff::default(),
             tx,
+            PersistenceFence::default(),
         ));
         drop(rx);
 

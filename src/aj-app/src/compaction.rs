@@ -1017,8 +1017,12 @@ mod tests {
         }));
 
         let handoff = AppendHandoff::default();
-        let _forwarder =
-            agent.subscribe(persisting_forwarder(Arc::clone(&log), handoff.clone(), tx));
+        let _forwarder = agent.subscribe(persisting_forwarder(
+            Arc::clone(&log),
+            handoff.clone(),
+            tx,
+            aj_session::PersistenceFence::default(),
+        ));
 
         agent
             .prompt("first question".to_string(), CancellationToken::new())
@@ -1222,8 +1226,12 @@ mod tests {
         }));
         let handoff = AppendHandoff::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TaggedEvent>();
-        let _forwarder =
-            agent.subscribe(persisting_forwarder(Arc::clone(&log), handoff.clone(), tx));
+        let _forwarder = agent.subscribe(persisting_forwarder(
+            Arc::clone(&log),
+            handoff.clone(),
+            tx,
+            aj_session::PersistenceFence::default(),
+        ));
 
         agent
             .prompt("first question".to_string(), CancellationToken::new())

@@ -25,7 +25,7 @@ use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, StreamOptions};
 use aj_session::{
     AppendHandoff, ConversationLog, ConversationPersistence, EntryId, PersistenceFailure,
-    PersistenceFence, TaggedEvent, fenced_persisting_forwarder, persistence_listener,
+    PersistenceFence, TaggedEvent, persistence_listener, persisting_forwarder,
 };
 use anyhow::Result;
 use tokio::sync::Mutex as TokioMutex;
@@ -484,7 +484,7 @@ impl SessionCore {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (failure_signal, failures) = tokio::sync::oneshot::channel();
         self.log.lock().await.install_failure_signal(failure_signal);
-        self.persistence_handle = self.subscriptions.subscribe(fenced_persisting_forwarder(
+        self.persistence_handle = self.subscriptions.subscribe(persisting_forwarder(
             Arc::clone(&self.log),
             handoff.clone(),
             tx,
