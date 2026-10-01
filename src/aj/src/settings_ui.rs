@@ -40,7 +40,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use aj_agent::events::AgentId;
-use aj_app::commands::{THINKING_LEVELS, ThinkingLevel, thinking_levels_for};
+use aj_app::commands::{THINKING_LEVELS, ThinkingOption, thinking_levels_for};
 use aj_app::footer::format_tokens;
 use aj_app::keybindings::{ACTION_SETTINGS_CLEAR, action_shortcut};
 use aj_app::settings::ConfigTarget;
@@ -213,7 +213,7 @@ pub(crate) fn open_selector_loading(
 // ============================================================================
 
 /// Pick-list rows for the thinking levels, current one tagged `(current)`.
-fn thinking_items(current_name: &str, levels: &[&ThinkingLevel]) -> Vec<SelectItem> {
+fn thinking_items(current_name: &str, levels: &[&ThinkingOption]) -> Vec<SelectItem> {
     levels
         .iter()
         .map(|level| {
@@ -234,7 +234,7 @@ pub(crate) fn fill_thinking(
     owner: crate::interactive::SettingsOwner,
     target: impl Into<SelectorTarget>,
     current: Option<&str>,
-    supported: Vec<&'static ThinkingLevel>,
+    supported: Vec<&'static ThinkingOption>,
 ) {
     let target = target.into();
     let current_name = current.unwrap_or("");
@@ -250,7 +250,7 @@ pub(crate) fn fill_thinking(
         let stack_c = Rc::clone(&handles.stack);
         let editor_c = Rc::clone(&handles.editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
-            if let Some(level) = aj_app::commands::parse_thinking_level(&item.filter_key) {
+            if let Some(level) = aj_models::thinking_config_from_name(&item.filter_key) {
                 activity.borrow_mut().push(match target {
                     SelectorTarget::Agent(target) => SelectorActivity::ThinkingConfirmed {
                         owner: owner.clone(),
@@ -1577,7 +1577,7 @@ fn open_setting_submenu(
     parent: &Rc<RefCell<SettingList>>,
     target: ConfigTarget,
     catalogs: &SettingsCatalogs,
-    thinking_supported: &[&ThinkingLevel],
+    thinking_supported: &[&ThinkingOption],
     id: &str,
     value: &str,
 ) {
@@ -2743,7 +2743,7 @@ mod tests {
 
     #[test]
     fn thinking_items_tag_the_current_level() {
-        let all: Vec<&ThinkingLevel> = THINKING_LEVELS.iter().collect();
+        let all: Vec<&ThinkingOption> = THINKING_LEVELS.iter().collect();
         let items = thinking_items("high", &all);
         assert!(items.iter().any(|i| i.label == "high (current)"));
         assert!(items.iter().all(|i| i.filter_key != "high (current)"));

@@ -410,7 +410,7 @@ pub enum CommandAction {
 /// Held as a static so the selector overlay and the status-notice
 /// formatter share the same human-readable descriptions without
 /// duplicating the table.
-pub struct ThinkingLevel {
+pub struct ThinkingOption {
     pub name: &'static str,
     pub description: &'static str,
     pub config: Option<ThinkingConfig>,
@@ -419,55 +419,43 @@ pub struct ThinkingLevel {
 /// Levels offered by the thinking selector, in the order the user
 /// sees them. `off` first because it's the cheapest option; the rest
 /// ascend in cost.
-pub const THINKING_LEVELS: &[ThinkingLevel] = &[
-    ThinkingLevel {
+pub const THINKING_LEVELS: &[ThinkingOption] = &[
+    ThinkingOption {
         name: "off",
         description: "No extended reasoning",
         config: None,
     },
-    ThinkingLevel {
+    ThinkingOption {
         name: "minimal",
         description: "Minimal thinking effort",
         config: Some(ThinkingConfig::Minimal),
     },
-    ThinkingLevel {
+    ThinkingOption {
         name: "low",
         description: "Light thinking effort",
         config: Some(ThinkingConfig::Low),
     },
-    ThinkingLevel {
+    ThinkingOption {
         name: "medium",
         description: "Moderate thinking effort",
         config: Some(ThinkingConfig::Medium),
     },
-    ThinkingLevel {
+    ThinkingOption {
         name: "high",
         description: "Deep thinking effort",
         config: Some(ThinkingConfig::High),
     },
-    ThinkingLevel {
+    ThinkingOption {
         name: "xhigh",
         description: "Extended-deep thinking effort",
         config: Some(ThinkingConfig::XHigh),
     },
-    ThinkingLevel {
+    ThinkingOption {
         name: "max",
         description: "Maximum thinking effort",
         config: Some(ThinkingConfig::Max),
     },
 ];
-
-/// Look up the [`ThinkingConfig`] for a level name. Returns
-/// `Some(None)` for `"off"` (i.e. a recognised level whose config
-/// is `None`), `Some(Some(...))` for the rest, and `None` for an
-/// unrecognised name. Case-insensitive.
-pub fn parse_thinking_level(name: &str) -> Option<Option<ThinkingConfig>> {
-    let needle = name.to_lowercase();
-    THINKING_LEVELS
-        .iter()
-        .find(|l| l.name == needle)
-        .map(|l| l.config.clone())
-}
 
 /// Render a [`ThinkingConfig`] back to its catalog name. Used by
 /// the selector to highlight the currently-active level on open
@@ -481,7 +469,7 @@ pub fn thinking_level_name(level: &Option<ThinkingConfig>) -> &'static str {
 /// [`aj_models::registry::supported_thinking_levels`] and kept in the
 /// canonical display order. Levels are matched by name, the vocabulary
 /// both the catalog rows and the wire enum share.
-pub fn thinking_levels_for(model: &ModelInfo) -> Vec<&'static ThinkingLevel> {
+pub fn thinking_levels_for(model: &ModelInfo) -> Vec<&'static ThinkingOption> {
     let supported = aj_models::registry::supported_thinking_levels(model);
     THINKING_LEVELS
         .iter()
@@ -492,20 +480,6 @@ pub fn thinking_levels_for(model: &ModelInfo) -> Vec<&'static ThinkingLevel> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_thinking_level_handles_all_levels() {
-        assert!(matches!(parse_thinking_level("off"), Some(None)));
-        assert!(matches!(
-            parse_thinking_level("low"),
-            Some(Some(ThinkingConfig::Low))
-        ));
-        assert!(matches!(
-            parse_thinking_level("MEDIUM"),
-            Some(Some(ThinkingConfig::Medium))
-        ));
-        assert!(parse_thinking_level("nonsense").is_none());
-    }
 
     #[test]
     fn thinking_level_name_round_trips() {
