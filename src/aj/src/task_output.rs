@@ -198,14 +198,36 @@ impl TaskOutputView {
 
     /// Poll once from the drive loop's select, releasing the widget borrow
     /// before waiting. A closed or fully read terminal task has no more work.
-    pub(crate) fn poll_output(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    ///
+    /// Ready with whether the settled read changed anything the viewer draws.
+    /// A running task is polled on an interval, and most of those reads find
+    /// nothing new, so `false` lets the caller skip the repaint.
+    pub(crate) fn poll_output(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
         let Some(reader) = self.reader.as_mut() else {
             return Poll::Pending;
         };
         let Poll::Ready(result) = reader.read.poll_unpin(cx) else {
             return Poll::Pending;
         };
-        let mut reader = self.reader.take().expect("polled reader");
+        let reader = self.reader.take().expect("polled reader");
+        let before = self.drawn();
+        self.settle(reader, result);
+        Poll::Ready(self.drawn() != before)
+    }
+
+    /// Everything a read can change that the viewer draws: the status line's
+    /// inputs, the output length, and the notice row.
+    fn drawn(&self) -> (TaskStatus, u64, u64, Option<String>) {
+        (
+            self.status,
+            self.total_bytes,
+            self.offset(),
+            self.notice.clone(),
+        )
+    }
+
+    /// Fold one settled read and arm the next one, if the task has more to give.
+    fn settle(&mut self, mut reader: OutputReader, result: Result<TaskOutput, ControlError>) {
         match result {
             Ok(output) => {
                 if output.id != self.id
@@ -217,7 +239,7 @@ impl TaskOutputView {
                     || (output.bytes.is_empty() && output.offset < output.total_bytes)
                 {
                     self.notice = Some("Host returned inconsistent task output.".to_string());
-                    return Poll::Ready(());
+                    return;
                 }
                 let total = output.total_bytes;
                 let running = output.status == TaskStatus::Running;
@@ -250,7 +272,6 @@ impl TaskOutputView {
                 }
             }
         }
-        Poll::Ready(())
     }
 
     fn apply_output(&mut self, output: TaskOutput) {
@@ -705,6 +726,64 @@ mod tests {
         press(&mut view, u32::from('k'), Modifiers::CTRL);
         assert_eq!(*view.kill.borrow_mut(), None);
         assert!(flatten(&view.draw(&draw_ctx(40, 12))).contains("exited 0"));
+    }
+
+    /// Settle one read of `view` that answers `result`, answering whether the
+    /// viewer reported a visible change.
+    fn settle_read(view: &mut TaskOutputView, result: Result<TaskOutput, ControlError>) -> bool {
+        view.reader = Some(OutputReader {
+            control: Control::remote(
+                crate::remote::RemoteClient::new("http://127.0.0.1:9").expect("client"),
+            ),
+            session: "session".to_string(),
+            read: futures::future::ready(result).boxed_local(),
+            retry_delay: POLL_INTERVAL,
+        });
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        match view.poll_output(&mut cx) {
+            Poll::Ready(changed) => changed,
+            Poll::Pending => panic!("a settled read is ready"),
+        }
+    }
+
+    /// A running task is re-read on an interval, so only a read that changed
+    /// what the viewer draws asks for a repaint.
+    #[tokio::test]
+    async fn only_a_read_that_changes_the_viewer_asks_for_a_repaint() {
+        let mut view = viewer();
+        let read = |status, offset: u64, bytes: &[u8]| {
+            Ok(TaskOutput {
+                id: 7,
+                status,
+                offset,
+                total_bytes: offset + u64::try_from(bytes.len()).unwrap(),
+                bytes: bytes.to_vec(),
+            })
+        };
+        assert!(
+            settle_read(&mut view, read(TaskStatus::Running, 0, b"hi\n")),
+            "new bytes"
+        );
+        assert!(view.reader.is_some(), "a running task is polled again");
+        assert!(
+            !settle_read(&mut view, read(TaskStatus::Running, 3, b"")),
+            "nothing new"
+        );
+        assert!(
+            settle_read(&mut view, read(TaskStatus::Running, 3, b"more\n")),
+            "more bytes"
+        );
+        let away = || Err(ControlError::Preview("host away".to_string()));
+        assert!(settle_read(&mut view, away()), "a read failure is shown");
+        assert!(!settle_read(&mut view, away()), "the same failure again");
+        assert!(
+            settle_read(&mut view, read(TaskStatus::Running, 8, b"")),
+            "recovery clears the notice"
+        );
+        assert!(
+            settle_read(&mut view, read(TaskStatus::Exited(Some(0)), 8, b"")),
+            "the status line changed"
+        );
     }
 
     #[test]

@@ -1287,7 +1287,7 @@ the footer.
 
 The same session browser opens locally, directly connected, and through a
 gateway. It starts with selectable directory rows and progressively enriches
-them with previews from their owning hosts, read in small batches in
+exactly those rows with previews from their owning hosts, read in small batches in
 directory order so the top of the list fills first and the rest keeps landing
 behind it. An arriving preview fills in its own row and leaves the highlight
 and the scroll where the user put them.

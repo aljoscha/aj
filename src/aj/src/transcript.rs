@@ -797,14 +797,16 @@ fn fingerprint_into(entry: &Entry, chat: &ChatState, hasher: &mut DefaultHasher)
             c.tokens_before.hash(hasher);
             c.tokens_after.hash(hasher);
         }
-        // Notice and turn-usage rows are immutable after append, so the id and
-        // width already distinguish them. We fold a stable discriminant (plus
-        // a couple of trivially cheap fields) for defence in depth.
+        // A notice can be rewritten in place (a re-served state notice, a
+        // connection outage reporting its latest attempt), and a rewrite may
+        // keep the text's length, so the text itself is hashed.
         EntryKind::Notice(n) => {
             5u8.hash(hasher);
             notice_level_tag(n.level).hash(hasher);
-            n.text.len().hash(hasher);
+            n.text.hash(hasher);
         }
+        // Turn-usage rows are immutable after append, so the id and width
+        // already distinguish them. The discriminant is defence in depth.
         EntryKind::TurnUsage(_) => {
             6u8.hash(hasher);
         }

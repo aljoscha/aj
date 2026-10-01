@@ -21,7 +21,7 @@ use aj_agent::TaskRegistry;
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::tool::TaskId;
 use aj_app::actions::AjAction;
-use aj_app::chat::ChatState;
+use aj_app::chat::{ChatState, NoticeLevel, NoticeRow};
 use aj_app::cli::args::{
     Args, Command as CliCommand, ENV_WITHOUT_A_CREATE, HOST_WITHOUT_A_CREATE, TAG_WITHOUT_A_CREATE,
     THINKING_WITHOUT_A_CREATE,
@@ -5207,14 +5207,16 @@ async fn recv_history(fill: Option<&mut HistoryFill>) -> Option<aj_wire::PromptH
     }
 }
 
-/// Request previews through the host boundary without blocking input or drawing.
-/// Dropping the receiver when the overlay closes cancels the remaining reads.
+/// Request the previews of `ids` through the host boundary without blocking
+/// input or drawing. Dropping the receiver when the overlay closes cancels the
+/// remaining reads.
 fn spawn_session_scan(
     world: &World,
+    ids: Vec<String>,
     tx: UnboundedSender<Result<Vec<SessionPreview>, ControlError>>,
 ) {
     let control = world.control.clone();
-    tokio::spawn(async move { control.session_previews(tx).await });
+    tokio::spawn(async move { control.session_previews(ids, tx).await });
 }
 
 /// Open the model or thinking selector on a loading placeholder and capture
@@ -7592,6 +7594,12 @@ struct Resume {
     /// a full projection and a client's cursor does not move until the block
     /// completes.
     retry: Retry,
+    /// Failed steps so far, which is the retry an outage row names.
+    failures: u32,
+    /// The transcript row this recovery reports its failures in, once it has
+    /// reported one. Rewritten by every later report, so an outage of any
+    /// length is one row whose text shows the recovery is still trying.
+    outage: Option<NoticeRow>,
 }
 
 enum ResumeStep {
@@ -7609,6 +7617,8 @@ impl Resume {
         Resume {
             step: ResumeStep::Waiting,
             retry: Retry::default(),
+            failures: 0,
+            outage: None,
         }
     }
 
@@ -7618,6 +7628,8 @@ impl Resume {
         Resume {
             step: ResumeStep::CatchingUp(Block::open(world)),
             retry: Retry::default(),
+            failures: 0,
+            outage: None,
         }
     }
 
@@ -7669,7 +7681,21 @@ impl Resume {
     /// `world.connection`.
     fn failed(&mut self) {
         self.retry.failed();
+        self.failures += 1;
         self.step = ResumeStep::Waiting;
+    }
+
+    /// Show `text` as this recovery's outage warning: the first report raises
+    /// the row and every later one rewrites it. A row the model no longer holds
+    /// (the chat was reset or replaced since) is raised afresh.
+    fn report(&mut self, world: &World, text: String) {
+        let mut chat = world.chat.borrow_mut();
+        if let Some(row) = self.outage
+            && chat.rewrite_notice(row, text.clone())
+        {
+            return;
+        }
+        self.outage = Some(chat.push_notice(AgentId::Main, NoticeLevel::Warning, text));
     }
 }
 
@@ -7689,12 +7715,14 @@ fn active_task_view(shell: &Rc<RefCell<Shell>>) -> Option<Rc<RefCell<TaskOutputV
     shell.borrow().task_view.borrow().clone()
 }
 
-async fn recv_task_output(view: Option<&Rc<RefCell<TaskOutputView>>>) {
+/// The viewer's next settled read, answering whether it changed what the
+/// viewer draws.
+async fn recv_task_output(view: Option<&Rc<RefCell<TaskOutputView>>>) -> bool {
     futures::future::poll_fn(|cx| match view {
         Some(view) => view.borrow_mut().poll_output(cx),
         None => std::task::Poll::Pending,
     })
-    .await;
+    .await
 }
 
 /// Advance a pending re-attach by one step, reporting a pending block, an open
@@ -8203,11 +8231,11 @@ async fn drive(
                             pending_history = Some(spawn_history_scan(world, fetch));
                         }
                         // A session-selector open: give it a fresh channel,
-                        // run the preview scan off the loop, and remember the
-                        // selector to stream into.
+                        // run the preview scan off the loop for the rows it
+                        // opened with, and remember the selector to stream into.
                         if let Some(scan) = shell.borrow().take_session_scan() {
                             let (tx, rx) = unbounded_channel();
-                            spawn_session_scan(world, tx);
+                            spawn_session_scan(world, scan.session_ids(), tx);
                             pending_session = Some(SessionFill {
                                 scan,
                                 rx,
@@ -8331,10 +8359,11 @@ async fn drive(
                                 block.settle(world.stall_attach(stalled));
                             }
                             None => {
+                                let mut state = Resume::new();
                                 if let ControlFrame::Lost(err) = lost {
-                                    fold_warning(world, &format!("Lost the connection: {err}"));
+                                    state.report(world, format!("Lost the connection: {err}"));
                                 }
-                                resume = Some(Resume::new());
+                                resume = Some(state);
                                 world.connection = Connection::Reconnecting;
                             }
                         }
@@ -8344,8 +8373,12 @@ async fn drive(
             }
 
             // Task output waits independently of input and frame processing.
-            _ = recv_task_output(task_view.as_ref()) => {
-                app.request_redraw();
+            // A running task is re-read on an interval, so only a read that
+            // changed the viewer paints.
+            changed = recv_task_output(task_view.as_ref()) => {
+                if changed {
+                    app.request_redraw();
+                }
             }
 
             // --- Autocomplete delivery ---
@@ -8501,14 +8534,20 @@ async fn drive(
                         world,
                         TransitionFailure::Open(reason.clone()),
                     );
-                    if !presented {
-                        fold_warning(world, &format!("Lost the session's event stream: {reason}"));
-                    }
                     if !world.control.is_remote() {
                         break Err(anyhow::anyhow!("the session host is gone: {error}"));
                     }
-                    tracing::warn!("could not re-attach the selected session: {reason}");
                     state.failed();
+                    if !presented {
+                        state.report(
+                            world,
+                            format!(
+                                "Lost the session's event stream: {reason}. Retrying (attempt {})…",
+                                state.failures
+                            ),
+                        );
+                    }
+                    tracing::warn!("could not re-attach the selected session: {reason}");
                     world.connection = Connection::Reconnecting;
                     resume = Some(state);
                 }
@@ -8552,17 +8591,17 @@ async fn drive(
                             world,
                             TransitionFailure::Attach(stalled),
                         );
+                        state.failed();
                         if !presented {
-                            fold_warning(
+                            state.report(
                                 world,
-                                &format!(
-                                    "The re-attach did not land: {reason}. This client is asking \
-                                     again."
+                                format!(
+                                    "The re-attach did not land: {reason}. Retrying (attempt {})…",
+                                    state.failures
                                 ),
                             );
                         }
                         tracing::warn!("the selected session's attach block did not land");
-                        state.failed();
                         world.connection = Connection::Stalled;
                         resume = Some(state);
                     }
@@ -8745,7 +8784,7 @@ mod tests {
     use std::io::{PipeWriter, Write};
     use std::sync::{Arc, OnceLock};
 
-    use aj_app::chat::{EntryKind, NoticeLevel, SubAgentStatus, ToolStatus, reduce};
+    use aj_app::chat::{EntryKind, SubAgentStatus, ToolStatus, reduce};
     use aj_app::session::AgentLifecycle;
     use aj_app::test_support::CanonicalState;
     use aj_models::auth::AuthCredential;
@@ -20761,7 +20800,7 @@ mod tests {
 
     async fn fill_browser_previews(world: &World, scan: &SessionScan) {
         let (tx, mut rx) = unbounded_channel();
-        world.control.session_previews(tx).await;
+        world.control.session_previews(scan.session_ids(), tx).await;
         while let Some(batch) = rx.recv().await {
             extend_session_scan(scan, &batch.expect("host previews"), Utc::now());
         }
@@ -27354,6 +27393,109 @@ mod tests {
         shut_down(&world).await;
     }
 
+    /// The selector's preview read asks for exactly the rows it opened with,
+    /// which the directory already holds, so opening it lists nothing again.
+    #[tokio::test]
+    async fn the_session_selector_previews_exactly_its_rows() {
+        use axum::{Json, Router, extract::Query, http::Uri};
+
+        let dir = TempDir::new().expect("tempdir");
+        create_disk_session(&dir, "alpha session prompt").await;
+        create_disk_session(&dir, "beta session prompt").await;
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "current session prompt").await;
+        refresh_browser_directory(&mut world).await;
+        let shown: Vec<String> = world
+            .directory
+            .rows()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        assert_eq!(shown.len(), 3, "the selector opens over every session");
+
+        // A peer that records every request and answers previews for the ids
+        // it was asked about.
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let recorded = Arc::clone(&requests);
+        let router = Router::new().fallback(
+            move |uri: Uri, Query(params): Query<Vec<(String, String)>>| {
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    let ids: Vec<String> = params
+                        .into_iter()
+                        .filter(|(key, _)| key == "session")
+                        .map(|(_, id)| id)
+                        .collect();
+                    let previews: Vec<_> = ids
+                        .iter()
+                        .map(|id| {
+                            serde_json::json!({
+                                "session_id": id, "modified": "2026-01-01T00:00:00Z",
+                                "created_at": "2026-01-01T00:00:00Z",
+                                "last_message_at": "2026-01-01T00:00:00Z",
+                                "size_bytes": 0, "message_count": 1,
+                                "first_user_message": format!("preview of {id}"),
+                                "tag": null, "archived": false
+                            })
+                        })
+                        .collect();
+                    recorded
+                        .lock()
+                        .expect("requests")
+                        .push((uri.path().to_string(), ids));
+                    Json(serde_json::json!({"previews": previews, "incomplete": []}))
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let host = world.control.host().expect("a local host").clone();
+        world.control = Control::remote(crate::remote::RemoteClient::new(&url).unwrap());
+
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+        let (mut theme_watch, mut history) = drive_parts();
+        let observed = Arc::clone(&requests);
+        let expected = shown.len();
+        let interaction = async {
+            // Any input turn hands the parked scan to the loop.
+            writer.write_all(b"p").unwrap();
+            let asked = poll_for(|| {
+                let requests = observed.lock().expect("requests");
+                let ids = requests.iter().map(|(_, ids)| ids.len()).sum::<usize>();
+                (ids >= expected).then_some(())
+            })
+            .await;
+            drop(writer);
+            asked
+        };
+        let (exit, asked) = tokio::join!(
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut history
+            ),
+            interaction,
+        );
+        assert!(matches!(exit.unwrap(), SessionExit::Quit));
+        assert!(asked.is_some(), "the selector never read its previews");
+        let requests = requests.lock().expect("requests").clone();
+        assert!(
+            requests.iter().all(|(path, _)| path == "/v1/previews"),
+            "opening the selector read only previews: {requests:?}",
+        );
+        let asked: Vec<String> = requests.into_iter().flat_map(|(_, ids)| ids).collect();
+        assert_eq!(asked, shown, "the previews asked for are the rows shown");
+        host.shutdown().await;
+        serving.abort();
+    }
+
     /// A label the store would not keep is reported in a toast and changes
     /// nothing. The editor stays open, so the refusal is not a dead end.
     #[tokio::test]
@@ -29533,6 +29675,140 @@ mod tests {
                 .iter()
                 .any(|toast| toast.starts_with("Switched to")),
             "the unopened target was called successful",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A host that stays down costs the transcript one warning row per outage,
+    /// rewritten by every failed attempt so its count shows recovery is still
+    /// trying. The row outlives the recovery, and the next outage starts its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_outage_is_one_warning_row_rewritten_by_each_retry() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let reason = "host down";
+        let down = WarmPeer::refusing_events(reason).await;
+        fn outage_rows(chat: &RefCell<ChatState>) -> Vec<String> {
+            notices_of(&chat.borrow())
+                .into_iter()
+                .filter(|text| text.starts_with("Lost the "))
+                .collect()
+        }
+        // A conversation, so the transcript rather than the splash is painted.
+        assert!(handle_submit(&mut world, "hello".to_string()).await);
+        settle(&mut world).await;
+        assert!(
+            outage_rows(&world.chat).is_empty(),
+            "the launch reported no outage"
+        );
+
+        // Down: the stream is cut and every reopen is refused.
+        redirect_to(&mut world, &down, Duration::from_secs(5));
+        let chat = Rc::clone(&world.chat);
+        let observed_shell = Rc::clone(&shell);
+        let (exit, seen) = drive_until(&mut world, &shell, move |writer| async move {
+            // Whether the painted transcript shows `attempt`. Consecutive
+            // attempts rewrite the row to text of the same length, which is
+            // what a render cache keyed on less than the text would miss.
+            let painted = |attempt: u32| {
+                // The terminal's own size, so this paint shares the render
+                // cache slots the drive loop's paints fill.
+                painted_rows(&observed_shell, 80, 40)
+                    .iter()
+                    .any(|row| row.contains(&format!("Retrying (attempt {attempt})…")))
+            };
+            let at = |attempt: u32| {
+                let chat = Rc::clone(&chat);
+                let marker = format!(". Retrying (attempt {attempt})…");
+                poll_for(move || {
+                    let rows = outage_rows(&chat);
+                    rows.iter()
+                        .any(|row| row.contains(reason) && row.ends_with(&marker))
+                        .then_some(rows)
+                })
+            };
+            let first = at(1).await;
+            let painted_first = painted(1);
+            let second = at(2).await;
+            let painted_second = painted(2);
+            let third = at(3).await;
+            drop(writer);
+            (first.zip(second).zip(third), painted_first, painted_second)
+        })
+        .await;
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let (Some(((first, _), third)), painted_first, painted_second) = seen else {
+            panic!(
+                "the outage never reported three retries: {:?}",
+                main_notices(&world)
+            );
+        };
+        assert!(down.opens() >= 3, "the peer saw the retries");
+        assert_eq!(first.len(), 1, "one row at the first retry: {first:?}");
+        assert_eq!(third.len(), 1, "still one row at the third: {third:?}");
+        assert_ne!(first, third, "the row's text followed the attempts");
+        assert!(
+            painted_first && painted_second,
+            "the painted row followed the attempts: {painted_first} {painted_second}"
+        );
+        let outage = outage_rows(&world.chat);
+        assert_eq!(outage.len(), 1, "{outage:?}");
+
+        // Up again: the reopen lands, and the outage row stays as the record.
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&remote.url()).expect("a client against the host"),
+        );
+        let chat = Rc::clone(&world.chat);
+        let (exit, reconnected) = drive_until(&mut world, &shell, move |writer| async move {
+            let reconnected = poll_for(|| {
+                notices_of(&chat.borrow())
+                    .iter()
+                    .any(|text| text == "Reconnected to the host.")
+                    .then_some(())
+            })
+            .await;
+            drop(writer);
+            reconnected
+        })
+        .await;
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(
+            reconnected.is_some(),
+            "the stream never came back: {:?}",
+            main_notices(&world)
+        );
+        assert_eq!(outage_rows(&world.chat), outage, "the record kept its text");
+
+        // Down again: a second outage is a second row, and the first one is
+        // left as it was.
+        redirect_to(&mut world, &down, Duration::from_secs(5));
+        let chat = Rc::clone(&world.chat);
+        let (exit, second) = drive_until(&mut world, &shell, move |writer| async move {
+            let second = poll_for(|| {
+                let rows = outage_rows(&chat);
+                (rows.len() > 1
+                    && rows.last().is_some_and(|row| {
+                        row.contains(reason) && row.ends_with(". Retrying (attempt 1)…")
+                    }))
+                .then_some(rows)
+            })
+            .await;
+            drop(writer);
+            second
+        })
+        .await;
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let second = second.unwrap_or_else(|| {
+            panic!(
+                "the second outage raised no row of its own: {:?}",
+                main_notices(&world)
+            )
+        });
+        assert_eq!(second.len(), 2, "{second:?}");
+        assert_eq!(
+            second[0], outage[0],
+            "the first outage's row was left alone"
         );
         remote.shutdown().await;
     }

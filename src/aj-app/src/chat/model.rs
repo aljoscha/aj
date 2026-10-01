@@ -262,6 +262,18 @@ pub struct NoticeEntry {
     pub entry: Option<String>,
 }
 
+/// A notice row its raiser may rewrite, minted by [`ChatState::push_notice`].
+///
+/// Bound to the incarnation of the model that minted it (see
+/// [`ChatState::generation`]): entry ids restart with the transcript, so the
+/// bare id could name an unrelated row of a later incarnation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoticeRow {
+    generation: u64,
+    agent: AgentId,
+    id: EntryId,
+}
+
 /// One accounted usage delta, stored structured so views format it without
 /// reparsing. Most rows follow assistant turns; compaction rows follow their
 /// checkpoint.
@@ -568,6 +580,49 @@ impl ChatState {
     /// The transcript for `id`, if one exists.
     pub fn transcript(&self, id: AgentId) -> Option<&Transcript> {
         self.transcripts.get(&id)
+    }
+
+    /// Append a locally raised notice row to `agent`'s transcript, answering
+    /// the handle that rewrites it through [`Self::rewrite_notice`].
+    ///
+    /// For a frontend notice that reports an ongoing condition and should
+    /// stay one row however often the condition changes.
+    pub fn push_notice(&mut self, agent: AgentId, level: NoticeLevel, text: String) -> NoticeRow {
+        let id = self
+            .transcripts
+            .entry(agent)
+            .or_default()
+            .append(EntryKind::Notice(NoticeEntry {
+                level,
+                text,
+                entry: None,
+            }));
+        NoticeRow {
+            generation: self.generation,
+            agent,
+            id,
+        }
+    }
+
+    /// Replace the text of the notice row `row` names, answering `false` when
+    /// this model no longer holds that row (it was reset or replaced since),
+    /// in which case nothing changed.
+    pub fn rewrite_notice(&mut self, row: NoticeRow, text: String) -> bool {
+        if row.generation != self.generation {
+            return false;
+        }
+        match self
+            .transcripts
+            .get_mut(&row.agent)
+            .and_then(|transcript| transcript.get_mut(row.id))
+            .map(|entry| &mut entry.kind)
+        {
+            Some(EntryKind::Notice(notice)) => {
+                notice.text = text;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The agent whose transcript the chat view currently shows.

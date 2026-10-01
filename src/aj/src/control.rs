@@ -245,10 +245,14 @@ impl Control {
             )
             .chain(additional_providers.iter().map(String::as_str))
             .collect();
-        let mut accounts = Vec::with_capacity(providers.len());
-        for provider in providers {
-            accounts.push(self.accounts(session, Some(provider)).await?);
-        }
+        // One read per provider, all in flight at once. Results keep the
+        // providers' order, and the first failure fails the overview.
+        let accounts = futures::future::try_join_all(
+            providers
+                .into_iter()
+                .map(|provider| self.accounts(session, Some(provider))),
+        )
+        .await?;
         Ok((overview, accounts))
     }
 
@@ -500,25 +504,18 @@ impl Control {
         }
     }
 
-    /// Read every available preview on request. Batches arrive independently,
-    /// errors do not discard healthy rows, and receiver closure cancels work.
+    /// Read the previews of `ids`, the sessions a browser is showing. Batches
+    /// arrive independently, errors do not discard healthy rows, and receiver
+    /// closure cancels work.
     pub(crate) async fn session_previews(
         &self,
+        ids: Vec<String>,
         tx: tokio::sync::mpsc::UnboundedSender<
             Result<Vec<aj_session::SessionPreview>, ControlError>,
         >,
     ) {
-        let directory = tokio::select! {
-            biased;
-            _ = tx.closed() => return,
-            result = self.sessions() => match result {
-                Ok(directory) => directory,
-                Err(err) => { let _ = tx.send(Err(err)); return; }
-            },
-        };
-        // Start in directory order so the first rows fill first. A few batches
+        // Batches start in the order given so the first rows fill first. A few
         // in flight let healthy hosts make progress beside a slow one.
-        let ids: Vec<String> = directory.sessions.into_iter().map(|row| row.id).collect();
         let batches: Vec<Vec<String>> = ids.chunks(PREVIEW_BATCH).map(<[String]>::to_vec).collect();
         let mut reads = futures::stream::iter(batches)
             .map(|batch| async move {
@@ -1013,9 +1010,9 @@ mod preview_tests {
     use crate::remote::{IdentityGate, RemoteServer};
     use std::time::Duration;
 
-    async fn collect(control: &Control) -> Vec<aj_wire::SessionPreview> {
+    async fn collect(control: &Control, ids: &[String]) -> Vec<aj_wire::SessionPreview> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        bounded("preview scan", control.session_previews(tx)).await;
+        bounded("preview scan", control.session_previews(ids.to_vec(), tx)).await;
         let mut rows = Vec::new();
         while let Some(batch) = rx.recv().await {
             rows.extend(
@@ -1081,8 +1078,9 @@ mod preview_tests {
                 .expect("row")
                 .locked
         );
-        let local = collect(&Control::local(host.clone())).await;
-        let remote = collect(&Control::remote(client.clone())).await;
+        let ids: Vec<String> = before.sessions.iter().map(|row| row.id.clone()).collect();
+        let local = collect(&Control::local(host.clone()), &ids).await;
+        let remote = collect(&Control::remote(client.clone()), &ids).await;
         assert_eq!(local, remote);
         assert_eq!(remote.len(), 2);
         let row = remote
@@ -1123,14 +1121,6 @@ mod preview_tests {
         })
     }
 
-    fn directory_json(ids: &[&str]) -> serde_json::Value {
-        serde_json::json!({"sessions": ids.iter().map(|id| serde_json::json!({
-            "id": id, "live": false, "working": false,
-            "queued": {"steering": 0, "follow_up": 0}, "tasks": 0,
-            "last_activity": "2026-01-01T00:00:00Z"
-        })).collect::<Vec<_>>()})
-    }
-
     fn requested(params: &[(String, String)]) -> Vec<String> {
         params
             .iter()
@@ -1145,29 +1135,25 @@ mod preview_tests {
     async fn preview_remote_emits_ready_batches_and_cancels_abandoned_reads() {
         use axum::{Json, Router, extract::Query, routing::get};
         let ids: Vec<String> = (0..PREVIEW_BATCH * 2).map(|i| format!("s{i:02}")).collect();
-        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let directory = directory_json(&refs);
         let (started, mut requests) = tokio::sync::mpsc::unbounded_channel();
-        let app = Router::new()
-            .route("/v1/sessions", get(move || async move { Json(directory) }))
-            .route(
-                "/v1/previews",
-                get(move |Query(params): Query<Vec<(String, String)>>| {
-                    let started = started.clone();
-                    async move {
-                        let batch = requested(&params);
-                        let _ = started.send(batch.clone());
-                        // The second batch never answers.
-                        if batch.first().map(String::as_str) != Some("s00") {
-                            futures::future::pending::<()>().await;
-                        }
-                        Json(serde_json::json!({
-                            "previews": batch.iter().map(|id| preview_json(id)).collect::<Vec<_>>(),
-                            "incomplete": [],
-                        }))
+        let app = Router::new().route(
+            "/v1/previews",
+            get(move |Query(params): Query<Vec<(String, String)>>| {
+                let started = started.clone();
+                async move {
+                    let batch = requested(&params);
+                    let _ = started.send(batch.clone());
+                    // The second batch never answers.
+                    if batch.first().map(String::as_str) != Some("s00") {
+                        futures::future::pending::<()>().await;
                     }
-                }),
-            );
+                    Json(serde_json::json!({
+                        "previews": batch.iter().map(|id| preview_json(id)).collect::<Vec<_>>(),
+                        "incomplete": [],
+                    }))
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
             .await
             .expect("bind");
@@ -1180,7 +1166,7 @@ mod preview_tests {
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let scan = tokio::spawn(async move {
-            control.session_previews(tx).await;
+            control.session_previews(ids, tx).await;
         });
         let rows = bounded("first batch before the slow one completes", rx.recv())
             .await
@@ -1217,11 +1203,7 @@ mod preview_tests {
                 format!("{host}/{i:02}")
             })
             .collect();
-        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let directory = directory_json(&refs);
-        let app = Router::new()
-            .route("/v1/sessions", get(move || async move { Json(directory) }))
-            .route(
+        let app = Router::new().route(
                 "/v1/previews",
                 get(|Query(params): Query<Vec<(String, String)>>| async move {
                     let batch = requested(&params);
@@ -1248,7 +1230,7 @@ mod preview_tests {
         });
         let control = Control::remote(RemoteClient::new(&base).expect("client"));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        bounded("scan", control.session_previews(tx)).await;
+        bounded("scan", control.session_previews(ids.clone(), tx)).await;
         let mut rows = Vec::new();
         let mut errors = Vec::new();
         while let Some(batch) = rx.recv().await {
@@ -1270,10 +1252,14 @@ mod preview_tests {
         let control =
             Control::remote(RemoteClient::new(&format!("{base}/nowhere")).expect("client"));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        bounded("scan", control.session_previews(tx)).await;
+        bounded("scan", control.session_previews(ids, tx)).await;
         let mut errors = Vec::new();
         while let Some(batch) = rx.recv().await {
-            errors.push(batch.expect_err("no rows without a directory").to_string());
+            errors.push(
+                batch
+                    .expect_err("no rows from a missing endpoint")
+                    .to_string(),
+            );
         }
         assert_eq!(errors.len(), 1, "{errors:?}");
         server.abort();

@@ -24,7 +24,7 @@ mod reducer;
 
 pub use model::{
     AgentEntry, AssistantEntry, ChatState, CompactionEntry, Entry, EntryId, EntryKind, NoticeEntry,
-    NoticeLevel, SubAgentEntry, SubAgentStatus, TaskInfo, TaskNotificationEntry, ToolEntry,
-    ToolStatus, Transcript, TurnUsageEntry, UserEntry,
+    NoticeLevel, NoticeRow, SubAgentEntry, SubAgentStatus, TaskInfo, TaskNotificationEntry,
+    ToolEntry, ToolStatus, Transcript, TurnUsageEntry, UserEntry,
 };
 pub use reducer::{Redraw, reduce};

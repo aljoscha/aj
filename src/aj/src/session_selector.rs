@@ -88,6 +88,12 @@ impl SessionScan {
             .is_some_and(|overlay| Rc::ptr_eq(&overlay.focus, &self.select.borrow().focus_target()))
     }
 
+    /// The sessions this selector opened with, in directory order, archived
+    /// ones included: the ids its preview read asks for.
+    pub(crate) fn session_ids(&self) -> Vec<String> {
+        self.rows.rows.iter().map(|row| row.id.clone()).collect()
+    }
+
     pub(crate) fn finish(&self, failed: bool) {
         if let Some(window) = &self.window {
             window.borrow_mut().title = if failed {
