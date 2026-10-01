@@ -91,8 +91,8 @@ use fanout::Fanout;
 /// `last_seq` churns on every durable event of a busy turn, and every frame
 /// carries the whole directory to every subscriber, so a busy host pays for
 /// each tick in proportion to its store. The cost of a longer tick is lag in
-/// what only a row shows: a sidebar's working flag and unseen glyph, and a
-/// fresh subscriber's first directory, may trail the host by up to this much.
+/// what only a row shows: a sidebar's working flag and unseen glyph may trail
+/// the host by up to this much. A fresh subscriber gets its directory on attach.
 /// An attached session is unaffected, since its `state` frames travel at
 /// once.
 pub const DEFAULT_LIST_COALESCE: Duration = Duration::from_secs(1);
@@ -1114,6 +1114,13 @@ impl SessionHost {
         // sessions all resolved.
         if let Err(err) = self.enumerate().await {
             tracing::warn!("could not re-read the session store for an attach: {err}");
+        }
+        if list == ListFrames::Included {
+            let sessions = self.directory().await.sessions;
+            // Teardown can drain the live map while the directory is being
+            // composed. Its cold rows must not replace clients' live positions.
+            self.alive()?;
+            self.inner.shared.fanout.publish_initial_list(id, sessions);
         }
         let (attachment, block_tx, block_complete) = Attachment::new(
             id,

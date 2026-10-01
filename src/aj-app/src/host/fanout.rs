@@ -56,16 +56,15 @@ struct Subscriber {
 }
 
 /// Where one subscriber stands with the fan-out's latest directory.
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum ListState {
     /// The subscriber asked for no `list` frames, and is never offered one.
     Unwanted,
-    /// Its queue has not accepted the latest directory. A fresh subscriber and
-    /// one whose full queue dropped the frame are here, so the next refresh
-    /// offers the current snapshot to them.
+    /// Its queue has not accepted a directory yet, so the next refresh offers
+    /// the current snapshot to it.
     Stale,
-    /// Its queue accepted the latest directory.
-    Current,
+    /// The directory its queue last accepted. Attach-time snapshots reach only
+    /// one subscriber, so acceptance must be compared per subscriber.
+    Current(Arc<Vec<SessionSummary>>),
 }
 
 impl Subscriber {
@@ -144,9 +143,9 @@ struct FanoutState {
     /// atomic with every registration that could otherwise follow it.
     closed: bool,
     subscribers: HashMap<SubscriberId, Subscriber>,
-    /// The latest directory payload, compared once per publisher tick.
-    /// Subscribers retain only whether their own queue accepted it.
-    current_list: Option<Vec<SessionSummary>>,
+    /// The latest directory payload, compared on attach and publisher ticks.
+    /// Subscribers share accepted snapshots without copying their payloads.
+    current_list: Option<Arc<Vec<SessionSummary>>>,
 }
 
 impl Default for Fanout {
@@ -273,38 +272,49 @@ impl Fanout {
     /// directory. Queue admission remains per subscriber: a fresh subscriber or
     /// one whose full queue dropped the frame still needs the next refresh.
     pub(crate) fn publish_list(&self, sessions: Vec<SessionSummary>) {
+        self.publish_list_to(sessions, None);
+    }
+
+    /// Offer the attach-time directory only to its new subscriber. Existing
+    /// subscribers retain their coalesced cadence, even if this snapshot changed.
+    pub(crate) fn publish_initial_list(&self, id: SubscriberId, sessions: Vec<SessionSummary>) {
+        self.publish_list_to(sessions, Some(id));
+    }
+
+    fn publish_list_to(&self, sessions: Vec<SessionSummary>, recipient: Option<SubscriberId>) {
         let mut state = self.lock();
         if state.current_list.as_deref() != Some(&sessions) {
-            state.current_list = Some(sessions);
-            for subscriber in state.subscribers.values_mut() {
-                if subscriber.list == ListState::Current {
-                    subscriber.list = ListState::Stale;
-                }
-            }
+            state.current_list = Some(Arc::new(sessions));
         }
-        if !state
-            .subscribers
-            .values()
-            .any(|subscriber| subscriber.list == ListState::Stale)
-        {
-            return;
-        }
-        let frame = Frame::List {
-            sessions: state
+        let sessions = Arc::clone(
+            state
                 .current_list
-                .clone()
+                .as_ref()
                 .expect("the current directory was set above"),
-            // A plain host's rows are all its own, so it names no hosts:
-            // that field is a gateway's.
-            hosts: Vec::new(),
-        };
-        state.subscribers.retain(|_, subscriber| {
-            if subscriber.list != ListState::Stale {
+        );
+        let mut frame = None;
+        state.subscribers.retain(|id, subscriber| {
+            if recipient.is_some_and(|recipient| recipient != *id) {
                 return true;
             }
-            match subscriber.deliver(&frame) {
+            match &subscriber.list {
+                ListState::Unwanted => return true,
+                ListState::Current(accepted)
+                    if Arc::ptr_eq(accepted, &sessions) || accepted == &sessions =>
+                {
+                    return true;
+                }
+                ListState::Stale | ListState::Current(_) => {}
+            }
+            let frame = frame.get_or_insert_with(|| Frame::List {
+                sessions: sessions.as_ref().clone(),
+                // A plain host's rows are all its own, so it names no hosts:
+                // that field is a gateway's.
+                hosts: Vec::new(),
+            });
+            match subscriber.deliver(frame) {
                 Offered::Queued => {
-                    subscriber.list = ListState::Current;
+                    subscriber.list = ListState::Current(Arc::clone(&sessions));
                     true
                 }
                 // The next refresh retries the current directory only for this
@@ -717,7 +727,7 @@ mod tests {
         // not be dropped.
         fanout.publish(reliable("one"));
         fanout.publish(reliable("two"));
-        fanout.publish_list(directory(1));
+        fanout.publish_initial_list(id, directory(1));
         assert!(
             !cancelled.is_cancelled(),
             "a lossy frame meeting the bound drops rather than evicting",
@@ -735,6 +745,30 @@ mod tests {
             vec!["list"],
             "the subscriber is offered the directory it never got",
         );
+    }
+
+    /// A change seen only by a new subscriber does not invalidate another
+    /// subscriber's accepted baseline when the directory returns to it.
+    #[test]
+    fn an_attach_snapshot_does_not_republish_an_unseen_change_and_restore() {
+        let fanout = Fanout::default();
+        let (_settled, mut settled_rx, _) = fanout.register(&[], ListFrames::Included);
+        fanout.publish_list(directory(1));
+        assert_eq!(drained(&mut settled_rx), vec!["list"]);
+
+        let (fresh, mut fresh_rx, _) = fanout.register(&[], ListFrames::Included);
+        fanout.publish_initial_list(fresh, directory(2));
+        assert!(drained(&mut settled_rx).is_empty());
+        assert_eq!(drained(&mut fresh_rx), vec!["list"]);
+
+        fanout.publish_list(directory(1));
+        assert!(drained(&mut settled_rx).is_empty());
+        let Some(Frame::List { sessions, .. }) = fresh_rx.try_recv() else {
+            panic!("the new subscriber needs the restored directory");
+        };
+        assert_eq!(sessions, directory(1));
+        fanout.publish_list(directory(1));
+        assert!(drained(&mut fresh_rx).is_empty());
     }
 
     /// A snapshot that restores the last delivered value is still offered when

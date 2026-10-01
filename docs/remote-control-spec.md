@@ -917,7 +917,9 @@ entire unseen window fell inside a disconnect and went cold before
 reconnect shows no glyph until opened, and a never-viewed session reads
 as having nothing unseen.
 
-`list` frames are lossy (section 5.4) and debounced on a one-second
+`list` frames are lossy (section 5.4). A host queues an initial directory
+for a new subscriber on attach, without waiting for the refresh tick.
+Ongoing updates are debounced on a one-second
 tick, so `last_seq` churn never produces a frame per event. A host
 recomposes the directory only when something a row shows may have
 changed, which transient events such as streaming deltas never do. A

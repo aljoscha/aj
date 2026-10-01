@@ -242,6 +242,15 @@ impl Harness {
         messages: Vec<AssistantMessage>,
         idle_grace: Option<Duration>,
     ) -> Harness {
+        self.revive_with_timing(messages, idle_grace, LIST_WINDOW)
+    }
+
+    fn revive_with_timing(
+        &self,
+        messages: Vec<AssistantMessage>,
+        idle_grace: Option<Duration>,
+        list_coalesce: Duration,
+    ) -> Harness {
         let dir = TempDir::new().expect("tempdir");
         let config = Arc::new(StdMutex::new(harness_config(&dir)));
         let host = SessionHost::new(HostSetup {
@@ -261,7 +270,7 @@ impl Harness {
             name: None,
             idle_grace,
             live_capacity: None,
-            list_coalesce: Some(LIST_WINDOW),
+            list_coalesce: Some(list_coalesce),
         })
         .expect("host");
         Harness {
@@ -9570,6 +9579,78 @@ async fn a_shutting_down_host_publishes_no_directory() {
         );
     }
     drop(other);
+}
+
+/// A resumed session needs the full sidebar inventory before the first refresh,
+/// including cold sessions that were not attached. Attaching another client
+/// must not bypass the refresh cadence for clients already watching.
+#[tokio::test]
+async fn attach_serves_its_initial_directory_without_waiting_for_a_refresh() {
+    let original = Harness::new(vec![
+        finalized_text_message("recorded first session"),
+        finalized_text_message("recorded second session"),
+    ]);
+    let session = original.create().await;
+    let cold = original.create().await;
+    for id in [&session, &cold] {
+        let mut client = Client::attach(&original.host, id).await;
+        original.prompt(id, "record this session").await;
+        client.pump_until_idle().await;
+    }
+    original.host.shutdown().await;
+    let harness = original.revive_with_timing(Vec::new(), None, Duration::from_secs(3600));
+    let stored = harness.host.sessions().await.expect("persisted inventory");
+    assert_eq!(stored.sessions.len(), 2);
+    assert!(stored.sessions.iter().all(|row| !row.live));
+    let mut resumed = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("resume");
+    frames_until(&mut resumed, "caught_up", |frame| {
+        assert!(
+            !matches!(frame, Frame::Error { .. }),
+            "resume refused: {frame:?}"
+        );
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    let frames = frames_until(&mut resumed, "the initial directory", |frame| {
+        matches!(frame, Frame::List { .. })
+    })
+    .await;
+    let lists = directories(&frames);
+    assert_eq!(lists.len(), 1);
+    let rows = &lists[0];
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row.id == session && row.live));
+    assert!(rows.iter().any(|row| row.id == cold && !row.live));
+    assert_eq!(harness.host.list_builds(), 0, "no refresh tick fired");
+    assert!(directories(&drained(&mut resumed)).is_empty());
+
+    let added = harness.create().await;
+    let mut fresh = harness
+        .host
+        .attach(&[])
+        .await
+        .expect("directory-only attach");
+    let frames = frames_until(&mut fresh, "the new client's directory", |frame| {
+        matches!(frame, Frame::List { sessions, .. }
+            if sessions.iter().any(|row| row.id == added))
+    })
+    .await;
+    assert_eq!(directories(&frames)[0].len(), 3);
+    assert_eq!(harness.host.list_builds(), 0, "no refresh tick fired");
+    assert!(
+        directories(&drained(&mut resumed)).is_empty(),
+        "the existing client still waits for its coalesced update",
+    );
+    drop(fresh);
+    drop(resumed);
+    harness.host.shutdown().await;
 }
 
 /// Suppression compares against what subscribers have already been sent, so a
