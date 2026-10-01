@@ -1021,7 +1021,7 @@ mod tests {
             "--model-api",
             "openai-codex",
             "--model-name",
-            "gpt-5.2",
+            "gpt-5.5",
         ]);
         let auth = empty_auth(&dir);
         let mut config = Config::default();
@@ -1108,7 +1108,7 @@ mod tests {
         let args = Args::parse_from(["aj"]);
         let mut config = Config {
             model_api: Some("openai-codex".to_string()),
-            model_name: Some("gpt-5.2".to_string()),
+            model_name: Some("gpt-5.5".to_string()),
             model_url: Some("https://startup.example/v1".to_string()),
             thinking: Some(ConfigThinkingLevel::Low),
             thinking_display: Some(ConfigThinkingDisplay::Summarized),
@@ -1158,7 +1158,7 @@ mod tests {
         );
 
         config.oracle_model_api = Some("openai-codex".into());
-        config.oracle_model_name = Some("gpt-5.2".into());
+        config.oracle_model_name = Some("gpt-5.5".into());
         config.oracle_model_url = Some("https://oracle-later.example/v1".into());
         config.oracle_thinking = Some(ConfigThinkingLevel::Medium);
         config.oracle_speed = Some(ConfigSpeed::Fast);
@@ -1167,7 +1167,7 @@ mod tests {
         assert_eq!(changed.main.settings(), run.main.settings());
         assert_eq!(
             changed.oracle.model_key,
-            ("openai-codex".into(), "gpt-5.2".into())
+            ("openai-codex".into(), "gpt-5.5".into())
         );
         assert_eq!(
             changed.oracle.model_info.base_url,
@@ -1189,7 +1189,7 @@ mod tests {
             "--model-api",
             "openai-codex",
             "--model-name",
-            "gpt-5.2",
+            "gpt-5.5",
             "--model-url",
             "https://launch.example/v1",
             "--thinking",
@@ -1218,7 +1218,7 @@ mod tests {
 
         assert_eq!(
             run.main.model_key,
-            ("openai-codex".to_string(), "gpt-5.2".to_string())
+            ("openai-codex".to_string(), "gpt-5.5".to_string())
         );
         assert_eq!(run.main.model_info.base_url, "https://launch.example/v1");
         assert_eq!(run.main.thinking, Some(ThinkingConfig::Low));
@@ -1232,7 +1232,7 @@ mod tests {
         let args = Args::parse_from(["aj", "--model-api", "openai-codex"]);
         let mut config = Config {
             model_api: Some("anthropic".to_string()),
-            model_name: Some("gpt-5.2".to_string()),
+            model_name: Some("gpt-5.5".to_string()),
             ..Config::default()
         };
         let thinking = resolve_thinking(&args, &config).expect("thinking");
@@ -1252,7 +1252,7 @@ mod tests {
             ("openai-codex".to_string(), "gpt-5.5".to_string())
         );
 
-        let args = Args::parse_from(["aj", "--model-name", "gpt-5.2"]);
+        let args = Args::parse_from(["aj", "--model-name", "gpt-5.5"]);
         let mut config = Config {
             model_api: Some("openai-codex".to_string()),
             ..Config::default()
@@ -1271,7 +1271,7 @@ mod tests {
             .expect("model launch override with live provider");
         assert_eq!(
             run.main.model_key,
-            ("openai".to_string(), "gpt-5.2".to_string())
+            ("openai".to_string(), "gpt-5.5".to_string())
         );
     }
 

@@ -10754,7 +10754,7 @@ mod tests {
             "--model-api",
             "openai-codex",
             "--model-name",
-            "gpt-5.2",
+            "gpt-5.5",
         ];
         let parsed = Args::parse_from(argv);
         assert!(
@@ -10780,7 +10780,7 @@ mod tests {
                 .expect("run config mutex poisoned");
             assert_eq!(
                 run_config.main.model_key,
-                ("openai-codex".to_string(), "gpt-5.2".to_string()),
+                ("openai-codex".to_string(), "gpt-5.5".to_string()),
                 "the fixture did not cross the requested registry arm",
             );
             assert_eq!(run_config.main.model_info.api, "openai-codex-responses");
@@ -21723,7 +21723,7 @@ mod tests {
                 "--model-api",
                 "openai-codex",
                 "--model-name",
-                "gpt-5.2",
+                "gpt-5.5",
             ];
             let remote = if connected {
                 Some(RemoteHost::with_args(&dir, Args::parse_from(argv)).await)
@@ -21791,7 +21791,7 @@ mod tests {
                 .iter()
                 .find(|info| {
                     info.provider == "openai-codex"
-                        && info.id != "gpt-5.2"
+                        && info.id != "gpt-5.5"
                         && aj_models::registry::validate_thinking_level(
                             info,
                             &aj_models::types::ThinkingLevel::High,
