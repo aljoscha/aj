@@ -7,7 +7,7 @@
 //! flagged `header_only` render as a bare wrapped header line
 //! instead, so they compose inside the sub-agent box.
 //!
-//! The cell is a plain function of the entry plus the session-wide
+//! The cell is a plain function of the entry plus the global
 //! `tools_expanded` flag: the transcript's builder constructs a fresh
 //! widget per draw, so there is no cache or event handling here.
 
@@ -1794,6 +1794,7 @@ mod tests {
             std::rc::Rc::new(std::cell::RefCell::new(
                 crate::image_store::ImageStore::default(),
             )),
+            std::rc::Rc::default(),
         );
         let ctx = DrawContext {
             min: Size {

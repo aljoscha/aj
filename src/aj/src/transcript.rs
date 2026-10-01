@@ -119,6 +119,41 @@ pub(crate) struct TranscriptStyles {
     pub(crate) images: bool,
 }
 
+/// How transcripts are presented. This is frontend UI state, global across
+/// sessions: the shell owns one value and shares it into every session's
+/// [`TranscriptView`], which reads it at draw time, so a toggle reaches parked
+/// sessions as well as the focused one. The chat model records everything
+/// these flags hide, they only gate what is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TranscriptDisplay {
+    pub(crate) show_thinking_block: bool,
+    pub(crate) show_token_usage: bool,
+    pub(crate) transcript_mode: aj_conf::TranscriptMode,
+    /// Runtime-only, not a config setting, so it starts collapsed.
+    pub(crate) tools_expanded: bool,
+    pub(crate) show_image_in_terminal: bool,
+    pub(crate) syntax_highlight: bool,
+}
+
+impl TranscriptDisplay {
+    pub(crate) fn from_config(config: &aj_conf::Config) -> TranscriptDisplay {
+        TranscriptDisplay {
+            show_thinking_block: config.show_thinking_block,
+            show_token_usage: config.show_token_usage,
+            transcript_mode: config.transcript_mode,
+            tools_expanded: false,
+            show_image_in_terminal: config.show_image_in_terminal,
+            syntax_highlight: config.syntax_highlighting,
+        }
+    }
+}
+
+impl Default for TranscriptDisplay {
+    fn default() -> TranscriptDisplay {
+        TranscriptDisplay::from_config(&aj_conf::Config::default())
+    }
+}
+
 /// The SGR-2 faint attribute over the default foreground, used by every dim
 /// transcript row, tool-cell detail, and background-task line. It is an
 /// attribute, not a palette gray, so it tracks the terminal's own foreground.
@@ -221,11 +256,10 @@ struct CachedEntry {
 ///
 /// Owned by [`TranscriptView`] and shared into the [`EntryBuilder`] by
 /// `Rc<RefCell<..>>`. One slot per key, so stale `(fingerprint, width)`
-/// variants never accumulate. Session-wide render inputs (the theme,
-/// `tools_expanded`, `show_thinking_block`, `show_token_usage`,
-/// `transcript_mode`, `syntax_highlight`, `show_image_in_terminal`, the
-/// active view) are handled by clearing the whole cache when they change rather
-/// than folding them into every fingerprint (see [`TranscriptView::draw`] and
+/// variants never accumulate. View-wide render inputs (the theme, the
+/// [`TranscriptDisplay`] flags, the active view) are handled by clearing the
+/// whole cache when they change rather than folding them into every
+/// fingerprint (see [`TranscriptView::draw`] and
 /// [`TranscriptView::set_styles`]). Width is a per-slot key.
 ///
 /// Storing surfaces is safe today: no transcript entry participates in event
@@ -264,7 +298,7 @@ impl EntryRenderCache {
         }
     }
 
-    /// Drop every cached surface. Called when a session-wide render input
+    /// Drop every cached surface. Called when a view-wide render input
     /// changes (theme swap, a display toggle, a view switch), since those are
     /// not part of any per-entry fingerprint.
     fn clear(&mut self) {
@@ -398,7 +432,7 @@ impl EntryTextCache {
         }
     }
 
-    /// Drop every cached row set. Called when a session-wide render input
+    /// Drop every cached row set. Called when a view-wide render input
     /// changes (theme swap, a display toggle, a view switch, a session
     /// rebuild), since those are not part of any per-entry fingerprint. The
     /// view switch is what keeps the `EntryId`-only key safe: two views restart
@@ -523,6 +557,8 @@ struct EntryBuilder {
     /// id and records visible-but-untransmitted images as pending; the host
     /// drains that pending set after the frame to transmit them.
     image_store: Rc<RefCell<ImageStore>>,
+    /// The global display flags, shared with [`TranscriptView`] and the shell.
+    display: Rc<RefCell<TranscriptDisplay>>,
 }
 
 impl EntryBuilder {
@@ -549,9 +585,8 @@ impl EntryBuilder {
 
     /// How a tool-result image `entry` should render this frame.
     ///
-    /// `images_enabled` is `styles.images && chat.show_image_in_terminal`,
-    /// computed by the caller (which already holds the `chat` borrow, so we do
-    /// not re-borrow here). Returns [`ImageRender::Disabled`] when images are
+    /// `images_enabled` is `styles.images && display.show_image_in_terminal`,
+    /// computed by the caller. Returns [`ImageRender::Disabled`] when images are
     /// off or `entry` is not a tool-result image, which draws the text
     /// fallback. Otherwise returns [`ImageRender::Transmitted`] when the store
     /// has an id, [`ImageRender::Failed`] when a prior transmit gave up (the
@@ -598,6 +633,7 @@ impl EntryBuilder {
 impl Builder for EntryBuilder {
     fn item_at_idx(&self, idx: usize, cursor: usize) -> Option<WidgetRef> {
         let chat = self.chat.borrow();
+        let display = *self.display.borrow();
         let agent = chat.active_view();
         let entry = chat.transcript(agent)?.entries().get(idx)?;
         // The bubble border is per-cursor / per-branch chrome, not entry
@@ -610,12 +646,11 @@ impl Builder for EntryBuilder {
         // Resolve how this entry's tool-result image renders. Images are on
         // only when the terminal supports them (`styles.images`, the caps
         // probe) and the user has not turned them off
-        // (`show_image_in_terminal`). Reading the config here, under the borrow
-        // the caller already holds, keeps the gate on one seam. Recording a
-        // visible-but-untransmitted image as pending is what makes transmission
-        // lazy: only entries drawn this frame get recorded.
+        // (`show_image_in_terminal`). Resolving both here keeps the gate on one
+        // seam. Recording a visible-but-untransmitted image as pending is what
+        // makes transmission lazy: only entries drawn this frame get recorded.
         let images_enabled = self.styles.images
-            && chat.show_image_in_terminal
+            && display.show_image_in_terminal
             && self.activity.borrow().shows_body(entry.id);
         let image = self.resolve_image(agent, entry, images_enabled);
         let mut hasher = DefaultHasher::new();
@@ -641,6 +676,7 @@ impl Builder for EntryBuilder {
             chat: Rc::clone(&self.chat),
             activity: Rc::clone(&self.activity),
             styles: Rc::clone(&self.styles),
+            display,
             agent,
             entry_id: entry.id,
             fingerprint,
@@ -666,6 +702,9 @@ struct CachingEntry {
     chat: Rc<RefCell<ChatState>>,
     activity: Rc<RefCell<FocusedTranscript>>,
     styles: Rc<TranscriptStyles>,
+    /// The display flags `item_at_idx` observed, so the miss-path build uses
+    /// the same values the cache was validated against.
+    display: TranscriptDisplay,
     agent: AgentId,
     entry_id: EntryId,
     fingerprint: u64,
@@ -732,9 +771,15 @@ impl Widget for CachingEntry {
                 EntryBorder::Focus => Some(self.copy_label.as_slice()),
                 EntryBorder::Branch => Some(self.branch_label.as_slice()),
             };
-            self.activity
-                .borrow_mut()
-                .draw(entry, &chat, &self.styles, label, self.image, ctx)
+            self.activity.borrow_mut().draw(
+                entry,
+                &chat,
+                self.display,
+                &self.styles,
+                label,
+                self.image,
+                ctx,
+            )
         };
         // A bypass entry is never stored, so it can't strand a stale slot when
         // its glyph advances or when it later concludes and becomes cacheable.
@@ -758,11 +803,9 @@ impl Widget for CachingEntry {
 ///
 /// Philosophy: over-fingerprint. A field we forget shows stale content (a real
 /// bug); a field we include that doesn't affect rendering only costs a
-/// harmless rebuild. Session-wide render inputs (`tools_expanded`,
-/// `show_thinking_block`, `show_token_usage`, `transcript_mode`,
-/// `syntax_highlight`, `show_image_in_terminal`, the active view, the theme,
-/// the draw width) are NOT hashed here: the cache clears wholesale when they
-/// change, and width is a per-slot key.
+/// harmless rebuild. View-wide render inputs (the [`TranscriptDisplay`]
+/// flags, the active view, the theme, the draw width) are NOT hashed here:
+/// the cache clears wholesale when they change, and width is a per-slot key.
 fn entry_fingerprint(entry: &Entry, chat: &ChatState) -> u64 {
     let mut hasher = DefaultHasher::new();
     fingerprint_into(entry, chat, &mut hasher);
@@ -1159,6 +1202,7 @@ fn indent_entry<W: Widget + 'static>(widget: W) -> Padding {
 pub(crate) fn build_entry_widget(
     entry: &Entry,
     chat: &ChatState,
+    display: TranscriptDisplay,
     styles: &TranscriptStyles,
     nested: bool,
     focus: Option<&[TextSpan]>,
@@ -1168,19 +1212,19 @@ pub(crate) fn build_entry_widget(
         EntryKind::Tool(tool) => EntryWidget::Bubble(build_tool_cell(
             tool,
             chat.tasks(),
-            chat.tools_expanded,
-            chat.transcript_mode == aj_conf::TranscriptMode::Compact,
+            display.tools_expanded,
+            display.transcript_mode == aj_conf::TranscriptMode::Compact,
             styles,
             image,
         )),
         EntryKind::User(user) => EntryWidget::Bubble(build_user_bubble(user, styles, focus)),
         EntryKind::TaskNotification(n) => {
-            EntryWidget::Bubble(build_task_notification(n, chat.tools_expanded, styles))
+            EntryWidget::Bubble(build_task_notification(n, display.tools_expanded, styles))
         }
         EntryKind::SubAgent(s) if !nested => EntryWidget::SubAgent(build_subagent_box(
             s,
-            chat.tools_expanded,
-            chat.syntax_highlight,
+            display.tools_expanded,
+            display.syntax_highlight,
             styles,
         )),
         // Assistant prose and the expanded compaction summary render as
@@ -1189,21 +1233,21 @@ pub(crate) fn build_entry_widget(
         // messages render as markdown just like the top-level ones.
         EntryKind::Assistant(a) => EntryWidget::Markdown(build_assistant_markdown(
             a,
-            chat.show_thinking_block,
-            chat.syntax_highlight,
+            display.show_thinking_block,
+            display.syntax_highlight,
             styles,
         )),
         EntryKind::Compaction(c) => EntryWidget::Markdown(build_compaction_markdown(
             c,
-            chat.tools_expanded,
-            chat.syntax_highlight,
+            display.tools_expanded,
+            display.syntax_highlight,
             styles,
         )),
         // Token-usage rows are hidden when the toggle is off. They render as
         // an empty (zero-height) rich text rather than being dropped from the
         // list, so the entry index stays aligned with selection and focus,
         // which key on it.
-        EntryKind::TurnUsage(_) if !chat.show_token_usage => {
+        EntryKind::TurnUsage(_) if !display.show_token_usage => {
             EntryWidget::Rich(RichText::new(Vec::new()))
         }
         _ => EntryWidget::Rich(RichText::new(entry_spans(entry, styles))),
@@ -1251,7 +1295,7 @@ fn build_user_bubble(
 /// The tint reflects the outcome (success vs did-not-succeed), matching
 /// how a tool cell tints by status. A long notice folds to its first
 /// [`NOTIFICATION_COLLAPSED_LINES`] source lines plus a dim expand hint,
-/// expanding together with tool output under the session-wide
+/// expanding together with tool output under the global
 /// `tools_expanded` flag. The body embeds captured task output, so it
 /// runs through [`sanitize_terminal_output`].
 fn build_task_notification(
@@ -1509,7 +1553,7 @@ fn build_assistant_blocks(
 ///
 /// The header stays a plain (non-markdown) leading row so its token glyphs
 /// survive verbatim, carrying the `(<key> to expand)` hint while collapsed.
-/// Folding rides the session-wide `tools_expanded` flag, the same one tool
+/// Folding rides the global `tools_expanded` flag, the same one tool
 /// bodies honor, so a summary expands and collapses together with tool results
 /// under one keystroke. The summary renders as a markdown segment only once
 /// expanded and non-empty. The shared one-column left indent is applied when
@@ -1751,6 +1795,9 @@ pub struct TranscriptView {
     /// (which transmits and frees). Held here so [`set_styles`](Self::set_styles)
     /// can rebuild the builder with the same handle on a theme swap.
     image_store: Rc<RefCell<ImageStore>>,
+    /// The global display flags, owned by the shell and shared with every
+    /// session's view. See [`TranscriptDisplay`].
+    display: Rc<RefCell<TranscriptDisplay>>,
     /// Per-entry rendered rows, laid out on demand and cached. Select-to-copy
     /// extracts and highlights text out of these rather than a whole-transcript
     /// grid. See [`entry_rows`](Self::entry_rows).
@@ -1763,7 +1810,7 @@ pub struct TranscriptView {
     /// runtime values are what it actually uses.
     cell_size: Size,
     width_method: gwidth::Method,
-    /// Last-seen session-wide render inputs. When any of these changes the
+    /// Last-seen view-wide render inputs. When any of these changes the
     /// whole cache is cleared, since they are not part of any per-entry
     /// fingerprint.
     last_globals: GlobalRenderInputs,
@@ -1841,10 +1888,14 @@ pub struct TranscriptView {
     scroll_tick_scheduled: bool,
 }
 
-/// The session-wide render inputs the transcript cache does not fingerprint
+/// The view-wide render inputs the transcript cache does not fingerprint
 /// per entry. A change to any of them invalidates every cached surface, so
 /// [`TranscriptView::draw`] clears the cache wholesale on a change. These
 /// toggles are rare, so a full clear costs one all-miss frame.
+///
+/// The display flags are shared by every session's view, but each view keeps
+/// its own last-seen copy, so a view parked while a flag flipped clears its
+/// cache on its first draw after it is shown again.
 ///
 /// `show_image_in_terminal` rides here rather than the per-entry fingerprint
 /// because that fingerprint folds only an image's transmitted id, absent for
@@ -1855,24 +1906,14 @@ pub struct TranscriptView {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GlobalRenderInputs {
     active_view: AgentId,
-    tools_expanded: bool,
-    show_thinking_block: bool,
-    show_token_usage: bool,
-    transcript_mode: aj_conf::TranscriptMode,
-    syntax_highlight: bool,
-    show_image_in_terminal: bool,
+    display: TranscriptDisplay,
 }
 
 impl GlobalRenderInputs {
-    fn read(chat: &ChatState) -> GlobalRenderInputs {
+    fn read(chat: &ChatState, display: TranscriptDisplay) -> GlobalRenderInputs {
         GlobalRenderInputs {
             active_view: chat.active_view(),
-            tools_expanded: chat.tools_expanded,
-            show_thinking_block: chat.show_thinking_block,
-            show_token_usage: chat.show_token_usage,
-            transcript_mode: chat.transcript_mode,
-            syntax_highlight: chat.syntax_highlight,
-            show_image_in_terminal: chat.show_image_in_terminal,
+            display,
         }
     }
 }
@@ -2004,6 +2045,8 @@ impl TranscriptView {
     /// (its single writer) so the branch border tracks the armed message.
     /// `image_store` is the per-session image store, shared with the host loop
     /// so the builder records pending images the host then transmits.
+    /// `display` is the global display state, shared with the shell (its
+    /// writer) and every other session's view.
     pub fn new(
         chat: Rc<RefCell<ChatState>>,
         theme: &Theme,
@@ -2011,6 +2054,7 @@ impl TranscriptView {
         branch_armed: Rc<RefCell<Option<crate::branch::BranchDraft>>>,
         selection_copied: Rc<std::cell::Cell<Option<SelectionCopied>>>,
         image_store: Rc<RefCell<ImageStore>>,
+        display: Rc<RefCell<TranscriptDisplay>>,
     ) -> TranscriptView {
         // Caps are unknown at construction (the probe runs after `app.init`),
         // so build with the default (images off). `Shell::restyle` pushes
@@ -2028,6 +2072,7 @@ impl TranscriptView {
             copy_label: Rc::new(copy_label_spans(&styles)),
             branch_label: Rc::new(branch_label_spans(&styles)),
             image_store: Rc::clone(&image_store),
+            display: Rc::clone(&display),
         };
         let mut list = ListView::new(Source::Builder(Box::new(builder)));
         // `draw_cursor` stays off in every mode: the focused-message marker is
@@ -2043,7 +2088,7 @@ impl TranscriptView {
         bars.borrow_mut().draw_horizontal_scrollbar = false;
         apply_scrollbar_thumbs(&mut bars.borrow_mut(), &styles);
         let list = Rc::clone(&bars.borrow().view);
-        let last_globals = GlobalRenderInputs::read(&chat.borrow());
+        let last_globals = GlobalRenderInputs::read(&chat.borrow(), *display.borrow());
         let generation = chat.borrow().generation();
         TranscriptView {
             chat,
@@ -2056,6 +2101,7 @@ impl TranscriptView {
             cache,
             styles,
             image_store,
+            display,
             entry_text: EntryTextCache::new(),
             // Match the shell's `DrawContext` defaults so a layout built before
             // the first draw wraps the same way the first visible frame will.
@@ -2647,7 +2693,7 @@ impl TranscriptView {
             return;
         }
         let empty = Modifiers::empty();
-        if self.chat.borrow().transcript_mode == aj_conf::TranscriptMode::Focused {
+        if self.display.borrow().transcript_mode == aj_conf::TranscriptMode::Focused {
             if key.matches(u32::from('['), empty) || key.matches(u32::from(']'), empty) {
                 let cursor = usize::try_from(self.list.borrow().cursor).unwrap_or(0);
                 let next = self
@@ -2815,6 +2861,7 @@ impl TranscriptView {
             copy_label: Rc::new(copy_label_spans(&styles)),
             branch_label: Rc::new(branch_label_spans(&styles)),
             image_store: Rc::clone(&self.image_store),
+            display: Rc::clone(&self.display),
         };
         self.list.borrow_mut().children = Source::Builder(Box::new(builder));
         apply_scrollbar_thumbs(&mut self.bars.borrow_mut(), &styles);
@@ -2877,6 +2924,7 @@ impl TranscriptView {
             let surface = self.activity.borrow_mut().draw(
                 entry,
                 &chat,
+                *self.display.borrow(),
                 &self.styles,
                 None,
                 ImageRender::Disabled,
@@ -3295,13 +3343,17 @@ impl TranscriptView {
         self.selection = None;
         let agent = self.chat.borrow().active_view();
         self.activity.borrow_mut().toggle(agent, id);
-        self.activity.borrow_mut().rebuild(&self.chat.borrow());
+        self.activity
+            .borrow_mut()
+            .rebuild(&self.chat.borrow(), *self.display.borrow());
         self.entry_text.clear();
     }
 
     fn reveal_activity(&mut self, index: usize, entry: EntryId) {
         self.cancel_scroll_anim();
-        self.activity.borrow_mut().rebuild(&self.chat.borrow());
+        self.activity
+            .borrow_mut()
+            .rebuild(&self.chat.borrow(), *self.display.borrow());
         self.entry_rows(entry, self.content_width());
         let line = self.activity.borrow().selected_line().unwrap_or(0);
         let mut list = self.list.borrow_mut();
@@ -3676,7 +3728,7 @@ impl Widget for TranscriptView {
         // frame and clear wholesale on a change. These toggles are rare, so a
         // full clear costs one all-miss frame. A width change is handled
         // per-slot (width mismatch = miss), so it needs no global clear.
-        let globals = GlobalRenderInputs::read(&self.chat.borrow());
+        let globals = GlobalRenderInputs::read(&self.chat.borrow(), *self.display.borrow());
         if globals != self.last_globals {
             self.cache.borrow_mut().clear();
             // The per-entry text cache keys on the same fingerprint, which also
@@ -3686,7 +3738,9 @@ impl Widget for TranscriptView {
             self.entry_text.clear();
             self.last_globals = globals;
         }
-        self.activity.borrow_mut().rebuild(&self.chat.borrow());
+        self.activity
+            .borrow_mut()
+            .rebuild(&self.chat.borrow(), *self.display.borrow());
         let count = self.entry_count();
         // Focus mode hands the viewport to the item cursor, so follow-tail
         // must neither pin the bottom nor re-engage while it is active, or the
@@ -4627,6 +4681,7 @@ mod tests {
             Rc::new(RefCell::new(None)),
             Rc::new(std::cell::Cell::new(None)),
             Rc::new(RefCell::new(ImageStore::default())),
+            Rc::default(),
         )
     }
 
@@ -6059,6 +6114,7 @@ mod tests {
             Rc::clone(&branch_armed),
             Rc::new(std::cell::Cell::new(None)),
             Rc::new(RefCell::new(ImageStore::default())),
+            Rc::default(),
         );
         let ctx = draw_ctx(48, 40);
         let rows = crate::test_support::rows(&view.draw(&ctx));
@@ -6296,6 +6352,8 @@ mod tests {
             copy_label,
             branch_label,
             image_store: Rc::new(RefCell::new(ImageStore::default())),
+
+            display: Rc::default(),
         }
     }
 
@@ -6324,6 +6382,8 @@ mod tests {
             copy_label,
             branch_label,
             image_store: Rc::clone(store),
+
+            display: Rc::default(),
         }
     }
 
@@ -6404,9 +6464,9 @@ mod tests {
     #[test]
     fn config_off_falls_back_to_text_and_records_no_pending() {
         let chat = chat_with_image_entry();
-        chat.borrow_mut().show_image_in_terminal = false;
         let store = Rc::new(RefCell::new(ImageStore::default()));
         let builder = image_builder(&chat, &store);
+        builder.display.borrow_mut().show_image_in_terminal = false;
         let ctx = crate::test_support::draw_ctx(60, None);
 
         let surface = builder
@@ -6488,9 +6548,6 @@ mod tests {
     #[test]
     fn config_toggle_clears_cache_so_no_stale_text() {
         let chat = chat_with_image_entry();
-        // Start with the config off so the first frame caches the text
-        // fallback under this entry's key.
-        chat.borrow_mut().show_image_in_terminal = false;
         let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
         let mut view = TranscriptView::new(
             Rc::clone(&chat),
@@ -6499,7 +6556,11 @@ mod tests {
             Rc::new(RefCell::new(None)),
             Rc::new(std::cell::Cell::new(None)),
             Rc::new(RefCell::new(ImageStore::default())),
+            Rc::default(),
         );
+        // Start with the config off so the first frame caches the text
+        // fallback under this entry's key.
+        view.display.borrow_mut().show_image_in_terminal = false;
         // Caps on, so only the config gate decides.
         view.set_styles(Rc::new(TranscriptStyles::from_theme(
             &theme,
@@ -6519,7 +6580,7 @@ mod tests {
         // Toggle on: the image is still untransmitted (Pending), so it draws
         // the blank reserve, not the stale text. Only the wholesale clear can
         // rebuild it, since the per-entry fingerprint did not change.
-        chat.borrow_mut().show_image_in_terminal = true;
+        view.display.borrow_mut().show_image_in_terminal = true;
         let rows1 = crate::test_support::rows(&view.draw(&ctx));
         assert!(
             !rows1.iter().any(|r| r.contains("[image:")),
@@ -6559,6 +6620,7 @@ mod tests {
         let mut widget = build_entry_widget(
             entry,
             &chat,
+            *builder.display.borrow(),
             &builder.styles,
             false,
             None,
@@ -6697,11 +6759,11 @@ mod tests {
         })
     }
 
-    fn focused_chat() -> Rc<RefCell<ChatState>> {
-        let chat = empty_chat();
-        chat.borrow_mut().transcript_mode = aj_conf::TranscriptMode::Focused;
-        chat.borrow_mut().show_token_usage = false;
-        chat
+    fn focused_view(chat: &Rc<RefCell<ChatState>>) -> TranscriptView {
+        let view = transcript_view(chat);
+        view.display.borrow_mut().transcript_mode = aj_conf::TranscriptMode::Focused;
+        view.display.borrow_mut().show_token_usage = false;
+        view
     }
 
     fn transcript_text(view: &mut TranscriptView, width: u16) -> String {
@@ -6727,7 +6789,7 @@ mod tests {
 
     #[test]
     fn focused_groups_activity_without_hiding_prose_or_notices() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(&chat, &mut life, user_end("Please investigate"));
         apply(
@@ -6773,7 +6835,7 @@ mod tests {
             &mut life,
             assistant_message_end(text_message("Here is the answer.")),
         );
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         let text = transcript_text(&mut view, 100);
         assert!(text.contains("Please investigate"), "{text}");
         assert!(text.contains("thinking ×1 · custom_search ×2"), "{text}");
@@ -6796,8 +6858,8 @@ mod tests {
             assert!(at >= previous, "{phrase}: {text}");
             previous = at;
         }
-        chat.borrow_mut().transcript_mode = aj_conf::TranscriptMode::Full;
-        chat.borrow_mut().show_thinking_block = true;
+        view.display.borrow_mut().transcript_mode = aj_conf::TranscriptMode::Full;
+        view.display.borrow_mut().show_thinking_block = true;
         let text = transcript_text(&mut view, 100);
         assert!(
             text.contains("private reasoning") && text.contains("hidden results"),
@@ -6808,7 +6870,7 @@ mod tests {
 
     #[test]
     fn focused_task_results_fold_in_arrival_order_without_crossing_prose_or_notices() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(
             &chat,
@@ -6867,7 +6929,7 @@ mod tests {
             &mut life,
             assistant_message_end(text_message("Final answer.")),
         );
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         let text = transcript_text(&mut view, 100);
         assert_eq!(text.matches("▸").count(), 3, "{text}");
         assert!(text.contains("▸ bash ×1"), "{text}");
@@ -6904,7 +6966,7 @@ mod tests {
             aj_conf::TranscriptMode::Full,
             aj_conf::TranscriptMode::Compact,
         ] {
-            chat.borrow_mut().transcript_mode = mode;
+            view.display.borrow_mut().transcript_mode = mode;
             let text = transcript_text(&mut view, 100);
             for body in ["Tests passed.", "Agent report.", "Build finished."] {
                 assert!(text.contains(body), "{mode} retains notifications: {text}");
@@ -6926,13 +6988,13 @@ mod tests {
             ),
             (TaskOutcome::Killed, Some("1 task stopped: cargo test")),
         ] {
-            let chat = focused_chat();
+            let chat = empty_chat();
             apply(
                 &chat,
                 &mut AgentLifecycle::default(),
                 task_notification_end("cargo test", outcome, "Notification body"),
             );
-            let mut view = transcript_view(&chat);
+            let mut view = focused_view(&chat);
             let ctx = draw_ctx(100, 20);
             let surface = view.draw(&ctx);
             let rows = crate::test_support::rows(&surface);
@@ -6958,7 +7020,7 @@ mod tests {
 
     #[test]
     fn focused_mouse_folds_independently_and_body_selection_does_not_fold() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         for (call, tool, body) in [
             ("a", "read_file", "first body"),
@@ -6984,7 +7046,7 @@ mod tests {
                 assistant_message_end(text_message("Visible prose")),
             );
         }
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         let ctx = draw_ctx(80, 60);
         click_activity(&mut view, &ctx, "read_file ×1");
         let text = transcript_text(&mut view, 80);
@@ -7019,7 +7081,7 @@ mod tests {
 
     #[test]
     fn focused_selection_copies_visible_rows_without_hidden_entry_separators() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(
             &chat,
@@ -7046,7 +7108,7 @@ mod tests {
             &mut life,
             assistant_message_end(text_message("After")),
         );
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         let rows = crate::test_support::rows(&view.draw(&draw_ctx(80, 12)));
         let start = i16::try_from(rows.iter().position(|r| r.contains("Before")).unwrap()).unwrap();
         let end = i16::try_from(rows.iter().position(|r| r.contains("After")).unwrap()).unwrap();
@@ -7067,7 +7129,7 @@ mod tests {
 
     #[test]
     fn focused_expansion_keeps_the_readers_position_when_activity_grows() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(
             &chat,
@@ -7082,7 +7144,7 @@ mod tests {
                 },
             ),
         );
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         let ctx = draw_ctx(80, 20);
         click_activity(&mut view, &ctx, "read_file ×1");
         let text = crate::test_support::rows(&view.draw(&ctx)).join("\n");
@@ -7117,10 +7179,10 @@ mod tests {
 
     #[test]
     fn focused_live_counts_failures_and_background_status_update_in_place() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(&chat, &mut life, tool_start(AgentId::Main, "a", "bash"));
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         assert!(transcript_text(&mut view, 100).contains("bash ×1 · running: bash"));
         apply(
             &chat,
@@ -7202,7 +7264,7 @@ mod tests {
 
     #[test]
     fn focused_keyboard_navigation_and_expand_all_reveal_activity() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(&chat, &mut life, user_end("Question"));
         apply(
@@ -7223,7 +7285,7 @@ mod tests {
                 },
             ),
         );
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         transcript_text(&mut view, 80);
         view.handle_event(&mut EventContext::new(), &Event::FocusIn);
         for code in [u32::from(']'), Key::ENTER] {
@@ -7249,15 +7311,15 @@ mod tests {
             }),
         );
         assert!(!transcript_text(&mut view, 80).contains("The body"));
-        chat.borrow_mut().tools_expanded = true;
+        view.display.borrow_mut().tools_expanded = true;
         assert!(transcript_text(&mut view, 80).contains("The body"));
     }
 
     #[test]
     fn focused_streaming_thinking_counts_blocks_and_reveals_text_immediately() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         let mut life = AgentLifecycle::default();
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         let message = AgentMessage::wire(Message::Assistant(assistant_message(Vec::new())));
         for contents in [
             vec![thinking("one")],
@@ -7294,7 +7356,7 @@ mod tests {
         assert!(text.contains("Visible immediately"), "{text}");
         assert!(!text.contains("running: thinking"), "{text}");
         click_activity(&mut view, &draw_ctx(35, 60), "thinking ×1");
-        chat.borrow_mut().show_thinking_block = true;
+        view.display.borrow_mut().show_thinking_block = true;
         let text = transcript_text(&mut view, 35);
         assert!(
             text.contains("one growing") && text.contains("Visible immediately"),
@@ -7304,7 +7366,7 @@ mod tests {
 
     #[test]
     fn focused_keyboard_reaches_groups_inside_a_long_assistant_message() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(&chat, &mut life, user_end("Question"));
         apply(
@@ -7319,7 +7381,7 @@ mod tests {
                 thinking("second"),
             ])),
         );
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         let ctx = draw_ctx(60, 12);
         view.draw(&ctx);
         view.handle_event(&mut EventContext::new(), &Event::FocusIn);
@@ -7337,7 +7399,7 @@ mod tests {
                 "selected group must be visible: {text}"
             );
         }
-        chat.borrow_mut().show_thinking_block = true;
+        view.display.borrow_mut().show_thinking_block = true;
         view.handle_event(
             &mut EventContext::new(),
             &Event::KeyPress(Key {
@@ -7354,9 +7416,9 @@ mod tests {
 
     #[test]
     fn focused_subagent_summary_folds_without_observing_and_body_still_observes() {
-        let chat = focused_chat();
+        let chat = empty_chat();
         spawn_sub(&chat, &mut AgentLifecycle::default());
-        let mut view = transcript_view(&chat);
+        let mut view = focused_view(&chat);
         let observed = Rc::new(std::cell::Cell::new(None));
         let record = Rc::clone(&observed);
         view.set_on_observe_agent(Box::new(move |agent| record.set(Some(agent))));
@@ -7380,8 +7442,8 @@ mod tests {
     #[test]
     fn focused_images_are_transmitted_and_placed_only_when_revealed() {
         let chat = chat_with_image_entry();
-        chat.borrow_mut().transcript_mode = aj_conf::TranscriptMode::Focused;
         let mut view = transcript_view(&chat);
+        view.display.borrow_mut().transcript_mode = aj_conf::TranscriptMode::Focused;
         view.set_styles(Rc::new(TranscriptStyles::from_theme(
             &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
             TerminalCaps {
@@ -8008,7 +8070,7 @@ mod tests {
         let misses_before = view.cache.borrow().misses;
         assert!(hits_before > 0, "second draw hit");
 
-        chat.borrow_mut().tools_expanded = true;
+        view.display.borrow_mut().tools_expanded = true;
         let _ = view.draw(&ctx);
         assert!(
             view.cache.borrow().misses > misses_before,
@@ -8039,13 +8101,15 @@ mod tests {
             },
         );
         let mut view = transcript_view(&chat);
+        // Start shown (the config default hides it) so the toggle hides it.
+        view.display.borrow_mut().show_thinking_block = true;
         let ctx = draw_ctx(60, 24);
         let _ = view.draw(&ctx);
         let _ = view.draw(&ctx);
         let misses_before = view.cache.borrow().misses;
         assert!(view.cache.borrow().hits > 0, "second draw hit");
 
-        chat.borrow_mut().show_thinking_block = false;
+        view.display.borrow_mut().show_thinking_block = false;
         let _ = view.draw(&ctx);
         assert!(
             view.cache.borrow().misses > misses_before,
@@ -8093,7 +8157,7 @@ mod tests {
         let _ = view.draw(&ctx);
         let misses_before = view.cache.borrow().misses;
 
-        chat.borrow_mut().show_token_usage = false;
+        view.display.borrow_mut().show_token_usage = false;
         let rows = crate::test_support::rows(&view.draw(&ctx));
         assert!(
             view.cache.borrow().misses > misses_before,
@@ -8146,9 +8210,8 @@ mod tests {
                 text: "BBB".into(),
             },
         );
-        chat.borrow_mut().show_token_usage = false;
-
         let mut view = transcript_view(&chat);
+        view.display.borrow_mut().show_token_usage = false;
         let ctx = draw_ctx(40, 10);
         let rows = crate::test_support::rows(&view.draw(&ctx));
         let bbb_row = rows
@@ -8185,8 +8248,8 @@ mod tests {
         let misses_before = view.cache.borrow().misses;
         assert!(view.cache.borrow().hits > 0, "second draw hit");
 
-        // Seeded off (the `ChatState` default), so flip it on.
-        chat.borrow_mut().syntax_highlight = true;
+        // Seeded off (the config default), so flip it on.
+        view.display.borrow_mut().syntax_highlight = true;
         let _ = view.draw(&ctx);
         assert!(
             view.cache.borrow().misses > misses_before,
@@ -8296,7 +8359,7 @@ mod tests {
         let _ = view.entry_rows(entry_id(&chat, 0), w);
         assert!(!view.entry_text.slots.is_empty(), "text cache warmed");
 
-        chat.borrow_mut().tools_expanded = true;
+        view.display.borrow_mut().tools_expanded = true;
         let _ = view.draw(&ctx);
         assert!(
             view.entry_text.slots.is_empty(),
@@ -8622,7 +8685,7 @@ mod tests {
             let mut view = transcript_view(&chat);
             let id = entry_id(&chat, 0);
             for highlight in [false, true] {
-                chat.borrow_mut().syntax_highlight = highlight;
+                view.display.borrow_mut().syntax_highlight = highlight;
                 for width in [10, 19, 80] {
                     let _ = view.draw(&draw_ctx(width, 60));
                     let content_width = view.content_width();
@@ -9428,6 +9491,7 @@ mod tests {
             Rc::new(RefCell::new(None)),
             Rc::clone(&selection_copied),
             Rc::new(RefCell::new(ImageStore::default())),
+            Rc::default(),
         );
         let ctx = draw_ctx(40, 10);
         view.follow_tail = false;

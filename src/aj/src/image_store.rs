@@ -42,7 +42,7 @@ impl ImageRender {
     /// render state changed.
     ///
     /// `Disabled` and `Pending` fold identically: the only transition between
-    /// them is a `show_image_in_terminal` toggle, a session-wide input the
+    /// them is a `show_image_in_terminal` toggle, a global display input the
     /// wholesale `GlobalRenderInputs` clear owns. The per-entry axis is the
     /// transmit lifecycle, so `Pending` -> `Transmitted` (the id lands) and
     /// `Pending` -> `Failed` (the transmit gave up) each fold to a distinct

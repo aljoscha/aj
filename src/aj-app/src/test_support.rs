@@ -220,8 +220,8 @@ pub fn build_tagged_test_agent(
 ///
 /// - Wall-clock fields. An `Instant` differs between any two runs.
 ///   Where the distinction carries meaning it becomes a `finished` flag.
-/// - The display flags and `active_view`. They are client-local view
-///   state, set from config rather than from the event stream.
+/// - `active_view`. It is client-local view state, not set from the event
+///   stream.
 /// - Raw [`EntryId`](crate::chat::EntryId)s. Positional order carries the
 ///   same information without coupling the oracle to append counters,
 ///   which two folds of the same conversation legitimately differ on.

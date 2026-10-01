@@ -101,14 +101,14 @@ fn short(text: &str) -> String {
 }
 
 impl FocusedTranscript {
-    pub fn rebuild(&mut self, chat: &ChatState) {
+    pub fn rebuild(&mut self, chat: &ChatState, display: TranscriptDisplay) {
         self.parts.clear();
         self.groups.clear();
-        if self.expand_all != chat.tools_expanded {
+        if self.expand_all != display.tools_expanded {
             self.overrides.clear();
-            self.expand_all = chat.tools_expanded;
+            self.expand_all = display.tools_expanded;
         }
-        if chat.transcript_mode != aj_conf::TranscriptMode::Focused {
+        if display.transcript_mode != aj_conf::TranscriptMode::Focused {
             self.headers.clear();
             return;
         }
@@ -251,7 +251,7 @@ impl FocusedTranscript {
                 .overrides
                 .get(&(chat.active_view(), id))
                 .copied()
-                .unwrap_or(chat.tools_expanded);
+                .unwrap_or(self.expand_all);
             self.push(
                 entry,
                 Part::Header {
@@ -369,13 +369,14 @@ impl FocusedTranscript {
         &mut self,
         entry: &Entry,
         chat: &ChatState,
+        display: TranscriptDisplay,
         styles: &TranscriptStyles,
         focus: Option<&[TextSpan]>,
         image: ImageRender,
         ctx: &DrawContext,
     ) -> Surface {
         let Some(parts) = self.parts.get(&entry.id) else {
-            return build_entry_widget(entry, chat, styles, false, focus, image)
+            return build_entry_widget(entry, chat, display, styles, false, focus, image)
                 .into_indented_boxed()
                 .draw(ctx);
         };
@@ -407,7 +408,7 @@ impl FocusedTranscript {
                         ..TextSpan::default()
                     }])))
                 }
-                Part::Body => build_entry_widget(entry, chat, styles, false, focus, image)
+                Part::Body => build_entry_widget(entry, chat, display, styles, false, focus, image)
                     .into_indented_boxed(),
                 Part::Assistant(range) => {
                     let EntryKind::Assistant(a) = &entry.kind else {
@@ -415,8 +416,8 @@ impl FocusedTranscript {
                     };
                     Box::new(indent_entry(build_assistant_blocks(
                         &a.message.content[range.clone()],
-                        chat.show_thinking_block,
-                        chat.syntax_highlight,
+                        display.show_thinking_block,
+                        display.syntax_highlight,
                         styles,
                     )))
                 }

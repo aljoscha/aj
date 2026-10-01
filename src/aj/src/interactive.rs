@@ -114,7 +114,7 @@ use crate::status::{Connection, STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::{TaskOutputView, open_task_output};
 use crate::terminal::TerminalCaps;
 use crate::toasts::{ToastBody, ToastStack, Toasts, busy_refusal, show_toast};
-use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
+use crate::transcript::{TranscriptDisplay, TranscriptStyles, TranscriptView, vaxis_color};
 use crate::usage_overlay::open_usage_overlay;
 
 /// App-event name the drive loop posts after opening an overlay outside
@@ -341,7 +341,7 @@ async fn build_world(
         StartupSession::Resume(id) => id,
     };
     let control = Control::local(host);
-    let chat = Rc::new(RefCell::new(seeded_chat(&config, unknown_settings())));
+    let chat = Rc::new(RefCell::new(ChatState::new(unknown_settings())));
     let mut directory = SessionDirectory::new(session.clone(), Rc::clone(&chat));
     // The stream before the handles: its attachment is what stops the host from
     // releasing the session in between (attachment is the retention signal an
@@ -361,7 +361,7 @@ async fn build_world(
             .expect("run config mutex poisoned");
         cfg.settings()
     };
-    *chat.borrow_mut() = seeded_chat(&config, settings);
+    *chat.borrow_mut() = ChatState::new(settings);
     let mut world = World {
         control,
         directory,
@@ -529,7 +529,7 @@ async fn build_connect_world(
         created,
     } = connected;
     let working_directory_follows_focus = working_directory.is_none();
-    let chat = Rc::new(RefCell::new(seeded_chat(&config, unknown_settings())));
+    let chat = Rc::new(RefCell::new(ChatState::new(unknown_settings())));
     let mut directory = SessionDirectory::new(session.clone(), Rc::clone(&chat));
     // No run config to seed from: the block's opening `state` frame carries
     // the host's own settings and lands before the first paint.
@@ -607,24 +607,6 @@ async fn build_connect_world(
 /// notice. Empty for a local run, which has no url.
 fn connect_url(world: &World) -> String {
     world.control.base_url().unwrap_or_default().to_string()
-}
-
-/// A fresh chat model seeded with the settings identity and context window
-/// its next main turn runs against, plus the config-driven display flags.
-///
-/// The seed is needed before any frame has been folded, so it comes off the
-/// live run config for a local run. A connection has no such handle, and its
-/// attach block opens with a `state` frame carrying the same identity, which
-/// is folded before the first paint.
-fn seeded_chat(config: &Arc<StdMutex<Config>>, settings: AgentSettings) -> ChatState {
-    let mut chat = ChatState::new(settings);
-    let config = config.lock().expect("config mutex poisoned");
-    chat.show_thinking_block = config.show_thinking_block;
-    chat.show_token_usage = config.show_token_usage;
-    chat.transcript_mode = config.transcript_mode;
-    chat.show_image_in_terminal = config.show_image_in_terminal;
-    chat.syntax_highlight = config.syntax_highlighting;
-    chat
 }
 
 /// The settings a local session's next main turn runs against.
@@ -1362,9 +1344,7 @@ async fn focus_session(
         .get(&session)
         .map(|view| Rc::clone(&view.chat));
     world.directory.focus(&session, || {
-        remembered.unwrap_or_else(|| {
-            Rc::new(RefCell::new(seeded_chat(&world.config, unknown_settings())))
-        })
+        remembered.unwrap_or_else(|| Rc::new(RefCell::new(ChatState::new(unknown_settings()))))
     });
     world.chat = world.directory.chat();
     world.sync_working_directory();
@@ -4910,30 +4890,30 @@ fn presentation_save(
             format!("Theme set to {value}.")
         }
         "show_thinking_block" => {
-            world.chat.borrow_mut().show_thinking_block = on;
+            shell.borrow().display.borrow_mut().show_thinking_block = on;
             format!(
                 "Thinking blocks {}.",
                 if on { "expanded" } else { "hidden" }
             )
         }
         "show_token_usage" => {
-            world.chat.borrow_mut().show_token_usage = on;
+            shell.borrow().display.borrow_mut().show_token_usage = on;
             format!("Token-usage rows {}.", if on { "shown" } else { "hidden" })
         }
         "transcript_mode" => {
             let mode = value.parse::<aj_conf::TranscriptMode>()?;
-            world.chat.borrow_mut().transcript_mode = mode;
+            shell.borrow().display.borrow_mut().transcript_mode = mode;
             format!("Transcript mode set to {mode}.")
         }
         "syntax_highlighting" => {
-            world.chat.borrow_mut().syntax_highlight = on;
+            shell.borrow().display.borrow_mut().syntax_highlight = on;
             format!(
                 "Syntax highlighting {}.",
                 if on { "enabled" } else { "disabled" }
             )
         }
         "show_image_in_terminal" => {
-            world.chat.borrow_mut().show_image_in_terminal = on;
+            shell.borrow().display.borrow_mut().show_image_in_terminal = on;
             format!("show_image_in_terminal set to {on}.")
         }
         "show_frame_stats" => {
@@ -5837,6 +5817,7 @@ impl SessionView {
         chat: Rc<RefCell<ChatState>>,
         status: Rc<RefCell<StatusState>>,
         theme: &ThemeHandle,
+        display: &Rc<RefCell<TranscriptDisplay>>,
         header: String,
         id: &str,
         cwd: PathBuf,
@@ -5869,6 +5850,7 @@ impl SessionView {
             Rc::clone(&branch_anchor),
             Rc::clone(&selection_copied),
             Rc::clone(&image_store),
+            Rc::clone(display),
         )));
         transcript
             .borrow_mut()
@@ -6013,6 +5995,11 @@ struct Shell {
     /// `config.show_frame_stats` at build time and flipped live by the
     /// settings window through `apply_setting_change`, which shares this cell.
     show_frame_stats: Rc<Cell<bool>>,
+    /// How every session's transcript is presented. Seeded from config by the
+    /// run loop, written by the settings window and the display shortcuts,
+    /// and shared into each [`SessionView`]'s transcript, which reads it at
+    /// draw time.
+    display: Rc<RefCell<TranscriptDisplay>>,
     /// The latest frame-render snapshot, written by the drive loop just before
     /// each paint so the box shows the previous frame's numbers. `None` before
     /// the first frame. Copy payload, so a `Cell` rather than a `RefCell`.
@@ -6116,10 +6103,14 @@ impl Shell {
         cwd: PathBuf,
     ) -> Shell {
         let window_title = aj_app::session::window_title(APP_TITLE, session_id, &cwd);
+        // Defaults until the run loop seeds it from config, like
+        // `show_frame_stats` below.
+        let display = Rc::new(RefCell::new(TranscriptDisplay::default()));
         let view = Rc::new(SessionView::new(
             Rc::clone(&chat),
             status,
             &theme,
+            &display,
             header,
             session_id,
             cwd,
@@ -6227,10 +6218,10 @@ impl Shell {
             let theme_for_actions = theme.clone();
             let sidebar_for_actions = Rc::clone(&sidebar);
             let session_request_for_actions = Rc::clone(&session_request);
+            let display_for_actions = Rc::clone(&display);
             let views = Rc::clone(&views);
             Box::new(move |ctx, action| {
                 let view = Rc::clone(&views.borrow().active);
-                let chat = &view.chat;
                 let editor_widget = to_widget_ref(Rc::clone(&view.editor));
                 let transcript_widget = to_widget_ref(Rc::clone(&view.transcript));
                 let editor_for_actions = &view.editor;
@@ -6289,14 +6280,14 @@ impl Shell {
                         );
                     }
                     AjAction::ThinkingToggle => {
-                        let mut chat = chat.borrow_mut();
-                        chat.show_thinking_block = !chat.show_thinking_block;
+                        let mut display = display_for_actions.borrow_mut();
+                        display.show_thinking_block = !display.show_thinking_block;
                         *action_slot.borrow_mut() = Some(AjAction::ThinkingToggle);
                         ctx.redraw = true;
                     }
                     AjAction::ToolsExpand => {
-                        let mut chat = chat.borrow_mut();
-                        chat.tools_expanded = !chat.tools_expanded;
+                        let mut display = display_for_actions.borrow_mut();
+                        display.tools_expanded = !display.tools_expanded;
                         ctx.redraw = true;
                     }
                     AjAction::PaletteOpen => {
@@ -6451,6 +6442,7 @@ impl Shell {
             toasts,
             busy,
             show_frame_stats,
+            display,
             frame_stats,
             host_action,
             overlays,
@@ -6720,6 +6712,7 @@ impl Shell {
                     Rc::clone(&world.chat),
                     Rc::new(RefCell::new(StatusState::default())),
                     &self.theme,
+                    &self.display,
                     format!("{APP_TITLE} - session {}", world.session()),
                     world.session(),
                     world.working_directory.clone(),
@@ -7257,16 +7250,15 @@ pub async fn run(args: Args) -> Result<()> {
     )));
     let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
 
-    // Seed the frame-stats overlay toggle from config (off by default). The
-    // cell lives on the Shell, and `Shell::new` has no config handle, so we
-    // seed it here once. It persists across session rebinds.
-    shell.borrow().show_frame_stats.set(
-        world
-            .config
-            .lock()
-            .expect("config mutex poisoned")
-            .show_frame_stats,
-    );
+    // Seed the frame-stats overlay toggle and the transcript display from
+    // config. Both live on the Shell, and `Shell::new` has no config handle,
+    // so we seed them here once. They persist across session rebinds.
+    {
+        let config = world.config.lock().expect("config mutex poisoned");
+        let shell = shell.borrow();
+        shell.show_frame_stats.set(config.show_frame_stats);
+        *shell.display.borrow_mut() = TranscriptDisplay::from_config(&config);
+    }
 
     let tty = PosixTty::new()?;
     let reader = tty.open_reader()?;
@@ -8114,7 +8106,7 @@ async fn drive(
                         let host_action = shell.borrow().take_host_action();
                         if let Some(action) = host_action {
                             if action == AjAction::ThinkingToggle {
-                                let value = world.chat.borrow().show_thinking_block.to_string();
+                                let value = shell.borrow().display.borrow().show_thinking_block.to_string();
                                 start_setting_change(
                                     world,
                                     shell,
@@ -8796,18 +8788,18 @@ mod tests {
     use crate::overlay::OverlayPlacement;
 
     #[tokio::test]
-    async fn transcript_mode_settings_cycle_updates_chat_and_persistence() {
+    async fn transcript_mode_settings_cycle_updates_display_and_persistence() {
         let Some(_home) = isolated_test_home() else {
             return;
         };
         let dir = TempDir::new().unwrap();
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let display = Rc::clone(&shell.borrow().display);
         assert_eq!(
-            world.chat.borrow().transcript_mode,
+            display.borrow().transcript_mode,
             aj_conf::TranscriptMode::Full
         );
         let observed = Rc::clone(&shell);
-        let chat = Rc::clone(&world.chat);
         let (exit, ()) = drive_until(&mut world, &shell, move |mut writer| async move {
             writer.write_all(b"\x0fsettings\r").unwrap();
             assert!(
@@ -8833,7 +8825,7 @@ mod tests {
                         let (saved, diagnostics) = Config::load();
                         (diagnostics.is_empty()
                             && saved.transcript_mode == mode
-                            && chat.borrow().transcript_mode == mode)
+                            && display.borrow().transcript_mode == mode)
                             .then_some(())
                     })
                     .await
@@ -8844,12 +8836,12 @@ mod tests {
         })
         .await;
         exit.unwrap();
-        let config = Arc::new(StdMutex::new(Config {
+        let config = Config {
             transcript_mode: aj_conf::TranscriptMode::Focused,
             ..Config::default()
-        }));
+        };
         assert_eq!(
-            seeded_chat(&config, unknown_settings()).transcript_mode,
+            TranscriptDisplay::from_config(&config).transcript_mode,
             aj_conf::TranscriptMode::Focused
         );
         world.host().shutdown().await;
@@ -11926,19 +11918,20 @@ mod tests {
         assert_ne!(minimal, xhigh, "the tint changed with the level");
     }
 
-    /// The tools-expand chord (alt+o) flips the chat model's flag through
+    /// The tools-expand chord (alt+o) flips the shell's display flag through
     /// the keymap controller's capture phase: the editor never sees the
     /// key, and a plain `o` still reaches it.
     #[tokio::test]
     async fn tools_expand_chord_flips_the_flag_via_the_keymap() {
         let chat = empty_chat();
         let (mut app, mut writer, shell, _root) = init_app_with_chat(Rc::clone(&chat)).await;
+        let display = Rc::clone(&shell.borrow().display);
 
         // ESC-prefixed 'o' is the legacy encoding of alt+o.
         writer.write_all(b"\x1bo").expect("write alt+o");
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
-        assert!(chat.borrow().tools_expanded);
+        assert!(display.borrow().tools_expanded);
         assert_eq!(
             shell.borrow().view().editor.borrow().cursor(),
             (0, 0),
@@ -11949,7 +11942,7 @@ mod tests {
         writer.write_all(b"o").expect("write o");
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
-        assert!(chat.borrow().tools_expanded, "unchanged by plain typing");
+        assert!(display.borrow().tools_expanded, "unchanged by plain typing");
         assert_eq!(shell.borrow().view().editor.borrow().cursor(), (0, 1));
     }
 
@@ -11958,18 +11951,19 @@ mod tests {
     #[tokio::test]
     async fn thinking_toggle_chord_flips_visibility_via_the_keymap() {
         let chat = empty_chat();
-        let (mut app, mut writer, _shell, _root) = init_app_with_chat(Rc::clone(&chat)).await;
-        let initial = chat.borrow().show_thinking_block;
+        let (mut app, mut writer, shell, _root) = init_app_with_chat(Rc::clone(&chat)).await;
+        let display = Rc::clone(&shell.borrow().display);
+        let initial = display.borrow().show_thinking_block;
 
         writer.write_all(b"\x1bt").expect("write alt+t");
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
-        assert_eq!(chat.borrow().show_thinking_block, !initial);
+        assert_eq!(display.borrow().show_thinking_block, !initial);
 
         writer.write_all(b"\x1bt").expect("write alt+t");
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
-        assert_eq!(chat.borrow().show_thinking_block, initial);
+        assert_eq!(display.borrow().show_thinking_block, initial);
     }
 
     /// The world-facing chords park their action for the host loop.
@@ -12694,6 +12688,7 @@ mod tests {
             Rc::new(std::cell::RefCell::new(
                 crate::image_store::ImageStore::default(),
             )),
+            Rc::default(),
         );
         let ctx = DrawContext {
             min: Size {
@@ -24853,6 +24848,88 @@ mod tests {
         shut_down(&world).await;
     }
 
+    /// Display flags are global: a toggle made while focused on one session
+    /// reaches a parked session whose view drew, and cached, the old value.
+    #[tokio::test]
+    async fn display_toggle_reaches_parked_sessions() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let usage_rows = |shell: &Rc<RefCell<Shell>>| {
+            shell.borrow().toasts.borrow_mut().clear();
+            painted_rows(shell, 100, 30)
+                .iter()
+                .filter(|row| row.contains("Token Usage"))
+                .count()
+        };
+        run_prompt(&mut world, "hello from A").await;
+        let a = world.session().to_string();
+        assert!(usage_rows(&shell) > 0, "A paints its usage row");
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        run_prompt(&mut world, "hello from B").await;
+        // A just-created session can still look idle to `settle` before its
+        // first turn starts, so wait for the usage row itself.
+        let folded = poll_for(|| {
+            fold_ready_frames(&mut world);
+            let chat = world.chat.borrow();
+            let entries = chat.transcript(AgentId::Main)?.entries();
+            entries
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::TurnUsage(_)))
+                .then_some(())
+        })
+        .await;
+        assert!(folded.is_some(), "B's turn recorded its usage");
+        settle(&mut world).await;
+        let b = world.session().to_string();
+        let view_b = shell.borrow().view();
+        sync_status(&world);
+        assert!(usage_rows(&shell) > 0, "B paints its usage row");
+        apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(a)).await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        sync_status(&world);
+        assert!(
+            usage_rows(&shell) > 0,
+            "A, shown again, caches its usage row"
+        );
+
+        apply_setting_change(
+            &world,
+            &shell,
+            &mut inert_theme_watch(),
+            PersistAction::None,
+            "show_token_usage",
+            "false",
+        )
+        .await;
+        sync_status(&world);
+        assert_eq!(usage_rows(&shell), 0, "A hides its usage row");
+
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(b.clone()),
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert_eq!(world.session(), b);
+        assert!(
+            Rc::ptr_eq(&shell.borrow().view(), &view_b),
+            "B's parked view, with its cache, is the one shown again"
+        );
+        sync_status(&world);
+        assert_eq!(usage_rows(&shell), 0, "B renders with the new value");
+        shut_down(&world).await;
+    }
+
     #[tokio::test]
     async fn session_views_keep_reading_position_until_the_model_is_evicted() {
         let dir = TempDir::new().expect("tempdir");
@@ -24863,7 +24940,6 @@ mod tests {
             .collect::<String>();
         run_prompt(&mut world, &prompt).await;
         let a = world.session().to_string();
-        world.chat.borrow_mut().tools_expanded = true;
         shell
             .borrow()
             .view()
@@ -24961,10 +25037,6 @@ mod tests {
             .await;
             settle_pending_transition(&mut app, &shell, &mut world).await;
             assert_eq!(shell.borrow().view().editor.borrow().text(), "");
-            assert!(
-                !world.chat.borrow().tools_expanded,
-                "new views have their own presentation defaults"
-            );
         }
         assert!(
             !world.directory.is_attached(&a),
@@ -24978,10 +25050,6 @@ mod tests {
         assert_eq!(
             shell.borrow().view().editor.borrow().text(),
             "retained beyond eviction"
-        );
-        assert!(
-            world.chat.borrow().tools_expanded,
-            "local presentation survives model eviction"
         );
         sync_status(&world);
         shell.borrow().toasts.borrow_mut().clear();
@@ -25031,7 +25099,7 @@ mod tests {
                 .expect("user index");
             let generation = world.chat.borrow().generation();
             let mut lifecycle = AgentLifecycle::default();
-            let mut replacement = seeded_chat(&world.config, unknown_settings());
+            let mut replacement = ChatState::new(unknown_settings());
             // Replace the message at the focused index, not just the length of
             // the transcript. A stale branch chord could otherwise be inert.
             for _ in 0..user_index {
@@ -25283,7 +25351,6 @@ mod tests {
         run_prompt(&mut world, &prompt).await;
         let session = world.session().to_string();
         let transcript = Rc::clone(&shell.borrow().view().transcript);
-        world.chat.borrow_mut().tools_expanded = true;
         painted_rows(&shell, 100, 30);
         transcript
             .borrow_mut()
@@ -25387,7 +25454,6 @@ mod tests {
                 );
             }
             assert_eq!(transcript.borrow().is_following_tail(), restart);
-            assert!(world.chat.borrow().tools_expanded);
             assert_eq!(transcript.borrow().has_selection(), !restart);
             if restart {
                 assert_ne!(world.chat.borrow().generation(), generation);
@@ -31011,7 +31077,7 @@ mod tests {
             // Keep the overlay alive while changing the same directory focus that
             // subsequent commands read, without closing the overlay.
             world.directory.focus(&focus_next, || {
-                Rc::new(RefCell::new(seeded_chat(&world.config, unknown_settings())))
+                Rc::new(RefCell::new(ChatState::new(unknown_settings())))
             });
             assert_ne!(world.session(), opening);
             press(&mut app, &mut writer, b"\r").await;

@@ -101,9 +101,9 @@ enum BoxBody {
 /// spinner glyph plus latest-activity line (running). Reads no
 /// transcript.
 ///
-/// `expanded` is the session-wide tools-expand flag: when set, a long
+/// `expanded` is the global tools-expand flag: when set, a long
 /// done-report renders in full, otherwise it folds to a head preview.
-/// `syntax_highlight` is the session-wide flag threaded into the report's
+/// `syntax_highlight` is the global flag threaded into the report's
 /// markdown segments, the same one assistant prose uses.
 pub(crate) fn build_subagent_box(
     entry: &SubAgentEntry,
@@ -944,7 +944,7 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        use crate::transcript::TranscriptView;
+        use crate::transcript::{TranscriptDisplay, TranscriptView};
 
         let mut chat = chat();
         let mut life = AgentLifecycle::default();
@@ -955,6 +955,7 @@ mod tests {
         finish_with_report(&mut chat, &mut life, &report);
         let chat = Rc::new(RefCell::new(chat));
         let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+        let display = Rc::new(RefCell::new(TranscriptDisplay::default()));
         let mut view = TranscriptView::new(
             Rc::clone(&chat),
             &theme,
@@ -964,6 +965,7 @@ mod tests {
             Rc::new(std::cell::RefCell::new(
                 crate::image_store::ImageStore::default(),
             )),
+            Rc::clone(&display),
         );
         let ctx = DrawContext {
             max: MaxSize {
@@ -988,7 +990,7 @@ mod tests {
 
         // Toggling the shared flag clears the render cache, so the next draw
         // rebuilds the box in full.
-        chat.borrow_mut().tools_expanded = true;
+        display.borrow_mut().tools_expanded = true;
         let expanded = rows(&view.draw(&ctx)).join("\n");
         assert!(
             expanded.contains("row15"),
@@ -1116,6 +1118,7 @@ mod tests {
             std::rc::Rc::new(std::cell::RefCell::new(
                 crate::image_store::ImageStore::default(),
             )),
+            Rc::default(),
         );
         let ctx = DrawContext {
             max: MaxSize {

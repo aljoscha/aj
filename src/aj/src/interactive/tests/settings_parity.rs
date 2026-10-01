@@ -1161,7 +1161,7 @@ async fn settings_parity_failed_saves_leave_defaults_coherent_and_retry_writes_d
             .unwrap();
             assert!(note.contains("couldn't save"), "{note}");
             assert_eq!(
-                world.chat.borrow().show_token_usage,
+                shell.borrow().display.borrow().show_token_usage,
                 show,
                 "the live presentation effect is independent of defaults"
             );

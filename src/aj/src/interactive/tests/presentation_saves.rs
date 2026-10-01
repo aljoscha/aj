@@ -8,10 +8,10 @@ async fn thinking_shortcut_persists_and_settings_reads_the_saved_default() {
     let dir = TempDir::new().unwrap();
     let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
     let user_file = home.join(".aj/config.toml");
-    assert!(!world.chat.borrow().show_thinking_block);
+    let display = Rc::clone(&shell.borrow().display);
+    assert!(!display.borrow().show_thinking_block);
     assert!(!user_file.exists());
     let observed = Rc::clone(&shell);
-    let chat = Rc::clone(&world.chat);
     let (exit, ()) = drive_until(&mut world, &shell, move |mut writer| async move {
         for value in [true, false] {
             writer.write_all(b"\x1bt").unwrap();
@@ -21,7 +21,7 @@ async fn thinking_shortcut_persists_and_settings_reads_the_saved_default() {
                     (user_file.exists()
                         && diagnostics.is_empty()
                         && saved.show_thinking_block == value
-                        && chat.borrow().show_thinking_block == value)
+                        && display.borrow().show_thinking_block == value)
                         .then_some(())
                 })
                 .await
@@ -76,9 +76,9 @@ async fn rapid_thinking_shortcuts_keep_input_live_and_finish_saving_on_quit() {
     let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
     let user_file = home.join(".aj/config.toml");
     let writes = Arc::clone(&world.config_layers.lock().unwrap().writes);
-    let chat = Rc::clone(&world.chat);
+    let display = Rc::clone(&shell.borrow().display);
     let observed = Rc::clone(&shell);
-    assert!(!chat.borrow().show_thinking_block);
+    assert!(!display.borrow().show_thinking_block);
 
     let (exit, (release_tx, holder)) =
         drive_until(&mut world, &shell, move |mut writer| async move {
@@ -93,7 +93,7 @@ async fn rapid_thinking_shortcuts_keep_input_live_and_finish_saving_on_quit() {
             for value in [true, false] {
                 writer.write_all(b"\x1bt").unwrap();
                 assert!(
-                    poll_for(|| (chat.borrow().show_thinking_block == value).then_some(()))
+                    poll_for(|| (display.borrow().show_thinking_block == value).then_some(()))
                         .await
                         .is_some(),
                     "visibility must change without waiting for disk"

@@ -1355,7 +1355,6 @@ mod tests {
     fn detachment_clears_retained_models_and_remint_reuses_the_cell() {
         for detach in ["lru", "archive-focus", "archive-list", "archive-mark"] {
             let retained = chat();
-            retained.borrow_mut().show_token_usage = false;
             let mut directory = SessionDirectory::new(FOCUSED.into(), Rc::clone(&retained));
             assert!(Rc::ptr_eq(&directory.chat(), &retained));
             let _ = directory.apply(opening(FOCUSED));
@@ -1441,10 +1440,6 @@ mod tests {
             assert!(retained.borrow().tasks().is_empty(), "{detach}");
             assert!(retained.borrow().queue().queues.is_empty(), "{detach}");
             assert_ne!(retained.borrow().generation(), generation);
-            assert!(
-                !retained.borrow().show_token_usage,
-                "view configuration survives"
-            );
             assert!(!directory.apply(durable(FOCUSED, 2, "detached tail")).0);
             assert!(notices(&retained.borrow()).is_empty());
 

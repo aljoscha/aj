@@ -515,18 +515,6 @@ pub struct ChatState {
     /// phase.
     pub(crate) compaction_phase: HashMap<AgentId, CompactionPhase>,
 
-    /// Display flags the view reads at draw time. Flipping one is a
-    /// redraw, not a walk of entries.
-    pub show_thinking_block: bool,
-    /// Whether the inline per-turn token-usage rows are visible. Usage
-    /// is always recorded, this only gates its display.
-    pub show_token_usage: bool,
-    /// Transcript detail selected by the frontend, read at draw time.
-    pub transcript_mode: aj_conf::TranscriptMode,
-    pub tools_expanded: bool,
-    pub show_image_in_terminal: bool,
-    /// Whether fenced code blocks in rendered markdown are syntax-highlighted.
-    pub syntax_highlight: bool,
     /// Which incarnation of the model this is, unique for the life of the
     /// process (see [`Self::generation`]).
     generation: u64,
@@ -541,7 +529,6 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl ChatState {
     /// Build a fresh model seeded with the Main agent's settings snapshot.
-    /// Display flags start at their defaults.
     pub fn new(main_settings: AgentSettings) -> Self {
         let mut transcripts = HashMap::new();
         transcripts.insert(AgentId::Main, Transcript::default());
@@ -554,12 +541,6 @@ impl ChatState {
             footers: AgentFooters::new(main_settings),
             sub_boxes: HashMap::new(),
             compaction_phase: HashMap::new(),
-            show_thinking_block: true,
-            show_token_usage: true,
-            transcript_mode: aj_conf::TranscriptMode::Full,
-            tools_expanded: false,
-            show_image_in_terminal: true,
-            syntax_highlight: false,
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -963,8 +944,7 @@ impl ChatState {
         }
     }
 
-    /// Drop everything the frame stream built, keeping only client-local
-    /// view configuration.
+    /// Drop everything the frame stream built.
     ///
     /// A client calls this when it adopts a different epoch for the session
     /// (a head switch to another branch, a host restart).
@@ -972,12 +952,10 @@ impl ChatState {
     /// history it is about to be served, so the fold restarts from the full
     /// backfill.
     ///
-    /// The display flags survive: they come from
-    /// config, not from the stream. Main's footer keeps its settings seed,
-    /// which the stream never wrote either: a client reads the host's
-    /// active settings off the `state` frame. Every other agent's footer
-    /// goes with its transcript, and Main's occupancy numerator goes with
-    /// the turns it measured.
+    /// Main's footer keeps its settings seed, which the stream never wrote:
+    /// a client reads the host's active settings off the `state` frame.
+    /// Every other agent's footer goes with its transcript, and Main's
+    /// occupancy numerator goes with the turns it measured.
     pub fn reset(&mut self, lifecycle: &mut AgentLifecycle) {
         // Entry ids restart here, so this is a new incarnation and nothing
         // keyed on an id of the old one may survive it.

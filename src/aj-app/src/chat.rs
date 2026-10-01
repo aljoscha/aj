@@ -2,11 +2,11 @@
 //!
 //! [`ChatState`] is the data model behind an interactive chat view:
 //! per-agent transcripts of typed entries, streaming bookkeeping, the
-//! background-task table, footer accounting, and the display flags. The
-//! [`reduce`] function folds one [`AgentEvent`] into the model, updating
-//! the shared [`AgentLifecycle`] sets alongside it. It answers "what is
-//! there to render". Turning entries into widgets, layout, styling, and
-//! scroll position stay with the consuming view.
+//! background-task table, and footer accounting. The [`reduce`] function
+//! folds one [`AgentEvent`] into the model, updating the shared
+//! [`AgentLifecycle`] sets alongside it. It answers "what is there to
+//! render". Turning entries into widgets, display toggles, layout, styling,
+//! and scroll position stay with the consuming view.
 //!
 //! The reducer preserves the domain rules of `aj`'s imperative event
 //! pump, but it mutates data instead of a live component tree, so it is

@@ -4928,7 +4928,7 @@ mod tests {
     // ---- The canonical form itself --------------------------------------
 
     #[test]
-    fn canonical_form_ignores_instants_display_flags_and_active_view() {
+    fn canonical_form_ignores_instants_and_active_view() {
         // Both states fold the same events, so their durable content
         // matches while every wall-clock stamp differs.
         let events = vec![
@@ -4972,10 +4972,6 @@ mod tests {
             "the two folds really do carry different instants",
         );
 
-        second.show_thinking_block = !second.show_thinking_block;
-        second.show_token_usage = !second.show_token_usage;
-        second.transcript_mode = aj_conf::TranscriptMode::Focused;
-        second.tools_expanded = !second.tools_expanded;
         second.set_active_view(AgentId::Sub(1));
 
         assert_eq!(canon(&first, &first_life), canon(&second, &second_life));
