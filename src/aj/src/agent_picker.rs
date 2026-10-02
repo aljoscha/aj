@@ -9,9 +9,9 @@
 //! at-target, so they never enter the global keymap:
 //!
 //! - `Ctrl+T` ([`ACTION_AGENT_TOGGLE_SCOPE`]) flips the scope between
-//!   "running only" and "all", rebuilding the row set in place.
-//! - `Ctrl+K` ([`ACTION_TASK_KILL`]) on a running task row parks an
-//!   [`AgentPickerOutcome::Kill`] and closes.
+//!   "active only" and "all", rebuilding the row set in place.
+//! - `Ctrl+K` ([`ACTION_TASK_KILL`]) kills a running task or a running or
+//!   interrupted sub-agent assignment and closes.
 //!
 //! The main agent is always listed so the user can return home. The
 //! current view is pre-selected. Task rows are recovered on confirm by
@@ -60,12 +60,14 @@ pub(crate) enum AgentPickerOutcome {
     OpenTask(TaskId),
     /// Kill this (still-running at snapshot time) background task.
     Kill(TaskId),
+    /// Terminate a running or interrupted sub-agent assignment.
+    KillAgent(AgentId),
 }
 
 /// Which agents and tasks the picker lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scope {
-    /// The main agent plus currently-running sub-agents and tasks: the
+    /// The main agent plus running or interrupted sub-agents and running tasks: the
     /// work worth watching right now.
     Running,
     /// The main agent plus every sub-agent and task in the session.
@@ -144,30 +146,29 @@ impl AgentPicker {
         self.window = Some(window);
     }
 
-    /// Whether the picker lists any running task, for the kill hint (the
-    /// kill chord only acts on running tasks, so it is advertised only
-    /// when one is present).
-    fn has_killable_tasks(&self) -> bool {
+    /// Whether the picker lists work the kill chord can terminate.
+    fn has_killable_work(&self) -> bool {
         self.tasks.iter().any(|t| t.status == TaskStatus::Running)
+            || self.agents.iter().any(agent_killable)
     }
 
     /// The scope-toggle subtitle, resolved from keybinding data: the
     /// toggle hint names the scope it would switch *to*, and the kill
-    /// hint appears only while a running task is listed.
+    /// hint appears only while killable work is listed.
     fn subtitle(&self) -> String {
         let scope = action_shortcut(ACTION_AGENT_TOGGLE_SCOPE)
             .expect("aj.agent.toggle_scope has a default chord");
         let scope_target = match self.scope {
-            Scope::All => "running agents",
+            Scope::All => "active agents",
             Scope::Running => "all agents",
         };
         let confirm = confirm_key_label();
         let close = close_key_label();
         let mut hint =
             format!("{confirm} to observe  \u{2022}  {scope} {scope_target}  \u{2022}  ");
-        if self.has_killable_tasks() {
+        if self.has_killable_work() {
             let kill = action_shortcut(ACTION_TASK_KILL).expect("aj.task.kill has a default chord");
-            hint.push_str(&format!("{kill} kill task  \u{2022}  "));
+            hint.push_str(&format!("{kill} kill  \u{2022}  "));
         }
         hint.push_str(&format!("{close} to close"));
         hint
@@ -217,8 +218,8 @@ impl Widget for AgentPicker {
             ctx.consume_and_redraw();
             return;
         }
-        // Overlay-local kill: acts only on a selected, still-running task
-        // row. On anything else the chord is consumed but inert, matching
+        // Kill targets a running task or a running/interrupted sub-agent.
+        // On anything else the chord is consumed but inert, matching
         // the capturing overlay's swallow-everything contract.
         if action_matches(key, ACTION_TASK_KILL) {
             if let Some(id) = self
@@ -233,6 +234,15 @@ impl Widget for AgentPicker {
             {
                 *self.outcome.borrow_mut() = Some(AgentPickerOutcome::Kill(id));
                 close_top(&self.stack, ctx, &self.editor);
+            } else if let Some(id) = self
+                .select
+                .borrow()
+                .selected()
+                .and_then(|item| decode_agent(&item.filter_key))
+                && self.agents.iter().any(|a| a.id == id && agent_killable(a))
+            {
+                *self.outcome.borrow_mut() = Some(AgentPickerOutcome::KillAgent(id));
+                close_top(&self.stack, ctx, &self.editor);
             }
             ctx.consume_and_redraw();
         }
@@ -245,15 +255,22 @@ impl Widget for AgentPicker {
     }
 }
 
-/// Whether an agent entry is listed in `scope`. Main is always listed.
-/// A sub-agent shows in `Running` scope only while running, and always
-/// in `All`.
+/// Only unfinished sub-agent work is an explicit kill target.
+fn agent_killable(entry: &AgentEntry) -> bool {
+    entry.id != AgentId::Main
+        && matches!(
+            entry.status,
+            Some(SubAgentStatus::Running | SubAgentStatus::Interrupted)
+        )
+}
+
+/// Main and unfinished assignments stay visible in the active scope.
 fn agent_visible(entry: &AgentEntry, scope: Scope) -> bool {
     if entry.id == AgentId::Main {
         return true;
     }
     match scope {
-        Scope::Running => entry.status == Some(SubAgentStatus::Running),
+        Scope::Running => agent_killable(entry),
         Scope::All => true,
     }
 }
@@ -302,6 +319,9 @@ fn agent_item(entry: &AgentEntry, active: AgentId) -> SelectItem {
         Some(status) => format!("{} {name}", sub_status_glyph(status)),
         None => name.clone(),
     };
+    if entry.status == Some(SubAgentStatus::Interrupted) {
+        label.push_str(" · Interrupted");
+    }
     if entry.id == active {
         label.push_str(" (current)");
     }
@@ -404,7 +424,8 @@ fn task_status_label(status: TaskStatus) -> String {
 /// sub-agent box so the two views read the same.
 fn sub_status_glyph(status: SubAgentStatus) -> &'static str {
     match status {
-        SubAgentStatus::Running => "\u{25b8}",   // ▸
+        SubAgentStatus::Running => "\u{25b8}", // ▸
+        SubAgentStatus::Interrupted => "Ⅱ",
         SubAgentStatus::Done => "\u{2713}",      // ✓
         SubAgentStatus::Truncated => "\u{26a0}", // ⚠
         SubAgentStatus::Failed => "\u{2717}",    // ✗
@@ -972,6 +993,58 @@ mod tests {
         ctx.phase = Phase::Capturing;
         picker.capture_event(&mut ctx, &ctrl_k);
         assert_eq!(*outcome.borrow(), Some(AgentPickerOutcome::Kill(3)));
+    }
+
+    #[test]
+    fn ctrl_k_kills_running_and_interrupted_agents_but_not_finished_agents() {
+        for status in [
+            SubAgentStatus::Running,
+            SubAgentStatus::Interrupted,
+            SubAgentStatus::Done,
+        ] {
+            let agents = vec![main_entry(), sub_entry(1, status)];
+            let active_items = build_items(&agents, &[], AgentId::Main, Scope::Running);
+            assert_eq!(
+                active_items.len(),
+                if status == SubAgentStatus::Done { 1 } else { 2 }
+            );
+            let select = Rc::new(RefCell::new(FilterableSelect::new(
+                build_items(&agents, &[], AgentId::Main, Scope::All),
+                SelectStyles::default(),
+            )));
+            select
+                .borrow()
+                .select_matching(|item| decode_agent(&item.filter_key) == Some(AgentId::Sub(1)));
+            let outcome = Rc::new(RefCell::new(None));
+            let mut picker = AgentPicker {
+                select,
+                agents,
+                tasks: vec![],
+                active: AgentId::Main,
+                scope: Scope::All,
+                window: None,
+                outcome: Rc::clone(&outcome),
+                stack: Rc::new(RefCell::new(OverlayStack::default())),
+                editor: Rc::new(RefCell::new(crate::overlay::Scrim)),
+            };
+            let mut ctx = EventContext::new();
+            picker.capture_event(
+                &mut ctx,
+                &Event::KeyPress(Key {
+                    codepoint: u32::from('k'),
+                    mods: Modifiers::CTRL,
+                    ..Key::default()
+                }),
+            );
+            assert_eq!(
+                *outcome.borrow(),
+                if status == SubAgentStatus::Done {
+                    None
+                } else {
+                    Some(AgentPickerOutcome::KillAgent(AgentId::Sub(1)))
+                }
+            );
+        }
     }
 
     /// Ctrl+T flips the scope and rebuilds the rows: a finished sub that

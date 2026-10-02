@@ -42,6 +42,8 @@ use tracing_subscriber::fmt::MakeWriter;
 
 #[path = "session_host/goals.rs"]
 mod goals;
+#[path = "session_host/interruptions.rs"]
+mod interruptions;
 
 /// Every wait in this file is bounded by this, so a wedged host fails a
 /// test instead of hanging CI.
@@ -5663,14 +5665,13 @@ async fn a_cancel_stops_the_turn_and_publishes_its_notice() {
     harness.host.shutdown().await;
 }
 
-/// Cancelling a foreground sub-agent cascades to the main turn that owns
-/// it, matching the local gesture.
+/// Cancelling the parent also stops the foreground child it owns.
 #[tokio::test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: paced streaming on the successful path"
 )]
-async fn cancelling_a_foreground_sub_cascades_to_main() {
+async fn cancelling_main_stops_its_foreground_sub() {
     let harness = Harness::with_provider(scripted(
         vec![
             calling(
@@ -5689,7 +5690,7 @@ async fn cancelling_a_foreground_sub_cascades_to_main() {
     let mut client = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "delegate it").await;
 
-    // Wait until the sub-agent's run has started, then cancel the sub.
+    // Wait until the sub-agent's run has started, then cancel its parent.
     frames_until(&mut client.stream, "the sub-agent to start", |frame| {
         matches!(
             frame,
@@ -5707,21 +5708,14 @@ async fn cancelling_a_foreground_sub_cascades_to_main() {
         .command(
             &session,
             Command::Cancel {
-                agent: AgentId::Sub(1),
+                agent: AgentId::Main,
             },
         )
         .await
-        .expect("cancel the sub");
+        .expect("cancel the parent");
 
     let frames = client.pump_until_idle().await;
-    assert!(
-        !client.client.working(),
-        "the cascade cancelled the main turn too",
-    );
-    // A cancel of a foreground sub fires the main turn's token, because the
-    // child's run is owned by that turn. Without the cascade nothing is
-    // cancelled at all: the sub reports normally, the parent runs its
-    // concluding inference, and neither of the two below holds.
+    assert!(!client.client.working(), "the main turn stopped",);
     assert!(
         notice(&frames, CANCELLED),
         "the main turn was cancelled: {:?}",

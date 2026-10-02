@@ -388,6 +388,10 @@ pub enum Command {
     Cancel {
         agent: AgentId,
     },
+    /// End a sub-agent assignment, rather than interrupting its current turn.
+    KillAgent {
+        agent: AgentId,
+    },
     Queue(QueueOp),
     Compact {
         instructions: Option<String>,
@@ -2136,6 +2140,7 @@ impl SessionHost {
             // `SessionStatus::finished_subs`).
             finished_subs: log.sub_agent_ids(),
             driven_subs: std::collections::BTreeSet::new(),
+            interrupted_subs: std::collections::BTreeSet::new(),
             last_activity: self.opening_stamp(&log, &session_id),
             tag,
             archived,
@@ -2291,6 +2296,7 @@ impl SessionHost {
             goal_seen,
             finished_subs,
             driven_subs,
+            interrupted_subs,
         ) = {
             let log = tokio::select! {
                 biased;
@@ -2307,6 +2313,7 @@ impl SessionHost {
                 status.goal.clone(),
                 status.finished_subs.clone(),
                 status.driven_subs.clone(),
+                status.interrupted_subs.clone(),
             )
         };
         let boundary = snapshot.last_seq();
@@ -2343,6 +2350,7 @@ impl SessionHost {
             .difference(&finished_subs)
             .copied()
             .chain(driven_subs)
+            .chain(interrupted_subs.iter().copied())
             .collect();
         // Projected outside the log lock: a full backfill walks the whole
         // log, and holding the lock would stall the session's next append
@@ -2427,18 +2435,12 @@ impl SessionHost {
         {
             return false;
         }
-        // The opening half of the lifecycle repair: a sub-agent still
-        // running when this client attached announced itself only through a
-        // live `AgentStart` this client never saw, so the block synthesizes
-        // it. After the backfill events so the box the reducer's
-        // `AgentStart` arm reopens exists, and before `caught_up` so the
-        // lifecycle set is complete the moment the attach flips live, with
-        // no window in which the footer, the picker, or a busy-gated
-        // gesture reads the sub as idle. `open_subs` is already
-        // liveness-scoped (`close_finished_runs` force-closes non-live
-        // runs), so no second filter here. Idempotent on re-attach:
-        // `mark_running` is a set insert and `reopen_sub_box` leaves a
-        // running box alone.
+        // Repair live lifecycle state after projecting the boxes, before
+        // `caught_up` makes them actionable. An open assignment is either
+        // running or interrupted waiting for input. Both keep their parent
+        // call pending, but only a running turn belongs in the busy set.
+        // The projection force-closes non-live runs, so `open_subs` already
+        // scopes this repair to assignments on the selected branch.
         let open_subs = backfill.open_subs();
         for child in &open_subs {
             if !send_block_frame(
@@ -2451,8 +2453,14 @@ impl SessionHost {
                     // sweep below, tagging it durable would make the
                     // client's cursor invariant drop it.
                     durability: None,
-                    event: aj_agent::events::AgentEvent::AgentStart {
-                        agent_id: AgentId::Sub(*child),
+                    event: if interrupted_subs.contains(child) {
+                        AgentEvent::AgentInterrupted {
+                            agent_id: AgentId::Sub(*child),
+                        }
+                    } else {
+                        AgentEvent::AgentStart {
+                            agent_id: AgentId::Sub(*child),
+                        }
                     }
                     .into(),
                 },

@@ -27,9 +27,9 @@ use aj_models::{speed_from_name, thinking_config_from_name};
 use aj_session::normalize_tag;
 use aj_wire::{
     AccountRequest, ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor,
-    EmptyRequest, EnvRequest, ErrorResponse, Frame, HeadRequest, PromptRequest, QueueOperation,
-    QueueOutcome, QueueRequest, RequestBody, SessionCreated, SessionSettings, SettingsRequest,
-    SteerRequest, TagRequest, decode_request,
+    EmptyRequest, EnvRequest, ErrorResponse, Frame, HeadRequest, KillAgentRequest, PromptRequest,
+    QueueOperation, QueueOutcome, QueueRequest, RequestBody, SessionCreated, SessionSettings,
+    SettingsRequest, SteerRequest, TagRequest, decode_request,
 };
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
@@ -228,6 +228,7 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/prompt", post(prompt))
         .route("/v1/sessions/{id}/steer", post(steer))
         .route("/v1/sessions/{id}/cancel", post(cancel))
+        .route("/v1/sessions/{id}/kill-agent", post(kill_agent))
         .route("/v1/sessions/{id}/compact", post(compact))
         .route("/v1/sessions/{id}/settings", post(settings))
         .route("/v1/sessions/{id}/models", get(models))
@@ -602,6 +603,24 @@ async fn cancel(
                 &session,
                 Command::Cancel {
                     agent: request.agent.unwrap_or(AgentId::Main),
+                },
+            )
+            .await?,
+    )
+}
+
+async fn kill_agent(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(request): Body<KillAgentRequest>,
+) -> Result<Response, ApiError> {
+    accepted(
+        state
+            .host
+            .command(
+                &session,
+                Command::KillAgent {
+                    agent: request.agent,
                 },
             )
             .await?,

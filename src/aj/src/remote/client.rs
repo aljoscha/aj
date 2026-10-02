@@ -21,9 +21,9 @@ use aj_agent::tool::TaskId;
 use aj_app::host::{AttachRequest, CommandOutcome, ListFrames};
 use aj_wire::{
     AccountList, AccountRequest, ArchiveRequest, CancelRequest, CompactRequest,
-    CreateSessionRequest, DecodedFrame, EnvRequest, Frame, HeadRequest, Hello, PROTOCOL_VERSION,
-    PromptRequest, QueueOperation, QueueOutcome, QueueRequest, SessionCreated, SessionList,
-    SessionTree, SettingsRequest, SteerRequest, TagRequest,
+    CreateSessionRequest, DecodedFrame, EnvRequest, Frame, HeadRequest, Hello, KillAgentRequest,
+    PROTOCOL_VERSION, PromptRequest, QueueOperation, QueueOutcome, QueueRequest, SessionCreated,
+    SessionList, SessionTree, SettingsRequest, SteerRequest, TagRequest,
 };
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures::{Stream, StreamExt};
@@ -129,6 +129,7 @@ pub(crate) enum RemoteCommand {
     Prompt(PromptRequest),
     Steer(SteerRequest),
     Cancel(CancelRequest),
+    KillAgent(KillAgentRequest),
     Queue(QueueRequest),
     Compact(CompactRequest),
     Settings(SettingsRequest),
@@ -147,6 +148,7 @@ impl RemoteCommand {
             Self::Goal(_) => "goal".to_string(),
             Self::Prompt(_) => "prompt".to_string(),
             Self::Steer(_) => "steer".to_string(),
+            Self::KillAgent(_) => "kill-agent".to_string(),
             Self::Cancel(_) => "cancel".to_string(),
             Self::Queue(_) => "queue".to_string(),
             Self::Compact(_) => "compact".to_string(),
@@ -165,6 +167,7 @@ impl RemoteCommand {
             Self::Goal(request) => encode(request),
             Self::Prompt(request) => encode(request),
             Self::Steer(request) => encode(request),
+            Self::KillAgent(request) => encode(request),
             Self::Cancel(request) => encode(request),
             Self::Queue(request) => encode(request),
             Self::Compact(request) => encode(request),

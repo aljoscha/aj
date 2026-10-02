@@ -149,6 +149,8 @@ pub(crate) struct SessionStatus {
     /// again". It is recorded before the turn's task exists, so no append of
     /// the new run can land while the run still reads as finished.
     pub(crate) driven_subs: BTreeSet<usize>,
+    /// Foreground assignments waiting for user input, not final reports.
+    pub(crate) interrupted_subs: BTreeSet<usize>,
     pub(crate) last_activity: DateTime<Utc>,
     /// The session's label, read from its sidecar when the session
     /// was materialized and kept current by the tag command.

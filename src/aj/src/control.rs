@@ -28,9 +28,9 @@ use aj_models::types::UserContent;
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{
     AccountList, AccountRequest, ArchiveRequest, CancelRequest, CompactRequest,
-    CreateSessionRequest, EnvRequest, Frame, HeadRequest, ModelSelection, PromptInput,
-    PromptRequest, QueueOperation, QueueRequest, SessionList, SessionSettings, SessionTree,
-    SettingsRequest, SteerRequest, TagRequest,
+    CreateSessionRequest, EnvRequest, Frame, HeadRequest, KillAgentRequest, ModelSelection,
+    PromptInput, PromptRequest, QueueOperation, QueueRequest, SessionList, SessionSettings,
+    SessionTree, SettingsRequest, SteerRequest, TagRequest,
 };
 use futures::{FutureExt, StreamExt};
 use reqwest::StatusCode;
@@ -702,6 +702,7 @@ fn wire_command(command: Command) -> RemoteCommand {
             request.changes = changes;
             RemoteCommand::Head(request)
         }
+        Command::KillAgent { agent } => RemoteCommand::KillAgent(KillAgentRequest { agent }),
         Command::KillTask { task } => RemoteCommand::KillTask(task),
     }
 }

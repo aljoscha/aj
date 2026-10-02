@@ -181,6 +181,8 @@ pub struct ToolEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum SubAgentStatus {
     Running,
+    /// Current turn stopped, waiting for user input while the assignment stays pending.
+    Interrupted,
     /// Finished cleanly.
     Done,
     /// Finished, but the final report hit the model's token cap and is
@@ -850,17 +852,17 @@ impl ChatState {
     }
 
     /// Re-open the `Sub(n)` box for a new run of a sub we already have a
-    /// box for: a `Done` box flips back to `Running` and its runtime clock
+    /// box for: a `Done` or `Interrupted` box flips to `Running` and its runtime clock
     /// starts over. A missing box and one that is already running are left
     /// untouched.
     ///
-    /// Only a `Done` box re-opens, because that is the genuine
-    /// continuation case. A `Truncated` or `Failed` conclusion is terminal,
+    /// A `Done` or `Interrupted` box re-opens for continuation or resumption.
+    /// A `Truncated` or `Failed` conclusion is terminal,
     /// and re-opening it would let the new run's plain `AgentEnd` conclude
     /// the box `Done` and quietly rewrite a failure into a success.
     pub(crate) fn reopen_sub_box(&mut self, n: usize) {
         if let Some(b) = self.sub_box_mut(n)
-            && b.status == SubAgentStatus::Done
+            && matches!(b.status, SubAgentStatus::Done | SubAgentStatus::Interrupted)
         {
             b.status = SubAgentStatus::Running;
             // The clock restarts so the runtime times the new run, not the

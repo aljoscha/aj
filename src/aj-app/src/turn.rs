@@ -355,7 +355,14 @@ impl Turns {
         let log = Arc::clone(&core.log);
         let handoff = self.handoff.clone();
         let cleanup = core.task_registry.track_cleanup();
-        let turn_cancel = CancellationToken::new();
+        let turn_cancel = match target {
+            AgentId::Sub(n) => core
+                .registry
+                .assignment(n)
+                .map(|assignment| assignment.turn_token())
+                .unwrap_or_default(),
+            AgentId::Main => CancellationToken::new(),
+        };
         self.cancels.insert(target, turn_cancel.clone());
         let handle = self.set.spawn(async move {
             let _cleanup = cleanup;

@@ -313,6 +313,28 @@ impl Driver {
 
     fn apply_lifecycle(&mut self, event: &AgentEvent) {
         match event {
+            AgentEvent::AgentInterrupted {
+                agent_id: AgentId::Sub(n),
+            } => {
+                self.lifecycle.mark_idle(AgentId::Sub(*n));
+                self.session.status().interrupted_subs.insert(*n);
+            }
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(n),
+            }
+            | AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(n),
+                ..
+            }
+            | AgentEvent::SubAgentEnd {
+                child: AgentId::Sub(n),
+                ..
+            } => {
+                self.session.status().interrupted_subs.remove(n);
+            }
+            _ => {}
+        }
+        match event {
             AgentEvent::AgentStart { agent_id } => self.lifecycle.mark_running(*agent_id),
             AgentEvent::AgentEnd { agent_id, .. } => {
                 self.lifecycle.mark_idle(*agent_id);
@@ -362,6 +384,20 @@ impl Driver {
         let Joined { agent, outcome } = joined;
         if agent == AgentId::Main {
             self.goal.finish(&outcome);
+            // An interrupted child has no running mark for `reap` to sweep.
+            // The parent's tool future nevertheless owned its assignment.
+            let interrupted = std::mem::take(&mut self.session.status().interrupted_subs);
+            for n in interrupted {
+                self.publish_event(
+                    None,
+                    AgentEvent::SubAgentEnd {
+                        parent: AgentId::Main,
+                        child: AgentId::Sub(n),
+                        report: "sub-agent assignment cancelled with parent".into(),
+                        conclusion: aj_agent::events::SubAgentConclusion::Failed,
+                    },
+                );
+            }
         }
         for idled in self
             .turns
@@ -447,6 +483,13 @@ impl Driver {
     }
 
     fn wake(&mut self, owner: AgentId) {
+        // A foreground interruption waits for deliberate user input. A task
+        // notice or queued message must not restart it or fulfill its caller.
+        if let AgentId::Sub(n) = owner
+            && self.session.core.registry.assignment(n).is_some()
+        {
+            return;
+        }
         if !self.turns.is_busy(&self.lifecycle, owner) {
             self.prepare_goal_turn(owner, false);
         }
@@ -585,6 +628,7 @@ impl Driver {
                 }
                 self.cancel(agent)
             }
+            Command::KillAgent { agent } => self.kill_agent(agent),
             Command::Queue(op) => Ok(self.queue_op(op)),
             Command::Compact { instructions } => self.compact(instructions),
             Command::Settings(change) => self.settings(change).await,
@@ -666,6 +710,12 @@ impl Driver {
         if self.turns.cancel(agent) {
             return Ok(CommandOutcome::Accepted);
         }
+        if let AgentId::Sub(n) = agent
+            && let Some(assignment) = self.session.core.registry.assignment(n)
+        {
+            assignment.interrupt();
+            return Ok(CommandOutcome::Accepted);
+        }
         // A detached background run belongs to the task registry, not to any
         // turn. Delegating a Running entry to the kill path gives both
         // gestures the same conclusion, notice, status, and parked usage. A
@@ -681,12 +731,6 @@ impl Driver {
             };
         }
         if self.lifecycle.is_running(agent) {
-            // A sub running its initial spawn is owned by the main turn,
-            // so cancelling that token is what reaches the child. For Main,
-            // the first route already tried this token and this call misses.
-            if self.turns.cancel(AgentId::Main) {
-                return Ok(CommandOutcome::Accepted);
-            }
             // Running by the mark, owned by neither a turn nor a task: no
             // mechanism here can end it. Reachable only through a leaked
             // mark, which is why it refuses out loud instead of accepting.
@@ -700,6 +744,19 @@ impl Driver {
             });
         }
         Ok(CommandOutcome::Accepted)
+    }
+
+    fn kill_agent(&self, agent: AgentId) -> Result<CommandOutcome, HostError> {
+        let AgentId::Sub(n) = agent else {
+            return Err(HostError::Invalid(
+                "the main agent is not a kill target".into(),
+            ));
+        };
+        if let Some(assignment) = self.session.core.registry.assignment(n) {
+            assignment.cancel();
+            return Ok(CommandOutcome::Accepted);
+        }
+        self.cancel(agent)
     }
 
     fn queue_op(&self, op: QueueOp) -> CommandOutcome {

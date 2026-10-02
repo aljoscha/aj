@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 const EVENT_TYPES: &[&str] = &[
     "agent_start",
     "agent_end",
+    "agent_interrupted",
     "turn_start",
     "turn_end",
     "message_start",
@@ -87,6 +88,24 @@ fn fixture(name: &str) -> Value {
         _ => panic!("unknown fixture {name}"),
     })
     .expect("fixture is valid JSON")
+}
+
+#[test]
+fn kill_agent_requires_an_explicit_target_and_rejects_unknown_fields() {
+    let request = decode_request::<aj_wire::KillAgentRequest>(br#"{"agent":{"sub":2}}"#).unwrap();
+    assert_eq!(request.agent, AgentId::Sub(2));
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        json!({"agent":{"sub":2}})
+    );
+    assert_public_request_round_trip(request);
+    for body in [
+        br#"{}"#.as_slice(),
+        br#"{"agent":null}"#,
+        br#"{"agent":{"sub":2},"future":true}"#,
+    ] {
+        assert!(decode_request::<aj_wire::KillAgentRequest>(body).is_err());
+    }
 }
 
 #[test]
@@ -2841,6 +2860,7 @@ fn agent_event_type(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::AgentStart { .. } => "agent_start",
         AgentEvent::AgentEnd { .. } => "agent_end",
+        AgentEvent::AgentInterrupted { .. } => "agent_interrupted",
         AgentEvent::TurnStart { .. } => "turn_start",
         AgentEvent::TurnEnd { .. } => "turn_end",
         AgentEvent::MessageStart { .. } => "message_start",

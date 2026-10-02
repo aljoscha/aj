@@ -98,6 +98,16 @@ pub fn reduce(
             }
             Redraw(true)
         }
+        AgentEvent::AgentInterrupted { agent_id } => {
+            lifecycle.mark_idle(agent_id);
+            if let AgentId::Sub(n) = agent_id
+                && let Some(b) = state.sub_box_mut(n)
+            {
+                b.status = SubAgentStatus::Interrupted;
+                b.finished_at = Some(Instant::now());
+            }
+            Redraw(true)
+        }
         AgentEvent::TurnStart { agent_id } => {
             // Each new turn opens a fresh assistant entry. NOTE: a turn
             // that aborts or errors emits no `TurnEnd`, so nothing here

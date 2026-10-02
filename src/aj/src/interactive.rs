@@ -3289,8 +3289,8 @@ async fn submit_launch(world: &mut World, launch: aj_app::cli::InitialInput) {
 /// `CancelTurn` action, whose predicate keeps it off the dispatch path while
 /// nothing runs.
 ///
-/// The host owns the cascade: cancelling a sub-agent that runs inside its
-/// parent's turn fires the parent's token.
+/// The host interrupts a foreground child's turn without ending its assignment.
+/// Explicit assignment termination is the agents picker's kill action.
 async fn cancel_viewed_turn(world: &mut World) -> bool {
     let active = world.chat.borrow().active_view();
     if !view_busy(world, active) {
@@ -4161,6 +4161,19 @@ async fn apply_picker_outcome(
                     ActionEffect::Redraw
                 }
             }
+        }
+        AgentPickerOutcome::KillAgent(agent) => {
+            if refuse_while_attaching(world, shell, "kill an agent") {
+                return ActionEffect::Redraw;
+            }
+            if let Err(error) = world
+                .control
+                .command(world.session(), Command::KillAgent { agent })
+                .await
+            {
+                fold_notice(world, &format!("Could not kill agent: {error}"));
+            }
+            ActionEffect::Redraw
         }
         AgentPickerOutcome::Kill(id) => {
             if refuse_while_attaching(world, shell, "kill a task") {

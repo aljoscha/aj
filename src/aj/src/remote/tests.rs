@@ -5300,6 +5300,292 @@ async fn frames_from_a_stale_epoch_are_dropped_until_a_reattach() {
 }
 
 #[tokio::test]
+async fn foreground_interruption_resume_and_kill_are_equal_through_both_control_arms() {
+    use aj_models::streaming::{AssistantMessageEvent, DoneReason};
+    use aj_models::types::UserContent;
+
+    // Each inference is held until the test supplies its result. Capturing the
+    // context proves what the resumed child and waiting parent actually see.
+    struct HeldProvider {
+        calls: tokio::sync::mpsc::UnboundedSender<(Context, AssistantMessageEventStream)>,
+    }
+
+    impl Provider for HeldProvider {
+        fn stream(
+            &self,
+            _model: &ModelInfo,
+            context: &Context,
+            _options: &StreamOptions,
+        ) -> AssistantMessageEventStream {
+            let stream = AssistantMessageEventStream::new();
+            stream.push(AssistantMessageEvent::Start {
+                partial: finalized_text_message(""),
+            });
+            self.calls.send((context.clone(), stream.clone())).unwrap();
+            stream
+        }
+
+        fn stream_simple(
+            &self,
+            model: &ModelInfo,
+            context: &Context,
+            _options: &SimpleStreamOptions,
+        ) -> AssistantMessageEventStream {
+            self.stream(model, context, &StreamOptions::default())
+        }
+    }
+
+    fn finish(stream: &AssistantMessageEventStream, message: AssistantMessage) {
+        let reason = if message.stop_reason == StopReason::ToolUse {
+            DoneReason::ToolUse
+        } else {
+            DoneReason::Stop
+        };
+        stream.push(AssistantMessageEvent::Done { reason, message });
+    }
+
+    async fn event_until(
+        stream: &mut crate::control::Stream,
+        predicate: impl Fn(&AgentEvent) -> bool,
+    ) -> AgentEvent {
+        bounded("the control lifecycle event", async {
+            loop {
+                match stream.recv().await {
+                    ControlFrame::Frame(Frame::Event { event, .. }) => {
+                        if let Some(event) = event.known()
+                            && predicate(event)
+                        {
+                            return event.clone();
+                        }
+                    }
+                    ControlFrame::Frame(_) => {}
+                    ControlFrame::Lost(error) => panic!("control stream failed: {error}"),
+                    ControlFrame::Closed => panic!("control stream closed"),
+                }
+            }
+        })
+        .await
+    }
+
+    fn has_user_text(context: &Context, expected: &str) -> bool {
+        context.messages.iter().any(|message| {
+            matches!(message, Message::User(message) if message.content.iter().any(|content| {
+                matches!(content, UserContent::Text(text) if text.text == expected)
+            }))
+        })
+    }
+
+    for kill in [false, true] {
+        let mut outcomes = Vec::new();
+        for remote in [false, true] {
+            let (calls, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let fixture = Fixture::build(
+                Arc::new(HeldProvider { calls }),
+                IdentityGate::local(),
+                Duration::from_secs(30),
+            )
+            .await;
+            let control = if remote {
+                Control::remote(fixture.client())
+            } else {
+                Control::local(fixture.host.clone())
+            };
+            let session = control.create(None, None, None, None, None).await.unwrap();
+            let mut events = control.attach_all(&[attach(&session)]).await.unwrap();
+            control
+                .command(
+                    &session,
+                    Command::Prompt {
+                        agent: AgentId::Main,
+                        content: vec![UserContent::text("delegate")],
+                    },
+                )
+                .await
+                .unwrap();
+            let (_, parent) = bounded("parent inference", received.recv()).await.unwrap();
+            finish(
+                &parent,
+                calling(
+                    "delegating",
+                    "call-sub",
+                    "agent",
+                    serde_json::json!({"task": "original assignment"}),
+                ),
+            );
+            let (child_context, _held_child) =
+                bounded("child inference", received.recv()).await.unwrap();
+            assert!(has_user_text(&child_context, "original assignment"));
+            let AgentEvent::AgentStart { agent_id: child } = event_until(&mut events, |event| {
+                matches!(
+                    event,
+                    AgentEvent::AgentStart {
+                        agent_id: AgentId::Sub(_)
+                    }
+                )
+            })
+            .await
+            else {
+                unreachable!()
+            };
+            control
+                .command(
+                    &session,
+                    Command::Cancel {
+                        agent: child.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            event_until(&mut events, |event| {
+                matches!(event, AgentEvent::AgentInterrupted { agent_id } if agent_id == &child)
+            }).await;
+            assert!(
+                control
+                    .sessions()
+                    .await
+                    .unwrap()
+                    .sessions
+                    .iter()
+                    .find(|row| row.id == session)
+                    .unwrap()
+                    .working,
+                "interrupting the foreground child must leave its parent working"
+            );
+            assert!(
+                received.try_recv().is_err(),
+                "interruption must not resolve the parent's agent call"
+            );
+
+            if kill {
+                control
+                    .command(
+                        &session,
+                        Command::KillAgent {
+                            agent: child.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                control
+                    .command(
+                        &session,
+                        Command::Prompt {
+                            agent: child.clone(),
+                            content: vec![UserContent::text("resume instruction")],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let (context, resumed) = bounded("resumed child inference", received.recv())
+                    .await
+                    .unwrap();
+                assert!(has_user_text(&context, "original assignment"));
+                assert!(has_user_text(&context, "resume instruction"));
+                event_until(&mut events, |event| {
+                    matches!(event, AgentEvent::AgentStart { agent_id } if agent_id == &child)
+                }).await;
+                finish(
+                    &resumed,
+                    finalized_text_message("completed original report"),
+                );
+            }
+            let (context, parent) = bounded("parent receives assignment outcome", received.recv())
+                .await
+                .unwrap();
+            let results: Vec<_> = context
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResult(result) if result.tool_call_id == "call-sub" => {
+                        Some(result)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                results.len(),
+                1,
+                "the original delegation resolves exactly once"
+            );
+            let result = results[0];
+            assert_eq!(result.tool_name, "agent");
+            assert_eq!(result.is_error, kill);
+            let text = result
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    UserContent::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains(if kill {
+                    "cancelled"
+                } else {
+                    "completed original report"
+                }),
+                "{text}"
+            );
+            outcomes.push((result.is_error, text));
+            finish(&parent, finalized_text_message("parent finished"));
+            event_until(&mut events, |event| {
+                matches!(
+                    event,
+                    AgentEvent::AgentEnd {
+                        agent_id: AgentId::Main,
+                        ..
+                    }
+                )
+            })
+            .await;
+            fixture.shutdown().await;
+            assert!(
+                received.try_recv().is_err(),
+                "no extra inference after assignment completion"
+            );
+        }
+        assert_eq!(
+            outcomes[0], outcomes[1],
+            "local and remote parent results differ"
+        );
+    }
+}
+
+#[tokio::test]
+async fn kill_agent_refuses_main_through_both_control_arms() {
+    let mut refusals = Vec::new();
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+    for control in [
+        Control::local(fixture.host.clone()),
+        Control::remote(fixture.client()),
+    ] {
+        let err = control
+            .command(
+                &session,
+                Command::KillAgent {
+                    agent: AgentId::Main,
+                },
+            )
+            .await
+            .expect_err("main is not a kill target");
+        assert!(err.mutation_refused(), "{err}");
+        assert!(!err.unknown_endpoint(), "{err}");
+        refusals.push(match err {
+            ControlError::Host(error) => (error.code().to_string(), error.to_string()),
+            ControlError::Remote(RemoteError::Status { code, message, .. }) => {
+                (code.expect("protocol refusal code"), message)
+            }
+            other => panic!("unexpected refusal: {other}"),
+        });
+    }
+    assert_eq!(refusals[0], refusals[1]);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn environment_reads_and_edits_are_equal_through_both_control_arms() {
     let fixture = Fixture::new(Vec::new()).await;
     let session = fixture.create().await;

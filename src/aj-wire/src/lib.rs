@@ -198,6 +198,13 @@ pub struct CancelRequest {
     pub agent: Option<AgentId>,
 }
 
+/// Explicitly terminates a sub-agent assignment, including an interrupted one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KillAgentRequest {
+    pub agent: AgentId,
+}
+
 /// A pending-message queue mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1066,6 +1073,7 @@ mod request {
     request_body!(SteerRequest, SteerRequest, |request| request);
 
     request_body!(CancelRequest, CancelRequest, |request| request);
+    request_body!(KillAgentRequest, KillAgentRequest, |request| request);
 
     request_body!(QueueRequest, QueueRequest, |request| request);
 
@@ -2423,6 +2431,7 @@ fn is_known_event_type(event_type: &str) -> bool {
         event_type,
         "agent_start"
             | "agent_end"
+            | "agent_interrupted"
             | "turn_start"
             | "turn_end"
             | "message_start"

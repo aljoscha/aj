@@ -5,6 +5,7 @@
 // [`bus::EventBus`]; the binary subscribes a renderer listener and a
 // persistence listener (the latter lives in `aj-session`) and owns
 // the readline loop, log management, and history display.
+mod assignment;
 pub mod bus;
 pub mod error;
 pub mod events;
@@ -17,6 +18,7 @@ pub mod sanitize;
 pub mod tool;
 pub mod types;
 
+pub use assignment::ForegroundAssignment;
 pub use error::BoxError;
 pub use sanitize::sanitize_terminal_output;
 
@@ -305,6 +307,8 @@ pub struct Agent {
     /// [`Agent::set_sub_agent_registry`]. Sub-agents never read it
     /// (they can't spawn), and one-shot callers leave it empty.
     sub_agent_registry: SubAgentRegistry,
+    /// Present only while this child's foreground caller owns its assignment.
+    assignment: Option<Arc<ForegroundAssignment>>,
     /// Shared registry of background tasks this agent (and its
     /// sub-agents) started. Default; the binary injects a shared
     /// instance via [`Agent::set_task_registry`] so it can observe
@@ -407,6 +411,7 @@ impl Agent {
             should_stop_after_turn: None,
             block_images: false,
             sub_agent_registry: SubAgentRegistry::default(),
+            assignment: None,
             task_registry: TaskRegistry::default(),
             goal_control: None,
             goal_admission: None,
@@ -1108,6 +1113,8 @@ impl Agent {
     /// transcript — including any just-drained notices — is fed back
     /// to the model unchanged).
     async fn run_top_level_turn(&mut self, prompt: Option<AgentMessage>) -> Result<(), TurnError> {
+        let mut assignment_guard =
+            assignment::AssignmentTurnGuard(self.assignment.clone().filter(|a| a.is_pending()));
         // Mirror the run as `AgentStart` / `AgentEnd` events on the
         // bus. `AgentEnd` carries a clone of the agent's transcript
         // so a listener can take a final snapshot without replaying
@@ -1121,6 +1128,14 @@ impl Agent {
 
         let outcome = self.run_top_level_turn_inner(prompt).await;
 
+        let interrupted = matches!(outcome, Err(TurnError::Aborted))
+            && assignment_guard.0.as_ref().is_some_and(|a| a.is_pending());
+        let reply = if interrupted {
+            None
+        } else {
+            assignment_guard.0.as_ref().and_then(|a| a.take_reply())
+        };
+
         self.bus
             .emit(AgentEvent::AgentEnd {
                 agent_id: self.agent_id,
@@ -1128,6 +1143,21 @@ impl Agent {
             })
             .await
             .map_err(TurnError::Fatal)?;
+
+        if interrupted {
+            self.bus
+                .emit(AgentEvent::AgentInterrupted {
+                    agent_id: self.agent_id,
+                })
+                .await
+                .map_err(TurnError::Fatal)?;
+        } else if let Some(reply) = reply {
+            let _ = reply.send(match &outcome {
+                Ok(()) => self.sub_agent_outcome(),
+                Err(err) => Err(err.to_string().into()),
+            });
+        }
+        assignment_guard.0 = None;
 
         outcome
     }
@@ -1187,6 +1217,15 @@ impl Agent {
 
         let outcome = self.run_single_turn_inner(prompt).await;
 
+        let interrupted = outcome.is_err()
+            && self.cancellation.is_cancelled()
+            && self.assignment.as_ref().is_some_and(|a| !a.is_cancelled());
+        if !interrupted && let Some(assignment) = &self.assignment {
+            // The initial caller already owns this result. Release assignment
+            // ownership before AgentEnd allows the host to wake queued work.
+            assignment.take_reply();
+        }
+
         self.bus
             .emit(AgentEvent::AgentEnd {
                 agent_id: self.agent_id,
@@ -1194,6 +1233,15 @@ impl Agent {
             })
             .await?;
 
+        if interrupted {
+            // Published while the child is still locked, so a manual resume
+            // cannot overtake the interruption with its next AgentStart.
+            self.bus
+                .emit(AgentEvent::AgentInterrupted {
+                    agent_id: self.agent_id,
+                })
+                .await?;
+        }
         outcome
     }
 
@@ -1225,6 +1273,10 @@ impl Agent {
 
         self.execute_turn().await?;
 
+        self.sub_agent_outcome()
+    }
+
+    fn sub_agent_outcome(&self) -> Result<SubAgentOutcome, BoxError> {
         // Extract the last assistant message text from the
         // sub-agent's own transcript.
         let last_assistant = self
@@ -2265,17 +2317,25 @@ pub type SharedAgent = Arc<tokio::sync::Mutex<Agent>>;
 /// lifetime of the owning `Agent` and drop with it.
 #[derive(Clone, Default)]
 pub struct SubAgentRegistry {
-    inner: Arc<StdMutex<BTreeMap<usize, SharedAgent>>>,
+    inner: Arc<StdMutex<BTreeMap<usize, RetainedAgent>>>,
+}
+
+struct RetainedAgent {
+    agent: SharedAgent,
+    assignment: Option<Arc<ForegroundAssignment>>,
 }
 
 impl SubAgentRegistry {
     /// Retain `agent` under key `n`. `Sub(n)` indices are minted
     /// monotonically per session, so each key is inserted exactly once.
     pub fn insert(&self, n: usize, agent: SharedAgent) {
-        self.inner
-            .lock()
-            .expect("registry mutex poisoned")
-            .insert(n, agent);
+        self.inner.lock().expect("registry mutex poisoned").insert(
+            n,
+            RetainedAgent {
+                agent,
+                assignment: None,
+            },
+        );
     }
 
     /// Resolve the live handle for `Sub(n)`, if one is retained.
@@ -2284,7 +2344,17 @@ impl SubAgentRegistry {
             .lock()
             .expect("registry mutex poisoned")
             .get(&n)
-            .cloned()
+            .map(|entry| Arc::clone(&entry.agent))
+    }
+
+    /// The pending foreground assignment, if this child still has a caller.
+    pub fn assignment(&self, n: usize) -> Option<Arc<ForegroundAssignment>> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .get(&n)
+            .and_then(|entry| entry.assignment.clone())
+            .filter(|assignment| assignment.is_pending())
     }
 
     /// Retained sub-agent indices in ascending order.
@@ -3646,18 +3716,22 @@ impl SessionContextWrapper<'_> {
             // its activity.
             sub_agent.set_bus(self.parent_bus.clone());
 
-            // Wire the run's cancellation per mode. A blocking run is
-            // nested in the parent's turn, so it derives from the
-            // parent's token (via `child_token` so a future
-            // per-sub-agent cancel stays possible). A background run
-            // must outlive the parent's turn, so it hangs off the
+            // Foreground assignment ownership survives an interrupted turn.
+            // Background work must outlive the parent's turn, so it hangs off the
             // background task's token instead: `task_stop`, the TUI's
             // kill action, cancellation aimed at this sub-agent, and
             // shutdown all reach the run through it. Cancelling the
             // parent's turn deliberately does not.
+            let foreground = matches!(mode, SpawnMode::Blocking)
+                .then(|| ForegroundAssignment::new(&self.cancellation));
+            let _assignment_guard = foreground
+                .as_ref()
+                .map(|(assignment, _)| assignment::AssignmentGuard(Arc::clone(assignment)));
             let background = match mode {
                 SpawnMode::Blocking => {
-                    sub_agent.set_cancellation(self.cancellation.child_token());
+                    let assignment = &foreground.as_ref().expect("foreground assignment").0;
+                    sub_agent.set_cancellation(assignment.initial_token());
+                    sub_agent.assignment = Some(Arc::clone(assignment));
                     None
                 }
                 SpawnMode::Background => {
@@ -3682,7 +3756,18 @@ impl SessionContextWrapper<'_> {
             // modes) so the binary can drive later continuations.
             let shared: SharedAgent = Arc::new(tokio::sync::Mutex::new(sub_agent));
             self.sub_agent_registry
-                .insert(agent_id, Arc::clone(&shared));
+                .inner
+                .lock()
+                .expect("registry mutex poisoned")
+                .insert(
+                    agent_id,
+                    RetainedAgent {
+                        agent: Arc::clone(&shared),
+                        assignment: foreground
+                            .as_ref()
+                            .map(|(assignment, _)| Arc::clone(assignment)),
+                    },
+                );
 
             // The registry insertion, retained sub-agent, and driver spawn are
             // one synchronous ownership handoff. If this future is dropped
@@ -3720,7 +3805,15 @@ impl SessionContextWrapper<'_> {
             // retained handle. The handle stays in the registry after
             // the run; the parent's tool result is still the first
             // report, so the `agent` tool contract is unchanged.
-            let result = shared.lock().await.run_single_turn(task).await;
+            let mut result = shared.lock().await.run_single_turn(task).await;
+            let (assignment, reply) = foreground.expect("blocking assignment");
+            if assignment.is_cancelled() {
+                result = Err("sub-agent assignment cancelled by user".into());
+            } else if result.is_err() && assignment.initial_token().is_cancelled() {
+                // A subsequent host-driven turn fulfills this same call. No
+                // parent tool result is published for the interrupted turn.
+                result = assignment.wait(reply).await;
+            }
 
             // Emit `SubAgentEnd` regardless of success — listeners
             // need to clean up nested-transcript framing on errors
@@ -4550,6 +4643,7 @@ mod event_protocol_tests {
         match event {
             AgentEvent::AgentStart { agent_id } => EventLabel::AgentStart(*agent_id),
             AgentEvent::AgentEnd { agent_id, .. } => EventLabel::AgentEnd(*agent_id),
+            AgentEvent::AgentInterrupted { .. } => EventLabel::Other("AgentInterrupted"),
             AgentEvent::TurnStart { agent_id } => EventLabel::TurnStart(*agent_id),
             AgentEvent::Notice { agent_id, text } => EventLabel::Notice(*agent_id, text.clone()),
             AgentEvent::Warning { agent_id, text } => EventLabel::Warning(*agent_id, text.clone()),

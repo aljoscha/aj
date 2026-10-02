@@ -180,6 +180,9 @@ pub enum AgentEvent {
         agent_id: AgentId,
         messages: Vec<AgentMessage>,
     },
+    /// Ephemeral pause state, emitted after `AgentEnd`. The assignment remains
+    /// pending until resumed or killed. `AgentStart` clears this state.
+    AgentInterrupted { agent_id: AgentId },
     /// Beginning of an assistant-message turn (one inference + any
     /// tool calls it triggers). Paired with a closing [`TurnEnd`], but
     /// only on a clean completion: a turn that aborts or errors emits
@@ -465,6 +468,7 @@ impl AgentEvent {
         match self {
             Self::AgentStart { agent_id }
             | Self::AgentEnd { agent_id, .. }
+            | Self::AgentInterrupted { agent_id }
             | Self::TurnStart { agent_id }
             | Self::TurnEnd { agent_id, .. }
             | Self::MessageStart { agent_id, .. }
