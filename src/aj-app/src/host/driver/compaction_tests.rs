@@ -112,6 +112,145 @@ async fn idle(host: &SessionHost, id: &str, session: &super::LiveSession) {
 }
 
 #[tokio::test]
+async fn compaction_settings_edits_apply_at_the_next_tool_batch_boundary() {
+    let scenario = async {
+        for (key, before, after, compacts) in [
+            ("auto_compact_during_turn", "false", "true", true),
+            ("auto_compact_during_turn", "true", "false", false),
+            ("auto_compact", "false", "true", true),
+            ("auto_compact", "true", "false", false),
+            ("compact_threshold", "0.95", "0.85", true),
+            ("compact_threshold", "0.85", "0.95", false),
+            ("compact_keep_recent", "100000", "1000", true),
+            ("compact_keep_recent", "1000", "100000", false),
+        ] {
+            let dir = task_lifetime_dir();
+            let evidence = dir.path().join("evidence.txt");
+            std::fs::write(&evidence, "EVIDENCE").unwrap();
+            let mut batch = finalized_text_message("");
+            batch.stop_reason = StopReason::ToolUse;
+            batch.usage.input = 900;
+            batch.content = vec![AssistantContent::ToolCall(ToolCall {
+                id: "read-evidence".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": evidence}),
+            })];
+            let mut replies = vec![
+                finalized_text_message(&"OLD_WORK_TO_SUMMARIZE ".repeat(3000)),
+                batch,
+            ];
+            if compacts {
+                replies.push(finalized_text_message("CHECKPOINT_SUMMARY"));
+            }
+            replies.push(finalized_text_message("finished"));
+            let run = scripted_run_config_with_window(replies, 1000);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            {
+                let mut run = run.lock().unwrap();
+                run.main.provider = Arc::new(RecordingProvider {
+                    inner: Arc::clone(&run.main.provider),
+                    requests: Arc::clone(&requests),
+                });
+            }
+            let mut config = aj_conf::Config {
+                auto_compact: true,
+                auto_compact_during_turn: true,
+                compact_keep_recent: 1000,
+                ..Default::default()
+            };
+            aj_conf::Config::option(key)
+                .unwrap()
+                .apply_str(before, &mut config)
+                .unwrap();
+            let host = test_host(dir, config, run.lock().unwrap().clone());
+            host.inner.shared.layers.lock().unwrap().project_path =
+                Some(dir.path().join("config.toml"));
+            let id = host.create().await.unwrap();
+            let session = Arc::clone(&host.inner.sessions.lock().await.get(&id).unwrap().session);
+            prompt(&host, &id, "warm history").await;
+            idle(&host, &id, &session).await;
+            assert_eq!(requests.lock().unwrap().len(), 1);
+
+            // Hold the completed real tool before the compaction check, so the
+            // edit is acknowledged while the same run is still active.
+            let (completed, tool_completed) = oneshot::channel();
+            let (release, proceed) = oneshot::channel();
+            let barrier = Mutex::new(Some((completed, proceed)));
+            let _listener = session
+                .core
+                .agent
+                .lock()
+                .await
+                .subscribe(Arc::new(move |event| {
+                    let barrier = if let AgentEvent::ToolExecutionEnd { is_error, .. } = event {
+                        assert!(!is_error, "the real read_file must succeed");
+                        barrier.lock().unwrap().take()
+                    } else {
+                        None
+                    };
+                    Box::pin(async move {
+                        if let Some((completed, proceed)) = barrier {
+                            completed.send(()).unwrap();
+                            proceed.await.unwrap();
+                        }
+                        Ok(())
+                    })
+                }));
+            prompt(&host, &id, "read the evidence").await;
+            tool_completed.await.unwrap();
+            assert!(session.status().working);
+            assert_eq!(requests.lock().unwrap().len(), 2);
+            assert_eq!(host.config(&id).await.unwrap().effective[key], before);
+            host.edit_config(
+                &id,
+                aj_wire::ConfigEdit {
+                    key: key.into(),
+                    value: Some(after.into()),
+                    persist: aj_wire::PersistAction::ProjectSet,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(host.config(&id).await.unwrap().effective[key], after);
+            release.send(()).unwrap();
+            idle(&host, &id, &session).await;
+
+            {
+                let requests = requests.lock().unwrap();
+                assert_eq!(
+                    requests.len(),
+                    if compacts { 4 } else { 3 },
+                    "{key}: {before} -> {after}"
+                );
+                if compacts {
+                    assert_eq!(
+                        requests[2].system_prompt.as_deref(),
+                        Some(aj_session::compaction::SUMMARIZATION_SYSTEM_PROMPT)
+                    );
+                }
+                let continuation =
+                    serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+                assert_eq!(
+                    continuation.contains("CHECKPOINT_SUMMARY"),
+                    compacts,
+                    "{key}"
+                );
+                assert_eq!(
+                    continuation.contains("OLD_WORK_TO_SUMMARIZE"),
+                    !compacts,
+                    "{key}"
+                );
+                assert!(continuation.contains("EVIDENCE"), "{key}");
+            }
+            host.shutdown().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), scenario)
+        .await
+        .expect("live compaction settings regression timed out");
+}
+
+#[tokio::test]
 async fn completed_join_folds_buffered_failure_before_it_can_wake_queued_work() {
     use crate::host::live::{LiveSession, SessionStatus, settings_of};
     use crate::session::{SessionCore, SessionEntry, SessionSpec};

@@ -125,7 +125,9 @@ within a running turn in interactive and print mode. It defaults to `false`
 and requires `auto_compact = true` (the default). After each full tool batch,
 before the next inference, AJ checks provider-reported input occupancy against
 `compact_threshold` (default `0.85` of the context window). It never interrupts
-a streaming response. Compaction uses the usual compaction flow and the same
+a streaming response. Changes made in settings take effect at the next
+compaction check, even during a running turn. A compaction already underway
+keeps its settings. Compaction uses the usual compaction flow and the same
 run stays active. If compaction fails, the original history is preserved and
 continuation stops, including overflow recovery, with no automatic retry after
 the failure. Queued messages and task notices wait until you explicitly start
