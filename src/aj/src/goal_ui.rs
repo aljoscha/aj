@@ -33,25 +33,8 @@ pub(crate) fn open_goal(
 ) -> futures::future::LocalBoxFuture<'static, ()> {
     let (requests, mut receiver) = unbounded_channel::<GoalRequest>();
     let toasts = Rc::clone(&handles.toasts);
-    let ui = Rc::new(RefCell::new(GoalUi {
-        stack: Rc::downgrade(&handles.stack),
-        editor: Rc::clone(&handles.editor),
-        chrome: handles.chrome.clone(),
-        toasts: Rc::clone(&handles.toasts),
-        chat,
-        requests,
-        entry,
-        replacement: None,
-        budget_draft: None,
-        objective: String::new(),
-        budget: String::new(),
-        edit_draft: None,
-        pending: false,
-        notice: None,
-        pages: Vec::new(),
-    }));
+    let ui = GoalUi::open(&handles, chat, requests, entry);
     let weak = Rc::downgrade(&ui);
-    push_goal_page(&ui, false);
     // The shell owns completion, not the overlay's draw lifecycle. Keep only a
     // weak UI handle so closing the window cannot suppress a refusal or leak it.
     Box::pin(async move {
@@ -121,6 +104,33 @@ struct GoalUi {
 }
 
 impl GoalUi {
+    fn open(
+        handles: &OverlayHandles,
+        chat: Rc<RefCell<ChatState>>,
+        requests: UnboundedSender<GoalRequest>,
+        entry: bool,
+    ) -> Rc<RefCell<Self>> {
+        let ui = Rc::new(RefCell::new(Self {
+            stack: Rc::downgrade(&handles.stack),
+            editor: Rc::clone(&handles.editor),
+            chrome: handles.chrome.clone(),
+            toasts: Rc::clone(&handles.toasts),
+            chat,
+            requests,
+            entry,
+            replacement: None,
+            budget_draft: None,
+            objective: String::new(),
+            budget: String::new(),
+            edit_draft: None,
+            pending: false,
+            notice: None,
+            pages: Vec::new(),
+        }));
+        push_goal_page(&ui, false);
+        ui
+    }
+
     fn close(&self, ctx: &mut EventContext) {
         if let Some(stack) = self.stack.upgrade() {
             close_top(&stack, ctx, &self.editor);
@@ -844,6 +854,91 @@ fn row(id: &str, label: &str, value: &str, description: &str, editable: bool) ->
 mod tests {
     use super::*;
 
+    use crate::test_support::{draw_ctx, rows, widget_app};
+
+    struct GoalWidget {
+        handles: OverlayHandles,
+        chat: Rc<RefCell<ChatState>>,
+        requests: tokio::sync::mpsc::UnboundedReceiver<GoalRequest>,
+    }
+
+    impl GoalWidget {
+        fn new(goal: Option<Goal>) -> Self {
+            let handles = OverlayHandles::for_tests();
+            let chat = Rc::new(RefCell::new(ChatState::new(
+                aj_agent::events::AgentSettings {
+                    context_window: 0,
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "off".into(),
+                    thinking_display: "default".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+            )));
+            chat.borrow_mut().goal = goal;
+            let (requests, receiver) = unbounded_channel();
+            GoalUi::open(&handles, Rc::clone(&chat), requests, false);
+            Self {
+                handles,
+                chat,
+                requests: receiver,
+            }
+        }
+
+        fn rows(&self) -> Vec<String> {
+            let widget = Rc::clone(&self.handles.stack.borrow().top().unwrap().widget);
+            rows(&draw_widget(&widget, &draw_ctx(80, Some(24))))
+        }
+
+        async fn send(&self, events: impl IntoIterator<Item = Event>) {
+            let (widget, focus) = {
+                let stack = self.handles.stack.borrow();
+                let top = stack.top().unwrap();
+                (Rc::clone(&top.widget), Rc::clone(&top.focus))
+            };
+            let (mut app, root, _input) = widget_app(
+                widget,
+                focus,
+                Size {
+                    width: 80,
+                    height: 24,
+                },
+            )
+            .await;
+            app.render(&root).unwrap();
+            for event in events {
+                app.handle_input(event);
+            }
+        }
+
+        async fn choose(&self, query: &str) {
+            self.send([
+                key(u32::from('a'), Modifiers::CTRL),
+                key(u32::from('k'), Modifiers::CTRL),
+                Event::Paste(query.into()),
+                key(Key::ENTER, Modifiers::empty()),
+            ])
+            .await;
+        }
+
+        async fn submit(&self, text: &str) {
+            self.send([
+                Event::Paste(text.into()),
+                key(Key::ENTER, Modifiers::empty()),
+            ])
+            .await;
+        }
+    }
+
+    fn key(codepoint: u32, mods: Modifiers) -> Event {
+        Event::KeyPress(Key {
+            codepoint,
+            mods,
+            ..Key::default()
+        })
+    }
+
     #[test]
     fn creation_validates_without_altering_the_multiline_draft() {
         let objective = "First line\n  second line  ";
@@ -859,6 +954,126 @@ mod tests {
         assert!(create_action(" \n ", "").is_err());
         for invalid in ["0", "-1", "1.5", "abc", "18446744073709551616"] {
             assert!(create_action(objective, invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_budget_keeps_the_editor_and_cancelled_objective_is_not_submitted() {
+        let mut ui = GoalWidget::new(None);
+        ui.choose("objective").await;
+        ui.send([
+            Event::Paste("discard this".into()),
+            key(Key::ESCAPE, Modifiers::empty()),
+        ])
+        .await;
+        assert!(ui.requests.try_recv().is_err());
+        ui.choose("objective").await;
+        assert!(!ui.rows().join("\n").contains("discard this"));
+        let objective = "First line\n  second line  ";
+        ui.submit(objective).await;
+        ui.choose("token budget").await;
+        ui.submit("0").await;
+        assert_eq!(ui.handles.stack.borrow().depth(), 2);
+        assert!(ui.rows().join("\n").contains('0'));
+        assert!(
+            ui.handles
+                .toasts
+                .borrow()
+                .iter()
+                .any(|toast| toast.text().contains("positive integer"))
+        );
+        assert!(ui.requests.try_recv().is_err());
+        ui.send([
+            key(u32::from('a'), Modifiers::CTRL),
+            key(u32::from('k'), Modifiers::CTRL),
+        ])
+        .await;
+        ui.submit("100").await;
+        assert_eq!(ui.handles.stack.borrow().depth(), 1);
+        assert!(
+            ui.requests.try_recv().is_err(),
+            "drafting must not start pursuit"
+        );
+        ui.choose("start goal").await;
+        let request = ui.requests.try_recv().unwrap();
+        assert!(request.expected_goal_id.is_none());
+        assert!(matches!(request.action,
+            GoalAction::Create { objective: saved, token_budget: Some(100) }
+            if saved == objective));
+    }
+
+    #[tokio::test]
+    async fn management_bounds_preview_but_keeps_the_full_objective_editable() {
+        let objective = format!(
+            "first line\n{}\nsecond line",
+            "A detailed requirement. ".repeat(200)
+        );
+        let mut ui = GoalWidget::new(Some(Goal {
+            id: "goal".into(),
+            objective: objective.clone(),
+            status: GoalStatus::Active,
+            token_budget: Some(100),
+            tokens_used: 0,
+            time_used_seconds: 0,
+        }));
+        let preview = ui.rows();
+        assert!(preview.iter().any(|line| line.contains("first line")));
+        assert!(
+            preview
+                .iter()
+                .filter(|line| line.contains("A detailed requirement."))
+                .count()
+                >= 2,
+            "objective wraps across preview rows"
+        );
+        assert!(!preview.join("\n").contains("second line"));
+        assert!(
+            preview.join("\n").contains("Token budget"),
+            "preview leaves room for controls"
+        );
+        ui.choose("objective").await;
+        assert!(ui.rows().join("\n").contains("second line"));
+        ui.send([key(Key::ENTER, Modifiers::empty())]).await;
+        let request = ui.requests.try_recv().unwrap();
+        assert_eq!(request.expected_goal_id.as_deref(), Some("goal"));
+        assert!(
+            matches!(request.action, GoalAction::Edit { objective: saved } if saved == objective)
+        );
+    }
+
+    #[test]
+    fn management_renders_live_goal_durations() {
+        let ui = GoalWidget::new(Some(Goal {
+            id: "goal".into(),
+            objective: "objective".into(),
+            status: GoalStatus::Active,
+            token_budget: None,
+            tokens_used: 0,
+            time_used_seconds: 0,
+        }));
+        for (seconds, expected) in [
+            (59, "59s"),
+            (90, "1m"),
+            (7200, "2h"),
+            (5400, "1h 30m"),
+            (93780, "1d 2h 3m"),
+        ] {
+            ui.chat
+                .borrow_mut()
+                .goal
+                .as_mut()
+                .unwrap()
+                .time_used_seconds = seconds;
+            let rows = ui.rows();
+            let time = rows.iter().find(|row| row.contains("Time used")).unwrap();
+            assert_eq!(
+                time.trim_matches('│')
+                    .trim()
+                    .strip_prefix("Time used")
+                    .unwrap()
+                    .trim(),
+                expected
+            );
         }
     }
 }

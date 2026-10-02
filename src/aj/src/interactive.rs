@@ -5221,30 +5221,18 @@ async fn fill_host_selector(fetch: SelectorFetch) {
     let mut owner = fetch.owner;
     owner.models = Arc::new(models);
     let handles = fetch.handles;
+    let models = Arc::clone(&owner.models);
     if fetch.thinking {
-        // Runtime-injected models and historical branch settings can be absent
-        // from the catalog. Their choices still pass through host validation.
-        let supported = fetch
-            .model
-            .as_ref()
-            .and_then(|(provider, id)| {
-                owner
-                    .models
-                    .iter()
-                    .find(|info| &info.provider == provider && &info.id == id)
-            })
-            .map(aj_app::commands::thinking_levels_for)
-            .unwrap_or_else(|| aj_app::commands::THINKING_LEVELS.iter().collect());
         fill_thinking(
             &handles,
             &select,
             owner,
+            &models,
             fetch.target,
+            fetch.model.as_ref(),
             fetch.current_thinking.as_deref(),
-            supported,
         );
     } else {
-        let models = Arc::clone(&owner.models);
         fill_model(&handles, &select, owner, models, fetch.target, fetch.model);
     }
 }

@@ -179,13 +179,7 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
             focus(&mut world, &shell, &mut app, &initial).await;
             let fetch = open(&world, &shell, action);
             let select = fetch.select.upgrade().unwrap();
-            assert_eq!(select.borrow().visible_labels(), ["Loading host models…"]);
             focus_overlay(&mut app, &root);
-            press(&mut app, &mut writer, b"\r").await;
-            assert!(
-                shell.borrow().take_activity().is_empty(),
-                "loading is inert"
-            );
             fill_host_selector(fetch).await;
             let labels = select.borrow().visible_labels();
             if action == CommandAction::OpenModelSelector {
@@ -225,44 +219,47 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
             "no global catalog proxy"
         );
         focus(&mut world, &shell, &mut app, &initial).await;
-        for disposition in ["stage", "rearm", "switch"] {
-            let anchor = Rc::clone(&shell.borrow().view().branch_anchor);
-            arm_branch(&anchor, "opening-branch".into());
-            let fetch = open(&world, &shell, CommandAction::OpenModelSelector);
-            fill_host_selector(fetch).await;
-            focus_overlay(&mut app, &root);
-            type_text(&mut app, &mut writer, "selector-left-first").await;
-            press(&mut app, &mut writer, b"\r").await;
-            let edits = shell.borrow().take_activity();
-            assert_eq!(edits.len(), 1);
-            if disposition == "rearm" {
-                arm_branch(&anchor, "different-branch".into());
-            }
-            if disposition == "switch" {
-                focus(&mut world, &shell, &mut app, &other).await;
-            }
-            apply_selector_activity(&mut world, &shell, &mut watch, edits).await;
-            let staged = anchor
-                .borrow()
-                .as_ref()
-                .and_then(|draft| draft.changes.settings.model.clone());
-            if disposition != "stage" {
-                assert!(
-                    staged.is_none(),
-                    "a different draft must not receive this choice"
+        // Branch-draft ownership is a UI rule, independent of transport.
+        if mode == "local" {
+            for disposition in ["stage", "rearm", "switch"] {
+                let anchor = Rc::clone(&shell.borrow().view().branch_anchor);
+                arm_branch(&anchor, "opening-branch".into());
+                let fetch = open(&world, &shell, CommandAction::OpenModelSelector);
+                fill_host_selector(fetch).await;
+                focus_overlay(&mut app, &root);
+                type_text(&mut app, &mut writer, "selector-left-first").await;
+                press(&mut app, &mut writer, b"\r").await;
+                let edits = shell.borrow().take_activity();
+                assert_eq!(edits.len(), 1);
+                if disposition == "rearm" {
+                    arm_branch(&anchor, "different-branch".into());
+                }
+                if disposition == "switch" {
+                    focus(&mut world, &shell, &mut app, &other).await;
+                }
+                apply_selector_activity(&mut world, &shell, &mut watch, edits).await;
+                let staged = anchor
+                    .borrow()
+                    .as_ref()
+                    .and_then(|draft| draft.changes.settings.model.clone());
+                if disposition != "stage" {
+                    assert!(
+                        staged.is_none(),
+                        "a different draft must not receive this choice"
+                    );
+                } else {
+                    assert_eq!(staged.unwrap().name, "selector-left-first");
+                }
+                assert_eq!(
+                    opening.run_config.lock().unwrap().main.model_key.1,
+                    "selector-left-second"
                 );
-            } else {
-                assert_eq!(staged.unwrap().name, "selector-left-first");
+                assert_eq!(
+                    elsewhere.run_config.lock().unwrap().main.model_key,
+                    other_before
+                );
+                focus(&mut world, &shell, &mut app, &initial).await;
             }
-            assert_eq!(
-                opening.run_config.lock().unwrap().main.model_key.1,
-                "selector-left-second"
-            );
-            assert_eq!(
-                elsewhere.run_config.lock().unwrap().main.model_key,
-                other_before
-            );
-            focus(&mut world, &shell, &mut app, &initial).await;
         }
         if let Some(gateway) = gateway {
             gateway.shutdown().await;
@@ -302,68 +299,6 @@ async fn selector_parity_unsupported_and_disconnected_have_no_fallback() {
         }
     }
     remote.shutdown().await;
-}
-
-#[tokio::test]
-async fn selector_parity_uncatalogued_runtime_keeps_thinking_edits() {
-    for mode in ["local", "direct", "gateway"] {
-        let host_dir = TempDir::new().unwrap();
-        let client_dir = TempDir::new().unwrap();
-        let remote = RemoteHost::start(&host_dir, "streaming-text").await;
-        let session = remote.host.create().await.unwrap();
-        let gateway = if mode == "gateway" {
-            let gateway = RemoteGateway::over(&[&remote]).await;
-            gateway.until_sessions(1).await;
-            Some(gateway)
-        } else {
-            None
-        };
-        let (url, selected) = if let Some(gateway) = &gateway {
-            (
-                gateway.url(),
-                format!("{}:{session}", remote.host.hello().host_id),
-            )
-        } else {
-            (remote.url(), session.clone())
-        };
-        let (mut world, shell) = connect_world_and_shell_at(&client_dir, &url, &[&selected]).await;
-        if mode == "local" {
-            world.control = Control::local(remote.host.clone());
-        }
-        let model = viewed_model(&world, AgentId::Main);
-        let catalog = world.control.models(&selected).await.unwrap();
-        assert!(
-            catalog
-                .iter()
-                .all(|info| (info.provider.clone(), info.id.clone()) != model)
-        );
-        let handles = remote.host.local_handles(&session).await.unwrap();
-        assert_ne!(
-            handles.run_config.lock().unwrap().main.thinking,
-            Some(ThinkingConfig::High)
-        );
-        let (mut app, mut writer, root) = app_over(&shell).await;
-        let fetch = open(&world, &shell, CommandAction::OpenThinkingSelector);
-        fill_host_selector(fetch).await;
-        focus_overlay(&mut app, &root);
-        type_text(&mut app, &mut writer, "high").await;
-        press(&mut app, &mut writer, b"\r").await;
-        let edits = shell.borrow().take_activity();
-        assert_eq!(
-            edits.len(),
-            1,
-            "{mode}: an injected runtime model remains editable"
-        );
-        apply_selector_activity(&mut world, &shell, &mut inert_theme_watch(), edits).await;
-        assert_eq!(
-            handles.run_config.lock().unwrap().main.thinking,
-            Some(ThinkingConfig::High)
-        );
-        if let Some(gateway) = gateway {
-            gateway.shutdown().await;
-        }
-        remote.shutdown().await;
-    }
 }
 
 /// A slow host answer for a selector the user already closed must not land

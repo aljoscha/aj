@@ -228,14 +228,24 @@ fn thinking_items(current_name: &str, levels: &[&ThinkingOption]) -> Vec<SelectI
 }
 
 /// Fill the opening selector with the host model's supported thinking levels.
+/// Models absent from the catalog expose generic choices for the host to validate.
 pub(crate) fn fill_thinking(
     handles: &crate::interactive::OverlayHandles,
     select: &Rc<RefCell<FilterableSelect>>,
     owner: crate::interactive::SettingsOwner,
+    catalog: &[ModelInfo],
     target: impl Into<SelectorTarget>,
+    model: Option<&(String, String)>,
     current: Option<&str>,
-    supported: Vec<&'static ThinkingOption>,
 ) {
+    let supported = model
+        .and_then(|(provider, id)| {
+            catalog
+                .iter()
+                .find(|info| &info.provider == provider && &info.id == id)
+        })
+        .map(thinking_levels_for)
+        .unwrap_or_else(|| THINKING_LEVELS.iter().collect());
     let target = target.into();
     let current_name = current.unwrap_or("");
     select
@@ -2849,6 +2859,77 @@ mod tests {
         assert_eq!(next_cycle_value(&values, "c"), "a");
         // An unknown current lands on the first value.
         assert_eq!(next_cycle_value(&values, "z"), "a");
+    }
+
+    #[test]
+    fn thinking_selector_with_uncatalogued_model_still_confirms_edits() {
+        let handles = crate::interactive::OverlayHandles::for_tests();
+        let select = open_selector_loading(
+            &handles.stack,
+            &handles.editor,
+            &handles.chrome,
+            "Thinking effort",
+        );
+        select
+            .borrow_mut()
+            .capture_event(&mut EventContext::new(), &enter());
+        assert!(handles.activity.borrow().is_empty(), "loading is inert");
+        let catalog = Arc::new(vec![ModelInfo {
+            provider: "fixture".into(),
+            id: "advertised".into(),
+            reasoning: false,
+            reasoning_options: Vec::new(),
+            ..aj_app::test_support::scripted_model_info()
+        }]);
+        assert!(
+            thinking_levels_for(&catalog[0])
+                .iter()
+                .all(|level| level.name != "high")
+        );
+        let model = ("fixture".into(), "injected".into());
+        let owner = crate::interactive::SettingsOwner::new(
+            crate::control::Control::remote(
+                crate::remote::RemoteClient::new("http://127.0.0.1:1").unwrap(),
+            ),
+            "selector-widget-test".into(),
+            Arc::clone(&catalog),
+        );
+        fill_thinking(
+            &handles,
+            &select,
+            owner,
+            &catalog,
+            AgentId::Main,
+            Some(&model),
+            Some("low"),
+        );
+        assert!(
+            select
+                .borrow()
+                .visible_labels()
+                .contains(&"low (current)".to_string())
+        );
+        assert!(
+            select
+                .borrow()
+                .visible_labels()
+                .contains(&"high".to_string())
+        );
+        select
+            .borrow()
+            .select_matching(|item| item.filter_key == "high");
+        select
+            .borrow_mut()
+            .capture_event(&mut EventContext::new(), &enter());
+        assert!(matches!(
+            handles.activity.borrow().as_slice(),
+            [SelectorActivity::ThinkingConfirmed {
+                target: AgentId::Main,
+                level: Some(ThinkingConfig::High),
+                ..
+            }]
+        ));
+        assert!(!handles.stack.borrow().is_open());
     }
 
     #[test]
