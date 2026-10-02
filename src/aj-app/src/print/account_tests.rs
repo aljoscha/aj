@@ -147,7 +147,7 @@ impl Store {
                 self.persistence.clone(),
                 self.dir.path().to_path_buf(),
                 Arc::clone(&sink),
-                Some(Arc::<CredentialProvider>::clone(&self.provider)),
+                |model| model.provider = Arc::<CredentialProvider>::clone(&self.provider),
             ),
         )
         .await

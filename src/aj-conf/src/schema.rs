@@ -700,6 +700,11 @@ pub struct Config {
     /// crosses `compact_threshold`. Defaults to `true`. Also gates the
     /// reactive context-overflow recovery path.
     pub auto_compact: bool,
+    /// Also check the main agent's provider-reported input occupancy after
+    /// each full tool batch, before the next inference, in interactive and
+    /// print mode. Requires `auto_compact` and uses `compact_threshold`.
+    /// Defaults to `false`. Never interrupts a streaming response.
+    pub auto_compact_during_turn: bool,
     /// Fraction of the model's context window at which auto-compaction
     /// fires. Defaults to `0.85`. Must be in the half-open range
     /// `(0.0, 1.0]`.
@@ -767,6 +772,7 @@ impl Default for Config {
             image_block: false,
             syntax_highlighting: false,
             auto_compact: true,
+            auto_compact_during_turn: false,
             compact_threshold: 0.85,
             compact_keep_recent: 20_000,
             bash_rtk: false,
@@ -1188,6 +1194,17 @@ impl Config {
             },
             display_fn: |c| c.auto_compact.to_string(),
             to_toml_fn: |c| bool_item(c.auto_compact, true),
+        },
+        ConfigOption {
+            name: "auto_compact_during_turn",
+            description: "Also compact Main between tool batches and inference (requires auto_compact).",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.auto_compact_during_turn = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.auto_compact_during_turn.to_string(),
+            to_toml_fn: |c| bool_item(c.auto_compact_during_turn, false),
         },
         ConfigOption {
             name: "compact_threshold",
@@ -2338,6 +2355,30 @@ keybindings = "nope"
             ConfigDiagnostic::InvalidValue { key, error, .. }
                 if key == "keybindings" && error == "keybindings must be a table"
         )));
+    }
+
+    #[test]
+    fn auto_compact_during_turn_defaults_off_and_round_trips() {
+        let defaults = Config::default();
+        assert!(!defaults.auto_compact_during_turn);
+        let (omitted, diagnostics) = parse_config("", Path::new("/tmp/config.toml"));
+        assert!(diagnostics.is_empty());
+        assert!(!omitted.auto_compact_during_turn);
+
+        let option = Config::option("auto_compact_during_turn").unwrap();
+        let mut config = defaults.clone();
+        option.apply_str("true", &mut config).unwrap();
+        assert_eq!(option.display(&config), "true");
+        let written = rewrite_changed("", &defaults, &config);
+        let (parsed, diagnostics) = parse_config(&written, Path::new("/tmp/config.toml"));
+        assert!(diagnostics.is_empty(), "got: {diagnostics:?}");
+        assert!(parsed.auto_compact_during_turn);
+
+        let reverted = rewrite_changed(&written, &parsed, &defaults);
+        let (parsed, diagnostics) = parse_config(&reverted, Path::new("/tmp/config.toml"));
+        assert!(diagnostics.is_empty());
+        assert!(!parsed.auto_compact_during_turn);
+        assert!(option.apply_str("invalid", &mut config).is_err());
     }
 
     #[test]

@@ -50,6 +50,9 @@ use crate::settings::{ConfirmOutcome, PersistAction};
 use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 
 mod goal;
+
+#[cfg(test)]
+mod compaction_tests;
 pub(crate) use goal::{context as goal_context, has_goal_history, restore_goal};
 
 /// Resolve a head target against `log` to the entry the head moves to.
@@ -129,6 +132,10 @@ pub(crate) struct Driver {
     /// polled again and a turn that failed on that same write does not report
     /// the storage error a second time.
     persistence_failed: bool,
+    /// Failed compaction leaves Main idle for inspection. Retain queued input
+    /// and task notices until the user starts work again, rather than waking
+    /// into the same oversized context. This is not a session-persistent pause.
+    compaction_failed: bool,
     goal: goal::GoalRun,
     /// Zero means no goal history. User mutations advance this revision, which
     /// admission returns to fence tools from an older objective or stop request.
@@ -155,6 +162,7 @@ impl Driver {
             requests,
             persistence_failure,
             persistence_failed: false,
+            compaction_failed: false,
             goal,
             goal_revision,
         }
@@ -303,6 +311,7 @@ impl Driver {
         self.refresh_state();
         if !self.session.is_draining()
             && let Some((owner, conditional)) = trigger
+            && self.automatic_wake_allowed(owner)
             && (!conditional
                 || self.session.core.task_registry.has_notices(owner)
                 || self.session.has_queued(owner))
@@ -343,8 +352,13 @@ impl Driver {
             AgentEvent::CompactionStart { agent_id, .. } => {
                 self.lifecycle.mark_compacting(*agent_id);
             }
-            AgentEvent::CompactionEnd { agent_id, .. } => {
+            AgentEvent::CompactionEnd {
+                agent_id, error, ..
+            } => {
                 self.lifecycle.clear_compacting(*agent_id);
+                if *agent_id == AgentId::Main && error.is_some() {
+                    self.compaction_failed = true;
+                }
             }
             _ => {}
         }
@@ -381,6 +395,11 @@ impl Driver {
     /// Handle one completed turn: reap, conclude the sub-agent boxes the
     /// reap swept, wake on queued work, and surface the outcome.
     fn on_join(&mut self, joined: Joined) {
+        // A producer can emit its final events and finish after the select
+        // loop polled an empty event channel but before it polls this join.
+        // Fold those events while the turn is still driven, before any reap
+        // can permit an automatic wake past a compaction failure.
+        self.drain_events();
         let Joined { agent, outcome } = joined;
         if agent == AgentId::Main {
             self.goal.finish(&outcome);
@@ -442,6 +461,7 @@ impl Driver {
             }
         };
         if !self.session.is_draining()
+            && self.automatic_wake_allowed(agent)
             && (self.session.core.task_registry.has_notices(agent)
                 || self.session.has_queued(agent))
         {
@@ -482,6 +502,10 @@ impl Driver {
         self.shared.fanout.mark_list_dirty();
     }
 
+    fn automatic_wake_allowed(&self, owner: AgentId) -> bool {
+        owner != AgentId::Main || !self.compaction_failed
+    }
+
     fn wake(&mut self, owner: AgentId) {
         // A foreground interruption waits for deliberate user input. A task
         // notice or queued message must not restart it or fulfill its caller.
@@ -491,6 +515,11 @@ impl Driver {
             return;
         }
         if !self.turns.is_busy(&self.lifecycle, owner) {
+            // Reactive callers check the hold. A user-resumed goal can also
+            // wake pending work, and that deliberate start releases it.
+            if owner == AgentId::Main {
+                self.compaction_failed = false;
+            }
             self.prepare_goal_turn(owner, false);
         }
         self.note_driven(owner, true);
@@ -865,6 +894,9 @@ impl Driver {
             return Err(HostError::Conflict {
                 reason: format!("{agent:?} has no live handle and cannot be prompted"),
             });
+        }
+        if agent == AgentId::Main {
+            self.compaction_failed = false;
         }
         self.refresh_state();
         self.shared.fanout.mark_list_dirty();

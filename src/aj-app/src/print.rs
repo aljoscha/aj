@@ -57,6 +57,7 @@ use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TaskRegistry, TurnError};
 use aj_conf::{Config, ConfigSpeed, Severity};
 use aj_models::auth::AuthStorage;
+#[cfg(test)]
 use aj_models::provider::Provider;
 use aj_models::types::Speed;
 use aj_session::{ConversationPersistence, ThreadFilter, persistence_listener, replay};
@@ -122,7 +123,7 @@ pub async fn run(args: Args) -> Result<()> {
         conversation_persistence,
         cwd,
         Arc::new(Mutex::new(io::stdout())),
-        None,
+        |_| {},
     )
     .await?;
     Ok(())
@@ -159,7 +160,7 @@ async fn run_inner<W: Write + Send + 'static>(
     conversation_persistence: ConversationPersistence,
     cwd: PathBuf,
     out: Arc<Mutex<W>>,
-    provider_override: Option<Arc<dyn Provider>>,
+    configure_model: impl FnOnce(&mut crate::session_setup::ModelConfig),
 ) -> Result<Agent> {
     // Validate dispatch shape early so the user sees a clear error
     // instead of a confusing failure later. `Continue` resolves to
@@ -222,9 +223,7 @@ async fn run_inner<W: Write + Send + 'static>(
     // once to build the agent.
     let (mut run_config, restore_context) =
         build_initial_run_config(&args, &config, &auth, thinking, speed)?;
-    if let Some(provider) = provider_override {
-        run_config.main.provider = provider;
-    }
+    configure_model(&mut run_config.main);
     let run_config = Arc::new(std::sync::Mutex::new(run_config));
 
     // Apply a `--api-key` runtime override to the resolved provider.
@@ -445,13 +444,15 @@ async fn run_inner<W: Write + Send + 'static>(
     });
     // Drive the turn inline (print mode is one-shot — no spawn, no
     // responsiveness constraint) and use the result for the exit status.
-    // The policy enables only reactive overflow recovery: the threshold
-    // and queued-work paths don't apply to a single headless turn.
+    // Post-turn compaction does not apply to a single headless turn.
+    // Mid-turn compaction is opt-in, as it is in interactive mode.
     // Recovery runs before the background-task teardown below so the
     // retried turn can still use tools.
     let policy = crate::turn::TurnPolicy {
         recover_overflow: config.auto_compact,
         auto_threshold: None,
+        during_turn_threshold: (config.auto_compact && config.auto_compact_during_turn)
+            .then_some(config.compact_threshold),
         keep_recent: config.compact_keep_recent,
     };
     let prompt_result = crate::turn::drive_turn(
@@ -756,7 +757,12 @@ mod tests {
             persistence.clone(),
             cwd.path().to_path_buf(),
             Arc::clone(&sink),
-            provider_override,
+            |model| {
+                if let Some(provider) = provider_override {
+                    model.provider = provider;
+                    Arc::make_mut(&mut model.model_info).context_window = 1000;
+                }
+            },
         )
         .await
         .expect("print run completes");
@@ -771,6 +777,75 @@ mod tests {
         run_capture_with_config(persistence, cli, Config::default(), None)
             .await
             .0
+    }
+
+    #[tokio::test]
+    async fn print_compacts_during_turn_but_not_after_the_final_answer() {
+        use crate::test_support::{finalized_text_message, finalized_text_message_with_usage};
+        use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
+        use aj_models::types::{AssistantContent, StopReason, ToolCall};
+
+        let sessions = TempDir::new().unwrap();
+        let persistence = ConversationPersistence::new(sessions.path().join("sessions"));
+        let provider = |messages| -> Arc<dyn Provider> {
+            Arc::new(
+                ScriptedProvider::from_messages(messages, 0, std::time::Duration::ZERO)
+                    .on_exhausted(ExhaustedBehavior::Panic),
+            )
+        };
+        let (_, warm) = run_capture_with_config(
+            &persistence,
+            &["--print", "--scripted", "streaming-text", "earlier request"],
+            Config::default(),
+            Some(provider(vec![finalized_text_message(
+                &"old work ".repeat(2000),
+            )])),
+        )
+        .await;
+        let window = warm.model_info().context_window;
+        assert!(window > 0, "fixture must have a meaningful threshold");
+        let id = persistence.get_latest_session_id().unwrap().unwrap();
+        drop(warm);
+        let evidence = sessions.path().join("evidence.txt");
+        std::fs::write(&evidence, "tool evidence").unwrap();
+        let mut call = finalized_text_message_with_usage("", window);
+        call.stop_reason = StopReason::ToolUse;
+        call.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "read".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": evidence}),
+        }));
+        let (output, agent) = run_capture_with_config(
+            &persistence,
+            &[
+                "--print",
+                "--format",
+                "json",
+                "--scripted",
+                "streaming-text",
+                "continue",
+                &id,
+                "finish the task",
+            ],
+            Config {
+                auto_compact_during_turn: true,
+                compact_keep_recent: 1000,
+                ..Config::default()
+            },
+            Some(provider(vec![
+                call,
+                finalized_text_message("PRINT_CHECKPOINT"),
+                // A high final occupancy must not cause a post-turn request.
+                finalized_text_message_with_usage("PRINT_FINISHED", window),
+            ])),
+        )
+        .await;
+        let messages = format!("{:?}", agent.messages());
+        assert!(messages.contains("PRINT_CHECKPOINT"), "{messages}");
+        assert!(messages.contains("PRINT_FINISHED"), "{messages}");
+        let checkpoint = output.find("PRINT_CHECKPOINT").expect("compaction event");
+        let finish = output.find("PRINT_FINISHED").expect("continued answer");
+        assert!(checkpoint < finish, "compaction precedes continuation");
     }
 
     /// Drive `run_inner` against a fresh session store, returning the
@@ -1180,7 +1255,7 @@ mod tests {
             persistence.clone(),
             cwd.path().to_path_buf(),
             Arc::new(Mutex::new(Vec::<u8>::new())),
-            None,
+            |_| {},
         )
         .await
         .err()
@@ -1277,7 +1352,7 @@ mod tests {
             persistence.clone(),
             cwd.path().to_path_buf(),
             Arc::new(Mutex::new(Vec::<u8>::new())),
-            None,
+            |_| {},
         )
         .await
         .err()

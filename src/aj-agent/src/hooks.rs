@@ -1,6 +1,6 @@
 //! Single-slot hook surface for agent runtime extension.
 //!
-//! Three hooks bracket the per-turn / per-tool flow inside
+//! Hooks bracket the per-turn / per-tool flow inside
 //! [`crate::Agent::execute_turn`]:
 //!
 //! - [`BeforeToolCallHook`] — fires after [`crate::events::AgentEvent::ToolExecutionStart`]
@@ -16,8 +16,11 @@
 //!   transcript update and before the next inference. Returning
 //!   `true` ends the turn with no follow-up call (e.g. budget /
 //!   context-window guard).
+//! - [`BeforeContinuationHook`] — runs only when continuing after a
+//!   completed tool batch. Allows application work with exclusive access
+//!   to the paused agent, without ending its run.
 //!
-//! All three are stored as `Option<Box<dyn Fn... + Send + Sync>>` —
+//! Hooks are stored as `Option<Arc<dyn Fn... + Send + Sync>>` —
 //! one slot per hook, replacing on `set_*`. No registry, no
 //! priority order; if a host wants to chain multiple effects it
 //! composes them into a single closure.
@@ -92,6 +95,24 @@ pub type AfterToolCallHook = Arc<
 /// inference — useful for "stop before the context window fills"
 /// guards or budget enforcement.
 pub type ShouldStopAfterTurnHook = Arc<dyn Fn() -> HookFuture<'static, bool> + Send + Sync>;
+
+/// Application work before continuing with another model request.
+///
+/// Runs after the entire tool batch's events and the should-stop hook,
+/// before draining notices or steering. No inference or foreground tool
+/// is in flight, and event subscribers have finished recording the batch.
+/// The callback may replace the transcript, but must not re-enter the run
+/// loop. An error ends the run through its normal lifecycle. The callback
+/// must cooperate with the supplied cancellation token. The runtime also
+/// checks cancellation before and after awaiting it.
+pub type BeforeContinuationHook = Arc<
+    dyn for<'a> Fn(
+            &'a mut crate::Agent,
+            tokio_util::sync::CancellationToken,
+        ) -> HookFuture<'a, Result<(), crate::TurnError>>
+        + Send
+        + Sync,
+>;
 
 #[cfg(test)]
 mod tests {
