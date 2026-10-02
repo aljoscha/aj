@@ -341,6 +341,10 @@ async fn a_cancelled_command_gets_its_sigterm_handler() {
 /// it. Its lifetime moved to the task registry at the handoff, so a
 /// cancel of that turn must not touch it.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: waits through a 4s background survival window"
+)]
 async fn cancelling_a_turn_leaves_its_background_task_running() {
     let fx = fixture();
     let mut agent = agent_running(

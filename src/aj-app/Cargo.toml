@@ -57,6 +57,8 @@ aj-models = { path = "../aj-models/", features = ["test-support"] }
 anthropic-sdk = { path = "../anthropic-sdk" }
 
 [features]
+# Enables slow tests only, with no production effect.
+slow-tests = []
 # Exposes the `test_support` module (scripted-provider / run-config
 # builders and a headless agent builder) to downstream crates' tests.
 # Kept behind a feature rather than `#[cfg(test)]` because a crate's

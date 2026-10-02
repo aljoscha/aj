@@ -3,6 +3,10 @@ name = "vaxis"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Includes wall-clock tests, without changing production behavior.
+slow-tests = []
+
 [dependencies]
 vaxis-ucd = { path = "../vaxis-ucd" }
 vaxis-derive = { path = "../vaxis-derive" }

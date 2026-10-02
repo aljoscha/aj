@@ -10,7 +10,9 @@
 # The suite is built first, under the ambient temp directory, so that rustc's
 # own scratch files are not mistaken for a test's.
 # Arguments select a cargo test target or scheduling mode. With no arguments,
-# the guard runs the whole workspace with ordinary test parallelism.
+# the guard runs the fast workspace suite with ordinary test parallelism.
+# Pass --workspace --features slow-tests to include the slow tier, without
+# enabling opt-in tests that need live credentials or external infrastructure.
 set -euo pipefail
 
 # State that legitimately outlives a test lives under one named per-process

@@ -1005,6 +1005,10 @@ async fn a_preview_batch_fans_out_per_host_and_names_the_ones_it_could_not_read(
 /// The client leaves the gateway time to return a healthy host's previews when
 /// another connected host accepts the read but never answers it.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real stalled-upstream deadline"
+)]
 async fn a_preview_batch_outwaits_the_gateways_stalled_upstream() {
     let mut healthy = Upstream::start().await;
     let session = healthy.create().await;
@@ -2984,6 +2988,7 @@ async fn prompt_history_all_merges_latest_snapshots_in_label_then_id_order() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: real upstream timeout")]
 async fn prompt_history_all_retains_failed_and_timed_out_host_snapshots() {
     let mut failed = history_peer("failed-id", "broken").await;
     let mut stalled = history_peer("stalled-id", "slow").await;
@@ -3317,6 +3322,10 @@ async fn a_remembered_host_the_configuration_names_too_keeps_its_id() {
 /// attached across both, and the one that was not rebuilt has to keep its
 /// session and its stream through it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: gateway quiet observation window"
+)]
 async fn a_configured_hosts_contact_under_a_new_id_replaces_the_old_identity() {
     let rebuilt = FakeHost::rebuildable("before", "after", "s-2", Script::Blocks).await;
     let other = FakeHost::with_rows(
@@ -3736,6 +3745,7 @@ async fn a_stream_that_attaches_nothing_carries_the_merged_directory() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: real heartbeat interval")]
 async fn an_idle_gateway_stream_heartbeats() {
     let state = TempDir::new().expect("tempdir");
     let gateway = Gateway::new(GatewaySetup {
@@ -3811,6 +3821,10 @@ async fn a_shutdown_does_not_wait_out_an_attached_client() {
 /// is what proves the first was read and merged, because they arrive in order on
 /// one connection, and it is what a quiet window on its own could never say.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: gateway quiet observation window"
+)]
 async fn an_unchanged_directory_publishes_nothing() {
     let settled = vec![serde_json::to_string(&fake_row("s-1")).expect("a row")];
     let changed = vec![
@@ -4709,6 +4723,10 @@ async fn a_spliced_turn_reaches_a_client_with_its_ids_namespaced() {
 /// The gateway composes its directory from the control link alone, so a list
 /// on a splice is the whole directory spent on a stream that drops it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: coalesced directory publication"
+)]
 async fn a_spliced_upstream_carries_no_list_frames() {
     let mut host = Upstream::start().await;
     let session = host.create().await;
@@ -5311,6 +5329,10 @@ async fn a_lost_host_resets_its_own_sessions_and_leaves_the_others_alone() {
 /// nothing else moving: exactly one upstream was ever opened, and exactly one
 /// `reset` came back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: gateway quiet observation window"
+)]
 async fn a_gateway_does_not_reopen_an_upstream_it_lost() {
     let fake = FakeHost::start("fake", Script::Ends(block("s-1", "epoch-1", 0))).await;
     let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
@@ -5350,6 +5372,10 @@ async fn a_gateway_does_not_reopen_an_upstream_it_lost() {
 /// announces the host's return, because a client that read them the other way
 /// round would re-ask, then settle on "unreachable" for a host that is back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: gateway quiet observation window"
+)]
 async fn a_reattach_while_a_host_is_down_is_answered_and_told_of_its_return() {
     let mut down = Upstream::start().await;
     let mut up = Upstream::start().await;
@@ -5880,6 +5906,10 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
 /// stayed as well: that one has to be served on the same stream that refuses the
 /// withdrawn one, and nothing more may arrive for the id that was refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: gateway quiet observation window"
+)]
 async fn a_re_attach_after_a_withdrawal_is_refused_for_that_session_alone() {
     let leaving = FakeHost::start("leaving", Script::Frames(block("s-1", "epoch-1", 0))).await;
     let staying = FakeHost::start("staying", Script::Frames(block("s-9", "epoch-9", 0))).await;
@@ -6131,6 +6161,10 @@ async fn a_withdrawal_interrupts_the_dial_of_the_host_it_withdraws() {
 /// would never arrive, and it is exactly the client whose upstream costs a host
 /// a subscriber it can do nothing about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real socket backpressure and drain"
+)]
 async fn a_withdrawal_ends_the_upstream_of_a_client_that_stopped_reading() {
     let resuming = deep_block("s-1", "epoch-1", 800);
     let deep = resuming.len();
@@ -6454,6 +6488,10 @@ async fn a_refusal_ends_the_block_it_was_sent_instead_of() {
 /// task pumping them is parked. How much fits is the machine's business, so it is
 /// checked rather than assumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real socket backpressure and drain"
+)]
 async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
     let backfilled: u64 = 800;
     let resuming = deep_block("s-1", "epoch-1", backfilled);
@@ -6511,6 +6549,10 @@ async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
 /// while its own block is still in flight. In production this is a client
 /// watching a big session resume on one host while a turn runs on another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real socket backpressure and drain"
+)]
 async fn a_live_frame_from_another_host_does_not_evict_a_client_mid_block() {
     let backfilled: u64 = 800;
     let resuming = deep_block("s-1", "epoch-1", backfilled);
@@ -6607,6 +6649,10 @@ async fn a_live_frame_from_another_host_does_not_evict_a_client_mid_block() {
 /// deep, because a session dropped out of the paced set is not evicted until its
 /// block meets the live bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real socket backpressure and drain"
+)]
 async fn two_sessions_on_one_host_are_both_paced_and_both_reset() {
     let backfilled: u64 = 800;
     let mut script = block("s-1", "epoch-1", 0);
@@ -6673,6 +6719,10 @@ async fn two_sessions_on_one_host_are_both_paced_and_both_reset() {
 /// response head, and both blocks must reach the client whole once it answers.
 /// Buffering that backfill or leaving it upstream are equally valid here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: large backfill across a stalled attach"
+)]
 async fn a_slow_attach_does_not_lose_another_hosts_block() {
     let backfilled: u64 = 800;
     let talking = deep_block("s-1", "epoch-1", backfilled);
@@ -6766,6 +6816,10 @@ async fn a_slow_attach_does_not_lose_another_hosts_block() {
 /// The hung host sorts first, so a gateway that dialed its hosts one after the
 /// other would hold the healthy block behind the whole dial budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: gateway quiet observation window"
+)]
 async fn a_hung_host_costs_only_its_own_sessions() {
     let hung = FakeHost::start("aaa", Script::Mute).await;
     let healthy = FakeHost::start("zzz", Script::Frames(block("s-9", "epoch-9", 0))).await;
@@ -6889,6 +6943,10 @@ async fn a_shutdown_ends_a_spliced_stream_and_its_upstreams() {
 /// observes the shutdown token at all. What ends its upstreams is the token
 /// behind them: the splice's own, a child of the serving port's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real socket backpressure and drain"
+)]
 async fn a_shutdown_releases_a_stalled_clients_upstreams() {
     let resuming = deep_block("s-1", "epoch-1", 800);
     let deep = resuming.len();
@@ -7776,6 +7834,7 @@ async fn a_frame_kind_the_gateway_does_not_know_does_not_break_its_link() {
 /// a client of a gateway must not be held open for as long as a host cares to
 /// stay silent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: real upstream timeout")]
 async fn a_host_that_answers_nothing_becomes_a_503() {
     let (url, serving, _) = wedged_host().await;
     let state = TempDir::new().expect("tempdir");
@@ -7878,6 +7937,10 @@ async fn wedged_host() -> (
 /// against a ceiling of 200ms means an unbacked-off link dials some tens of times
 /// in the window and a backed-off one about a dozen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real reconnect rate observation"
+)]
 async fn a_host_that_hangs_up_at_once_is_not_redialed_at_the_floor_rate() {
     let dials = Arc::new(AtomicUsize::new(0));
     let (url, serving) = hanging_up_host(Arc::clone(&dials)).await;

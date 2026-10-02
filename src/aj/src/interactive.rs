@@ -9184,6 +9184,10 @@ mod tests {
     /// the editor, so opening it never changes the editor block's height and so
     /// never shrinks the flex transcript or moves the input line and footer.
     /// The popup shrinks to fit the space above the editor on a short terminal.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: 80 one-millisecond autocomplete waits per byte"
+    )]
     #[tokio::test]
     async fn autocomplete_popup_is_an_overlay_above_the_fixed_editor() {
         let tmp = TempDir::new().unwrap();
@@ -9397,6 +9401,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: 80 one-millisecond autocomplete waits per byte"
+    )]
     #[tokio::test]
     async fn at_file_autocomplete_end_to_end_through_the_shell() {
         // End-to-end host wiring: `Shell::new` installs the `@`-file provider
@@ -9882,6 +9890,10 @@ mod tests {
     /// The attach block projects sub threads eagerly, so a resumed session
     /// has nothing left to materialize on demand: the cursor is the applied
     /// prefix of one seq space, which a deferred thread would break.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced parallel-agents replay fixture"
+    )]
     #[tokio::test]
     async fn a_resume_projects_every_subagent_transcript() {
         let dir = TempDir::new().expect("tempdir");
@@ -9925,6 +9937,10 @@ mod tests {
 
     /// Observing a resumed sub-agent switches the view to it and shows the
     /// same entry shape the eager replay path builds.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced parallel-agents replay fixture"
+    )]
     #[tokio::test]
     async fn observing_a_resumed_subagent_matches_the_eager_replay() {
         let dir = TempDir::new().expect("tempdir");
@@ -10032,6 +10048,10 @@ mod tests {
     }
 
     /// Re-observing a sub-agent is a no-op: its transcript is unchanged.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced parallel-agents replay fixture"
+    )]
     #[tokio::test]
     async fn re_observe_is_idempotent() {
         let dir = TempDir::new().expect("tempdir");
@@ -10090,6 +10110,10 @@ mod tests {
     /// its tool cells' `header_only` flags exactly as the eager path leaves
     /// them with the sub active. This pins the reconcile in
     /// `set_active_view` for a backfilled transcript.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced parallel-agents replay fixture"
+    )]
     #[tokio::test]
     async fn header_only_reconciles_across_view_switches() {
         let dir = TempDir::new().expect("tempdir");
@@ -10149,6 +10173,10 @@ mod tests {
     /// Switching from a session full of sub-agents to a fresh one replaces
     /// the transcripts wholesale, so no box or child thread of the outgoing
     /// session can leak into the new one's view.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced parallel-agents replay fixture"
+    )]
     #[tokio::test]
     async fn a_session_switch_replaces_the_subagent_transcripts() {
         let dir = TempDir::new().expect("tempdir");
@@ -10194,6 +10222,10 @@ mod tests {
     /// `an_aborted_run_concludes_the_same_under_either_interleaving` pins
     /// that directly, on both interleavings, without needing this test to
     /// draw the unlucky one.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced parallel-agents replay fixture"
+    )]
     #[tokio::test]
     async fn aborted_session_resume_loads_and_observes() {
         let dir = TempDir::new().expect("tempdir");
@@ -10380,6 +10412,10 @@ mod tests {
     /// listing is a record in the log beside the frozen prompt it describes,
     /// so it replays exactly once, at the top, and reads the same as it did the
     /// day the session was made.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_resumed_session_opens_with_the_context_it_was_created_with() {
         let dir = TempDir::new().expect("tempdir");
@@ -10754,6 +10790,10 @@ mod tests {
 
     /// A resume has no created session for `--tag` to name, so the flag is
     /// reported rather than dropped.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_launch_tag_on_a_resume_says_it_has_nothing_to_name() {
         let dir = TempDir::new().expect("tempdir");
@@ -10885,6 +10925,10 @@ mod tests {
     /// one, while a resume neither repeats its context nor the process-side
     /// warnings. The context opens the transcript in both cases, as the log's
     /// own record, and this process's rows land after it.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn session_switch_folds_complete_notice_block_for_fresh_only() {
         let dir = TempDir::new().expect("tempdir");
@@ -11109,6 +11153,10 @@ mod tests {
     /// The held session carries a tag, because the toast names the session
     /// the way the user knows it and the label has to come off the live
     /// directory to get there.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_locked_session_refuses_the_switch_in_a_toast() {
         let dir = TempDir::new().expect("tempdir");
@@ -11310,6 +11358,10 @@ mod tests {
     ///
     /// Counted rather than searched, so a confirmation folded under any
     /// wording fails here.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_switch_that_took_toasts_and_folds_into_neither_transcript() {
         let dir = TempDir::new().expect("tempdir");
@@ -11382,6 +11434,10 @@ mod tests {
     /// A create reports itself in a toast, and the session it left keeps the
     /// transcript it had. The created session's own startup notices still
     /// fold: those are facts about that session, not about the gesture.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_create_toasts_and_leaves_the_outgoing_transcript_alone() {
         let dir = TempDir::new().expect("tempdir");
@@ -11556,6 +11612,10 @@ mod tests {
     /// drive loop's submit path, so a later Up press recalls it. Drives the
     /// real submit through the app so the record site (not a test shortcut)
     /// runs.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn submit_records_into_history_and_up_recalls_it() {
         let dir = TempDir::new().expect("tempdir");
@@ -12468,6 +12528,10 @@ mod tests {
     /// scripted session, fold the frames the host publishes for it, and check
     /// the chat model holds the user prompt plus a finalized assistant reply.
     /// A full transcript render over the result must not panic.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn scripted_prompt_streams_into_the_chat_model() {
         let dir = TempDir::new().expect("tempdir");
@@ -12541,6 +12605,10 @@ mod tests {
 
     /// A non-empty launch prompt runs a Main turn, so the initial session
     /// drives it without the user typing anything.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn launch_prompt_spawns_a_main_turn() {
         let dir = TempDir::new().expect("tempdir");
@@ -12617,6 +12685,10 @@ mod tests {
     /// A submit reaches the host, and the frames the host publishes for it are
     /// what build the transcript: the submit itself renders nothing, and the
     /// message is on the session's log before any frame is folded.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_prompt_reaches_the_host_and_its_frames_build_the_transcript() {
         let dir = TempDir::new().expect("tempdir");
@@ -12700,6 +12772,10 @@ mod tests {
     /// storage error shows up as an error row, the client owes
     /// a re-attach at once, and the loop's ordinary rejoin lands on a fresh
     /// materialization of the same session, which then runs the next prompt.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_persistence_failure_re_attaches_a_fresh_materialization() {
         let dir = TempDir::new().expect("tempdir");
@@ -12769,6 +12845,10 @@ mod tests {
     /// The drive loop discharges the same obligation at the bottom of each
     /// iteration. Nothing in phase 1 moves a head behind this client's back,
     /// so the command below stands in for the second writer that will.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_reset_is_discharged_by_a_re_attach() {
         let dir = TempDir::new().expect("tempdir");
@@ -12920,6 +13000,10 @@ mod tests {
     /// This covers the step the loop drives; that the loop routes a local
     /// `Closed` here at all is
     /// [`the_loop_re_attaches_an_evicted_local_stream`].
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn an_evicted_local_stream_is_re_attached() {
         let dir = TempDir::new().expect("tempdir");
@@ -12960,6 +13044,10 @@ mod tests {
     /// The host really being gone still ends the shell: the re-attach is what
     /// tells that apart from an eviction, because a host that is gone refuses
     /// it.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_local_re_attach_after_the_host_is_gone_is_fatal() {
         let dir = TempDir::new().expect("tempdir");
@@ -13175,6 +13263,10 @@ mod tests {
     ///
     /// The frame arm is the only place that is decided, so a test that hands
     /// `advance_resume` a `Resume` of its own never reaches it.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn the_loop_re_attaches_an_evicted_local_stream() {
         let dir = TempDir::new().expect("tempdir");
@@ -13235,6 +13327,10 @@ mod tests {
     /// The local views read the live handles, so nothing on screen depends on
     /// this. The client's own model does, and it is the fold connect mode
     /// uses, so leaving it stale would leave the two paths unequal.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn an_attach_carries_the_task_table_and_queues() {
         let dir = TempDir::new().expect("tempdir");
@@ -13277,6 +13373,10 @@ mod tests {
     /// spawns a real background bash task, its completion triggers a
     /// wake turn, and the wake delivers the collapsible
     /// task-notification plus the wrap-up response.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced background-task demo and shell completion"
+    )]
     #[tokio::test]
     async fn background_task_completion_wakes_the_agent() {
         let dir = TempDir::new().expect("tempdir");
@@ -13360,6 +13460,10 @@ mod tests {
     /// A submit while the viewed agent runs queues a follow-up: the
     /// pending snapshot fills, the post-turn wake consumes it, and
     /// the queued text lands in the transcript as a user entry.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn submit_while_running_queues_and_the_wake_delivers_it() {
         let dir = TempDir::new().expect("tempdir");
@@ -13648,6 +13752,10 @@ mod tests {
 
     /// Alt+Enter's steer action while idle starts a normal turn (there
     /// is nothing to steer yet), matching aj.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn steer_action_spawns_a_turn_while_idle() {
         let dir = TempDir::new().expect("tempdir");
@@ -13736,6 +13844,10 @@ mod tests {
 
     /// Editor-focused busy Alt+Enter returns a scrolled transcript to the live
     /// tail after the host accepts the steering text.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn editor_focused_busy_alt_enter_follows_the_transcript_tail() {
         let dir = TempDir::new().expect("tempdir");
@@ -13797,6 +13909,10 @@ mod tests {
 
     /// Alt+Enter is editor-local: with transcript focus, an idle draft is
     /// preserved and no host action or turn is produced.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn focused_idle_alt_enter_does_not_submit() {
         let dir = TempDir::new().expect("tempdir");
@@ -13845,6 +13961,10 @@ mod tests {
 
     /// Alt+Enter is also inert outside the editor while a turn is busy, so it
     /// cannot consume the draft or mutate the steering queue.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn focused_busy_alt_enter_does_not_steer() {
         let dir = TempDir::new().expect("tempdir");
@@ -17245,6 +17365,10 @@ mod tests {
 
     /// Full-log export is identical locally, over HTTP, and through the gateway,
     /// even when a host branch is absent from the client's attached transcript.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn export_html_parity_saves_the_full_host_log_on_the_client() {
         let Some(home) = isolated_test_home() else {
@@ -18315,6 +18439,10 @@ mod tests {
         assert_eq!(reattach(world, shell).await.unwrap(), CatchUp::Caught);
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn oracle_state_refreshes_after_a_backpressured_attach() {
         let dir = TempDir::new().unwrap();
@@ -20524,6 +20652,10 @@ mod tests {
 
     /// A running background task does not hold the user in a session either: it
     /// keeps running behind the switch, exactly as a turn does.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn new_session_is_allowed_while_background_work_runs() {
         let dir = TempDir::new().expect("tempdir");
@@ -20583,6 +20715,10 @@ mod tests {
 
     /// While idle the session tree opens read-only, listing the current
     /// session's single branch (its first user message).
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn session_tree_opens_and_lists_the_branch_when_idle() {
         let dir = TempDir::new().expect("tempdir");
@@ -20646,6 +20782,10 @@ mod tests {
     /// marks the current session, and confirming a
     /// different row parks a resume request the drive loop turns into
     /// `SessionExit::Switch`.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn session_selector_fills_and_confirms_a_switch() {
         let dir = TempDir::new().expect("tempdir");
@@ -20714,6 +20854,10 @@ mod tests {
     /// only reached if the overlay actually installed it: the chord is matched
     /// on the focus path, and a selector pushed as a bare list would swallow
     /// the press with nothing to show for it.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn the_selector_toggle_reveals_an_archived_session() {
         let dir = TempDir::new().expect("tempdir");
@@ -20793,6 +20937,10 @@ mod tests {
 
     /// Confirming the current session reaches the frontend, which leaves a
     /// healthy session unchanged. Esc closes without asking.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn session_selector_current_is_noop_and_esc_cancels() {
         let dir = TempDir::new().expect("tempdir");
@@ -20847,6 +20995,10 @@ mod tests {
     /// The switch path: focusing another session re-attaches over the same
     /// Shell, selecting a session-owned tree so the transcript renders the new
     /// session's model and the pending box reads the new session's queues.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn switch_rebuilds_the_session_and_updates_exit_hint() {
         let dir = TempDir::new().expect("tempdir");
@@ -20928,6 +21080,10 @@ mod tests {
 
     // --- Branch flow (Phase 3) ---
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn branch_arming_editing_and_cancel_do_not_wait_for_the_host() {
         for connected in [false, true] {
@@ -21061,6 +21217,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn branch_refusal_retains_edits_and_cancel_or_rearm_discards_only_the_draft() {
         let dir = TempDir::new().expect("tempdir");
@@ -21442,6 +21602,10 @@ mod tests {
     /// refused the same way: a toast, the anchor kept, the text restored, and
     /// no branch resolved. This is the case the removed two-step
     /// background-task confirm used to cover.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn background_task_submit_refused_toasts_keeps_anchor() {
         let dir = TempDir::new().expect("tempdir");
@@ -21476,6 +21640,10 @@ mod tests {
     /// a branch exit naming that message as the one to branch before, so the
     /// host moves the head to its parent, carrying the edited prompt. The
     /// anchor remains client-owned until the host accepts the switch.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn armed_submit_branches_before_the_anchored_message() {
         use aj_models::types::Message;
@@ -21860,6 +22028,10 @@ mod tests {
     /// The refusal is the host's: a mid-turn head switch would let the running
     /// turn persist onto the branch being left. The frontend surfaces the
     /// reason as the branch-failure notice.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn branch_switch_refused_while_busy_and_proceeds_when_idle() {
         let dir = TempDir::new().expect("tempdir");
@@ -21940,6 +22112,10 @@ mod tests {
     /// `NewSession` command) are what keep a user from walking away from live
     /// work by accident. There is no recheck at the consumption site, because
     /// with nothing torn down there is nothing left to protect.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_switch_leaves_the_outgoing_sessions_work_running() {
         let dir = TempDir::new().expect("tempdir");
@@ -21996,6 +22172,10 @@ mod tests {
     ///
     /// The state is staged straight on the host's handles, which publishes no
     /// frame, so the block's `caught_up` is the only thing that can carry it.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_backgrounded_session_takes_its_tables_from_caught_up() {
         let dir = TempDir::new().expect("tempdir");
@@ -22084,6 +22264,10 @@ mod tests {
     /// The cursor is what makes this observable: it advances only if that
     /// session's fold ran, and a switch that dropped the outgoing client the way
     /// a rebuild does would leave nothing there to advance.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_backgrounded_session_keeps_folding() {
         let dir = TempDir::new().expect("tempdir");
@@ -22211,6 +22395,10 @@ mod tests {
     /// Bounded explicitly, because the failure mode is a hang: without the
     /// timeout a regression here shows up as a test suite that never finishes
     /// rather than one that fails.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_swap_onto_an_attached_session_does_not_await_a_block() {
         let dir = TempDir::new().expect("tempdir");
@@ -22271,6 +22459,10 @@ mod tests {
     /// user going anywhere. Its obligation has to be visible to the loop's
     /// set-wide check, or the session sits frozen until something else happens
     /// to reopen the stream.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced demo and two-second recovery observation"
+    )]
     #[tokio::test]
     async fn the_loop_discharges_a_background_session_s_re_attach() {
         let dir = TempDir::new().expect("tempdir");
@@ -22351,6 +22543,10 @@ mod tests {
     /// switching that session's head mints a fresh epoch, and until a re-attach
     /// is served its fold filters out every later frame, so a switch onto it
     /// would paint the branch the reset abandoned.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_background_session_reset_by_another_peer_recovers() {
         let dir = TempDir::new().expect("tempdir");
@@ -22439,6 +22635,10 @@ mod tests {
     /// deliberately attached background session as use, so a client that keeps
     /// one keeps its lock. What the user gets for it is an instant switch back
     /// onto a transcript that stayed current while they were away.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced demo and 800-millisecond retention observation"
+    )]
     #[tokio::test]
     async fn a_switch_keeps_the_outgoing_session_attached_and_live() {
         const GRACE: Duration = Duration::from_millis(200);
@@ -22491,6 +22691,10 @@ mod tests {
     /// A ninth visited session replaces the least recently focused attachment.
     /// The replacement stream omits that session, so the host can release it,
     /// while its directory row remains available for an ordinary later focus.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced demo and 200-millisecond idle release"
+    )]
     #[tokio::test]
     async fn visiting_past_the_working_set_releases_and_can_reopen_the_oldest_session() {
         const GRACE: Duration = Duration::from_millis(200);
@@ -22576,6 +22780,10 @@ mod tests {
     /// host is free to release it, and the handles the world holds then name a
     /// core nothing drives: the footer's task table, the tree and session-info
     /// overlays and the export all read through them.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced demo and 200-millisecond idle release"
+    )]
     #[tokio::test]
     async fn a_reattach_after_a_release_repoints_the_handles() {
         const GRACE: Duration = Duration::from_millis(200);
@@ -22792,6 +23000,10 @@ mod tests {
     /// where it is, the failure notice names the reason, and the pending prompt
     /// is restored into the editor rather than run against a head that did not
     /// move.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_stale_head_keeps_the_session_and_restores_the_prompt() {
         let dir = TempDir::new().expect("tempdir");
@@ -22958,6 +23170,10 @@ mod tests {
     ///
     /// The restore path (a head that did not move) is covered by
     /// `a_stale_head_keeps_the_session_and_restores_the_prompt`.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_branch_submits_the_handed_off_prompt() {
         let dir = TempDir::new().expect("tempdir");
@@ -23527,6 +23743,10 @@ mod tests {
     /// The release is read off the host, not off the client's own bookkeeping.
     /// A client that drops the row and never renegotiates its stream looks
     /// right from the inside and holds the session forever from the outside.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced demo and 200-millisecond idle release"
+    )]
     #[tokio::test]
     async fn the_archive_chord_puts_a_session_away_and_brings_it_back() {
         const GRACE: Duration = Duration::from_millis(200);
@@ -23653,6 +23873,10 @@ mod tests {
     /// Two presses of the gesture leave the session as it started, however
     /// quickly they follow one another. The peer coalesces its rows on a tick,
     /// so a direction read from the last row alone would archive twice.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_second_press_undoes_the_first() {
         let dir = TempDir::new().expect("tempdir");
@@ -23925,6 +24149,10 @@ mod tests {
     /// The strip's reveal, every byte of it real: an archived row is out of
     /// the default view, the chord on the keyboard puts it back struck
     /// through, and the same chord takes it away again.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn the_reveal_chord_shows_the_archived_rows() {
         let dir = TempDir::new().expect("tempdir");
@@ -24004,6 +24232,10 @@ mod tests {
     /// A session with a turn running wears the working glyph, and a session that
     /// moved on while the user was looking elsewhere wears the unseen one (spec
     /// 6.8, 9.2).
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_row_shows_what_its_session_is_doing() {
         let dir = TempDir::new().expect("tempdir");
@@ -24110,6 +24342,10 @@ mod tests {
     /// The three brightnesses need all three working-set states at once, which
     /// is what the visit-and-return is for: it leaves the second session
     /// attached in the background while the third is only listed.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn the_strip_paints_focus_and_the_working_set() {
         let dir = TempDir::new().expect("tempdir");
@@ -24383,6 +24619,10 @@ mod tests {
     /// Not merely "moves nowhere": running the switch body would fold a notice
     /// for a switch that did not happen, discard an armed branch anchor, and
     /// reset the scroll.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn resuming_the_focused_session_changes_nothing() {
         let dir = TempDir::new().expect("tempdir");
@@ -24435,6 +24675,10 @@ mod tests {
         shut_down(&world).await;
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn session_views_restore_drafts_and_submit_only_to_the_focused_session() {
         let dir = TempDir::new().expect("tempdir");
@@ -24561,6 +24805,10 @@ mod tests {
         shut_down(&world).await;
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn session_views_route_completions_through_the_selected_editor() {
         use vaxis::vxfw::{
@@ -24704,6 +24952,10 @@ mod tests {
 
     /// Display flags are global: a toggle made while focused on one session
     /// reaches a parked session whose view drew, and cached, the old value.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn display_toggle_reaches_parked_sessions() {
         let dir = TempDir::new().expect("tempdir");
@@ -24784,6 +25036,10 @@ mod tests {
         shut_down(&world).await;
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn session_views_keep_reading_position_until_the_model_is_evicted() {
         let dir = TempDir::new().expect("tempdir");
@@ -24924,6 +25180,10 @@ mod tests {
         shut_down(&world).await;
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn replacing_a_focused_model_returns_to_the_editor_before_paint_or_capture() {
         use aj_agent::message::AgentMessage;
@@ -25062,6 +25322,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn branch_submission_leaves_scroll_back_for_the_new_response() {
         let dir = TempDir::new().expect("tempdir");
@@ -25136,6 +25400,10 @@ mod tests {
         shut_down(&world).await;
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced parallel-agents replay fixture"
+    )]
     #[tokio::test]
     async fn replay_falls_back_to_main_when_the_observed_agent_is_not_on_the_selected_branch() {
         let dir = TempDir::new().expect("tempdir");
@@ -25194,6 +25462,10 @@ mod tests {
         shut_down(&world).await;
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn passive_reattachment_keeps_live_reading_state_but_rebuilt_models_open_at_tail() {
         let dir = TempDir::new().expect("tempdir");
@@ -25333,6 +25605,10 @@ mod tests {
     ///
     /// Driven through the real loop, because what is under test is where the
     /// refresh sits relative to the input arm.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn holding_the_step_chord_keeps_walking() {
         let dir = TempDir::new().expect("tempdir");
@@ -25407,6 +25683,10 @@ mod tests {
     /// The unit tests above prove the toast is raised. This one proves it is
     /// wired to something the user can see, so a toast stack left out of the
     /// layout fails here.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn the_step_chord_paints_its_switch_confirmation() {
         let dir = TempDir::new().expect("tempdir");
@@ -25466,6 +25746,10 @@ mod tests {
     ///
     /// The mirror runs every drive-loop iteration and is what applies the
     /// default, so the claim is only worth anything across a re-sync.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second directory publication window"
+    )]
     #[tokio::test]
     async fn an_explicit_toggle_survives_the_mirror() {
         let dir = TempDir::new().expect("tempdir");
@@ -25534,6 +25818,10 @@ mod tests {
     ///
     /// The default is the only thing under test here, so the toggle is left
     /// alone: an explicit ask would pin `visible` and answer for it.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn an_archived_session_does_not_bring_the_strip_out() {
         let dir = TempDir::new().expect("tempdir");
@@ -26012,6 +26300,10 @@ mod tests {
     /// The completion popup belongs to the editor, so it starts where the editor
     /// does. Left at column zero it would cover the strip and sit adrift of the
     /// text it completes.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: 80 one-millisecond autocomplete waits per byte"
+    )]
     #[tokio::test]
     async fn the_completion_popup_clears_the_strip() {
         let tmp = TempDir::new().expect("tempdir");
@@ -26052,6 +26344,10 @@ mod tests {
     ///
     /// Three rows is the smallest set that can tell the two directions apart:
     /// with two, next and previous both wrap onto the same row.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn the_session_chords_step_the_sidebar_s_order() {
         let dir = TempDir::new().expect("tempdir");
@@ -26661,6 +26957,10 @@ mod tests {
 
     // ---- Session environment ----
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn the_env_overlay_edits_adds_and_removes_through_the_drive_loop_locally_and_remotely() {
         for connected in [false, true] {
@@ -26877,6 +27177,10 @@ mod tests {
     /// keystroke goes through the composed tree, the action through the host
     /// handler and the command slot, and the submitted label through the same
     /// control surface a connection uses, so dropping any link fails this.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second tag publication window"
+    )]
     #[tokio::test]
     async fn the_tag_chord_opens_the_prefilled_editor_and_a_submit_relabels_the_row() {
         let dir = TempDir::new().expect("tempdir");
@@ -26935,6 +27239,10 @@ mod tests {
     /// one the editor never showed: with no row to prefill from, the empty
     /// field is what the client could show rather than what the store holds,
     /// and confirming it would delete a label the user never saw.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second tag publication window"
+    )]
     #[tokio::test]
     async fn an_empty_submit_does_not_clear_a_label_the_editor_never_showed() {
         let dir = TempDir::new().expect("tempdir");
@@ -26974,6 +27282,10 @@ mod tests {
 
     /// The palette command opens the same prefilled editor the chord does, so
     /// the two are one gesture with two triggers.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second tag publication window"
+    )]
     #[tokio::test]
     async fn the_tag_palette_command_opens_the_same_prefilled_editor() {
         let dir = TempDir::new().expect("tempdir");
@@ -27002,6 +27314,10 @@ mod tests {
 
     /// An empty submission clears the label, which is the same "blank clears"
     /// rule the wire and the launch flag follow.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second tag publication window"
+    )]
     #[tokio::test]
     async fn an_empty_tag_submission_clears_the_label() {
         let dir = TempDir::new().expect("tempdir");
@@ -27055,6 +27371,10 @@ mod tests {
     /// keystrokes, so a missing drain, a chord that parks nothing, or an
     /// overlay that never takes focus leaves the label unset and fails here.
     /// The trailing create chord is only how the loop is made to return.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second tag publication window"
+    )]
     #[tokio::test]
     async fn the_drive_loop_carries_a_tag_edit_from_the_keystroke_to_the_peer() {
         let dir = TempDir::new().expect("tempdir");
@@ -27101,6 +27421,10 @@ mod tests {
     /// environment extracted from the focused persisted log. The assertion is
     /// made on a drawn page so the extraction, fetch handoff, row renderer, and
     /// terminal widget are all part of the observed path.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second tag publication window"
+    )]
     #[tokio::test]
     async fn the_session_info_page_draws_the_focused_logs_environment() {
         let dir = TempDir::new().expect("tempdir");
@@ -27175,6 +27499,10 @@ mod tests {
     }
 
     /// The host's facts reach the drawn page through either remote route.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn connected_session_info_draws_the_hosts_facts_directly_and_through_gateway() {
         let dir = TempDir::new().expect("tempdir");
@@ -27267,6 +27595,10 @@ mod tests {
     /// The selector labels its rows from the same scan it lists them from, so
     /// a tag set through the peer reaches the picker off the store, and typing
     /// it finds the session it names.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second tag publication window"
+    )]
     #[tokio::test]
     async fn the_session_selector_labels_and_indexes_a_tagged_row() {
         let dir = TempDir::new().expect("tempdir");
@@ -27304,6 +27636,10 @@ mod tests {
 
     /// The selector's preview read asks for exactly the rows it opened with,
     /// which the directory already holds, so opening it lists nothing again.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn the_session_selector_previews_exactly_its_rows() {
         use axum::{Json, Router, extract::Query, http::Uri};
@@ -27407,6 +27743,10 @@ mod tests {
 
     /// A label the store would not keep is reported in a toast and changes
     /// nothing. The editor stays open, so the refusal is not a dead end.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second tag publication window"
+    )]
     #[tokio::test]
     async fn a_refused_tag_toasts_and_leaves_the_label_alone() {
         let dir = TempDir::new().expect("tempdir");
@@ -28089,6 +28429,10 @@ mod tests {
     /// parent turn being over, so the sub's live `AgentStart` is entirely
     /// in the past and only the attach block's synthesized bracket can
     /// carry the fact to this client.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced background-agent-slow demo"
+    )]
     #[tokio::test]
     async fn attaching_over_a_running_background_sub_counts_it_in_the_footer() {
         let dir = TempDir::new().expect("tempdir");
@@ -28166,6 +28510,10 @@ mod tests {
     /// The connect-mode smoke test: a prompt submitted over the
     /// wire streams the host's answer into the transcript, and the footer
     /// shows the host's settings rather than this client's.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn connect_mode_prompt_streams_the_hosts_answer() {
         let dir = TempDir::new().expect("tempdir");
@@ -28246,6 +28594,10 @@ mod tests {
     /// Session selection: an explicit id attaches it, `--new`
     /// creates, bare connect takes the host's latest, and a host with no
     /// sessions gets one created.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn connect_mode_resolves_the_session_to_attach() {
         let dir = TempDir::new().expect("tempdir");
@@ -28291,6 +28643,10 @@ mod tests {
 
     /// A stream that drops mid-turn reconnects rather than killing the shell,
     /// and converges on the same state a client attaching fresh would build.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn connect_mode_reconnects_after_a_dropped_stream() {
         let dir = TempDir::new().expect("tempdir");
@@ -28675,6 +29031,10 @@ mod tests {
 
     /// Selection commits before attach, remains responsive while the target's
     /// block arrives, and does not become usable or successful before Caught.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced WarmPeer attach frames"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_selected_target_is_not_usable_or_successful_before_its_caught() {
         let dir = TempDir::new().expect("tempdir");
@@ -28930,6 +29290,10 @@ mod tests {
     /// comes out of its build catching up, and the first Caught puts the history
     /// on screen with the launch's own rows on top of it, saying nothing about a
     /// stream coming back.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_launch_lands_its_rows_on_top_of_the_replayed_history() {
         let dir = TempDir::new().expect("tempdir");
@@ -29043,6 +29407,10 @@ mod tests {
     /// The block lands in the chat model frame by frame and the loop paints in
     /// between, so without this the user watches the whole transcript scroll
     /// past on every switch.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced WarmPeer attach frames"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_selected_target_paints_its_history_whole_once_caught() {
         let dir = TempDir::new().expect("tempdir");
@@ -29127,6 +29495,10 @@ mod tests {
     /// A rejoin into the epoch already on screen keeps the transcript up and
     /// shows the suffix as it arrives: the block extends what the user was
     /// reading rather than rebuilding it, so what appears is what they missed.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced WarmPeer attach frames"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rejoin_into_the_same_epoch_keeps_the_transcript_on_screen() {
         let dir = TempDir::new().expect("tempdir");
@@ -29283,6 +29655,10 @@ mod tests {
     /// A directory edge after refusal rejoins through the responsive Resume
     /// driver and completes the selected session's deferred startup obligation
     /// without turning passive recovery into delayed action success.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced WarmPeer attach frames"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_target_passively_rejoins_and_completes_its_startup() {
         let dir = TempDir::new().expect("tempdir");
@@ -29528,6 +29904,10 @@ mod tests {
 
     /// A request-level stream refusal happens after selection commits. Its exact
     /// peer reason is toasted once while paced reconnect remains on the target.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: two-second retry observation window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stream_open_failure_keeps_the_target_selected_and_reconnecting() {
         let dir = TempDir::new().expect("tempdir");
@@ -29592,6 +29972,10 @@ mod tests {
     /// A host that stays down costs the transcript one warning row per outage,
     /// rewritten by every failed attempt so its count shows recovery is still
     /// trying. The row outlives the recovery, and the next outage starts its own.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: repeated reconnect backoff windows"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_outage_is_one_warning_row_rewritten_by_each_retry() {
         let dir = TempDir::new().expect("tempdir");
@@ -29723,11 +30107,19 @@ mod tests {
         remote.shutdown().await;
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced demo and WarmPeer recovery frames"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_accepted_head_locked_follow_recovers_forward_without_submitting() {
         accepted_head_refused_follow_recovers_forward("locked", Refusal::Locked).await;
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced demo and WarmPeer recovery frames"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_accepted_head_unknown_follow_recovers_forward_without_submitting() {
         accepted_head_refused_follow_recovers_forward("unknown_session", Refusal::Other).await;
@@ -30039,6 +30431,10 @@ mod tests {
     /// The block is spaced under the silence budget and runs to more than twice it
     /// in total, so a driver measuring anything but silence about the session
     /// would cut it short and ask again. The stream count is what says it did not.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced WarmPeer attach frames"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_loop_reads_input_while_a_block_arrives() {
         let dir = TempDir::new().expect("tempdir");
@@ -30158,6 +30554,10 @@ mod tests {
     /// The backoff is only visible as a rate, so the assertion is the count over a
     /// window: the first delay is [`RETRY_BACKOFF_MIN`] and doubles, which puts a
     /// handful of attempts in the window and hundreds without the pacing.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: two-second retry observation window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_loop_paces_a_stream_that_dies_inside_the_block() {
         let dir = TempDir::new().expect("tempdir");
@@ -30527,6 +30927,10 @@ mod tests {
 
     /// A locked refusal stays settled through release and disappearance/return
     /// updates, without retrying or repeating the notice while the loop runs.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: 15-second refusal observation window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refusal_is_folded_once_however_long_the_client_waits() {
         let dir = TempDir::new().expect("tempdir");
@@ -31283,6 +31687,10 @@ mod tests {
     /// Creating and switching sessions work over a connection, which is what the
     /// sidebar drives. Both go through the control surface, so the
     /// session they land on attaches the same way it would in process.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn connect_mode_creates_and_switches_sessions() {
         let dir = TempDir::new().expect("tempdir");
@@ -31623,6 +32031,10 @@ mod tests {
     /// has to happen before the terminal is taken, so an unreadable `@file`
     /// reports on the normal screen, which leaves the submit a second statement
     /// no test below the drive loop can reach.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn a_created_session_submits_the_launch_turn_its_argv_carried() {
         let dir = TempDir::new().expect("tempdir");
@@ -31777,6 +32189,10 @@ mod tests {
     /// A connected attach cannot apply create-only environment identity. The
     /// warning is client-visible, and neither a second session nor an EnvChange
     /// may appear on the host as a side effect of carrying the flag.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text seed turn"
+    )]
     #[tokio::test]
     async fn a_launch_env_on_connect_attach_warns_without_backfilling_identity() {
         let dir = TempDir::new().expect("tempdir");
@@ -31921,6 +32337,10 @@ mod tests {
     /// The tag gesture is the same one over a connection: the chord opens the
     /// editor prefilled from the peer's row, and the submit travels as the
     /// wire's tag request, so the host's own store ends up carrying the label.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second tag publication window"
+    )]
     #[tokio::test]
     async fn the_tag_gesture_relabels_a_connected_session() {
         let dir = TempDir::new().expect("tempdir");
@@ -31971,6 +32391,10 @@ mod tests {
 
     /// A command the peer refuses folds the peer's own reason, and a refusal
     /// the peer classes as a conflict keeps its local wording.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: 50-millisecond busy-script chunks"
+    )]
     #[tokio::test]
     async fn connect_mode_folds_a_refused_commands_reason() {
         let dir = TempDir::new().expect("tempdir");
@@ -32023,6 +32447,10 @@ mod tests {
 
     /// A host refusal from the Ctrl+C action crosses the real HTTP control
     /// seam and lands as a visible transcript notice.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced parallel-agents demo"
+    )]
     #[tokio::test]
     async fn connect_mode_ctrl_c_renders_a_cancel_refusal() {
         let dir = TempDir::new().expect("tempdir");
@@ -32089,6 +32517,10 @@ mod tests {
 
     /// Scrollback, appends and kill travel through the composed viewer and drive
     /// loop, using the real adapters. Tails deliberately omit the first marker.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: 500-millisecond task-output polling windows"
+    )]
     #[tokio::test]
     async fn task_output_scrollback_local_direct_and_gateway() {
         use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
@@ -32340,6 +32772,10 @@ mod tests {
     /// Without the head the overlay falls back to its default cursor, and
     /// confirming that row parks a real branch request, so the user switches
     /// to the branch they were already on.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn the_tree_overlay_opens_on_the_head_the_read_carries() {
         let dir = TempDir::new().expect("tempdir");
@@ -32366,6 +32802,10 @@ mod tests {
     /// The tree view and the branch gesture work over a connection: the tree
     /// read carries the head the overlay pre-selects, and the branch anchor
     /// travels as a `before` target the host resolves to the message's parent.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test]
     async fn connect_mode_browses_the_tree_and_branches() {
         let dir = TempDir::new().expect("tempdir");
@@ -33428,6 +33868,10 @@ mod tests {
         (inert_theme_watch(), None)
     }
 
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: paced streaming-text demo"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn real_input_new_session_keeps_the_launch_env_armed() {
         let dir = TempDir::new().expect("tempdir");
@@ -33699,6 +34143,10 @@ mod tests {
     /// This is the wiring test. Nothing reaches into the shell between
     /// keystrokes, so a create that never consults the host list, a picker that
     /// never takes focus and a pick that parks nothing all fail here.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second directory publication window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_picked_host_is_what_the_create_lands_on() {
         let (left_dir, right_dir, client_dir) = (
@@ -33790,6 +34238,10 @@ mod tests {
     /// overlay stack when the request parks: the loop pops it and pushes the
     /// picker in the same input turn, and the keys after it have to reach the
     /// picker rather than the palette or the editor.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second directory publication window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_palette_create_asks_the_same_question() {
         let (left_dir, right_dir, client_dir) = (
@@ -33843,6 +34295,10 @@ mod tests {
     /// one that proves the sentinel row is not in the way: typing anything drops
     /// it from the list, so the confirm lands on the host the query narrowed to
     /// without a cursor move at all.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second directory publication window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_filtered_host_can_be_confirmed_without_moving_the_cursor() {
         let (left_dir, right_dir, client_dir) = (
@@ -33942,6 +34398,10 @@ mod tests {
     /// session on the host the picker lists first, so pre-selecting either the
     /// focused row's host or the first row mints a session and fails the counts
     /// below.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: directory publication and 500-millisecond no-create window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn enter_alone_on_the_picker_creates_nowhere() {
         let (left_dir, right_dir, client_dir) = (
@@ -34002,6 +34462,10 @@ mod tests {
 
     /// Cancelling the picker leaves the create undone and the client where it
     /// was, with nothing minted.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: directory publication and 500-millisecond no-create window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelling_the_picker_mints_nothing() {
         let (left_dir, right_dir, client_dir) = (
@@ -34123,6 +34587,10 @@ mod tests {
     /// A refused create reports the refusing server's own sentence. A gateway
     /// says it is a gateway, and nothing in the toast claims a host answered,
     /// which is what the transport wrapper would have said for either.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second directory publication window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_create_reads_in_the_refusing_server_s_words() {
         let (left_dir, right_dir, client_dir) = (
@@ -34173,6 +34641,10 @@ mod tests {
 
     /// `--host` is the same answer for a run with no terminal to ask: the named
     /// host is the one the created session lands on.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second directory publication window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_host_flag_creates_on_the_host_it_names() {
         let (left_dir, right_dir, client_dir) = (
@@ -34267,6 +34739,10 @@ mod tests {
     /// nowhere to put it. `--tag` reports the same way for the same reason, and
     /// a client that stayed silent would leave an operator believing a create
     /// happened somewhere it did not.
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: one-second directory publication window"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_host_flag_with_no_create_reports_itself() {
         let (left_dir, right_dir, client_dir) = (

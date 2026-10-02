@@ -161,6 +161,10 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
 /// host, and the store's cold half is served from the cache the last
 /// enumeration point left.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real I/O budget across a paced streaming turn"
+)]
 async fn the_directory_opens_no_logs_at_startup_or_during_refresh() {
     let dir = TempDir::new().expect("tempdir");
     let sessions_dir = dir.path().join("sessions");

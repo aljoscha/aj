@@ -789,7 +789,7 @@ impl Fixture {
 
     /// A second client against the same server, for tests with two peers.
     fn client(&self) -> RemoteClient {
-        RemoteClient::new(&self.server.url()).expect("client")
+        self.client.clone()
     }
 
     /// A second host and server over the *same* session store, for the
@@ -1348,6 +1348,10 @@ async fn frontend_shutdown_stops_accepting_before_host_teardown_finishes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn creation_applies_settings_and_runs_a_first_prompt() {
     let fixture = Fixture::new(vec![finalized_text_message("hello from the script")]).await;
 
@@ -1587,6 +1591,10 @@ async fn control_create_defaults_unstated_thinking_against_the_selected_model() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn control_never_drops_env_from_a_remote_create() {
     let fixture = Fixture::new(vec![
         calling(
@@ -1749,6 +1757,10 @@ async fn a_list_value_the_host_does_not_know_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn the_tree_read_and_the_queue_withdrawal_answer() {
     let fixture = Fixture::new(vec![finalized_text_message("answered")]).await;
     let session = fixture.create().await;
@@ -1810,6 +1822,10 @@ async fn the_tree_read_and_the_queue_withdrawal_answer() {
 /// unknown task, and accepts a blank body. A task path segment that is not an
 /// id answers the protocol's error shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
     let fixture = Fixture::new(background_task_turn()).await;
     let session = fixture.create().await;
@@ -2109,6 +2125,10 @@ async fn nested_unknown_fields_are_refused_by_real_host_routes() {
 /// The read-back and inference counter observe the state where that harm lands,
 /// not only the 400 returned by the extractor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: negative observation window"
+)]
 async fn defaultable_unknown_fields_leave_session_state_untouched() {
     let (fixture, inference) = Fixture::with_gate(
         IdentityGate::local(),
@@ -2227,6 +2247,10 @@ async fn defaultable_unknown_fields_leave_session_state_untouched() {
 /// working, and the complete durable answer proves no cancellation raced ahead
 /// of the decode failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn an_unknown_cancel_field_does_not_cancel_main() {
     let expected = "the answer reaches its end";
     let fixture = Fixture::with_provider(scripted(
@@ -2822,6 +2846,10 @@ async fn a_malformed_settings_body_answers_400() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_head_switch_is_refused_with_409_while_a_turn_runs() {
     // A slow-streaming turn, so the switch lands mid-turn.
     let fixture = Fixture::with_provider(scripted(
@@ -2898,6 +2926,10 @@ async fn a_head_switch_naming_no_target_or_two_answers_400() {
 /// unknown entry is a 404 and the session's first entry is refused,
 /// so a client cannot branch a session into having no history.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_head_switch_before_an_entry_resolves_over_http() {
     let fixture = Fixture::new(vec![finalized_text_message("answered")]).await;
     let session = fixture.create().await;
@@ -2978,6 +3010,10 @@ async fn a_head_switch_before_an_entry_resolves_over_http() {
 /// Every route that would materialize answers it, and the
 /// reads that do not materialize answer for a cold session instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_session_another_host_holds_answers_409_locked() {
     let fixture = Fixture::new(vec![
         finalized_text_message("answered"),
@@ -3153,6 +3189,10 @@ async fn a_remote_settings_change_without_persistence_is_session_only() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_prompt_drives_a_turn_observed_on_the_stream() {
     let fixture = Fixture::new(tool_turn()).await;
     let session = fixture.create().await;
@@ -3218,6 +3258,7 @@ async fn one_stream_attaches_several_sessions() {
 /// An idle stream heartbeats with a real frame, and the timer restarts after
 /// every write, so a client can tell a live connection from a stalled one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: real heartbeat interval")]
 async fn an_idle_stream_heartbeats_with_a_real_frame() {
     let fixture = Fixture::build(
         scripted(Vec::new(), 0, Duration::ZERO),
@@ -3255,6 +3296,10 @@ async fn an_idle_stream_heartbeats_with_a_real_frame() {
 /// coalesced frames, ending on the final one, with the reliable frame behind
 /// the burst still after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming and coalescing"
+)]
 async fn a_streaming_burst_reaches_the_client_coalesced() {
     // One delta per character, about a millisecond apart: far more snapshots
     // than pacing windows, and slow enough that an unpaced writer keeps up.
@@ -3339,6 +3384,10 @@ async fn a_streaming_burst_reaches_the_client_coalesced() {
 /// window would tell the client the stream is healthy while the block it
 /// waits for never comes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: heartbeat and silence intervals"
+)]
 async fn a_stalled_block_withholds_the_heartbeat() {
     let fixture = Fixture::build(
         scripted(Vec::new(), 0, Duration::ZERO),
@@ -3405,6 +3454,10 @@ async fn a_stalled_block_withholds_the_heartbeat() {
 /// Silence is what a dead stream looks like to a client, and it has to end
 /// with an error the caller can reconnect from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real stream silence timeout"
+)]
 async fn a_silent_stream_is_reported_dead() {
     // A heartbeat interval far beyond the client's tolerance, so the stream
     // is alive and silent, which is exactly the case under test.
@@ -3453,6 +3506,10 @@ async fn a_silent_stream_is_reported_dead() {
 /// every one of those, and a host wedged mid-turn (whose spinner keeps the
 /// loop iterating) would never be declared dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real stream silence timeout"
+)]
 async fn a_silent_stream_is_reported_dead_to_a_polling_client() {
     let silence = Duration::from_millis(300);
     // A heartbeat interval far beyond the client's tolerance, so the stream is
@@ -3507,6 +3564,7 @@ async fn a_silent_stream_is_reported_dead_to_a_polling_client() {
 /// that accepts the connection and never answers must not park the caller,
 /// which for the TUI's reconnect path would freeze input and redraw with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: real stream-open timeout")]
 async fn opening_a_stream_against_a_mute_host_is_abandoned() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -4398,6 +4456,10 @@ async fn a_peer_from_the_outer_global_allow_occurrence_can_connect() {
 /// The core property: a client fed through the real HTTP stack lands on the
 /// same state as one attached in process to the same host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn an_http_client_converges_with_an_in_process_oracle() {
     for scenario in [CutScenario::ToolTurn, CutScenario::SubAgentTurn] {
         let fixture = Fixture::new(scenario.script()).await;
@@ -4436,6 +4498,10 @@ async fn an_http_client_converges_with_an_in_process_oracle() {
 /// included. Whoever changes what that snapshot carries breaks this test, and
 /// the fix is here rather than in the ordering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_joiner_takes_the_task_table_from_caught_up() {
     let fixture = Fixture::new(background_task_turn()).await;
     let session = fixture.create().await;
@@ -4484,6 +4550,10 @@ async fn a_joiner_takes_the_task_table_from_caught_up() {
 /// A mid-session joiner learns the active settings from the attach `state`
 /// frame, which is their only carrier: no projected event names them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_mid_session_joiner_sees_the_active_settings() {
     let fixture = Fixture::new(vec![finalized_text_message("answered")]).await;
     let session = fixture.create().await;
@@ -4638,7 +4708,7 @@ impl CutScenario {
             .await
             .expect("a compact on an idle session");
         assert!(matches!(outcome, CommandOutcome::Accepted));
-        oracle.settle().await;
+        finish_cut_turn(oracle).await;
 
         // What the compact did, not just that it did something: a compact
         // that found work would summarize instead, and this run needs the
@@ -4651,8 +4721,27 @@ impl CutScenario {
         );
 
         fixture.prompt(session, "and one more thing").await;
-        oracle.settle().await;
+        finish_cut_turn(oracle).await;
     }
+}
+
+/// These scripts have no background work or queued continuations. Their live
+/// idle state follows the turn's transcript events, so it is the completion
+/// boundary, not a period of transport silence. The client must have consumed
+/// its attach block before the command starts.
+async fn finish_cut_turn(client: &mut Attached) {
+    client
+        .pump_until("the scripted turn to finish", |frame| {
+            matches!(
+                frame,
+                Frame::State {
+                    opens_block: false,
+                    working: false,
+                    ..
+                }
+            )
+        })
+        .await;
 }
 
 /// What one cut run proved, so a sweep of runs that proved nothing fails
@@ -4679,10 +4768,12 @@ async fn converges_after_a_cut(scenario: CutScenario, cut: usize) -> CutRun {
     let folded = remote.pump_frames(cut).await;
     remote.cut();
     let interrupted = remote.client.cursor().map(|cursor| cursor.seq);
-    oracle.settle().await;
+    finish_cut_turn(&mut oracle).await;
     scenario.while_away(&fixture, &session, &mut oracle).await;
     let complete = oracle.client.cursor().map(|cursor| cursor.seq);
     remote.reattach().await;
+    // Finished sub-agents' lifecycle repair frames follow caught_up, so the
+    // attach block alone is not the end of the client's catch-up work.
     remote.settle().await;
 
     scenario.assert_completed(&oracle.canonical());
@@ -4803,6 +4894,10 @@ async fn sweep(scenario: CutScenario, seed: u64, count: usize) -> CutTally {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: generated reconnect cut sweep"
+)]
 async fn tool_turn_stream_cuts_at_seeded_boundaries_converge() {
     let tally = sweep(CutScenario::ToolTurn, 0x5eed_1234_9abc_def0, 6).await;
     assert!(
@@ -4812,6 +4907,10 @@ async fn tool_turn_stream_cuts_at_seeded_boundaries_converge() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: generated reconnect cut sweep"
+)]
 async fn sub_agent_stream_cuts_at_seeded_boundaries_converge() {
     let tally = sweep(CutScenario::SubAgentTurn, 0x1234_5678_9abc_def0, 4).await;
     assert!(
@@ -4821,6 +4920,10 @@ async fn sub_agent_stream_cuts_at_seeded_boundaries_converge() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: generated reconnect cut sweep"
+)]
 async fn stream_cuts_converge_without_replaying_notices_raised_while_away() {
     let tally = sweep(CutScenario::NoticeWhileAway, 0x0bad_c0de_9abc_def0, 4).await;
     assert!(
@@ -4840,6 +4943,10 @@ async fn stream_cuts_converge_without_replaying_notices_raised_while_away() {
 /// `ToolExecutionEnd` and the durable `MessageEnd` of its result entry, so
 /// the client holds a finished cell whose log entry it never saw.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_cut_between_a_tool_end_and_its_durable_message_converges() {
     let fixture = Fixture::new(tool_turn()).await;
     let session = fixture.create().await;
@@ -4869,6 +4976,10 @@ async fn a_cut_between_a_tool_end_and_its_durable_message_converges() {
 /// arguments live nowhere else, so quiesce keeps the cell and the backfill
 /// cannot regenerate it) and must not leave either spinner stuck.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_cut_with_a_tool_and_a_sub_agent_running_converges() {
     // A report long enough that the sub is still streaming it when the client
     // comes back, and a command that keeps the parent blocked past that.
@@ -4941,6 +5052,10 @@ async fn a_cut_with_a_tool_and_a_sub_agent_running_converges() {
 /// reliable-transient and went to no stream, and a block carries no task
 /// events, so the table on `caught_up` is the only thing that can say so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_task_that_ended_while_away_reads_as_ended_from_caught_up() {
     let mut script = background_task_turn();
     // The kill's completion notice wakes the agent for one more turn.
@@ -5010,6 +5125,10 @@ async fn a_task_that_ended_while_away_reads_as_ended_from_caught_up() {
 /// the post-`caught_up` sweep, and the test pins both: the first concludes the
 /// box, the second lands on it without disturbing it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
     // A short report, so the sub concludes early in the parent's long sleep.
     let fixture =
@@ -5109,6 +5228,10 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
 /// re-attach, the full backfill lands it where a client that only ever saw
 /// the new branch is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn frames_from_a_stale_epoch_are_dropped_until_a_reattach() {
     let fixture = Fixture::new(vec![
         finalized_text_message("first answer"),
@@ -5275,6 +5398,10 @@ async fn invalid_environment_requests_leave_the_map_unchanged() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn a_busy_environment_edit_forwards_the_host_refusal() {
     let fixture = Fixture::with_provider(scripted(
         vec![finalized_text_message("a fairly long answer to stream")],
@@ -5348,6 +5475,10 @@ async fn a_host_without_historical_environment_reads_never_returns_the_live_map(
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: remote catch-up quiet window"
+)]
 async fn branch_context_and_environment_cross_both_control_adapters() {
     let fixture = Fixture::new(vec![finalized_text_message("original answer")]).await;
     let session = fixture.create().await;

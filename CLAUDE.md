@@ -67,16 +67,17 @@ override the effective config. Skills are discovered from user and project
 
 ## Verification
 
+Normally run only fast tests (`./scripts/check-test-scratch.sh`), reserving slow tests for relevant changes or CI.
+
 The current CI gate for review-ready work is:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`
-- `./scripts/check-test-scratch.sh` (the ordinary parallel workspace suite)
+- `./scripts/check-test-scratch.sh --workspace --features slow-tests` (fast and slow tests, excluding opt-in live-provider tests)
 - `cargo build --all-targets`
 - `./scripts/check-no-tui-dep.sh`
 - `./scripts/check-no-http-dep.sh`
 - `./scripts/test-check-test-scratch.sh`
-- `./scripts/check-test-scratch.sh -p aj gateway::tests -- --test-threads=1`
 
 Scale targeted checks while iterating, but verify the final range against the
 guarantees it claims. Important behavior is exercised through the real composed

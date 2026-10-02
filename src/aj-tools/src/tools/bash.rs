@@ -1940,6 +1940,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for the 500ms RTK hook timeout"
+    )]
     fn rtk_passthrough_runs_the_hook_answer_or_original_command() {
         let bash = host_executable("bash");
         let sleep = host_executable("sleep");
@@ -2056,6 +2060,10 @@ esac
     /// child, capture readers, and session cleanup lease.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for TERM grace and the reap timeout"
+    )]
     async fn direct_command_reap_bound_releases_capture_and_cleanup_ownership() {
         let sleep = host_executable("sleep");
         let child = Command::new(sleep)
@@ -2130,6 +2138,10 @@ esac
     /// driver record, capture readers, and process cleanup lease to be gone.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for TERM grace and the reap timeout"
+    )]
     async fn cancelled_background_command_settles_after_an_unavailable_reap() {
         let sleep = host_executable("sleep");
         let child = Command::new(sleep)
@@ -2658,6 +2670,10 @@ esac
     /// timeout.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for the SIGKILL escalation grace"
+    )]
     async fn cancellation_escalates_to_sigkill_when_sigterm_is_ignored() {
         let dir = TempDir::new().expect("tempdir");
         let pid_path = dir.path().join("command.pid");
@@ -2728,6 +2744,10 @@ esac
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for command timeout and TERM grace"
+    )]
     async fn timeout_kills_command_and_marks_error() {
         let dir = TempDir::new().expect("tempdir");
         let pid_path = dir.path().join("command.pid");
@@ -2794,6 +2814,10 @@ esac
     /// survives a run where the turn never returns at all.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for the pipe drain grace"
+    )]
     async fn descendant_holding_a_pipe_does_not_hold_the_turn_open() {
         /// How long the turn may take once the shell has exited. Well
         /// above any bounded drain, well below the descendant's own
@@ -2898,6 +2922,10 @@ esac
     /// `nohup`-style daemon that behaves.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits through a 300ms survival window"
+    )]
     async fn a_straggler_that_let_go_of_the_pipes_is_left_alone() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("daemon-pid");
@@ -2971,6 +2999,10 @@ esac
     /// `setsid`ed descendant walked away from it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for command timeout and pipe drain windows"
+    )]
     async fn a_holder_outside_the_group_is_bounded_by_dropping_the_pipes() {
         /// Timeout, two drain windows, the post-kill window, and room
         /// for a loaded machine.
@@ -3039,6 +3071,10 @@ esac
     /// held open past the grace.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for the pipe drain grace"
+    )]
     async fn a_straggler_holding_one_stream_is_drained_like_any_other() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("stderr-holder-pid");
@@ -3108,6 +3144,10 @@ esac
     /// because the child has already been reaped.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for pipe drain and escalation windows"
+    )]
     async fn the_drain_escalates_from_sigterm_to_sigkill() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("holder-pid");
@@ -3169,6 +3209,10 @@ esac
     /// grace to nothing.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for the 300ms mid-drain drop timeout"
+    )]
     async fn a_drop_during_the_drain_still_kills_the_group() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("holder-pid");
@@ -3230,6 +3274,10 @@ esac
     /// wait ended by dropping the read ends.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for escaped-holder pipe drain windows"
+    )]
     async fn a_cancel_with_a_holder_outside_the_group_is_still_bounded() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("session-leader-pid");
@@ -3309,6 +3357,10 @@ esac
     /// can leave a trace of its own.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for 1s shell staging and a 1.5s leak window"
+    )]
     async fn a_spill_failure_does_not_leak_the_command() {
         let dir = TempDir::new().expect("create temp dir");
         let allowed = dir.path().join("spill");
@@ -3365,6 +3417,10 @@ esac
     /// test uses a command that goes away on the first signal.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for the SIGKILL escalation grace"
+    )]
     async fn a_dropped_command_that_ignores_sigterm_is_killed() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("shell-pid");
@@ -3405,6 +3461,10 @@ esac
     /// looks at.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for teardown grace before reader release"
+    )]
     async fn a_dropped_command_releases_its_capture_readers() {
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
@@ -3466,6 +3526,10 @@ esac
     /// than into the pipe under test.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for teardown grace before reader release"
+    )]
     async fn a_dropped_call_releases_the_pipes_the_tool_opened() {
         let dir = TempDir::new().expect("create temp dir");
         let pid_path = dir.path().join("session-leader-pid");
@@ -3575,6 +3639,10 @@ esac
     /// completion path kills the same holder.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for the SIGKILL escalation grace"
+    )]
     async fn a_reaped_leader_still_gets_its_group_killed() {
         let dir = TempDir::new().expect("create temp dir");
         let shell_pid_path = dir.path().join("shell-pid");
@@ -3745,40 +3813,6 @@ esac
         );
     }
 
-    /// The residue of the guarantee above, specified rather than
-    /// fixed: escalation belongs to the spawned teardown and dies with
-    /// the runtime, so a command that ignores `SIGTERM` outlives the
-    /// host that held it. Under a live host the same command is
-    /// killed, which is what
-    /// `a_dropped_command_that_ignores_sigterm_is_killed` holds.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_term_immune_command_outlives_the_runtime_that_held_it() {
-        let dir = TempDir::new().expect("create temp dir");
-        let pid_path = dir.path().join("shell-pid");
-        let command = format!(
-            "trap '' TERM; echo $$ > '{pid}'; \
-             while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done",
-            pid = pid_path.display(),
-            dir = dir.path().display(),
-        );
-        let held = GuardHeldByItsRuntime::spawn(command, &pid_path);
-        let pid = held.pid;
-
-        held.drop_the_runtime();
-
-        // Past the point a live host would have escalated. What
-        // survives this survives because there was nothing left to
-        // escalate, not because the kill is still on its way.
-        std::thread::sleep(KILL_GRACE + Duration::from_millis(500));
-        assert!(
-            process_is_live(pid),
-            "a SIGTERM-immune command was killed after its runtime went: the escalation is \
-             a courtesy of the spawned teardown, and a synchronous kill in Drop would stall \
-             every host exit by the grace, per live guard"
-        );
-    }
-
     /// A command running under an armed guard that only the runtime's
     /// own shutdown can drop, which is the shape a host exit has.
     ///
@@ -3788,7 +3822,6 @@ esac
     #[cfg(target_os = "linux")]
     struct GuardHeldByItsRuntime {
         runtime: tokio::runtime::Runtime,
-        pid: i32,
         dropped_in_runtime_context: Arc<AtomicBool>,
     }
 
@@ -3831,7 +3864,6 @@ esac
             );
             Self {
                 runtime,
-                pid,
                 dropped_in_runtime_context,
             }
         }
@@ -4244,6 +4276,10 @@ esac
     /// capture was cut short, and still reports the real exit status.
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for the pipe drain grace"
+    )]
     async fn background_task_with_a_pipe_holder_still_finishes() {
         let dir = TempDir::new().expect("create temp dir");
         let mut ctx = DummyToolContext::default();

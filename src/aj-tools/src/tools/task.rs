@@ -512,6 +512,10 @@ mod tests {
     /// Hitting the blocking timeout is a normal "still running"
     /// report, not an error.
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: waits for the 1s blocking read timeout"
+    )]
     async fn block_timeout_is_not_an_error() {
         let mut ctx = DummyToolContext::default();
         let (id, spill) = start_background(&mut ctx, "sleep 30").await;

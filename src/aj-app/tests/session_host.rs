@@ -297,6 +297,10 @@ impl Harness {
 /// A current-thread runtime makes blocking a host caller observable even when
 /// the machine has spare worker threads.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 250ms blocked config-write observation window"
+)]
 fn concurrent_config_edits_preserve_disables_and_keep_readers_available() {
     const CHILD: &str = "AJ_CONFIG_EDITS_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -2211,6 +2215,10 @@ async fn the_tick_probes_nothing_until_something_is_held() {
 /// Deliberately no enumeration point after the kill: a `sessions()` call would
 /// sweep the locks and clear the bit for the wrong reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 2s lock probe tick after a rival process crash"
+)]
 async fn a_crashed_rivals_hold_falls_away_on_its_own() {
     let harness = Harness::new(vec![finalized_text_message("on the record")]);
     let session = harness.create().await;
@@ -2673,6 +2681,10 @@ async fn two_sessions_on_one_host_stay_independent() {
 /// The rule is what keeps a busy session a client never asked for from
 /// filling that client's bounded queue and evicting it.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn a_stream_sees_nothing_from_a_session_it_did_not_attach() {
     let harness = Harness::new(Vec::new());
     let watched = harness.create().await;
@@ -2897,6 +2909,10 @@ async fn a_head_switch_replaces_the_epoch_and_resets_the_stream() {
 /// is live: a mid-turn switch would let the running turn persist onto the
 /// wrong branch.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn a_head_switch_is_refused_while_work_is_live() {
     async fn assert_env_edit_refused(harness: &Harness, session: &str) {
         let handles = harness.host.local_handles(session).await.unwrap();
@@ -3625,6 +3641,10 @@ async fn stays_live(host: &SessionHost, session: &str, windows: u32) {
 /// driver is gone, its lock is free for another writer, and the directory
 /// reports it cold with the stamp its own work left.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn an_idle_unattached_session_is_released() {
     let harness =
         Harness::with_idle_grace(vec![finalized_text_message("on the record")], IDLE_GRACE);
@@ -3668,6 +3688,10 @@ async fn an_idle_unattached_session_is_released() {
 /// what keeps the `list` publisher's suppression from being defeated by a
 /// stamp that ticks on every event.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn a_lossy_event_does_not_move_a_sessions_stamp() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message("a slowly streamed answer")],
@@ -3724,6 +3748,10 @@ async fn a_lossy_event_does_not_move_a_sessions_stamp() {
 /// log bears, so a session the user merely opens does not claim it just did
 /// something, and the row survives a round trip through liveness unchanged.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_resumed_session_reports_its_logs_stamp_in_both_directions() {
     let harness =
         Harness::with_idle_grace(vec![finalized_text_message("on the record")], IDLE_GRACE);
@@ -3777,6 +3805,10 @@ async fn a_resumed_session_reports_its_logs_stamp_in_both_directions() {
 /// at view time, so a row that goes back in time is a glyph that will not
 /// fire for output the user has not seen.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_sessions_stamp_survives_a_round_trip_through_liveness() {
     let harness = Harness::with_idle_grace(
         vec![
@@ -3841,6 +3873,10 @@ async fn a_sessions_stamp_survives_a_round_trip_through_liveness() {
 /// them. A row carrying that reads to a client as output it has not seen,
 /// on a session that produced nothing.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 1.2s wait distinguishes flush mtime from activity"
+)]
 async fn a_release_does_not_stamp_a_session_with_its_own_flush() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -3897,6 +3933,10 @@ async fn a_release_does_not_stamp_a_session_with_its_own_flush() {
 /// retention signal, so a sidebar-era client that holds
 /// background sessions holds their locks, deliberately.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn an_attached_session_is_never_released() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("hi back")], IDLE_GRACE);
     let session = harness.create().await;
@@ -3920,6 +3960,10 @@ async fn an_attached_session_is_never_released() {
 /// message: the queues are memory only, so releasing a session with one
 /// pending would discard it. Both let go once they are gone.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn live_work_and_queued_messages_hold_a_session_live() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("noted")], IDLE_GRACE);
     let session = harness.create().await;
@@ -3964,6 +4008,10 @@ async fn live_work_and_queued_messages_hold_a_session_live() {
 /// not go the instant that client lets go: the next attach would re-resume the
 /// whole log for nothing, which is what the grace exists to prevent.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_detach_starts_the_grace_over() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -3989,6 +4037,10 @@ async fn a_detach_starts_the_grace_over() {
 /// wire surface of a release, and a client watching another
 /// session has no other way to learn it: a released session emits no events.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_release_publishes_the_directory() {
     let harness = Harness::with_idle_grace(
         vec![
@@ -4050,6 +4102,10 @@ async fn a_release_publishes_the_directory() {
 /// recently the session had been working, which is the resume thrash the grace
 /// exists to prevent.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn work_between_two_ticks_restarts_the_grace() {
     let harness = Harness::with_idle_grace(
         vec![
@@ -4097,6 +4153,10 @@ async fn work_between_two_ticks_restarts_the_grace() {
 /// is memory only, like the message queues, so a release would discard a
 /// completion the model never saw.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn an_undelivered_task_notice_holds_a_session_live() {
     let harness = Harness::with_idle_grace(
         vec![
@@ -4154,6 +4214,10 @@ async fn an_undelivered_task_notice_holds_a_session_live() {
 /// directory or leave a row that predates the materialization, and both are
 /// worse than holding the lock for another grace.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_session_the_host_cannot_row_is_not_released() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -4182,6 +4246,10 @@ async fn a_session_the_host_cannot_row_is_not_released() {
 /// publishing a row that predates the session's own work would silently erase
 /// it.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_release_never_lowers_the_stamp_it_publishes() {
     let harness = Harness::with_idle_grace(
         vec![
@@ -4223,6 +4291,10 @@ async fn a_release_never_lowers_the_stamp_it_publishes() {
 /// The epoch dies with the materialization, so the cursor the
 /// client still holds names a history this host no longer has.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn attaching_after_a_release_rebuilds_the_same_state() {
     let harness =
         Harness::with_idle_grace(vec![finalized_text_message("recorded answer")], IDLE_GRACE);
@@ -4269,6 +4341,10 @@ async fn attaching_after_a_release_rebuilds_the_same_state() {
 /// already cold, which is the re-materializing half. A grace of nothing means
 /// the sweeper takes every session it finds idle.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: commands paced across real release ticks"
+)]
 async fn a_command_racing_a_release_is_neither_lost_nor_doubled() {
     let harness = Harness::with_idle_grace(
         vec![
@@ -4331,6 +4407,10 @@ async fn a_command_racing_a_release_is_neither_lost_nor_doubled() {
 /// for, so releasing one would drop it: a client that created a session and
 /// has not prompted or attached yet would find its id gone.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_session_with_nothing_on_disk_is_never_released() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("first words")], IDLE_GRACE);
     let session = harness.create().await;
@@ -4361,6 +4441,10 @@ async fn a_session_with_nothing_on_disk_is_never_released() {
 /// submits a prompt and closes its stream still gets its work done, and the
 /// release waits for the turn rather than cancelling it.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn a_turn_nobody_is_attached_to_is_not_released_out_from_under() {
     let harness = Harness::with_run_config(
         snapshot(scripted(
@@ -4416,6 +4500,10 @@ async fn a_turn_nobody_is_attached_to_is_not_released_out_from_under() {
 /// records it: main is idle throughout, and a continuation is a turn the host
 /// drives rather than a background task, so nothing else in the status names it.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn a_sub_agents_continuation_holds_its_session_live() {
     let mut script = sub_agent_turn();
     // A continuation slow enough to outlast several graces.
@@ -4473,6 +4561,10 @@ async fn a_sub_agents_continuation_holds_its_session_live() {
 /// mark, which is what makes the teardown flush load-bearing rather than
 /// decorative.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_released_session_can_be_taken_over_by_another_host() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -4540,6 +4632,10 @@ async fn a_released_session_can_be_taken_over_by_another_host() {
 /// passes. A store with many logs widens the scan, which is what makes landing
 /// there likely.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_release_never_drops_a_session_out_of_the_directory() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let sessions_dir = harness.persistence.sessions_dir().to_path_buf();
@@ -4590,6 +4686,10 @@ async fn a_release_never_drops_a_session_out_of_the_directory() {
 /// state, and the next enumeration preserves that answer while the file stays
 /// unchanged.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_release_hands_its_row_to_the_directory() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -4671,6 +4771,10 @@ async fn a_release_hands_its_row_to_the_directory() {
 /// Every queue mutation publishes a `QueueUpdate`, on the enqueue side as
 /// well as the drain side, and a second attached subscriber sees them.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn queue_mutations_reach_every_subscriber() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message("a slowly streamed answer")],
@@ -4774,6 +4878,10 @@ async fn queue_mutations_reach_every_subscriber() {
 /// them off the `QueueUpdate` payloads, so this asserts on the fold of those
 /// frames rather than on the queues behind the host.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn a_steer_queues_as_steering_and_an_empty_steer_promotes() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
@@ -4955,6 +5063,10 @@ async fn every_queue_mutation_publishes_an_update() {
 /// `caught_up` carries are asserted here for the same reason, against state
 /// the host itself built.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn clearing_the_queue_empties_every_agent() {
     let mut script = sub_agent_turn();
     // Two slow turns for the two agents to be busy in, long enough that the
@@ -5429,6 +5541,10 @@ async fn a_settings_change_that_did_not_apply_is_refused() {
 /// A prompt runs a turn when the agent is idle and queues when it is busy,
 /// exactly like the local submit gesture.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn a_prompt_runs_when_idle_and_queues_when_busy() {
     let harness = Harness::with_provider(scripted(
         vec![
@@ -5550,6 +5666,10 @@ async fn a_cancel_stops_the_turn_and_publishes_its_notice() {
 /// Cancelling a foreground sub-agent cascades to the main turn that owns
 /// it, matching the local gesture.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn cancelling_a_foreground_sub_cascades_to_main() {
     let harness = Harness::with_provider(scripted(
         vec![
@@ -5991,6 +6111,10 @@ fn assert_detached_sub_was_killed(ending: &DetachedEnding, parent: ParentTurn) {
 /// invented for a cancelled run, whether a status, a box report, a
 /// completion notice or a notice of its own, fails here.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn a_cancelled_detached_sub_ends_exactly_as_a_killed_task_does() {
     for parent in [ParentTurn::Ended, ParentTurn::Live] {
         let cancelled = end_detached_sub(EndDetached::Cancel, parent).await;
@@ -6015,6 +6139,10 @@ async fn a_cancelled_detached_sub_ends_exactly_as_a_killed_task_does() {
 /// registry first would kill an all-but-finished run, leave the continuation
 /// going, and report `Accepted` for it.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn a_cancel_of_a_driven_sub_takes_the_turn_not_its_task() {
     let mut script = sub_agent_turn();
     // The continuation, slow enough to be cancelled mid-stream.
@@ -6281,6 +6409,10 @@ async fn cancelling_an_idle_agent_is_accepted() {
 
 /// Compaction is refused while the main agent is busy.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn compaction_is_refused_while_busy() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message("a slowly streamed answer")],
@@ -7645,6 +7777,10 @@ async fn a_persistence_failure_ends_the_materialization_and_a_reopen_rebuilds_it
 /// it ends only its own materialization: another session on the host keeps
 /// working and its bytes are untouched.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn a_detached_writers_persistence_failure_ends_only_its_session() {
     let harness = detached_sub_harness();
     let affected = harness.create().await;
@@ -7942,6 +8078,10 @@ async fn a_failed_log_open_says_the_message_was_not_recorded() {
 /// stream, and no live durable frame at or below the boundary follows it,
 /// even when durable events land while the attach is being served.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn the_attach_block_is_contiguous_and_filters_the_boundary() {
     let harness = Harness::with_provider(scripted(
         vec![
@@ -8200,6 +8340,10 @@ fn states(frames: &[Frame], thinking: &str) -> usize {
 /// was attached from the start. This is the phase-1 shape of the
 /// equivalence harness.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn attaching_mid_turn_converges_with_a_client_attached_all_along() {
     let harness = Harness::with_provider(scripted(
         vec![
@@ -8254,6 +8398,10 @@ async fn attaching_mid_turn_converges_with_a_client_attached_all_along() {
 /// force-closed box, no spurious conclusion. Once the sub finishes both
 /// clients converge.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn attaching_mid_sub_run_leaves_the_bracket_open() {
     let harness = Harness::with_provider(scripted(sub_agent_turn(), 1, Duration::from_millis(20)));
     let session = harness.create().await;
@@ -8301,6 +8449,10 @@ async fn attaching_mid_sub_run_leaves_the_bracket_open() {
 /// live. Without it the footer's agent count, the picker, the spinner, and
 /// every busy-gated gesture read the inherited sub as idle.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn an_attach_block_opens_the_bracket_of_a_live_sub() {
     let harness = Harness::with_provider(scripted(sub_agent_turn(), 1, Duration::from_millis(20)));
     let session = harness.create().await;
@@ -8382,6 +8534,10 @@ async fn an_attach_block_opens_the_bracket_of_a_live_sub() {
 /// real conclusion has not reached the warm client by the time a block has
 /// been written was still live when that block was written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn attaching_as_a_sub_agent_spawns_never_concludes_it() {
     let harness =
         Harness::with_provider(scripted(background_sub_turn(), 1, Duration::from_millis(5)));
@@ -8455,6 +8611,10 @@ async fn attaching_as_a_sub_agent_spawns_never_concludes_it() {
 /// turn for is the other half, recorded before the turn's task exists so no
 /// append of the new run can land while the run still reads as finished.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn attaching_during_a_sub_agent_continuation_leaves_its_bracket_open() {
     let mut script = sub_agent_turn();
     script.push(finalized_text_message(
@@ -8545,6 +8705,10 @@ async fn attaching_during_a_sub_agent_continuation_leaves_its_bracket_open() {
 /// settings: without them a client that had lost the box would re-open it as
 /// an unlabelled foreground run.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn attaching_with_a_cursor_inside_a_live_sub_run_resynthesizes_its_start() {
     // The parent and the background child share the provider, so which of the
     // two long messages each gets is up to their interleaving. Both are long,
@@ -8705,6 +8869,10 @@ fn spawn_root_seq(frames: &[Frame]) -> u64 {
 /// `Running`, so one left concluded would render the first run's report for
 /// good.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn attaching_during_a_sub_agent_continuation_converges_on_its_report() {
     let mut script = sub_agent_turn();
     script.push(finalized_text_message(
@@ -8940,6 +9108,10 @@ async fn settled(harness: &Harness, session: &str, last_seq: u64) {
 /// own contract is
 /// [`distinct_directories_inside_one_window_reach_a_client_as_one_frame`].
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn list_frames_carry_the_directory_and_not_one_per_event() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
@@ -9006,6 +9178,10 @@ async fn list_frames_carry_the_directory_and_not_one_per_event() {
 /// was, so its deltas do not wake the list publisher at all, let alone send a
 /// frame.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real delta-only publication observation window"
+)]
 async fn streaming_deltas_alone_do_not_wake_the_list_publisher() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
@@ -9113,6 +9289,10 @@ const RELABEL_STEP: Duration = Duration::from_millis(5);
 /// stretch the burst past it fails loudly instead of passing on a bound it
 /// would meet with or without the tick.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn distinct_directories_inside_one_window_reach_a_client_as_one_frame() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
@@ -9244,6 +9424,10 @@ fn directories(frames: &[Frame]) -> Vec<Vec<SessionSummary>> {
 /// directory read the host does is attributable to an enumeration point, and a
 /// streaming turn, which marks the directory dirty on every event, is not one.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn a_turns_refreshes_never_read_the_directory() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
@@ -9295,6 +9479,10 @@ async fn a_turns_refreshes_never_read_the_directory() {
 /// working directory, so a sibling's session is a conflict to
 /// surface when asked, not a workload to poll for.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn a_siblings_session_appears_at_the_next_enumeration_point() {
     let harness = Harness::new(vec![finalized_text_message("hi back")]);
     let session = harness.create().await;
@@ -9376,6 +9564,10 @@ async fn a_siblings_session_is_attachable_before_it_is_listed() {
 /// long-running host sees what the store holds now rather than what it held
 /// when the host started.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn a_fresh_stream_enumerates_the_store() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
@@ -9404,6 +9596,10 @@ async fn a_fresh_stream_enumerates_the_store() {
 /// The host's own structural changes reach the directory without an
 /// enumeration: it knows what it just did, and the answer is already in memory.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn the_hosts_own_changes_need_no_enumeration() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let first = harness.create().await;
@@ -9458,6 +9654,10 @@ async fn the_hosts_own_changes_need_no_enumeration() {
 /// unsuppressed a streaming turn republishes one payload at the debounce rate
 /// for the length of the turn.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn an_unchanged_directory_is_not_published_again() {
     let harness = Harness::with_provider(scripted(
         vec![
@@ -9525,6 +9725,10 @@ async fn an_unchanged_directory_is_not_published_again() {
 /// dropping its position and walking its stamp backwards on the last
 /// directory a client ever sees.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn a_shutting_down_host_publishes_no_directory() {
     let harness = Harness::with_idle_grace(
         vec![
@@ -9657,6 +9861,10 @@ async fn attach_serves_its_initial_directory_without_waiting_for_a_refresh() {
 /// client attaching to a host whose directory has not moved in hours is still
 /// served a snapshot. Nothing else on the stream carries one.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn a_new_subscriber_is_served_a_directory_the_others_already_have() {
     let harness = Harness::new(vec![finalized_text_message("recorded")]);
     let session = harness.create().await;
@@ -9704,6 +9912,10 @@ async fn a_new_subscriber_is_served_a_directory_the_others_already_have() {
 /// is asserted away from its default: a turn in flight, a last-activity stamp
 /// that moved, and a durable position.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn list_frames_report_a_working_session() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
@@ -9768,6 +9980,10 @@ async fn list_frames_report_a_working_session() {
 /// as on-disk only until it happens to emit an event, and an
 /// attached-but-idle session emits none.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn a_materialization_publishes_the_directory() {
     let harness = Harness::new(vec![finalized_text_message("on the record")]);
     let dormant = harness.create().await;
@@ -9853,6 +10069,10 @@ async fn tag_of(host: &SessionHost, session: &str) -> Option<String> {
 /// it takes it off both. It is display metadata, so this is the only place it
 /// shows: no log entry, no `state` frame.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn a_tag_reaches_the_row_and_the_directory() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
@@ -9959,6 +10179,10 @@ async fn a_session_can_be_created_already_tagged() {
 /// the driver's own answer is the only one available at that moment, and it is
 /// also the only current one: the label may have been set since the last scan.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_released_session_keeps_its_label_without_an_enumeration() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     // Attached throughout, so this one is never released and the stream stays
@@ -10034,6 +10258,10 @@ async fn a_released_session_keeps_its_label_without_an_enumeration() {
 /// starts over the same directory finds it at its startup enumeration and
 /// keeps it when it materializes the session.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_tag_survives_a_restart() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -10081,6 +10309,10 @@ async fn a_tag_survives_a_restart() {
 
 /// Explicit listings observe cold labels even when sidecar metadata does not change.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn listings_observe_external_cold_relabels_and_clears() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -10130,6 +10362,10 @@ async fn listings_observe_external_cold_relabels_and_clears() {
 /// what the host already knew, and its release hands that on rather than
 /// clearing the cached entry.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn an_unreadable_sidecar_does_not_cost_a_live_session_its_label() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -10287,6 +10523,10 @@ async fn archived_of(host: &SessionHost, session: &str) -> Option<bool> {
 /// the only place it shows: nothing about the session's state changed, so
 /// there is no `state` frame and no entry in the log.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn an_archive_reaches_the_row_and_the_directory() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
@@ -10373,6 +10613,10 @@ async fn an_archive_reaches_the_row_and_the_directory() {
 /// turn. The bit is display metadata with no lifecycle coupling: refusing here,
 /// or cancelling, or releasing, would be exactly the coupling it may not have.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn archiving_a_working_session_leaves_the_turn_alone() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message("a slowly streamed answer")],
@@ -10470,6 +10714,10 @@ async fn a_prompt_does_not_un_archive_a_session() {
 /// repair a handover that never happened, which is exactly the bug this test
 /// is for. The stream names no session, so it holds nothing live.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn a_release_hands_the_archived_bit_to_the_row_it_leaves() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -10507,6 +10755,10 @@ async fn a_release_hands_the_archived_bit_to_the_row_it_leaves() {
 /// The bit survives a release and a restart. A host that starts over the store
 /// finds it on disk, and materializing the session keeps it.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn an_archived_bit_survives_a_release_and_a_restart() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -10618,6 +10870,10 @@ async fn a_head_switch_does_not_move_the_archived_bit() {
 /// session its bit. The read says nothing about the bit, so the session goes
 /// live with what the host already knew, and its release hands that on.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 200ms idle-retention windows"
+)]
 async fn an_unreadable_sidecar_does_not_cost_a_live_session_its_archived_bit() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
@@ -11292,6 +11548,10 @@ async fn shutdown_releases_every_session() {
 /// turn. Shutdown waits for its cancellation to emit terminal events and
 /// publishes those events before closing the attachment.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn shutdown_publishes_a_detached_sub_agents_terminal_events_before_eof() {
     let harness = detached_sub_harness();
     let session = harness.create().await;
@@ -11391,6 +11651,10 @@ async fn shutdown_publishes_a_detached_sub_agents_terminal_events_before_eof() {
 /// drains live terminal frames in that state instead of mistaking the block for
 /// an aborted partial one.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn shutdown_preserves_terminal_frames_when_block_completion_is_not_yet_observed() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
@@ -11859,6 +12123,10 @@ async fn a_driven_foreground_turn_is_part_of_session_cleanup_ownership() {
 /// The turn and a foreground Bash process's asynchronous drop cleanup remain
 /// part of the session owner, so neither can outlive the advisory lock.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 2s TERM grace before forced process reaping"
+)]
 async fn host_drop_reaps_foreground_bash_before_releasing_the_lock() {
     let process_dir = TempDir::new().expect("process tempdir");
     let pid_path = process_dir.path().join("foreground-bash.pid");
@@ -12745,6 +13013,10 @@ async fn shutdown_of_idle_sessions_is_fast_and_releases_every_lock() {
 /// healthy until a stream writer existed, which is why the check lives here
 /// rather than waiting for one.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 600ms list-publisher settling windows"
+)]
 async fn every_published_frame_round_trips_through_the_wire_codec() {
     let harness = Harness::with_provider(scripted(sub_agent_turn(), 1, Duration::from_millis(5)));
     let session = harness.create().await;
@@ -13234,6 +13506,10 @@ async fn branch_draft_refusals_leave_live_and_durable_state_unchanged() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced streaming on the successful path"
+)]
 async fn environment_before_runs_during_a_turn_without_mutating_branch_state() {
     let (harness, session, historical, _) = branch_restore_harness().await;
     let handles = harness.host.local_handles(&session).await.unwrap();

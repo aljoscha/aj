@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+slow-tests = []
 # Exposes the `testing` module (no-op `ToolContext` doubles) to downstream
 # test code. Off by default so the doubles never ship in production builds.
 # `tempfile` stays a normal dependency regardless: `tools::bash` uses it for

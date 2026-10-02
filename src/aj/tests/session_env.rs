@@ -151,6 +151,10 @@ fn main_preflight_refuses_serve_and_gateway_env_before_any_state() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: paced print-mode subprocesses"
+)]
 fn print_continue_reports_that_env_is_create_only_without_backfilling_the_log() {
     let home = TempDir::new().expect("isolated home");
     let cwd = TempDir::new().expect("non-repository working directory");

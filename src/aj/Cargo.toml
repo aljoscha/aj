@@ -7,6 +7,10 @@ edition.workspace = true
 name = "aj"
 path = "src/main.rs"
 
+[features]
+# Includes wall-clock and expensive composed tests, without changing production behavior.
+slow-tests = []
+
 [dependencies]
 aj-agent = { path = "../aj-agent/" }
 aj-app = { path = "../aj-app/" }

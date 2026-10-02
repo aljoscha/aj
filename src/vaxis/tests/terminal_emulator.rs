@@ -152,6 +152,10 @@ fn osc_sets_window_title() {
 
 #[test]
 #[serial]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: real PTY resize staging delay"
+)]
 fn resize_updates_child_reported_size() {
     // The child sleeps briefly so we can resize before it reads its size, then
     // prints the current PTY size which the resize should have changed.

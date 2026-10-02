@@ -53,9 +53,11 @@ exit 71
 EOF
 chmod +x "$fixture/cargo-bin/cargo" "$fixture/scan-failure-bin/find"
 
-for mode in workspace gateway; do
+for mode in workspace full gateway; do
     args=()
-    if [[ $mode == gateway ]]; then
+    if [[ $mode == full ]]; then
+        args=(--workspace --features slow-tests)
+    elif [[ $mode == gateway ]]; then
         args=(-p aj gateway::tests -- --test-threads=1)
     fi
     SCRATCH_CARGO_LOG="$fixture/$mode-commands" PATH="$fixture/cargo-bin:$PATH" \
@@ -65,11 +67,15 @@ cat >"$fixture/workspace-expected" <<'EOF'
 <test><--no-run><--quiet><--workspace>
 <test><--quiet><--workspace>
 EOF
+cat >"$fixture/full-expected" <<'EOF'
+<test><--no-run><--quiet><--workspace><--features><slow-tests>
+<test><--quiet><--workspace><--features><slow-tests>
+EOF
 cat >"$fixture/gateway-expected" <<'EOF'
 <test><--no-run><--quiet><-p><aj><gateway::tests><--><--test-threads=1>
 <test><--quiet><-p><aj><gateway::tests><--><--test-threads=1>
 EOF
-for mode in workspace gateway; do
+for mode in workspace full gateway; do
     if ! cmp -s "$fixture/$mode-expected" "$fixture/$mode-commands"; then
         echo "error: scratch guard did not build and run $mode exactly once" >&2
         exit 1

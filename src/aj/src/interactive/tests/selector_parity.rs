@@ -348,6 +348,10 @@ async fn selector_parity_uncatalogued_runtime_keeps_thinking_edits() {
 
 /// A slow host answer for a selector the user already closed must not land
 /// in the selector opened afterwards for another host.
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: 50-millisecond stalled selector observation"
+)]
 #[tokio::test]
 async fn selector_parity_cancel_and_reopen_isolates_delayed_host_fill() {
     let left_dir = TempDir::new().unwrap();

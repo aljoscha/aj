@@ -939,6 +939,10 @@ async fn settings_parity_unsupported_host_never_falls_back_to_client_disk() {
     let _ = server.await;
 }
 
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: one-second late-reply observation window"
+)]
 #[tokio::test]
 async fn settings_parity_stalled_open_keeps_drive_responsive_and_ignores_late_reply() {
     let dir = TempDir::new().unwrap();
