@@ -49,8 +49,7 @@ fn summary_text(message: &AssistantMessage) -> Result<String, &'static str> {
     Ok(out)
 }
 
-/// Outcome of a compaction run, for callers that render text (the CLI)
-/// rather than relying on the emitted events (the TUI).
+/// Outcome of a compaction run. Progress is also emitted on the event bus.
 #[derive(Debug)]
 pub enum CompactionOutcome {
     /// Compaction ran. Token counts are estimated occupancy.
@@ -66,9 +65,27 @@ pub enum CompactionOutcome {
     Failed(String),
 }
 
-/// Plan, summarize, persist, and reseed in one shot. Assumes no turn is
-/// in flight (the caller holds the agent lock; `agent` is already
-/// borrowed mutably). Locks `log` only around the pure planning and the
+/// A failed compaction is not a failed conversational inference. The turn
+/// driver must not classify its retained assistant message for overflow retry.
+#[derive(Debug, thiserror::Error)]
+#[error("compaction failed: {0}")]
+pub(crate) struct CompactionFailure(String);
+
+impl CompactionOutcome {
+    /// Stop the driven turn on failure or cancellation. A no-op permits
+    /// continuation, but callers must not retry compaction without new work.
+    pub(crate) fn into_turn_result(self) -> Result<(), TurnError> {
+        match self {
+            Self::Compacted { .. } | Self::NothingToDo => Ok(()),
+            Self::Canceled => Err(TurnError::Aborted),
+            Self::Failed(error) => Err(TurnError::Recoverable(Box::new(CompactionFailure(error)))),
+        }
+    }
+}
+
+/// Plan, summarize, persist, and reseed in one shot. The agent must be
+/// idle or paused in its before-continuation hook, with all foreground
+/// message events persisted. Locks `log` only around the pure planning and the
 /// final persist+reseed, never across the summarizer network call, so a
 /// long summary doesn't block log writers. Cancellation is honored by
 /// the `complete_oneshot` calls; an abort before the persist step leaves
@@ -211,6 +228,12 @@ pub async fn run_compaction(
     emit_progress(agent, reason, CompactionPhase::Saving).await;
     let tokens_after = {
         let mut log_guard = log.lock().await;
+        // Cancellation before the commit boundary leaves history untouched.
+        // Once appended, checkpoint publication and reseeding must finish together.
+        if cancel.is_cancelled() {
+            drop(log_guard);
+            return finish_canceled(agent, reason, plan.tokens_before).await;
+        }
         let checkpoint = match log_guard.append_compaction(
             ThreadFilter::USER,
             summary.clone(),

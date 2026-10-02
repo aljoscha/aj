@@ -2,9 +2,9 @@
 //! continuations (overflow recovery, threshold compaction) to
 //! quiescence.
 //!
-//! `aj::compaction` owns the compaction *mechanics* (`run_compaction`);
+//! [`crate::compaction`] owns the compaction mechanics (`run_compaction`);
 //! this module owns the turn *lifecycle*. Both the interactive TUI and
-//! `--print` drive turns through [`drive_turn`], so the post-turn
+//! `--print` drive turns through [`drive_turn`], so the automatic
 //! compaction policy lives in exactly one place rather than being
 //! duplicated across the two frontends' loops.
 //!
@@ -29,7 +29,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::compaction::run_compaction;
+use crate::compaction::{CompactionFailure, run_compaction};
 use crate::session::{AgentLifecycle, SessionCore, SubAgentOverrides};
 use crate::session_setup::{RunConfigSnapshot, builtin_tool_options};
 
@@ -71,13 +71,12 @@ pub enum TurnStart {
     },
 }
 
-/// The automatic compaction continuations [`drive_turn`] applies after
-/// a turn.
+/// Automatic compaction at the boundaries driven by [`drive_turn`].
 ///
 /// Constructed per caller: interactive Main enables overflow recovery
 /// and threshold compaction; a sub-agent continuation enables neither
 /// (compaction operates on the log's Main thread); print mode enables
-/// only overflow recovery.
+/// overflow recovery and opt-in mid-turn compaction.
 pub struct TurnPolicy {
     /// Compact and retry once when a turn fails with a context overflow.
     pub recover_overflow: bool,
@@ -85,6 +84,9 @@ pub struct TurnPolicy {
     /// the model's context window, compact (no re-drive). `None`
     /// disables the threshold trigger (print mode, sub-agents).
     pub auto_threshold: Option<f64>,
+    /// `Some(t)`: compact after a completed tool batch before continuing
+    /// inference, without ending the run. `None` disables this boundary.
+    pub during_turn_threshold: Option<f64>,
     /// Shared verbatim budget for original user messages and the recent tail.
     pub keep_recent: u64,
 }
@@ -100,6 +102,8 @@ fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> TurnP
     TurnPolicy {
         recover_overflow: main && c.auto_compact,
         auto_threshold: (main && c.auto_compact).then_some(c.compact_threshold),
+        during_turn_threshold: (main && c.auto_compact && c.auto_compact_during_turn)
+            .then_some(c.compact_threshold),
         keep_recent: c.compact_keep_recent,
     }
 }
@@ -537,9 +541,10 @@ pub fn running_work_counts<'a>(
 
 /// Drive one turn and its automatic continuations to quiescence.
 ///
-/// `reconfigure` re-stamps the latest staged run-config onto the agent
-/// before each inference (interactive's `apply_turn_config`; a no-op in
-/// print mode). Returns the final turn result: `Ok` when the sequence
+/// `reconfigure` applies staged run-config at run start and idle compaction
+/// boundaries (interactive's `apply_turn_config`; a no-op in print mode).
+/// Mid-turn compaction uses the active run's configuration.
+/// Returns the final turn result: `Ok` when the sequence
 /// settled cleanly, `Recoverable`/`Aborted` for the caller to surface,
 /// `Fatal` to bubble out. Progress (compaction start/end, message
 /// events) is emitted on the agent bus as it happens, so a spawned
@@ -560,13 +565,37 @@ pub async fn drive_turn(
     cancel: CancellationToken,
 ) -> Result<(), TurnError> {
     reconfigure(agent);
+    // The hook owns only application resources, never an agent lock. It is
+    // replaced for every driven run and is not inherited by spawned agents.
+    agent.set_before_continuation(policy.during_turn_threshold.map(|threshold| {
+        let log = Arc::clone(log);
+        let handoff = handoff.clone();
+        let keep_recent = policy.keep_recent;
+        let hook: aj_agent::hooks::BeforeContinuationHook = Arc::new(move |agent, cancel| {
+            let log = Arc::clone(&log);
+            let handoff = handoff.clone();
+            Box::pin(async move {
+                compact_over_threshold(
+                    agent,
+                    &log,
+                    &handoff,
+                    threshold,
+                    keep_recent,
+                    cancel,
+                    |_| {},
+                )
+                .await
+            })
+        });
+        hook
+    }));
     let mut result = match start {
         // A compact-only start has no turn and no post-turn ladder.
         TurnStart::Compact {
             reason,
             instructions,
         } => {
-            let _ = run_compaction(
+            return run_compaction(
                 agent,
                 log,
                 handoff,
@@ -575,8 +604,8 @@ pub async fn drive_turn(
                 policy.keep_recent,
                 cancel,
             )
-            .await;
-            return Ok(());
+            .await
+            .into_turn_result();
         }
         TurnStart::Goal(text) => {
             agent
@@ -596,7 +625,7 @@ pub async fn drive_turn(
         // 1. Reactive overflow recovery (compact + retry once). The
         //    failed assistant is classified from the agent's retained
         //    terminal message, no log round-trip.
-        if matches!(result, Err(TurnError::Recoverable(_)))
+        if matches!(&result, Err(TurnError::Recoverable(error)) if !error.is::<CompactionFailure>())
             && policy.recover_overflow
             && last_turn_overflowed(agent)
         {
@@ -616,7 +645,7 @@ pub async fn drive_turn(
             }
             overflow_recovered = true;
             reconfigure(agent);
-            let _ = run_compaction(
+            run_compaction(
                 agent,
                 log,
                 handoff,
@@ -625,7 +654,8 @@ pub async fn drive_turn(
                 policy.keep_recent,
                 cancel.clone(),
             )
-            .await;
+            .await
+            .into_turn_result()?;
             // `run_compaction` trims the trailing failed assistant from
             // the reseed, so the transcript ends in a user/tool-result
             // message and `continue_run`'s precondition holds.
@@ -645,23 +675,50 @@ pub async fn drive_turn(
         //    that turn runs against the freshly reduced context — so we
         //    compact first rather than letting an over-threshold context
         //    grow further.
-        if let Some(threshold) = policy.auto_threshold
-            && over_threshold(agent, threshold)
-        {
-            reconfigure(agent);
-            let _ = run_compaction(
+        if let Some(threshold) = policy.auto_threshold {
+            compact_over_threshold(
                 agent,
                 log,
                 handoff,
-                CompactionReason::Threshold,
-                None,
+                threshold,
                 policy.keep_recent,
                 cancel.clone(),
+                &mut reconfigure,
             )
-            .await;
+            .await?;
         }
         return result;
     }
+}
+
+/// Both threshold boundaries share the same trigger and outcome handling.
+/// Each call follows new inference work, so a no-op never spins on stale usage.
+async fn compact_over_threshold(
+    agent: &mut Agent,
+    log: &Arc<TokioMutex<ConversationLog>>,
+    handoff: &AppendHandoff,
+    threshold: f64,
+    keep_recent: u64,
+    cancel: CancellationToken,
+    reconfigure: impl FnOnce(&mut Agent),
+) -> Result<(), TurnError> {
+    if over_threshold(agent, threshold) {
+        // Classify occupancy against the model that produced it. Idle callers
+        // can then apply staged settings for the compaction request itself.
+        reconfigure(agent);
+        run_compaction(
+            agent,
+            log,
+            handoff,
+            CompactionReason::Threshold,
+            None,
+            keep_recent,
+            cancel,
+        )
+        .await
+        .into_turn_result()?;
+    }
+    Ok(())
 }
 
 /// Whether the most recent inference was a context overflow, read from
@@ -701,6 +758,9 @@ fn wrap_overflow_giveup(err: TurnError) -> TurnError {
         other => other,
     }
 }
+
+#[cfg(test)]
+mod compaction_tests;
 
 #[cfg(test)]
 mod tests {
@@ -748,6 +808,7 @@ mod tests {
         TurnPolicy {
             recover_overflow: true,
             auto_threshold: None,
+            during_turn_threshold: None,
             keep_recent: 20_000,
         }
     }
@@ -952,6 +1013,7 @@ mod tests {
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: None,
+            during_turn_threshold: None,
             keep_recent: 20_000,
         };
         let result = drive_turn(
@@ -987,6 +1049,7 @@ mod tests {
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: None,
+            during_turn_threshold: None,
             keep_recent: 20_000,
         };
         let result = drive_turn(
@@ -1032,6 +1095,7 @@ mod tests {
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: Some(0.85),
+            during_turn_threshold: None,
             keep_recent: 10,
         };
         let result = drive_turn(
@@ -1204,6 +1268,7 @@ mod tests {
         let policy = TurnPolicy {
             recover_overflow: false,
             auto_threshold: Some(0.85),
+            during_turn_threshold: None,
             keep_recent: 10,
         };
         let result = drive_turn(

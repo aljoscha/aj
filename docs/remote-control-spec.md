@@ -119,6 +119,17 @@ The host layer depends on no terminal, which is what `aj serve` is.
   before opening the log, the message directs the user to start a new
   session. An id with no log answers `unknown_session`. Fatal turn failures
   that do not compromise persistence stay scoped to the turn.
+- **Mid-turn compaction.** With host config `auto_compact_during_turn = true`
+  (default `false`) and `auto_compact = true`, Main checks provider-reported
+  input occupancy against `compact_threshold` after a full tool batch and
+  before its next inference. Streaming responses are never interrupted.
+  Compaction uses the ordinary compaction events and keeps the same run active,
+  with `working` remaining true through successful compaction and continuation.
+  Failed compaction preserves the original history and stops continuation,
+  including overflow recovery, without automatically retrying compaction.
+  Queued input and task notices remain pending until an explicit start, such
+  as a prompt, manual compaction, or goal resume. The hold is in-memory only.
+  Post-turn threshold triggering is unchanged.
 
 ## 5. Wire protocol
 

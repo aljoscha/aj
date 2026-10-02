@@ -289,6 +289,9 @@ pub struct Agent {
     /// its tool batch. Set via [`Agent::set_should_stop_after_turn`];
     /// returning `true` ends the turn without a follow-up inference.
     should_stop_after_turn: Option<hooks::ShouldStopAfterTurnHook>,
+    /// Application-owned work at the paused continuation boundary.
+    /// Not inherited by sub-agents.
+    before_continuation: Option<hooks::BeforeContinuationHook>,
     /// Defense-in-depth gate for the `image_block` config flag.
     /// When `true`, [`aj_models::transform::block_user_images`] is
     /// applied to the wire-bound message vector before it reaches
@@ -405,6 +408,7 @@ impl Agent {
             before_tool_call: None,
             after_tool_call: None,
             should_stop_after_turn: None,
+            before_continuation: None,
             block_images: false,
             sub_agent_registry: SubAgentRegistry::default(),
             assignment: None,
@@ -707,8 +711,8 @@ impl Agent {
     }
 
     /// Replace the in-memory transcript wholesale. Contract: call only
-    /// while no turn is in flight (the caller holds the agent lock and
-    /// is not inside `prompt` / `wake` / `continue_run`). Used by
+    /// while no run is in flight, or from a [`hooks::BeforeContinuationHook`]
+    /// while the run is paused with its entire tool batch recorded. Used by
     /// host-driven compaction to install the reduced post-compaction
     /// projection; the durable record is the conversation log's
     /// compaction entry, from which an identical transcript is
@@ -758,6 +762,13 @@ impl Agent {
     /// context-window guards, per-turn budget enforcement.
     pub fn set_should_stop_after_turn(&mut self, hook: Option<hooks::ShouldStopAfterTurnHook>) {
         self.should_stop_after_turn = hook;
+    }
+
+    /// Install application work before the next tool-continuation request.
+    /// The hook is not inherited by sub-agents. Hosts replace it when
+    /// configuring a run, and pass `None` to disable it.
+    pub fn set_before_continuation(&mut self, hook: Option<hooks::BeforeContinuationHook>) {
+        self.before_continuation = hook;
     }
 
     /// Borrow the assembled system prompt. Empty until
@@ -1794,6 +1805,16 @@ impl Agent {
                     if hook().await {
                         break;
                     }
+                }
+
+                if self.cancellation.is_cancelled() {
+                    return Err(TurnError::Aborted);
+                }
+                if let Some(hook) = self.before_continuation.clone() {
+                    hook(self, self.cancellation.clone()).await?;
+                }
+                if self.cancellation.is_cancelled() {
+                    return Err(TurnError::Aborted);
                 }
 
                 // Notices that arrived while the tool batch ran reach

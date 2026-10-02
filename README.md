@@ -120,6 +120,18 @@ Configuration lives in `~/.aj/config.toml`. The settings window (open it from
 the command palette) covers every option and writes your changes there. You can
 also edit the file by hand.
 
+Set `auto_compact_during_turn = true` to let the main agent compact context
+within a running turn in interactive and print mode. It defaults to `false`
+and requires `auto_compact = true` (the default). After each full tool batch,
+before the next inference, AJ checks provider-reported input occupancy against
+`compact_threshold` (default `0.85` of the context window). It never interrupts
+a streaming response. Compaction uses the usual compaction flow and the same
+run stays active. If compaction fails, the original history is preserved and
+continuation stops, including overflow recovery, with no automatic retry after
+the failure. Queued messages and task notices wait until you explicitly start
+work again. Post-turn threshold triggering is unchanged: interactive mode
+checks the threshold, while print mode does not.
+
 `transcript_mode = "full"` selects transcript detail. The settings window cycles
 through `full` (the default), `compact`, and `focused`, applying changes immediately.
 This controls display, not context-window compaction. The legacy
