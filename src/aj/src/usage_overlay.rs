@@ -1127,6 +1127,7 @@ mod tests {
             provider_name: String::new(),
             provider_id: provider_id.into(),
             account: account.map(str::to_string),
+            is_default: false,
             outcome: UsageOutcome::Usage(ProviderUsage {
                 details: Vec::new(),
                 windows: vec![UsageWindow {

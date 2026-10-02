@@ -31312,6 +31312,15 @@ mod tests {
             let page = usage_page_until(&shell, "usage-owner work report").await;
             assert!(page.contains("usage-owner personal report"));
             assert!(
+                page.contains("usage-owner · personal · provider default"),
+                "{page}"
+            );
+            assert!(
+                !page.contains("usage-owner · work · provider default"),
+                "{page}"
+            );
+            assert_eq!(page.matches("provider default").count(), 1, "{page}");
+            assert!(
                 page.contains("Usage credits") && page.contains("work credits"),
                 "{page}"
             );

@@ -739,11 +739,14 @@ pub(crate) fn usage_rows(
             &status.provider_name,
             status.account.as_deref(),
         );
-        rows.push(plain(account_label_for_auth_row(
-            &identity,
-            usize::from(AUTH_ROW_CELL_LIMIT),
-            width_method,
-        )));
+        let mut heading = vec![span(
+            account_label_for_auth_row(&identity, usize::from(AUTH_ROW_CELL_LIMIT), width_method),
+            Style::default(),
+        )];
+        if status.is_default && status.account.is_some() {
+            heading.push(span(" · provider default", styles.muted));
+        }
+        rows.push(Row::Text(heading));
         rows.extend(group);
     }
     if rows.is_empty() {
@@ -1485,6 +1488,7 @@ mod tests {
                 provider_id: "anthropic".into(),
                 provider_name: "Claude".into(),
                 account: Some("個人".into()),
+                is_default: false,
                 outcome: UsageOutcome::Usage(ProviderUsage {
                     details: Vec::new(),
                     windows: vec![UsageWindow {
@@ -1500,6 +1504,7 @@ mod tests {
                 provider_id: "openai-codex".into(),
                 provider_name: String::new(),
                 account: Some(String::new()),
+                is_default: true,
                 outcome: UsageOutcome::Usage(ProviderUsage {
                     details: Vec::new(),
                     windows: vec![UsageWindow {
@@ -1527,7 +1532,15 @@ mod tests {
                 "  A long note that must not widen any window column"
             );
             assert_eq!(row_text(&rows[3]), " ");
-            assert_eq!(row_text(&rows[4]), "openai-codex · Unnamed account");
+            assert_eq!(
+                row_text(&rows[4]),
+                "openai-codex · Unnamed account · provider default"
+            );
+            let widget = row_widgets(&rows[4..5]).pop().unwrap();
+            let surface =
+                vaxis::vxfw::draw_widget(&widget, &crate::test_support::draw_ctx(80, Some(1)));
+            let cells = crate::test_support::flatten(&surface);
+            assert_eq!(cells[0][33].style, test_styles().muted);
             assert_eq!(row_text(&rows[6]), "  Rate-limit resets  2 available");
             let mut ctx = crate::test_support::draw_ctx(80, Some(1));
             ctx.width_method = method;
@@ -1563,6 +1576,7 @@ mod tests {
                 provider_id: "first".into(),
                 provider_name: String::new(),
                 account: None,
+                is_default: false,
                 outcome: UsageOutcome::Usage(ProviderUsage {
                     windows: vec![UsageWindow {
                         label: "5h limit".into(),
@@ -1576,6 +1590,7 @@ mod tests {
                 provider_id: "second".into(),
                 provider_name: String::new(),
                 account: None,
+                is_default: false,
                 outcome: UsageOutcome::Usage(ProviderUsage {
                     details: vec![UsageDetail {
                         label: "Usage credits".into(),
@@ -1621,6 +1636,7 @@ mod tests {
             provider_id: "provider".into(),
             provider_name: String::new(),
             account: Some(" a    b ".into()),
+            is_default: false,
             outcome,
         })
         .collect();

@@ -778,7 +778,7 @@ side's limitation. Neither side's values fall back to the other's.
   session's token totals. Returns `ProviderUsageReport` in `aj-wire`, with
   `statuses` sorted by provider and exact account label, and `reset_providers`
   naming providers with a configured reset adapter. Each status contains
-  `provider_id`, `provider_name`, nullable `account`, and `outcome`: `Usage`
+  `provider_id`, `provider_name`, nullable `account`, `is_default`, and `outcome`: `Usage`
   (windows, details, notes, optional reset credits), `Unsupported` (reason),
   `NotConfigured`, `NoSource`, or `Error` (message). Enums use serde's externally
   tagged representation.
@@ -792,6 +792,10 @@ side's limitation. Neither side's values fall back to the other's.
   defaults to an empty string when absent. Clients display `provider_id` when
   it is empty, without inferring a name from human-readable status text.
   Naming alone never refreshes a token.
+  `is_default` marks the exact stored account that was the provider default
+  when accounts were discovered. It defaults to false when absent and is false
+  for provider-level sources, including runtime overrides. Clients show it as
+  `provider default`, not as a session's explicit account selection.
   A runtime credential override collapses its provider to one unlabeled row.
   The host reads credentials and performs any OAuth refresh and writeback.
 - `POST /v1/sessions/{id}/usage/reset`: `{target, idempotency_key}`. The target

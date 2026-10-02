@@ -158,6 +158,7 @@ async fn collect_usage_from_sources(
                     provider_name: api_provider_name(&provider_id).to_string(),
                     provider_id,
                     account: None,
+                    is_default: false,
                     outcome: source
                         .map_or(UsageOutcome::NoSource, |_| UsageOutcome::Error(message)),
                 });
@@ -165,17 +166,20 @@ async fn collect_usage_from_sources(
             }
         };
         let Some(source) = source else {
-            statuses.extend(accounts.into_iter().map(|(account, provider_name)| {
-                ProviderUsageStatus {
-                    provider_id: provider_id.clone(),
-                    provider_name,
-                    account,
-                    outcome: UsageOutcome::NoSource,
-                }
-            }));
+            statuses.extend(
+                accounts
+                    .into_iter()
+                    .map(|(account, provider_name, is_default)| ProviderUsageStatus {
+                        provider_id: provider_id.clone(),
+                        provider_name,
+                        account,
+                        is_default,
+                        outcome: UsageOutcome::NoSource,
+                    }),
+            );
             continue;
         };
-        for (account, provider_name) in accounts {
+        for (account, provider_name, is_default) in accounts {
             let source = Arc::clone(&source);
             let auth = auth.clone();
             tasks.spawn(async move {
@@ -193,6 +197,7 @@ async fn collect_usage_from_sources(
                     provider_id: source.provider_id().to_string(),
                     provider_name,
                     account,
+                    is_default,
                     outcome,
                 }
             });
@@ -218,8 +223,8 @@ async fn account_names(
     auth: &AuthStorage,
     provider_id: &str,
     timeout: std::time::Duration,
-) -> Result<Vec<(Option<String>, String)>, String> {
-    let provider_level = || vec![(None, api_provider_name(provider_id).to_string())];
+) -> Result<Vec<(Option<String>, String, bool)>, String> {
+    let provider_level = || vec![(None, api_provider_name(provider_id).to_string(), false)];
     if auth.has_runtime_override(provider_id).await {
         return Ok(provider_level());
     }
@@ -240,7 +245,10 @@ async fn account_names(
         Some(set) => set
             .accounts
             .into_iter()
-            .map(|(label, credential)| (Some(label), name(&credential)))
+            .map(|(label, credential)| {
+                let is_default = label == set.default;
+                (Some(label), name(&credential), is_default)
+            })
             .collect(),
         None => provider_level(),
     })
@@ -602,6 +610,7 @@ mod tests {
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         seed_accounts(&auth, "anthropic").await;
         seed_accounts(&auth, "openrouter").await;
+        auth.set_default_account("anthropic", "work").await.unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let statuses = collect_usage_from_sources(
             &auth,
@@ -614,6 +623,8 @@ mod tests {
 
         let anthropic = accounts_of(&statuses, "anthropic");
         assert_eq!(labels(&anthropic), vec![Some("personal"), Some("work")]);
+        assert!(!anthropic[0].is_default);
+        assert!(anthropic[1].is_default);
         assert!(anthropic.iter().all(|row| row.provider_name == "Anthropic"));
         let UsageOutcome::Usage(personal) = &anthropic[0].outcome else {
             panic!("personal account lost its usage report")
@@ -630,6 +641,8 @@ mod tests {
 
         let openrouter = accounts_of(&statuses, "openrouter");
         assert_eq!(labels(&openrouter), vec![Some("personal"), Some("work")]);
+        assert!(openrouter[0].is_default);
+        assert!(!openrouter[1].is_default);
         assert!(
             openrouter
                 .iter()
@@ -661,6 +674,7 @@ mod tests {
 
         let anthropic = accounts_of(&statuses, "anthropic");
         assert_eq!(labels(&anthropic), vec![None]);
+        assert!(!anthropic[0].is_default);
         assert!(matches!(
             &anthropic[0].outcome,
             UsageOutcome::Unsupported { reason } if reason == "provider-level source"

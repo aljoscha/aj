@@ -13,6 +13,10 @@ pub struct ProviderUsageStatus {
     /// The exact stored account label. `None` is the effective unlabeled
     /// credential or an unconfigured provider.
     pub account: Option<String>,
+    /// Whether this exact stored account was the provider default at discovery.
+    /// Provider-level sources are never store defaults.
+    #[serde(default)]
+    pub is_default: bool,
     pub outcome: UsageOutcome,
 }
 
@@ -79,6 +83,8 @@ mod tests {
             "reset_providers": []
         });
         let mut report: ProviderUsageReport = serde_json::from_value(old).unwrap();
+        assert!(!report.statuses[0].is_default);
+        report.statuses[0].is_default = true;
         let UsageOutcome::Usage(usage) = &mut report.statuses[0].outcome else {
             panic!("expected usage");
         };
