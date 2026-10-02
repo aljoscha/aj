@@ -222,6 +222,21 @@ async fn goal_palette_manages_goals_through_real_keys_locally_and_remotely() {
             assert_eq!(created.token_budget, Some(100));
             wait_for_save(&observed).await;
 
+            let saved_seconds = chat.borrow().goal.as_ref().unwrap().time_used_seconds;
+            for (seconds, expected) in [
+                (59, "59s"),
+                (90, "1m"),
+                (7200, "2h"),
+                (5400, "1h 30m"),
+                (93780, "1d 2h 3m"),
+            ] {
+                chat.borrow_mut().goal.as_mut().unwrap().time_used_seconds = seconds;
+                let rows = top_overlay_rows(&observed);
+                let time = rows.iter().find(|row| row.contains("Time used")).unwrap();
+                assert!(time.contains(expected), "{time}");
+            }
+            chat.borrow_mut().goal.as_mut().unwrap().time_used_seconds = saved_seconds;
+
             choose(&mut writer, "objective");
             depth(&observed, 3).await;
             page(&observed, "second line").await;

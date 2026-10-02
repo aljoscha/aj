@@ -263,7 +263,7 @@ fn goal_indicator(goal: &Goal, seconds: u64) -> String {
     detail.map_or_else(|| label.to_string(), |detail| format!("{label} ({detail})"))
 }
 
-fn format_goal_runtime(seconds: u64) -> String {
+pub(crate) fn format_goal_runtime(seconds: u64) -> String {
     let minutes = seconds / 60;
     let hours = minutes / 60;
     if hours >= 24 {

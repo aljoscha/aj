@@ -14,6 +14,7 @@ use vaxis::vxfw::{
 };
 
 use crate::control::Control;
+use crate::footer::format_goal_runtime;
 use crate::interactive::OverlayHandles;
 use crate::overlay::{
     OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_edit_close,
@@ -475,7 +476,7 @@ impl GoalUi {
             rows.push(row(
                 "time",
                 "Time used",
-                &format!("{}s", goal.time_used_seconds),
+                &format_goal_runtime(goal.time_used_seconds),
                 "Time spent on this goal.",
                 false,
             ));
