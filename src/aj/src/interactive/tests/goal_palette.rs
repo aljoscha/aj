@@ -114,22 +114,28 @@ async fn goal_palette_manages_goals_through_real_keys_locally_and_remotely() {
                 Duration::ZERO,
             ),
         });
-        let handles = crate::remote::tests::HostHandles::new(&host_dir);
-        let config = Arc::clone(&handles.config);
-        let host = crate::remote::tests::scripted_host(&host_dir, provider, handles, None);
-        let server = crate::remote::RemoteServer::bind(
-            host.clone(),
-            "127.0.0.1:0".parse().unwrap(),
-            crate::remote::IdentityGate::local(),
-        )
-        .await
-        .unwrap();
-        let remote = RemoteHost { host, server };
-        let session = remote.host.create().await.unwrap();
-        let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &[&session]).await;
-        if !connected {
-            world.control = Control::local(remote.host.clone());
-        }
+        let (mut world, shell, config, remote) = if connected {
+            let handles = crate::remote::tests::HostHandles::new(&host_dir);
+            let config = Arc::clone(&handles.config);
+            let host = crate::remote::tests::scripted_host(&host_dir, provider, handles, None);
+            let server = crate::remote::RemoteServer::bind(
+                host.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                crate::remote::IdentityGate::local(),
+            )
+            .await
+            .unwrap();
+            let remote = RemoteHost { host, server };
+            let session = remote.host.create().await.unwrap();
+            let (world, shell) = connect_world_and_shell(&client_dir, &remote, &[&session]).await;
+            (world, shell, config, Some(remote))
+        } else {
+            let (world, shell) = world_and_shell(&host_dir, "streaming-text").await;
+            world.handles().run_config.lock().unwrap().main.provider = provider;
+            let config = Arc::clone(&world.config);
+            (world, shell, config, None)
+        };
+        let session = world.session().to_string();
         let control = world.control.clone();
         let chat = Rc::clone(&world.chat);
         let status = Rc::clone(&world.status);
@@ -331,7 +337,11 @@ async fn goal_palette_manages_goals_through_real_keys_locally_and_remotely() {
             user_rows(&world).is_empty(),
             "goal UI must not submit command text as user prompts"
         );
-        remote.shutdown().await;
+        if let Some(remote) = remote {
+            remote.shutdown().await;
+        } else {
+            shut_down(&world).await;
+        }
     }
 }
 

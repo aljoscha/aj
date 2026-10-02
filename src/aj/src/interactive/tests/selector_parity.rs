@@ -10,26 +10,7 @@ async fn host_with_handles(
     name: &str,
     handles: crate::remote::tests::HostHandles,
 ) -> RemoteHost {
-    let mut delegate = aj_app::test_support::finalized_text_message("delegate");
-    delegate
-        .content
-        .push(aj_models::types::AssistantContent::ToolCall(
-            aj_models::types::ToolCall {
-                id: "selector-child".into(),
-                name: "agent".into(),
-                arguments: serde_json::json!({"task": "inspect the fixture"}),
-            },
-        ));
-    delegate.stop_reason = aj_models::types::StopReason::ToolUse;
-    let provider = crate::remote::tests::scripted(
-        vec![
-            delegate,
-            aj_app::test_support::finalized_text_message("child done"),
-            aj_app::test_support::finalized_text_message("parent done"),
-        ],
-        0,
-        Duration::ZERO,
-    );
+    let provider = crate::remote::tests::scripted(vec![], 0, Duration::ZERO);
     let mut run = crate::remote::tests::snapshot(provider);
     let model = ModelInfo {
         provider: "openai".into(),
@@ -102,6 +83,41 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
         let opening = left.host.local_handles(&session).await.unwrap();
         let elsewhere = other_host.host.local_handles(&other).await.unwrap();
         let other_before = elsewhere.run_config.lock().unwrap().main.model_key.clone();
+        // A retained, recorded child is the input to a settings edit. No agent
+        // inference is needed to establish that state.
+        let sub = 1;
+        let model = opening.run_config.lock().unwrap().main.clone();
+        let mut agent = aj_agent::Agent::with_provider(
+            opening.env.working_directory.clone(),
+            Vec::new(),
+            Vec::new(),
+            Arc::clone(&model.provider),
+            Arc::clone(&model.model_info),
+            model.stream_options.clone(),
+            model.thinking.clone(),
+        );
+        agent.set_agent_id(AgentId::Sub(sub));
+        opening
+            .registry
+            .insert(sub, Arc::new(tokio::sync::Mutex::new(agent)));
+        {
+            let mut log = opening.log.lock().await;
+            let parent = log
+                .snapshot()
+                .system_prompt_id()
+                .cloned()
+                .expect("session root");
+            log.append_subagent_spawn(
+                sub,
+                parent,
+                "existing child",
+                "agent",
+                false,
+                &model.settings(),
+            )
+            .unwrap();
+        }
+
         let gateway = if let Some(right) = &right {
             let gateway = RemoteGateway::over(&[&left, right]).await;
             gateway.until_sessions(2).await;
@@ -132,9 +148,8 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
         let (mut app, mut writer, root) = app_over(&shell).await;
         let mut watch = inert_theme_watch();
 
-        run_prompt(&mut world, "create a child").await;
-        assert_eq!(reattach(&mut world, &shell).await.unwrap(), CatchUp::Caught);
-        let sub = first_sub(&world.chat.borrow());
+        assert_eq!(first_sub(&world.chat.borrow()), sub);
+        assert!(opening.registry.get(sub).is_some());
         world.chat.borrow_mut().set_active_view(AgentId::Sub(sub));
         let mut sub_edits = Vec::new();
         for (action, query) in [
