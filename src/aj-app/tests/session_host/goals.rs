@@ -1054,7 +1054,7 @@ async fn goal_idle_continuation_notice_is_visible_live_and_after_reopen() {
         let state = client.canonical();
         assert_eq!(
             all_notices(&state),
-            vec![(AgentId::Main, "Continuing goal".into())],
+            vec![(AgentId::Main, "Continuing goal.".into())],
             "only idle pursuit is announced, not ordinary goal-state updates"
         );
         let rows = &state.agent(AgentId::Main).unwrap().entries;
@@ -1067,8 +1067,8 @@ async fn goal_idle_continuation_notice_is_visible_live_and_after_reopen() {
                 })
                 .unwrap()
         };
-        assert!(position("first part done") < position("Continuing goal"));
-        assert!(position("Continuing goal") < position("verified everything"));
+        assert!(position("first part done") < position("Continuing goal."));
+        assert!(position("Continuing goal.") < position("verified everything"));
         assert_eq!(
             rows.iter()
                 .filter(|row| matches!(row, CanonicalEntry::User { .. }))
@@ -1081,7 +1081,7 @@ async fn goal_idle_continuation_notice_is_visible_live_and_after_reopen() {
     assert!(provider.contexts.lock().unwrap().iter().all(|context| {
         !serde_json::to_string(context)
             .unwrap()
-            .contains("Continuing goal")
+            .contains("Continuing goal.")
     }));
     live.reattach(&h.host, cursor).await;
     assert_notice(&live);

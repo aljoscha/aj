@@ -461,7 +461,7 @@ async fn run_inner<W: Write + Send + 'static>(
         // Print mode has no tagged event stream, so nothing reads what a
         // compaction files here.
         &aj_session::AppendHandoff::default(),
-        &policy,
+        move || policy,
         crate::turn::TurnStart::Content(content),
         |_| {},
         turn_cancel,

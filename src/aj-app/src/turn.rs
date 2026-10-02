@@ -77,6 +77,7 @@ pub enum TurnStart {
 /// and threshold compaction; a sub-agent continuation enables neither
 /// (compaction operates on the log's Main thread); print mode enables
 /// overflow recovery and opt-in mid-turn compaction.
+#[derive(Clone, Copy)]
 pub struct TurnPolicy {
     /// Compact and retry once when a turn fails with a context overflow.
     pub recover_overflow: bool,
@@ -327,9 +328,8 @@ impl Turns {
     /// without spawning when `target` has no live handle (e.g. a
     /// resumed sub-agent).
     ///
-    /// The compaction
-    /// [`TurnPolicy`] is derived from `config` once here, so the whole
-    /// sequence runs under one policy. The session's staged run config
+    /// The compaction [`TurnPolicy`] is read from live `config` at each
+    /// compaction boundary. The session's staged run config
     /// and the config-derived tool catalog are re-read before the
     /// sequence's first inference and before each automatic
     /// continuation, by [`apply_turn_config`].
@@ -352,7 +352,7 @@ impl Turns {
         let Some(handle) = core.resolve_agent(target) else {
             return false;
         };
-        let policy = turn_policy(target, config);
+        let config_for_policy = Arc::clone(config);
         let config_for_turn = Arc::clone(config);
         let run_config_for_turn = Arc::clone(&core.run_config);
         let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
@@ -375,7 +375,7 @@ impl Turns {
                 &mut a,
                 &log,
                 &handoff,
-                &policy,
+                move || turn_policy(target, &config_for_policy),
                 start,
                 |agent: &mut Agent| {
                     apply_turn_config(
@@ -543,7 +543,9 @@ pub fn running_work_counts<'a>(
 ///
 /// `reconfigure` applies staged run-config at run start and idle compaction
 /// boundaries (interactive's `apply_turn_config`; a no-op in print mode).
-/// Mid-turn compaction uses the active run's configuration.
+/// Mid-turn compaction uses the active run's model configuration. `policy`
+/// is read at each compaction boundary, so settings edits affect the next
+/// check without changing a compaction already underway.
 /// Returns the final turn result: `Ok` when the sequence
 /// settled cleanly, `Recoverable`/`Aborted` for the caller to surface,
 /// `Fatal` to bubble out. Progress (compaction start/end, message
@@ -559,32 +561,38 @@ pub async fn drive_turn(
     agent: &mut Agent,
     log: &Arc<TokioMutex<ConversationLog>>,
     handoff: &AppendHandoff,
-    policy: &TurnPolicy,
+    policy: impl Fn() -> TurnPolicy + Send + Sync + 'static,
     start: TurnStart,
     mut reconfigure: impl FnMut(&mut Agent),
     cancel: CancellationToken,
 ) -> Result<(), TurnError> {
     reconfigure(agent);
+    let policy = Arc::new(policy);
     // The hook owns only application resources, never an agent lock. It is
     // replaced for every driven run and is not inherited by spawned agents.
-    agent.set_before_continuation(policy.during_turn_threshold.map(|threshold| {
+    // Install it even when disabled so a settings edit can enable it mid-turn.
+    agent.set_before_continuation(Some({
         let log = Arc::clone(log);
         let handoff = handoff.clone();
-        let keep_recent = policy.keep_recent;
+        let policy = Arc::clone(&policy);
         let hook: aj_agent::hooks::BeforeContinuationHook = Arc::new(move |agent, cancel| {
             let log = Arc::clone(&log);
             let handoff = handoff.clone();
+            let policy = policy();
             Box::pin(async move {
-                compact_over_threshold(
-                    agent,
-                    &log,
-                    &handoff,
-                    threshold,
-                    keep_recent,
-                    cancel,
-                    |_| {},
-                )
-                .await
+                if let Some(threshold) = policy.during_turn_threshold {
+                    compact_over_threshold(
+                        agent,
+                        &log,
+                        &handoff,
+                        threshold,
+                        policy.keep_recent,
+                        cancel,
+                        |_| {},
+                    )
+                    .await?;
+                }
+                Ok(())
             })
         });
         hook
@@ -601,7 +609,7 @@ pub async fn drive_turn(
                 handoff,
                 reason,
                 instructions.as_deref(),
-                policy.keep_recent,
+                policy().keep_recent,
                 cancel,
             )
             .await
@@ -609,7 +617,7 @@ pub async fn drive_turn(
         }
         TurnStart::Goal(text) => {
             agent
-                .prompt_context(text, Some("Continuing goal".into()), cancel.clone())
+                .prompt_context(text, Some("Continuing goal.".into()), cancel.clone())
                 .await
         }
         TurnStart::Prompt(text) => agent.prompt(text, cancel.clone()).await,
@@ -622,6 +630,7 @@ pub async fn drive_turn(
     let mut overflow_recovered = false;
 
     loop {
+        let policy = policy();
         // 1. Reactive overflow recovery (compact + retry once). The
         //    failed assistant is classified from the agent's retained
         //    terminal message, no log round-trip.
@@ -909,7 +918,7 @@ mod tests {
             &mut agent,
             &log,
             &AppendHandoff::default(),
-            &policy,
+            move || policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
             CancellationToken::new(),
@@ -944,7 +953,7 @@ mod tests {
             &mut agent,
             &log,
             &AppendHandoff::default(),
-            &policy,
+            move || policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
             CancellationToken::new(),
@@ -987,7 +996,7 @@ mod tests {
             &mut agent,
             &log,
             &AppendHandoff::default(),
-            &policy,
+            move || policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
             CancellationToken::new(),
@@ -1020,7 +1029,7 @@ mod tests {
             &mut agent,
             &log,
             &AppendHandoff::default(),
-            &policy,
+            move || policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
             CancellationToken::new(),
@@ -1056,7 +1065,7 @@ mod tests {
             &mut agent,
             &log,
             &AppendHandoff::default(),
-            &policy,
+            move || policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
             CancellationToken::new(),
@@ -1102,7 +1111,7 @@ mod tests {
             &mut agent,
             &log,
             &AppendHandoff::default(),
-            &policy,
+            move || policy,
             TurnStart::Prompt("next".into()),
             |_| {},
             CancellationToken::new(),
@@ -1275,7 +1284,7 @@ mod tests {
             &mut agent,
             &log,
             &AppendHandoff::default(),
-            &policy,
+            move || policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
             CancellationToken::new(),

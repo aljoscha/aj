@@ -122,7 +122,10 @@ The host layer depends on no terminal, which is what `aj serve` is.
 - **Mid-turn compaction.** With host config `auto_compact_during_turn = true`
   (default `false`) and `auto_compact = true`, Main checks provider-reported
   input occupancy against `compact_threshold` after a full tool batch and
-  before its next inference. Streaming responses are never interrupted.
+  before its next inference. Compaction settings are read at each check, so
+  settings edits apply within a running turn, including enabling or disabling
+  mid-turn compaction. A compaction already underway keeps its settings.
+  Streaming responses are never interrupted.
   Compaction uses the ordinary compaction events and keeps the same run active,
   with `working` remaining true through successful compaction and continuation.
   Failed compaction preserves the original history and stops continuation,
@@ -523,7 +526,7 @@ switching heads does not automatically pursue a restored goal. Explicit
 resume is required. Cancelling Main pauses pursuit. Reconnecting to a still
 live session does not pause it. Goal commands do not cancel a turn or its tools.
 Each idle-driven goal turn records internal context with a display-only `notice`
-field. The transcript renders it as a dim "Continuing goal" row, live and on
+field. The transcript renders it as a dim "Continuing goal." row, live and on
 replay, rather than as editable user input. Ordinary goal-state context stays
 hidden. The notice is not included in model input.
 Explicit pause, block and completion close goal accounting, whether requested
