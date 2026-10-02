@@ -27,7 +27,7 @@
 use std::collections::HashSet;
 
 use aj_agent::message::AgentMessage;
-use aj_models::types::{AssistantContent, Message, ToolResultMessage};
+use aj_models::types::{AssistantContent, Message, StopReason, ToolResultMessage};
 
 use crate::log::{
     Conversation, ConversationEntryKind, ConversationError, ConversationLog, ConversationView,
@@ -38,6 +38,10 @@ use crate::log::{
 /// error-flagged `Message::ToolResult` per dangling id and append
 /// them to the log so the conversation is valid input for the model
 /// again.
+///
+/// Calls in errored or aborted assistant responses are abandoned provider
+/// output, not interrupted executions. They are excluded along with those
+/// responses by model-context construction and need no persisted result.
 ///
 /// The function mutates `log` in place. Pass the linearized
 /// `conversation` you've already computed for the user thread; the
@@ -59,6 +63,8 @@ pub fn repair_interrupted_tool_uses(
             continue;
         };
         match msg.as_stored_wire() {
+            Some(Message::Assistant(a))
+                if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) => {}
             Some(Message::Assistant(a)) => {
                 for c in &a.content {
                     if let AssistantContent::ToolCall(tc) = c {
@@ -204,6 +210,55 @@ mod tests {
             .expect("user head exists");
         let convo = log.linearize(&head, ThreadFilter::USER);
         assert_eq!(convo.entries().len(), entry_count_before);
+    }
+
+    #[test]
+    fn repair_leaves_abandoned_provider_calls_unanswered() {
+        for stop_reason in [StopReason::Error, StopReason::Aborted] {
+            for arguments in [json!({}), json!({"command": "printf hello"})] {
+                let (_dir, mut log) = fresh_log();
+                {
+                    let mut view = ConversationView::user(&mut log);
+                    view.add_message(user("hi")).expect("user");
+                    view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
+                        content: vec![AssistantContent::ToolCall(ToolCall {
+                            id: "abandoned".into(),
+                            name: "bash".into(),
+                            arguments,
+                        })],
+                        stop_reason: stop_reason.clone(),
+                        ..AssistantMessage::empty()
+                    })))
+                    .expect("failed response");
+                    view.add_message(assistant_text("Recovered after retry"))
+                        .expect("retry");
+                }
+                let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+                let convo = log.linearize(&head, ThreadFilter::USER);
+                let count_before = log.entries_in_order().len();
+                assert!(!repair_interrupted_tool_uses(&mut log, &convo).expect("repair"));
+                assert_eq!(log.entries_in_order().len(), count_before);
+                assert_eq!(log.latest_leaf(ThreadFilter::USER), Some(head));
+
+                // A real unfinished execution must still be repaired even when
+                // abandoned provider output exists in the same history.
+                ConversationView::user(&mut log)
+                    .add_message(assistant_tool_call("interrupted", "bash"))
+                    .expect("unfinished execution");
+                let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+                let convo = log.linearize(&head, ThreadFilter::USER);
+                assert!(repair_interrupted_tool_uses(&mut log, &convo).expect("repair"));
+                assert_eq!(log.entries_in_order().len(), count_before + 2);
+                let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+                let convo = log.linearize(&head, ThreadFilter::USER);
+                let Some(Message::ToolResult(result)) = convo.last_message() else {
+                    panic!("expected interrupted execution result");
+                };
+                assert_eq!(result.tool_call_id, "interrupted");
+                assert!(result.is_error);
+                assert!(!repair_interrupted_tool_uses(&mut log, &convo).expect("repeat repair"));
+            }
+        }
     }
 
     #[test]
