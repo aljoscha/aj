@@ -877,20 +877,88 @@ mod tests {
         assert_eq!((decoded.width(), decoded.height()), (40, 30));
     }
 
-    /// When the byte budget is so tight that no PNG fits, the
-    /// algorithm should fall back to JPEG.
+    /// When PNG exceeds the byte budget but JPEG fits, the image can
+    /// change format without sacrificing dimensions.
     #[test]
     fn resize_image_falls_back_to_jpeg_when_png_does_not_fit() {
-        let bytes = make_png(800, 600);
+        // Deterministic noise separates the lossless and lossy sizes on a
+        // small canvas. Calibrate the budget with real encodings rather than
+        // depending on a particular codec version's compressed byte count.
+        let mut noise = 0x1234_5678_u32;
+        let image = RgbaImage::from_fn(96, 64, |_, _| {
+            noise ^= noise << 13;
+            noise ^= noise >> 17;
+            noise ^= noise << 5;
+            let [r, g, b, _] = noise.to_le_bytes();
+            Rgba([r, g, b, 255])
+        });
         let opts = ResizeOptions {
-            // Tiny budget that the synthetic noise-pattern PNG will
-            // exceed at any reasonable dimension, forcing JPEG.
-            max_bytes: 8 * 1024,
+            max_width: image.width(),
+            max_height: image.height(),
             ..ResizeOptions::default()
         };
+        let image = image::DynamicImage::ImageRgba8(image);
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("encode fixture PNG");
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, opts.jpeg_quality)
+            .encode_image(&image.to_rgb8())
+            .expect("encode fixture JPEG");
+        let png_size = BASE64.encode(&bytes).len();
+        let jpeg_size = BASE64.encode(&jpeg).len();
+        let max_bytes = (png_size + jpeg_size) / 2;
+        assert!(
+            jpeg_size < max_bytes && max_bytes < png_size,
+            "the fixture must fit as JPEG but not PNG: JPEG {jpeg_size}, PNG {png_size}, budget {max_bytes}"
+        );
+        let opts = ResizeOptions { max_bytes, ..opts };
         let resized = resize_image(&bytes, "image/png", &opts).expect("resize result");
         assert!(resized.was_resized);
         assert_eq!(resized.mime_type, "image/jpeg");
+        assert!(resized.data.len() < max_bytes);
+        assert_eq!(
+            (resized.original_width, resized.original_height),
+            (image.width(), image.height())
+        );
+        assert_eq!(
+            (resized.width, resized.height),
+            (image.width(), image.height())
+        );
+        let output = BASE64.decode(&resized.data).expect("base64 image");
+        assert_eq!(image::guess_format(&output).unwrap(), ImageFormat::Jpeg);
+        let decoded = image::load_from_memory(&output).expect("decode returned JPEG");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (image.width(), image.height())
+        );
+    }
+
+    #[test]
+    fn resize_image_finds_a_fit_under_a_tight_byte_budget() {
+        let bytes = make_png(64, 64);
+        let opts = ResizeOptions {
+            max_width: 64,
+            max_height: 64,
+            // Leave room for a tiny PNG, but not the source. The byte-budget
+            // search must find an attachment rather than give up at its first miss.
+            max_bytes: BASE64.encode(make_png(1, 1)).len() * 2,
+            ..ResizeOptions::default()
+        };
+        assert!(BASE64.encode(&bytes).len() > opts.max_bytes);
+        let resized = resize_image(&bytes, "image/png", &opts)
+            .expect("a smaller image can fit the byte budget");
+        assert!(resized.was_resized);
+        assert!(resized.data.len() < opts.max_bytes);
+        assert_eq!((resized.original_width, resized.original_height), (64, 64));
+        assert!(resized.width <= opts.max_width && resized.height <= opts.max_height);
+        let output = BASE64.decode(&resized.data).expect("base64 image");
+        let decoded = image::load_from_memory(&output).expect("decode byte-budgeted image");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (resized.width, resized.height)
+        );
     }
 
     #[test]

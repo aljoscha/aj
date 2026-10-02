@@ -1161,10 +1161,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_large_image_with_auto_resize_disabled_skips_omission_note() {
-        // A large solid-color PNG. With auto_resize disabled the
-        // resize ladder is bypassed entirely, so the result is an
-        // image attachment (not the "[Image omitted]" placeholder).
-        let bytes = make_solid_png(4000, 3000);
+        // Exceed the dimension limit with few pixels, so accidentally enabling
+        // resizing changes the attachment even though the solid PNG is small.
+        let dimensions = (4000, 40);
+        assert!(dimensions.0 > crate::image::ResizeOptions::default().max_width);
+        let bytes = make_solid_png(dimensions.0, dimensions.1);
         let file = write_png_tempfile(&bytes);
         let path = file.path().to_path_buf();
 
@@ -1182,11 +1183,31 @@ mod tests {
             .expect("execute");
 
         assert!(!outcome.is_error);
-        assert!(
-            matches!(&outcome.content[1], UserContent::Image(_)),
-            "expected image attachment, not omission text"
-        );
-        assert!(matches!(&outcome.details, ToolDetails::Image { .. }));
+        match &outcome.content[1] {
+            UserContent::Image(image) => {
+                use base64::Engine;
+                assert_eq!(image.mime_type, "image/png");
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&image.data)
+                        .expect("base64 image"),
+                    bytes,
+                    "disabled resizing preserves the source bytes"
+                );
+            }
+            other => panic!("expected image attachment, not omission text: {other:?}"),
+        }
+        match &outcome.details {
+            ToolDetails::Image {
+                original_dimensions,
+                displayed_dimensions,
+                ..
+            } => {
+                assert_eq!(*original_dimensions, dimensions);
+                assert_eq!(*displayed_dimensions, dimensions);
+            }
+            other => panic!("expected image details: {other:?}"),
+        }
         let annotation = match &outcome.content[0] {
             UserContent::Text(t) => t.text.clone(),
             other => panic!("expected text annotation, got {other:?}"),
@@ -1194,6 +1215,10 @@ mod tests {
         assert!(
             !annotation.contains("Image omitted"),
             "passthrough must not emit the omission placeholder: {annotation:?}"
+        );
+        assert!(
+            !annotation.contains("Multiply coordinates"),
+            "passthrough must not report coordinate scaling: {annotation:?}"
         );
     }
 }

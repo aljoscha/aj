@@ -158,8 +158,10 @@ async fn goal_palette_manages_goals_through_real_keys_locally_and_remotely() {
                 "first line\n{}\nsecond line",
                 "A detailed requirement. ".repeat(200)
             );
+            // Keep the full multiline payload on the real input path as one paste.
+            writer.write_all(b"\x1b[200~").unwrap();
             writer.write_all(objective.as_bytes()).unwrap();
-            writer.write_all(b"\r").unwrap();
+            writer.write_all(b"\x1b[201~\r").unwrap();
             depth(&observed, 2).await;
             page(&observed, "first line").await;
 

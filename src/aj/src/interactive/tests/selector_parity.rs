@@ -91,20 +91,29 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
         let right_dir = TempDir::new().unwrap();
         let client_dir = TempDir::new().unwrap();
         let left = host(&left_dir, "selector-left").await;
-        let right = host(&right_dir, "selector-right").await;
+        let right = if mode == "gateway" {
+            Some(host(&right_dir, "selector-right").await)
+        } else {
+            None
+        };
         let session = left.host.create().await.unwrap();
-        let other_host = if mode == "gateway" { &right } else { &left };
+        let other_host = right.as_ref().unwrap_or(&left);
         let other = other_host.host.create().await.unwrap();
         let opening = left.host.local_handles(&session).await.unwrap();
         let elsewhere = other_host.host.local_handles(&other).await.unwrap();
         let other_before = elsewhere.run_config.lock().unwrap().main.model_key.clone();
-        let gateway = RemoteGateway::over(&[&left, &right]).await;
-        gateway.until_sessions(2).await;
-        let (url, initial, other) = if mode == "gateway" {
+        let gateway = if let Some(right) = &right {
+            let gateway = RemoteGateway::over(&[&left, right]).await;
+            gateway.until_sessions(2).await;
+            Some(gateway)
+        } else {
+            None
+        };
+        let (url, initial, other) = if let Some(gateway) = &gateway {
             (
                 gateway.url(),
                 format!("{}:{session}", left.host.hello().host_id),
-                format!("{}:{other}", right.host.hello().host_id),
+                format!("{}:{other}", other_host.host.hello().host_id),
             )
         } else {
             (left.url(), session.clone(), other)
@@ -255,9 +264,13 @@ async fn selector_parity_host_catalog_and_confirmations_local_direct_gateway() {
             );
             focus(&mut world, &shell, &mut app, &initial).await;
         }
-        gateway.shutdown().await;
+        if let Some(gateway) = gateway {
+            gateway.shutdown().await;
+        }
         left.shutdown().await;
-        right.shutdown().await;
+        if let Some(right) = right {
+            right.shutdown().await;
+        }
     }
 }
 
@@ -298,9 +311,14 @@ async fn selector_parity_uncatalogued_runtime_keeps_thinking_edits() {
         let client_dir = TempDir::new().unwrap();
         let remote = RemoteHost::start(&host_dir, "streaming-text").await;
         let session = remote.host.create().await.unwrap();
-        let gateway = RemoteGateway::over(&[&remote]).await;
-        gateway.until_sessions(1).await;
-        let (url, selected) = if mode == "gateway" {
+        let gateway = if mode == "gateway" {
+            let gateway = RemoteGateway::over(&[&remote]).await;
+            gateway.until_sessions(1).await;
+            Some(gateway)
+        } else {
+            None
+        };
+        let (url, selected) = if let Some(gateway) = &gateway {
             (
                 gateway.url(),
                 format!("{}:{session}", remote.host.hello().host_id),
@@ -341,7 +359,9 @@ async fn selector_parity_uncatalogued_runtime_keeps_thinking_edits() {
             handles.run_config.lock().unwrap().main.thinking,
             Some(ThinkingConfig::High)
         );
-        gateway.shutdown().await;
+        if let Some(gateway) = gateway {
+            gateway.shutdown().await;
+        }
         remote.shutdown().await;
     }
 }
