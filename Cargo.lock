@@ -116,29 +116,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aj-apply-patch-eval"
-version = "0.1.0"
-dependencies = [
- "aj-agent",
- "aj-app",
- "aj-conf",
- "aj-models",
- "aj-tools",
- "chrono",
- "clap",
- "dotenv",
- "futures",
- "nix",
- "rand 0.10.2",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "aj-conf"
 version = "0.1.0"
 dependencies = [

@@ -513,7 +513,7 @@ fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
 ///
 /// Non-reasoning models omit the reasoning object. [`ThinkingLevel::Off`]
 /// maps to `none` for reasoning models whose vocabulary advertises it.
-pub fn responses_reasoning_effort(
+pub(super) fn responses_reasoning_effort(
     model: &ModelInfo,
     level: &ThinkingLevel,
 ) -> Option<ReasoningEffort> {

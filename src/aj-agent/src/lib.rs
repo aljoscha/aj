@@ -53,8 +53,6 @@ use std::sync::Arc;
 use tokio_retry2::strategy::{ExponentialBackoff, jitter};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_STREAM_RETRY_LIMIT: usize = 10;
-
 /// Derive a sub-agent's prompt-cache key from the parent session's
 /// base key and the sub-agent's id.
 ///
@@ -331,8 +329,6 @@ pub struct Agent {
     /// one turn (see [`max_tool_concurrency`]). Read once at
     /// construction so a turn never re-reads the environment.
     max_tool_concurrency: usize,
-    /// Maximum transparent retries for one failed provider inference.
-    stream_retry_limit: usize,
     /// Terminal assistant message of the most recent inference
     /// (success, error, or abort). Retained so the host can classify
     /// the just-finished turn — context overflow, occupancy — without
@@ -418,7 +414,6 @@ impl Agent {
             inference_goal_revision: 0,
             message_queues: MessageQueues::default(),
             max_tool_concurrency: max_tool_concurrency(),
-            stream_retry_limit: DEFAULT_STREAM_RETRY_LIMIT,
             last_assistant: None,
         }
     }
@@ -462,11 +457,6 @@ impl Agent {
     /// they captured at the top of [`Self::execute_turn`].
     pub fn set_cancellation(&mut self, token: CancellationToken) {
         self.cancellation = token;
-    }
-
-    /// Sets the maximum transparent retries for one provider inference.
-    pub fn set_stream_retry_limit(&mut self, limit: usize) {
-        self.stream_retry_limit = limit;
     }
 
     /// Replace the environment overlay for this session's tool subshells.
@@ -1613,7 +1603,7 @@ impl Agent {
                 });
                 if is_retryable {
                     if retry_strategy.is_none() {
-                        retry_strategy = Some(Self::create_retry_strategy(self.stream_retry_limit));
+                        retry_strategy = Some(Self::create_retry_strategy());
                     }
                     let retry_sleep = retry_strategy.as_mut().expect("known to be some").next();
                     if let Some(retry_sleep) = retry_sleep {
@@ -2041,10 +2031,10 @@ impl Agent {
     }
 
     /// Creates a retry strategy for handling overloaded API errors.
-    fn create_retry_strategy(limit: usize) -> impl Iterator<Item = Duration> {
+    fn create_retry_strategy() -> impl Iterator<Item = Duration> {
         ExponentialBackoff::from_millis(100)
             .max_delay(Duration::from_secs(2))
-            .take(limit)
+            .take(10)
             .map(jitter)
     }
 
@@ -6378,18 +6368,6 @@ mod event_protocol_tests {
             _ => panic!("expected trailing assistant message"),
         };
         assert_eq!(last_assistant.stop_reason, StopReason::Stop);
-    }
-
-    #[tokio::test]
-    async fn stream_retry_limit_can_surface_the_first_transient_failure() {
-        let mut agent = build_agent(vec![transient_error_script()], Vec::new());
-        agent.set_stream_retry_limit(0);
-
-        let error = agent
-            .prompt("hello".into(), CancellationToken::new())
-            .await
-            .expect_err("disabled stream retries must surface the provider failure");
-        assert!(matches!(error, crate::TurnError::Recoverable(_)));
     }
 
     /// `last_assistant` exposes the terminal success message right after
