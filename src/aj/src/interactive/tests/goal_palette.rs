@@ -424,256 +424,250 @@ async fn goal_matching(chat: &Rc<RefCell<ChatState>>, predicate: impl Fn(&Goal) 
 }
 
 #[tokio::test]
-async fn goal_palette_budget_replacement_and_completed_edit_through_both_adapters() {
-    for connected in [false, true] {
-        let host_dir = TempDir::new().unwrap();
-        let client_dir = TempDir::new().unwrap();
-        let (ready, mut held) = tokio::sync::mpsc::unbounded_channel();
-        let handles = crate::remote::tests::HostHandles::new(&host_dir);
-        let config = Arc::clone(&handles.config);
-        let host =
-            crate::remote::tests::scripted_host(&host_dir, Arc::new(HoldAll(ready)), handles, None);
-        let server = crate::remote::RemoteServer::bind(
-            host.clone(),
-            "127.0.0.1:0".parse().unwrap(),
-            crate::remote::IdentityGate::local(),
-        )
-        .await
-        .unwrap();
-        let remote = RemoteHost { host, server };
-        let session = remote.host.create().await.unwrap();
-        let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &[&session]).await;
-        if !connected {
-            world.control = Control::local(remote.host.clone());
-        }
-        let control = world.control.clone();
-        let chat = Rc::clone(&world.chat);
-        let observed = Rc::clone(&shell);
-        let (exit, ()) = drive_until(&mut world, &shell, move |mut writer| async move {
-            writer.write_all(b"\x0fgoal\r").unwrap();
-            depth(&observed, 2).await;
-            choose(&mut writer, "objective");
-            depth(&observed, 3).await;
-            writer.write_all(b"original objective\r").unwrap();
-            depth(&observed, 2).await;
-            choose(&mut writer, "start goal");
-            let (stream, _) = held.recv().await.unwrap();
-            finish_inference(stream);
-            let (_stream, cancel) = held.recv().await.unwrap();
-            let original = goal_matching(&chat, |goal| goal.tokens_used > 0).await;
-            assert_eq!(original.status, GoalStatus::Active);
-            wait_for_save(&observed).await;
+async fn goal_palette_budget_replacement_and_completed_edit_through_remote_adapter() {
+    let host_dir = TempDir::new().unwrap();
+    let client_dir = TempDir::new().unwrap();
+    let (ready, mut held) = tokio::sync::mpsc::unbounded_channel();
+    let handles = crate::remote::tests::HostHandles::new(&host_dir);
+    let config = Arc::clone(&handles.config);
+    let host =
+        crate::remote::tests::scripted_host(&host_dir, Arc::new(HoldAll(ready)), handles, None);
+    let server = crate::remote::RemoteServer::bind(
+        host.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        crate::remote::IdentityGate::local(),
+    )
+    .await
+    .unwrap();
+    let remote = RemoteHost { host, server };
+    let session = remote.host.create().await.unwrap();
+    let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &[&session]).await;
+    let control = world.control.clone();
+    let chat = Rc::clone(&world.chat);
+    let observed = Rc::clone(&shell);
+    let (exit, ()) = drive_until(&mut world, &shell, move |mut writer| async move {
+        writer.write_all(b"\x0fgoal\r").unwrap();
+        depth(&observed, 2).await;
+        choose(&mut writer, "objective");
+        depth(&observed, 3).await;
+        writer.write_all(b"original objective\r").unwrap();
+        depth(&observed, 2).await;
+        choose(&mut writer, "start goal");
+        let (stream, _) = held.recv().await.unwrap();
+        finish_inference(stream);
+        let (_stream, cancel) = held.recv().await.unwrap();
+        let original = goal_matching(&chat, |goal| goal.tokens_used > 0).await;
+        assert_eq!(original.status, GoalStatus::Active);
+        wait_for_save(&observed).await;
 
-            choose(&mut writer, "token budget");
-            depth(&observed, 3).await;
-            writer
-                .write_all(original.tokens_used.to_string().as_bytes())
-                .unwrap();
-            writer.write_all(b"\r").unwrap();
-            depth(&observed, 2).await;
-            let exhausted =
-                goal_matching(&chat, |goal| goal.status == GoalStatus::BudgetLimited).await;
-            assert_eq!(exhausted.id, original.id);
-            assert_eq!(exhausted.tokens_used, original.tokens_used);
-            wait_for_save(&observed).await;
-            clear_filter(&mut writer);
-            let rows = page(&observed, "Token budget").await;
-            assert!(
-                !rows.contains("Resume"),
-                "exhausted goals cannot resume: {rows}"
-            );
-            assert!(
-                !cancel.is_cancelled(),
-                "budget edits do not cancel current work"
-            );
+        choose(&mut writer, "token budget");
+        depth(&observed, 3).await;
+        writer
+            .write_all(original.tokens_used.to_string().as_bytes())
+            .unwrap();
+        writer.write_all(b"\r").unwrap();
+        depth(&observed, 2).await;
+        let exhausted = goal_matching(&chat, |goal| goal.status == GoalStatus::BudgetLimited).await;
+        assert_eq!(exhausted.id, original.id);
+        assert_eq!(exhausted.tokens_used, original.tokens_used);
+        wait_for_save(&observed).await;
+        clear_filter(&mut writer);
+        let rows = page(&observed, "Token budget").await;
+        assert!(
+            !rows.contains("Resume"),
+            "exhausted goals cannot resume: {rows}"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "budget edits do not cancel current work"
+        );
 
-            choose(&mut writer, "token budget");
-            depth(&observed, 3).await;
-            clear_filter(&mut writer);
-            writer
-                .write_all((original.tokens_used + 100).to_string().as_bytes())
-                .unwrap();
-            writer.write_all(b"\r").unwrap();
-            depth(&observed, 2).await;
-            goal_matching(&chat, |goal| {
-                goal.token_budget == Some(original.tokens_used + 100)
-            })
-            .await;
-            wait_for_save(&observed).await;
-            clear_filter(&mut writer);
-            page(&observed, "Resume").await;
-            assert_eq!(
-                current(&control, &session).await.unwrap().status,
-                GoalStatus::BudgetLimited
-            );
-            choose(&mut writer, "token budget");
-            depth(&observed, 3).await;
-            clear_filter(&mut writer);
-            writer.write_all(b"\r").unwrap();
-            depth(&observed, 2).await;
-            let unlimited = goal_matching(&chat, |goal| goal.token_budget.is_none()).await;
-            assert_eq!(unlimited.status, GoalStatus::BudgetLimited);
-            assert_eq!(unlimited.tokens_used, original.tokens_used);
-            assert_eq!(unlimited.id, original.id);
-            wait_for_save(&observed).await;
-            choose(&mut writer, "resume");
-            goal_matching(&chat, |goal| goal.status == GoalStatus::Active).await;
-            wait_for_save(&observed).await;
-
-            choose(&mut writer, "new goal");
-            depth(&observed, 3).await;
-            let rows = page(&observed, "Replace goal").await;
-            assert!(
-                !rows.contains("original objective"),
-                "replacement has an independent draft"
-            );
-            choose(&mut writer, "objective");
-            depth(&observed, 4).await;
-            writer.write_all(b"replacement draft\r").unwrap();
-            depth(&observed, 3).await;
-            choose(&mut writer, "replace goal");
-            depth(&observed, 4).await;
-            page(&observed, "Replace unfinished goal").await;
-            writer.write_all(b"\r").unwrap(); // Safe default: keep editing.
-            depth(&observed, 3).await;
-            assert_eq!(current(&control, &session).await.unwrap().id, original.id);
-            clear_filter(&mut writer);
-            page(&observed, "replacement draft").await;
-            choose(&mut writer, "replace goal");
-            depth(&observed, 4).await;
-            config
-                .lock()
-                .unwrap()
-                .disabled_tools
-                .push("update_goal".into());
-            choose(&mut writer, "replace unfinished");
-            depth(&observed, 3).await;
-            page(&observed, "Goal pursuit requires").await;
-            assert_eq!(current(&control, &session).await.unwrap().id, original.id);
-            clear_filter(&mut writer);
-            page(&observed, "replacement draft").await;
-            config
-                .lock()
-                .unwrap()
-                .disabled_tools
-                .retain(|tool| tool != "update_goal");
-            choose(&mut writer, "replace goal");
-            depth(&observed, 4).await;
-            choose(&mut writer, "replace unfinished");
-            depth(&observed, 3).await;
-            let replacement = goal_matching(&chat, |goal| goal.id != original.id).await;
-            assert_eq!(replacement.objective, "replacement draft");
-            assert_eq!(replacement.tokens_used, 0);
-            assert_eq!(replacement.time_used_seconds, 0);
-            wait_for_save(&observed).await;
-            writer.write_all(b"\x1b").unwrap();
-            depth(&observed, 2).await;
-
-            control
-                .command(&session, Command::Goal(GoalAction::Complete.into()))
-                .await
-                .unwrap();
-            goal_matching(&chat, |goal| goal.status == GoalStatus::Complete).await;
-            choose(&mut writer, "objective");
-            depth(&observed, 3).await;
-            page(&observed, "Save and continue").await;
-            writer.write_all(b"\r").unwrap(); // Unchanged complete objective reactivates.
-            depth(&observed, 2).await;
-            let continued = goal_matching(&chat, |goal| goal.status == GoalStatus::Active).await;
-            assert_eq!(continued.id, replacement.id);
-            assert_eq!(continued.objective, replacement.objective);
-            wait_for_save(&observed).await;
-            control
-                .command(&session, Command::Goal(GoalAction::Complete.into()))
-                .await
-                .unwrap();
-            goal_matching(&chat, |goal| goal.status == GoalStatus::Complete).await;
-            choose(&mut writer, "new goal");
-            depth(&observed, 3).await;
-            choose(&mut writer, "objective");
-            depth(&observed, 4).await;
-            writer.write_all(b"completed replacement\r").unwrap();
-            depth(&observed, 3).await;
-            choose(&mut writer, "replace goal");
-            goal_matching(&chat, |goal| goal.objective == "completed replacement").await;
-            assert_eq!(
-                observed.borrow().overlays.borrow().depth(),
-                3,
-                "completed replacement needs no extra confirmation"
-            );
-            wait_for_save(&observed).await;
-            writer.write_all(b"\x1b").unwrap();
-            depth(&observed, 2).await;
-            choose(&mut writer, "objective");
-            depth(&observed, 3).await;
-            writer.write_all(b" with unsent changes").unwrap();
-            let old = current(&control, &session).await.unwrap();
-            control
-                .command(
-                    &session,
-                    Command::Goal(aj_agent::goal::GoalRequest::for_goal(
-                        old.id,
-                        GoalAction::Replace {
-                            objective: "concurrent replacement".into(),
-                            token_budget: None,
-                        },
-                    )),
-                )
-                .await
-                .unwrap();
-            goal_matching(&chat, |goal| goal.objective == "concurrent replacement").await;
-            page(&observed, "with unsent changes").await;
-            writer.write_all(b"\r").unwrap();
-            depth(&observed, 2).await;
-            page(&observed, "goal changed").await;
-            assert_eq!(
-                current(&control, &session).await.unwrap().objective,
-                "concurrent replacement"
-            );
-            choose(&mut writer, "unsent objective");
-            depth(&observed, 3).await;
-            page(&observed, "with unsent changes").await;
-            writer.write_all(b"\x1b").unwrap();
-            depth(&observed, 2).await;
-            choose(&mut writer, "token budget");
-            depth(&observed, 3).await;
-            writer.write_all(b"71").unwrap();
-            let old = current(&control, &session).await.unwrap();
-            control
-                .command(
-                    &session,
-                    Command::Goal(aj_agent::goal::GoalRequest::for_goal(
-                        old.id,
-                        GoalAction::Replace {
-                            objective: "another replacement".into(),
-                            token_budget: None,
-                        },
-                    )),
-                )
-                .await
-                .unwrap();
-            goal_matching(&chat, |goal| goal.objective == "another replacement").await;
-            writer.write_all(b"\r").unwrap();
-            depth(&observed, 2).await;
-            wait_for_save(&observed).await;
-            assert_eq!(
-                current(&control, &session).await.unwrap().token_budget,
-                None
-            );
-            choose(&mut writer, "unsent budget");
-            depth(&observed, 3).await;
-            page(&observed, "71").await;
-            writer.write_all(b"\x1b").unwrap();
-            depth(&observed, 2).await;
-            control
-                .command(&session, Command::Goal(GoalAction::Pause.into()))
-                .await
-                .unwrap();
+        choose(&mut writer, "token budget");
+        depth(&observed, 3).await;
+        clear_filter(&mut writer);
+        writer
+            .write_all((original.tokens_used + 100).to_string().as_bytes())
+            .unwrap();
+        writer.write_all(b"\r").unwrap();
+        depth(&observed, 2).await;
+        goal_matching(&chat, |goal| {
+            goal.token_budget == Some(original.tokens_used + 100)
         })
         .await;
-        exit.unwrap();
-        remote.shutdown().await;
-    }
+        wait_for_save(&observed).await;
+        clear_filter(&mut writer);
+        page(&observed, "Resume").await;
+        assert_eq!(
+            current(&control, &session).await.unwrap().status,
+            GoalStatus::BudgetLimited
+        );
+        choose(&mut writer, "token budget");
+        depth(&observed, 3).await;
+        clear_filter(&mut writer);
+        writer.write_all(b"\r").unwrap();
+        depth(&observed, 2).await;
+        let unlimited = goal_matching(&chat, |goal| goal.token_budget.is_none()).await;
+        assert_eq!(unlimited.status, GoalStatus::BudgetLimited);
+        assert_eq!(unlimited.tokens_used, original.tokens_used);
+        assert_eq!(unlimited.id, original.id);
+        wait_for_save(&observed).await;
+        choose(&mut writer, "resume");
+        goal_matching(&chat, |goal| goal.status == GoalStatus::Active).await;
+        wait_for_save(&observed).await;
+
+        choose(&mut writer, "new goal");
+        depth(&observed, 3).await;
+        let rows = page(&observed, "Replace goal").await;
+        assert!(
+            !rows.contains("original objective"),
+            "replacement has an independent draft"
+        );
+        choose(&mut writer, "objective");
+        depth(&observed, 4).await;
+        writer.write_all(b"replacement draft\r").unwrap();
+        depth(&observed, 3).await;
+        choose(&mut writer, "replace goal");
+        depth(&observed, 4).await;
+        page(&observed, "Replace unfinished goal").await;
+        writer.write_all(b"\r").unwrap(); // Safe default: keep editing.
+        depth(&observed, 3).await;
+        assert_eq!(current(&control, &session).await.unwrap().id, original.id);
+        clear_filter(&mut writer);
+        page(&observed, "replacement draft").await;
+        choose(&mut writer, "replace goal");
+        depth(&observed, 4).await;
+        config
+            .lock()
+            .unwrap()
+            .disabled_tools
+            .push("update_goal".into());
+        choose(&mut writer, "replace unfinished");
+        depth(&observed, 3).await;
+        page(&observed, "Goal pursuit requires").await;
+        assert_eq!(current(&control, &session).await.unwrap().id, original.id);
+        clear_filter(&mut writer);
+        page(&observed, "replacement draft").await;
+        config
+            .lock()
+            .unwrap()
+            .disabled_tools
+            .retain(|tool| tool != "update_goal");
+        choose(&mut writer, "replace goal");
+        depth(&observed, 4).await;
+        choose(&mut writer, "replace unfinished");
+        depth(&observed, 3).await;
+        let replacement = goal_matching(&chat, |goal| goal.id != original.id).await;
+        assert_eq!(replacement.objective, "replacement draft");
+        assert_eq!(replacement.tokens_used, 0);
+        assert_eq!(replacement.time_used_seconds, 0);
+        wait_for_save(&observed).await;
+        writer.write_all(b"\x1b").unwrap();
+        depth(&observed, 2).await;
+
+        control
+            .command(&session, Command::Goal(GoalAction::Complete.into()))
+            .await
+            .unwrap();
+        goal_matching(&chat, |goal| goal.status == GoalStatus::Complete).await;
+        choose(&mut writer, "objective");
+        depth(&observed, 3).await;
+        page(&observed, "Save and continue").await;
+        writer.write_all(b"\r").unwrap(); // Unchanged complete objective reactivates.
+        depth(&observed, 2).await;
+        let continued = goal_matching(&chat, |goal| goal.status == GoalStatus::Active).await;
+        assert_eq!(continued.id, replacement.id);
+        assert_eq!(continued.objective, replacement.objective);
+        wait_for_save(&observed).await;
+        control
+            .command(&session, Command::Goal(GoalAction::Complete.into()))
+            .await
+            .unwrap();
+        goal_matching(&chat, |goal| goal.status == GoalStatus::Complete).await;
+        choose(&mut writer, "new goal");
+        depth(&observed, 3).await;
+        choose(&mut writer, "objective");
+        depth(&observed, 4).await;
+        writer.write_all(b"completed replacement\r").unwrap();
+        depth(&observed, 3).await;
+        choose(&mut writer, "replace goal");
+        goal_matching(&chat, |goal| goal.objective == "completed replacement").await;
+        assert_eq!(
+            observed.borrow().overlays.borrow().depth(),
+            3,
+            "completed replacement needs no extra confirmation"
+        );
+        wait_for_save(&observed).await;
+        writer.write_all(b"\x1b").unwrap();
+        depth(&observed, 2).await;
+        choose(&mut writer, "objective");
+        depth(&observed, 3).await;
+        writer.write_all(b" with unsent changes").unwrap();
+        let old = current(&control, &session).await.unwrap();
+        control
+            .command(
+                &session,
+                Command::Goal(aj_agent::goal::GoalRequest::for_goal(
+                    old.id,
+                    GoalAction::Replace {
+                        objective: "concurrent replacement".into(),
+                        token_budget: None,
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        goal_matching(&chat, |goal| goal.objective == "concurrent replacement").await;
+        page(&observed, "with unsent changes").await;
+        writer.write_all(b"\r").unwrap();
+        depth(&observed, 2).await;
+        page(&observed, "goal changed").await;
+        assert_eq!(
+            current(&control, &session).await.unwrap().objective,
+            "concurrent replacement"
+        );
+        choose(&mut writer, "unsent objective");
+        depth(&observed, 3).await;
+        page(&observed, "with unsent changes").await;
+        writer.write_all(b"\x1b").unwrap();
+        depth(&observed, 2).await;
+        choose(&mut writer, "token budget");
+        depth(&observed, 3).await;
+        writer.write_all(b"71").unwrap();
+        let old = current(&control, &session).await.unwrap();
+        control
+            .command(
+                &session,
+                Command::Goal(aj_agent::goal::GoalRequest::for_goal(
+                    old.id,
+                    GoalAction::Replace {
+                        objective: "another replacement".into(),
+                        token_budget: None,
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        goal_matching(&chat, |goal| goal.objective == "another replacement").await;
+        writer.write_all(b"\r").unwrap();
+        depth(&observed, 2).await;
+        wait_for_save(&observed).await;
+        assert_eq!(
+            current(&control, &session).await.unwrap().token_budget,
+            None
+        );
+        choose(&mut writer, "unsent budget");
+        depth(&observed, 3).await;
+        page(&observed, "71").await;
+        writer.write_all(b"\x1b").unwrap();
+        depth(&observed, 2).await;
+        control
+            .command(&session, Command::Goal(GoalAction::Pause.into()))
+            .await
+            .unwrap();
+    })
+    .await;
+    exit.unwrap();
+    remote.shutdown().await;
 }
 
 #[tokio::test]

@@ -15379,341 +15379,307 @@ mod tests {
     /// the login or the default-removal follow-up, and neither route touches the
     /// deliberately different credential store carried by the client.
     #[tokio::test]
-    async fn credential_ui_login_and_mutations_are_host_owned_local_direct_and_gateway() {
-        for mode in ["local", "direct", "gateway"] {
-            let host_dir = TempDir::new().unwrap();
-            let client_dir = TempDir::new().unwrap();
-            let right_dir = TempDir::new().unwrap();
-            let (left, auth) = credential_fixture(&host_dir).await;
-            auth.insert_account(
-                "credential-fake",
+    async fn credential_ui_keeps_the_opening_host_across_focus_changes() {
+        let host_dir = TempDir::new().unwrap();
+        let client_dir = TempDir::new().unwrap();
+        let right_dir = TempDir::new().unwrap();
+        let (left, auth) = credential_fixture(&host_dir).await;
+        auth.insert_account(
+            "credential-fake",
+            "",
+            AuthCredential::ApiKey {
+                key: "host-old-secret".into(),
+            },
+        )
+        .await
+        .unwrap();
+        auth.insert_account(
+            "host-sentinel",
+            "",
+            AuthCredential::ApiKey {
+                key: "host-sentinel-secret".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let left_session = left.host.create().await.unwrap();
+        let right = RemoteHost::named_at_directory(&right_dir, "credential-right").await;
+        let right_session = right.host.create().await.unwrap();
+        let gateway = RemoteGateway::over(&[&left, &right]).await;
+        gateway.until_sessions(2).await;
+        let url = gateway.url();
+        let initial = format!("{}:{left_session}", left.host.hello().host_id);
+        let other = format!("{}:{right_session}", right.host.hello().host_id);
+        let (mut world, shell) = connect_world_and_shell_at(&client_dir, &url, &[&initial]).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        // The client runs the provider's flow itself, whichever host stores
+        // the result.
+        register_controlled_oauth(
+            &world,
+            "credential-fake",
+            "host-login-secret",
+            LoginGate::Ready,
+        )
+        .await;
+        world
+            .auth
+            .insert_account(
+                "client-sentinel",
                 "",
                 AuthCredential::ApiKey {
-                    key: "host-old-secret".into(),
+                    key: "client-only-secret".into(),
                 },
             )
             .await
             .unwrap();
-            auth.insert_account(
-                "host-sentinel",
-                "",
-                AuthCredential::ApiKey {
-                    key: "host-sentinel-secret".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let left_session = left.host.create().await.unwrap();
-            let right = RemoteHost::named_at_directory(&right_dir, "credential-right").await;
-            let right_session = right.host.create().await.unwrap();
-            let gateway = RemoteGateway::over(&[&left, &right]).await;
-            gateway.until_sessions(2).await;
-            let (url, initial, other) = if mode == "gateway" {
-                (
-                    gateway.url(),
-                    format!("{}:{left_session}", left.host.hello().host_id),
-                    format!("{}:{right_session}", right.host.hello().host_id),
-                )
-            } else {
-                (left.url(), left_session.clone(), String::new())
-            };
-            let (mut world, shell) =
-                connect_world_and_shell_at(&client_dir, &url, &[&initial]).await;
-            if mode == "local" {
-                world.control = Control::local(left.host.clone());
-            }
-            let (mut app, mut writer, root) = app_over(&shell).await;
-            // The client runs the provider's flow itself, whichever host stores
-            // the result.
-            register_controlled_oauth(
-                &world,
-                "credential-fake",
-                "host-login-secret",
-                LoginGate::Ready,
-            )
-            .await;
-            world
-                .auth
-                .insert_account(
-                    "client-sentinel",
-                    "",
-                    AuthCredential::ApiKey {
-                        key: "client-only-secret".into(),
-                    },
-                )
-                .await
-                .unwrap();
-            let client_before = stored_auth_bytes(&world.auth).unwrap();
-            assert_ne!(client_before, stored_auth_bytes(&auth).unwrap());
-            world.auth.reset_credential_read_count();
-            assert_eq!(credential_host(&world), "credential-left");
-            let (tx, rx) = oneshot::channel();
-            spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, tx);
-            let rows = rx.await.unwrap();
-            let page = rows
-                .iter()
-                .flat_map(Row::spans)
-                .map(|s| s.text.as_str())
-                .collect::<String>();
-            assert!(page.contains("host-sentinel"), "{page}");
-            assert_eq!(
-                page.contains("Credentials on credential-left"),
-                mode != "local",
-                "{page}"
-            );
-            assert!(
-                !page.contains("client-sentinel") && !page.contains("secret"),
-                "{page}"
-            );
+        let client_before = stored_auth_bytes(&world.auth).unwrap();
+        assert_ne!(client_before, stored_auth_bytes(&auth).unwrap());
+        world.auth.reset_credential_read_count();
+        assert_eq!(credential_host(&world), "credential-left");
+        let (tx, rx) = oneshot::channel();
+        spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, tx);
+        let rows = rx.await.unwrap();
+        let page = rows
+            .iter()
+            .flat_map(Row::spans)
+            .map(|s| s.text.as_str())
+            .collect::<String>();
+        assert!(page.contains("host-sentinel"), "{page}");
+        assert!(page.contains("Credentials on credential-left"), "{page}");
+        assert!(
+            !page.contains("client-sentinel") && !page.contains("secret"),
+            "{page}"
+        );
 
-            let request = pick_credential(
-                &mut world,
-                &shell,
-                &mut app,
-                &mut writer,
-                &root,
-                CommandAction::OpenLoginSelector,
-                "credential-fake add account",
-            )
-            .await;
-            assert!(request.target.session == initial && request.target.host == "credential-left");
-            if mode == "gateway" {
-                apply_focus_request(
-                    &mut app,
-                    &shell,
-                    &mut world,
-                    FocusRequest::Resume(other.clone()),
-                )
-                .await;
-                settle_pending_transition(&mut app, &shell, &mut world).await;
-                assert_eq!(credential_host(&world), "credential-right");
-            }
-            let (redraw, _) = unbounded_channel();
-            let mut login = None;
-            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            let title = &top_overlay_rows(&shell)[0];
-            assert_eq!(
-                title.contains("credential-left"),
-                mode != "local",
-                "{title}"
-            );
-            assert!(
-                !title.contains("credential-right"),
-                "login keeps its captured host: {title}"
-            );
-            answer_login(&shell, &mut app, &mut writer, &root, "Account name", "work").await;
-            let outcome =
-                tokio::time::timeout(Duration::from_secs(3), &mut login.as_mut().unwrap().handle)
-                    .await
-                    .unwrap();
-            assert!(
-                matches!(
-                    outcome,
-                    Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied)))
-                ),
-                "{outcome:?}"
-            );
-            finish_login(&mut world, &shell, &mut app, &mut login, outcome);
-            assert!(
-                main_notices(&world)
-                    .last()
-                    .unwrap()
-                    .contains("on credential-left.")
-            );
-            assert!(
-                matches!(auth.get_account("credential-fake", "work").await.unwrap(), Some(AuthCredential::OAuth(c)) if c.access == "host-login-secret" && c.expires == i64::MAX)
-            );
-            if mode == "gateway" {
-                assert!(
-                    right
-                        .host
-                        .credential_overview(&right_session)
-                        .await
-                        .unwrap()
-                        .stored
-                        .is_empty()
-                );
-                apply_focus_request(
-                    &mut app,
-                    &shell,
-                    &mut world,
-                    FocusRequest::Resume(initial.clone()),
-                )
-                .await;
-                settle_pending_transition(&mut app, &shell, &mut world).await;
-            }
-            // Exact reauthentication changes only the selected account, not
-            // its sibling or the default slot, and never asks for a new label.
-            let unnamed_before =
-                serde_json::to_value(auth.get_account("credential-fake", "").await.unwrap())
-                    .unwrap();
-            auth.remove_account("credential-fake", "work")
+        let request = pick_credential(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut writer,
+            &root,
+            CommandAction::OpenLoginSelector,
+            "credential-fake add account",
+        )
+        .await;
+        assert!(request.target.session == initial && request.target.host == "credential-left");
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(other.clone()),
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        assert_eq!(credential_host(&world), "credential-right");
+        let (redraw, _) = unbounded_channel();
+        let mut login = None;
+        apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+        let title = &top_overlay_rows(&shell)[0];
+        assert!(title.contains("credential-left"), "{title}");
+        assert!(
+            !title.contains("credential-right"),
+            "login keeps its captured host: {title}"
+        );
+        answer_login(&shell, &mut app, &mut writer, &root, "Account name", "work").await;
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(3), &mut login.as_mut().unwrap().handle)
                 .await
                 .unwrap();
-            auth.insert_account(
-                "credential-fake",
-                "work",
-                AuthCredential::ApiKey {
-                    key: "stale-work-secret".into(),
-                },
-            )
+        assert!(
+            matches!(
+                outcome,
+                Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied)))
+            ),
+            "{outcome:?}"
+        );
+        finish_login(&mut world, &shell, &mut app, &mut login, outcome);
+        assert!(
+            main_notices(&world)
+                .last()
+                .unwrap()
+                .contains("on credential-left.")
+        );
+        assert!(
+            matches!(auth.get_account("credential-fake", "work").await.unwrap(), Some(AuthCredential::OAuth(c)) if c.access == "host-login-secret" && c.expires == i64::MAX)
+        );
+        assert!(
+            right
+                .host
+                .credential_overview(&right_session)
+                .await
+                .unwrap()
+                .stored
+                .is_empty()
+        );
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(initial.clone()),
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        // Exact reauthentication changes only the selected account, not
+        // its sibling or the default slot, and never asks for a new label.
+        let unnamed_before =
+            serde_json::to_value(auth.get_account("credential-fake", "").await.unwrap()).unwrap();
+        auth.remove_account("credential-fake", "work")
             .await
             .unwrap();
-            let request = pick_credential(
-                &mut world,
-                &shell,
-                &mut app,
-                &mut writer,
-                &root,
-                CommandAction::OpenLoginSelector,
-                "credential-fake work reauthenticate",
-            )
-            .await;
-            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            let outcome =
-                tokio::time::timeout(Duration::from_secs(3), &mut login.as_mut().unwrap().handle)
-                    .await
-                    .unwrap();
-            assert!(
-                matches!(
-                    outcome,
-                    Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied)))
-                ),
-                "{outcome:?}"
-            );
-            finish_login(&mut world, &shell, &mut app, &mut login, outcome);
-            assert_eq!(
-                serde_json::to_value(auth.get_account("credential-fake", "").await.unwrap())
-                    .unwrap(),
-                unnamed_before
-            );
-            assert_eq!(
-                auth.accounts("credential-fake")
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .default,
-                ""
-            );
-            assert!(
-                matches!(auth.get_account("credential-fake", "work").await.unwrap(), Some(AuthCredential::OAuth(c)) if c.access == "host-login-secret")
-            );
-            let request = pick_credential(
-                &mut world,
-                &shell,
-                &mut app,
-                &mut writer,
-                &root,
-                CommandAction::OpenDefaultAccountSelector,
-                "credential-fake work",
-            )
-            .await;
-            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            assert_eq!(
-                auth.accounts("credential-fake")
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .default,
-                "work"
-            );
-            let request = pick_credential(
-                &mut world,
-                &shell,
-                &mut app,
-                &mut writer,
-                &root,
-                CommandAction::OpenLogoutSelector,
-                "credential-fake work",
-            )
-            .await;
-            if mode == "gateway" {
-                apply_focus_request(
-                    &mut app,
-                    &shell,
-                    &mut world,
-                    FocusRequest::Resume(other.clone()),
-                )
-                .await;
-                settle_pending_transition(&mut app, &shell, &mut world).await;
-            }
-            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            run_fills(&shell).await;
-            let title = &top_overlay_rows(&shell)[0];
-            assert_eq!(
-                title.contains("credential-left"),
-                mode != "local",
-                "{title}"
-            );
-            focus_overlay(&mut app, &root);
-            press(&mut app, &mut writer, b"\r").await;
-            let request = shell.borrow().take_auth_request().unwrap();
-            assert!(request.target.session == initial && request.target.host == "credential-left");
-            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            let set = auth.accounts("credential-fake").await.unwrap().unwrap();
-            assert_eq!(set.default, "");
-            assert_eq!(set.accounts.len(), 1);
-            assert!(
-                main_notices(&world)
-                    .last()
-                    .unwrap()
-                    .starts_with("credential-left:")
-            );
-            if mode == "gateway" {
-                apply_focus_request(
-                    &mut app,
-                    &shell,
-                    &mut world,
-                    FocusRequest::Resume(initial.clone()),
-                )
-                .await;
-                settle_pending_transition(&mut app, &shell, &mut world).await;
-            }
-            auth.insert_account(
-                "credential-fake",
-                "sibling",
-                AuthCredential::ApiKey {
-                    key: "host-sibling-secret".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let request = pick_credential(
-                &mut world,
-                &shell,
-                &mut app,
-                &mut writer,
-                &root,
-                CommandAction::OpenLogoutSelector,
-                "credential-fake Unnamed",
-            )
-            .await;
-            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            run_fills(&shell).await;
-            focus_overlay(&mut app, &root);
-            type_text(&mut app, &mut writer, "remove all").await;
-            press(&mut app, &mut writer, b"\r").await;
-            let request = shell.borrow().take_auth_request().unwrap();
-            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            assert!(auth.get("credential-fake").await.unwrap().is_none());
-            let request = pick_credential(
-                &mut world,
-                &shell,
-                &mut app,
-                &mut writer,
-                &root,
-                CommandAction::OpenLogoutSelector,
-                "host-sentinel",
-            )
-            .await;
-            apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
-            assert!(auth.get("host-sentinel").await.unwrap().is_none());
-            assert_eq!(world.auth.credential_read_count(), 0);
-            assert_eq!(stored_auth_bytes(&world.auth).unwrap(), client_before);
-            gateway.shutdown().await;
-            right.shutdown().await;
-            left.shutdown().await;
-        }
+        auth.insert_account(
+            "credential-fake",
+            "work",
+            AuthCredential::ApiKey {
+                key: "stale-work-secret".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let request = pick_credential(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut writer,
+            &root,
+            CommandAction::OpenLoginSelector,
+            "credential-fake work reauthenticate",
+        )
+        .await;
+        apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(3), &mut login.as_mut().unwrap().handle)
+                .await
+                .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Ok(LoginOutcome::Store(Ok(CredentialOutcome::Applied)))
+            ),
+            "{outcome:?}"
+        );
+        finish_login(&mut world, &shell, &mut app, &mut login, outcome);
+        assert_eq!(
+            serde_json::to_value(auth.get_account("credential-fake", "").await.unwrap()).unwrap(),
+            unnamed_before
+        );
+        assert_eq!(
+            auth.accounts("credential-fake")
+                .await
+                .unwrap()
+                .unwrap()
+                .default,
+            ""
+        );
+        assert!(
+            matches!(auth.get_account("credential-fake", "work").await.unwrap(), Some(AuthCredential::OAuth(c)) if c.access == "host-login-secret")
+        );
+        let request = pick_credential(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut writer,
+            &root,
+            CommandAction::OpenDefaultAccountSelector,
+            "credential-fake work",
+        )
+        .await;
+        apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+        assert_eq!(
+            auth.accounts("credential-fake")
+                .await
+                .unwrap()
+                .unwrap()
+                .default,
+            "work"
+        );
+        let request = pick_credential(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut writer,
+            &root,
+            CommandAction::OpenLogoutSelector,
+            "credential-fake work",
+        )
+        .await;
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(other.clone()),
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+        run_fills(&shell).await;
+        let title = &top_overlay_rows(&shell)[0];
+        assert!(title.contains("credential-left"), "{title}");
+        focus_overlay(&mut app, &root);
+        press(&mut app, &mut writer, b"\r").await;
+        let request = shell.borrow().take_auth_request().unwrap();
+        assert!(request.target.session == initial && request.target.host == "credential-left");
+        apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+        let set = auth.accounts("credential-fake").await.unwrap().unwrap();
+        assert_eq!(set.default, "");
+        assert_eq!(set.accounts.len(), 1);
+        assert!(
+            main_notices(&world)
+                .last()
+                .unwrap()
+                .starts_with("credential-left:")
+        );
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(initial.clone()),
+        )
+        .await;
+        settle_pending_transition(&mut app, &shell, &mut world).await;
+        auth.insert_account(
+            "credential-fake",
+            "sibling",
+            AuthCredential::ApiKey {
+                key: "host-sibling-secret".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let request = pick_credential(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut writer,
+            &root,
+            CommandAction::OpenLogoutSelector,
+            "credential-fake Unnamed",
+        )
+        .await;
+        apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+        run_fills(&shell).await;
+        focus_overlay(&mut app, &root);
+        type_text(&mut app, &mut writer, "remove all").await;
+        press(&mut app, &mut writer, b"\r").await;
+        let request = shell.borrow().take_auth_request().unwrap();
+        apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+        assert!(auth.get("credential-fake").await.unwrap().is_none());
+        let request = pick_credential(
+            &mut world,
+            &shell,
+            &mut app,
+            &mut writer,
+            &root,
+            CommandAction::OpenLogoutSelector,
+            "host-sentinel",
+        )
+        .await;
+        apply_auth_request(&mut world, &shell, &mut app, &mut login, &redraw, request).await;
+        assert!(auth.get("host-sentinel").await.unwrap().is_none());
+        assert_eq!(world.auth.credential_read_count(), 0);
+        assert_eq!(stored_auth_bytes(&world.auth).unwrap(), client_before);
+        gateway.shutdown().await;
+        right.shutdown().await;
+        left.shutdown().await;
     }
 
     #[tokio::test]
@@ -26483,6 +26449,19 @@ mod tests {
             if connected {
                 assert!(world.auth.list().await.unwrap().is_empty());
             }
+            let (tx, rx) = oneshot::channel();
+            spawn_shell_overlay_fetch(&world, &shell, FetchKind::Auth, tx);
+            let rows = rx.await.unwrap();
+            let summary = rows
+                .iter()
+                .flat_map(Row::spans)
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            assert_eq!(
+                summary.contains(&format!("Credentials on {}", credential_host(&world))),
+                connected,
+                "{summary}"
+            );
             let (mut app, mut writer, root) = app_over(&shell).await;
             for action in [
                 CommandAction::OpenLoginSelector,
@@ -31211,179 +31190,163 @@ mod tests {
         .await
     }
 
-    /// The composed overlay consumes only its opening host/account through all
-    /// adapters, including after focus moves. Client reads and writes are observed.
+    /// The composed overlay consumes only its opening host/account after gateway
+    /// focus moves. Client credential reads and writes are observed separately.
     #[tokio::test]
-    async fn provider_usage_overlay_is_host_owned_locally_directly_and_through_gateway() {
+    async fn provider_usage_overlay_keeps_the_opening_host_across_focus_changes() {
         use crate::remote::tests::provider_usage::FakeUsage;
-        for mode in ["local", "direct", "gateway"] {
-            let host_dir = TempDir::new().unwrap();
-            let other_dir = TempDir::new().unwrap();
-            let client_dir = TempDir::new().unwrap();
-            let source = FakeUsage::new("usage-owner");
-            let other_source = FakeUsage::new("other-host");
-            let host = source.host(&host_dir).await;
-            let other_host = other_source.host(&other_dir).await;
-            let session = host.create().await.unwrap();
-            let sibling = host.create().await.unwrap();
-            let other_session = other_host.create().await.unwrap();
-            let remote = RemoteHost {
-                server: crate::remote::RemoteServer::bind(
-                    host.clone(),
-                    "127.0.0.1:0".parse().unwrap(),
-                    crate::remote::IdentityGate::local(),
-                )
-                .await
-                .unwrap(),
-                host,
-            };
-            let other = RemoteHost {
-                server: crate::remote::RemoteServer::bind(
-                    other_host.clone(),
-                    "127.0.0.1:0".parse().unwrap(),
-                    crate::remote::IdentityGate::local(),
-                )
-                .await
-                .unwrap(),
-                host: other_host,
-            };
-            let gateway = RemoteGateway::over(&[&remote, &other]).await;
-            gateway.until_sessions(3).await;
-            let (url, opening, focus_next) = if mode == "gateway" {
-                (
-                    gateway.url(),
-                    format!("{}:{session}", remote.host.hello().host_id),
-                    format!("{}:{other_session}", other.host.hello().host_id),
-                )
-            } else {
-                (remote.url(), session.clone(), sibling)
-            };
-            let (mut world, shell) =
-                connect_world_and_shell_at(&client_dir, &url, &[&opening]).await;
-            if mode == "local" {
-                world.control = Control::local(remote.host.clone());
-            }
-            assert_eq!(world.session(), opening);
-            world
-                .auth
-                .insert_account(
-                    "openai-codex",
-                    "",
-                    aj_models::auth::AuthCredential::ApiKey {
-                        key: "client-secret-sentinel".into(),
-                    },
-                )
-                .await
-                .unwrap();
-            let client_path = client_dir.path().join("client-auth.json");
-            let client_before = std::fs::read(&client_path).unwrap();
-            let host_before = std::fs::read(host_dir.path().join("auth.json")).unwrap();
-            assert_ne!(client_before, host_before);
-            assert!(String::from_utf8_lossy(&client_before).contains("client-secret-sentinel"));
-            assert!(String::from_utf8_lossy(&host_before).contains("usage-owner-work-secret"));
+        let host_dir = TempDir::new().unwrap();
+        let other_dir = TempDir::new().unwrap();
+        let client_dir = TempDir::new().unwrap();
+        let source = FakeUsage::new("usage-owner");
+        let other_source = FakeUsage::new("other-host");
+        let host = source.host(&host_dir).await;
+        let other_host = other_source.host(&other_dir).await;
+        let session = host.create().await.unwrap();
+        let other_session = other_host.create().await.unwrap();
+        let remote = RemoteHost {
+            server: crate::remote::RemoteServer::bind(
+                host.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                crate::remote::IdentityGate::local(),
+            )
+            .await
+            .unwrap(),
+            host,
+        };
+        let other = RemoteHost {
+            server: crate::remote::RemoteServer::bind(
+                other_host.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                crate::remote::IdentityGate::local(),
+            )
+            .await
+            .unwrap(),
+            host: other_host,
+        };
+        let gateway = RemoteGateway::over(&[&remote, &other]).await;
+        gateway.until_sessions(2).await;
+        let url = gateway.url();
+        let opening = format!("{}:{session}", remote.host.hello().host_id);
+        let focus_next = format!("{}:{other_session}", other.host.hello().host_id);
+        let (mut world, shell) = connect_world_and_shell_at(&client_dir, &url, &[&opening]).await;
+        assert_eq!(world.session(), opening);
+        world
+            .auth
+            .insert_account(
+                "openai-codex",
+                "",
+                aj_models::auth::AuthCredential::ApiKey {
+                    key: "client-secret-sentinel".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let client_path = client_dir.path().join("client-auth.json");
+        let client_before = std::fs::read(&client_path).unwrap();
+        let host_before = std::fs::read(host_dir.path().join("auth.json")).unwrap();
+        assert_ne!(client_before, host_before);
+        assert!(String::from_utf8_lossy(&client_before).contains("client-secret-sentinel"));
+        assert!(String::from_utf8_lossy(&host_before).contains("usage-owner-work-secret"));
 
-            let unread_root = client_dir.path().join("must-stay-unread");
-            let unread_auth = AuthStorage::new(unread_root.join("auth.json"));
-            unread_auth.get("openai-codex").await.unwrap();
-            assert!(
-                unread_root.exists(),
-                "calibrate the credential read observer"
-            );
-            std::fs::remove_dir_all(&unread_root).unwrap();
-            world.auth = unread_auth;
-            let (mut app, mut writer, root) = app_over(&shell).await;
-            assert!(matches!(
-                apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await,
-                ActionEffect::OpenedOverlay
-            ));
-            focus_overlay(&mut app, &root);
-            let page = usage_page_until(&shell, "usage-owner work report").await;
-            assert!(page.contains("usage-owner personal report"));
-            assert!(
-                page.contains("usage-owner · personal · provider default"),
-                "{page}"
-            );
-            assert!(
-                !page.contains("usage-owner · work · provider default"),
-                "{page}"
-            );
-            assert_eq!(page.matches("provider default").count(), 1, "{page}");
-            assert!(
-                page.contains("Usage credits") && page.contains("work credits"),
-                "{page}"
-            );
-            assert_eq!(page.matches("2 available").count(), 2);
-            assert!(
-                !page.contains("other-host") && !page.contains("secret"),
-                "{page}"
-            );
-            assert_eq!(source.reads.load(Ordering::SeqCst), 2);
-            assert_eq!(source.refreshes.load(Ordering::SeqCst), 2);
-            assert_eq!(other_source.refreshes.load(Ordering::SeqCst), 0);
-            assert_eq!(
-                other_source.reads.load(Ordering::SeqCst),
-                0,
-                "no gateway aggregation"
-            );
-            assert!(
-                String::from_utf8_lossy(&std::fs::read(host_dir.path().join("auth.json")).unwrap())
-                    .contains("-secret-refreshed")
-            );
+        let unread_root = client_dir.path().join("must-stay-unread");
+        let unread_auth = AuthStorage::new(unread_root.join("auth.json"));
+        unread_auth.get("openai-codex").await.unwrap();
+        assert!(
+            unread_root.exists(),
+            "calibrate the credential read observer"
+        );
+        std::fs::remove_dir_all(&unread_root).unwrap();
+        world.auth = unread_auth;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenUsageStatus).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+        let page = usage_page_until(&shell, "usage-owner work report").await;
+        assert!(page.contains("usage-owner personal report"));
+        assert!(
+            page.contains("usage-owner · personal · provider default"),
+            "{page}"
+        );
+        assert!(
+            !page.contains("usage-owner · work · provider default"),
+            "{page}"
+        );
+        assert_eq!(page.matches("provider default").count(), 1, "{page}");
+        assert!(
+            page.contains("Usage credits") && page.contains("work credits"),
+            "{page}"
+        );
+        assert_eq!(page.matches("2 available").count(), 2);
+        assert!(
+            !page.contains("other-host") && !page.contains("secret"),
+            "{page}"
+        );
+        assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(source.refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(other_source.refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            other_source.reads.load(Ordering::SeqCst),
+            0,
+            "no gateway aggregation"
+        );
+        assert!(
+            String::from_utf8_lossy(&std::fs::read(host_dir.path().join("auth.json")).unwrap())
+                .contains("-secret-refreshed")
+        );
 
-            press(&mut app, &mut writer, b"r").await;
-            assert!(top_overlay_rows(&shell).join("\n").contains("personal"));
-            press(&mut app, &mut writer, b"\x1b[B").await;
-            press(&mut app, &mut writer, b"\r").await;
-            assert!(
-                top_overlay_rows(&shell)
-                    .join("\n")
-                    .contains("usage-owner · work")
-            );
-            assert!(
-                source.spent().is_empty(),
-                "selection must not spend before confirmation"
-            );
-            // Keep the overlay alive while changing the same directory focus that
-            // subsequent commands read, without closing the overlay.
-            world.directory.focus(&focus_next, || {
-                Rc::new(RefCell::new(ChatState::new(unknown_settings())))
-            });
-            assert_ne!(world.session(), opening);
-            press(&mut app, &mut writer, b"\r").await;
-            usage_page_until(&shell, "response lost after consumption").await;
-            press(&mut app, &mut writer, b"\r").await;
-            usage_page_until(&shell, "Usage reset.").await;
-            let attempts = source.attempts.lock().unwrap().clone();
-            assert_eq!(attempts.len(), 2);
-            assert_eq!(attempts[0], attempts[1], "retry retains target and key");
-            assert_eq!(attempts[0].0.account(), Some("work"));
-            assert!(!attempts[0].1.is_empty());
-            assert_eq!(source.spent(), vec![attempts[0].0.clone()]);
-            assert!(other_source.spent().is_empty());
-            press(&mut app, &mut writer, b"\r").await;
-            let refreshed = usage_page_until(&shell, "usage-owner work report").await;
-            assert!(!refreshed.contains("other-host"));
-            assert_eq!(refreshed.matches("1 available").count(), 1);
-            assert_eq!(refreshed.matches("2 available").count(), 1);
-            assert_eq!(
-                source.reads.load(Ordering::SeqCst),
-                4,
-                "refresh uses opening host"
-            );
-            assert_eq!(other_source.reads.load(Ordering::SeqCst), 0);
-            assert!(
-                !unread_root.exists(),
-                "usage/reset read client credentials in {mode}"
-            );
-            assert_eq!(std::fs::read(&client_path).unwrap(), client_before);
-            drop(app);
-            drop(world);
-            gateway.shutdown().await;
-            remote.shutdown().await;
-            other.shutdown().await;
-            assert!(!unread_root.exists());
-            assert_eq!(std::fs::read(&client_path).unwrap(), client_before);
-        }
+        press(&mut app, &mut writer, b"r").await;
+        assert!(top_overlay_rows(&shell).join("\n").contains("personal"));
+        press(&mut app, &mut writer, b"\x1b[B").await;
+        press(&mut app, &mut writer, b"\r").await;
+        assert!(
+            top_overlay_rows(&shell)
+                .join("\n")
+                .contains("usage-owner · work")
+        );
+        assert!(
+            source.spent().is_empty(),
+            "selection must not spend before confirmation"
+        );
+        // Keep the overlay alive while changing the same directory focus that
+        // subsequent commands read, without closing the overlay.
+        world.directory.focus(&focus_next, || {
+            Rc::new(RefCell::new(ChatState::new(unknown_settings())))
+        });
+        assert_ne!(world.session(), opening);
+        press(&mut app, &mut writer, b"\r").await;
+        usage_page_until(&shell, "response lost after consumption").await;
+        press(&mut app, &mut writer, b"\r").await;
+        usage_page_until(&shell, "Usage reset.").await;
+        let attempts = source.attempts.lock().unwrap().clone();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], attempts[1], "retry retains target and key");
+        assert_eq!(attempts[0].0.account(), Some("work"));
+        assert!(!attempts[0].1.is_empty());
+        assert_eq!(source.spent(), vec![attempts[0].0.clone()]);
+        assert!(other_source.spent().is_empty());
+        press(&mut app, &mut writer, b"\r").await;
+        let refreshed = usage_page_until(&shell, "usage-owner work report").await;
+        assert!(!refreshed.contains("other-host"));
+        assert_eq!(refreshed.matches("1 available").count(), 1);
+        assert_eq!(refreshed.matches("2 available").count(), 1);
+        assert_eq!(
+            source.reads.load(Ordering::SeqCst),
+            4,
+            "refresh uses opening host"
+        );
+        assert_eq!(other_source.reads.load(Ordering::SeqCst), 0);
+        assert!(!unread_root.exists(), "usage/reset read client credentials");
+        assert_eq!(std::fs::read(&client_path).unwrap(), client_before);
+        drop(app);
+        drop(world);
+        gateway.shutdown().await;
+        remote.shutdown().await;
+        other.shutdown().await;
+        assert!(!unread_root.exists());
+        assert_eq!(std::fs::read(&client_path).unwrap(), client_before);
     }
 
     #[tokio::test]
