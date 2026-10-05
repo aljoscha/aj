@@ -529,6 +529,15 @@ Each idle-driven goal turn records internal context with a display-only `notice`
 field. The transcript renders it as a dim "Continuing goal." row, live and on
 replay, rather than as editable user input. Ordinary goal-state context stays
 hidden. The notice is not included in model input.
+The hosted Main agent can call `wait` to yield after its complete tool batch.
+The resulting transient `agent_end` has `waiting: true` (an absent field means
+false). The agent is idle and the goal remains active, but no synthetic goal
+turn is started until new input arrives. Queued input and task-completion
+notices, including ones already queued at yield, retain their ordinary wake
+paths. A new run clears the wait. Explicit user goal creation, replacement,
+objective editing or resume also releases it. Running background processes
+alone do not suppress goal continuation. The wait is not persisted, and the
+tool is unavailable to sub-agents and print mode.
 Explicit pause, block and completion close goal accounting, whether requested
 by the user or the model. Later reporting and descendant results are outside
 that subtotal. Clearing a goal also stops its accounting and continuations.

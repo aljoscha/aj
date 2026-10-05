@@ -44,7 +44,7 @@ fn tools_for_turn(
         tools.retain(|tool| {
             !matches!(
                 tool.name.as_str(),
-                "agent" | "oracle" | "create_goal" | "get_goal" | "update_goal"
+                "agent" | "oracle" | "create_goal" | "get_goal" | "update_goal" | "wait"
             )
         });
     }
@@ -892,11 +892,13 @@ mod tests {
         let options = aj_tools::BuiltinToolOptions::default();
         let gpt = tools_for_turn(&options, &[], Some("gpt-codex"), true);
         assert!(gpt.iter().any(|tool| tool.name == "agent"));
+        assert!(gpt.iter().any(|tool| tool.name == "wait"));
         assert!(gpt.iter().any(|tool| tool.name == "apply_patch"));
         assert!(gpt.iter().all(|tool| tool.name != "edit_file"));
 
         let sub = tools_for_turn(&options, &[], Some("claude-sonnet"), false);
         assert!(sub.iter().all(|tool| tool.name != "agent"));
+        assert!(sub.iter().all(|tool| tool.name != "wait"));
         assert!(sub.iter().all(|tool| tool.name != "apply_patch"));
         assert!(sub.iter().any(|tool| tool.name == "edit_file"));
         assert!(sub.iter().any(|tool| tool.name == "write_file"));

@@ -924,6 +924,30 @@ fn every_agent_event_has_a_pinned_round_trip_fixture() {
     }
 }
 
+#[test]
+fn agent_end_defaults_to_not_waiting_and_round_trips_waiting() {
+    let legacy = json!({
+        "type": "agent_end",
+        "agent_id": "main",
+        "messages": []
+    });
+    let decoded: DecodedAgentEvent = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(matches!(
+        decoded.known(),
+        Some(AgentEvent::AgentEnd { waiting: false, .. })
+    ));
+
+    let mut expected = legacy;
+    expected["waiting"] = json!(true);
+    let decoded: DecodedAgentEvent = serde_json::from_value(expected.clone()).unwrap();
+    assert!(matches!(
+        decoded.known(),
+        Some(AgentEvent::AgentEnd { waiting: true, .. })
+    ));
+    let typed = DecodedAgentEvent::from(decoded.known().unwrap().clone());
+    assert_eq!(serde_json::to_value(typed).unwrap(), expected);
+}
+
 /// A `MessageUpdate` crosses the wire without its duplicate `message`, and
 /// the receiver rebuilds it from `event.partial`.
 #[test]

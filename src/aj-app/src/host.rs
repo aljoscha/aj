@@ -2169,6 +2169,7 @@ impl SessionHost {
             });
         {
             let mut agent = core.agent.lock().await;
+            agent.enable_wait();
             let goal_inferences = requests_tx.clone();
             agent.set_goal_control(
                 goal_control,
@@ -2521,6 +2522,7 @@ impl SessionHost {
                     event: aj_agent::events::AgentEvent::AgentEnd {
                         agent_id: AgentId::Sub(*child),
                         messages: Vec::new(),
+                        waiting: false,
                     }
                     .into(),
                 },

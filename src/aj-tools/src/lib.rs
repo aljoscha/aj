@@ -36,6 +36,7 @@ pub use tools::oracle::OracleTool;
 pub use tools::read_file::ReadFileTool;
 pub use tools::task::{TaskOutputTool, TaskStopTool};
 pub use tools::todo::{TodoReadTool, TodoWriteTool};
+pub use tools::wait::WaitTool;
 pub use tools::write_file::WriteFileTool;
 
 /// Cross-cutting settings the binary feeds into builtin tool
@@ -81,6 +82,7 @@ pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefiniti
         EditFileTool.into(),
         TaskOutputTool.into(),
         TaskStopTool.into(),
+        WaitTool.into(),
         CreateGoalTool.into(),
         GetGoalTool.into(),
         UpdateGoalTool.into(),

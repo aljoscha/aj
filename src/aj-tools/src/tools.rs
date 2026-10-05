@@ -9,4 +9,5 @@ pub mod oracle;
 pub mod read_file;
 pub mod task;
 pub mod todo;
+pub mod wait;
 pub mod write_file;

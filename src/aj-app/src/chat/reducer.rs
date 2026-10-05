@@ -2229,6 +2229,7 @@ mod tests {
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
                     messages: Vec::new(),
+                    waiting: false,
                 },
             );
             assert_eq!(box_status(&mut s), SubAgentStatus::Done);
@@ -2266,6 +2267,7 @@ mod tests {
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
                     messages: Vec::new(),
+                    waiting: false,
                 },
             );
             apply(
@@ -2314,6 +2316,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
+                waiting: false,
             },
         );
         assert_eq!(
@@ -2361,6 +2364,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
+                waiting: false,
             },
         );
         assert_eq!(
@@ -2384,6 +2388,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
+                waiting: false,
             },
         );
 
@@ -2436,6 +2441,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
+                waiting: false,
             },
         );
         assert_eq!(
@@ -2459,6 +2465,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
+                waiting: false,
             },
         );
 
@@ -2509,6 +2516,7 @@ mod tests {
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
                     messages: Vec::new(),
+                    waiting: false,
                 },
             );
             (s, life)
@@ -2606,6 +2614,7 @@ mod tests {
                     AgentEvent::AgentEnd {
                         agent_id: AgentId::Sub(1),
                         messages: Vec::new(),
+                        waiting: false,
                     },
                 );
 
@@ -2765,6 +2774,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
+                waiting: false,
             },
         );
         assert!(s.sub_box_mut(1).expect("box").finished_at.is_some());
@@ -2898,6 +2908,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
                 messages: Vec::new(),
+                waiting: false,
             },
         );
         apply(
@@ -2968,6 +2979,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
                 messages: Vec::new(),
+                waiting: false,
             },
         );
         apply(
@@ -3164,6 +3176,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
+                waiting: false,
             },
         );
 
@@ -3198,6 +3211,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
                 messages: Vec::new(),
+                waiting: false,
             },
         );
         assert!(!life.is_running(AgentId::Main));
@@ -3582,6 +3596,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
                 messages: Vec::new(),
+                waiting: false,
             },
         );
         let before = canon(&s, &life);
@@ -4308,6 +4323,7 @@ mod tests {
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
                     messages: Vec::new(),
+                    waiting: false,
                 },
             );
             let before = canon(&s, &life);
@@ -4325,6 +4341,7 @@ mod tests {
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
                     messages: Vec::new(),
+                    waiting: false,
                 },
             );
 

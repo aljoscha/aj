@@ -1234,6 +1234,12 @@ pub struct SpawnAgentConfig {
 /// list), sub-agent spawning, progress updates, and a cancellation
 /// token tools must honor for long-running work.
 pub trait ToolContext: Send {
+    /// Yield after the complete tool batch, without another inference.
+    /// Hosts opt into this capability when they can resume on new input.
+    fn request_wait(&self) -> Result<(), BoxError> {
+        Err("Waiting is unavailable outside the hosted main agent.".into())
+    }
+
     /// Application-owned goal capability. Absent in print mode and subagents.
     fn goal(&self, _action: crate::goal::GoalAction) -> crate::goal::GoalFuture {
         Box::pin(async { Err(crate::goal::GoalError::Unsupported) })

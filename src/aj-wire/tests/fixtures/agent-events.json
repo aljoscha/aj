@@ -12,7 +12,8 @@
         "content": [{ "type": "text", "text": "hello" }],
         "timestamp": 10
       }
-    ]
+    ],
+    "waiting": false
   },
   {
     "type": "agent_interrupted",

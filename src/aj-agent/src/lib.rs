@@ -771,6 +771,12 @@ impl Agent {
         self.before_continuation = hook;
     }
 
+    /// Enable explicit waiting when the host can wake this Main agent on input.
+    /// The capability is not inherited by sub-agents.
+    pub fn enable_wait(&mut self) {
+        self.session_state.lock().wait_enabled = true;
+    }
+
     /// Borrow the assembled system prompt. Empty until
     /// [`Agent::seed_session`] supplies one.
     pub fn assembled_system_prompt(&self) -> &str {
@@ -1137,10 +1143,12 @@ impl Agent {
             assignment_guard.0.as_ref().and_then(|a| a.take_reply())
         };
 
+        let waiting = outcome.is_ok() && self.session_state.lock().wait_requested;
         self.bus
             .emit(AgentEvent::AgentEnd {
                 agent_id: self.agent_id,
                 messages: self.transcript.clone(),
+                waiting,
             })
             .await
             .map_err(TurnError::Fatal)?;
@@ -1231,6 +1239,7 @@ impl Agent {
             .emit(AgentEvent::AgentEnd {
                 agent_id: self.agent_id,
                 messages: self.transcript.clone(),
+                waiting: false,
             })
             .await?;
 
@@ -1357,6 +1366,7 @@ impl Agent {
     ///    the transcript never carries a `tool_use` without a
     ///    matching `tool_result`.
     async fn execute_turn(&mut self) -> Result<(), TurnError> {
+        self.session_state.lock().wait_requested = false;
         self.session_state.bump_turn_counter();
 
         // Number of streaming retries observed for the current
@@ -1809,6 +1819,11 @@ impl Agent {
 
                 if self.cancellation.is_cancelled() {
                     return Err(TurnError::Aborted);
+                }
+                // A wait request never leaves sibling calls unfinished. Their
+                // results and TurnEnd are recorded before yielding to the host.
+                if self.session_state.lock().wait_requested {
+                    break;
                 }
                 if let Some(hook) = self.before_continuation.clone() {
                     hook(self, self.cancellation.clone()).await?;
@@ -3009,6 +3024,8 @@ struct SessionStateInner {
     turn_counter: usize,
     accumulated_usage: Usage,
     sub_agent_counter: usize,
+    wait_enabled: bool,
+    wait_requested: bool,
 }
 
 impl SessionState {
@@ -3020,6 +3037,8 @@ impl SessionState {
                 turn_counter: 0,
                 accumulated_usage: Usage::default(),
                 sub_agent_counter: 0,
+                wait_enabled: false,
+                wait_requested: false,
             })),
             session_env: Arc::new(StdMutex::new(BTreeMap::new())),
         }
@@ -3625,7 +3644,7 @@ impl SessionContextWrapper<'_> {
             config.tools.retain(|tool| {
                 !matches!(
                     tool.name.as_str(),
-                    "create_goal" | "get_goal" | "update_goal"
+                    "create_goal" | "get_goal" | "update_goal" | "wait"
                 )
             });
             // Get the next agent ID
@@ -3866,6 +3885,15 @@ impl SessionContextWrapper<'_> {
 }
 
 impl ToolContext for SessionContextWrapper<'_> {
+    fn request_wait(&self) -> Result<(), BoxError> {
+        let mut state = self.session_state.lock();
+        if self.agent_id != AgentId::Main || !state.wait_enabled {
+            return Err("Waiting is unavailable outside the hosted main agent.".into());
+        }
+        state.wait_requested = true;
+        Ok(())
+    }
+
     fn goal(&self, action: goal::GoalAction) -> goal::GoalFuture {
         if self.agent_id == AgentId::Main {
             if let Some(control) = &self.goal_control {
@@ -5661,6 +5689,45 @@ mod event_protocol_tests {
     }
 
     #[tokio::test]
+    async fn wait_capability_requires_host_opt_in_and_main() {
+        let mut tool: ErasedToolDefinition = PingTool.into();
+        tool.func = Arc::new(|ctx, _| {
+            Box::pin(async move {
+                ctx.request_wait()?;
+                Ok(ToolOutcome {
+                    content: Vec::new(),
+                    details: ToolDetails::Text {
+                        summary: "Wait".into(),
+                        body: String::new(),
+                    },
+                    is_error: false,
+                })
+            })
+        });
+        let mut agent = build_agent(Vec::new(), vec![tool]);
+        assert!(
+            agent
+                .execute_tool("wait", "ping", serde_json::json!({}))
+                .await
+                .is_err()
+        );
+        agent.enable_wait();
+        assert!(
+            agent
+                .execute_tool("wait", "ping", serde_json::json!({}))
+                .await
+                .is_ok()
+        );
+        agent.set_agent_id(AgentId::Sub(1));
+        assert!(
+            agent
+                .execute_tool("wait", "ping", serde_json::json!({}))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn host_context_is_persistable_but_does_not_wake_a_turn() {
         use crate::message::AgentMessageKind;
         let mut agent = build_agent(
@@ -6911,12 +6978,13 @@ mod event_protocol_tests {
         let mut oracle: ErasedToolDefinition = PingTool.into();
         oracle.name = "oracle".into();
         let mut tools = vec![SpawnTool::blocking().into(), oracle, PingTool.into()];
-        for name in ["create_goal", "get_goal", "update_goal"] {
+        for name in ["create_goal", "get_goal", "update_goal", "wait"] {
             let mut tool: ErasedToolDefinition = PingTool.into();
             tool.name = name.into();
             tools.push(tool);
         }
         let mut parent = build_agent(Vec::new(), tools);
+        parent.enable_wait();
         parent.set_goal_control(
             Arc::new(|_, _, _| Box::pin(async { Ok(None) })),
             Arc::new(|_| Box::pin(async { Ok(0) })),
@@ -6975,6 +7043,8 @@ mod event_protocol_tests {
         model.id = "selected-model".into();
         model.provider = "selected-provider".into();
         let mut spawn = SpawnTool::blocking();
+        let mut wait: ErasedToolDefinition = PingTool.into();
+        wait.name = "wait".into();
         spawn.config = Some(tool::SpawnAgentConfig {
             provider: Arc::<ChildRecordingProvider>::clone(&provider),
             model_info: Arc::new(model),
@@ -6988,7 +7058,7 @@ mod event_protocol_tests {
             thinking: Some(ThinkingConfig::High),
             speed: Some(Speed::Fast),
             thinking_display: "visible".into(),
-            tools: vec![PingTool.into()],
+            tools: vec![PingTool.into(), wait],
             system_prompt_suffix: "\nselected suffix".into(),
         });
         let mut spawn: ErasedToolDefinition = spawn.into();

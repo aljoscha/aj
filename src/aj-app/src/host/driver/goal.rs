@@ -231,6 +231,7 @@ impl Driver {
         // The request loop folds preceding usage and spawns before admission.
         // Its normal checkpoint owns persistence failures, including cancellation
         // and reporting. Admission only fixes ownership and the context revision.
+        self.goal_resume_pending = false;
         self.goal.begin_inference(AgentId::Main);
         self.goal_revision
     }
@@ -373,6 +374,9 @@ impl Driver {
             self.wake(AgentId::Main);
             return Ok(());
         }
+        if self.waiting_for_input {
+            return Ok(());
+        }
         let prompt = context(self.goal.current.as_ref(), true);
         if let Err(err) = self.spawn(AgentId::Main, TurnStart::Goal(prompt)) {
             self.goal.set_status(GoalStatus::Blocked);
@@ -472,6 +476,14 @@ impl Driver {
         }
         self.goal.elapsed();
         let user_mutation = !from_tool && !matches!(action, GoalAction::Get);
+        let resumes_work = !from_tool
+            && matches!(
+                action,
+                GoalAction::Create { .. }
+                    | GoalAction::Replace { .. }
+                    | GoalAction::Edit { .. }
+                    | GoalAction::Resume
+            );
         let replacing = matches!(action, GoalAction::Replace { .. });
         match action {
             GoalAction::Get => {}
@@ -590,6 +602,10 @@ impl Driver {
             // Admission and mutation share the driver's request order, so a
             // revision never authorizes tools against an unseen objective.
             self.goal_revision += 1;
+        }
+        if resumes_work {
+            self.waiting_for_input = false;
+            self.goal_resume_pending = self.turns.is_busy(&self.lifecycle, AgentId::Main);
         }
         self.checkpoint_goal().await?;
         Ok(self.goal.current.clone())

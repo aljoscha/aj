@@ -7943,6 +7943,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
                 messages: Vec::new(),
+                waiting: false,
             },
         );
         let builder = caching_builder(&chat);
@@ -9275,6 +9276,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
                 messages: Vec::new(),
+                waiting: false,
             },
         );
 

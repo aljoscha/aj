@@ -561,6 +561,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: sub,
                 messages: Vec::new(),
+                waiting: false,
             },
         ];
         for event in events {
@@ -582,6 +583,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
                 messages: Vec::new(),
+                waiting: false,
             },
         ] {
             let _ = reduce(chat, life, event, None);
@@ -774,6 +776,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
                 messages: Vec::new(),
+                waiting: false,
             },
             None,
         );
@@ -816,6 +819,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
                 messages: Vec::new(),
+                waiting: false,
             },
             None,
         );

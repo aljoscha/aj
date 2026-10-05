@@ -342,12 +342,15 @@ async fn run_inner<W: Write + Send + 'static>(
         let cfg = run_config.lock().expect("run config mutex poisoned");
         cfg.main.model_key.clone()
     };
+    // A one-shot frontend cannot resume a yielded run on future input.
+    let mut tool_config = config.clone();
+    tool_config.disabled_tools.push("wait".into());
     let BuiltAgent {
         mut agent,
         env,
         include_skills,
     } = build_agent(
-        &config,
+        &tool_config,
         &run_config.lock().expect("run config mutex poisoned"),
     );
     agent.set_session_env(session_env.unwrap_or_default());
@@ -803,6 +806,10 @@ mod tests {
         )
         .await;
         let window = warm.model_info().context_window;
+        assert!(
+            !warm.tool_names().contains(&"wait"),
+            "print has no input wake loop"
+        );
         assert!(window > 0, "fixture must have a meaningful threshold");
         let id = persistence.get_latest_session_id().unwrap().unwrap();
         drop(warm);

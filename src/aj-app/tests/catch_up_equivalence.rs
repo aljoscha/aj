@@ -167,6 +167,7 @@ fn agent_end_frame(epoch: &str, agent_id: AgentId) -> Frame {
         event: AgentEvent::AgentEnd {
             agent_id,
             messages: Vec::new(),
+            waiting: false,
         }
         .into(),
     }

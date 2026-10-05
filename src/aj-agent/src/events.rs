@@ -179,6 +179,10 @@ pub enum AgentEvent {
     AgentEnd {
         agent_id: AgentId,
         messages: Vec<AgentMessage>,
+        /// A successful explicit yield. Resume on real input rather than
+        /// manufacturing another turn. This is transient, not a goal status.
+        #[serde(default)]
+        waiting: bool,
     },
     /// Ephemeral pause state, emitted after `AgentEnd`. The assignment remains
     /// pending until resumed or killed. `AgentStart` clears this state.

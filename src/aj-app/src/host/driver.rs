@@ -136,6 +136,12 @@ pub(crate) struct Driver {
     /// and task notices until the user starts work again, rather than waking
     /// into the same oversized context. This is not a session-persistent pause.
     compaction_failed: bool,
+    /// Explicit yield. Only synthetic goal continuation is held: queued input
+    /// and task notices retain their ordinary wake paths.
+    waiting_for_input: bool,
+    /// User goal input not yet admitted by Main. A yield decided against
+    /// the earlier objective must not swallow that request to continue.
+    goal_resume_pending: bool,
     goal: goal::GoalRun,
     /// Zero means no goal history. User mutations advance this revision, which
     /// admission returns to fence tools from an older objective or stop request.
@@ -163,6 +169,8 @@ impl Driver {
             persistence_failure,
             persistence_failed: false,
             compaction_failed: false,
+            waiting_for_input: false,
+            goal_resume_pending: false,
             goal,
             goal_revision,
         }
@@ -344,10 +352,21 @@ impl Driver {
             _ => {}
         }
         match event {
-            AgentEvent::AgentStart { agent_id } => self.lifecycle.mark_running(*agent_id),
-            AgentEvent::AgentEnd { agent_id, .. } => {
+            AgentEvent::AgentStart { agent_id } => {
+                self.lifecycle.mark_running(*agent_id);
+                if *agent_id == AgentId::Main {
+                    self.waiting_for_input = false;
+                }
+            }
+            AgentEvent::AgentEnd {
+                agent_id, waiting, ..
+            } => {
                 self.lifecycle.mark_idle(*agent_id);
                 self.note_finished(*agent_id);
+                if *agent_id == AgentId::Main {
+                    let resume_pending = std::mem::take(&mut self.goal_resume_pending);
+                    self.waiting_for_input = *waiting && !resume_pending;
+                }
             }
             AgentEvent::CompactionStart { agent_id, .. } => {
                 self.lifecycle.mark_compacting(*agent_id);
@@ -436,6 +455,7 @@ impl Driver {
                     AgentEvent::AgentEnd {
                         agent_id: AgentId::Sub(n),
                         messages: Vec::new(),
+                        waiting: false,
                     },
                 );
             }

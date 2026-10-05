@@ -6,6 +6,9 @@ use aj_models::streaming::AssistantMessageEventStream;
 use aj_models::types::{Context, SimpleStreamOptions, StreamOptions, Usage};
 use serde_json::json;
 
+#[path = "goals/wait.rs"]
+mod wait;
+
 struct Recorded {
     script: Arc<ScriptedProvider>,
     contexts: StdMutex<Vec<Context>>,

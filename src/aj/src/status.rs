@@ -371,6 +371,7 @@ mod tests {
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: vec![],
+                waiting: false,
             },
             AgentEvent::AgentInterrupted {
                 agent_id: AgentId::Sub(1),
