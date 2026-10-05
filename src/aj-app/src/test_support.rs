@@ -53,6 +53,8 @@ pub fn scripted_model_info() -> ModelInfo {
         reasoning_options: Vec::new(),
         supports_verbosity: false,
         default_verbosity: None,
+        speed_modes: Vec::new(),
+        default_speed: None,
         input: vec![aj_models::registry::InputModality::Text],
         cost: aj_models::registry::ModelCost::default(),
         context_window: 0,

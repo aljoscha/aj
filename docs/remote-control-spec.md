@@ -206,7 +206,7 @@ internally tagged with `kind`:
   semantics apply whether or not the nested event type is known to the
   receiver. Durable main-thread user-message ends carry `branch_settings`:
   the recorded model (`{api, name}`), thinking, speed, verbosity, their independent
-  `oracle_model`, `oracle_thinking`, `oracle_speed`, and `oracle_verbosity`
+  `oracle_model`, `oracle_thinking`, and `oracle_verbosity`
   counterparts, and provider account pins at that message's parent.
   Unrecorded inference axes are omitted,
   distinct from explicit `off` or `default`. An absent provider pin follows the
@@ -629,7 +629,7 @@ agent" locally take an optional `agent` field (default: the main agent).
 | `.../{id}/kill-agent` | `{agent}` | Explicitly terminate a sub-agent assignment, or a running independent continuation. The main agent is not a kill target. |
 | `.../{id}/queue` | `{op: "remove", agent?}` or `{op: "clear"}` | Withdraw one agent's pending message, or clear the session's queues. A withdrawal answers 200 `{text?}` with the text it took, which is what makes the dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index. A clear answers 202. |
 | `.../{id}/compact` | `{instructions?}` | Manual compaction. |
-| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, `oracle_model`, `oracle_thinking`, `oracle_speed`, `oracle_verbosity`, optional `agent`, `persist` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. `persist` defaults to `none`, or is `user`, `project_set`, or `project_clear`, and also writes the value into that host config layer. Oracle axes reject sub-agent targets. Persistence is main-agent only. |
+| `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, `oracle_model`, `oracle_thinking`, `oracle_verbosity`, optional `agent`, `persist` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. `persist` defaults to `none`, or is `user`, `project_set`, or `project_clear`, and also writes the value into that host config layer. Oracle axes reject sub-agent targets. Persistence is main-agent only. |
 | `.../{id}/account` | `{provider, account?}` | Select an account for this session and provider from the host-local auth store. Missing or null `account` resets to Provider default, `""` pins the unnamed account, any other string pins that exact label. Does not change the provider's auth-store default. Read the result through `accounts`. |
 | `.../{id}/env` | `{key, value}` | Set one session environment value, including the empty string. Null or an absent `value` removes the key from the map, not from the inherited process environment. Idle-only: 409 `conflict` while a turn or background task is live. Validates before mutation and persists the full resulting active-branch map. |
 | `.../{id}/tag` | `{tag}`, empty or absent clears | Set the session's tag (section 5.8): one trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
@@ -1225,7 +1225,7 @@ environment variable, or an entry written in the client's config file. A
 built-in fallback is not a preference and does not travel. The create
 command sends only stated axes, and stated axes are strict: a value the
 host's model cannot serve fails the create with an error naming the
-supported values, never a silent clamp or substitution. A stated model
+supported values, except for speed's explicit model-specific fallback below. A stated model
 must be servable by the host (present in its catalog, with credentials).
 Unstated axes are the host's to default, model-aware: its own configured
 default when the chosen model supports it, otherwise a supported value.
@@ -1234,9 +1234,10 @@ as peers, with host-owned model resolution. Model edits preserve the current
 effort, and the next inference validates the combination. Thinking display is an inference
 setting because it changes what the provider is asked to emit.
 
-Oracle is an advisory child with its own model, thinking effort, speed, and
-verbosity. Its `oracle_*` settings use the same vocabularies and precedence as
-main's settings, with independent built-in, user, and project defaults. An
+Oracle is an advisory child with its own model, thinking effort, and verbosity.
+Its `oracle_*` settings use the same vocabularies and precedence as main's
+settings, with independent built-in, user, and project defaults. Speed is one
+shared preference for Main and Oracle, not an `oracle_*` setting. An
 Oracle model selection requires both `api` and `name` and may include a URL
 override. There is no partial model selection or follow-main mode. Oracle
 thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
@@ -1245,6 +1246,23 @@ server default, gated by `supports_verbosity`. Explicit verbosity overrides
 the catalog default. Settings and session records keep `default` unresolved
 so model changes follow their own catalog defaults, without live catalog
 discovery. Oracle uses its own model's default, not main's value.
+
+Speed supports `standard`, `fast`, `ultrafast`, `flex`, and model-advertised
+named identifiers. `default` leaves the choice to each model's advertised
+catalog default. Explicit `standard` requests ordinary processing even if a
+provider project or catalog defaults to a premium mode. Supported choices and
+available prices travel with model metadata. A selected preference is retained
+in the session record, while each model independently resolves unsupported
+modes to standard speed. The host reports fallback notices. Catalog support
+does not guarantee account eligibility, and a server rejection is surfaced
+rather than retried at a different price. Flex does not trigger an automatic
+fallback to standard capacity.
+
+A speed edit targeting Main applies the shared preference to Main and Oracle.
+An edit targeting a promptable child records a thread-local override. Speed
+changes apply at the next turn, not to in-flight requests. `oracle_speed` is
+not accepted in create, settings, or branch-edit requests. Historical Oracle
+speed records remain readable but do not override the shared preference.
 
 Oracle calls use the same inputs and delivery modes as the `agent` tool. Calls
 block by default. With `run_in_background: true`, the tool returns the task id
@@ -1272,8 +1290,8 @@ the current runtime choices, just as for main. Unrecorded historical axes remain
 unknown in session-info and branch metadata. Live selectors use `oracle_settings`
 from state frames, while armed branch selectors use only historical metadata.
 Each main turn captures its Oracle bundle at turn start. Edits during that turn
-apply to consultations in the next main turn. Main edits never change Oracle's
-choices, and a retained child keeps its own bundle. Session selectors change
+apply to consultations in the next main turn. Main model, effort, and verbosity edits never change Oracle's choices. Speed
+edits apply to both roles, and a retained child keeps its own bundle. Session selectors change
 only the current session.
 Settings-window edits also save the chosen default on the host, whether the
 client is local or connected. Explicit model saves record both provider and name,

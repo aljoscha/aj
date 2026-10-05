@@ -170,7 +170,7 @@ pub(crate) fn apply_turn_config(
             crate::oracle::configure_tool(&mut tools, &config, &cfg);
             agent.set_tools(tools);
             agent.set_default_thinking(cfg.main.thinking.clone());
-            agent.set_speed(cfg.main.speed);
+            agent.set_speed(cfg.main.speed.clone());
         }
         AgentId::Sub(n) => {
             // Base session key used to scope the sub-agent's bundle
@@ -210,8 +210,8 @@ pub(crate) fn apply_turn_config(
             if let Some(thinking) = &entry.thinking {
                 agent.set_default_thinking(thinking.clone());
             }
-            if let Some(speed) = entry.speed {
-                agent.set_speed(speed);
+            if let Some(speed) = &entry.speed {
+                agent.set_speed(speed.clone());
             }
         }
     }

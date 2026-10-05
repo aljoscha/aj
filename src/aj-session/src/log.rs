@@ -727,7 +727,7 @@ impl SessionSettings {
         Self {
             model: self.oracle_model.clone(),
             thinking: self.oracle_thinking.clone(),
-            speed: self.oracle_speed.clone(),
+            speed: self.speed.clone(),
             verbosity: self.oracle_verbosity.clone(),
             ..Default::default()
         }

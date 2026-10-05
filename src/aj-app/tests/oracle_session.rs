@@ -17,7 +17,9 @@ use aj_conf::{
 use aj_models::ThinkingConfig;
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
-use aj_models::registry::{Catalog, ModelInfo, ModelRegistry, OverridesFile, ReasoningOption};
+use aj_models::registry::{
+    Catalog, ModelInfo, ModelRegistry, OverridesFile, ReasoningOption, SpeedMode,
+};
 use aj_models::scripted::script_from_message;
 use aj_models::streaming::AssistantMessageEventStream;
 use aj_models::types::{
@@ -62,7 +64,7 @@ impl Provider for AdvisorFixture {
             model: model.id.clone(),
             url: model.base_url.clone(),
             effort: options.reasoning,
-            speed: options.base.speed,
+            speed: options.base.speed.clone(),
             verbosity: options.base.verbosity,
         });
         let mut message = finalized_text_message("oracle evidence received");
@@ -123,7 +125,6 @@ impl Store {
             oracle_model_api: Some("fixture".into()),
             oracle_model_name: Some(oracle.into()),
             oracle_thinking: Some(ConfigThinkingLevel::High),
-            oracle_speed: Some(ConfigSpeed::Standard),
             oracle_verbosity: Some(ConfigVerbosity::High),
             spill_dir: Some(
                 self.root
@@ -199,7 +200,7 @@ impl Store {
         main_effort: ThinkingLevel,
         oracle_effort: ThinkingLevel,
         oracle_verbosity: Verbosity,
-        oracle_speed: Speed,
+        speed: Speed,
     ) {
         self.provider.0.lock().unwrap().clear();
         let mut attachment = host
@@ -269,9 +270,10 @@ impl Store {
         assert_eq!(requests[1].model, "oracle-a");
         assert_eq!(requests[1].url, model("oracle-a").base_url);
         assert_eq!(requests[1].effort, oracle_effort);
-        assert_eq!(requests[1].speed, Some(oracle_speed));
+        assert_eq!(requests[1].speed.as_ref(), Some(&speed));
         assert_eq!(requests[1].verbosity, Some(oracle_verbosity));
         for parent in [&requests[0], &requests[2]] {
+            assert_eq!(parent.speed.as_ref(), Some(&speed));
             assert_eq!(parent.model, "main-a");
             assert_eq!(parent.effort, main_effort);
             assert_eq!(parent.url, model("main-a").base_url);
@@ -299,6 +301,14 @@ fn model(id: &str) -> ModelInfo {
         }],
         supports_verbosity: true,
         default_verbosity: None,
+        speed_modes: vec![SpeedMode {
+            speed: Speed::Fast,
+            name: "Fast".into(),
+            description: String::new(),
+            wire_value: "priority".into(),
+            cost: None,
+        }],
+        default_speed: None,
         ..scripted_model_info()
     }
 }
@@ -336,12 +346,15 @@ fn assert_bundle(bundle: &ModelConfig, id: &str, thinking: &str, speed: &str, ve
     assert_eq!(bundle.model_info.id, id);
     assert_eq!(settings.thinking, thinking);
     assert_eq!(settings.speed, speed);
-    assert_eq!(aj_models::speed_name(bundle.stream_options.speed), speed);
+    assert_eq!(
+        aj_models::speed_name(bundle.stream_options.speed.as_ref()),
+        speed
+    );
     assert_eq!(settings.verbosity, verbosity);
 }
 
 #[tokio::test]
-async fn session_axes_reach_the_next_child_without_following_main_edits() {
+async fn oracle_axes_stay_independent_while_speed_follows_main_edits() {
     let store = Store::new();
     let (host, _) = store.host("oracle-a");
     let session = host.create().await.unwrap();
@@ -395,7 +408,7 @@ async fn session_axes_reach_the_next_child_without_following_main_edits() {
     }
     let run = handles.run_config.lock().unwrap().clone();
     assert_bundle(&run.main, "main-b", "high", "fast", "high");
-    assert_bundle(&run.oracle, "oracle-a", "low", "standard", "medium");
+    assert_bundle(&run.oracle, "oracle-a", "low", "fast", "medium");
     assert!(Arc::ptr_eq(&run.oracle.provider, &oracle.provider));
     assert_eq!(run.oracle.model_info.base_url, oracle.model_info.base_url);
     assert_eq!(run.oracle.thinking_display, oracle.thinking_display);
@@ -417,7 +430,6 @@ async fn oracle_edits_update_only_the_current_session_and_persist_only_oracle_ke
         for axis in [
             SettingsAxis::OracleModel(model("oracle-b")),
             SettingsAxis::OracleThinking(Some(ThinkingConfig::Low)),
-            SettingsAxis::OracleSpeed(Some(Speed::Fast)),
             SettingsAxis::OracleVerbosity(Some(ConfigVerbosity::Medium)),
         ] {
             edit(&host, &session, axis, persist).await;
@@ -426,8 +438,11 @@ async fn oracle_edits_update_only_the_current_session_and_persist_only_oracle_ke
         {
             let run = handles.run_config.lock().unwrap();
             assert_bundle(&run.main, "main-a", "low", "standard", "low");
-            assert_bundle(&run.oracle, "oracle-b", "low", "fast", "medium");
-            assert_eq!(run.oracle.stream_options.speed, Some(Speed::Fast));
+            assert_bundle(&run.oracle, "oracle-b", "low", "standard", "medium");
+            assert_eq!(
+                run.oracle.stream_options.speed,
+                run.main.stream_options.speed
+            );
         }
         let other = host.local_handles(&other).await.unwrap();
         {
@@ -443,7 +458,8 @@ async fn oracle_edits_update_only_the_current_session_and_persist_only_oracle_ke
             Some(("fixture".into(), "oracle-b".into()))
         );
         assert_eq!(recorded.oracle_thinking.as_deref(), Some("low"));
-        assert_eq!(recorded.oracle_speed.as_deref(), Some("fast"));
+        assert_eq!(recorded.speed.as_deref(), Some("standard"));
+        assert_eq!(recorded.oracle_speed, None);
         assert_eq!(recorded.oracle_verbosity.as_deref(), Some("medium"));
         drop(log);
         let saved = std::fs::read_to_string(&path).unwrap();
@@ -462,7 +478,6 @@ async fn oracle_edits_update_only_the_current_session_and_persist_only_oracle_ke
                 [
                     "oracle_model_api = \"fixture\"",
                     "oracle_model_name = \"oracle-b\"",
-                    "oracle_speed = \"fast\"",
                     "oracle_thinking = \"low\"",
                     "oracle_verbosity = \"medium\"",
                 ]
@@ -474,7 +489,6 @@ async fn oracle_edits_update_only_the_current_session_and_persist_only_oracle_ke
             assert_eq!(config.verbosity, Some(ConfigVerbosity::Low));
             assert_eq!(config.oracle_model_name.as_deref(), Some("oracle-b"));
             assert_eq!(config.oracle_thinking, Some(ConfigThinkingLevel::Low));
-            assert_eq!(config.oracle_speed, Some(ConfigSpeed::Fast));
             assert_eq!(config.oracle_verbosity, Some(ConfigVerbosity::Medium));
         }
         host.shutdown().await;
@@ -525,7 +539,7 @@ async fn creation_and_head_changes_resolve_oracle_selections_from_the_catalog() 
             ..selection("oracle-b")
         }),
         oracle_thinking: Some("low".into()),
-        oracle_speed: Some("fast".into()),
+        speed: Some("fast".into()),
         oracle_verbosity: Some("medium".into()),
         ..SessionSettings::default()
     };
@@ -536,7 +550,7 @@ async fn creation_and_head_changes_resolve_oracle_selections_from_the_catalog() 
     let handles = host.local_handles(&session).await.unwrap();
     {
         let run = handles.run_config.lock().unwrap();
-        assert_bundle(&run.main, "main-a", "low", "standard", "low");
+        assert_bundle(&run.main, "main-a", "low", "fast", "low");
         assert_bundle(&run.oracle, "oracle-b", "low", "fast", "medium");
         assert_eq!(
             run.oracle.model_info.base_url,
@@ -552,7 +566,7 @@ async fn creation_and_head_changes_resolve_oracle_selections_from_the_catalog() 
                 settings: SessionSettings {
                     oracle_model: Some(selection("oracle-a")),
                     oracle_thinking: Some("high".into()),
-                    oracle_speed: Some("standard".into()),
+                    speed: Some("standard".into()),
                     oracle_verbosity: Some("high".into()),
                     ..SessionSettings::default()
                 },
@@ -635,7 +649,8 @@ async fn captured_defaults_survive_resume_and_head_switch_restores_each_oracle_a
             Some(("fixture".into(), "oracle-a".into()))
         );
         assert_eq!(recorded.oracle_thinking.as_deref(), Some("high"));
-        assert_eq!(recorded.oracle_speed.as_deref(), Some("standard"));
+        assert_eq!(recorded.speed.as_deref(), Some("standard"));
+        assert_eq!(recorded.oracle_speed, None);
         assert_eq!(recorded.oracle_verbosity.as_deref(), Some("high"));
     }
     host.shutdown().await;
@@ -660,7 +675,7 @@ async fn captured_defaults_survive_resume_and_head_switch_restores_each_oracle_a
     for axis in [
         SettingsAxis::OracleModel(model("oracle-b")),
         SettingsAxis::OracleThinking(None),
-        SettingsAxis::OracleSpeed(Some(Speed::Fast)),
+        SettingsAxis::Speed(Some(Speed::Fast)),
         SettingsAxis::OracleVerbosity(None),
     ] {
         select(&host, &session, axis).await;
@@ -680,7 +695,7 @@ async fn captured_defaults_survive_resume_and_head_switch_restores_each_oracle_a
         .await
         .unwrap();
         let run = handles.run_config.lock().unwrap();
-        assert_bundle(&run.main, "main-a", "low", "standard", "low");
+        assert_bundle(&run.main, "main-a", "low", speed, "low");
         assert_bundle(&run.oracle, id, thinking, speed, verbosity);
     }
     host.shutdown().await;
@@ -834,7 +849,8 @@ async fn unavailable_recorded_oracle_keeps_fallback_and_restores_request_speed()
         .unwrap();
     log.append_oracle_model_change("fixture", "unavailable")
         .unwrap();
-    log.append_oracle_speed_change("fast").unwrap();
+    log.append_speed_change(ThreadFilter::USER, "fast").unwrap();
+    log.append_oracle_speed_change("standard").unwrap();
     log.append(
         log.head().cloned(),
         aj_session::ThreadKind::User,
@@ -849,6 +865,17 @@ async fn unavailable_recorded_oracle_keeps_fallback_and_restores_request_speed()
     let session = log.session_id().to_string();
     drop(log);
     let (host, _) = store.host("oracle-a");
+    let handles = host.local_handles(&session).await.unwrap();
+    {
+        let mut run = handles.run_config.lock().unwrap();
+        assert_bundle(&run.main, "main-a", "low", "fast", "low");
+        assert_bundle(&run.oracle, "oracle-a", "high", "fast", "high");
+        let fallback: Arc<dyn Provider> = Arc::<AdvisorFixture>::clone(&store.provider);
+        assert!(Arc::ptr_eq(&run.oracle.provider, &fallback));
+        // Main's recorded speed rebuilds its real adapter during restoration.
+        // Keep the injected request recorder at the inference boundary.
+        run.main.provider = fallback;
+    }
     store
         .consult(
             &host,
@@ -912,5 +939,58 @@ async fn branch_model_restore_preserves_unrecorded_verbosity() {
         assert_eq!(run.main.stream_options.verbosity, Some(Verbosity::High));
         assert_eq!(run.oracle.stream_options.verbosity, Some(Verbosity::Medium));
     }
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_speed_persists_one_default_without_changing_other_live_sessions() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("config.toml");
+    let args = aj_app::cli::args::Args::try_parse_from(["aj"]).unwrap();
+    let composed = aj_app::session_setup::compose_host(
+        &args,
+        ConfigLayers {
+            user: Config {
+                speed: Some(ConfigSpeed::Standard),
+                ..Config::default()
+            },
+            project: ConfigLayer::default(),
+            project_path: Some(path.clone()),
+            writes: Default::default(),
+        },
+        &AuthStorage::with_providers(root.path().join("auth.json"), HashMap::new()),
+        &ConversationPersistence::new(root.path().join("sessions")),
+        None,
+    )
+    .unwrap();
+    let host = composed.host;
+    let session = host.create().await.unwrap();
+    let other = host.create().await.unwrap();
+    edit(
+        &host,
+        &session,
+        SettingsAxis::Speed(Some(Speed::Fast)),
+        PersistAction::ProjectSet,
+    )
+    .await;
+    let assert_speed = |run: &aj_app::session_setup::RunConfigSnapshot, speed: Speed| {
+        for model in [&run.main, &run.oracle] {
+            assert_eq!(model.speed.as_ref(), Some(&speed));
+            assert_eq!(model.stream_options.speed.as_ref(), Some(&speed));
+        }
+    };
+    let handles = host.local_handles(&session).await.unwrap();
+    assert_speed(&handles.run_config.lock().unwrap(), Speed::Fast);
+    let other = host.local_handles(&other).await.unwrap();
+    assert_speed(&other.run_config.lock().unwrap(), Speed::Standard);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.lines().any(|line| line == "speed = \"fast\""),
+        "{saved}"
+    );
+    assert!(!saved.contains("oracle_speed"), "{saved}");
+    let fresh = host.create().await.unwrap();
+    let fresh = host.local_handles(&fresh).await.unwrap();
+    assert_speed(&fresh.run_config.lock().unwrap(), Speed::Fast);
     host.shutdown().await;
 }

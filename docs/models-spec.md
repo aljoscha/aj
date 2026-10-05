@@ -941,6 +941,28 @@ clamp usage to the window.
 
 ---
 
+### 3.5 Speed Modes
+
+`Speed` identifies `standard`, `fast`, `ultrafast`, `flex`, or a named mode.
+Names serialize as strings. Model metadata carries supported modes with display
+names, descriptions, provider wire values, and optional token pricing. An unset
+preference uses the model's advertised default, otherwise standard. Explicit
+standard overrides a premium catalog default. Unsupported selections fall back
+to standard without changing the preference recorded by the application.
+
+Catalog refresh recognizes speed-bearing entries in models.dev's
+`experimental.modes`, using `body.speed` for Anthropic and `body.service_tier`
+for OpenAI. Reasoning-only modes are excluded. The normalized Codex seed retains
+its pinned upstream `service_tiers` and `default_service_tier`. Reviewed catalog
+overrides supplement verified availability and prices missing from those sources.
+The catalog does not establish account eligibility.
+
+Per-mode token rates replace standard rates. Context tiers belong to that mode,
+not to the standard price table. Server-reported OpenAI service tiers and
+Anthropic `usage.speed` select the rates actually used. When mode pricing is
+unknown, the provider warns and estimates with standard rates. Codex costs are
+API-equivalent estimates, not a measurement of subscription limits or credits.
+
 ## 4. Stream Options
 
 Options passed to any streaming call:
@@ -985,9 +1007,10 @@ struct StreamOptions {
     /// test fixtures, or tracing provider-specific payload shape.
     /// Must not mutate the body — providers treat it as read-only.
     on_payload: Option<Arc<dyn Fn(&serde_json::Value) + Send + Sync>>,
-    /// Responses-only: request a non-default service tier. Ignored
-    /// by non-Responses providers. See §7.3 for cost multipliers.
+    /// OpenAI-only low-level tier override, taking precedence over speed.
     service_tier: Option<ServiceTier>,
+    /// Requested catalog speed. Unsupported modes resolve to standard.
+    speed: Option<Speed>,
     /// Responses-only: reasoning summary verbosity. Ignored by
     /// non-Responses providers. Defaults to `Auto` when reasoning
     /// is enabled. See §7.3.2.
@@ -1259,6 +1282,11 @@ non-null. This preserves `message_start` values when proxies omit fields in
 `ToolCallDelta` events carry progressively more complete argument objects even
 before the JSON is fully received.
 
+**Speed:** supported Fast mode sends `speed: "fast"` and the
+`fast-mode-2026-02-01` beta header together. Standard fallback sends neither.
+Actual `usage.speed` selects the mode's catalog token rates. Fast uses the same
+model weights and does not change reasoning effort or model capabilities.
+
 **Responses-specific options:** `StreamOptions.service_tier` and
 `StreamOptions.reasoning_summary` are ignored by this provider.
 Anthropic's `service_tier` is in beta and its cost model (reservation-
@@ -1425,7 +1453,7 @@ POST /responses
   store: false,
   prompt_cache_key: <session_id or omit>,
   prompt_cache_retention: <"24h" or omit>,
-  service_tier: <"flex" | "priority" or omit>,
+  service_tier: <resolved catalog tier or standard routing>,
   temperature: <if set>,
   max_output_tokens: <if set>,
   tools: [{type: "function", name, description, parameters, strict: false}],
@@ -1436,24 +1464,19 @@ POST /responses
 }
 ```
 
-**Service tier:** the Responses API accepts an optional `service_tier`
-parameter that trades latency/availability against cost. Surface this
-as an optional field on `StreamOptions` (specific to the Responses
-provider; other providers ignore it):
+**Service tier:** Responses, Codex, and Chat Completions map the resolved
+catalog speed onto its advertised wire value. Fast commonly maps to `priority`,
+Ultrafast to `ultrafast`, and Flex to `flex`. Public API standard routing sends
+`default` to bypass premium project defaults. Codex omits the field for standard,
+matching its backend contract. Explicit low-level `StreamOptions.service_tier`
+takes precedence over the speed preference.
 
-| Tier | Wire value | Cost multiplier |
-|---|---|---|
-| Flex | `"flex"` | 0.5× |
-| Priority | `"priority"` | 2× |
-| Standard (default) | omit | 1× |
-
-When a non-default tier is used, the provider multiplies the computed
-`usage.cost.{input, output, cache_read, cache_write, total}` by the
-tier's factor after the base cost calculation in §3.3, before returning
-the final `Usage`. When applying the tier multiplier, use the
-`service_tier` value from `response.completed` if present, falling back
-to the requested tier from `StreamOptions`. The server may assign a
-different tier than requested, including the standard `"default"` tier.
+The server's returned tier wins for pricing, with the requested wire tier as
+fallback when absent. Catalog mode rates are applied directly, including their
+own context tiers. For low-level Flex/Priority calls on a model without catalog
+mode metadata, the existing 0.5×/2× estimates remain and produce a warning.
+There is no automatic retry from unavailable Flex capacity into a more expensive
+tier.
 
 **Prompt caching:** caching is automatic on the Responses API — no
 key required. The fields below are routing/retention hints that
@@ -1721,7 +1744,7 @@ POST /codex/responses
   stream: true,
   store: false,                     // mandatory; server rejects store: true
   prompt_cache_key: <session_id or omit>,
-  service_tier: <"flex" | "priority" or omit>,
+  service_tier: <resolved catalog tier or standard routing>,
   temperature: <if set>,
   tools: [{type: "function", name, description, parameters}],
   tool_choice: "auto",
@@ -1768,20 +1791,11 @@ sourcing) carries over from §7.3.2 unchanged.
 
 #### 7.4.4 Service Tier Pricing
 
-Same `service_tier` knob as §7.3 with the same effective-tier
-resolution rule. The response value wins when present, and the requested
-value is the fallback when it is absent. The cost multipliers differ
-slightly because the Codex endpoint's pricing curve is not identical
-to the public Responses API:
-
-| Tier | Wire value | Cost multiplier (default) | Cost multiplier (`gpt-5.5`) |
-|---|---|---|---|
-| Flex | `"flex"` | 0.5× | 0.5× |
-| Priority | `"priority"` | 2× | 2.5× |
-| Standard | omit | 1× | 1× |
-
-The `gpt-5.5` exception is hard-coded in the provider's multiplier
-helper; all other Codex models use the default column.
+Codex follows the resolved tier and catalog-rate rules in §7.3. Its advertised
+speed availability comes from the Codex catalog, not matching public API models.
+For programmatic tier calls without catalog mode metadata, legacy estimates use
+0.5× for Flex and 2× for Priority, with 2.5× for GPT-5.5 Priority. These estimates
+are not applied on top of catalog mode prices.
 
 #### 7.4.5 Stream Event Mapping
 

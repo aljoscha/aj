@@ -132,7 +132,7 @@ fn stale_cache_loads_catalog_verbosity_defaults() {
         source: "stale cache".into(),
         models,
     };
-    for schema_version in [3, 4] {
+    for schema_version in [3, 4, 5] {
         cache.schema_version = schema_version;
         std::fs::write(
             home.path().join(".aj/models.json"),

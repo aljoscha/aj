@@ -26,17 +26,19 @@ use openai_sdk::types::chat_completions::{
     FinishReason, FunctionChoice, FunctionDefinition, ImageUrl, StreamOptions as ChatStreamOptions,
     Tool as ChatTool, ToolCall as ChatToolCall, ToolChoice as ChatToolChoice, Usage as ChatUsage,
 };
-use openai_sdk::types::common::ReasoningEffort;
+use openai_sdk::types::common::{ReasoningEffort, ServiceTier as OpenAIServiceTier};
 use serde_json::Value;
 
 use crate::cancel::{SelectOutcome, select_cancel};
 use crate::errors::classify_openai_finish_reason;
 use crate::openai::errors::{account_for_client_error, classify_client_error};
-use crate::openai::responses::map_verbosity;
+use crate::openai::responses::{
+    effective_service_tier, finalize_usage, map_verbosity, responses_cost_multiplier, tier_pricing,
+};
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{
-    ModelCost, ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level,
+    ModelCost, ModelInfo, SpeedMode, supports_verbosity, validate_thinking_level,
 };
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
@@ -183,6 +185,7 @@ async fn run_stream_inner(
     }
 
     let mut state = StreamState::new_with_account(model, credential.account.clone());
+    state.requested_tier = request.service_tier.clone();
     let mut sse = match select_cancel(
         options.cancel.as_ref(),
         client.chat_completions_stream(request),
@@ -358,7 +361,7 @@ fn build_request(
         safety_identifier: None,
         prompt_cache_key: None,
         prompt_cache_retention: None,
-        service_tier: None,
+        service_tier: effective_service_tier(model, options, false),
     };
 
     // String metadata is the only kind Chat Completions accepts; drop
@@ -825,6 +828,9 @@ struct StreamState {
     /// We keep an owned copy rather than borrowing the `ModelInfo` so the
     /// state machine carries no lifetime tie back to the provider call.
     cost: ModelCost,
+    speed_modes: Vec<SpeedMode>,
+    requested_tier: Option<OpenAIServiceTier>,
+    server_tier: Option<OpenAIServiceTier>,
 }
 
 struct ToolCallSlot {
@@ -860,12 +866,18 @@ impl StreamState {
             finish_reason: None,
             usage: None,
             cost: model.cost.clone(),
+            speed_modes: model.speed_modes.clone(),
+            requested_tier: None,
+            server_tier: None,
         }
     }
 
     fn process(&mut self, chunk: CreateChatCompletionStreamResponse) -> Vec<AssistantMessageEvent> {
         let mut events = Vec::new();
 
+        if let Some(tier) = chunk.service_tier.as_ref() {
+            self.server_tier = Some(tier.clone());
+        }
         if let Some(usage) = chunk.usage.as_ref() {
             self.usage = Some(usage.clone());
         }
@@ -1204,7 +1216,18 @@ impl StreamState {
         if let Some(usage) = self.usage.as_ref() {
             apply_usage(&mut self.partial.usage, usage);
         }
-        finalize_usage(&mut self.partial.usage, &self.cost);
+        let multiplier = responses_cost_multiplier(
+            &self.partial.model,
+            self.server_tier.as_ref(),
+            self.requested_tier.as_ref(),
+        );
+        let (cost, multiplier) = tier_pricing(
+            &self.cost,
+            &self.speed_modes,
+            self.server_tier.as_ref().or(self.requested_tier.as_ref()),
+            multiplier,
+        );
+        finalize_usage(&mut self.partial.usage, cost, multiplier);
     }
 
     /// The terminal event for a stream the client cancelled mid-flight.
@@ -1379,12 +1402,6 @@ fn apply_usage(target: &mut Usage, source: &ChatUsage) {
     target.output = u64::from(source.completion_tokens);
 }
 
-fn finalize_usage(usage: &mut Usage, cost: &ModelCost) {
-    // trust our own arithmetic over the wire's `total_tokens`.
-    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-    calculate_cost(cost, usage);
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1415,6 +1432,8 @@ mod tests {
             reasoning_options: Vec::new(),
             supports_verbosity: false,
             default_verbosity: None,
+            speed_modes: Vec::new(),
+            default_speed: None,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 1.25,
@@ -1425,6 +1444,166 @@ mod tests {
             },
             context_window: 200_000,
             max_tokens: 16_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_speed_requests_and_accounting_share_the_effective_tier() {
+        for (served, rates, expected) in [
+            (Some("priority"), true, 38.0),
+            (Some("fast"), true, 38.0),
+            (None, true, 38.0),
+            (Some("default"), true, 11.25),
+            (Some("future-tier"), true, 11.25),
+            (Some("priority"), false, 11.25),
+        ] {
+            let mut chunk = empty_chunk();
+            chunk.service_tier = served.map(|tier| OpenAIServiceTier::from(tier.to_owned()));
+            chunk.usage = Some(ChatUsage {
+                prompt_tokens: 1_000_000,
+                completion_tokens: 1_000_000,
+                total_tokens: 2_000_000,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            });
+            let finish = finish_chunk(FinishReason::Stop);
+            let events = vec![
+                serde_json::to_string(&finish).unwrap(),
+                serde_json::to_string(&chunk).unwrap(),
+            ];
+            let server =
+                crate::provider_test_support::held_sse_server("POST /v1/chat/completions", events)
+                    .await;
+            let mut model = fake_model();
+            model.base_url = format!("{}/v1", server.base_url);
+            model.speed_modes.push(crate::registry::SpeedMode {
+                speed: crate::types::Speed::Fast,
+                name: "Fast".into(),
+                description: "".into(),
+                wire_value: "priority".into(),
+                cost: rates.then_some(crate::registry::ModelCost {
+                    input: 7.0,
+                    output: 31.0,
+                    cache_read: 1.0,
+                    cache_write: 0.0,
+                    tiers: vec![],
+                }),
+            });
+            let mut options = labeled_options(tokio_util::sync::CancellationToken::new());
+            options.service_tier = None;
+            options.speed = Some(crate::types::Speed::Fast);
+            let payload = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let captured = std::sync::Arc::clone(&payload);
+            options.on_payload = Some(OnPayload::new(move |value| {
+                *captured.lock().unwrap() = Some(value.clone())
+            }));
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                OpenAiCompletionsProvider
+                    .stream(&model, &Context::new("sys"), &options)
+                    .result(),
+            )
+            .await
+            .unwrap();
+            server.finish().await;
+            assert_eq!(
+                payload.lock().unwrap().as_ref().unwrap()["service_tier"],
+                "priority"
+            );
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(result.usage.total_tokens, 2_000_000);
+            assert_eq!(
+                result.usage.cost.total, expected,
+                "reported tier {served:?}, published prices {rates}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_speed_modes_use_catalog_wire_values_and_safe_standard_fallback() {
+        let mut model = fake_model();
+        for (speed, wire) in [
+            (crate::types::Speed::Fast, "priority"),
+            (crate::types::Speed::Ultrafast, "ultrafast"),
+            (crate::types::Speed::Flex, "flex"),
+            (crate::types::Speed::Named("custom".into()), "custom-wire"),
+        ] {
+            model.speed_modes.push(crate::registry::SpeedMode {
+                speed: speed.clone(),
+                name: wire.into(),
+                description: "".into(),
+                wire_value: wire.into(),
+                cost: None,
+            });
+            let options = StreamOptions {
+                speed: Some(speed),
+                ..Default::default()
+            };
+            let request =
+                build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off);
+            assert_eq!(
+                request.service_tier,
+                Some(OpenAIServiceTier::from(wire.to_owned()))
+            );
+        }
+        model.default_speed = Some(crate::types::Speed::Fast);
+        let request = build_request(
+            &model,
+            &Context::new("sys"),
+            &StreamOptions::default(),
+            &ThinkingLevel::Off,
+        );
+        assert_eq!(request.service_tier, Some(OpenAIServiceTier::Priority));
+        for speed in [
+            crate::types::Speed::Standard,
+            crate::types::Speed::Named("unsupported".into()),
+        ] {
+            let options = StreamOptions {
+                speed: Some(speed),
+                ..Default::default()
+            };
+            assert_eq!(
+                build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off)
+                    .service_tier,
+                Some(OpenAIServiceTier::Default)
+            );
+        }
+        let options = StreamOptions {
+            speed: Some(crate::types::Speed::Fast),
+            service_tier: Some(crate::types::ServiceTier::Flex),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off).service_tier,
+            Some(OpenAIServiceTier::Flex)
+        );
+        model.speed_modes.clear();
+        model.default_speed = None;
+        let options = StreamOptions {
+            speed: Some(crate::types::Speed::Fast),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off).service_tier,
+            Some(OpenAIServiceTier::Default)
+        );
+        model.provider = "compatible".into();
+        model.base_url = "https://compatible.example/v1".into();
+        for speed in [
+            None,
+            Some(crate::types::Speed::Standard),
+            Some(crate::types::Speed::Fast),
+        ] {
+            let options = StreamOptions {
+                speed,
+                ..Default::default()
+            };
+            assert!(
+                build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off)
+                    .service_tier
+                    .is_none(),
+                "tierless compatible endpoints must not receive unsupported parameters"
+            );
         }
     }
 

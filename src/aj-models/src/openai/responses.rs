@@ -39,7 +39,8 @@ use crate::openai::errors::{account_for_client_error, classify_client_error};
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{
-    ModelCost, ModelInfo, calculate_cost, supports_verbosity, validate_thinking_level,
+    ModelCost, ModelInfo, SpeedMode, calculate_cost, resolve_speed, supports_verbosity,
+    validate_thinking_level,
 };
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
@@ -47,7 +48,7 @@ use crate::streaming::{
 use crate::transform::transform_messages;
 use crate::types::{
     AssistantContent, AssistantError, AssistantMessage, CacheRetention, Context, ErrorCategory,
-    Message, ReasoningSummary as UnifiedReasoningSummary, ServiceTier, SimpleStreamOptions,
+    Message, ReasoningSummary as UnifiedReasoningSummary, ServiceTier, SimpleStreamOptions, Speed,
     StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, ToolChoice,
     ToolDefinition, ToolResultMessage, UserContent, UserMessage, Verbosity as UnifiedVerbosity,
 };
@@ -280,9 +281,11 @@ async fn run_stream_inner(
         }
     }
 
-    let mut state = StreamState::new_with_account(
+    let mut state = StreamState::new_with_tier(
+        API_NAME,
         model,
-        options.service_tier.clone(),
+        request.service_tier.clone(),
+        responses_cost_multiplier,
         credential.account.clone(),
     );
     let mut sse =
@@ -447,7 +450,7 @@ fn build_request(
         _ => None,
     };
 
-    let service_tier = options.service_tier.as_ref().map(map_service_tier);
+    let service_tier = effective_service_tier(model, options, false);
 
     let text = verbosity_text_config(model, options);
 
@@ -524,6 +527,75 @@ pub(super) fn responses_reasoning_effort(
     })
 }
 
+/// An explicit low-level tier overrides speed, including an advertised default.
+/// Codex omits `default`, as its upstream client does in
+/// `codex-rs/protocol/src/openai_models.rs::service_tier_for_request`.
+pub(super) fn effective_service_tier(
+    model: &ModelInfo,
+    options: &StreamOptions,
+    codex: bool,
+) -> Option<OpenAIServiceTier> {
+    if let Some(tier) = options.service_tier.as_ref() {
+        return Some(map_service_tier(tier));
+    }
+    let speed = resolve_speed(model, options.speed.as_ref())?;
+    if speed == Speed::Standard {
+        // Public APIs accept default to bypass a project's paid tier setting.
+        // Compatible endpoints without tier metadata may reject this field.
+        let supports_tiers = model.provider == "openai"
+            || is_openai_host(&model.base_url)
+            || !model.speed_modes.is_empty();
+        return (!codex && supports_tiers).then_some(OpenAIServiceTier::Default);
+    }
+    model
+        .speed_mode(&speed)
+        .map(|mode| OpenAIServiceTier::from(mode.wire_value.clone()))
+}
+
+/// Catalog rates describe the actual tier, not a blanket premium multiplier.
+/// Without catalog modes, preserve the low-level flex/priority estimate.
+pub(super) fn tier_pricing<'a>(
+    standard: &'a ModelCost,
+    modes: &'a [SpeedMode],
+    tier: Option<&OpenAIServiceTier>,
+    legacy_multiplier: f64,
+) -> (&'a ModelCost, f64) {
+    fn canonical_tier(value: &str) -> &str {
+        match value {
+            "fast" => "priority",
+            value => value,
+        }
+    }
+    if let Some(mode) = tier.and_then(|tier| {
+        // OpenAI accepts fast and priority as aliases and may echo either.
+        modes
+            .iter()
+            .find(|mode| canonical_tier(mode.wire_value.as_str()) == canonical_tier(tier.as_str()))
+    }) {
+        if let Some(cost) = mode.cost.as_ref() {
+            return (cost, 1.0);
+        }
+        if mode.speed != Speed::Standard {
+            tracing::warn!(tier = ?tier, "speed pricing is unknown; estimating with standard rates");
+        }
+        return (standard, 1.0);
+    }
+    if modes.is_empty()
+        && matches!(
+            tier,
+            Some(OpenAIServiceTier::Flex | OpenAIServiceTier::Priority | OpenAIServiceTier::Fast)
+        )
+    {
+        tracing::warn!(tier = ?tier, "catalog tier pricing is unavailable; using legacy service-tier estimate");
+        return (standard, legacy_multiplier);
+    }
+    if matches!(tier, Some(tier) if !matches!(tier, OpenAIServiceTier::Default | OpenAIServiceTier::Auto | OpenAIServiceTier::Scale))
+    {
+        tracing::warn!(tier = ?tier, "served tier pricing is unknown; estimating with standard rates");
+    }
+    (standard, 1.0)
+}
+
 pub(super) fn map_service_tier(tier: &ServiceTier) -> OpenAIServiceTier {
     match tier {
         ServiceTier::Flex => OpenAIServiceTier::Flex,
@@ -542,7 +614,7 @@ pub(super) fn responses_cost_multiplier(
 fn cost_multiplier_from_tier(tier: Option<&OpenAIServiceTier>) -> f64 {
     match tier {
         Some(OpenAIServiceTier::Flex) => 0.5,
-        Some(OpenAIServiceTier::Priority) => 2.0,
+        Some(OpenAIServiceTier::Priority | OpenAIServiceTier::Fast) => 2.0,
         _ => 1.0,
     }
 }
@@ -1048,6 +1120,7 @@ pub(super) struct StreamState {
     /// We keep an owned copy rather than borrowing the `ModelInfo` so the
     /// state machine carries no lifetime tie back to the provider call.
     cost: ModelCost,
+    speed_modes: Vec<SpeedMode>,
 }
 
 impl StreamState {
@@ -1056,6 +1129,7 @@ impl StreamState {
         Self::new_with_account(model, requested_tier, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn new_with_account(
         model: &ModelInfo,
         requested_tier: Option<ServiceTier>,
@@ -1079,10 +1153,27 @@ impl StreamState {
     /// terminal message the state produces carries it, the same reason
     /// the cost rates are snapshotted here. Codex shares this state, so
     /// this is the stamp for both providers.
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn new_with(
         api_name: &'static str,
         model: &ModelInfo,
         requested_tier: Option<ServiceTier>,
+        cost_multiplier: CostMultiplierFn,
+        account: Option<String>,
+    ) -> Self {
+        Self::new_with_tier(
+            api_name,
+            model,
+            requested_tier.as_ref().map(map_service_tier),
+            cost_multiplier,
+            account,
+        )
+    }
+
+    pub(super) fn new_with_tier(
+        api_name: &'static str,
+        model: &ModelInfo,
+        requested_tier: Option<OpenAIServiceTier>,
         cost_multiplier: CostMultiplierFn,
         account: Option<String>,
     ) -> Self {
@@ -1099,10 +1190,11 @@ impl StreamState {
             final_response: None,
             finish_status: None,
             finish_error: None,
-            requested_tier: requested_tier.as_ref().map(map_service_tier),
+            requested_tier,
             api_name,
             cost_multiplier,
             cost: model.cost.clone(),
+            speed_modes: model.speed_modes.clone(),
         }
     }
 
@@ -1574,7 +1666,13 @@ impl StreamState {
         if let Some(usage) = self.final_response.as_ref().and_then(|r| r.usage.as_ref()) {
             apply_usage(&mut self.partial.usage, usage);
         }
-        finalize_usage(&mut self.partial.usage, &self.cost, multiplier);
+        let tier = self
+            .final_response
+            .as_ref()
+            .and_then(|r| r.service_tier.as_ref())
+            .or(self.requested_tier.as_ref());
+        let (cost, multiplier) = tier_pricing(&self.cost, &self.speed_modes, tier, multiplier);
+        finalize_usage(&mut self.partial.usage, cost, multiplier);
     }
 
     /// The terminal event for a stream the client cancelled mid-flight.
@@ -1754,7 +1852,11 @@ fn apply_usage(target: &mut crate::types::Usage, source: &ResponseUsage) {
     target.output = u64::from(source.output_tokens);
 }
 
-fn finalize_usage(usage: &mut crate::types::Usage, cost: &ModelCost, tier_multiplier: f64) {
+pub(super) fn finalize_usage(
+    usage: &mut crate::types::Usage,
+    cost: &ModelCost,
+    tier_multiplier: f64,
+) {
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
     calculate_cost(cost, usage);
     if (tier_multiplier - 1.0).abs() > f64::EPSILON {
@@ -1791,6 +1893,8 @@ mod tests {
             reasoning_options: Vec::new(),
             supports_verbosity: false,
             default_verbosity: None,
+            speed_modes: Vec::new(),
+            default_speed: None,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 1.25,
@@ -1802,6 +1906,143 @@ mod tests {
             context_window: 200_000,
             max_tokens: 16_000,
         }
+    }
+
+    #[tokio::test]
+    async fn live_speed_requests_and_accounting_share_the_effective_tier() {
+        for (served, rates, expected) in [
+            (Some("priority"), true, 38.0),
+            (None, true, 38.0),
+            (Some("default"), true, 11.25),
+            (Some("future-tier"), true, 11.25),
+            (Some("priority"), false, 11.25),
+        ] {
+            let mut event = serde_json::json!({
+                "type": "response.completed", "sequence_number": 1,
+                "response": { "id":"resp_speed", "object":"response", "created_at":0.0,
+                    "model":"gpt-5.5", "output":[], "parallel_tool_calls":true, "tools":[], "status":"completed",
+                    "usage": {"input_tokens":1_000_000, "output_tokens":1_000_000, "total_tokens":2_000_000}
+                }
+            });
+            if let Some(tier) = served {
+                event["response"]["service_tier"] = tier.into();
+            }
+            let events = vec![event.to_string()];
+            let server =
+                crate::provider_test_support::held_sse_server("POST /v1/responses", events).await;
+            let mut model = fake_model(false);
+            model.base_url = format!("{}/v1", server.base_url);
+            model.speed_modes.push(crate::registry::SpeedMode {
+                speed: crate::types::Speed::Fast,
+                name: "Fast".into(),
+                description: "".into(),
+                wire_value: "priority".into(),
+                cost: rates.then_some(crate::registry::ModelCost {
+                    input: 7.0,
+                    output: 31.0,
+                    cache_read: 1.0,
+                    cache_write: 0.0,
+                    tiers: vec![],
+                }),
+            });
+            let mut options = labeled_options(tokio_util::sync::CancellationToken::new());
+            options.service_tier = None;
+            options.speed = Some(crate::types::Speed::Fast);
+            let payload = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let captured = std::sync::Arc::clone(&payload);
+            options.on_payload = Some(OnPayload::new(move |value| {
+                *captured.lock().unwrap() = Some(value.clone())
+            }));
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                OpenAiResponsesProvider
+                    .stream(&model, &Context::new("sys"), &options)
+                    .result(),
+            )
+            .await
+            .unwrap();
+            server.finish().await;
+            assert_eq!(
+                payload.lock().unwrap().as_ref().unwrap()["service_tier"],
+                "priority"
+            );
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(result.usage.total_tokens, 2_000_000);
+            assert_eq!(
+                result.usage.cost.total, expected,
+                "reported tier {served:?}, published prices {rates}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_speed_modes_use_catalog_wire_values_and_safe_standard_fallback() {
+        let mut model = fake_model(false);
+        for (speed, wire) in [
+            (crate::types::Speed::Fast, "priority"),
+            (crate::types::Speed::Ultrafast, "ultrafast"),
+            (crate::types::Speed::Flex, "flex"),
+            (crate::types::Speed::Named("custom".into()), "custom-wire"),
+        ] {
+            model.speed_modes.push(crate::registry::SpeedMode {
+                speed: speed.clone(),
+                name: wire.into(),
+                description: "".into(),
+                wire_value: wire.into(),
+                cost: None,
+            });
+            let options = StreamOptions {
+                speed: Some(speed),
+                ..Default::default()
+            };
+            let request =
+                build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off);
+            assert_eq!(
+                request.service_tier,
+                Some(OpenAIServiceTier::from(wire.to_owned()))
+            );
+        }
+        model.default_speed = Some(crate::types::Speed::Fast);
+        let request = build_request(
+            &model,
+            &Context::new("sys"),
+            &StreamOptions::default(),
+            &ThinkingLevel::Off,
+        );
+        assert_eq!(request.service_tier, Some(OpenAIServiceTier::Priority));
+        for speed in [
+            crate::types::Speed::Standard,
+            crate::types::Speed::Named("unsupported".into()),
+        ] {
+            let options = StreamOptions {
+                speed: Some(speed),
+                ..Default::default()
+            };
+            assert_eq!(
+                build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off)
+                    .service_tier,
+                Some(OpenAIServiceTier::Default)
+            );
+        }
+        let options = StreamOptions {
+            speed: Some(crate::types::Speed::Fast),
+            service_tier: Some(crate::types::ServiceTier::Flex),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off).service_tier,
+            Some(OpenAIServiceTier::Flex)
+        );
+        model.speed_modes.clear();
+        model.default_speed = None;
+        let options = StreamOptions {
+            speed: Some(crate::types::Speed::Fast),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off).service_tier,
+            Some(OpenAIServiceTier::Default)
+        );
     }
 
     fn labeled_options(cancel: CancellationToken) -> StreamOptions {
@@ -2402,12 +2643,19 @@ mod tests {
 
     #[test]
     fn responses_terminal_tier_pricing_table() {
-        use OpenAIServiceTier::{Auto, Default, Flex, Priority, Scale};
+        use OpenAIServiceTier::{Auto, Default, Fast, Flex, Priority, Scale};
 
         let half = (1.0, 2.0, 0.5, 0.0, 3.5);
         let standard = (2.0, 4.0, 1.0, 0.0, 7.0);
         let double = (4.0, 8.0, 2.0, 0.0, 14.0);
         let cases = [
+            PricingCase {
+                name: "fast echo aliases priority estimate",
+                model_id: "gpt-pricing-test",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Fast),
+                expected_cost: double,
+            },
             PricingCase {
                 name: "default echo overrides flex request",
                 model_id: "gpt-pricing-test",

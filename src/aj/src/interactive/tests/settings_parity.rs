@@ -1778,7 +1778,6 @@ async fn settings_parity_rejected_values_can_be_corrected_without_reopening() {
         world.control = control;
         shell.borrow().toasts.borrow_mut().clear();
         let previous = Config::load().0.compact_threshold.to_string();
-        let run_config = Arc::clone(&world.local.as_ref().unwrap().run_config);
         let observed = Rc::clone(&shell);
         let (exit, ()) = drive_until(&mut world, &shell, move |mut writer| async move {
             writer.write_all(b"\x0fsettings\r").unwrap();
@@ -1791,36 +1790,6 @@ async fn settings_parity_rejected_values_can_be_corrected_without_reopening() {
                     .and_then(|ui| ui.value_of("compact_threshold")))
                 .await
                 .is_some()
-            );
-            let speed_before = observed
-                .borrow()
-                .settings_ui
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .value_of("speed");
-            writer.write_all(b"speed\r").unwrap();
-            assert!(
-                poll_for(|| toast_lines(&observed)
-                    .iter()
-                    .any(|line| line.contains("Failed to set speed"))
-                    .then_some(()))
-                .await
-                .is_some()
-            );
-            assert_eq!(
-                observed
-                    .borrow()
-                    .settings_ui
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .value_of("speed"),
-                speed_before
-            );
-            assert_eq!(
-                aj_models::speed_name(run_config.lock().unwrap().main.speed),
-                "standard"
             );
             writer.write_all(b"\x15compact_threshold\r").unwrap();
             assert!(

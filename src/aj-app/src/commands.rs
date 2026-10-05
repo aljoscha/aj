@@ -70,6 +70,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::OpenThinkingSelector,
     },
     Command {
+        name: "speed",
+        title: "speed",
+        category: "agent",
+        description: "Set shared Main and Oracle speed for this session, or override the focused sub-thread.",
+        action_id: None,
+        action: CommandAction::OpenSpeedSelector,
+    },
+    Command {
         name: "model",
         title: "model",
         category: "agent",
@@ -315,6 +323,8 @@ pub enum CommandAction {
     /// affects the current session only. Use the settings window to
     /// change the default for new sessions.
     OpenThinkingSelector,
+    /// Choose session-only speed, shared by Main and Oracle or overridden for a sub-thread.
+    OpenSpeedSelector,
     /// Open the model selector overlay. The current model is
     /// pre-selected. `Esc` cancels, `Enter` applies. The choice
     /// affects the current session only. Use the settings window to

@@ -988,18 +988,27 @@ impl Driver {
                     .flatten();
                 crate::settings::confirm_model_for_sub(&info, n, &shared.auth, speed, core).await
             }
-            (SettingsAxis::Speed(speed) | SettingsAxis::OracleSpeed(speed), AgentId::Main) => {
+            (SettingsAxis::Speed(speed), AgentId::Main) => {
                 crate::settings::confirm_speed(
-                    target,
                     speed,
                     persist,
-                    &shared.auth,
                     &core.run_config,
                     &shared.config,
                     &shared.layers,
                     core,
                 )
                 .await
+            }
+            (SettingsAxis::Speed(speed), AgentId::Sub(n)) => {
+                let tracked = self.sub_settings(n).await.model.and_then(|key| {
+                    self.shared
+                        .catalog
+                        .iter()
+                        .find(|info| info.provider == key.0 && info.id == key.1)
+                        .cloned()
+                        .map(Arc::new)
+                });
+                crate::settings::confirm_speed_for_sub(speed, n, tracked, core).await
             }
             (
                 SettingsAxis::Verbosity(verbosity) | SettingsAxis::OracleVerbosity(verbosity),
@@ -1019,17 +1028,15 @@ impl Driver {
             (
                 SettingsAxis::OracleModel(_)
                 | SettingsAxis::OracleThinking(_)
-                | SettingsAxis::OracleSpeed(_)
                 | SettingsAxis::OracleVerbosity(_)
                 | SettingsAxis::ThinkingDisplay(_)
-                | SettingsAxis::Speed(_)
                 | SettingsAxis::Verbosity(_),
                 AgentId::Sub(n),
             ) => {
                 // Malformed rather than unservable: these axes are
                 // session-wide, so no host could serve this request.
                 return Err(HostError::Invalid(format!(
-                    "thinking display, speed, and verbosity are session-wide and cannot be set for agent {n}"
+                    "thinking display and verbosity are session-wide and cannot be set for agent {n}"
                 )));
             }
         };
@@ -1075,6 +1082,15 @@ impl Driver {
             status.oracle_settings = oracle_settings;
             true
         });
+        for text in outcome.notices {
+            self.publish_event(
+                None,
+                AgentEvent::Notice {
+                    agent_id: agent,
+                    text,
+                },
+            );
+        }
         Ok(incomplete.map_or(CommandOutcome::Accepted, CommandOutcome::Incomplete))
     }
 
@@ -1393,6 +1409,23 @@ impl Driver {
             session: self.session.id().to_string(),
         });
         self.publish_state();
+        let notices = crate::settings::speed_fallback_notices(
+            &self
+                .session
+                .core
+                .run_config
+                .lock()
+                .expect("run config mutex poisoned"),
+        );
+        for text in notices {
+            self.publish_event(
+                None,
+                AgentEvent::Notice {
+                    agent_id: AgentId::Main,
+                    text,
+                },
+            );
+        }
         self.shared.fanout.mark_list_dirty();
         Ok(CommandOutcome::Accepted)
     }

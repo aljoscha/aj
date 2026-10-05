@@ -3117,6 +3117,21 @@ fn editing_thinking(world: &World, shell: &Rc<RefCell<Shell>>, target: AgentId) 
     Some(aj_models::thinking_config_name(viewed_thinking(world, target).as_ref()).to_string())
 }
 
+fn editing_speed(world: &World, shell: &Rc<RefCell<Shell>>, target: AgentId) -> Option<String> {
+    if target == AgentId::Main
+        && let Some(state) = branch_settings(shell)
+    {
+        return state.speed;
+    }
+    world
+        .chat
+        .borrow()
+        .footers()
+        .settings(target)
+        .or_else(|| world.client().settings())
+        .map(|settings| settings.speed.clone())
+}
+
 /// Stage an axis choice on the pending branch draft. With a branch open the
 /// running session must not change, so the session effect waits for the
 /// branch's submission while `save`, an editor row's config edit, is written
@@ -3775,6 +3790,7 @@ async fn apply_command_action(
         CommandAction::Compact => Some("compact"),
         CommandAction::ExportHtml => Some("export the session"),
         CommandAction::OpenThinkingSelector => Some("change thinking effort"),
+        CommandAction::OpenSpeedSelector => Some("change speed"),
         CommandAction::OpenModelSelector => Some("change the model"),
         CommandAction::OpenOracleModelSelector | CommandAction::OpenOracleThinkingSelector => {
             Some("change Oracle settings")
@@ -3788,6 +3804,7 @@ async fn apply_command_action(
         && matches!(
             action,
             CommandAction::OpenThinkingSelector
+                | CommandAction::OpenSpeedSelector
                 | CommandAction::OpenModelSelector
                 | CommandAction::OpenOracleModelSelector
                 | CommandAction::OpenOracleThinkingSelector
@@ -3839,13 +3856,10 @@ async fn apply_command_action(
         // their read in `Shell::fills` for the drive loop, so the window is
         // there and cancellable before the host has answered.
         CommandAction::OpenThinkingSelector
+        | CommandAction::OpenSpeedSelector
         | CommandAction::OpenModelSelector
         | CommandAction::OpenOracleModelSelector
         | CommandAction::OpenOracleThinkingSelector => {
-            let thinking = matches!(
-                action,
-                CommandAction::OpenThinkingSelector | CommandAction::OpenOracleThinkingSelector
-            );
             let oracle = matches!(
                 action,
                 CommandAction::OpenOracleModelSelector | CommandAction::OpenOracleThinkingSelector
@@ -3855,7 +3869,14 @@ async fn apply_command_action(
             } else {
                 editing_target(world, shell).into()
             };
-            let fetch = open_host_selector(world, shell, thinking, target);
+            let kind = match action {
+                CommandAction::OpenSpeedSelector => SelectorKind::Speed,
+                CommandAction::OpenThinkingSelector | CommandAction::OpenOracleThinkingSelector => {
+                    SelectorKind::Thinking
+                }
+                _ => SelectorKind::Model,
+            };
+            let fetch = open_host_selector(world, shell, kind, target);
             shell
                 .borrow_mut()
                 .fills
@@ -4369,6 +4390,7 @@ async fn dispatch_selector_activity(
         let session_mutation = match &item {
             SelectorActivity::OracleConfirmed { .. }
             | SelectorActivity::ThinkingConfirmed { .. }
+            | SelectorActivity::SpeedConfirmed { .. }
             | SelectorActivity::ModelConfirmed { .. }
             | SelectorActivity::EnvironmentEdit(_) => true,
             SelectorActivity::SettingChange { id, .. }
@@ -4379,6 +4401,7 @@ async fn dispatch_selector_activity(
             && match &item {
                 SelectorActivity::OracleConfirmed { .. } => true,
                 SelectorActivity::ThinkingConfirmed { target, .. }
+                | SelectorActivity::SpeedConfirmed { target, .. }
                 | SelectorActivity::ModelConfirmed { target, .. } => *target == AgentId::Main,
                 SelectorActivity::SettingChange { id, .. }
                 | SelectorActivity::SettingClear { id, .. } => matches!(
@@ -4389,7 +4412,6 @@ async fn dispatch_selector_activity(
                         | "verbosity"
                         | "oracle_model"
                         | "oracle_thinking"
-                        | "oracle_speed"
                         | "oracle_verbosity"
                 ),
                 SelectorActivity::EnvironmentEdit(edit) => edit.session == world.session(),
@@ -4398,6 +4420,7 @@ async fn dispatch_selector_activity(
         let opening_owner = match &item {
             SelectorActivity::OracleConfirmed { owner, .. }
             | SelectorActivity::ThinkingConfirmed { owner, .. }
+            | SelectorActivity::SpeedConfirmed { owner, .. }
             | SelectorActivity::ModelConfirmed { owner, .. }
             | SelectorActivity::SettingChange { owner, .. }
             | SelectorActivity::SettingClear { owner, .. }
@@ -4451,6 +4474,22 @@ async fn dispatch_selector_activity(
                 .await
                 {
                     fold_notice(world, &notice);
+                }
+            }
+            SelectorActivity::SpeedConfirmed {
+                owner,
+                target,
+                speed,
+            } => {
+                let axis = SettingsAxis::Speed(speed);
+                if owner.branch.is_some() {
+                    let notice = stage_branch_setting(&owner, None, axis).await;
+                    shell.borrow().show_toast(notice);
+                } else {
+                    match command_settings(&owner, target, PersistAction::None, axis).await {
+                        Ok(Some(notice)) | Err(notice) => shell.borrow().show_toast(notice),
+                        Ok(None) => {}
+                    }
                 }
             }
             SelectorActivity::ModelConfirmed {
@@ -5121,22 +5160,43 @@ fn spawn_session_scan(
     tokio::spawn(async move { control.session_previews(ids, tx).await });
 }
 
-/// Open the model or thinking selector on a loading placeholder and capture
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectorKind {
+    Model,
+    Thinking,
+    Speed,
+}
+
+#[cfg(test)]
+impl From<bool> for SelectorKind {
+    fn from(thinking: bool) -> Self {
+        if thinking {
+            Self::Thinking
+        } else {
+            Self::Model
+        }
+    }
+}
+
+/// Open a session settings selector on a loading placeholder and capture
 /// what its fill needs: the host, the session, and the branch it was opened
 /// against, so neither a focus change nor a re-armed anchor can redirect the
 /// choice.
 fn open_host_selector(
     world: &World,
     shell: &Rc<RefCell<Shell>>,
-    thinking: bool,
+    kind: impl Into<SelectorKind>,
     target: crate::settings_ui::SelectorTarget,
 ) -> SelectorFetch {
     use crate::settings_ui::SelectorTarget;
-    let title = match (target, thinking) {
-        (SelectorTarget::Oracle, true) => "Oracle thinking effort",
-        (SelectorTarget::Oracle, false) => "Oracle model",
-        (_, true) => "Thinking effort",
-        (_, false) => "Select model",
+    let kind = kind.into();
+    let title = match (target, kind) {
+        (SelectorTarget::Agent(AgentId::Main), SelectorKind::Speed) => "Main + Oracle speed",
+        (_, SelectorKind::Speed) => "Sub-thread speed",
+        (SelectorTarget::Oracle, SelectorKind::Thinking) => "Oracle thinking effort",
+        (SelectorTarget::Oracle, SelectorKind::Model) => "Oracle model",
+        (_, SelectorKind::Thinking) => "Thinking effort",
+        _ => "Select model",
     };
     let (model, current_thinking) = match target {
         SelectorTarget::Agent(agent) => (
@@ -5160,6 +5220,10 @@ fn open_host_selector(
     };
     let handles = shell.borrow().overlay_handles();
     let select = open_selector_loading(&handles.stack, &handles.editor, &handles.chrome, title);
+    let current_speed = match target {
+        SelectorTarget::Agent(agent) => editing_speed(world, shell, agent),
+        SelectorTarget::Oracle => None,
+    };
     let mut owner = SettingsOwner::capture(world, shell, Arc::new(Vec::new()));
     if matches!(target, SelectorTarget::Agent(AgentId::Sub(_))) {
         owner.branch = None;
@@ -5171,7 +5235,8 @@ fn open_host_selector(
         target,
         model,
         current_thinking,
-        thinking,
+        current_speed,
+        kind,
     }
 }
 
@@ -5196,7 +5261,8 @@ struct SelectorFetch {
     target: crate::settings_ui::SelectorTarget,
     model: Option<(String, String)>,
     current_thinking: Option<String>,
-    thinking: bool,
+    current_speed: Option<String>,
+    kind: SelectorKind,
 }
 
 async fn fill_host_selector(fetch: SelectorFetch) {
@@ -5222,7 +5288,19 @@ async fn fill_host_selector(fetch: SelectorFetch) {
     owner.models = Arc::new(models);
     let handles = fetch.handles;
     let models = Arc::clone(&owner.models);
-    if fetch.thinking {
+    if fetch.kind == SelectorKind::Speed {
+        if let crate::settings_ui::SelectorTarget::Agent(target) = fetch.target {
+            crate::settings_ui::fill_speed(
+                &handles,
+                &select,
+                owner,
+                &models,
+                target,
+                fetch.model.as_ref(),
+                fetch.current_speed.as_deref(),
+            );
+        }
+    } else if fetch.kind == SelectorKind::Thinking {
         fill_thinking(
             &handles,
             &select,
@@ -14731,6 +14809,19 @@ mod tests {
         }
         app.render(&root).expect("render");
 
+        let mut help = top_overlay_rows(&shell).join("\n");
+        while !help.contains("Main and Oracle") {
+            press(&mut app, &mut writer, b"\x1b[6~").await;
+            app.render(&root).expect("render next help page");
+            let next = top_overlay_rows(&shell).join("\n");
+            assert_ne!(next, help, "help must expose the shared speed command");
+            help = next;
+        }
+        assert!(
+            help.contains("speed") && help.contains("Main and Oracle"),
+            "{help}"
+        );
+
         // The help is taller than its fixed-height overlay and the palette-open
         // row sits in a lower section, so scroll to the bottom to bring the
         // resolved shortcut on screen. End maps to scroll-to-bottom in the
@@ -18842,6 +18933,172 @@ mod tests {
         remote.host.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn speed_confirmation_stages_only_on_its_opening_branch() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let before = world.handles().run_config.lock().unwrap().clone();
+        arm_branch(&shell.borrow().view().branch_anchor, "m1".into());
+        let owner = SettingsOwner::capture(&world, &shell, Arc::clone(&world.catalog));
+        let mut watch = inert_theme_watch();
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::SpeedConfirmed {
+                owner: owner.clone(),
+                target: AgentId::Main,
+                speed: Some(aj_models::types::Speed::Standard),
+            }],
+        )
+        .await;
+        let staged = branch_settings(&shell).unwrap();
+        assert_eq!(staged.speed.as_deref(), Some("standard"));
+        assert_eq!(staged.oracle_speed.as_deref(), Some("standard"));
+        arm_branch(&shell.borrow().view().branch_anchor, "m2".into());
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::SpeedConfirmed {
+                owner,
+                target: AgentId::Main,
+                speed: Some(aj_models::types::Speed::Fast),
+            }],
+        )
+        .await;
+        assert_eq!(branch_settings(&shell).unwrap().speed, None);
+        let handles = world.handles();
+        let run = handles.run_config.lock().unwrap();
+        assert_eq!(run.main.speed, before.main.speed);
+        assert_eq!(run.oracle.speed, before.oracle.speed);
+    }
+
+    #[tokio::test]
+    async fn speed_selector_uses_sub_model_catalog_and_keeps_its_opening_target() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let model = world
+            .control
+            .models(world.session())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|model| {
+                model
+                    .speed_modes
+                    .iter()
+                    .any(|mode| mode.speed == aj_models::types::Speed::Fast)
+            })
+            .expect("host catalog advertises a fast model");
+        let fast_name = model
+            .speed_modes
+            .iter()
+            .find(|mode| mode.speed == aj_models::types::Speed::Fast)
+            .unwrap()
+            .name
+            .clone();
+        assert_ne!(
+            viewed_model(&world, AgentId::Main),
+            (model.provider.clone(), model.id.clone())
+        );
+        fold_event(
+            &mut world,
+            AgentEvent::SubAgentStart {
+                tool_name: "agent".into(),
+                parent: AgentId::Main,
+                child: AgentId::Sub(7),
+                task: "speed selector fixture".into(),
+                background: false,
+                settings: aj_agent::events::AgentSettings {
+                    context_window: model.context_window,
+                    provider: model.provider,
+                    model_id: model.id,
+                    thinking: "off".into(),
+                    thinking_display: "default".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+            },
+        );
+        world.chat.borrow_mut().set_active_view(AgentId::Sub(7));
+        world.catalog = Arc::new(Vec::new());
+        apply_command(&mut world, &shell, CommandAction::OpenSpeedSelector).await;
+        focus_overlay(&mut app, &root);
+        let rows = top_overlay_rows(&shell).join("\n");
+        assert!(
+            rows.contains("Sub-thread speed") && rows.contains("Standard (current)"),
+            "{rows}"
+        );
+        assert!(
+            rows.contains(&fast_name),
+            "the host's sub-model choices are visible: {rows}"
+        );
+        world.chat.borrow_mut().set_active_view(AgentId::Main);
+        type_text(&mut app, &mut writer, "fast\r").await;
+        assert!(matches!(
+            shell.borrow().take_activity().as_slice(),
+            [SelectorActivity::SpeedConfirmed {
+                target: AgentId::Sub(7),
+                speed: Some(aj_models::types::Speed::Fast),
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn speed_selector_updates_main_and_oracle_without_persisting_defaults() {
+        use aj_models::types::Speed;
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        assert_eq!(world.handles().run_config.lock().unwrap().main.speed, None);
+        let before = world.control.config(world.session()).await.unwrap().user;
+        let mut watch = inert_theme_watch();
+        for (query, expected) in [("standard\r", Some(Speed::Standard)), ("default\r", None)] {
+            assert!(matches!(
+                apply_command(&mut world, &shell, CommandAction::OpenSpeedSelector).await,
+                ActionEffect::OpenedOverlay
+            ));
+            focus_overlay(&mut app, &root);
+            let rows = top_overlay_rows(&shell).join("\n");
+            assert!(rows.contains("Main + Oracle speed"), "{rows}");
+            assert!(
+                rows.contains("Standard") && rows.contains("Default"),
+                "{rows}"
+            );
+            type_text(&mut app, &mut writer, query).await;
+            let activity = shell.borrow().take_activity();
+            assert!(
+                matches!(activity.as_slice(), [SelectorActivity::SpeedConfirmed {
+                target: AgentId::Main, speed, ..
+            }] if speed == &expected)
+            );
+            apply_selector_activity(&mut world, &shell, &mut watch, activity).await;
+            fold_ready_frames(&mut world);
+            let handles = world.handles();
+            let run = handles.run_config.lock().unwrap().clone();
+            assert_eq!(run.main.speed, expected);
+            assert_eq!(run.oracle.speed, expected);
+            let name = aj_models::speed_name(expected.as_ref());
+            assert_eq!(world.client().settings().unwrap().speed, name);
+            let log = handles.log.lock().await;
+            assert_eq!(
+                log.linearize(log.head().unwrap(), ThreadFilter::USER)
+                    .settings()
+                    .speed
+                    .as_deref(),
+                Some(name)
+            );
+            drop(log);
+            assert_eq!(
+                world.control.config(world.session()).await.unwrap().user,
+                before
+            );
+        }
+    }
+
     /// The thinking selector, driven through real dispatch: open from the
     /// host path, filter to `high`, confirm. The change updates the footer and
     /// stages the run config, is recorded on the session log, and (session
@@ -21921,16 +22178,12 @@ mod tests {
                         target: AgentId::Main,
                         level: Some(ThinkingConfig::High),
                     },
+                    SelectorActivity::SpeedConfirmed {
+                        owner: selector_owner.clone(),
+                        target: AgentId::Main,
+                        speed: Some(aj_models::types::Speed::Fast),
+                    },
                 ],
-            )
-            .await;
-            apply_setting_change(
-                &world,
-                &shell,
-                &mut watch,
-                PersistAction::None,
-                "speed",
-                "fast",
             )
             .await;
             apply_setting_change(

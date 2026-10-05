@@ -83,8 +83,6 @@ pub struct SessionSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_thinking: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oracle_speed: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_verbosity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
@@ -105,7 +103,6 @@ impl SessionSettings {
         Self {
             model: self.oracle_model.clone(),
             thinking: self.oracle_thinking.clone(),
-            speed: self.oracle_speed.clone(),
             verbosity: self.oracle_verbosity.clone(),
             ..Default::default()
         }
@@ -1164,8 +1161,6 @@ mod request {
         #[serde(default)]
         oracle_thinking: Option<String>,
         #[serde(default)]
-        oracle_speed: Option<String>,
-        #[serde(default)]
         oracle_verbosity: Option<String>,
         #[serde(default)]
         thinking: Option<String>,
@@ -1187,7 +1182,6 @@ mod request {
                 model: request.model,
                 oracle_model: request.oracle_model,
                 oracle_thinking: request.oracle_thinking,
-                oracle_speed: request.oracle_speed,
                 oracle_verbosity: request.oracle_verbosity,
                 thinking: request.thinking,
                 thinking_display: request.thinking_display,

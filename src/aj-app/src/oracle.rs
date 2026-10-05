@@ -13,7 +13,7 @@ pub fn defaults(config: &Config) -> Config {
         model_name: config.oracle_model_name.clone(),
         model_url: config.oracle_model_url.clone(),
         thinking: config.oracle_thinking,
-        speed: config.oracle_speed,
+        speed: config.speed.clone(),
         verbosity: config.oracle_verbosity,
         ..config.clone()
     }
@@ -47,7 +47,7 @@ pub(crate) fn configure_tool(
         model_info: std::sync::Arc::clone(&model.model_info),
         stream_options,
         thinking: model.thinking.clone(),
-        speed: model.speed,
+        speed: model.speed.clone(),
         thinking_display: thinking_display_name(model.thinking_display).to_string(),
         tools: child_tools,
         system_prompt_suffix: aj_tools::tools::oracle::ORACLE_PROMPT.to_string(),

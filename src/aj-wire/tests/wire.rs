@@ -404,7 +404,6 @@ fn session_settings() -> SessionSettings {
         model: Some(selected_model()),
         oracle_model: None,
         oracle_thinking: None,
-        oracle_speed: None,
         oracle_verbosity: None,
         thinking: Some("high".into()),
         thinking_display: Some("detailed".into()),
@@ -418,8 +417,8 @@ fn session_settings() -> SessionSettings {
 fn oracle_settings_roundtrip_independent_choices() {
     for value in [
         json!({}),
-        json!({"oracle_model": {"api": "openai", "name": "oracle"}, "oracle_thinking": "off", "oracle_speed": "standard", "oracle_verbosity": "default"}),
-        json!({"oracle_model": {"api": "openai", "name": "oracle", "url": "https://example.com"}, "oracle_thinking": "high", "oracle_speed": "fast", "oracle_verbosity": "low"}),
+        json!({"oracle_model": {"api": "openai", "name": "oracle"}, "oracle_thinking": "off", "oracle_verbosity": "default"}),
+        json!({"oracle_model": {"api": "openai", "name": "oracle", "url": "https://example.com"}, "oracle_thinking": "high", "oracle_verbosity": "low"}),
     ] {
         let body = serde_json::to_vec(&value).unwrap();
         let request = decode_request::<SettingsRequest>(&body).unwrap();
@@ -452,10 +451,35 @@ fn oracle_settings_roundtrip_independent_choices() {
                 })
         );
         assert_eq!(recorded.oracle_thinking, request.change.oracle_thinking);
-        assert_eq!(recorded.oracle_speed, request.change.oracle_speed);
         assert_eq!(recorded.oracle_verbosity, request.change.oracle_verbosity);
         assert_eq!(serde_json::to_value(recorded).unwrap(), recorded_value);
     }
+}
+
+#[test]
+fn oracle_speed_is_not_a_request_axis_but_recorded_history_remains_readable() {
+    for value in [json!("fast"), json!(null)] {
+        let settings = json!({"oracle_speed": value});
+        assert!(
+            decode_request::<SettingsRequest>(&serde_json::to_vec(&settings).unwrap()).is_err()
+        );
+        assert!(
+            decode_request::<CreateSessionRequest>(
+                &serde_json::to_vec(&json!({"settings": settings})).unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            decode_request::<HeadRequest>(
+                &serde_json::to_vec(&json!({"entry": "head", "changes": {"settings": settings}}))
+                    .unwrap()
+            )
+            .is_err()
+        );
+    }
+    let recorded: aj_wire::BranchSettings =
+        serde_json::from_value(json!({"oracle_speed": "fast"})).unwrap();
+    assert_eq!(recorded.oracle_speed.as_deref(), Some("fast"));
 }
 
 #[test]
@@ -514,7 +538,6 @@ fn oracle_projection_excludes_main_settings_and_account() {
             url: Some("https://oracle.example".into()),
         }),
         oracle_thinking: Some("off".into()),
-        oracle_speed: Some("fast".into()),
         oracle_verbosity: Some("default".into()),
         ..main
     };
@@ -522,7 +545,7 @@ fn oracle_projection_excludes_main_settings_and_account() {
         serde_json::to_value(settings.oracle()).unwrap(),
         json!({
             "model": {"api": "anthropic", "name": "oracle", "url": "https://oracle.example"},
-            "thinking": "off", "speed": "fast", "verbosity": "default"
+            "thinking": "off", "verbosity": "default"
         })
     );
 }

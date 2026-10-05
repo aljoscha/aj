@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::paths::display_path;
@@ -615,8 +615,8 @@ pub struct Config {
     /// the channel. See [`ConfigThinkingDisplay`] for the per-variant
     /// mapping.
     pub thinking_display: Option<ConfigThinkingDisplay>,
-    /// Inference speed mode (Anthropic only). `fast` enables higher
-    /// output-tokens-per-second at some quality cost.
+    /// Shared inference speed preference for Main and Oracle.
+    /// Supported modes depend on the selected model.
     pub speed: Option<ConfigSpeed>,
     /// Output verbosity (`text.verbosity`): the visible answer-length
     /// knob. Unset uses the model's catalog default, then the server default.
@@ -633,8 +633,6 @@ pub struct Config {
     pub oracle_model_name: Option<String>,
     /// Oracle thinking level, independent of the main agent.
     pub oracle_thinking: Option<ConfigThinkingLevel>,
-    /// Oracle inference speed override (Anthropic only).
-    pub oracle_speed: Option<ConfigSpeed>,
     /// Oracle output answer verbosity override for models that support it.
     /// Unset uses Oracle's model catalog default, then the server default.
     pub oracle_verbosity: Option<ConfigVerbosity>,
@@ -756,7 +754,6 @@ impl Default for Config {
             oracle_model_url: None,
             oracle_model_name: Some("claude-fable-5-1".into()),
             oracle_thinking: Some(ConfigThinkingLevel::XHigh),
-            oracle_speed: None,
             oracle_verbosity: None,
             theme: None,
             disabled_tools: Vec::new(),
@@ -783,20 +780,25 @@ impl Default for Config {
     }
 }
 
-/// Inference speed mode set in `config.toml` (Anthropic only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// Inference speed preference, including provider-defined mode identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSpeed {
     Standard,
     Fast,
+    Ultrafast,
+    Flex,
+    Named(String),
 }
 
 impl fmt::Display for ConfigSpeed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConfigSpeed::Standard => write!(f, "standard"),
-            ConfigSpeed::Fast => write!(f, "fast"),
-        }
+        f.write_str(match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+            Self::Ultrafast => "ultrafast",
+            Self::Flex => "flex",
+            Self::Named(name) => name,
+        })
     }
 }
 
@@ -804,11 +806,36 @@ impl FromStr for ConfigSpeed {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "standard" => Ok(ConfigSpeed::Standard),
-            "fast" => Ok(ConfigSpeed::Fast),
-            _ => Err(format!("invalid speed '{s}': expected standard or fast")),
+        let name = s.trim().to_ascii_lowercase();
+        if name.is_empty()
+            || name == "default"
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err("speed must be a nonempty identifier containing letters, digits, underscores, or hyphens".into());
         }
+        Ok(match name.as_str() {
+            "standard" => Self::Standard,
+            "fast" => Self::Fast,
+            "ultrafast" => Self::Ultrafast,
+            "flex" => Self::Flex,
+            _ => Self::Named(name),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigSpeed {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for ConfigSpeed {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -920,8 +947,8 @@ impl Config {
         },
         ConfigOption {
             name: "speed",
-            description: "Inference speed mode (Anthropic only).",
-            kind: ValueKind::Enum(&["standard", "fast"]),
+            description: "Shared Main and Oracle inference speed (standard, fast, ultrafast, flex, or a named mode).",
+            kind: ValueKind::String,
             apply_toml_fn: |v, c| {
                 c.speed = v.try_into()?;
                 Ok(())
@@ -983,17 +1010,6 @@ impl Config {
             },
             display_fn: |c| display_opt(&c.oracle_thinking),
             to_toml_fn: |c| opt_value_item(&c.oracle_thinking),
-        },
-        ConfigOption {
-            name: "oracle_speed",
-            description: "Oracle inference speed mode (Anthropic only).",
-            kind: ValueKind::Enum(&["standard", "fast"]),
-            apply_toml_fn: |v, c| {
-                c.oracle_speed = v.try_into()?;
-                Ok(())
-            },
-            display_fn: |c| display_opt(&c.oracle_speed),
-            to_toml_fn: |c| opt_value_item(&c.oracle_speed),
         },
         ConfigOption {
             name: "oracle_verbosity",
@@ -2201,7 +2217,6 @@ oracle_model_api = "openai"
 oracle_model_url = "https://oracle.example.test"
 oracle_model_name = "oracle-x"
 oracle_thinking = "max"
-oracle_speed = "standard"
 oracle_verbosity = "high"
 theme = "dark"
 disabled_tools = ["bash"]
@@ -2233,7 +2248,6 @@ bash_rtk = true
         );
         assert_eq!(config.oracle_model_name.as_deref(), Some("oracle-x"));
         assert_eq!(config.oracle_thinking, Some(ConfigThinkingLevel::Max));
-        assert_eq!(config.oracle_speed, Some(ConfigSpeed::Standard));
         assert_eq!(config.oracle_verbosity, Some(ConfigVerbosity::High));
         assert_eq!(config.theme.as_deref(), Some("dark"));
         assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
@@ -2246,6 +2260,65 @@ bash_rtk = true
     }
 
     #[test]
+    fn speed_names_roundtrip_through_config_and_layers() {
+        let path = Path::new("/p/.aj/config.toml");
+        for (input, canonical) in [
+            (" Standard ", "standard"),
+            ("FAST", "fast"),
+            ("Ultrafast", "ultrafast"),
+            ("flex", "flex"),
+            (" Provider_Mode-2 ", "provider_mode-2"),
+        ] {
+            let speed: ConfigSpeed = input.parse().unwrap();
+            assert_eq!(speed.to_string(), canonical);
+            let encoded = toml::Value::try_from(&speed).unwrap();
+            assert_eq!(encoded, toml::Value::String(canonical.into()));
+            assert_eq!(encoded.try_into::<ConfigSpeed>().unwrap(), speed);
+            let mut layer = ConfigLayer::default();
+            layer.set_str("speed", input).unwrap();
+            let config = layer.overlay_onto(&Config::default());
+            assert_eq!(config.speed, Some(speed));
+            let written = rewrite_changed("", &Config::default(), &config);
+            let (loaded, diagnostics) = parse_config(&written, path);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            assert_eq!(loaded.speed, config.speed);
+        }
+        assert!(Config::option("oracle_speed").is_none());
+    }
+
+    #[test]
+    fn unsafe_speed_names_are_refused_without_dropping_other_options() {
+        let path = Path::new("/p/.aj/config.toml");
+        for name in [
+            "",
+            " ",
+            "default",
+            "two words",
+            "fast\nmode",
+            "\u{1b}[31m",
+            "\u{202e}fast",
+            "fäst",
+            "mode/fast",
+        ] {
+            assert!(name.parse::<ConfigSpeed>().is_err(), "{name:?}");
+            let mut layer = ConfigLayer::default();
+            assert!(layer.set_str("speed", name).is_err());
+            let (config, diagnostics) = parse_config(
+                &format!(
+                    "speed = {}\ntheme = \"dark\"",
+                    toml::Value::String(name.into())
+                ),
+                path,
+            );
+            assert_eq!(config.speed, None);
+            assert_eq!(config.theme.as_deref(), Some("dark"));
+            assert!(
+                matches!(diagnostics.as_slice(), [ConfigDiagnostic::InvalidValue { key, .. }] if key == "speed")
+            );
+        }
+    }
+
+    #[test]
     fn oracle_options_have_independent_defaults_and_layers() {
         let path = Path::new("/p/.aj/config.toml");
         let (empty, diag) = parse_config("", path);
@@ -2255,7 +2328,6 @@ bash_rtk = true
             ("model_url", "https://user.test", "https://project.test"),
             ("model_name", "user-model", "project-model"),
             ("thinking", "low", "off"),
-            ("speed", "fast", "standard"),
             ("verbosity", "high", "low"),
         ] {
             let key = format!("oracle_{name}");

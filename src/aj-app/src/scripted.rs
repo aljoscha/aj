@@ -94,6 +94,8 @@ fn scripted_model_info(name: &str) -> ModelInfo {
         reasoning_options: Vec::new(),
         supports_verbosity: false,
         default_verbosity: None,
+        speed_modes: Vec::new(),
+        default_speed: None,
         input: vec![InputModality::Text],
         cost: ModelCost::default(),
         context_window: 0,

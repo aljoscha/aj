@@ -22,6 +22,29 @@
       ],
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "2x speed, increased usage",
+          "wire_value": "priority",
+          "cost": {
+            "input": 20.0,
+            "output": 100.0,
+            "cache_read": 2.0,
+            "cache_write": 25.0,
+            "tiers": [
+              {
+                "input_tokens_above": 272000,
+                "input": 40.0,
+                "output": 150.0,
+                "cache_read": 4.0,
+                "cache_write": 50.0
+              }
+            ]
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -66,6 +89,29 @@
       ],
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "2x speed, increased usage",
+          "wire_value": "priority",
+          "cost": {
+            "input": 4.0,
+            "output": 20.0,
+            "cache_read": 0.2,
+            "cache_write": 5.0,
+            "tiers": [
+              {
+                "input_tokens_above": 272000,
+                "input": 8.0,
+                "output": 30.0,
+                "cache_read": 0.4,
+                "cache_write": 10.0
+              }
+            ]
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -110,6 +156,21 @@
       ],
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "1.5x speed",
+          "wire_value": "priority",
+          "cost": {
+            "input": 4.0,
+            "output": 20.0,
+            "cache_read": 0.4,
+            "cache_write": 5.0
+          }
+        }
+      ],
+      "default_speed": "fast",
       "input": [
         "text",
         "image"
@@ -154,6 +215,30 @@
       ],
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "1.5x speed",
+          "wire_value": "priority",
+          "cost": {
+            "input": 0.2,
+            "output": 1.0,
+            "cache_read": 0.02,
+            "cache_write": 0.25,
+            "tiers": [
+              {
+                "input_tokens_above": 272000,
+                "input": 0.4,
+                "output": 1.5,
+                "cache_read": 0.04,
+                "cache_write": 0.5
+              }
+            ]
+          }
+        }
+      ],
+      "default_speed": "fast",
       "input": [
         "text",
         "image"
@@ -197,6 +282,20 @@
       ],
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "1.5x speed, increased usage",
+          "wire_value": "priority",
+          "cost": {
+            "input": 12.5,
+            "output": 75.0,
+            "cache_read": 1.25,
+            "cache_write": 0.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -241,6 +340,20 @@
       ],
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "1.5x speed, increased usage",
+          "wire_value": "priority",
+          "cost": {
+            "input": 8.0,
+            "output": 40.0,
+            "cache_read": 0.8,
+            "cache_write": 10.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -285,6 +398,20 @@
       ],
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "1.5x speed, increased usage",
+          "wire_value": "priority",
+          "cost": {
+            "input": 4.0,
+            "output": 24.0,
+            "cache_read": 0.4,
+            "cache_write": 5.0
+          }
+        }
+      ],
       "input": [
         "text",
         "image"
@@ -329,6 +456,20 @@
       ],
       "supports_verbosity": true,
       "default_verbosity": "low",
+      "speed_modes": [
+        {
+          "speed": "fast",
+          "name": "Fast",
+          "description": "1.5x speed, increased usage",
+          "wire_value": "priority",
+          "cost": {
+            "input": 0.4,
+            "output": 2.4,
+            "cache_read": 0.04,
+            "cache_write": 0.5
+          }
+        }
+      ],
       "input": [
         "text",
         "image"

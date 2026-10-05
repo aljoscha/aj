@@ -55,11 +55,10 @@ use std::sync::{Arc, Mutex};
 use aj_agent::bus::{Listener, listener_from_sync};
 use aj_agent::events::AgentEvent;
 use aj_agent::{Agent, TaskRegistry, TurnError};
-use aj_conf::{Config, ConfigSpeed, Severity};
+use aj_conf::{Config, Severity};
 use aj_models::auth::AuthStorage;
 #[cfg(test)]
 use aj_models::provider::Provider;
-use aj_models::types::Speed;
 use aj_session::{ConversationPersistence, ThreadFilter, persistence_listener, replay};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex as TokioMutex;
@@ -202,18 +201,7 @@ async fn run_inner<W: Write + Send + 'static>(
 
     let thinking = resolve_thinking(&args, &config)?;
 
-    // Speed selection follows the same precedence as the model:
-    // CLI flag > config.toml > default. `--speed` is parsed here; the
-    // model bundle itself is resolved in `build_initial_run_config`
-    // below.
-    let speed = match args.speed.as_deref() {
-        Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
-        None => config.speed,
-    }
-    .map(|s| match s {
-        ConfigSpeed::Standard => Speed::Standard,
-        ConfigSpeed::Fast => Speed::Fast,
-    });
+    let speed = crate::session_setup::resolve_speed(&args, &config)?;
 
     // Resolve the initial run config (provider / model / thinking /
     // speed, merged CLI > env > config) plus the resume-time

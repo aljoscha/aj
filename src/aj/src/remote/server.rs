@@ -960,7 +960,6 @@ fn settings_change(
             &change.speed,
             &change.verbosity,
             &change.oracle_thinking,
-            &change.oracle_speed,
             &change.oracle_verbosity,
         ]
         .into_iter()
@@ -968,7 +967,7 @@ fn settings_change(
         .count();
     if named != 1 {
         return Err(ApiError::invalid(format!(
-            "a settings change names {named} axes: send exactly one model, thinking, thinking_display, speed, verbosity, oracle_model, oracle_thinking, oracle_speed, or oracle_verbosity"
+            "a settings change names {named} axes: send exactly one model, thinking, thinking_display, speed, verbosity, oracle_model, oracle_thinking, or oracle_verbosity"
         )));
     }
     if is_oracle && agent.is_some_and(|agent| agent != AgentId::Main) {
@@ -1016,9 +1015,18 @@ fn settings_change(
         ));
     }
     if let Some(name) = speed {
-        axes.push(SettingsAxis::Speed(speed_from_name(&name).ok_or_else(
-            || ApiError::invalid(format!("unknown speed {name:?}. Expected standard or fast")),
-        )?));
+        let canonical = if name.is_empty() || name.trim().eq_ignore_ascii_case("default") {
+            "default".to_string()
+        } else {
+            name.parse::<aj_conf::ConfigSpeed>()
+                .map_err(ApiError::invalid)?
+                .to_string()
+        };
+        axes.push(SettingsAxis::Speed(
+            speed_from_name(&canonical).ok_or_else(|| {
+                ApiError::invalid(format!("invalid speed identifier {canonical:?}"))
+            })?,
+        ));
     }
     if let Some(name) = verbosity {
         // `"default"` is the vocabulary's unset value, as in the log's
@@ -1196,7 +1204,7 @@ mod oracle_settings_tests {
                 ..Default::default()
             },
             SessionSettings {
-                oracle_speed: Some("invalid".into()),
+                speed: Some("invalid mode".into()),
                 ..Default::default()
             },
         ] {

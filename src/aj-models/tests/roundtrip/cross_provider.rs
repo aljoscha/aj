@@ -66,6 +66,8 @@ fn target_model(provider: &str, api: &str, id: &str) -> ModelInfo {
         reasoning_options: Vec::new(),
         supports_verbosity: false,
         default_verbosity: None,
+        speed_modes: Vec::new(),
+        default_speed: None,
         // Vision-on so the image downgrade never fires here —
         // these tests focus on the cross-provider rewrites.
         input: vec![InputModality::Text, InputModality::Image],

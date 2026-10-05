@@ -83,29 +83,20 @@ pub fn thinking_config_from_name(name: &str) -> Option<Option<ThinkingConfig>> {
     }
 }
 
-/// Render an optional [`types::Speed`] as its canonical name:
-/// `"standard"` (also for `None`, the default) or `"fast"`. This
-/// vocabulary is shared by the session log's settings entries and
-/// the event protocol.
-pub fn speed_name(speed: Option<types::Speed>) -> &'static str {
-    match speed {
-        None | Some(types::Speed::Standard) => "standard",
-        Some(types::Speed::Fast) => "fast",
+/// Canonical speed name. `default` means no explicit selection.
+pub fn speed_name(speed: Option<&types::Speed>) -> &str {
+    speed.map_or("default", types::Speed::as_str)
+}
+
+/// Parse a speed selection, preserving explicit standard and named modes.
+pub fn speed_from_name(name: &str) -> Option<Option<types::Speed>> {
+    match name {
+        "default" | "" => Some(None),
+        name => name.parse().ok().map(Some),
     }
 }
 
-/// Parse a canonical speed name back into an optional
-/// [`types::Speed`] — the inverse of [`speed_name`], with
-/// `"standard"` mapping to `None` (the wire-equivalent default).
-/// Returns `None` for names outside the vocabulary so callers can
-/// keep their current speed.
-pub fn speed_from_name(name: &str) -> Option<Option<types::Speed>> {
-    match name {
-        "standard" => Some(None),
-        "fast" => Some(Some(types::Speed::Fast)),
-        _ => None,
-    }
-}
+pub use registry::resolve_speed;
 
 /// Render an optional [`types::Verbosity`] as its canonical name:
 /// `"default"` for `None` (server default), otherwise `"low"`,
@@ -146,6 +137,21 @@ pub fn verbosity_from_name(name: &str) -> Option<Option<types::Verbosity>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_names_preserve_explicit_and_unset_selections() {
+        for speed in [
+            None,
+            Some(types::Speed::Standard),
+            Some(types::Speed::Fast),
+            Some(types::Speed::Ultrafast),
+            Some(types::Speed::Flex),
+            Some(types::Speed::Named("turbo".into())),
+        ] {
+            assert_eq!(speed_from_name(speed_name(speed.as_ref())), Some(speed));
+        }
+        assert_eq!(speed_from_name(""), Some(None));
+    }
 
     #[test]
     fn verbosity_name_round_trips() {

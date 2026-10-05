@@ -1211,7 +1211,6 @@ async fn explicit_creation_applies_settings_before_its_first_prompt() {
                 verbosity: Some("high".into()),
                 oracle_model: None,
                 oracle_thinking: None,
-                oracle_speed: None,
                 oracle_verbosity: None,
             }),
             Some(vec![UserContent::text("begin")]),
@@ -1521,7 +1520,7 @@ async fn refused_creation_leaves_no_discoverable_session() {
     for (settings, prompt, tag) in [
         (
             Some(SessionSettings {
-                speed: Some("warp".into()),
+                speed: Some("warp!".into()),
                 ..SessionSettings::default()
             }),
             None,
@@ -13414,7 +13413,7 @@ async fn branch_draft_refusals_leave_live_and_durable_state_unchanged() {
             ..Default::default()
         },
         SessionSettings {
-            speed: Some("unknown".into()),
+            speed: Some("unknown!".into()),
             ..Default::default()
         },
         SessionSettings {
@@ -13600,7 +13599,7 @@ async fn branch_draft_can_override_effort_speed_and_account_without_changing_oth
     assert_eq!(settings.thinking, "low");
     assert_eq!(settings.speed, "standard");
     assert_eq!(
-        aj_models::speed_name(run.main.stream_options.speed),
+        aj_models::speed_name(run.main.stream_options.speed.as_ref()),
         "standard"
     );
     assert_eq!(
@@ -13873,5 +13872,177 @@ async fn transcript_settings_keep_unrecorded_axes_unknown_after_materialization(
             .unwrap()
             .is_empty()
     );
+    harness.host.shutdown().await;
+}
+
+/// A child speed edit reaches its next inference without changing the session default.
+#[tokio::test]
+async fn thread_speed_override_reaches_the_provider_and_stays_thread_local() {
+    struct RecordingProvider {
+        seen: Arc<StdMutex<Vec<Option<aj_models::types::Speed>>>>,
+        inner: Arc<ScriptedProvider>,
+    }
+    impl aj_models::provider::Provider for RecordingProvider {
+        fn stream(
+            &self,
+            model: &aj_models::registry::ModelInfo,
+            context: &aj_models::types::Context,
+            options: &aj_models::types::StreamOptions,
+        ) -> aj_models::streaming::AssistantMessageEventStream {
+            self.seen.lock().unwrap().push(options.speed.clone());
+            aj_models::provider::Provider::stream(&*self.inner, model, context, options)
+        }
+        fn stream_simple(
+            &self,
+            model: &aj_models::registry::ModelInfo,
+            context: &aj_models::types::Context,
+            options: &aj_models::types::SimpleStreamOptions,
+        ) -> aj_models::streaming::AssistantMessageEventStream {
+            self.stream(model, context, &options.base)
+        }
+    }
+    let unsupported = scripted_model_info();
+    assert!(unsupported.speed_modes.is_empty());
+    let harness = Harness::with_catalog(
+        scripted(sub_agent_turn(), 0, Duration::ZERO),
+        vec![unsupported],
+    );
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    let child = handles
+        .registry
+        .get(1)
+        .expect("completed child remains promptable");
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    {
+        let mut child = child.lock().await;
+        let info = child.model_info();
+        child.set_provider(
+            Arc::new(RecordingProvider {
+                seen: Arc::clone(&seen),
+                inner: scripted(
+                    vec![finalized_text_message("child reply")],
+                    0,
+                    Duration::ZERO,
+                ),
+            }),
+            info,
+            aj_models::types::StreamOptions {
+                speed: Some(aj_models::types::Speed::Standard),
+                ..Default::default()
+            },
+        );
+    }
+    let outcome = harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Sub(1),
+                persist: PersistAction::None,
+                axis: SettingsAxis::Speed(Some(aj_models::types::Speed::Fast)),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CommandOutcome::Accepted));
+    let frames = frames_until(&mut client.stream, "child speed fallback confirmation", |frame| {
+        matches!(frame, Frame::Event { event, .. } if matches!(event.known(),
+            Some(AgentEvent::Notice { agent_id: AgentId::Sub(1), text }) if text.contains("does not support fast") && text.contains("Using standard")))
+    }).await;
+    for frame in frames {
+        let _ = client.client.apply(&mut client.chat, frame);
+    }
+    harness
+        .host
+        .command(
+            &session,
+            Command::Prompt {
+                agent: AgentId::Sub(1),
+                content: vec![UserContent::text("follow up")],
+            },
+        )
+        .await
+        .unwrap();
+    // A retained child's lifecycle is independent of Main's idle state.
+    frames_until(
+        &mut client.stream,
+        "the child follow-up to finish",
+        |frame| {
+            matches!(frame, Frame::Event { event, .. } if matches!(event.known(),
+            Some(AgentEvent::AgentEnd { agent_id: AgentId::Sub(1), .. })))
+        },
+    )
+    .await;
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Some(aj_models::types::Speed::Fast)]
+    );
+    {
+        let run = handles.run_config.lock().unwrap();
+        assert_eq!(run.main.speed, None);
+        assert_eq!(run.oracle.speed, None);
+    }
+    let log = handles.log.lock().await;
+    let filter = ThreadFilter::subagent(1);
+    let head = log.latest_leaf(filter).expect("child thread has a reply");
+    assert_eq!(
+        log.linearize(&head, filter).settings().speed.as_deref(),
+        Some("fast")
+    );
+    drop(log);
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn branch_speed_fallback_is_reported_after_the_new_state() {
+    let mut run = snapshot(scripted(Vec::new(), 0, Duration::ZERO));
+    for model in [&mut run.main, &mut run.oracle] {
+        let mut info = (*model.model_info).clone();
+        info.api = "openai-responses".into();
+        info.provider = "openai".into();
+        info.base_url = "https://api.openai.com/v1".into();
+        assert!(info.speed_modes.is_empty());
+        model.model_key = (info.provider.clone(), info.id.clone());
+        model.model_info = Arc::new(info);
+    }
+    let harness = Harness::with_run_config(run, Vec::new(), None, None);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    let head = handles.log.lock().await.head().unwrap().clone();
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(head),
+                changes: aj_wire::BranchChanges {
+                    settings: SessionSettings {
+                        speed: Some("ultrafast".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let frames = frames_until(&mut client.stream, "branch speed fallback", |frame| {
+        matches!(frame, Frame::Event { event, .. } if matches!(event.known(),
+            Some(AgentEvent::Notice { text, .. }) if text.contains("Oracle:") && text.contains("Using standard")))
+    }).await;
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::Reset { .. }))
+    );
+    assert!(frames.iter().any(
+        |frame| matches!(frame, Frame::State { settings, .. } if settings.speed == "ultrafast")
+    ));
     harness.host.shutdown().await;
 }

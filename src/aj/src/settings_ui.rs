@@ -1,9 +1,9 @@
-//! Config-editing overlays: the thinking and model selectors, the settings
+//! Config-editing overlays: the thinking, speed and model selectors, the settings
 //! and project-settings windows, and the skills window.
 //!
 //! # Two shapes
 //!
-//! The thinking and model selectors are confirm-and-close pick lists built on
+//! The thinking, speed and model selectors are confirm-and-close pick lists built on
 //! [`FilterableSelect`]. Confirming parks a [`SelectorActivity`] the host loop
 //! applies through the shared settings core, then the overlay closes.
 //!
@@ -91,6 +91,12 @@ pub(crate) enum SelectorActivity {
         owner: crate::interactive::SettingsOwner,
         target: AgentId,
         level: Option<ThinkingConfig>,
+    },
+    /// A speed preference was confirmed for `target` (session-scoped).
+    SpeedConfirmed {
+        owner: crate::interactive::SettingsOwner,
+        target: AgentId,
+        speed: Option<aj_models::types::Speed>,
     },
     /// A model was confirmed for `target` (session-scoped).
     ModelConfirmed {
@@ -225,6 +231,92 @@ fn thinking_items(current_name: &str, levels: &[&ThinkingOption]) -> Vec<SelectI
             SelectItem::new(label, level.name).with_description(level.description)
         })
         .collect()
+}
+
+/// Speed choices advertised by the selected model. Default leaves resolution to
+/// the host, including models absent from its catalog.
+pub(crate) fn speed_items(current: &str, model: Option<&ModelInfo>) -> Vec<SelectItem> {
+    let label = |name: &str, key: &str| {
+        if key == current {
+            format!("{name} (current)")
+        } else {
+            name.to_string()
+        }
+    };
+    let mut items = vec![
+        SelectItem::new(label("Default", UNSET_VALUE), UNSET_VALUE)
+            .with_description("Use the model's default speed."),
+        SelectItem::new(label("Standard", "standard"), "standard")
+            .with_description("Use standard speed, without an accelerated or flexible mode."),
+    ];
+    if let Some(model) = model {
+        for mode in &model.speed_modes {
+            let key = mode.speed.to_string();
+            if key == "standard" {
+                continue;
+            }
+            let mut description = mode.description.clone();
+            if let Some(cost) = &mode.cost
+                && let Some(price) = format_price(cost.input, cost.output)
+            {
+                if !description.is_empty() {
+                    description.push_str(" · ");
+                }
+                description.push_str(&price);
+            }
+            items.push(SelectItem::new(label(&mode.name, &key), key).with_description(description));
+        }
+    }
+    if !current.is_empty() && !items.iter().any(|item| item.filter_key == current) {
+        items.push(
+            SelectItem::new(format!("{current} (current, not advertised)"), current)
+                .with_description("Stored preference is not advertised by this model. The host resolves its runtime effect."),
+        );
+    }
+    items
+}
+
+/// Fill the speed selector from the opening host's model catalog.
+pub(crate) fn fill_speed(
+    handles: &crate::interactive::OverlayHandles,
+    select: &Rc<RefCell<FilterableSelect>>,
+    owner: crate::interactive::SettingsOwner,
+    catalog: &[ModelInfo],
+    target: AgentId,
+    model: Option<&(String, String)>,
+    current: Option<&str>,
+) {
+    let model = model.and_then(|(provider, id)| {
+        catalog
+            .iter()
+            .find(|info| &info.provider == provider && &info.id == id)
+    });
+    let current = current.unwrap_or(UNSET_VALUE);
+    select.borrow().set_items(speed_items(current, model));
+    select
+        .borrow()
+        .select_matching(|item| item.filter_key == current);
+    let activity = Rc::clone(&handles.activity);
+    let stack = Rc::clone(&handles.stack);
+    let editor = Rc::clone(&handles.editor);
+    select.borrow_mut().on_confirm = Some(Box::new(move |ctx, item| {
+        let speed = if item.filter_key == UNSET_VALUE {
+            None
+        } else {
+            let Ok(speed) = item.filter_key.parse() else {
+                return;
+            };
+            Some(speed)
+        };
+        activity
+            .borrow_mut()
+            .push(SelectorActivity::SpeedConfirmed {
+                owner: owner.clone(),
+                target,
+                speed,
+            });
+        close_all(&stack, ctx, &editor);
+    }));
 }
 
 /// Fill the opening selector with the host model's supported thinking levels.
@@ -1318,7 +1410,7 @@ fn row_value_kind(
     let value = if raw == "<unset>" {
         match name {
             "thinking" | "oracle_thinking" => "off",
-            "speed" | "oracle_speed" => "standard",
+            "speed" => UNSET_VALUE,
             "thinking_display" | "verbosity" | "oracle_verbosity" => UNSET_VALUE,
             "theme" => "light",
             _ => "",
@@ -1485,7 +1577,7 @@ pub(crate) fn fill_settings(
                 .iter()
                 .find(|row| row.id == model_row)
                 .map(|row| row.value.clone());
-            let supported = selected
+            let model = selected
                 .as_deref()
                 .and_then(|value| value.split_once('/'))
                 .and_then(|(provider, id)| {
@@ -1493,7 +1585,8 @@ pub(crate) fn fill_settings(
                         .models
                         .iter()
                         .find(|model| model.provider == provider && model.id == id)
-                })
+                });
+            let supported = model
                 .map(thinking_levels_for)
                 .unwrap_or_else(|| THINKING_LEVELS.iter().collect());
             open_setting_submenu(
@@ -1506,6 +1599,7 @@ pub(crate) fn fill_settings(
                 target,
                 &catalogs,
                 &supported,
+                model,
                 id,
                 value,
             );
@@ -1614,6 +1708,7 @@ fn open_setting_submenu(
     target: ConfigTarget,
     catalogs: &SettingsCatalogs,
     thinking_supported: &[&ThinkingOption],
+    model: Option<&ModelInfo>,
     id: &str,
     value: &str,
 ) {
@@ -1674,6 +1769,27 @@ fn open_setting_submenu(
                 } else {
                     "Thinking effort"
                 },
+                id.to_string(),
+                items,
+                Some(value.to_string()),
+                Box::new(|item| Some(item.filter_key.clone())),
+            );
+        }
+        "speed" => {
+            let mut items = speed_items(value, model);
+            items.push(SelectItem::new("Named mode…", "").with_description(
+                "Enter a speed identifier for the shared Main and Oracle preference.",
+            ));
+            open_picker_submenu(
+                ctx,
+                stack,
+                editor,
+                chrome,
+                parent,
+                activity,
+                target,
+                catalogs.owner.clone(),
+                "Speed",
                 id.to_string(),
                 items,
                 Some(value.to_string()),
@@ -1777,7 +1893,33 @@ fn open_picker_submenu(
         let editor_c = Rc::clone(editor);
         let parent_c = Rc::clone(parent);
         let activity_c = Rc::clone(activity);
+        let chrome_c = chrome.clone();
         sel.on_confirm = Some(Box::new(move |ctx, item| {
+            if id == "speed" && item.filter_key.is_empty() {
+                close_top(&stack_c, ctx, &editor_c);
+                let current = parent_c
+                    .borrow()
+                    .state
+                    .borrow()
+                    .rows
+                    .iter()
+                    .find(|row| row.id == id)
+                    .map(|row| row.value.clone())
+                    .unwrap_or_default();
+                open_text_submenu(
+                    ctx,
+                    &stack_c,
+                    &editor_c,
+                    &chrome_c,
+                    &parent_c,
+                    &activity_c,
+                    target,
+                    owner.clone(),
+                    id.clone(),
+                    &current,
+                );
+                return;
+            }
             if let Some(value) = resolve(item) {
                 parent_c.borrow().set_value(&id, &value);
                 parent_c.borrow().set_inherited(&id, false);
@@ -2749,7 +2891,8 @@ mod tests {
             .into_iter()
             .filter(|row| row.id.starts_with("oracle_"))
             .collect();
-        assert_eq!(oracle.len(), 5);
+        assert_eq!(oracle.len(), 4);
+        assert!(oracle.iter().all(|row| row.id != "oracle_speed"));
         assert!(matches!(
             oracle
                 .iter()
@@ -2859,6 +3002,91 @@ mod tests {
         assert_eq!(next_cycle_value(&values, "c"), "a");
         // An unknown current lands on the first value.
         assert_eq!(next_cycle_value(&values, "z"), "a");
+    }
+
+    #[test]
+    fn speed_picker_uses_catalog_identity_labels_and_prices() {
+        use aj_models::registry::{ModelCost, SpeedMode};
+        use aj_models::types::Speed;
+        let model = ModelInfo {
+            speed_modes: vec![SpeedMode {
+                speed: Speed::Named("priority-2".into()),
+                name: "Priority capacity".into(),
+                description: "Lower latency".into(),
+                wire_value: "priority".into(),
+                cost: Some(ModelCost {
+                    input: 2.5,
+                    output: 14.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    tiers: Vec::new(),
+                }),
+            }],
+            ..aj_app::test_support::scripted_model_info()
+        };
+        let items = speed_items("priority-2", Some(&model));
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].filter_key, UNSET_VALUE);
+        assert_eq!(items[1].filter_key, "standard");
+        assert_eq!(items[2].filter_key, "priority-2");
+        let mut picker = FilterableSelect::new(items, styles());
+        let page =
+            crate::test_support::rows(&picker.draw(&crate::test_support::draw_ctx(100, Some(10))))
+                .join("\n");
+        assert!(page.contains("Priority capacity (current)"), "{page}");
+        assert!(page.contains("Lower latency · $2.5/$14"), "{page}");
+        assert_eq!(speed_items("default", None).len(), 2);
+        let values = SettingsValues::from_config(&Config::default());
+        let rows = build_setting_rows(&values, &values, false, &BTreeSet::new());
+        assert!(!rows.iter().any(|row| row.id == "oracle_speed"));
+        let row = rows.iter().find(|row| row.id == "speed").unwrap();
+        assert_eq!(row.value, UNSET_VALUE);
+        assert!(matches!(row.kind, RowKind::Submenu));
+    }
+
+    #[test]
+    fn speed_selector_preserves_unsupported_preference_and_confirms_sub_target() {
+        let handles = crate::interactive::OverlayHandles::for_tests();
+        let select = open_selector_loading(
+            &handles.stack,
+            &handles.editor,
+            &handles.chrome,
+            "Sub-thread speed",
+        );
+        select
+            .borrow_mut()
+            .capture_event(&mut EventContext::new(), &enter());
+        assert!(handles.activity.borrow().is_empty(), "loading is inert");
+        let owner = crate::interactive::SettingsOwner::new(
+            crate::control::Control::remote(
+                crate::remote::RemoteClient::new("http://127.0.0.1:1").unwrap(),
+            ),
+            "speed-widget-test".into(),
+            Arc::new(Vec::new()),
+        );
+        fill_speed(
+            &handles,
+            &select,
+            owner,
+            &[],
+            AgentId::Sub(7),
+            None,
+            Some("priority-2"),
+        );
+        assert!(
+            select
+                .borrow()
+                .visible_labels()
+                .contains(&"priority-2 (current, not advertised)".to_string())
+        );
+        select
+            .borrow_mut()
+            .capture_event(&mut EventContext::new(), &enter());
+        assert!(matches!(handles.activity.borrow().as_slice(),
+            [SelectorActivity::SpeedConfirmed { target: AgentId::Sub(7), speed: Some(aj_models::types::Speed::Named(name)), .. }]
+            if name == "priority-2"
+        ));
+        assert!(!handles.stack.borrow().is_open());
     }
 
     #[test]

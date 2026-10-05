@@ -477,7 +477,6 @@ pub enum QueueOp {
 pub enum SettingsAxis {
     OracleModel(ModelInfo),
     OracleThinking(Option<ThinkingConfig>),
-    OracleSpeed(Option<Speed>),
     OracleVerbosity(Option<aj_conf::ConfigVerbosity>),
     Model(ModelInfo),
     Thinking(Option<ThinkingConfig>),
@@ -2648,8 +2647,10 @@ fn apply_settings(
     let default_settings = SessionSettings::default();
     let settings = settings.unwrap_or(&default_settings);
     apply_model_settings(&mut run.main, settings, catalog, auth, inherit_unstated)?;
-    let oracle = settings.oracle();
+    let mut oracle = settings.oracle();
+    oracle.speed = settings.speed.clone();
     apply_model_settings(&mut run.oracle, &oracle, catalog, auth, inherit_unstated)?;
+    run.set_speed(run.main.speed.clone());
     if let Some(selection) = &settings.account {
         run.accounts
             .set(&run.main.model_key.0, selection.name.clone());
@@ -2667,9 +2668,11 @@ fn apply_model_settings(
 ) -> Result<(), HostError> {
     let speed = match settings.speed.as_deref() {
         Some(name) => speed_from_name(name).ok_or_else(|| {
-            HostError::Invalid(format!("unknown speed {name:?}. Expected standard or fast"))
+            HostError::Invalid(format!(
+                "invalid speed {name:?}. Expected standard, fast, ultrafast, flex, or a named mode"
+            ))
         })?,
-        None => run.speed,
+        None => run.speed.clone(),
     };
 
     let verbosity = run.stream_options.verbosity;
@@ -2699,12 +2702,12 @@ fn apply_model_settings(
 
     if inherit_unstated
         && bundle_model.is_none()
-        && aj_models::speed_name(speed) != aj_models::speed_name(run.speed)
+        && aj_models::speed_name(speed.as_ref()) != aj_models::speed_name(run.speed.as_ref())
     {
         bundle_model = Some((*run.model_info).clone());
     }
     if let Some(info) = bundle_model {
-        let resolved = crate::model::from_model_info(auth, info, speed)
+        let resolved = crate::model::from_model_info(auth, info, speed.clone())
             .map_err(|err| HostError::Unsupported(err.to_string()))?;
         run.provider = resolved.provider;
         run.model_info = resolved.model_info;
@@ -2713,7 +2716,7 @@ fn apply_model_settings(
     // A model choice changes only that axis. Keep the independently defaulted
     // or inherited verbosity unless this request explicitly replaces it below.
     run.stream_options.verbosity = verbosity;
-    run.speed = speed;
+    run.speed = speed.clone();
     run.stream_options.speed = speed;
 
     if let Some(name) = settings.thinking_display.as_deref() {

@@ -1546,7 +1546,7 @@ async fn control_create_defaults_unstated_thinking_against_the_selected_model() 
     let control = Control::remote(RemoteClient::new(&server.url()).expect("client"));
 
     for (case, settings, expected_speed) in [
-        ("no creator settings", None, "standard"),
+        ("no creator settings", None, "default"),
         (
             "only an unrelated creator setting",
             Some(SessionSettings {
@@ -2843,7 +2843,7 @@ async fn a_malformed_settings_body_answers_400() {
             ..SessionSettings::default()
         },
         SessionSettings {
-            speed: Some("warp".to_string()),
+            speed: Some("warp!".to_string()),
             ..SessionSettings::default()
         },
         SessionSettings {
@@ -5975,7 +5975,7 @@ async fn head_overrides_reject_non_branch_settings_without_switching() {
     for settings in [
         serde_json::json!({"account":{"name":"pin"}}),
         serde_json::json!({"thinking_display":"full"}),
-        serde_json::json!({"speed":"not-a-speed"}),
+        serde_json::json!({"speed":"not a speed"}),
         serde_json::json!({"future":true}),
     ] {
         let response = http.post(format!("{}/v1/sessions/{session}/head", fixture.server.url()))

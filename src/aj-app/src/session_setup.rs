@@ -99,8 +99,8 @@ pub struct ModelConfig {
     /// Canonical choice, retained because provider-specific display mappings
     /// are lossy and cannot reconstruct the user's selection.
     pub thinking_display: Option<ConfigThinkingDisplay>,
-    /// `None` means standard. Must agree with `stream_options.speed` so the
-    /// displayed identity describes the inference request as well.
+    /// Requested speed. Providers resolve it independently against model capabilities.
+    /// Unsupported modes retain the preference and use standard inference.
     pub speed: Option<Speed>,
     /// Selector identity. A scripted bundle can use a launch provider id that
     /// differs from its synthetic model metadata's provider.
@@ -116,13 +116,21 @@ impl ModelConfig {
             model_id: self.model_key.1.clone(),
             thinking: thinking_config_name(self.thinking.as_ref()).to_string(),
             thinking_display: thinking_display_name(self.thinking_display).to_string(),
-            speed: speed_name(self.speed).to_string(),
+            speed: speed_name(self.speed.as_ref()).to_string(),
             verbosity: verbosity_name(self.stream_options.verbosity).to_string(),
         }
     }
 }
 
 impl RunConfigSnapshot {
+    /// Set one session preference while keeping model-specific resolution in providers.
+    pub fn set_speed(&mut self, speed: Option<Speed>) {
+        for model in [&mut self.main, &mut self.oracle] {
+            model.speed = speed.clone();
+            model.stream_options.speed = speed.clone();
+        }
+    }
+
     /// Bind both models to the session's provider-local account choices.
     pub fn bind_accounts(&mut self, auth: &AuthStorage) {
         for model in [&mut self.main, &mut self.oracle] {
@@ -240,12 +248,9 @@ impl RunConfigDefaults {
 
         let thinking =
             crate::model::default_thinking_from_config((*launch_thinking).or(config.thinking));
-        let speed = (*launch_speed).or_else(|| {
-            config.speed.map(|speed| match speed {
-                ConfigSpeed::Standard => Speed::Standard,
-                ConfigSpeed::Fast => Speed::Fast,
-            })
-        });
+        let speed = launch_speed
+            .clone()
+            .or_else(|| crate::model::speed_from_config(config.speed.as_ref()));
 
         let selection = ModelSelection {
             api: launch_model_api
@@ -269,8 +274,7 @@ impl RunConfigDefaults {
             run.bind_accounts(session_auth);
             run.main.thinking = thinking;
             run.main.thinking_display = config.thinking_display;
-            run.main.speed = speed;
-            run.main.stream_options.speed = speed;
+            run.set_speed(speed.clone());
             crate::model::apply_thinking_display(
                 &mut run.main.stream_options,
                 config.thinking_display,
@@ -283,7 +287,7 @@ impl RunConfigDefaults {
             provider,
             model_info,
             stream_options,
-        } = crate::model::resolve(registry, auth, &selection, speed)
+        } = crate::model::resolve(registry, auth, &selection, speed.clone())
             .context("failed to resolve current session defaults")?;
         let model_key = (model_info.provider.clone(), model_info.id.clone());
         let main = build_model_config(
@@ -295,7 +299,7 @@ impl RunConfigDefaults {
             },
             model_key,
             thinking,
-            speed,
+            speed.clone(),
         );
         let mut run = RunConfigSnapshot {
             main,
@@ -303,6 +307,7 @@ impl RunConfigDefaults {
             accounts: Default::default(),
             session_id: None,
         };
+        run.set_speed(speed);
         run.bind_accounts(session_auth);
         Ok(run)
     }
@@ -373,10 +378,7 @@ pub(crate) fn resolve_model_defaults(
     registry: &ModelRegistry,
     auth: &AuthStorage,
 ) -> Result<ModelConfig> {
-    let speed = config.speed.map(|speed| match speed {
-        ConfigSpeed::Standard => Speed::Standard,
-        ConfigSpeed::Fast => Speed::Fast,
-    });
+    let speed = crate::model::speed_from_config(config.speed.as_ref());
     let bundle = crate::model::resolve(
         registry,
         auth,
@@ -385,7 +387,7 @@ pub(crate) fn resolve_model_defaults(
             name: config.model_name.clone(),
             url: config.model_url.clone(),
         },
-        speed,
+        speed.clone(),
     )?;
     let key = (
         bundle.model_info.provider.clone(),
@@ -433,16 +435,16 @@ pub fn build_initial_run_config(
             },
             key,
             thinking,
-            speed,
+            speed.clone(),
         )
     } else {
-        let bundle = crate::model::resolve(&registry, auth, &selection, speed)
+        let bundle = crate::model::resolve(&registry, auth, &selection, speed.clone())
             .context("failed to resolve model from registry")?;
         let key = (
             bundle.model_info.provider.clone(),
             bundle.model_info.id.clone(),
         );
-        build_model_config(config, bundle, key, thinking, speed)
+        build_model_config(config, bundle, key, thinking, speed.clone())
     };
     let oracle = resolve_model_defaults(&crate::oracle::defaults(config), &registry, auth)
         .context("failed to resolve Oracle model from registry")?;
@@ -452,6 +454,7 @@ pub fn build_initial_run_config(
         accounts: Default::default(),
         session_id: None,
     };
+    run.set_speed(speed);
     run.bind_accounts(auth);
     let restore = args.scripted.is_none().then(|| RestoreContext {
         registry,
@@ -493,11 +496,16 @@ pub(crate) fn restore_session_settings(
     let mut run = run_config.lock().expect("run config mutex poisoned");
     run.accounts.replace(settings.accounts.clone());
     let mut notices = restore_model_settings(&mut run.main, settings, restore);
+    let mut oracle_settings = settings.oracle();
+    oracle_settings.speed = settings.speed.clone();
     notices.extend(
-        restore_model_settings(&mut run.oracle, &settings.oracle(), restore)
+        restore_model_settings(&mut run.oracle, &oracle_settings, restore)
             .into_iter()
             .map(|notice| format!("Oracle: {notice}")),
     );
+    let speed = run.main.speed.clone();
+    run.set_speed(speed);
+    notices.extend(crate::settings::speed_fallback_notices(&run));
     run.bind_accounts(&restore.auth);
     notices
 }
@@ -510,14 +518,13 @@ fn restore_model_settings(
     let mut notices = Vec::new();
     // Speed. `None` and `Some(Standard)` are equivalent on the wire,
     // so changes are tracked by canonical name.
-    let prior_speed_name = speed_name(cfg.speed);
+    let prior_speed_name = speed_name(cfg.speed.as_ref()).to_string();
     let prior_verbosity = cfg.stream_options.verbosity;
     if let Some(s) = settings.speed.as_deref() {
-        match s.parse::<ConfigSpeed>() {
-            Ok(ConfigSpeed::Standard) => cfg.speed = Some(Speed::Standard),
-            Ok(ConfigSpeed::Fast) => cfg.speed = Some(Speed::Fast),
-            Err(_) => notices.push(format!(
-                "Session recorded unknown speed {s:?}; keeping {prior_speed_name}."
+        match aj_models::speed_from_name(s) {
+            Some(speed) => cfg.speed = speed,
+            None => notices.push(format!(
+                "Session recorded invalid speed {s:?}; keeping {prior_speed_name}."
             )),
         }
     }
@@ -535,7 +542,7 @@ fn restore_model_settings(
             .get(prov, id)
             .cloned()
             .context("not in the model catalog")
-            .and_then(|info| crate::model::from_model_info(&restore.auth, info, cfg.speed));
+            .and_then(|info| crate::model::from_model_info(&restore.auth, info, cfg.speed.clone()));
         match resolved {
             Ok(resolved) => {
                 let name = resolved.model_info.name.clone();
@@ -556,10 +563,14 @@ fn restore_model_settings(
                 ));
             }
         }
-    } else if speed_name(cfg.speed) != prior_speed_name {
+    } else if speed_name(cfg.speed.as_ref()) != prior_speed_name {
         // Same model, different speed: rebuild the bundle so the
         // stream options carry the restored speed's headers.
-        match crate::model::from_model_info(&restore.auth, (*cfg.model_info).clone(), cfg.speed) {
+        match crate::model::from_model_info(
+            &restore.auth,
+            (*cfg.model_info).clone(),
+            cfg.speed.clone(),
+        ) {
             Ok(resolved) => {
                 cfg.provider = resolved.provider;
                 cfg.model_info = resolved.model_info;
@@ -579,7 +590,7 @@ fn restore_model_settings(
 
     // A missing recorded model retains the fallback bundle, including its provider.
     // Its inference options must still agree with the restored speed identity.
-    cfg.stream_options.speed = cfg.speed;
+    cfg.stream_options.speed = cfg.speed.clone();
 
     // Verbosity, re-applied onto the (possibly just-rebuilt) stream
     // options. A recorded value wins over the config default; an
@@ -665,7 +676,7 @@ pub fn build_agent(config: &Config, run: &RunConfigSnapshot) -> BuiltAgent {
     );
     agent.set_block_images(config.image_block);
     agent.set_default_thinking(run.main.thinking.clone());
-    agent.set_speed(run.main.speed);
+    agent.set_speed(run.main.speed.clone());
     BuiltAgent {
         agent,
         env,
@@ -814,6 +825,12 @@ pub fn prepare_log(
         cfg.session_id = Some(session_id);
     }
 
+    if !source.is_resume() {
+        restore_notices.extend(crate::settings::speed_fallback_notices(
+            &run_config.lock().expect("run config mutex poisoned"),
+        ));
+    }
+
     Ok(PreparedLog {
         log,
         transcript,
@@ -865,7 +882,7 @@ pub fn freeze_and_seed(
                 ThreadFilter::USER,
                 thinking_config_name(run.main.thinking.as_ref()),
             )?;
-            log.append_speed_change(ThreadFilter::USER, speed_name(run.main.speed))?;
+            log.append_speed_change(ThreadFilter::USER, speed_name(run.main.speed.as_ref()))?;
             log.append_verbosity_change(
                 ThreadFilter::USER,
                 verbosity_name(run.main.stream_options.verbosity),
@@ -873,7 +890,6 @@ pub fn freeze_and_seed(
             let oracle = &run.oracle;
             log.append_oracle_model_change(&oracle.model_key.0, &oracle.model_key.1)?;
             log.append_oracle_thinking_change(thinking_config_name(oracle.thinking.as_ref()))?;
-            log.append_oracle_speed_change(speed_name(oracle.speed))?;
             log.append_oracle_verbosity_change(verbosity_name(oracle.stream_options.verbosity))?;
         }
         assembled
@@ -1027,8 +1043,9 @@ mod tests {
         let mut config = Config::default();
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
-        let (startup, restore) = build_initial_run_config(&args, &config, &auth, thinking, speed)
-            .expect("scripted startup run config");
+        let (startup, restore) =
+            build_initial_run_config(&args, &config, &auth, thinking, speed.clone())
+                .expect("scripted startup run config");
         let startup_key = startup.main.model_key.clone();
         let defaults =
             RunConfigDefaults::layered(&args, &config, startup, speed, &auth, restore.as_ref());
@@ -1120,7 +1137,7 @@ mod tests {
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
         let (startup, restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed)
+            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed.clone())
                 .expect("startup run config");
         let oracle = startup.oracle.clone();
         assert_eq!(
@@ -1151,7 +1168,7 @@ mod tests {
         assert_eq!(verbosity_name(run.main.stream_options.verbosity), "high");
         assert_eq!(run.oracle.model_key, oracle.model_key);
         assert_eq!(run.oracle.thinking, oracle.thinking);
-        assert_eq!(run.oracle.speed, oracle.speed);
+        assert_eq!(run.oracle.speed, run.main.speed);
         assert_eq!(
             run.oracle.stream_options.verbosity,
             oracle.stream_options.verbosity
@@ -1161,7 +1178,6 @@ mod tests {
         config.oracle_model_name = Some("gpt-5.5".into());
         config.oracle_model_url = Some("https://oracle-later.example/v1".into());
         config.oracle_thinking = Some(ConfigThinkingLevel::Medium);
-        config.oracle_speed = Some(ConfigSpeed::Fast);
         config.oracle_verbosity = Some(aj_conf::ConfigVerbosity::Medium);
         let changed = defaults.resolve(&config, &auth).expect("Oracle defaults");
         assert_eq!(changed.main.settings(), run.main.settings());
@@ -1201,7 +1217,7 @@ mod tests {
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
         let (startup, restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed)
+            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed.clone())
                 .expect("startup run config");
         let auth = empty_auth(&dir);
         let defaults =
@@ -1238,7 +1254,7 @@ mod tests {
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
         let (startup, restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed)
+            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed.clone())
                 .expect("startup run config");
         let auth = empty_auth(&dir);
         let defaults =
@@ -1260,7 +1276,7 @@ mod tests {
         let thinking = resolve_thinking(&args, &config).expect("thinking");
         let speed = resolve_speed(&args, &config).expect("speed");
         let (startup, restore) =
-            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed)
+            build_initial_run_config(&args, &config, &empty_auth(&dir), thinking, speed.clone())
                 .expect("startup run config");
         let auth = empty_auth(&dir);
         let defaults =
@@ -1368,12 +1384,9 @@ pub fn resolve_thinking(args: &Args, config: &Config) -> Result<Option<ThinkingC
 pub fn resolve_speed(args: &Args, config: &Config) -> Result<Option<Speed>> {
     let configured = match args.speed.as_deref() {
         Some(name) => Some(name.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
-        None => config.speed,
+        None => config.speed.clone(),
     };
-    Ok(configured.map(|speed| match speed {
-        ConfigSpeed::Standard => Speed::Standard,
-        ConfigSpeed::Fast => Speed::Fast,
-    }))
+    Ok(crate::model::speed_from_config(configured.as_ref()))
 }
 
 /// Compose the session host for `layers`' working directory.
@@ -1394,7 +1407,8 @@ pub fn compose_host(
     let name = args
         .host_name()
         .map_err(|err| anyhow::anyhow!("--name: {err}"))?;
-    let (run_config, restore) = build_initial_run_config(args, &config, auth, thinking, speed)?;
+    let (run_config, restore) =
+        build_initial_run_config(args, &config, auth, thinking, speed.clone())?;
     let defaults =
         RunConfigDefaults::layered(args, &config, run_config, speed, auth, restore.as_ref());
     let catalog = crate::commands::load_model_catalog();

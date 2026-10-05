@@ -74,9 +74,6 @@ pub(super) fn append_changes(
     if let Some(effort) = &changes.settings.oracle_thinking {
         log.append_oracle_thinking_change(effort).map_err(persist)?;
     }
-    if let Some(speed) = &changes.settings.oracle_speed {
-        log.append_oracle_speed_change(speed).map_err(persist)?;
-    }
     if let Some(verbosity) = &changes.settings.oracle_verbosity {
         log.append_oracle_verbosity_change(verbosity)
             .map_err(persist)?;

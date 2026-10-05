@@ -23,8 +23,9 @@
 //!   `Error` that keeps the partial accumulated so far. The
 //!   Codex-specific 429 friendly-message overlay applies to HTTP-level
 //!   errors only.
-//! - **Service-tier pricing.** Same `flex` / `priority` knob, but
-//!   `gpt-5.5 + priority` uses a 2.5× multiplier (vs the default 2×).
+//! - **Service-tier pricing.** Catalog mode rates take precedence. Without
+//!   catalog modes, the legacy `gpt-5.5 + priority` estimate uses 2.5×
+//!   (vs the default 2×).
 //!
 //! Everything else — the streaming state machine, reasoning
 //! round-trip, composite tool-call IDs, usage parsing, stop-reason
@@ -62,8 +63,8 @@ use crate::types::ServiceTier;
 
 use super::errors::{account_for_client_error, classify_client_error_with};
 use super::responses::{
-    CostMultiplierFn, StreamState, convert_messages, empty_partial, error_message,
-    map_service_tier, responses_reasoning_effort, verbosity_text_config,
+    CostMultiplierFn, StreamState, convert_messages, effective_service_tier, empty_partial,
+    error_message, responses_reasoning_effort, verbosity_text_config,
 };
 #[cfg(any(test, feature = "test-support"))]
 use super::responses::{append_assistant_message, parse_assistant_input_items_with_api};
@@ -240,10 +241,10 @@ async fn run_stream_inner(
         }
     }
 
-    let mut state = StreamState::new_with(
+    let mut state = StreamState::new_with_tier(
         API_NAME,
         model,
-        options.service_tier.clone(),
+        request.service_tier.clone(),
         CODEX_COST_MULTIPLIER,
         credential.account.clone(),
     );
@@ -533,10 +534,9 @@ fn normalize_response_status_in_value(obj: &mut serde_json::Map<String, Value>) 
 // Cost multiplier
 // ---------------------------------------------------------------------------
 
-/// service-tier cost curve. Same `flex` / `priority` knobs as
-/// the public Responses API, except `gpt-5.5 + priority` uses a 2.5×
-/// multiplier (vs the default 2×). `default`, `auto`, `scale`, and no
-/// effective tier use 1×. A server-echoed tier wins over the request.
+/// Legacy service-tier estimate when catalog mode rates are unavailable.
+/// `gpt-5.5 + priority` uses 2.5× (vs the default 2×). `default`, `auto`,
+/// `scale`, and no effective tier use 1×. A server-echoed tier wins.
 pub(crate) fn codex_cost_multiplier(
     model_id: &str,
     server_tier: Option<&OpenAIServiceTier>,
@@ -545,7 +545,7 @@ pub(crate) fn codex_cost_multiplier(
     let effective = server_tier.or(requested_tier);
     match effective {
         Some(OpenAIServiceTier::Flex) => 0.5,
-        Some(OpenAIServiceTier::Priority) => {
+        Some(OpenAIServiceTier::Priority | OpenAIServiceTier::Fast) => {
             if model_id == "gpt-5.5" {
                 2.5
             } else {
@@ -663,7 +663,7 @@ fn build_request(
     // never sent for Codex (the backend doesn't expose retention tuning).
     let prompt_cache_key = options.session_id.clone();
 
-    let service_tier = options.service_tier.as_ref().map(map_service_tier);
+    let service_tier = effective_service_tier(model, options, true);
 
     // instructions carries the system prompt (or the
     // default if the caller didn't set one).
@@ -741,6 +741,8 @@ mod tests {
             reasoning_options: Vec::new(),
             supports_verbosity: false,
             default_verbosity: None,
+            speed_modes: Vec::new(),
+            default_speed: None,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 1.0,
@@ -825,6 +827,144 @@ mod tests {
         let body = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
         let sig = URL_SAFE_NO_PAD.encode(b"sig");
         format!("{header}.{body}.{sig}")
+    }
+
+    #[tokio::test]
+    async fn live_speed_requests_and_accounting_share_the_effective_tier() {
+        for (served, rates, expected) in [
+            (Some("priority"), true, 38.0),
+            (None, true, 38.0),
+            (Some("default"), true, 3.0),
+            (Some("future-tier"), true, 3.0),
+            (Some("priority"), false, 3.0),
+        ] {
+            let mut event = serde_json::json!({
+                "type": "response.completed", "sequence_number": 1,
+                "response": { "id":"resp_speed", "object":"response", "created_at":0.0,
+                    "model":"gpt-5.5", "output":[], "parallel_tool_calls":true, "tools":[], "status":"completed",
+                    "usage": {"input_tokens":1_000_000, "output_tokens":1_000_000, "total_tokens":2_000_000}
+                }
+            });
+            if let Some(tier) = served {
+                event["response"]["service_tier"] = tier.into();
+            }
+            let events = vec![event.to_string()];
+            let server =
+                crate::provider_test_support::held_sse_server("POST /codex/responses", events)
+                    .await;
+            let mut model = fake_model("gpt-5.5", false);
+            model.base_url = server.base_url.clone();
+            model.speed_modes.push(crate::registry::SpeedMode {
+                speed: crate::types::Speed::Fast,
+                name: "Fast".into(),
+                description: "".into(),
+                wire_value: "priority".into(),
+                cost: rates.then_some(crate::registry::ModelCost {
+                    input: 7.0,
+                    output: 31.0,
+                    cache_read: 1.0,
+                    cache_write: 0.0,
+                    tiers: vec![],
+                }),
+            });
+            let mut options = labeled_options(tokio_util::sync::CancellationToken::new());
+            options.service_tier = None;
+            options.speed = Some(crate::types::Speed::Fast);
+            let payload = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let captured = std::sync::Arc::clone(&payload);
+            options.on_payload = Some(OnPayload::new(move |value| {
+                *captured.lock().unwrap() = Some(value.clone())
+            }));
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                OpenAiCodexResponsesProvider
+                    .stream(&model, &Context::new("sys"), &options)
+                    .result(),
+            )
+            .await
+            .unwrap();
+            server.finish().await;
+            assert_eq!(
+                payload.lock().unwrap().as_ref().unwrap()["service_tier"],
+                "priority"
+            );
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(result.usage.total_tokens, 2_000_000);
+            assert_eq!(
+                result.usage.cost.total, expected,
+                "reported tier {served:?}, published prices {rates}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_speed_modes_use_catalog_wire_values_and_safe_standard_fallback() {
+        let mut model = fake_model("gpt-5.5", false);
+        for (speed, wire) in [
+            (crate::types::Speed::Fast, "priority"),
+            (crate::types::Speed::Ultrafast, "ultrafast"),
+            (crate::types::Speed::Flex, "flex"),
+            (crate::types::Speed::Named("custom".into()), "custom-wire"),
+        ] {
+            model.speed_modes.push(crate::registry::SpeedMode {
+                speed: speed.clone(),
+                name: wire.into(),
+                description: "".into(),
+                wire_value: wire.into(),
+                cost: None,
+            });
+            let options = StreamOptions {
+                speed: Some(speed),
+                ..Default::default()
+            };
+            let request =
+                build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off);
+            assert_eq!(
+                request.service_tier,
+                Some(OpenAIServiceTier::from(wire.to_owned()))
+            );
+        }
+        model.default_speed = Some(crate::types::Speed::Fast);
+        let request = build_request(
+            &model,
+            &Context::new("sys"),
+            &StreamOptions::default(),
+            &ThinkingLevel::Off,
+        );
+        assert_eq!(request.service_tier, Some(OpenAIServiceTier::Priority));
+        for speed in [
+            crate::types::Speed::Standard,
+            crate::types::Speed::Named("unsupported".into()),
+        ] {
+            let options = StreamOptions {
+                speed: Some(speed),
+                ..Default::default()
+            };
+            assert_eq!(
+                build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off)
+                    .service_tier,
+                None
+            );
+        }
+        let options = StreamOptions {
+            speed: Some(crate::types::Speed::Fast),
+            service_tier: Some(crate::types::ServiceTier::Flex),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off).service_tier,
+            Some(OpenAIServiceTier::Flex)
+        );
+        model.speed_modes.clear();
+        model.default_speed = None;
+        let options = StreamOptions {
+            speed: Some(crate::types::Speed::Fast),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off).service_tier,
+            None
+        );
     }
 
     fn labeled_options(cancel: tokio_util::sync::CancellationToken) -> StreamOptions {
@@ -1410,13 +1550,20 @@ mod tests {
 
     #[test]
     fn codex_terminal_tier_pricing_table() {
-        use OpenAIServiceTier::{Auto, Default, Flex, Priority, Scale};
+        use OpenAIServiceTier::{Auto, Default, Fast, Flex, Priority, Scale};
 
         let half = (1.0, 2.0, 0.5, 0.0, 3.5);
         let standard = (2.0, 4.0, 1.0, 0.0, 7.0);
         let double = (4.0, 8.0, 2.0, 0.0, 14.0);
         let two_and_a_half = (5.0, 10.0, 2.5, 0.0, 17.5);
         let cases = [
+            PricingCase {
+                name: "fast echo aliases priority estimate",
+                model_id: "gpt-5.5",
+                requested_tier: Some(ServiceTier::Priority),
+                server_tier: Some(Fast),
+                expected_cost: two_and_a_half,
+            },
             PricingCase {
                 name: "default echo overrides flex request",
                 model_id: "gpt-5.5",

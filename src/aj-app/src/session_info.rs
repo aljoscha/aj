@@ -137,14 +137,6 @@ pub fn digest(stats: &SessionInfo, tag: Option<&str>) -> Vec<InfoRow> {
                 .unwrap_or("(not recorded)"),
         ),
         kv(
-            "speed",
-            stats
-                .settings
-                .oracle_speed
-                .as_deref()
-                .unwrap_or("(not recorded)"),
-        ),
-        kv(
             "verbosity",
             stats
                 .settings
@@ -466,7 +458,6 @@ mod tests {
             RowView::Header("Oracle settings".to_string()),
             RowView::Kv("model".to_string(), "(not recorded)".to_string()),
             RowView::Kv("thinking".to_string(), "(not recorded)".to_string()),
-            RowView::Kv("speed".to_string(), "(not recorded)".to_string()),
             RowView::Kv("verbosity".to_string(), "(not recorded)".to_string()),
             RowView::Blank,
             RowView::Header("Activity".to_string()),
@@ -524,11 +515,10 @@ mod tests {
             .position(|row| row == &RowView::Header("Oracle settings".into()))
             .expect("Oracle settings section");
         assert_eq!(
-            &rows[oracle + 1..oracle + 5],
+            &rows[oracle + 1..oracle + 4],
             &[
                 RowView::Kv("model".into(), "openai / gpt-5.5".into()),
                 RowView::Kv("thinking".into(), "off".into()),
-                RowView::Kv("speed".into(), "fast".into()),
                 RowView::Kv("verbosity".into(), "default".into()),
             ]
         );

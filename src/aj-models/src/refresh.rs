@@ -17,10 +17,10 @@ use serde::Deserialize;
 
 use crate::registry::{
     CATALOG_SCHEMA_VERSION, CODEX_PROVIDER_ID, Catalog, InputModality, ModelCost, ModelCostTier,
-    ModelInfo, ReasoningOption, apply_override, bundled_codex_seed, bundled_overrides,
+    ModelInfo, ReasoningOption, SpeedMode, apply_override, bundled_codex_seed, bundled_overrides,
     splice_codex_seed, user_cache_path,
 };
-use crate::types::ThinkingLevel;
+use crate::types::{Speed, ThinkingLevel};
 
 /// Failure modes of a catalog refresh.
 ///
@@ -148,6 +148,32 @@ struct RawModel {
     cost: Option<RawCost>,
     #[serde(default)]
     modalities: Option<RawModalities>,
+    #[serde(default)]
+    experimental: Option<RawExperimental>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct RawExperimental {
+    #[serde(default)]
+    modes: BTreeMap<String, RawMode>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct RawMode {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    cost: Option<RawCost>,
+    #[serde(default)]
+    provider: Option<RawModeProvider>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct RawModeProvider {
+    #[serde(default)]
+    body: serde_json::Value,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -602,6 +628,87 @@ pub fn build_seed_from_models_dev(body: &str) -> Result<Catalog, RefreshError> {
     Ok(finalize_catalog(models, "models.dev"))
 }
 
+/// Update the normalized Codex seed's speed metadata from a pinned upstream
+/// model list. Prices come from matching native OpenAI wire tiers, not latency
+/// descriptions or inferred multipliers. Other seed metadata is unchanged.
+pub fn update_codex_speed_metadata(
+    models: &mut [ModelInfo],
+    upstream_body: &str,
+    native_models: &[ModelInfo],
+) -> Result<(), RefreshError> {
+    #[derive(Deserialize)]
+    struct List {
+        models: Vec<Model>,
+    }
+    #[derive(Deserialize)]
+    struct Model {
+        slug: String,
+        #[serde(default)]
+        service_tiers: Vec<Tier>,
+        #[serde(default)]
+        default_service_tier: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Tier {
+        id: String,
+        name: String,
+        #[serde(default)]
+        description: String,
+    }
+    let list: List = serde_json::from_str(upstream_body).map_err(|source| RefreshError::Parse {
+        context: "parsing pinned Codex model list".into(),
+        source,
+    })?;
+    let mut native_models = native_models.to_vec();
+    for entry in crate::registry::bundled_overrides().overrides {
+        if native_models
+            .iter()
+            .any(|model| model.provider == entry.target.provider && model.id == entry.target.id)
+        {
+            crate::registry::apply_override(&mut native_models, &entry);
+        }
+    }
+    for model in models
+        .iter_mut()
+        .filter(|m| m.provider == CODEX_PROVIDER_ID)
+    {
+        let Some(upstream) = list.models.iter().find(|m| m.slug == model.id) else {
+            continue;
+        };
+        let native = native_models
+            .iter()
+            .find(|m| m.provider == "openai" && m.id == model.id);
+        model.speed_modes = upstream
+            .service_tiers
+            .iter()
+            .filter_map(|tier| {
+                let speed = match tier.id.as_str() {
+                    "priority" => Speed::Fast,
+                    "default" => Speed::Standard,
+                    id => id.parse().ok()?,
+                };
+                Some(SpeedMode {
+                    speed,
+                    name: tier.name.clone(),
+                    description: tier.description.clone(),
+                    wire_value: tier.id.clone(),
+                    cost: native
+                        .and_then(|m| m.speed_modes.iter().find(|mode| mode.wire_value == tier.id))
+                        .and_then(|mode| mode.cost.clone()),
+                })
+            })
+            .collect();
+        model.default_speed = upstream.default_service_tier.as_ref().and_then(|id| {
+            model
+                .speed_modes
+                .iter()
+                .find(|mode| &mode.wire_value == id)
+                .map(|mode| mode.speed.clone())
+        });
+    }
+    Ok(())
+}
+
 /// Map an upstream effort value string onto AJ's [`ThinkingLevel`].
 /// Upstream `"none"` becomes [`ThinkingLevel::Off`] (an explicit
 /// no-reasoning effort). `"default"` and any unrecognized value are
@@ -678,32 +785,13 @@ fn reasoning_options_from_openrouter(raw: Option<&OpenRouterReasoning>) -> Vec<R
     options
 }
 
-/// Normalize a single models.dev entry into our [`ModelInfo`] shape.
-/// Missing fields fall back to spec-aligned defaults: zero costs (so we
-/// never silently bill against unknown rates), 4096-token context, and
-/// the upstream id when no human-readable name is supplied.
-fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
-    let cost = m.cost.as_ref();
-    let limit = m.limit.as_ref();
-    let modalities = m.modalities.as_ref();
-
-    // `modalities.input` may include "image"; if so the model
-    // accepts both text and images. Otherwise default to text-only —
-    // every supported model accepts text.
-    let mut input = vec![InputModality::Text];
-    if let Some(mods) = modalities
-        && let Some(values) = &mods.input
-        && values.iter().any(|s| s.eq_ignore_ascii_case("image"))
-    {
-        input.push(InputModality::Image);
-    }
-
-    // Base per-million rates. An absent rate means the model does not
-    // bill that category, so it defaults to 0.
-    let base_input = cost.and_then(|c| c.input).unwrap_or(0.0);
-    let base_output = cost.and_then(|c| c.output).unwrap_or(0.0);
-    let base_cache_read = cost.and_then(|c| c.cache_read).unwrap_or(0.0);
-    let base_cache_write = cost.and_then(|c| c.cache_write).unwrap_or(0.0);
+/// Merge published rates with the base, including context-tier overrides.
+fn map_cost(cost: Option<&RawCost>, base: &ModelCost) -> ModelCost {
+    // Partial rate overrides inherit the corresponding base rate.
+    let base_input = cost.and_then(|c| c.input).unwrap_or(base.input);
+    let base_output = cost.and_then(|c| c.output).unwrap_or(base.output);
+    let base_cache_read = cost.and_then(|c| c.cache_read).unwrap_or(base.cache_read);
+    let base_cache_write = cost.and_then(|c| c.cache_write).unwrap_or(base.cache_write);
 
     // Map models.dev context tiers onto our step-function pricing.
     // Only `type == "context"` tiers with a size become a
@@ -735,6 +823,69 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         })
         .collect();
 
+    ModelCost {
+        input: base_input,
+        output: base_output,
+        cache_read: base_cache_read,
+        cache_write: base_cache_write,
+        // Context prices belong to the selected mode. Standard-mode tiers
+        // must not replace premium rates when the mode omits tier metadata.
+        tiers,
+    }
+}
+
+/// Only speed-bearing provider fields make a mode eligible. Reasoning-only
+/// modes are not speed choices, irrespective of their catalog key.
+fn speed_modes_from_models_dev(m: &RawModel, api: &str, base: &ModelCost) -> Vec<SpeedMode> {
+    m.experimental
+        .as_ref()
+        .into_iter()
+        .flat_map(|e| &e.modes)
+        .filter_map(|(key, mode)| {
+            let body = &mode.provider.as_ref()?.body;
+            let field = if api == "anthropic-messages" {
+                "speed"
+            } else {
+                "service_tier"
+            };
+            let wire_value = body.get(field)?.as_str()?;
+            if wire_value.is_empty() {
+                return None;
+            }
+            Some(SpeedMode {
+                speed: key.parse().ok()?,
+                name: mode.name.clone().unwrap_or_else(|| key.clone()),
+                description: mode.description.clone(),
+                wire_value: wire_value.into(),
+                cost: mode.cost.as_ref().map(|cost| map_cost(Some(cost), base)),
+            })
+        })
+        .collect()
+}
+
+/// Normalize a single models.dev entry into our [`ModelInfo`] shape.
+/// Missing fields fall back to spec-aligned defaults: zero costs (so we
+/// never silently bill against unknown rates), 4096-token context, and
+/// the upstream id when no human-readable name is supplied.
+fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
+    let cost = m.cost.as_ref();
+    let limit = m.limit.as_ref();
+    let modalities = m.modalities.as_ref();
+
+    // `modalities.input` may include "image"; if so the model
+    // accepts both text and images. Otherwise default to text-only —
+    // every supported model accepts text.
+    let mut input = vec![InputModality::Text];
+    if let Some(mods) = modalities
+        && let Some(values) = &mods.input
+        && values.iter().any(|s| s.eq_ignore_ascii_case("image"))
+    {
+        input.push(InputModality::Image);
+    }
+
+    let cost = map_cost(cost, &ModelCost::default());
+    let speed_modes = speed_modes_from_models_dev(m, fixed.api, &cost);
+
     ModelInfo {
         id: id.to_string(),
         name: m.name.clone().unwrap_or_else(|| id.to_string()),
@@ -751,13 +902,9 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         supports_verbosity: fixed.api == "openai-responses" && id.starts_with("gpt-5"),
         default_verbosity: None,
         input,
-        cost: ModelCost {
-            input: base_input,
-            output: base_output,
-            cache_read: base_cache_read,
-            cache_write: base_cache_write,
-            tiers,
-        },
+        cost,
+        speed_modes,
+        default_speed: None,
         context_window: limit.and_then(|l| l.context).unwrap_or(4096),
         max_tokens: limit.and_then(|l| l.output).unwrap_or(4096),
     }
@@ -794,6 +941,8 @@ fn map_openrouter_model(m: &OpenRouterModel, family: Option<String>) -> ModelInf
         // there means the model honours OpenAI's `text.verbosity`.
         supports_verbosity: m.supported_parameters.iter().any(|p| p == "verbosity"),
         default_verbosity: None,
+        speed_modes: Vec::new(),
+        default_speed: None,
         input,
         cost: ModelCost {
             input: openrouter_price_per_million(pricing.and_then(|p| p.prompt.as_deref())),
@@ -852,7 +1001,14 @@ fn build_summary(dest: &Path, new_catalog: &Catalog) -> RefreshSummary {
         match prev_index.get(&(provider.clone(), id.clone())) {
             None => added.push(format!("{provider}/{id}")),
             Some(old) => {
-                if old.cost != new.cost {
+                let mode_prices = |model: &ModelInfo| {
+                    model
+                        .speed_modes
+                        .iter()
+                        .map(|mode| (mode.speed.clone(), mode.cost.clone()))
+                        .collect::<HashMap<_, _>>()
+                };
+                if old.cost != new.cost || mode_prices(old) != mode_prices(new) {
                     price_changed.push(format!("{provider}/{id}"));
                 }
             }
@@ -1011,6 +1167,66 @@ mod tests {
             }
         }
     }"#;
+
+    #[test]
+    fn dynamic_speed_modes_survive_catalog_round_trip() {
+        let body = r#"{"openai":{"models":{"test":{"tool_call":true,
+            "cost":{"input":2,"output":10,"cache_read":0.2,"cache_write":3,
+                "tiers":[{"input":4,"output":15,"tier":{"type":"context","size":272000}}]},
+            "experimental":{"modes":{
+                "turbo":{"name":"Turbo","description":"Lower latency",
+                    "provider":{"body":{"service_tier":"priority"}},"cost":{"input":7}},
+                "flex":{"provider":{"body":{"service_tier":"flex"}}},
+                "pro":{"provider":{"body":{"reasoning":{"mode":"pro"}}}},
+                "invalid":{"provider":{"body":{"service_tier":true}}}
+            }}}}},"anthropic":{"models":{"test":{"tool_call":true,
+                "experimental":{"modes":{"ultrafast":{"provider":{"body":{"speed":"warp"}}}}}
+            }}}}"#;
+        let catalog = build_catalog_from_json(body, None).unwrap();
+        let catalog: Catalog =
+            serde_json::from_str(&serde_json::to_string(&catalog).unwrap()).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|m| m.provider == "openai")
+            .unwrap();
+        assert_eq!(model.speed_modes.len(), 2);
+        let turbo = model.speed_mode(&Speed::Named("turbo".into())).unwrap();
+        assert_eq!(turbo.name, "Turbo");
+        assert_eq!(turbo.description, "Lower latency");
+        assert_eq!(turbo.wire_value, "priority");
+        let cost = turbo.cost.as_ref().unwrap();
+        assert!(!model.cost.tiers.is_empty());
+        assert!(
+            cost.tiers.is_empty(),
+            "standard context prices are not turbo prices"
+        );
+        assert_eq!(
+            (cost.input, cost.output, cost.cache_read, cost.cache_write),
+            (7.0, 10.0, 0.2, 3.0)
+        );
+        assert!(model.speed_mode(&Speed::Flex).unwrap().cost.is_none());
+        let anthropic = catalog
+            .models
+            .iter()
+            .find(|m| m.provider == "anthropic")
+            .unwrap();
+        assert_eq!(
+            anthropic.speed_mode(&Speed::Ultrafast).unwrap().wire_value,
+            "warp"
+        );
+    }
+
+    #[test]
+    fn codex_speed_metadata_preserves_unknown_tiers_without_inventing_prices() {
+        let mut models = bundled_codex_seed();
+        let id = models[0].id.clone();
+        let body = serde_json::json!({"models":[{"slug":id,
+            "service_tiers":[{"id":"turbo","name":"Turbo"}], "default_service_tier":"turbo"}]});
+        update_codex_speed_metadata(&mut models, &body.to_string(), &[]).unwrap();
+        assert_eq!(models[0].default_speed, Some(Speed::Named("turbo".into())));
+        assert!(models[0].speed_modes[0].cost.is_none());
+    }
 
     #[test]
     fn parse_failure_surfaces_refresh_error_parse() {
@@ -1214,6 +1430,23 @@ mod tests {
         cat3.models.push(extra);
         let summary3 = build_summary(&dest, &cat3);
         assert_eq!(summary3.added, vec!["anthropic/claude-new"]);
+
+        let mut mode_price_change = cat1.clone();
+        let model = &mut mode_price_change.models[0];
+        model.speed_modes.push(SpeedMode {
+            speed: Speed::Fast,
+            name: "Fast".into(),
+            description: String::new(),
+            wire_value: "fast".into(),
+            cost: Some(ModelCost {
+                input: 8.0,
+                ..model.cost.clone()
+            }),
+        });
+        assert_eq!(
+            build_summary(&dest, &mode_price_change).price_changed,
+            vec!["anthropic/claude-test-tool"]
+        );
     }
 
     #[test]

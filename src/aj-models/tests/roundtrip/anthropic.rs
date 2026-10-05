@@ -60,6 +60,8 @@ fn fixture_model() -> ModelInfo {
         }],
         supports_verbosity: false,
         default_verbosity: None,
+        speed_modes: Vec::new(),
+        default_speed: None,
         input: vec![InputModality::Text],
         cost: ModelCost {
             input: 3.0,

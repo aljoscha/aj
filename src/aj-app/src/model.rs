@@ -200,10 +200,8 @@ pub struct ResolvedModel {
 ///
 /// `speed` records the inference speed mode on the baseline
 /// [`StreamOptions`]; the provider decides what (if anything) it means
-/// on the wire. Anthropic maps `Fast` onto a request-body field plus a
-/// beta header; other providers ignore it. The Speed enum lives in
-/// `aj-models` because it's plumbed through the Anthropic SDK wire
-/// types as well.
+/// on the wire. Each provider resolves the preference against its model's
+/// catalog modes, including the provider-specific wire mapping and pricing.
 pub fn resolve(
     registry: &ModelRegistry,
     auth: &AuthStorage,
@@ -398,6 +396,11 @@ pub fn apply_verbosity(options: &mut StreamOptions, verbosity: Option<ConfigVerb
     options.verbosity = verbosity.map(config_verbosity_to_unified);
 }
 
+/// Convert the config vocabulary without losing model-advertised named modes.
+pub fn speed_from_config(speed: Option<&aj_conf::ConfigSpeed>) -> Option<Speed> {
+    speed.and_then(|speed| aj_models::speed_from_name(&speed.to_string()).flatten())
+}
+
 /// Map a `config.toml` thinking level onto the wire-level
 /// [`ThinkingConfig`] the agent runs with. [`ConfigThinkingLevel::Off`]
 /// collapses to `None` (no reasoning requested), so the result type is
@@ -434,6 +437,8 @@ mod tests {
             reasoning_options: Vec::new(),
             supports_verbosity: false,
             default_verbosity: None,
+            speed_modes: Vec::new(),
+            default_speed: None,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 1_000,

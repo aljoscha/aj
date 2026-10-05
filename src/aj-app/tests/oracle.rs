@@ -20,7 +20,8 @@ use aj_models::ThinkingConfig;
 use aj_models::auth::{AuthCredential, AuthStorage};
 use aj_models::provider::Provider;
 use aj_models::registry::{
-    Catalog, ModelInfo, ModelRegistry, OverridesFile, ReasoningOption, supported_thinking_levels,
+    Catalog, ModelCost, ModelInfo, ModelRegistry, OverridesFile, ReasoningOption, SpeedMode,
+    supported_thinking_levels,
 };
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::streaming::AssistantMessageEventStream;
@@ -99,6 +100,8 @@ fn snapshot(main: Arc<RecordingProvider>, oracle: Arc<RecordingProvider>) -> Run
     run.main.model_info = Arc::new(ModelInfo {
         id: "current-main".into(),
         base_url: "http://127.0.0.1:1/main-override-must-not-leak".into(),
+        speed_modes: vec![],
+        default_speed: None,
         reasoning: true,
         reasoning_options: vec![ReasoningOption::Effort {
             values: vec![ThinkingLevel::Low, ThinkingLevel::High],
@@ -110,7 +113,7 @@ fn snapshot(main: Arc<RecordingProvider>, oracle: Arc<RecordingProvider>) -> Run
     run.main.thinking_display = Some(ConfigThinkingDisplay::Detailed);
     run.main.stream_options.api_key = Some("synthetic-main-key".into());
     run.main.stream_options.verbosity = Some(Verbosity::Low);
-    run.main.stream_options.speed = run.main.speed;
+    run.main.stream_options.speed = run.main.speed.clone();
     run.session_id = Some("oracle-test-session".into());
     run.main.stream_options.session_id = run.session_id.clone();
     apply_thinking_display(&mut run.main.stream_options, run.main.thinking_display);
@@ -124,14 +127,14 @@ fn snapshot(main: Arc<RecordingProvider>, oracle: Arc<RecordingProvider>) -> Run
         }),
         stream_options: StreamOptions {
             api_key: Some("synthetic-oracle-key".into()),
-            speed: Some(Speed::Fast),
+            speed: Some(Speed::Standard),
             verbosity: Some(Verbosity::High),
             session_id: run.session_id.clone(),
             ..StreamOptions::default()
         },
         thinking: Some(ThinkingConfig::High),
         thinking_display: Some(ConfigThinkingDisplay::Omitted),
-        speed: Some(Speed::Fast),
+        speed: Some(Speed::Standard),
         model_key: ("scripted".into(), "independent-oracle".into()),
     };
     {
@@ -406,7 +409,6 @@ async fn independent_oracle_bundle_runs_an_advisory_isolated_child() {
         oracle_model_api: Some("unavailable-startup-provider".into()),
         oracle_model_name: Some("unavailable-startup-oracle".into()),
         oracle_thinking: Some(ConfigThinkingLevel::Max),
-        oracle_speed: Some(ConfigSpeed::Standard),
         oracle_verbosity: Some(ConfigVerbosity::Low),
         disabled_tools: vec!["todo_read".into()],
         ..Config::default()
@@ -432,7 +434,7 @@ async fn independent_oracle_bundle_runs_an_advisory_isolated_child() {
     assert_eq!(child.model.id, "independent-oracle");
     assert_eq!(child.model.base_url, run.oracle.model_info.base_url);
     assert_eq!(child.options.reasoning, ThinkingLevel::High);
-    assert_eq!(child.options.base.speed, Some(Speed::Fast));
+    assert_eq!(child.options.base.speed, Some(Speed::Standard));
     assert_eq!(child.options.base.verbosity, Some(Verbosity::High));
     assert_eq!(
         child.options.base.api_key,
@@ -653,12 +655,13 @@ async fn background_oracle_returns_before_completion_and_delivers_its_report_to_
     host.shutdown().await;
 }
 
-// One-shot local HTTP fixture, owned even if an assertion unwinds. No global
+// Bounded local HTTP fixture, owned even if an assertion unwinds. No global
 // environment mutation or external credentials are needed by the real adapter.
 struct MockResponses {
     url: String,
     request: tokio::sync::oneshot::Receiver<(String, Value)>,
     task: tokio::task::JoinHandle<()>,
+    requests: tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
 }
 
 impl Drop for MockResponses {
@@ -719,40 +722,57 @@ impl MockResponses {
     }
 
     async fn start_sse(response_body: String) -> Self {
+        Self::start_sequence(vec![response_body]).await
+    }
+
+    async fn start_sequence(response_bodies: Vec<String>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/oracle-endpoint", listener.local_addr().unwrap());
         let (tx, request) = tokio::sync::oneshot::channel();
+        let (requests_tx, requests) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let (headers, body) = loop {
-                let mut buffer = [0; 8192];
-                let count = socket.read(&mut buffer).await.unwrap();
-                assert!(count > 0, "complete HTTP request");
-                bytes.extend_from_slice(&buffer[..count]);
-                let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
-                    continue;
+            let mut first = Some(tx);
+            for response_body in response_bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (headers, body) = loop {
+                    let mut buffer = [0; 8192];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "complete HTTP request");
+                    bytes.extend_from_slice(&buffer[..count]);
+                    let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .expect("request content length");
+                    if bytes.len() >= end + 4 + length {
+                        break (
+                            headers,
+                            serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
+                                .unwrap(),
+                        );
+                    }
                 };
-                let headers = String::from_utf8(bytes[..end].to_vec()).unwrap();
-                let length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (key, value) = line.split_once(':')?;
-                        key.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .expect("request content length");
-                if bytes.len() >= end + 4 + length {
-                    break (
-                        headers,
-                        serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap(),
-                    );
+                if let Some(tx) = first.take() {
+                    tx.send((headers.clone(), body.clone())).unwrap();
                 }
-            };
-            tx.send((headers, body)).unwrap();
-            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}", response_body.len()).as_bytes()).await.unwrap();
+                requests_tx.send((headers, body)).unwrap();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}", response_body.len()).as_bytes()).await.unwrap();
+            }
         });
-        Self { url, request, task }
+        Self {
+            url,
+            request,
+            task,
+            requests,
+        }
     }
 }
 
@@ -771,6 +791,8 @@ async fn restore_context(root: &TempDir, url: String) -> RestoreContext {
         api: "openai-responses".into(),
         id: "oracle-other".into(),
         base_url: url,
+        speed_modes: vec![],
+        default_speed: None,
         reasoning: true,
         reasoning_options: vec![ReasoningOption::Effort {
             values: vec![ThinkingLevel::Low, ThinkingLevel::High],
@@ -811,7 +833,7 @@ async fn explicit_other_provider_uses_its_endpoint_credentials_and_oracle_axes()
         oracle_model_api: Some("oracle-provider".into()),
         oracle_model_name: Some("oracle-other".into()),
         oracle_thinking: Some(ConfigThinkingLevel::High),
-        oracle_speed: Some(ConfigSpeed::Fast),
+        speed: Some(ConfigSpeed::Standard),
         oracle_verbosity: Some(ConfigVerbosity::High),
         thinking_display: Some(ConfigThinkingDisplay::Omitted),
         ..Config::default()
@@ -824,7 +846,7 @@ async fn explicit_other_provider_uses_its_endpoint_credentials_and_oracle_axes()
             name: config.oracle_model_name.clone(),
             url: config.oracle_model_url.clone(),
         },
-        Some(Speed::Fast),
+        run.main.speed.clone(),
     )
     .unwrap();
     run.oracle = ModelConfig {
@@ -837,7 +859,7 @@ async fn explicit_other_provider_uses_its_endpoint_credentials_and_oracle_axes()
         stream_options: resolved.stream_options,
         thinking: Some(ThinkingConfig::High),
         thinking_display: Some(ConfigThinkingDisplay::Detailed),
-        speed: Some(Speed::Fast),
+        speed: run.main.speed.clone(),
     };
     run.oracle.stream_options.verbosity = Some(Verbosity::High);
     {
@@ -868,8 +890,10 @@ async fn explicit_other_provider_uses_its_endpoint_credentials_and_oracle_axes()
     assert_eq!(body["text"]["verbosity"], "high");
     assert!(body.to_string().contains(TASK));
     assert!(!body.to_string().contains(HISTORY));
-    // OpenAI does not implement the unified speed knob; assert the runtime's
-    // actual child settings event rather than inventing a wire field.
+    assert!(
+        body.get("service_tier").is_none(),
+        "tierless compatible Oracle: {body}"
+    );
     let mut starts = Vec::new();
     while let Ok(event) = events.try_recv() {
         if let AgentEvent::SubAgentStart {
@@ -886,7 +910,7 @@ async fn explicit_other_provider_uses_its_endpoint_credentials_and_oracle_axes()
     assert_eq!(starts[0].provider, "oracle-provider");
     assert_eq!(starts[0].model_id, "oracle-other");
     assert_eq!(starts[0].thinking, "high");
-    assert_eq!(starts[0].speed, "fast");
+    assert_eq!(starts[0].speed, "standard");
     assert_eq!(starts[0].verbosity, "high");
     assert_eq!(starts[0].thinking_display, "detailed");
     let requests = provider.requests.lock().unwrap();
@@ -908,7 +932,7 @@ async fn explicit_other_provider_uses_its_endpoint_credentials_and_oracle_axes()
 }
 
 #[tokio::test]
-async fn retained_oracle_settings_use_child_identity_and_preserve_its_speed_on_the_wire() {
+async fn retained_oracle_settings_use_child_identity_and_fall_back_for_unsupported_shared_speed() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let root = TempDir::new().unwrap();
         let mut server = MockResponses::start_anthropic("replacement-oracle").await;
@@ -918,6 +942,14 @@ async fn retained_oracle_settings_use_child_identity_and_preserve_its_speed_on_t
         );
         let main_info = ModelInfo {
             api: "openai-responses".into(),
+            speed_modes: vec![SpeedMode {
+                speed: Speed::Fast,
+                name: "Fast".into(),
+                description: String::new(),
+                wire_value: "priority".into(),
+                cost: None,
+            }],
+            default_speed: None,
             context_window: 200_000,
             max_tokens: 4096,
             ..(*run.main.model_info).clone()
@@ -959,12 +991,12 @@ async fn retained_oracle_settings_use_child_identity_and_preserve_its_speed_on_t
         run.main.provider = Arc::<RecordingProvider>::clone(&main);
         run.main.model_info = Arc::new(main_info.clone());
         run.main.speed = Some(Speed::Fast);
-        run.main.stream_options.speed = run.main.speed;
+        run.main.stream_options.speed = run.main.speed.clone();
         run.oracle.provider = Arc::<RecordingProvider>::clone(&oracle);
         run.oracle.model_info = Arc::new(initial_oracle.clone());
         run.oracle.model_key = (initial_oracle.provider.clone(), initial_oracle.id.clone());
-        run.oracle.speed = Some(Speed::Standard);
-        run.oracle.stream_options.speed = run.oracle.speed;
+        run.oracle.speed = run.main.speed.clone();
+        run.oracle.stream_options.speed = run.oracle.speed.clone();
 
         assert_eq!(
             supported_thinking_levels(&main_info),
@@ -1066,7 +1098,7 @@ async fn retained_oracle_settings_use_child_identity_and_preserve_its_speed_on_t
                         assert_eq!(settings.provider, initial_oracle.provider);
                         assert_eq!(settings.model_id, initial_oracle.id);
                         assert_eq!(settings.thinking, "high");
-                        assert_eq!(settings.speed, "standard");
+                        assert_eq!(settings.speed, "fast");
                     }
                     Some(AgentEvent::AgentEnd {
                         agent_id: AgentId::Main,
@@ -1104,7 +1136,7 @@ async fn retained_oracle_settings_use_child_identity_and_preserve_its_speed_on_t
             let requests = oracle.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].model.id, initial_oracle.id);
-            assert_eq!(requests[0].options.base.speed, Some(Speed::Standard));
+            assert_eq!(requests[0].options.base.speed, Some(Speed::Fast));
         }
 
         // All three commands precede the child's next turn. Low is absent from
@@ -1160,7 +1192,7 @@ async fn retained_oracle_settings_use_child_identity_and_preserve_its_speed_on_t
         // Anthropic encodes Standard by omitting both fast-mode signals.
         assert!(
             body.get("speed").is_none(),
-            "Main's fast speed leaked: {body}"
+            "unsupported shared fast speed must use standard: {body}"
         );
         assert!(!headers.to_lowercase().contains("fast-mode-"), "{headers}");
         let tools = body["tools"].as_array().expect("advisor tool definitions");
@@ -1213,4 +1245,167 @@ async fn retained_oracle_settings_use_child_identity_and_preserve_its_speed_on_t
     })
     .await
     .expect("bounded retained Oracle host turn");
+}
+
+// Both adapters see the requested preference. Only advertised modes reach the wire.
+#[tokio::test]
+async fn shared_speed_survives_resume_and_resolves_independently_on_real_requests() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let root = TempDir::new().unwrap();
+        let response = |tool: bool| {
+            let item = if tool {
+                json!({"type":"function_call", "id":"fc_speed", "call_id":"call_speed",
+                    "name":"oracle", "arguments":json!({"task":TASK}).to_string(), "status":"completed"})
+            } else {
+                json!({"type":"message", "id":"msg_speed", "role":"assistant", "status":"completed",
+                    "content":[{"type":"output_text", "text":REPORT, "annotations":[]}]})
+            };
+            let response = json!({"id":"resp_speed", "object":"response", "created_at":0.0,
+                "model":"speed-main", "output":[], "parallel_tool_calls":true, "tools":[], "status":"in_progress"});
+            let mut completed = response.clone();
+            completed["status"] = json!("completed");
+            completed["output"] = json!([item.clone()]);
+            completed["usage"] = json!({"input_tokens":100, "output_tokens":10, "total_tokens":110,
+                "input_tokens_details":{"cached_tokens":0}, "output_tokens_details":{"reasoning_tokens":0}});
+            let events = [
+                json!({"type":"response.created", "sequence_number":0, "response":response}),
+                json!({"type":"response.output_item.added", "sequence_number":1, "output_index":0, "item":item}),
+                json!({"type":"response.output_item.done", "sequence_number":2, "output_index":0, "item":item}),
+                json!({"type":"response.completed", "sequence_number":3, "response":completed}),
+            ];
+            events.iter().map(|event| format!("data: {event}\n\n")).collect::<String>()
+        };
+        let mut main_server = MockResponses::start_sequence(
+            (0..6).map(|index| response(index % 2 == 0)).collect(),
+        ).await;
+        let mut oracle_server = MockResponses::start_sequence(
+            (0..3).map(|_| response(false).replace("speed-main", "speed-oracle")).collect(),
+        ).await;
+        let standard_cost = ModelCost { input: 2.0, output: 4.0, ..ModelCost::default() };
+        let premium_cost = ModelCost { input: 10.0, output: 20.0, ..ModelCost::default() };
+        let main_info = ModelInfo {
+            provider: "openai".into(), api: "openai-responses".into(),
+            id: "speed-main".into(), base_url: main_server.url.clone(),
+            reasoning: false, reasoning_options: vec![],
+            speed_modes: vec![SpeedMode {
+                speed: Speed::Ultrafast, name: "Ultrafast".into(), description: String::new(),
+                wire_value: "ultrafast".into(), cost: Some(premium_cost.clone()),
+            }],
+            default_speed: None, cost: standard_cost.clone(),
+            max_tokens: 4096, context_window: 200_000,
+            ..scripted_model_info()
+        };
+        let oracle_info = ModelInfo {
+            id: "speed-oracle".into(), base_url: oracle_server.url.clone(),
+            speed_modes: vec![], ..main_info.clone()
+        };
+        assert!(main_info.speed_mode(&Speed::Ultrafast).is_some());
+        assert!(oracle_info.speed_mode(&Speed::Ultrafast).is_none());
+        let catalog = vec![main_info.clone(), oracle_info.clone()];
+        let auth = AuthStorage::with_providers(root.path().join("auth.json"), HashMap::new());
+        auth.insert_account("openai", "", AuthCredential::ApiKey { key: "speed-test-key".into() })
+            .await.unwrap();
+        let restore = RestoreContext {
+            auth: auth.clone(),
+            registry: Arc::new(ModelRegistry::from_catalog_with_overrides(
+                Catalog { schema_version: aj_models::registry::CATALOG_SCHEMA_VERSION, updated_at: 0,
+                    source: "shared-speed-test".into(), models: catalog.clone() },
+                OverridesFile { overrides: vec![] }, "shared-speed-test",
+            )),
+        };
+        let mut run = scripted_run_config(vec![]).lock().unwrap().clone();
+        let bundle = |info: ModelInfo| {
+            let resolved = aj_app::model::from_model_info(&auth, info, Some(Speed::Ultrafast)).unwrap();
+            ModelConfig {
+                model_key: (resolved.model_info.provider.clone(), resolved.model_info.id.clone()),
+                provider: resolved.provider, model_info: resolved.model_info,
+                stream_options: resolved.stream_options, thinking: None, thinking_display: None,
+                speed: Some(Speed::Ultrafast),
+            }
+        };
+        run.main = bundle(main_info);
+        run.oracle = bundle(oracle_info);
+        let make_host = |default_speed: Speed| {
+            let mut defaults = run.clone();
+            for model in [&mut defaults.main, &mut defaults.oracle] {
+                model.speed = Some(default_speed.clone());
+                model.stream_options.speed = Some(default_speed.clone());
+            }
+            let config = Config { speed: Some(default_speed.as_str().parse().unwrap()),
+                spill_dir: Some(root.path().join("spill").to_string_lossy().into_owned()),
+                ..Config::default() };
+            SessionHost::new(HostSetup {
+                config: Arc::new(Mutex::new(config.clone())),
+                layers: Arc::new(Mutex::new(ConfigLayers { user: config, project: ConfigLayer::default(),
+                    project_path: None, writes: Default::default() })),
+                catalog: Arc::new(catalog.clone()), defaults: RunConfigDefaults::fixed(defaults),
+                restore: Some(restore.clone()), persistence: ConversationPersistence::new(root.path().join("sessions")),
+                auth: auth.clone(), working_directory: root.path().to_path_buf(), name: None,
+                idle_grace: None, live_capacity: None, list_coalesce: None,
+            }).unwrap()
+        };
+        let mut host = make_host(Speed::Ultrafast);
+        let session = host.create().await.unwrap();
+        for phase in 0..3 {
+            if phase == 1 {
+                host.shutdown().await;
+                host = make_host(Speed::Standard);
+            }
+            if phase == 2 {
+                host.command(&session, Command::Settings(SettingsChange {
+                    agent: AgentId::Main, persist: PersistAction::None,
+                    axis: SettingsAxis::Speed(Some(Speed::Standard)),
+                })).await.unwrap();
+            }
+            let expected = if phase == 2 { Speed::Standard } else { Speed::Ultrafast };
+            let handles = host.local_handles(&session).await.unwrap();
+            {
+                let run = handles.run_config.lock().unwrap();
+                for model in [&run.main, &run.oracle] {
+                    assert_eq!(model.speed.as_ref(), Some(&expected));
+                    assert_eq!(model.stream_options.speed.as_ref(), Some(&expected));
+                }
+            }
+            {
+                let log = handles.log.lock().await;
+                assert_eq!(log.settings_at(log.head().unwrap()).speed.as_deref(), Some(expected.as_str()));
+            }
+            let mut attachment = host.attach(&[AttachRequest { session: session.clone(), cursor: None }]).await.unwrap();
+            while !matches!(attachment.recv().await.unwrap(), Frame::CaughtUp { .. }) {}
+            host.command(&session, Command::Prompt { agent: AgentId::Main,
+                content: vec![UserContent::text("Consult Oracle about speed")] }).await.unwrap();
+            let mut costs = Vec::new();
+            loop {
+                if let Frame::Event { event, .. } = attachment.recv().await.unwrap() {
+                    match event.known() {
+                        Some(AgentEvent::MessageEnd { agent_id, message, .. }) => {
+                            if let Some(Message::Assistant(message)) = message.as_stored_wire() {
+                                assert!(message.error.is_none(), "{message:?}");
+                                assert_eq!((message.usage.input, message.usage.output), (100, 10));
+                                costs.push((*agent_id, message.usage.cost.total));
+                            }
+                        }
+                        Some(AgentEvent::AgentEnd { agent_id: AgentId::Main, .. }) => break,
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(costs.len(), 3, "two Main responses and one real Oracle response");
+            for (agent, cost) in costs {
+                let rates = if agent == AgentId::Main && phase != 2 { &premium_cost } else { &standard_cost };
+                let expected_cost = (100.0 * rates.input + 10.0 * rates.output) / 1_000_000.0;
+                assert!((cost - expected_cost).abs() < 1e-12, "{agent:?}: {cost} != {expected_cost}");
+            }
+            for _ in 0..2 {
+                let (_, body) = main_server.requests.recv().await.unwrap();
+                assert_eq!(body["model"], "speed-main");
+                if phase == 2 { assert_eq!(body["service_tier"], "default"); }
+                else { assert_eq!(body["service_tier"], "ultrafast"); }
+            }
+            let (_, body) = oracle_server.requests.recv().await.unwrap();
+            assert_eq!(body["model"], "speed-oracle");
+            assert_eq!(body["service_tier"], "default", "unsupported shared mode: {body}");
+        }
+        host.shutdown().await;
+    }).await.expect("bounded shared-speed composed regression");
 }

@@ -38,9 +38,6 @@ impl BranchDraft {
         if change.oracle_thinking.is_some() {
             settings.oracle_thinking = change.oracle_thinking;
         }
-        if change.oracle_speed.is_some() {
-            settings.oracle_speed = change.oracle_speed;
-        }
         if change.oracle_verbosity.is_some() {
             settings.oracle_verbosity = change.oracle_verbosity;
         }
@@ -72,9 +69,6 @@ impl BranchDraft {
         if changes.oracle_thinking.is_some() {
             state.oracle_thinking.clone_from(&changes.oracle_thinking);
         }
-        if changes.oracle_speed.is_some() {
-            state.oracle_speed.clone_from(&changes.oracle_speed);
-        }
         if changes.oracle_verbosity.is_some() {
             state.oracle_verbosity.clone_from(&changes.oracle_verbosity);
         }
@@ -89,6 +83,7 @@ impl BranchDraft {
         }
         if changes.speed.is_some() {
             state.speed.clone_from(&changes.speed);
+            state.oracle_speed.clone_from(&changes.speed);
         }
         if changes.verbosity.is_some() {
             state.verbosity.clone_from(&changes.verbosity);

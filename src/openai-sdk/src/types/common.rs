@@ -88,18 +88,54 @@ pub enum PromptCacheRetention {
     TwentyFourHours,
 }
 
+/// Service tier as sent or reported by the server. Unknown tiers round-trip.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(from = "String", into = "String")]
 pub enum ServiceTier {
-    #[serde(rename = "auto")]
     Auto,
-    #[serde(rename = "default")]
     Default,
-    #[serde(rename = "flex")]
     Flex,
-    #[serde(rename = "scale")]
     Scale,
-    #[serde(rename = "priority")]
     Priority,
+    Fast,
+    Ultrafast,
+    Named(String),
+}
+
+impl ServiceTier {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Default => "default",
+            Self::Flex => "flex",
+            Self::Scale => "scale",
+            Self::Priority => "priority",
+            Self::Fast => "fast",
+            Self::Ultrafast => "ultrafast",
+            Self::Named(value) => value,
+        }
+    }
+}
+
+impl From<String> for ServiceTier {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "auto" => Self::Auto,
+            "default" => Self::Default,
+            "flex" => Self::Flex,
+            "scale" => Self::Scale,
+            "priority" => Self::Priority,
+            "fast" => Self::Fast,
+            "ultrafast" => Self::Ultrafast,
+            _ => Self::Named(value),
+        }
+    }
+}
+
+impl From<ServiceTier> for String {
+    fn from(value: ServiceTier) -> Self {
+        value.as_str().to_owned()
+    }
 }
 
 // Shared structured output types
@@ -118,6 +154,28 @@ pub struct JsonSchemaDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_tiers_roundtrip_as_strings() {
+        for (wire, tier) in [
+            ("fast", ServiceTier::Fast),
+            ("ultrafast", ServiceTier::Ultrafast),
+            ("future-tier", ServiceTier::Named("future-tier".into())),
+            ("default", ServiceTier::Default),
+            ("flex", ServiceTier::Flex),
+            ("priority", ServiceTier::Priority),
+            ("auto", ServiceTier::Auto),
+            ("scale", ServiceTier::Scale),
+        ] {
+            let value = serde_json::Value::String(wire.into());
+            assert_eq!(
+                serde_json::from_value::<ServiceTier>(value.clone()).unwrap(),
+                tier
+            );
+            assert_eq!(serde_json::to_value(tier).unwrap(), value);
+        }
+        assert!(serde_json::from_str::<ServiceTier>("42").is_err());
+    }
 
     #[test]
     fn api_error_display_is_stable() {

@@ -733,7 +733,6 @@ pub(crate) fn settings_request(change: SettingsChange) -> SettingsRequest {
         SettingsAxis::OracleThinking(level) => {
             wire.oracle_thinking = Some(thinking_config_name(level.as_ref()).to_string())
         }
-        SettingsAxis::OracleSpeed(speed) => wire.oracle_speed = Some(speed_name(speed).to_string()),
         SettingsAxis::OracleVerbosity(verbosity) => {
             wire.oracle_verbosity = Some(
                 verbosity_name(verbosity.map(aj_app::model::config_verbosity_to_unified))
@@ -763,7 +762,7 @@ pub(crate) fn settings_request(change: SettingsChange) -> SettingsRequest {
         SettingsAxis::ThinkingDisplay(display) => {
             wire.thinking_display = Some(thinking_display_name(display).to_string());
         }
-        SettingsAxis::Speed(speed) => wire.speed = Some(speed_name(speed).to_string()),
+        SettingsAxis::Speed(speed) => wire.speed = Some(speed_name(speed.as_ref()).to_string()),
         SettingsAxis::Verbosity(verbosity) => {
             let unified = verbosity.map(aj_app::model::config_verbosity_to_unified);
             wire.verbosity = Some(verbosity_name(unified).to_string());

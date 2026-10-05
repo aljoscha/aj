@@ -48,7 +48,7 @@ where
 /// Snapshot of an agent's bundle identity and inference settings.
 ///
 /// `thinking` uses the "off" / "minimal" / "low" / "medium" / "high"
-/// / "xhigh" / "max" vocabulary. `speed` is "standard" or "fast".
+/// / "xhigh" / "max" vocabulary. `speed` is the requested catalog mode, or "default" when unset.
 /// Sub-agent spawn entries persist the inference identity except for
 /// `thinking_display`, which is live-only session state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ pub struct AgentSettings {
     /// written before this field existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub thinking_display: String,
-    /// Inference speed: "standard" or "fast".
+    /// Requested speed preference. Providers resolve model-specific fallbacks.
     pub speed: String,
     /// Output verbosity: "default", "low", "medium", or "high". Default
     /// stays unresolved and uses the model catalog default, then server default.

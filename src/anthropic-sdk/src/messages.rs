@@ -1198,14 +1198,40 @@ pub enum RequestServiceTier {
     StandardOnly,
 }
 
-/// Inference speed mode for the request. `Fast` enables higher
-/// output-tokens-per-second at some quality cost.
+/// Inference speed mode. Fast inference uses the same model at higher
+/// output-tokens-per-second with separate pricing, not reduced quality.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(from = "String", into = "String")]
 pub enum Speed {
-    #[serde(rename = "standard")]
     Standard,
-    #[serde(rename = "fast")]
     Fast,
+    Named(String),
+}
+
+impl Speed {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+            Self::Named(value) => value,
+        }
+    }
+}
+
+impl From<String> for Speed {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "standard" => Self::Standard,
+            "fast" => Self::Fast,
+            _ => Self::Named(value),
+        }
+    }
+}
+
+impl From<Speed> for String {
+    fn from(value: Speed) -> Self {
+        value.as_str().to_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1885,6 +1911,16 @@ pub struct UsageDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_roundtrips_unknown_server_values() {
+        for wire in ["standard", "fast", "future-speed"] {
+            let value = serde_json::Value::String(wire.into());
+            let speed: Speed = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(speed.as_str(), wire);
+            assert_eq!(serde_json::to_value(speed).unwrap(), value);
+        }
+    }
 
     #[test]
     fn api_error_display_strings_are_stable() {

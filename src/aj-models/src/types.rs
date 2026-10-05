@@ -409,17 +409,70 @@ pub enum CacheRetention {
     Long,
 }
 
-/// Inference speed mode. Set on the binary's `--speed` flag or
-/// `speed = "fast"` in `config.toml`. Anthropic-only today: the
-/// provider maps `Fast` onto both the request-body `speed` field and
-/// the `fast-mode-2026-02-01` beta header (a matched pair — the header
-/// opts into the beta, the body field selects the speed). Other
-/// providers ignore it.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+/// Catalog speed identity, independent of a provider's wire vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum Speed {
     Standard,
     Fast,
+    Ultrafast,
+    Flex,
+    Named(String),
+}
+
+impl Speed {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+            Self::Ultrafast => "ultrafast",
+            Self::Flex => "flex",
+            Self::Named(name) => name,
+        }
+    }
+}
+
+impl std::fmt::Display for Speed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Speed {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err("speed must contain only letters, digits, underscores, or hyphens".into());
+        }
+        match name.as_str() {
+            "standard" => Ok(Self::Standard),
+            "fast" => Ok(Self::Fast),
+            "ultrafast" => Ok(Self::Ultrafast),
+            "flex" => Ok(Self::Flex),
+            "" | "default" => Err("speed must be a nonempty mode name, not default".into()),
+            name => Ok(Self::Named(name.into())),
+        }
+    }
+}
+
+impl TryFrom<String> for Speed {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        name.parse()
+    }
+}
+
+impl From<Speed> for String {
+    fn from(speed: Speed) -> Self {
+        speed.to_string()
+    }
 }
 
 /// Service tier override for OpenAI Responses requests. Ignored by
@@ -703,10 +756,7 @@ pub struct StreamOptions {
     /// [`Self::reasoning_summary`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_display: Option<ThinkingDisplay>,
-    /// Inference speed mode. Anthropic-only: the provider maps `Fast`
-    /// onto both the request-body `speed` field and the
-    /// `fast-mode-2026-02-01` beta header. Ignored by non-Anthropic
-    /// providers. See [`Speed`].
+    /// Requested catalog speed identity. See [`crate::registry::resolve_speed`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<Speed>,
     /// Controls whether/how the model uses tools. When `None`, the
@@ -886,6 +936,21 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_string_contract() {
+        for name in ["standard", "fast", "ultrafast", "flex", "turbo"] {
+            let speed: Speed = name.parse().unwrap();
+            assert_eq!(speed.to_string(), name);
+            assert_eq!(serde_json::to_value(&speed).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<Speed>(serde_json::json!(name)).unwrap(),
+                speed
+            );
+        }
+        assert!("".parse::<Speed>().is_err());
+        assert!("default".parse::<Speed>().is_err());
+    }
 
     #[test]
     fn accumulate_sums_every_token_and_cost_dimension() {

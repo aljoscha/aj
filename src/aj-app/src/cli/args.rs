@@ -83,10 +83,8 @@ pub struct Args {
     #[arg(long, global = true, conflicts_with = "account")]
     pub default_account: bool,
 
-    /// Inference speed mode: `standard` (default) or `fast`. Fast mode
-    /// is Anthropic-only — it sends `speed: "fast"` in the request body
-    /// together with the `fast-mode-2026-02-01` beta header. Models
-    /// that don't support fast mode reject the request.
+    /// Shared Main/Oracle inference speed: standard, fast, ultrafast, flex,
+    /// or a model-advertised mode. Unsupported models use standard speed.
     #[arg(long, env = "AJ_SPEED")]
     pub speed: Option<String>,
 

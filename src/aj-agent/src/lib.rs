@@ -942,13 +942,10 @@ impl Agent {
         self.default_thinking = level;
     }
 
-    /// Replace the agent's inference speed mode. `None` means
-    /// standard. The wire effect (provider-specific headers) travels
-    /// in the [`StreamOptions`] passed to [`Agent::set_provider`];
-    /// this knob keeps the user-facing value observable so
-    /// sub-agent spawn events report it accurately and spawned
-    /// sub-agents inherit it.
+    /// Set the requested inference speed for subsequent calls and child inheritance.
+    /// Providers resolve unsupported modes against their own model capabilities.
     pub fn set_speed(&mut self, speed: Option<Speed>) {
+        self.stream_options.speed = speed.clone();
         self.speed = speed;
     }
 
@@ -2239,7 +2236,7 @@ impl Agent {
             cancellation: self.cancellation.child_token(),
             block_images: self.block_images,
             default_thinking: self.default_thinking.clone(),
-            speed: self.speed,
+            speed: self.speed.clone(),
             sub_agent_registry: self.sub_agent_registry.clone(),
             task_registry: self.task_registry.clone(),
             goal_control: self.goal_control.clone(),
@@ -3564,7 +3561,7 @@ impl SessionContextWrapper<'_> {
                 model_info: Arc::clone(&self.model_info),
                 stream_options: self.stream_options.clone(),
                 thinking: self.default_thinking.clone(),
-                speed: self.speed,
+                speed: self.speed.clone(),
                 thinking_display: String::new(),
                 tools: self
                     .sub_agent_tools
@@ -3607,7 +3604,7 @@ impl SessionContextWrapper<'_> {
                         thinking: aj_models::thinking_config_name(config.thinking.as_ref())
                             .to_string(),
                         thinking_display: config.thinking_display,
-                        speed: aj_models::speed_name(config.speed).to_string(),
+                        speed: aj_models::speed_name(config.speed.as_ref()).to_string(),
                         verbosity: aj_models::verbosity_name(config.stream_options.verbosity)
                             .to_string(),
                     },
@@ -3661,7 +3658,7 @@ impl SessionContextWrapper<'_> {
             sub_agent.session_state.session_env = Arc::clone(&self.session_state.session_env);
             // Keep the selected thinking and speed on the retained child.
             sub_agent.set_default_thinking(config.thinking);
-            sub_agent.set_speed(config.speed);
+            sub_agent.set_speed(config.speed.clone());
             // Share the background-task registry so tasks the
             // sub-agent starts land in the same map the binary
             // observes, with notices scoped to the sub-agent's own
@@ -4391,6 +4388,8 @@ mod event_protocol_tests {
             reasoning_options: Vec::new(),
             supports_verbosity: false,
             default_verbosity: None,
+            speed_modes: Vec::new(),
+            default_speed: None,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 0,

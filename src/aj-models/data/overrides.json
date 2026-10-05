@@ -6,9 +6,74 @@
         "id": "gpt-6-astra"
       },
       "patch": {
-        "supports_verbosity": true
+        "supports_verbosity": true,
+        "speed_modes": [
+          {
+            "speed": "fast",
+            "name": "fast",
+            "description": "",
+            "wire_value": "priority",
+            "cost": {
+              "input": 20,
+              "output": 100,
+              "cache_read": 2,
+              "cache_write": 25,
+              "tiers": [
+                {
+                  "input_tokens_above": 272000,
+                  "input": 40,
+                  "output": 150,
+                  "cache_read": 4,
+                  "cache_write": 50
+                }
+              ]
+            }
+          },
+          {
+            "speed": "flex",
+            "name": "Flex",
+            "description": "Lower-priced best-effort capacity. No automatic standard fallback.",
+            "wire_value": "flex",
+            "cost": {
+              "input": 5,
+              "output": 25,
+              "cache_read": 0.5,
+              "cache_write": 6.25,
+              "tiers": [
+                {
+                  "input_tokens_above": 272000,
+                  "input": 10,
+                  "output": 37.5,
+                  "cache_read": 1,
+                  "cache_write": 12.5
+                }
+              ]
+            }
+          },
+          {
+            "speed": "ultrafast",
+            "name": "Ultrafast",
+            "description": "Premium low-latency processing. Account eligibility applies.",
+            "wire_value": "ultrafast",
+            "cost": {
+              "input": 60,
+              "output": 300,
+              "cache_read": 6,
+              "cache_write": 75,
+              "tiers": [
+                {
+                  "input_tokens_above": 272000,
+                  "input": 120,
+                  "output": 450,
+                  "cache_read": 12,
+                  "cache_write": 150
+                }
+              ]
+            }
+          }
+        ]
       },
-      "reason": "models.dev does not carry verbosity capability; OpenAI Codex advertises it for GPT-6 Astra"
+      "reason": "Verbosity follows the Codex catalog. Speed availability and short/long-context rates follow https://developers.openai.com/api/docs/pricing and https://developers.openai.com/api/docs/guides/ultrafast-mode. models.dev omits these mode-specific context prices and additional tiers."
     },
     {
       "target": {
@@ -26,9 +91,106 @@
         "id": "gpt-6-luna"
       },
       "patch": {
-        "supports_verbosity": true
+        "supports_verbosity": true,
+        "speed_modes": [
+          {
+            "speed": "fast",
+            "name": "fast",
+            "description": "",
+            "wire_value": "priority",
+            "cost": {
+              "input": 0.2,
+              "output": 1,
+              "cache_read": 0.02,
+              "cache_write": 0.25,
+              "tiers": [
+                {
+                  "input_tokens_above": 272000,
+                  "input": 0.4,
+                  "output": 1.5,
+                  "cache_read": 0.04,
+                  "cache_write": 0.5
+                }
+              ]
+            }
+          },
+          {
+            "speed": "flex",
+            "name": "Flex",
+            "description": "Lower-priced best-effort capacity. No automatic standard fallback.",
+            "wire_value": "flex",
+            "cost": {
+              "input": 0.05,
+              "output": 0.25,
+              "cache_read": 0.005,
+              "cache_write": 0.0625,
+              "tiers": [
+                {
+                  "input_tokens_above": 272000,
+                  "input": 0.1,
+                  "output": 0.375,
+                  "cache_read": 0.01,
+                  "cache_write": 0.125
+                }
+              ]
+            }
+          }
+        ]
       },
-      "reason": "models.dev does not carry verbosity capability; OpenAI Codex advertises it for GPT-6 Luna"
+      "reason": "Verbosity follows the Codex catalog. Speed availability and short/long-context rates follow https://developers.openai.com/api/docs/pricing and https://developers.openai.com/api/docs/guides/ultrafast-mode. models.dev omits these mode-specific context prices and additional tiers."
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-6.1-sol"
+      },
+      "patch": {
+        "speed_modes": [
+          {
+            "speed": "fast",
+            "name": "fast",
+            "description": "",
+            "wire_value": "priority",
+            "cost": {
+              "input": 4,
+              "output": 20,
+              "cache_read": 0.2,
+              "cache_write": 5,
+              "tiers": [
+                {
+                  "input_tokens_above": 272000,
+                  "input": 8,
+                  "output": 30,
+                  "cache_read": 0.4,
+                  "cache_write": 10
+                }
+              ]
+            }
+          },
+          {
+            "speed": "flex",
+            "name": "Flex",
+            "description": "Lower-priced best-effort capacity. No automatic standard fallback.",
+            "wire_value": "flex",
+            "cost": {
+              "input": 1,
+              "output": 5,
+              "cache_read": 0.05,
+              "cache_write": 1.25,
+              "tiers": [
+                {
+                  "input_tokens_above": 272000,
+                  "input": 2,
+                  "output": 7.5,
+                  "cache_read": 0.1,
+                  "cache_write": 2.5
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "reason": "Flex availability and mode-specific short/long-context prices follow https://developers.openai.com/api/docs/pricing. models.dev omits these additional tiers and context prices."
     }
   ]
 }

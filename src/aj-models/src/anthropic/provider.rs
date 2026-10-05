@@ -26,7 +26,8 @@ use crate::errors::{
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
 use crate::registry::{
-    ModelCost, ModelInfo, calculate_cost, supports_adaptive_thinking, validate_thinking_level,
+    ModelCost, ModelInfo, SpeedMode, calculate_cost, resolve_speed, supports_adaptive_thinking,
+    validate_thinking_level,
 };
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
@@ -46,7 +47,7 @@ const API_NAME: &str = "anthropic-messages";
 /// the request-body `speed: "fast"` field when [`StreamOptions::speed`]
 /// is [`Speed::Fast`]; the two are a matched pair (the header enables
 /// the beta, the body field selects the speed). Models that don't
-/// support fast mode reject the request — we don't gate client-side.
+/// advertise fast mode are resolved to standard before either is sent.
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 /// Stateless provider for the Anthropic Messages API.
@@ -292,7 +293,7 @@ fn build_client(
     // Fast mode is the beta header half of the matched pair; the body
     // `speed` field is set in `build_request`. Sent only for `Fast` —
     // `Standard` is the API default and rides without a beta.
-    if options.speed == Some(Speed::Fast) {
+    if to_anthropic_speed(model, options.speed.as_ref()) == Some(ASpeed::Fast) {
         client = client.with_beta(FAST_MODE_BETA);
     }
     client
@@ -409,20 +410,20 @@ fn build_request(
         output_config,
         temperature,
         metadata,
-        speed: to_anthropic_speed(options.speed),
+        speed: to_anthropic_speed(model, options.speed.as_ref()),
         ..Default::default()
     }
 }
 
-/// Map the unified [`Speed`] knob onto the Anthropic request-body
-/// `speed` field. Only `Fast` is sent explicitly; `Standard` (and an
-/// unset speed) leave the field absent so the request rides the API
-/// default, matching the beta-header half in [`build_client`].
-fn to_anthropic_speed(speed: Option<Speed>) -> Option<ASpeed> {
-    match speed {
-        Some(Speed::Fast) => Some(ASpeed::Fast),
-        Some(Speed::Standard) | None => None,
+/// Map only supported catalog modes. Standard inference needs no beta or field.
+fn to_anthropic_speed(model: &ModelInfo, requested: Option<&Speed>) -> Option<ASpeed> {
+    let speed = resolve_speed(model, requested)?;
+    if speed == Speed::Standard {
+        return None;
     }
+    model
+        .speed_mode(&speed)
+        .map(|mode| ASpeed::from(mode.wire_value.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,6 +1001,8 @@ struct StreamState {
     /// We keep an owned copy rather than borrowing the `ModelInfo` so the
     /// state machine carries no lifetime tie back to the provider call.
     cost: ModelCost,
+    speed_modes: Vec<SpeedMode>,
+    served_speed: Option<ASpeed>,
     /// Running snapshot of the assistant message. Cloned into every
     /// emitted event.
     partial: AssistantMessage,
@@ -1042,6 +1045,8 @@ impl StreamState {
         partial.account = account;
         Self {
             cost: model.cost.clone(),
+            speed_modes: model.speed_modes.clone(),
+            served_speed: None,
             partial,
             blocks: Vec::new(),
             stop_reason: None,
@@ -1057,6 +1062,7 @@ impl StreamState {
         match event {
             ServerSentEvent::MessageStart { message } => {
                 self.partial.response_id = Some(message.id);
+                self.served_speed = message.usage.speed.clone();
                 self.partial.usage = into_unified_usage(&message.usage);
                 self.seal();
                 events.push(AssistantMessageEvent::Start {
@@ -1341,7 +1347,18 @@ impl StreamState {
     /// an exit that seals what `process` already sealed prices the same
     /// tokens once.
     fn seal(&mut self) {
-        finalize_usage(&mut self.partial.usage, &self.cost);
+        let cost = self.served_speed.as_ref().and_then(|speed| {
+            self.speed_modes
+                .iter()
+                .find(|mode| mode.wire_value == speed.as_str())
+                .and_then(|mode| mode.cost.as_ref())
+        });
+        if cost.is_none()
+            && matches!(self.served_speed.as_ref(), Some(speed) if speed != &ASpeed::Standard)
+        {
+            tracing::warn!(speed = ?self.served_speed, "served speed pricing is unknown; estimating with standard rates");
+        }
+        finalize_usage(&mut self.partial.usage, cost.unwrap_or(&self.cost));
     }
 
     /// The terminal event for a stream the client cancelled mid-flight.
@@ -1514,6 +1531,8 @@ mod tests {
             }],
             supports_verbosity: false,
             default_verbosity: None,
+            speed_modes: Vec::new(),
+            default_speed: None,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 3.0,
@@ -1524,6 +1543,83 @@ mod tests {
             },
             context_window: 200_000,
             max_tokens: 64_000,
+        }
+    }
+
+    fn fast_mode() -> SpeedMode {
+        SpeedMode {
+            speed: Speed::Fast,
+            name: "Fast".into(),
+            description: "".into(),
+            wire_value: "fast".into(),
+            cost: Some(ModelCost {
+                input: 19.0,
+                output: 91.0,
+                cache_read: 2.0,
+                cache_write: 23.0,
+                tiers: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn unsupported_fast_requests_use_standard_inference() {
+        let model = fake_model();
+        assert!(model.speed_modes.is_empty());
+        let options = StreamOptions {
+            speed: Some(Speed::Fast),
+            ..Default::default()
+        };
+        let request = build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off);
+        assert!(request.speed.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_speed_accounting_uses_reported_speed_on_success_and_error() {
+        for (served, fail, expected) in [
+            (ASpeed::Fast, false, 19.0),
+            (ASpeed::Standard, false, 3.0),
+            (ASpeed::Fast, true, 19.0),
+            (ASpeed::Named("unknown".into()), false, 3.0),
+        ] {
+            let mut message = empty_a_message();
+            message.usage = AUsage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                speed: Some(served),
+                ..Default::default()
+            };
+            let terminal: ServerSentEvent = if fail {
+                serde_json::from_value(serde_json::json!({"type":"error", "error":{"type":"overloaded_error", "message":"busy"}})).unwrap()
+            } else {
+                ServerSentEvent::MessageStop
+            };
+            let (base_url, server) =
+                sse_fixture(vec![ServerSentEvent::MessageStart { message }, terminal]).await;
+            let mut model = fake_model();
+            model.speed_modes.push(fast_mode());
+            model.base_url = base_url;
+            let mut options = labeled_options(None);
+            options.speed = Some(Speed::Fast);
+            let payload = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let captured = std::sync::Arc::clone(&payload);
+            options.on_payload = Some(OnPayload::new(move |value| {
+                *captured.lock().unwrap() = Some(value.clone())
+            }));
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                AnthropicProvider
+                    .stream(&model, &Context::new("sys"), &options)
+                    .result(),
+            )
+            .await
+            .unwrap();
+            let request = server.await.unwrap();
+            assert!(request.contains(FAST_MODE_BETA));
+            assert_eq!(payload.lock().unwrap().as_ref().unwrap()["speed"], "fast");
+            assert_eq!(result.usage.input, 1_000_000);
+            assert_eq!(result.usage.cost.total, expected);
+            assert_eq!(result.stop_reason == StopReason::Error, fail);
         }
     }
 
@@ -1541,7 +1637,9 @@ mod tests {
         options
     }
 
-    async fn sse_fixture(events: Vec<ServerSentEvent>) -> (String, tokio::task::JoinHandle<()>) {
+    async fn sse_fixture(
+        events: Vec<ServerSentEvent>,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1573,6 +1671,7 @@ mod tests {
                     .await
                     .expect("write SSE event");
             }
+            String::from_utf8_lossy(&request[..read]).into_owned()
         });
         (format!("http://{address}"), server)
     }
@@ -1861,6 +1960,8 @@ mod tests {
             reasoning_options: Vec::new(),
             supports_verbosity: false,
             default_verbosity: None,
+            speed_modes: Vec::new(),
+            default_speed: None,
             ..fake_model()
         }
     }
@@ -2300,12 +2401,9 @@ mod tests {
             speed: Some(Speed::Fast),
             ..Default::default()
         };
-        let req = build_request(
-            &fake_model(),
-            &Context::new("sys"),
-            &options,
-            &ThinkingLevel::Off,
-        );
+        let mut model = fake_model();
+        model.speed_modes.push(fast_mode());
+        let req = build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off);
         assert_eq!(req.speed, Some(ASpeed::Fast));
     }
 
@@ -2316,7 +2414,7 @@ mod tests {
         // header half, which is also only sent for `Fast`).
         for speed in [None, Some(Speed::Standard)] {
             let options = StreamOptions {
-                speed,
+                speed: speed.clone(),
                 ..Default::default()
             };
             let req = build_request(

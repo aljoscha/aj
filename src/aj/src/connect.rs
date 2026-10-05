@@ -313,11 +313,9 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
         .speed
         .as_deref()
         .and_then(|name| name.parse::<aj_conf::ConfigSpeed>().ok())
-        .or(config.speed)
-        .map(|speed| match speed {
-            aj_conf::ConfigSpeed::Standard => aj_models::types::Speed::Standard,
-            aj_conf::ConfigSpeed::Fast => aj_models::types::Speed::Fast,
-        });
+        .or_else(|| config.speed.clone())
+        .and_then(|value| aj_models::speed_from_name(&value.to_string()))
+        .flatten();
     let thinking = args.thinking.or(config.thinking);
     let settings = SessionSettings {
         model,
@@ -328,12 +326,6 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
                 aj_app::model::default_thinking_from_config(config.oracle_thinking).as_ref(),
             )
             .to_string()
-        }),
-        oracle_speed: stated.has("oracle_speed").then(|| {
-            config
-                .oracle_speed
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "standard".into())
         }),
         oracle_verbosity: stated.has("oracle_verbosity").then(|| {
             config
@@ -350,7 +342,8 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
         thinking_display: stated.has("thinking_display").then(|| {
             aj_app::session_setup::thinking_display_name(config.thinking_display).to_string()
         }),
-        speed: (args.speed.is_some() || stated.has("speed")).then(|| speed_name(speed).to_string()),
+        speed: (args.speed.is_some() || stated.has("speed"))
+            .then(|| speed_name(speed.as_ref()).to_string()),
         verbosity: stated.has("verbosity").then(|| {
             let unified = config
                 .verbosity
@@ -437,7 +430,6 @@ mod tests {
             oracle_model_api: Some("openai".into()),
             oracle_model_name: Some("advisor".into()),
             oracle_thinking: Some(aj_conf::ConfigThinkingLevel::Off),
-            oracle_speed: Some(aj_conf::ConfigSpeed::Fast),
             oracle_verbosity: Some(aj_conf::ConfigVerbosity::High),
             ..Config::default()
         };
@@ -446,7 +438,6 @@ mod tests {
                 ("oracle_model_api", "openai"),
                 ("oracle_model_name", "advisor"),
                 ("oracle_thinking", "off"),
-                ("oracle_speed", "fast"),
                 ("oracle_verbosity", "high"),
             ]),
             ConfigLayer::default(),
@@ -460,11 +451,22 @@ mod tests {
                     url: None
                 }),
                 oracle_thinking: Some("off".into()),
-                oracle_speed: Some("fast".into()),
                 oracle_verbosity: Some("high".into()),
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn creator_settings_carry_named_speed_without_an_oracle_axis() {
+        let config = Config {
+            speed: Some(" Priority_2 ".parse().unwrap()),
+            ..Config::default()
+        };
+        let stated = Stated::new(wrote(&[("speed", "priority_2")]), ConfigLayer::default());
+        let settings = creator_settings(&args(&["aj"]), &config, &stated).unwrap();
+        assert_eq!(settings.speed.as_deref(), Some("priority_2"));
+        assert_eq!(settings.oracle(), SessionSettings::default());
     }
 
     /// The CLI wins over config, and a pinned model travels as the triple the

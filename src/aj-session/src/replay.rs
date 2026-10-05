@@ -1490,11 +1490,16 @@ mod tests {
             log.set_head(head.clone()).unwrap();
             let settings = log.settings_at(head);
             assert_eq!(
+                settings.oracle_speed.as_deref(),
+                speed,
+                "historical records stay readable"
+            );
+            assert_eq!(
                 settings.oracle(),
                 SessionSettings {
                     model: model.map(|(api, name)| (api.into(), name.into())),
                     thinking: thinking.map(str::to_string),
-                    speed: speed.map(str::to_string),
+                    speed: Some("standard".into()),
                     verbosity: verbosity.map(str::to_string),
                     ..Default::default()
                 }
