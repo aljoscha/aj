@@ -209,6 +209,11 @@ pub struct Usage {
     pub cache_write: u64,
     pub total_tokens: u64,
     pub cost: UsageCost,
+    /// Speed or tier reported by the server, not the requested preference.
+    /// Known names are canonicalized by adapters. Unknown identifiers round-trip.
+    /// Missing reports and mixed-mode aggregates have no served speed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_speed: Option<String>,
 }
 
 impl Usage {
@@ -218,8 +223,12 @@ impl Usage {
     /// by dimension, including `total_tokens` and `cost.total`. A
     /// per-response figure already satisfies `total_tokens == input +
     /// output + cache_read + cache_write`, so summing keeps the aggregate
-    /// internally consistent.
+    /// internally consistent. Served speed is retained only when both operands
+    /// agree, so a mixed or unknown total cannot claim a particular mode.
     pub fn accumulate(&mut self, other: &Usage) {
+        if self.served_speed != other.served_speed {
+            self.served_speed = None;
+        }
         self.input += other.input;
         self.output += other.output;
         self.cache_read += other.cache_read;
@@ -955,6 +964,7 @@ mod tests {
     #[test]
     fn accumulate_sums_every_token_and_cost_dimension() {
         let mut acc = Usage {
+            served_speed: None,
             input: 100,
             output: 50,
             cache_read: 20,
@@ -969,6 +979,7 @@ mod tests {
             },
         };
         let other = Usage {
+            served_speed: None,
             input: 200,
             output: 80,
             cache_read: 5,
@@ -1037,6 +1048,7 @@ mod tests {
             account: None,
             response_id: Some("resp_123".into()),
             usage: Usage {
+                served_speed: None,
                 input: 100,
                 output: 50,
                 cache_read: 10,
@@ -1085,6 +1097,44 @@ mod tests {
     #[test]
     fn test_stop_reason_default() {
         assert_eq!(StopReason::default(), StopReason::Stop);
+    }
+
+    #[test]
+    fn observed_speed_is_optional_and_preserves_unknown_identifiers() {
+        let encoded = serde_json::json!({"input":1,"output":2,"cache_read":0,
+            "cache_write":0,"total_tokens":3,"cost":UsageCost::default()});
+        let mut usage: Usage = serde_json::from_value(encoded).unwrap();
+        assert!(usage.served_speed.is_none());
+        assert!(
+            serde_json::to_value(&usage)
+                .unwrap()
+                .get("served_speed")
+                .is_none()
+        );
+        usage.served_speed = Some("future/vendor-tier+".into());
+        let decoded: Usage = serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
+        assert_eq!(decoded.served_speed, usage.served_speed);
+    }
+
+    #[test]
+    fn mixed_usage_cannot_claim_a_single_served_speed() {
+        let fast = Usage {
+            served_speed: Some("fast".into()),
+            output: 5,
+            ..Default::default()
+        };
+        let standard = Usage {
+            served_speed: Some("standard".into()),
+            output: 3,
+            ..Default::default()
+        };
+        let mut total = fast.clone();
+        total.accumulate(&fast);
+        assert_eq!(total.served_speed.as_deref(), Some("fast"));
+        total.accumulate(&standard);
+        total.accumulate(&fast);
+        assert!(total.served_speed.is_none());
+        assert_eq!(total.output, 18);
     }
 
     #[test]

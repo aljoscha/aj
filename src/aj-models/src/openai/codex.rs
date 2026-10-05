@@ -831,12 +831,21 @@ mod tests {
 
     #[tokio::test]
     async fn live_speed_requests_and_accounting_share_the_effective_tier() {
-        for (served, rates, expected) in [
-            (Some("priority"), true, 38.0),
-            (None, true, 38.0),
-            (Some("default"), true, 3.0),
-            (Some("future-tier"), true, 3.0),
-            (Some("priority"), false, 3.0),
+        for (served, rates, expected, observed, fail) in [
+            (Some("priority"), true, 38.0, Some("fast"), false),
+            (Some("fast"), true, 38.0, Some("fast"), false),
+            (None, true, 38.0, None, false),
+            (Some("default"), true, 3.0, Some("standard"), false),
+            (Some("future-tier"), true, 3.0, Some("future-tier"), false),
+            (Some("priority"), false, 3.0, Some("fast"), false),
+            (Some("ultrafast"), true, 3.0, Some("ultrafast"), false),
+            (Some("flex"), true, 3.0, Some("flex"), false),
+            (Some("scale"), true, 3.0, Some("scale"), false),
+            (Some("auto"), true, 3.0, None, false),
+            (Some(""), true, 3.0, None, false),
+            (Some("priority"), true, 38.0, Some("fast"), true),
+            (Some("default"), true, 3.0, Some("standard"), true),
+            (None, true, 38.0, None, true),
         ] {
             let mut event = serde_json::json!({
                 "type": "response.completed", "sequence_number": 1,
@@ -848,7 +857,19 @@ mod tests {
             if let Some(tier) = served {
                 event["response"]["service_tier"] = tier.into();
             }
-            let events = vec![event.to_string()];
+            if fail {
+                event["type"] = "response.failed".into();
+                event["response"]["status"] = "failed".into();
+                event["response"]["error"] =
+                    serde_json::json!({"code":"server_error", "message":"busy"});
+            }
+            let mut created = event.clone();
+            created["type"] = "response.created".into();
+            created["sequence_number"] = 0.into();
+            created["response"]["status"] = "in_progress".into();
+            created["response"]["service_tier"] = "priority".into();
+            created["response"].as_object_mut().unwrap().remove("usage");
+            let events = vec![created.to_string(), event.to_string()];
             let server =
                 crate::provider_test_support::held_sse_server("POST /codex/responses", events)
                     .await;
@@ -888,8 +909,16 @@ mod tests {
                 payload.lock().unwrap().as_ref().unwrap()["service_tier"],
                 "priority"
             );
-            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(
+                result.stop_reason,
+                if fail {
+                    StopReason::Error
+                } else {
+                    StopReason::Stop
+                }
+            );
             assert_eq!(result.usage.total_tokens, 2_000_000);
+            assert_eq!(result.usage.served_speed.as_deref(), observed);
             assert_eq!(
                 result.usage.cost.total, expected,
                 "reported tier {served:?}, published prices {rates}"
@@ -1041,7 +1070,8 @@ mod tests {
                 "output": [],
                 "parallel_tool_calls": true,
                 "tools": [],
-                "status": "in_progress"
+                "status": "in_progress",
+                "service_tier": "priority"
             }
         })
         .to_string();
@@ -1067,6 +1097,7 @@ mod tests {
         server.finish().await;
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.usage.served_speed.as_deref(), Some("fast"));
         assert_eq!(terminal.account.as_deref(), Some("work"));
         assert_eq!(terminal.usage.total_tokens, 0);
         assert_eq!(terminal.usage.cost.total, 0.0);
@@ -1140,11 +1171,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_live_sdk_read_failure_keeps_codex_state() {
-        let server = crate::provider_test_support::failing_sse_server(
-            "POST /codex/responses",
-            partial_text_events("partial"),
-        )
-        .await;
+        let mut events = partial_text_events("partial");
+        let mut created: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+        created["response"]["service_tier"] = "priority".into();
+        events[0] = created.to_string();
+        let server =
+            crate::provider_test_support::failing_sse_server("POST /codex/responses", events).await;
         let mut model = fake_model("gpt-5.5", false);
         model.base_url = server.base_url.clone();
         let options = labeled_options(tokio_util::sync::CancellationToken::new());
@@ -1172,6 +1204,7 @@ mod tests {
             .expect("body failure emits terminal");
 
         assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert_eq!(terminal.usage.served_speed.as_deref(), Some("fast"));
         assert_eq!(terminal.api, API_NAME);
         assert_eq!(terminal.model, "gpt-5.5");
         assert_eq!(terminal.response_id.as_deref(), Some("resp_1"));

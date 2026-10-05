@@ -1472,6 +1472,7 @@ fn into_unified_usage(au: &AUsage) -> Usage {
         // it when it seals.
         total_tokens: 0,
         cost: Default::default(),
+        served_speed: au.speed.as_ref().map(|speed| speed.as_str().to_owned()),
     }
 }
 
@@ -1577,16 +1578,19 @@ mod tests {
     #[tokio::test]
     async fn live_speed_accounting_uses_reported_speed_on_success_and_error() {
         for (served, fail, expected) in [
-            (ASpeed::Fast, false, 19.0),
-            (ASpeed::Standard, false, 3.0),
-            (ASpeed::Fast, true, 19.0),
-            (ASpeed::Named("unknown".into()), false, 3.0),
+            (Some(ASpeed::Fast), false, 19.0),
+            (Some(ASpeed::Standard), false, 3.0),
+            (Some(ASpeed::Fast), true, 19.0),
+            (Some(ASpeed::Named("unknown".into())), false, 3.0),
+            (None, false, 3.0),
+            (None, true, 3.0),
         ] {
+            let observed = served.as_ref().map(|speed| speed.as_str().to_owned());
             let mut message = empty_a_message();
             message.usage = AUsage {
                 input_tokens: 1_000_000,
                 output_tokens: 0,
-                speed: Some(served),
+                speed: served,
                 ..Default::default()
             };
             let terminal: ServerSentEvent = if fail {
@@ -1619,6 +1623,7 @@ mod tests {
             assert_eq!(payload.lock().unwrap().as_ref().unwrap()["speed"], "fast");
             assert_eq!(result.usage.input, 1_000_000);
             assert_eq!(result.usage.cost.total, expected);
+            assert_eq!(result.usage.served_speed, observed);
             assert_eq!(result.stop_reason == StopReason::Error, fail);
         }
     }
@@ -1710,10 +1715,10 @@ mod tests {
 
     #[tokio::test]
     async fn live_eof_retains_and_prices_the_retryable_partial() {
+        let mut message = empty_a_message();
+        message.usage.speed = Some(ASpeed::Standard);
         let (base_url, server) = sse_fixture(vec![
-            ServerSentEvent::MessageStart {
-                message: empty_a_message(),
-            },
+            ServerSentEvent::MessageStart { message },
             ServerSentEvent::ContentBlockStart {
                 index: 0,
                 content_block: AContentBlock::TextBlock {
@@ -1755,6 +1760,7 @@ mod tests {
             other => panic!("expected retained partial text, got {other:?}"),
         }
         assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.served_speed.as_deref(), Some("standard"));
         assert_eq!(
             (
                 terminal.usage.input,
@@ -1775,10 +1781,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_live_mid_stream_cancel_emits_the_states_aborted_terminal() {
-        let event = serde_json::to_string(&ServerSentEvent::MessageStart {
-            message: empty_a_message(),
-        })
-        .expect("serialize message_start");
+        let mut message = empty_a_message();
+        message.usage.speed = Some(ASpeed::Standard);
+        let event = serde_json::to_string(&ServerSentEvent::MessageStart { message })
+            .expect("serialize message_start");
         let server =
             crate::provider_test_support::held_sse_server("POST /v1/messages", vec![event]).await;
         let mut model = fake_model();
@@ -1800,6 +1806,7 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.served_speed.as_deref(), Some("standard"));
         assert_eq!(terminal.usage.total_tokens, 18);
         let expected = 0.000_036 + 0.000_001_2 + 0.000_007_5;
         assert!((terminal.usage.cost.total - expected).abs() < 1e-12);

@@ -1679,6 +1679,7 @@ mod tests {
             subagents: 2,
             compactions: 1,
             usage: Usage {
+                served_speed: None,
                 input: 1_000,
                 output: 2_000,
                 cache_read: 500,
@@ -1697,6 +1698,7 @@ mod tests {
                 model: "claude-sonnet-4-5".to_string(),
                 account: None,
                 usage: Usage {
+                    served_speed: None,
                     input: 1_000,
                     output: 2_000,
                     cache_read: 500,

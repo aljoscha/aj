@@ -1252,7 +1252,7 @@ async fn retained_oracle_settings_use_child_identity_and_fall_back_for_unsupport
 async fn shared_speed_survives_resume_and_resolves_independently_on_real_requests() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let root = TempDir::new().unwrap();
-        let response = |tool: bool| {
+        let response = |tool: bool, served: &str| {
             let item = if tool {
                 json!({"type":"function_call", "id":"fc_speed", "call_id":"call_speed",
                     "name":"oracle", "arguments":json!({"task":TASK}).to_string(), "status":"completed"})
@@ -1261,7 +1261,7 @@ async fn shared_speed_survives_resume_and_resolves_independently_on_real_request
                     "content":[{"type":"output_text", "text":REPORT, "annotations":[]}]})
             };
             let response = json!({"id":"resp_speed", "object":"response", "created_at":0.0,
-                "model":"speed-main", "output":[], "parallel_tool_calls":true, "tools":[], "status":"in_progress"});
+                "model":"speed-main", "output":[], "parallel_tool_calls":true, "tools":[], "status":"in_progress", "service_tier":served});
             let mut completed = response.clone();
             completed["status"] = json!("completed");
             completed["output"] = json!([item.clone()]);
@@ -1276,10 +1276,10 @@ async fn shared_speed_survives_resume_and_resolves_independently_on_real_request
             events.iter().map(|event| format!("data: {event}\n\n")).collect::<String>()
         };
         let mut main_server = MockResponses::start_sequence(
-            (0..6).map(|index| response(index % 2 == 0)).collect(),
+            (0..6).map(|index| response(index % 2 == 0, if index < 2 { "ultrafast" } else { "default" })).collect(),
         ).await;
         let mut oracle_server = MockResponses::start_sequence(
-            (0..3).map(|_| response(false).replace("speed-main", "speed-oracle")).collect(),
+            (0..3).map(|_| response(false, "default").replace("speed-main", "speed-oracle")).collect(),
         ).await;
         let standard_cost = ModelCost { input: 2.0, output: 4.0, ..ModelCost::default() };
         let premium_cost = ModelCost { input: 10.0, output: 20.0, ..ModelCost::default() };
@@ -1382,6 +1382,8 @@ async fn shared_speed_survives_resume_and_resolves_independently_on_real_request
                             if let Some(Message::Assistant(message)) = message.as_stored_wire() {
                                 assert!(message.error.is_none(), "{message:?}");
                                 assert_eq!((message.usage.input, message.usage.output), (100, 10));
+                                let observed = if *agent_id == AgentId::Main && phase == 0 { "ultrafast" } else { "standard" };
+                                assert_eq!(message.usage.served_speed.as_deref(), Some(observed));
                                 costs.push((*agent_id, message.usage.cost.total));
                             }
                         }
@@ -1392,7 +1394,7 @@ async fn shared_speed_survives_resume_and_resolves_independently_on_real_request
             }
             assert_eq!(costs.len(), 3, "two Main responses and one real Oracle response");
             for (agent, cost) in costs {
-                let rates = if agent == AgentId::Main && phase != 2 { &premium_cost } else { &standard_cost };
+                let rates = if agent == AgentId::Main && phase == 0 { &premium_cost } else { &standard_cost };
                 let expected_cost = (100.0 * rates.input + 10.0 * rates.output) / 1_000_000.0;
                 assert!((cost - expected_cost).abs() < 1e-12, "{agent:?}: {cost} != {expected_cost}");
             }
@@ -1405,6 +1407,15 @@ async fn shared_speed_survives_resume_and_resolves_independently_on_real_request
             let (_, body) = oracle_server.requests.recv().await.unwrap();
             assert_eq!(body["model"], "speed-oracle");
             assert_eq!(body["service_tier"], "default", "unsupported shared mode: {body}");
+            let info = host.session_info(&session).await.unwrap();
+            let buckets: Vec<_> = info.usage_breakdown.iter().filter(|bucket| bucket.model == "speed-main").collect();
+            let ultra = buckets.iter().find(|bucket| bucket.usage.served_speed.as_deref() == Some("ultrafast")).unwrap();
+            assert_eq!(ultra.responses, 2);
+            if phase > 0 {
+                let standard = buckets.iter().find(|bucket| bucket.usage.served_speed.as_deref() == Some("standard")).unwrap();
+                assert_eq!(standard.responses, 2 * phase);
+                assert_eq!(info.settings.speed.as_deref(), Some(expected.as_str()));
+            }
         }
         host.shutdown().await;
     }).await.expect("bounded shared-speed composed regression");

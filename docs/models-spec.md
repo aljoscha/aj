@@ -175,6 +175,8 @@ struct Usage {
     cache_write: u64,
     total_tokens: u64,
     cost: UsageCost,
+    /// Server-reported mode, not the requested preference. Missing is unknown.
+    served_speed: Option<String>,
 }
 
 struct UsageCost {
@@ -969,6 +971,18 @@ not to the standard price table. Server-reported OpenAI service tiers and
 Anthropic `usage.speed` select the rates actually used. When mode pricing is
 unknown, the provider warns and estimates with standard rates. Codex costs are
 API-equivalent estimates, not a measurement of subscription limits or credits.
+
+Each response records optional `usage.served_speed`. OpenAI `default` maps to
+`standard`, and `priority` or `fast` maps to `fast`. Ultrafast and Flex retain
+their names. Anthropic records the reported `usage.speed`. Unknown provider
+identifiers are preserved. Unreported or unresolved (`auto`) modes stay unknown,
+even when the request supplied a premium tier or pricing used a request fallback.
+Terminal response snapshots take precedence over earlier snapshots.
+
+Session Info labels the configured preference as requested speed. Its usage
+rows group by provider, model, account, and reported speed, so a downgrade and
+a premium response do not share a row. Missing metadata displays `[unknown]`.
+Mixed-mode totals do not claim a single served speed.
 
 ## 4. Stream Options
 

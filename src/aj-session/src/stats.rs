@@ -3,8 +3,8 @@
 //! [`SessionStats`] is the read-only digest behind a "session info" view:
 //! identity (id, on-disk path), timing, message counts broken out by kind,
 //! a per-tool call breakdown, aggregate token usage and dollar cost, a
-//! usage breakdown per provider, model, and account, and the settings the session
-//! is running with. It is computed in one pass over every entry across all
+//! usage breakdown per provider, model, account, and served speed, and the
+//! settings the session is running with. It is computed in one pass across all
 //! threads, so the message, tool-call, and usage totals include sub-agent
 //! activity.
 
@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use crate::log::{ConversationEntryKind, ConversationLog, SessionSettings, ThreadFilter};
 use crate::persistence::parse_session_id_created_at;
 
-/// Usage and response counts for one provider, model, and account.
+/// Usage and response counts for one provider, model, account, and served speed.
 #[derive(Debug, Clone)]
 pub struct UsageBucket {
     /// Provider recorded on the responses.
@@ -28,6 +28,7 @@ pub struct UsageBucket {
     /// Account label recorded on the responses, when available.
     pub account: Option<String>,
     /// Accumulated token usage and recorded cost for the responses.
+    /// `served_speed` identifies this homogeneous bucket, not the requested speed.
     pub usage: Usage,
     /// Number of assistant responses in this bucket.
     pub responses: usize,
@@ -44,6 +45,7 @@ fn compare_usage_buckets(a: &UsageBucket, b: &UsageBucket) -> Ordering {
         .then_with(|| a.provider.cmp(&b.provider))
         .then_with(|| a.model.cmp(&b.model))
         .then_with(|| a.account.cmp(&b.account))
+        .then_with(|| a.usage.served_speed.cmp(&b.usage.served_speed))
 }
 
 /// A read-only digest of a [`ConversationLog`].
@@ -98,13 +100,13 @@ pub struct SessionStats {
     /// contributes zero and a non-trivial token count can still report a
     /// zero cost.
     pub usage: Usage,
-    /// Assistant-response usage grouped by provider, model, and optional
-    /// account recorded on each response. Buckets span every thread and
+    /// Assistant-response usage grouped by provider, model, optional account,
+    /// and served speed recorded on each response. Buckets span every thread and
     /// branch, including sub-agent threads. Compaction spend is excluded
     /// because its entries identify no provider or model. Responses without
-    /// a label remain in a distinct `None` bucket. Buckets are sorted by cost
-    /// descending, then tokens descending, then the full provider, model, and
-    /// account key ascending.
+    /// an account label or served speed remain in distinct `None` buckets.
+    /// Buckets are sorted by cost descending, then tokens descending, then the
+    /// full provider, model, account, and served speed key ascending.
     pub usage_breakdown: Vec<UsageBucket>,
     /// The share of `usage` spent on compaction summaries rather than on
     /// the conversation itself, summed from the compaction entries that
@@ -136,8 +138,7 @@ impl ConversationLog {
         let mut compactions = 0;
         let mut total_entries = 0;
         let mut usage = Usage::default();
-        let mut usage_buckets: HashMap<(String, String, Option<String>), UsageBucket> =
-            HashMap::new();
+        let mut usage_buckets = HashMap::new();
         let mut compaction_usage = Usage::default();
         let mut last_activity: Option<DateTime<Utc>> = None;
         let mut per_tool: HashMap<String, usize> = HashMap::new();
@@ -155,12 +156,20 @@ impl ConversationLog {
                             assistant_messages += 1;
                             usage.accumulate(&a.usage);
                             let account = a.account.clone();
-                            let key = (a.provider.clone(), a.model.clone(), account.clone());
+                            let key = (
+                                a.provider.clone(),
+                                a.model.clone(),
+                                account.clone(),
+                                a.usage.served_speed.clone(),
+                            );
                             let bucket = usage_buckets.entry(key).or_insert_with(|| UsageBucket {
                                 provider: a.provider.clone(),
                                 model: a.model.clone(),
                                 account,
-                                usage: Usage::default(),
+                                usage: Usage {
+                                    served_speed: a.usage.served_speed.clone(),
+                                    ..Usage::default()
+                                },
                                 responses: 0,
                                 unpriced_responses: 0,
                             });
@@ -425,6 +434,7 @@ mod tests {
             cache_read: tokens[2],
             cache_write: tokens[3],
             total_tokens,
+            served_speed: None,
             cost: aj_models::types::UsageCost {
                 input: costs[0],
                 output: costs[1],
@@ -486,6 +496,7 @@ mod tests {
             input: 40_000,
             output: 900,
             total_tokens: 40_900,
+            served_speed: Some("fast".into()),
             ..Usage::default()
         };
         usage.cost.total = 0.25;
@@ -522,6 +533,8 @@ mod tests {
             stats.compaction_usage.cost.total
         );
         assert_eq!(stats.compaction_usage.total_tokens, 40_900);
+        assert_eq!(stats.compaction_usage.served_speed, None);
+        assert_eq!(stats.usage.served_speed, None);
         assert_eq!(
             stats.usage_breakdown.len(),
             1,
@@ -845,7 +858,115 @@ mod tests {
     }
 
     #[test]
-    fn usage_bucket_order_uses_the_optional_account_last() {
+    fn resumed_stats_group_by_served_speed_not_requested_speed() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).unwrap();
+        log.set_system_prompt("p".into()).unwrap();
+        log.append_speed_change(ThreadFilter::USER, "fast").unwrap();
+
+        // The first response was requested fast but actually served standard.
+        // Equal bucket totals also exercise the served-speed ordering tie-break.
+        for (speed, tokens, cost) in [
+            (
+                Some("standard"),
+                [10, 20, 30, 40],
+                [0.1, 0.2, 0.3, 0.4, 1.0],
+            ),
+            (Some("fast"), [5, 10, 15, 20], [0.05, 0.1, 0.15, 0.2, 0.5]),
+            (None, [10, 20, 30, 40], [0.1, 0.2, 0.3, 0.4, 1.0]),
+            (Some("fast"), [5, 10, 15, 20], [0.05, 0.1, 0.15, 0.2, 0.5]),
+        ] {
+            let mut usage = measured_usage(tokens, cost);
+            usage.served_speed = speed.map(str::to_string);
+            ConversationView::user(&mut log)
+                .add_message(AgentMessage::wire(assistant_for_account(
+                    "provider",
+                    "model",
+                    Some("work"),
+                    usage,
+                )))
+                .unwrap();
+        }
+        log.flush_pending().unwrap();
+        let id = log.session_id().to_string();
+        let disk = std::fs::read_to_string(log.path()).unwrap();
+        let stored_speeds: Vec<_> = disk
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter_map(|entry| entry.pointer("/message/usage").cloned())
+            .map(|usage| usage.get("served_speed").cloned())
+            .collect();
+        assert_eq!(
+            stored_speeds,
+            vec![
+                Some(json!("standard")),
+                Some(json!("fast")),
+                None,
+                Some(json!("fast"))
+            ],
+            "the unknown response must omit the field, as legacy records do",
+        );
+        drop(log);
+
+        let resumed = ConversationLog::resume(&persistence, &id).unwrap();
+        let stats = resumed.stats();
+        assert_eq!(stats.settings.speed.as_deref(), Some("fast"));
+        let buckets: Vec<_> = stats
+            .usage_breakdown
+            .iter()
+            .map(|bucket| {
+                assert_eq!(bucket.provider, "provider");
+                assert_eq!(bucket.model, "model");
+                assert_eq!(bucket.account.as_deref(), Some("work"));
+                assert_eq!(
+                    (
+                        bucket.usage.input,
+                        bucket.usage.output,
+                        bucket.usage.cache_read,
+                        bucket.usage.cache_write,
+                        bucket.usage.total_tokens
+                    ),
+                    (10, 20, 30, 40, 100)
+                );
+                assert_eq!(
+                    (
+                        bucket.usage.cost.input,
+                        bucket.usage.cost.output,
+                        bucket.usage.cost.cache_read,
+                        bucket.usage.cost.cache_write,
+                        bucket.usage.cost.total
+                    ),
+                    (0.1, 0.2, 0.3, 0.4, 1.0)
+                );
+                (
+                    bucket.usage.served_speed.as_deref(),
+                    bucket.responses,
+                    bucket.unpriced_responses,
+                )
+            })
+            .collect();
+        assert_eq!(
+            buckets,
+            vec![(None, 1, 0), (Some("fast"), 2, 0), (Some("standard"), 1, 0)]
+        );
+        assert_eq!(stats.assistant_messages, 4);
+        assert_eq!(
+            (
+                stats.usage.input,
+                stats.usage.output,
+                stats.usage.cache_read,
+                stats.usage.cache_write,
+                stats.usage.total_tokens
+            ),
+            (30, 60, 90, 120, 300)
+        );
+        assert_eq!(stats.usage.cost.total, 3.0);
+        assert_eq!(stats.usage.served_speed, None);
+    }
+
+    #[test]
+    fn usage_bucket_order_uses_the_optional_account_before_served_speed() {
         let bucket = |account: Option<&str>| super::UsageBucket {
             provider: "same-provider".to_string(),
             model: "same-model".to_string(),

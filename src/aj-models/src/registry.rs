@@ -1119,6 +1119,7 @@ mod tests {
     fn calculate_cost_basic() {
         let model = sample_model("anthropic", "claude-x");
         let mut usage = Usage {
+            served_speed: None,
             input: 1_000_000,
             output: 500_000,
             cache_read: 100_000,
@@ -1159,6 +1160,7 @@ mod tests {
         // rates apply to every category.
         let cost = tiered_cost();
         let mut usage = Usage {
+            served_speed: None,
             input: 200_000,
             output: 100_000,
             cache_read: 0,
@@ -1177,6 +1179,7 @@ mod tests {
         // tier's 2x rates apply to input, output, and both cache figures.
         let cost = tiered_cost();
         let mut usage = Usage {
+            served_speed: None,
             input: 200_000,
             output: 100_000,
             cache_read: 50_000,
@@ -1197,6 +1200,7 @@ mod tests {
         // not fire (strict >). Base rates apply.
         let cost = tiered_cost();
         let mut usage = Usage {
+            served_speed: None,
             input: 272_000,
             output: 10_000,
             cache_read: 0,
@@ -1238,6 +1242,7 @@ mod tests {
             ],
         };
         let mut usage = Usage {
+            served_speed: None,
             input: 500_000,
             output: 100_000,
             cache_read: 0,

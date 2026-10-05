@@ -789,13 +789,18 @@ side's limitation. Neither side's values fall back to the other's.
   head, and not derivable from the segments.
 - `GET /v1/sessions/{id}/info`: the session's aggregate log facts, encoded as
   `SessionInfo` in `aj-wire`: identity and host-local file path, timestamps,
-  file size, message and tool counts, usage and its provider/model/account
+  file size, message and tool counts, usage and its provider/model/account/served-speed
   breakdown, compaction usage, recorded settings, and session environment.
   Counts and usage span all threads and branches. Settings and environment
   reflect the active user branch. Environment values are unredacted, with
   `null` meaning unrecorded and `{}` meaning recorded empty. The response's
   `session_id` is the host-local log identity, not a gateway routing id.
   Clients render the facts and fetch only when the info overlay opens.
+  Response usage carries optional `served_speed`, canonicalized from server
+  reports rather than requested settings. A missing report is unknown. Usage
+  buckets carry their homogeneous reported mode in `usage.served_speed`, while
+  mixed or unknown totals carry none. Clients label missing modes `unknown` and
+  keep the requested settings distinct from the reported usage.
 - `GET /v1/sessions/{id}/export`: `SessionExport` in `aj-wire`, `{html}`.
   The host renders the complete log with the ordinary HTML exporter, including
   all threads and branches and its export redaction and tool-detail resolution.

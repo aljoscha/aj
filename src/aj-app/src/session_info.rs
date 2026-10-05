@@ -88,8 +88,8 @@ fn kv(key: &str, value: &str) -> InfoRow {
 
 /// Build the session-info digest: identity, recorded settings and environment,
 /// activity timing, message counts, aggregate usage, its usage breakdown per
-/// provider, model, and account, and the per-tool call breakdown, grouped into
-/// labelled sections separated by blank rows.
+/// provider, model, account, and served speed, and the per-tool call breakdown,
+/// grouped into labelled sections separated by blank rows.
 ///
 /// `tag` is the label the session carries, which lives beside the log rather
 /// than in it, so the caller supplies it.
@@ -110,7 +110,7 @@ pub fn digest(stats: &SessionInfo, tag: Option<&str>) -> Vec<InfoRow> {
             stats.settings.thinking.as_deref().unwrap_or("(default)"),
         ),
         kv(
-            "speed",
+            "requested speed",
             stats.settings.speed.as_deref().unwrap_or("(default)"),
         ),
         kv(
@@ -266,11 +266,14 @@ fn bucket_key(bucket: &UsageBucket) -> String {
     let provider = without_control_characters(&bucket.provider);
     let model = without_control_characters(&bucket.model);
     let key = format!("{provider} / {model}");
-    match &bucket.account {
+    let key = match &bucket.account {
         Some(account) if account.is_empty() => format!("{key} (Unnamed account)"),
         Some(account) => format!("{key} ({})", without_control_characters(account)),
         None => key,
-    }
+    };
+    let speed =
+        without_control_characters(bucket.usage.served_speed.as_deref().unwrap_or("unknown"));
+    format!("{key} [{speed}]")
 }
 
 fn without_control_characters(value: &str) -> String {
@@ -340,6 +343,7 @@ mod tests {
                 cache_read: 500,
                 cache_write: 250,
                 total_tokens: 3_750,
+                served_speed: None,
                 cost: UsageCost {
                     input: 0.10,
                     output: 0.20,
@@ -359,6 +363,7 @@ mod tests {
                         cache_read: 300,
                         cache_write: 50,
                         total_tokens: 2_250,
+                        served_speed: None,
                         cost: UsageCost {
                             input: 0.08,
                             output: 0.18,
@@ -380,6 +385,7 @@ mod tests {
                         cache_read: 200,
                         cache_write: 200,
                         total_tokens: 1_500,
+                        served_speed: None,
                         cost: UsageCost {
                             input: 0.02,
                             output: 0.005,
@@ -452,7 +458,7 @@ mod tests {
                 "anthropic / claude-sonnet-4-5".to_string(),
             ),
             RowView::Kv("thinking".to_string(), "medium".to_string()),
-            RowView::Kv("speed".to_string(), "(default)".to_string()),
+            RowView::Kv("requested speed".to_string(), "(default)".to_string()),
             RowView::Kv("verbosity".to_string(), "(default)".to_string()),
             RowView::Blank,
             RowView::Header("Oracle settings".to_string()),
@@ -486,11 +492,11 @@ mod tests {
                 "1 run, 0 tokens, $0.0000".to_string(),
             ),
             RowView::Kv(
-                "anthropic / claude-sonnet-4-5".to_string(),
+                "anthropic / claude-sonnet-4-5 [unknown]".to_string(),
                 "2250 tokens · $0.3000".to_string(),
             ),
             RowView::Kv(
-                "openai / gpt-5 (work)".to_string(),
+                "openai / gpt-5 (work) [unknown]".to_string(),
                 "1500 tokens · $0.0300".to_string(),
             ),
             RowView::Blank,
@@ -499,6 +505,74 @@ mod tests {
             RowView::Kv("Bash".to_string(), "8".to_string()),
         ];
         assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn digest_labels_recorded_served_speeds_through_the_wire() {
+        let mut stats = sample_stats();
+        stats.settings.speed = Some("fast".into());
+        let template = stats.usage_breakdown[0].clone();
+        stats.usage_breakdown = [
+            None,
+            Some("standard"),
+            Some("fast"),
+            Some("ultrafast"),
+            Some("flex"),
+            Some("custom\n\u{7}tier\r"),
+        ]
+        .into_iter()
+        .map(|speed| {
+            let mut bucket = template.clone();
+            bucket.usage.served_speed = speed.map(str::to_string);
+            bucket
+        })
+        .collect();
+        let encoded = serde_json::to_string(&to_wire(&stats)).unwrap();
+        let wire: SessionInfo = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            wire.usage_breakdown[5].usage.served_speed.as_deref(),
+            Some("custom\n\u{7}tier\r")
+        );
+        let rows = digest(&wire, None);
+        assert_eq!(value_of(&rows, "requested speed"), "fast");
+        let actual: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                InfoRow::Kv { key, value } if key.starts_with("anthropic /") => {
+                    Some((key.as_str(), value.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "anthropic / claude-sonnet-4-5 [unknown]",
+                    "2250 tokens · $0.3000"
+                ),
+                (
+                    "anthropic / claude-sonnet-4-5 [standard]",
+                    "2250 tokens · $0.3000"
+                ),
+                (
+                    "anthropic / claude-sonnet-4-5 [fast]",
+                    "2250 tokens · $0.3000"
+                ),
+                (
+                    "anthropic / claude-sonnet-4-5 [ultrafast]",
+                    "2250 tokens · $0.3000"
+                ),
+                (
+                    "anthropic / claude-sonnet-4-5 [flex]",
+                    "2250 tokens · $0.3000"
+                ),
+                (
+                    "anthropic / claude-sonnet-4-5 [customtier]",
+                    "2250 tokens · $0.3000"
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -620,11 +694,11 @@ mod tests {
             "$0.3000 · 7 of 18 responses unpriced"
         );
         assert_eq!(
-            value_of(&rows, "anthropic / claude-sonnet-4-5"),
+            value_of(&rows, "anthropic / claude-sonnet-4-5 [unknown]"),
             "2250 tokens · $0.3000 · 1 unpriced"
         );
         assert_eq!(
-            value_of(&rows, "openai / gpt-5 (work)"),
+            value_of(&rows, "openai / gpt-5 (work) [unknown]"),
             "1500 tokens · unpriced"
         );
     }

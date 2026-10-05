@@ -139,6 +139,7 @@ fn canonical_text_only() -> AssistantMessage {
         text_signature: None,
     })];
     msg.usage = Usage {
+        served_speed: None,
         input: 12,
         output: 5,
         cache_read: 0,
@@ -168,6 +169,7 @@ fn canonical_tool_call() -> AssistantMessage {
         }),
     ];
     msg.usage = Usage {
+        served_speed: None,
         input: 30,
         output: 22,
         cache_read: 0,
@@ -197,6 +199,7 @@ fn canonical_reasoning_text() -> AssistantMessage {
         }),
     ];
     msg.usage = Usage {
+        served_speed: None,
         input: 25,
         output: 18,
         cache_read: 0,

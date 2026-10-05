@@ -4838,6 +4838,7 @@ mod event_protocol_tests {
     async fn complete_oneshot_is_bus_transcript_and_accumulator_silent() {
         let mut response = finalize_text("summary");
         response.usage = Usage {
+            served_speed: None,
             input: 10,
             output: 20,
             cache_write: 30,
@@ -4966,6 +4967,7 @@ mod event_protocol_tests {
             _ => {}
         }));
         let first = Usage {
+            served_speed: None,
             input: 1,
             output: 2,
             cache_write: 3,
@@ -4977,6 +4979,7 @@ mod event_protocol_tests {
             },
         };
         let second = Usage {
+            served_speed: None,
             input: 10,
             output: 20,
             cache_write: 30,
@@ -4988,6 +4991,7 @@ mod event_protocol_tests {
             },
         };
         let third = Usage {
+            served_speed: None,
             input: 100,
             output: 200,
             cache_write: 300,
@@ -5058,6 +5062,7 @@ mod event_protocol_tests {
             Box::pin(async { Err(crate::BoxError::from("injected usage listener failure")) })
         }));
         let delta = Usage {
+            served_speed: None,
             input: 7,
             output: 11,
             cache_write: 13,
@@ -5149,6 +5154,7 @@ mod event_protocol_tests {
             })
         }));
         let delta = Usage {
+            served_speed: None,
             input: 7,
             output: 11,
             cache_write: 13,

@@ -33,7 +33,8 @@ use crate::cancel::{SelectOutcome, select_cancel};
 use crate::errors::classify_openai_finish_reason;
 use crate::openai::errors::{account_for_client_error, classify_client_error};
 use crate::openai::responses::{
-    effective_service_tier, finalize_usage, map_verbosity, responses_cost_multiplier, tier_pricing,
+    effective_service_tier, finalize_usage, map_verbosity, responses_cost_multiplier, served_speed,
+    tier_pricing,
 };
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
@@ -876,6 +877,7 @@ impl StreamState {
         let mut events = Vec::new();
 
         if let Some(tier) = chunk.service_tier.as_ref() {
+            self.partial.usage.served_speed = served_speed(Some(tier));
             self.server_tier = Some(tier.clone());
         }
         if let Some(usage) = chunk.usage.as_ref() {
@@ -1449,13 +1451,18 @@ mod tests {
 
     #[tokio::test]
     async fn live_speed_requests_and_accounting_share_the_effective_tier() {
-        for (served, rates, expected) in [
-            (Some("priority"), true, 38.0),
-            (Some("fast"), true, 38.0),
-            (None, true, 38.0),
-            (Some("default"), true, 11.25),
-            (Some("future-tier"), true, 11.25),
-            (Some("priority"), false, 11.25),
+        for (served, rates, expected, observed) in [
+            (Some("priority"), true, 38.0, Some("fast")),
+            (Some("fast"), true, 38.0, Some("fast")),
+            (None, true, 38.0, None),
+            (Some("default"), true, 11.25, Some("standard")),
+            (Some("future-tier"), true, 11.25, Some("future-tier")),
+            (Some("priority"), false, 11.25, Some("fast")),
+            (Some("ultrafast"), true, 11.25, Some("ultrafast")),
+            (Some("flex"), true, 11.25, Some("flex")),
+            (Some("scale"), true, 11.25, Some("scale")),
+            (Some("auto"), true, 11.25, None),
+            (Some(""), true, 11.25, None),
         ] {
             let mut chunk = empty_chunk();
             chunk.service_tier = served.map(|tier| OpenAIServiceTier::from(tier.to_owned()));
@@ -1512,6 +1519,7 @@ mod tests {
             );
             assert_eq!(result.stop_reason, StopReason::Stop);
             assert_eq!(result.usage.total_tokens, 2_000_000);
+            assert_eq!(result.usage.served_speed.as_deref(), observed);
             assert_eq!(
                 result.usage.cost.total, expected,
                 "reported tier {served:?}, published prices {rates}"
@@ -2210,7 +2218,9 @@ mod tests {
     async fn the_live_mid_stream_cancel_emits_the_states_aborted_terminal() {
         let mut opening = text_delta("partial");
         opening.role = Some(Role::Assistant);
-        let event = serde_json::to_string(&delta_chunk(opening)).expect("serialize opening chunk");
+        let mut chunk = delta_chunk(opening);
+        chunk.service_tier = Some(OpenAIServiceTier::Priority);
+        let event = serde_json::to_string(&chunk).expect("serialize opening chunk");
         let server =
             crate::provider_test_support::held_sse_server("POST /v1/chat/completions", vec![event])
                 .await;
@@ -2244,6 +2254,7 @@ mod tests {
 
         assert_eq!(terminal.stop_reason, StopReason::Aborted);
         assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.served_speed.as_deref(), Some("fast"));
         match terminal.content.first() {
             Some(AssistantContent::Text(text)) => assert_eq!(text.text, "partial"),
             other => panic!("expected preserved partial text, got {other:?}"),
@@ -2320,7 +2331,9 @@ mod tests {
     async fn a_live_sdk_read_failure_keeps_chat_state() {
         let mut opening = text_delta("partial");
         opening.role = Some(Role::Assistant);
-        let event = serde_json::to_string(&delta_chunk(opening)).expect("serialize opening chunk");
+        let mut chunk = delta_chunk(opening);
+        chunk.service_tier = Some(OpenAIServiceTier::Priority);
+        let event = serde_json::to_string(&chunk).expect("serialize opening chunk");
         let server = crate::provider_test_support::failing_sse_server(
             "POST /v1/chat/completions",
             vec![event],
@@ -2355,6 +2368,7 @@ mod tests {
         assert_eq!(terminal.stop_reason, StopReason::Error);
         assert_eq!(terminal.response_id.as_deref(), Some("chatcmpl_1"));
         assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.served_speed.as_deref(), Some("fast"));
         assert_eq!(message_text(&terminal), "partial");
         assert_eq!(terminal.usage.total_tokens, 0);
         let error = terminal.error.expect("transport error retained");
@@ -2439,11 +2453,13 @@ mod tests {
 
     #[tokio::test]
     async fn chat_retryable_finish_keeps_trailing_usage() {
+        let mut usage = usage_chunk();
+        usage.service_tier = Some(OpenAIServiceTier::Priority);
         let events = vec![
             serde_json::to_string(&delta_chunk(text_delta("partial"))).expect("serialize text"),
             serde_json::to_string(&finish_chunk(FinishReason::NetworkError))
                 .expect("serialize finish"),
-            serde_json::to_string(&usage_chunk()).expect("serialize usage"),
+            serde_json::to_string(&usage).expect("serialize usage"),
         ];
         let server =
             crate::provider_test_support::held_sse_server("POST /v1/chat/completions", events)
@@ -2459,6 +2475,7 @@ mod tests {
         server.finish().await;
 
         assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert_eq!(terminal.usage.served_speed.as_deref(), Some("fast"));
         assert_eq!(message_text(&terminal), "partial");
         assert_eq!(terminal.usage.total_tokens, 120);
         assert_eq!(

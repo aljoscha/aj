@@ -31,7 +31,8 @@ pub struct SessionInfo {
     pub compactions: usize,
     /// Total recorded usage, including compaction summaries.
     pub usage: Usage,
-    /// Assistant usage only, ordered by cost and tokens descending then key ascending.
+    /// Assistant usage grouped by provider, model, account, and served speed.
+    /// Ordered by cost and tokens descending then the full key ascending.
     pub usage_breakdown: Vec<UsageBucket>,
     /// The compaction-summary share of total usage.
     pub compaction_usage: Usage,
@@ -41,13 +42,15 @@ pub struct SessionInfo {
     pub session_env: Option<BTreeMap<String, String>>,
 }
 
-/// Recorded assistant usage for one provider, model, and account key.
+/// Recorded assistant usage for one provider, model, account, and served speed key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UsageBucket {
     pub provider: String,
     pub model: String,
     /// None is unlabelled, while an empty string identifies the unnamed account.
     pub account: Option<String>,
+    /// Homogeneous recorded usage, with the bucket's served speed in `served_speed`.
+    /// An absent served speed means the server did not report it, not standard speed.
     pub usage: Usage,
     pub responses: usize,
     /// Responses with tokens but no recorded cost.

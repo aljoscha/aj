@@ -484,6 +484,7 @@ mod tests {
         let mut msg = AssistantMessage::empty();
         msg.stop_reason = StopReason::Stop;
         msg.usage = Usage {
+            served_speed: None,
             input: 200_000,
             output: 0,
             cache_read: 5_000,
@@ -502,6 +503,7 @@ mod tests {
         let mut msg = AssistantMessage::empty();
         msg.stop_reason = StopReason::ToolUse;
         msg.usage = Usage {
+            served_speed: None,
             input: 200_000,
             output: 0,
             cache_read: 5_000,

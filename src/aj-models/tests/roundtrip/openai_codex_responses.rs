@@ -147,6 +147,7 @@ fn canonical_text_only() -> AssistantMessage {
         text_signature: Some(text_signature("msg_codex_text_1", None)),
     })];
     msg.usage = Usage {
+        served_speed: None,
         input: 14,
         output: 6,
         cache_read: 0,
@@ -176,6 +177,7 @@ fn canonical_thinking_text() -> AssistantMessage {
         }),
     ];
     msg.usage = Usage {
+        served_speed: None,
         input: 30,
         output: 12,
         cache_read: 12,
@@ -205,6 +207,7 @@ fn canonical_tool_call() -> AssistantMessage {
         }),
     ];
     msg.usage = Usage {
+        served_speed: None,
         input: 36,
         output: 18,
         cache_read: 0,
@@ -227,6 +230,7 @@ fn canonical_legacy_done() -> AssistantMessage {
         text_signature: Some(text_signature("msg_codex_legacy_1", None)),
     })];
     msg.usage = Usage {
+        served_speed: None,
         input: 10,
         output: 4,
         cache_read: 0,

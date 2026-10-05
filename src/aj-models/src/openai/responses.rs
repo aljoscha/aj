@@ -596,6 +596,21 @@ pub(super) fn tier_pricing<'a>(
     (standard, 1.0)
 }
 
+/// Observed response metadata, independent of requested-tier pricing fallbacks.
+pub(super) fn served_speed(tier: Option<&OpenAIServiceTier>) -> Option<String> {
+    let speed = match tier? {
+        OpenAIServiceTier::Default => "standard",
+        OpenAIServiceTier::Priority | OpenAIServiceTier::Fast => "fast",
+        OpenAIServiceTier::Ultrafast => "ultrafast",
+        OpenAIServiceTier::Flex => "flex",
+        OpenAIServiceTier::Scale => "scale",
+        OpenAIServiceTier::Auto => return None,
+        OpenAIServiceTier::Named(value) if value.is_empty() => return None,
+        OpenAIServiceTier::Named(value) => value,
+    };
+    Some(speed.to_owned())
+}
+
 pub(super) fn map_service_tier(tier: &ServiceTier) -> OpenAIServiceTier {
     match tier {
         ServiceTier::Flex => OpenAIServiceTier::Flex,
@@ -1304,6 +1319,9 @@ impl StreamState {
     }
 
     fn ensure_started(&mut self, response: &Response, out: &mut Vec<AssistantMessageEvent>) {
+        // Each lifecycle snapshot supersedes the preceding one. A terminal
+        // snapshot without a tier must not retain a preterminal tier.
+        self.partial.usage.served_speed = served_speed(response.service_tier.as_ref());
         if self.started {
             return;
         }
@@ -1910,12 +1928,21 @@ mod tests {
 
     #[tokio::test]
     async fn live_speed_requests_and_accounting_share_the_effective_tier() {
-        for (served, rates, expected) in [
-            (Some("priority"), true, 38.0),
-            (None, true, 38.0),
-            (Some("default"), true, 11.25),
-            (Some("future-tier"), true, 11.25),
-            (Some("priority"), false, 11.25),
+        for (served, rates, expected, observed, fail) in [
+            (Some("priority"), true, 38.0, Some("fast"), false),
+            (Some("fast"), true, 38.0, Some("fast"), false),
+            (None, true, 38.0, None, false),
+            (Some("default"), true, 11.25, Some("standard"), false),
+            (Some("future-tier"), true, 11.25, Some("future-tier"), false),
+            (Some("priority"), false, 11.25, Some("fast"), false),
+            (Some("ultrafast"), true, 11.25, Some("ultrafast"), false),
+            (Some("flex"), true, 11.25, Some("flex"), false),
+            (Some("scale"), true, 11.25, Some("scale"), false),
+            (Some("auto"), true, 11.25, None, false),
+            (Some(""), true, 11.25, None, false),
+            (Some("priority"), true, 38.0, Some("fast"), true),
+            (Some("default"), true, 11.25, Some("standard"), true),
+            (None, true, 38.0, None, true),
         ] {
             let mut event = serde_json::json!({
                 "type": "response.completed", "sequence_number": 1,
@@ -1927,7 +1954,19 @@ mod tests {
             if let Some(tier) = served {
                 event["response"]["service_tier"] = tier.into();
             }
-            let events = vec![event.to_string()];
+            if fail {
+                event["type"] = "response.failed".into();
+                event["response"]["status"] = "failed".into();
+                event["response"]["error"] =
+                    serde_json::json!({"code":"server_error", "message":"busy"});
+            }
+            let mut created = event.clone();
+            created["type"] = "response.created".into();
+            created["sequence_number"] = 0.into();
+            created["response"]["status"] = "in_progress".into();
+            created["response"]["service_tier"] = "priority".into();
+            created["response"].as_object_mut().unwrap().remove("usage");
+            let events = vec![created.to_string(), event.to_string()];
             let server =
                 crate::provider_test_support::held_sse_server("POST /v1/responses", events).await;
             let mut model = fake_model(false);
@@ -1966,8 +2005,16 @@ mod tests {
                 payload.lock().unwrap().as_ref().unwrap()["service_tier"],
                 "priority"
             );
-            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert_eq!(
+                result.stop_reason,
+                if fail {
+                    StopReason::Error
+                } else {
+                    StopReason::Stop
+                }
+            );
             assert_eq!(result.usage.total_tokens, 2_000_000);
+            assert_eq!(result.usage.served_speed.as_deref(), observed);
             assert_eq!(
                 result.usage.cost.total, expected,
                 "reported tier {served:?}, published prices {rates}"
@@ -2825,11 +2872,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_live_sdk_read_failure_keeps_responses_state() {
-        let server = crate::provider_test_support::failing_sse_server(
-            "POST /v1/responses",
-            partial_text_events("partial"),
-        )
-        .await;
+        let mut events = partial_text_events("partial");
+        let mut created: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+        created["response"]["service_tier"] = "priority".into();
+        events[0] = created.to_string();
+        let server =
+            crate::provider_test_support::failing_sse_server("POST /v1/responses", events).await;
         let mut model = fake_model(false);
         model.base_url = format!("{}/v1", server.base_url);
         let options = labeled_options(CancellationToken::new());
@@ -2856,6 +2904,7 @@ mod tests {
             .expect("body failure emits terminal");
 
         assert_eq!(terminal.stop_reason, StopReason::Error);
+        assert_eq!(terminal.usage.served_speed.as_deref(), Some("fast"));
         assert_eq!(terminal.api, API_NAME);
         assert_eq!(terminal.response_id.as_deref(), Some("resp_1"));
         assert_eq!(terminal.account.as_deref(), Some("work"));
