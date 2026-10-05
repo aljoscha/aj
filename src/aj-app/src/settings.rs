@@ -686,8 +686,8 @@ pub async fn confirm_thinking(
         })
     };
     // Persist as the new default only when the change should outlive
-    // this session (the settings windows). The `/thinking` overlay
-    // command is session-scoped: it relies on the session-log record
+    // this session (the settings windows). The thinking-effort selector
+    // is session-scoped: it relies on the session-log record
     // above to survive a resume and leaves the default untouched.
     let save_note = persist_axis(
         layers,
@@ -851,7 +851,7 @@ pub async fn confirm_model(
             };
             // Persist the model choice (provider + id) as the new
             // default only when the change should outlive this session
-            // (the settings windows). The `/model` overlay command is
+            // (the settings windows). The model selector is
             // session-scoped: it relies on the session-log record above
             // to survive a resume and leaves the default untouched.
             let save_note = persist_axis(

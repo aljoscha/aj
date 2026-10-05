@@ -20,7 +20,7 @@ pub struct ProviderUsageStatus {
     pub outcome: UsageOutcome,
 }
 
-/// What the `/usage` page shows for one provider account.
+/// What the usage page shows for one provider account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UsageOutcome {
     /// Usage numbers were fetched. Render one row per window.

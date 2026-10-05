@@ -1,4 +1,4 @@
-//! The interactive usage overlay (`/usage`).
+//! The interactive usage overlay.
 //!
 //! Unlike the other read-only content pages ([`crate::content_overlay`]),
 //! the usage page carries one action: spending an earned rate-limit reset

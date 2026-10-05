@@ -1,4 +1,4 @@
-//! What the `/info` overlay reports for a session whose turns did not
+//! What the session info overlay reports for a session whose turns did not
 //! all end cleanly.
 //!
 //! The fixtures here are messages a provider adapter produced, replayed

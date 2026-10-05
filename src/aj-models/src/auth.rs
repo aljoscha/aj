@@ -1,7 +1,7 @@
 //! Auth storage & API-key resolution.
 //!
-//! [`AuthStorage`] is the single entry point both the CLI (`aj /login`,
-//! flag plumbing) and the agent (per-request key fetch) hit when they
+//! [`AuthStorage`] is the single entry point for interactive login,
+//! CLI credential overrides, and per-request key resolution when they
 //! need a provider's bearer token. It owns:
 //!
 //! - **Persistence.** Credentials live in `~/.aj/auth.json` keyed by provider.

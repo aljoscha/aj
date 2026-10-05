@@ -121,8 +121,8 @@ mutexes. This is the property that makes concurrent turns tractable.
   returned. (A future "send report to parent" action is out of scope.)
 - **Re-prompting resumed sub-agents**: only sub-agents spawned in the
   *current process* are re-promptable (they have a live handle).
-  Sub-agents reconstructed by `/resume` render but are not re-promptable
-  until we add transcript rehydration (§8, open question).
+  Sub-agents reconstructed when resuming a session render but are not
+  re-promptable until we add transcript rehydration (§8, open question).
 - **Non-blocking spawn**: the initial `agent` tool call still blocks the
   parent and returns the first report inline (unchanged contract). Only
   *user-initiated continuations* are concurrent. Background spawn is
@@ -287,73 +287,24 @@ per-agent one:
 
 ### 4.3 Submit routing
 
-In the submit handler (interactive.rs:1232-1337), after the slash-command
-branch:
+`handle_submit` in `src/aj/src/interactive.rs` sends editor text through
+`Control` as `Command::Prompt`, targeting the viewed agent. The host starts
+a turn if that agent is idle or queues the text as a follow-up if it is
+busy. A target without a live handle produces a notice. Message events
+carry the target's id so rendering and persistence route to that agent.
 
-```rust
-let target = pump.active_view(&mut tui);
+Palette actions are dispatched separately from submitted text. Their scope
+depends on the action. Model and thinking selectors use
+`editing_target`: the viewed agent normally, or Main's pending branch draft
+when a branch anchor is armed. Session actions such as compaction keep
+their session scope. The catalog lives in `src/aj-app/src/commands.rs`.
 
-// Per-agent single-turn gate: refuse if the target is already busy,
-// whether the binary is driving it or it is running its initial spawn
-// inside the main turn.
-if turn_cancels.contains_key(&target) || pump.is_running(target) {
-    continue;
-}
+### 4.4 Editor submission while busy
 
-let Some(handle) = resolve_agent(target, &agent, &registry) else {
-    // Sub-agent has no live handle (e.g. resumed). Surface a notice.
-    pump.handle(&mut tui, &notice_event("This agent can't be prompted."));
-    continue;
-};
-
-// Clear editor + history as today, then disable submit only if the
-// target is the active view (it always is here, but keep it explicit).
-let turn_cancel = CancellationToken::new();
-turn_cancels.insert(target, turn_cancel.clone());
-let run_config_for_turn = Arc::clone(&run_config);
-turns.spawn(async move {
-    let mut a = handle.lock().await;
-    { /* apply run_config: set_provider + set_default_thinking */ }
-    let result = a.prompt(trimmed, turn_cancel).await;
-    (target, result)
-});
-sync_editor_enabled(&mut tui, &pump, &turn_cancels, target);
-```
-
-Notes:
-- `prompt` appends the user message and runs, emitting
-  `AgentStart`/`AgentEnd` and `MessageStart/End` tagged with `target`'s
-  id — so rendering and persistence route automatically.
-- Run-config (model/thinking) is applied to the target before each turn,
-  same as main, so continuations honor the currently-selected model.
-- Slash commands still operate on the **main** agent / session; they are
-  not retargeted by the active view (a `/model` change applies session
-  wide via run-config). This keeps session-level commands unsurprising.
-
-### 4.4 Editor enable/disable per active view
-
-The editor's submit is enabled iff the **active view's** agent is idle:
-
-```rust
-fn sync_editor_enabled(tui, pump, turn_cancels, active: AgentId) {
-    let busy = turn_cancels.contains_key(&active) || pump.is_running(active);
-    set_editor_submit_enabled(tui, !busy);
-}
-```
-
-Add `EventPump::is_running(&self, id: AgentId) -> bool` reading the
-running-agent set (§4.6). Recompute by calling `sync_editor_enabled`:
-
-- after `set_active_view` (view switch),
-- after spawning a turn,
-- after a turn completes (JoinSet arm),
-- after every `pump.handle(event)` in the bus arm (cheap; catches a
-  sub-agent's initial-run `AgentStart`/`AgentEnd` while that sub is the
-  active view).
-
-`pump.set_active_view` keeps repainting the transcript; the binary calls
-`sync_editor_enabled` right after so the marker + editability match the
-new view.
+The editor remains available while the viewed agent is busy. Submitted text
+appears in that agent's pending-message box and is delivered as a follow-up
+when its turn ends. See `message-queue-spec.md` for steering and queue
+editing gestures.
 
 ### 4.5 Cancellation (Ctrl+C)
 

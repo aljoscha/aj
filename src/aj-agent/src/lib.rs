@@ -875,7 +875,7 @@ impl Agent {
     /// Replace the provider handle, model metadata, and per-call
     /// [`StreamOptions`] mid-session.
     ///
-    /// Used by the interactive `/model` selector to swap to a fresh
+    /// Used by the interactive model selector to swap to a fresh
     /// registry entry without restarting the session. Takes effect on
     /// the next inference; in-flight turns keep their old handle,
     /// sub-agents spawned after the call see the new one.
@@ -934,7 +934,7 @@ impl Agent {
     /// Replace the agent's default thinking configuration mid-
     /// session.
     ///
-    /// Used by the interactive `/thinking` selector to retune the
+    /// Used by the interactive thinking-effort selector to retune the
     /// thinking effort without restarting the session. Takes
     /// effect on the next inference; in-flight turns continue with
     /// whatever they were already configured for.
@@ -4372,7 +4372,7 @@ mod event_protocol_tests {
     /// Build a [`ModelInfo`] mirroring what [`ScriptedProvider`] stamps
     /// onto every emitted [`AssistantMessage`] partial. The agent
     /// reads identity off this struct for the TUI footer and the
-    /// `/model` selector; the values are only checked for "matches
+    /// model selector; the values are only checked for "matches
     /// what the provider claims", so any consistent triple works.
     fn scripted_model_info() -> ModelInfo {
         ModelInfo {

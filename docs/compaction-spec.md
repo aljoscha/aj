@@ -1,7 +1,7 @@
 # Context Compaction Spec
 
 Status: proposed. This document specifies client-side context
-compaction for `aj`: a manual `/compact` command, automatic
+compaction for `aj`: a manual `compact` palette action, automatic
 threshold-driven compaction, and reactive recovery from a
 context-overflow error. Compaction replaces the earlier part of a
 thread with an LLM-generated structured summary while retaining selected
@@ -24,7 +24,7 @@ Goals:
 - Summarize-and-continue: when context grows past a threshold, replace
   the old prefix with selected original user messages and a summary,
   keeping a tool-safe recent suffix verbatim.
-- Three triggers: manual (`/compact [instructions]`), automatic
+- Three triggers: manual (the `compact` palette action or host API), automatic
   (occupancy crosses a configured fraction of the window), and reactive
   (a turn fails with a context-overflow error → compact and retry once).
 - Durable and resumable: a compaction is recorded in the session log so
@@ -76,7 +76,7 @@ aj (binary)              orchestration: the `compaction` host module
                          (`run_compaction` mechanics) and the `turn`
                          host module (`drive_turn`, the turn-and-
                          continuation driver that owns the post-turn
-                         policy ladder); the `/compact` command;
+                         policy ladder); the `compact` palette action;
                          interactive wiring (driver tasks, terminal-
                          outcome notices); print-mode wiring.
 ```
@@ -471,7 +471,7 @@ pub fn update_summary_prompt(conversation_text: &str, previous_summary: &str, cu
 pub fn turn_prefix_summary_prompt(conversation_text: &str) -> String;
 ```
 
-`custom` carries the optional `/compact <instructions>` focus text.
+`custom` carries optional focus instructions supplied through the host API.
 
 ### 4.6 File-op extraction and `CompactionDetails`
 
@@ -868,21 +868,21 @@ than growing an already-over-threshold prompt further. The cancel token
 covers the whole sequence, so one Ctrl+C stops the current inference and
 every continuation.
 
-### 7.3 Manual `/compact`
+### 7.3 Manual compaction
 
-Command surface (`aj/src/config/commands.rs`):
+The command catalog (`src/aj-app/src/commands.rs`) exposes `compact` in
+category `session` with `CommandAction::Compact` and description
+"Summarize earlier context to free up the window."
 
-- Add `CommandAction::Compact` (`commands.rs:202`).
-- Add a `COMMANDS` entry (`commands.rs:56`), category `"session"`,
-  name `"compact"`, description "Summarize earlier context to free up
-  the window."
+Choosing it in the palette sends `Command::Compact { instructions: None }`
+through `Control`. The palette action takes no arguments. Typing `/` in
+an empty editor opens the command palette as a discoverability shortcut.
 
-`/compact` accepts optional free-form focus instructions
-(`/compact focus on the auth refactor`); the typed tail is passed as
-`custom_instructions`. It dispatches a `drive_turn` with
-`TurnStart::Compact { reason: Manual, instructions }` (a compact-only
-sequence). Like the session-changing commands it is **refused mid-turn**
-via the busy guard with `session_busy_notice("compact")`.
+The host API accepts optional free-form focus instructions and passes them
+through `TurnStart::Compact { reason: Manual, instructions }` to the
+compaction flow. Manual compaction targets Main and is refused while Main
+is busy. The interactive client renders that conflict with
+`session_busy_notice("compact")`.
 
 ### 7.4 Interactive integration
 
@@ -958,7 +958,7 @@ Not implemented. A headless one-shot `aj compact [session_id]` would
 build an agent for a resolved session and run a single
 `run_compaction(Manual)` without sending a turn, but it duplicates print
 mode's agent-construction path for marginal value. Compaction is reached
-through the interactive `/compact` command, the automatic threshold
+through the interactive `compact` palette action, the automatic threshold
 trigger, and the reactive overflow path (including under `--print`),
 which together cover the intended use. Revisit if a scripted "compact
 this session" entry point is needed.
@@ -1104,7 +1104,7 @@ test.
 3. **Agent mechanisms.** `complete_oneshot`, `reseed_transcript`,
    `CompactionStart`/`End` events.
 4. **Host orchestration + manual path.** `aj::compaction::run_compaction`,
-   `/compact` command (+ tail-argument dispatch), interactive
+   `compact` palette action, optional host API instructions, interactive
    `spawn_compaction` + notice + footer accessor. End-to-end manual
    compaction.
 5. **Auto + reactive triggers.** Threshold check in the turn-completion

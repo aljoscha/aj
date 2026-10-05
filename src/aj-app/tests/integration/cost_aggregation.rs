@@ -1,4 +1,4 @@
-//! Cost as the `/info` overlay reports it, over a real persisted log.
+//! Cost as the session info overlay reports it, over a real persisted log.
 //!
 //! Pricing itself is pinned in the provider adapters, which is one
 //! layer below anything a user reads. What these pin is the stretch

@@ -3,7 +3,7 @@
 //! The fetching machinery (the [`UsageSource`] trait and its
 //! implementations) lives in `aj-models`; this module holds the
 //! binary's UX around it: [`collect_usage`] turns every registered
-//! source into render-ready rows for the `/usage` overlay, and the
+//! source into render-ready rows for the usage overlay, and the
 //! formatting helpers render utilization and reset times the way the
 //! overlay shows them.
 //!
@@ -99,9 +99,9 @@ fn usage_error_message(error: UsageError) -> String {
     }
 }
 
-/// Providers surfaced on the `/usage` page even without a usage
+/// Providers surfaced on the usage page even without a usage
 /// source, so the page self-documents that it covers all providers
-/// and not just Anthropic. Mirrors the `/auth` page's known set.
+/// and not just Anthropic. Mirrors the auth status page's known set.
 const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "openai-codex", "openrouter"];
 
 /// Fetch usage for every provider account concurrently: one status per

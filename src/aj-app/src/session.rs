@@ -6,7 +6,7 @@
 //! subscriptions, the staged settings, and the agent-lifecycle sets. A
 //! frontend wraps a `SessionCore` in its own view type (the `aj` binary
 //! adds an event pump plus the install/reconcile view work). Session
-//! changes (`/new`, `/resume`) build a fresh core and replace the old
+//! changes (new session, resume) build a fresh core and replace the old
 //! one wholesale instead of mutating shared state back into a pristine
 //! shape, so per-session state can never leak across session
 //! boundaries.
@@ -271,7 +271,7 @@ pub struct SessionCore {
     /// Per-session, like the agent itself.
     pub message_queues: MessageQueues,
     /// Loop-side staged settings overrides, keyed by sub-agent id. The
-    /// `/model` / `/thinking` selectors write entries when the user
+    /// model and thinking-effort selectors write entries when the user
     /// changes a sub-agent's settings; the turn primitive re-applies
     /// them at every turn start. Sub ids are per-session, so the map
     /// resets naturally with the core. A sub-agent with no entry runs
@@ -357,7 +357,7 @@ impl SessionCore {
         } = prepare_log(persistence, &source, &run_config, restore)?;
 
         // Build a fresh agent off the run-config snapshot, which at this
-        // point reflects both runtime `/model` / `/thinking` choices and
+        // point reflects both runtime model and thinking-effort choices and
         // any settings just restored from the resumed log.
         let settings = {
             let cfg = run_config.lock().expect("run config mutex poisoned");

@@ -484,7 +484,7 @@ pub fn thinking_level_for(level: &ThinkingConfig) -> ThinkingLevel {
 /// stamp speed-derived headers. Auth is deliberately not checked: key
 /// resolution is lazy (see `crate::model`), so an uncredentialed
 /// restored provider surfaces at the next turn, where the user can
-/// `/login`.
+/// open the login picker from the command palette.
 pub(crate) fn restore_session_settings(
     run_config: &Arc<StdMutex<RunConfigSnapshot>>,
     settings: &aj_session::SessionSettings,
@@ -638,11 +638,11 @@ pub struct BuiltAgent {
 /// config and a resolved provider bundle.
 ///
 /// `thinking`/`speed` come from the caller's run-config snapshot
-/// rather than from `config`, so a runtime `/thinking` change carries
-/// into agents built for later sessions. The [`AgentEnv`] is read
-/// fresh, so a new session picks up edits to AGENTS.md files, a system
-/// prompt override, and the current date. Skill-discovery diagnostics
-/// ride on the returned `env`. The caller decides how to surface them.
+/// rather than from `config`, so the agent uses the session's runtime
+/// settings. The [`AgentEnv`] is read fresh, so a new session picks up
+/// edits to AGENTS.md files, a system prompt override, and the current date.
+/// Skill-discovery diagnostics ride on the returned `env`. The caller
+/// decides how to surface them.
 pub fn build_agent(config: &Config, run: &RunConfigSnapshot) -> BuiltAgent {
     let mut tools = builtin_tools_for_model(
         &builtin_tool_options(config),

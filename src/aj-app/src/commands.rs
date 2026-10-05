@@ -5,7 +5,7 @@
 //! performs when the command is chosen. The catalog is consumed by
 //! the command-palette overlay (which groups by category and
 //! supports fuzzy search) and by the help overlay (which lists every
-//! entry). The host applies a [`CommandAction`] in `handle_command`.
+//! entry). The interactive UI dispatches the chosen [`CommandAction`].
 //!
 //! Because each entry carries its own action, adding a command is a
 //! single edit here: append a [`Command`] with the appropriate

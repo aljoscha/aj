@@ -104,7 +104,7 @@ at the end for orchestration.
 
 - **Detach-from-process**: no nohup-style tasks that outlive aj. Exit
   kills everything.
-- **Resurrecting tasks on `/resume`**: tasks are process-scoped.
+- **Resurrecting tasks when resuming a session**: tasks are process-scoped.
   Persisted launch results and notices stand alone in the transcript.
 - **Live transcript reads of a running background agent** through
   `task_output`: a running agent holds its own `TokioMutex`, so the

@@ -3,7 +3,7 @@
 //! A [`UsageSource`] knows how to fetch account-level usage numbers
 //! (rate-limit windows like "current session" or "current week") for
 //! one provider, resolving its own credentials through
-//! [`AuthStorage`]. The binary's `/usage` page walks
+//! [`AuthStorage`]. The binary's usage page walks
 //! [`default_usage_sources`] and renders every report on one page, so
 //! adding usage display for a new provider means implementing the
 //! trait and appending it to the default list — no UI changes.
@@ -820,7 +820,7 @@ pub mod codex {
     const CONSUME_URL: &str =
         "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
-    /// Tight timeout so a stalled request can't hang the `/usage`
+    /// Tight timeout so a stalled request can't hang the usage
     /// overlay (the outer collection also caps each source, but the
     /// HTTP-level bound keeps connection setup honest too).
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);

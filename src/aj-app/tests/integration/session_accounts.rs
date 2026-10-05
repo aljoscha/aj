@@ -473,10 +473,22 @@ async fn saved_pins_and_resets_survive_restart_and_missing_accounts_never_fall_b
         .expect("missing saved pin must fail inference");
     assert_eq!(error.category, ErrorCategory::Auth);
     assert!(error.message.contains("work"), "{error:?}");
+    assert!(error.message.contains("command palette"), "{error:?}");
     assert!(
         replies[0].content.is_empty(),
         "no fallback credential was served"
     );
+
+    let refused = bounded(host.command(
+        &session,
+        Command::Account {
+            provider: PROVIDER.into(),
+            account: Some("work".into()),
+        },
+    ))
+    .await
+    .expect_err("selecting a missing account is refused");
+    assert!(refused.to_string().contains("command palette"), "{refused}");
 
     select(&host, &session, None).await;
     assert_turn(&host, &session, "personal", "synthetic-personal-token").await;

@@ -163,7 +163,7 @@ fn session_line(session: &SessionMetadata, archived: bool) -> String {
 }
 
 /// `aj update-models`: refresh the on-disk model catalog at
-/// `~/.aj/models.json` from `models.dev`. The `/model` selector
+/// `~/.aj/models.json` from `models.dev`. The model selector
 /// overlay reads that catalog at startup, so running this command
 /// is how users surface freshly-released models to the picker
 /// without restarting from a different catalog source.

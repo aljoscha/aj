@@ -2589,8 +2589,8 @@ All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
     the binary.
 
 17. **Update `aj` CLI**: Add `--provider` flag alongside existing
-    `--model_api`. Add `/login` command support. Wire up model registry
-    for model selection and validation.
+    `--model_api`. Expose the `login` action in the command palette.
+    Wire up model registry for model selection and validation.
 
 18. **Remove old code**: Remove the `messages` module (replaced by
     `types`), remove the old `Model` trait and `create_model` function,

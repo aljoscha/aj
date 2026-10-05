@@ -91,7 +91,7 @@ impl SessionAccounts {
                     }),
                     Ok(None) => Err(match account {
                         Some(label) => format!(
-                            "No credential for {provider} account {}. Use /account to choose another account, or /login to authenticate it.",
+                            "No credential for {provider} account {}. In the command palette, choose 'account' to switch accounts or 'login' to authenticate it.",
                             if label.is_empty() { "(unnamed)".to_string() } else { format!("{label:?}") }
                         ),
                         None => missing_key_message(&provider),
@@ -127,7 +127,7 @@ pub async fn validate_account_selection(
             .is_none()
     {
         return Err(format!(
-            "No stored {provider} account {label:?}. Use /login to add it, or /account to choose another account."
+            "No stored {provider} account {label:?}. In the command palette, choose 'login' to add it or 'account' to switch accounts."
         ));
     }
     Ok(())
@@ -242,7 +242,7 @@ pub(crate) fn validate_model_url(url: &str) -> Result<()> {
 }
 
 /// Build a [`ResolvedModel`] from a pre-picked [`ModelInfo`] — used by
-/// the `/model` selector which already has the catalog row in hand.
+/// the model selector which already has the catalog row in hand.
 ///
 /// Same effect as [`resolve`] minus the lookup: dispatch the
 /// `model_info.api` to the matching [`Provider`] impl, install an

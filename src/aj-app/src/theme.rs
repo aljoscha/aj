@@ -842,8 +842,7 @@ fn user_themes_dir() -> Option<PathBuf> {
 
 /// Shared, hot-swappable handle to a [`Theme`]. The interactive
 /// mode threads a single [`ThemeHandle`] through every theme
-/// builder so a runtime palette swap (fs-watcher fires; a future
-/// `/theme` selector picks a new theme) is visible to every
+/// builder so a runtime theme change is visible to every
 /// component without rebuilding any of them.
 ///
 /// The handle is a plain `Arc<RwLock<Theme>>`. Anything a frontend

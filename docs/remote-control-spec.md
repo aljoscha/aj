@@ -593,9 +593,9 @@ closes it without making changes.
 Entering an idle saved session with a resumable paused, blocked
 or usage-limited goal offers Resume or leave stopped, without prompting again
 on live pauses or reconnects.
-There is no slash-argument command interface. The footer reads live snapshots
-and shows one compact goal phrase per status. Active pursuit shows budget usage,
-or elapsed runtime without a budget. Paused, stalled (blocked) and
+The zero-argument `goal` palette action opens the goal window. The footer reads
+live snapshots and shows one compact goal phrase per status. Active pursuit
+shows budget usage, or elapsed runtime without a budget. Paused, stalled (blocked) and
 usage-limited goals show the control hint. A budget-limited goal shows its
 usage against the budget. A complete goal shows tokens used when it had a
 budget, otherwise elapsed runtime.
@@ -1384,7 +1384,7 @@ unsupported action never silently does nothing.
 Account selection attempts the host's endpoint and shows the ordinary
 unsupported-endpoint notice if the peer lacks it. It does not fall back to
 reading or modifying the client's auth store. Credential pickers and the
-`/auth` overlay follow the same rule through section 5.12: they read the
+auth status overlay follow the same rule through section 5.12: they read the
 host's store, name the opening host, and keep its session address across
 focus changes. Login runs the OAuth flow on the client, opening the browser
 here when one is available, and stores the result on the host. Cancelling

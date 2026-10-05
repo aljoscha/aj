@@ -47,7 +47,7 @@ pub const ACTION_CLIPBOARD_PASTE_IMAGE: &str = "aj.clipboard.paste_image";
 /// command palette overlay. When a capturing overlay is already up
 /// the listener bails out, so the chord doesn't interrupt an open
 /// selector. The same overlay can also be opened by typing `/` at
-/// an empty prompt or by submitting `/palette`.
+/// an empty prompt. This is a palette shortcut, not a text-command parser.
 pub const ACTION_PALETTE_OPEN: &str = "aj.palette.open";
 
 /// Closes every open overlay in one keystroke regardless of
@@ -68,9 +68,8 @@ pub const ACTION_HISTORY_TOGGLE_SCOPE: &str = "aj.history.toggle_scope";
 ///
 /// Bound by default to `ctrl+r`. The interactive loop intercepts the
 /// keystroke globally (before any component sees it) and opens the
-/// prompt-history search overlay, exactly as if the user had typed
-/// `/history`. Because it is dispatched directly (not via the
-/// command palette), the overlay has no parent palette: `Esc`
+/// prompt-history search overlay. Because it is dispatched directly
+/// (not via the command palette), the overlay has no parent palette: `Esc`
 /// closes it back to the editor rather than popping to the palette.
 /// Inert while a capturing overlay is already up.
 pub const ACTION_HISTORY_OPEN: &str = "aj.history.open";

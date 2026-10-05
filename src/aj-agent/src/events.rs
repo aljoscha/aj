@@ -131,7 +131,7 @@ pub enum AgentId {
 }
 
 /// Why a compaction ran. Carried on the compaction lifecycle events so
-/// renderers can distinguish a user-invoked `/compact` from an
+/// renderers can distinguish manual compaction from an
 /// automatic threshold trigger or context-overflow recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

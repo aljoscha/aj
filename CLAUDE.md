@@ -35,6 +35,13 @@ caller branches on failure. Render-only seams use the named opaque `BoxError`.
 Frontend-independent application composition in `aj-app` may use `anyhow` when
 callers only propagate or display the failure.
 
+### Interactive actions
+
+The command palette and help overlay share `src/aj-app/src/commands.rs`.
+Actions take no text arguments: they open an overlay or perform an action.
+`Ctrl+O` and `/` at an empty prompt open the palette. The `/` shortcut is not
+a slash-command parser. Submitted editor text is a prompt, not a command.
+
 ### Remote control
 
 Every component should be safe and understandable on its own. Adding a wire

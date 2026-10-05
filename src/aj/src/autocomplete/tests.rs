@@ -275,58 +275,39 @@ mod provider {
         let lines = vec!["@src".to_string()];
         assert!(provider.should_trigger_file_completion(&lines, 0, 4));
 
-        // Past the leading `/` token, now in a later (argument) position.
-        let lines = vec!["/cmd ".to_string()];
-        assert!(provider.should_trigger_file_completion(&lines, 0, 5));
+        // After prose with room for a path.
+        let lines = vec!["inspect ".to_string()];
+        assert!(provider.should_trigger_file_completion(&lines, 0, 8));
     }
 
     // -- extract_path_prefix --
 
     #[test]
-    fn extracts_root_slash_from_hey_slash_when_forced() {
+    fn completes_absolute_paths_at_the_start_and_after_prose() {
         let tmp = TempDir::new().unwrap();
-        let provider = CombinedAutocompleteProvider::new(tmp.path());
-        let result = suggest(&provider, "hey /", true);
-        assert!(
-            result.is_some(),
-            "forced extraction should yield suggestions"
+        let base = base_dir(&tmp, "cwd");
+        setup_folder(
+            tmp.path(),
+            FolderShape {
+                dirs: &[],
+                files: &[("model.md", "model notes"), ("other.md", "other notes")],
+            },
         );
-        assert_eq!(result.unwrap().prefix, "/");
-    }
+        let provider = CombinedAutocompleteProvider::new(&base);
+        let root = tmp.path().canonicalize().unwrap();
+        let prefix = format!("{}/mod", root.display());
+        let expected = root.join("model.md").to_string_lossy().into_owned();
+        assert!(root.is_absolute());
+        assert!(!base.join("model.md").exists());
 
-    #[test]
-    fn extracts_slash_a_from_plain_slash_a_when_forced() {
-        let tmp = TempDir::new().unwrap();
-        let provider = CombinedAutocompleteProvider::new(tmp.path());
-        let result = suggest(&provider, "/A", true);
-        // "/A" may return None if nothing matches, but when it does return,
-        // the prefix is exactly what was typed.
-        if let Some(r) = result {
-            assert_eq!(r.prefix, "/A");
+        for before in ["", "inspect "] {
+            for force in [false, true] {
+                let result = suggest(&provider, &format!("{before}{prefix}"), force)
+                    .expect("an absolute path completes against its own directory");
+                assert_eq!(result.prefix, prefix);
+                assert_eq!(values(&result), vec![expected.clone()]);
+            }
         }
-    }
-
-    #[test]
-    fn does_not_trigger_on_bare_root_slash_token_when_forced() {
-        let tmp = TempDir::new().unwrap();
-        let provider = CombinedAutocompleteProvider::new(tmp.path());
-        let result = suggest(&provider, "/model", true);
-        assert!(
-            result.is_none(),
-            "forced extraction on a bare root-slash token should still suppress path suggestions",
-        );
-    }
-
-    #[test]
-    fn triggers_absolute_path_inside_command_argument() {
-        let tmp = TempDir::new().unwrap();
-        let provider = CombinedAutocompleteProvider::new(tmp.path());
-        let result = suggest(&provider, "/command /", true);
-        assert!(
-            result.is_some(),
-            "absolute path after command arg should complete"
-        );
-        assert_eq!(result.unwrap().prefix, "/");
     }
 
     // -- @-prefixed fuzzy file suggestions --

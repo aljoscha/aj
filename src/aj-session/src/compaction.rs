@@ -503,7 +503,7 @@ fn append_user_content(s: &mut String, content: &[UserContent]) {
     }
 }
 
-/// Append the optional `/compact <instructions>` focus text.
+/// Append the caller's optional compaction focus instructions.
 fn append_custom_focus(prompt: &mut String, custom: Option<&str>) {
     if let Some(custom) = custom {
         prompt.push_str("\n\nAdditional focus: ");

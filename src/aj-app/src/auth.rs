@@ -10,7 +10,7 @@
 //!   the session's host commits.
 //! - [`collect_statuses`] / [`provider_status`] turn the stored
 //!   credentials, env vars, and runtime overrides into human-readable
-//!   rows for the `/auth` status overlay and the login/logout pickers.
+//!   rows for the auth status overlay and the login/logout pickers.
 //! - [`open_browser`] best-effort launches the user's browser at the
 //!   OAuth authorization URL during a login flow.
 //! - [`auth_lines`] composes the login dialog's authorization-step
@@ -30,7 +30,7 @@ use aj_models::oauth::OAuthAuthInfo;
 mod login;
 pub use login::{LoginCallbacks, LoginTarget, login};
 
-/// Providers we always surface in the `/auth` status overlay even
+/// Providers we always surface in the auth status overlay even
 /// when they have no credential yet, so the user can see what's
 /// available to log into / configure. The union with
 /// [`AuthStorage::oauth_provider_ids`] and any hand-added entry in

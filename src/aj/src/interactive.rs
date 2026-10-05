@@ -1933,7 +1933,7 @@ fn warning_event(text: &str) -> AgentEvent {
 /// the session log and arrives with the attach block.
 ///
 /// Both the process-start path ([`build_world`]) and the in-process
-/// new-session path ([`focus_session`]) fold these, so a `/new` surfaces the
+/// new-session path ([`focus_session`]) fold these, so a new session surfaces the
 /// same skill problems a cold start does.
 fn fresh_env_notices(fresh: bool, env: &AgentEnv) -> Vec<AgentEvent> {
     if !fresh {
@@ -3813,7 +3813,7 @@ async fn apply_command_action(
             ActionEffect::Redraw
         }
         CommandAction::Compact => {
-            // `/compact` runs as a tracked turn on the main agent, so the
+            // Manual compaction runs as a tracked turn on the main agent, so the
             // host refuses it while one is already running. Its own wording
             // is the protocol's; the local notice points at the chord that
             // cancels the turn first, which is why the conflict is the one
@@ -9440,7 +9440,7 @@ mod tests {
                 .is_showing_autocomplete(),
             "typing `@hel` opens the file-completion popup",
         );
-        // `@` opens the file popup, not the `/`-command palette.
+        // `@` opens the file popup, not the command palette.
         assert!(
             !shell.borrow().overlays.borrow().is_open(),
             "the command palette must not open on `@`",
@@ -12729,7 +12729,7 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// `/compact` while a turn runs is refused by the host, and the refusal
+    /// Manual compaction while a turn runs is refused by the host, and the refusal
     /// keeps the local wording (which names the chord that cancels the turn
     /// first) rather than the protocol's. While idle it runs.
     #[tokio::test]
@@ -14366,44 +14366,49 @@ mod tests {
         assert!(!widget_eq(&deepest.widget, &scrim_widget));
     }
 
-    /// Ctrl+O opens the palette and moves focus into its filter: keys
+    /// Ctrl+O and `/` open the palette and move focus into its filter: keys
     /// typed while it is open never reach the editor. Esc closes it and
     /// returns focus, so the next key lands in the editor again.
     #[tokio::test]
-    async fn ctrl_o_opens_the_palette_and_esc_returns_focus_to_the_editor() {
-        let (mut app, mut writer, shell, root) = init_app().await;
+    async fn palette_shortcuts_open_the_palette_and_esc_returns_focus_to_the_editor() {
+        for shortcut in [0x0f, b'/'] {
+            let (mut app, mut writer, shell, root) = init_app().await;
 
-        writer.write_all(&[0x0f]).expect("write ctrl+o");
-        let event = app.next_input().await.expect("input event");
-        app.handle_input(event);
-        assert!(shell.borrow().overlays.borrow().is_open());
-        // The focus change lands on the dispatch path at the next layout.
-        app.render(&root).expect("render");
+            writer
+                .write_all(&[shortcut])
+                .expect("write palette shortcut");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+            assert!(shell.borrow().overlays.borrow().is_open());
+            assert_eq!(shell.borrow().view().editor.borrow().text(), "");
+            // The focus change lands on the dispatch path at the next layout.
+            app.render(&root).expect("render");
 
-        writer.write_all(b"q").expect("write key");
-        let event = app.next_input().await.expect("input event");
-        app.handle_input(event);
-        assert_eq!(
-            shell.borrow().view().editor.borrow().cursor(),
-            (0, 0),
-            "typed key went to the palette filter, not the editor"
-        );
+            writer.write_all(b"q").expect("write key");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+            assert_eq!(
+                shell.borrow().view().editor.borrow().cursor(),
+                (0, 0),
+                "typed key went to the palette filter, not the editor"
+            );
 
-        writer.write_all(b"\x1b").expect("write esc");
-        let event = app.next_input().await.expect("input event");
-        app.handle_input(event);
-        assert!(!shell.borrow().overlays.borrow().is_open(), "esc closes");
-        assert!(shell.borrow().take_command().is_none());
-        app.render(&root).expect("render");
+            writer.write_all(b"\x1b").expect("write esc");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+            assert!(!shell.borrow().overlays.borrow().is_open(), "esc closes");
+            assert!(shell.borrow().take_command().is_none());
+            app.render(&root).expect("render");
 
-        writer.write_all(b"x").expect("write key");
-        let event = app.next_input().await.expect("input event");
-        app.handle_input(event);
-        assert_eq!(
-            shell.borrow().view().editor.borrow().cursor(),
-            (0, 1),
-            "focus is back in the editor"
-        );
+            writer.write_all(b"x").expect("write key");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+            assert_eq!(
+                shell.borrow().view().editor.borrow().cursor(),
+                (0, 1),
+                "focus is back in the editor"
+            );
+        }
     }
 
     /// Typing narrows the palette rows and Enter confirms the highlighted
@@ -14782,7 +14787,7 @@ mod tests {
         assert!(app.handle_input(event).quit, "confirming quit quits");
     }
 
-    /// `/login` opens a picker over the OAuth providers (the default
+    /// The login palette action opens a picker over the OAuth providers (the default
     /// registry is non-empty, so it opens rather than folding a notice).
     #[tokio::test]
     async fn login_picker_opens_over_providers() {
@@ -33932,7 +33937,7 @@ mod tests {
         assert_eq!(
             world.handles().log.lock().await.session_env(),
             Some(&expected),
-            "the /new production arm dropped the frontend's armed env map"
+            "the new-session action dropped the frontend's armed env map"
         );
         shut_down(&world).await;
     }
@@ -33981,7 +33986,7 @@ mod tests {
         assert_eq!(
             remote.host.environment(world.session()).await.unwrap(),
             expected,
-            "the connected /new path must carry the launch environment, not host defaults"
+            "the connected new-session action must carry the launch environment, not host defaults"
         );
         remote.shutdown().await;
     }

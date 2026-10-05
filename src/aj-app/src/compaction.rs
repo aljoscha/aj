@@ -1,11 +1,10 @@
 //! Host-driven context compaction: plan, summarize, persist, reseed.
 //!
-//! The pure planning lives in `aj_session::compaction`; this module is
-//! the orchestration that the manual `/compact` command, the `compact`
-//! CLI subcommand, and the auto/overflow triggers all call. It locks
-//! the log to plan, runs a bus-silent summarizer inference on the
-//! agent, records a compaction entry, and reseeds the agent's
-//! transcript from the post-compaction projection.
+//! The pure planning lives in `aj_session::compaction`. This module is
+//! the orchestration behind manual compaction and the automatic threshold
+//! and overflow triggers. It locks the log to plan, runs a bus-silent
+//! summarizer inference on the agent, records a compaction entry, and
+//! reseeds the agent's transcript from the post-compaction projection.
 
 use std::sync::Arc;
 
@@ -366,8 +365,8 @@ fn format_file_ops(file_ops: &planning::CompactionDetails) -> String {
 }
 
 /// Report that there was nothing to compact, leaving the footer
-/// untouched (nothing changed). A user-initiated `/compact` gets a
-/// one-line notice explaining why; automatic triggers stay silent so a
+/// untouched (nothing changed). Manual compaction gets a
+/// one-line notice explaining why. Automatic triggers stay silent so a
 /// threshold that keeps firing without summarizable history can't spam
 /// the transcript.
 async fn finish_nothing(

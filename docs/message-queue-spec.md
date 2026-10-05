@@ -441,9 +441,9 @@ rejected to honor the requested UX.)
 
 ## 6. Out of scope
 
-- A `/queue` command or any way to inspect/reorder a multi-entry queue:
-  the TUI coalesces to one message per kind. The Vec shape keeps the
-  door open for multi-producer queues without a reshape.
+- A queue-management palette action or any way to inspect/reorder a
+  multi-entry queue: the TUI coalesces to one message per kind. The Vec
+  shape keeps the door open for multi-producer queues without a reshape.
 - Drain-mode configuration (`"all"` vs `"one-at-a-time"` from §1.9):
   immaterial while the TUI keeps one entry per kind. The agent drain
   loops over the Vec, so a future multi-entry producer works without
