@@ -957,6 +957,13 @@ its pinned upstream `service_tiers` and `default_service_tier`. Reviewed catalog
 overrides supplement verified availability and prices missing from those sources.
 The catalog does not establish account eligibility.
 
+Additive speed overrides preserve source-advertised modes and their prices.
+Codex seed regeneration applies these supplements and resolves missing prices
+from matching native API metadata. GPT-6 Astra Ultrafast is documented for
+eligible Codex plans even though the CLI's bundled catalog omits it. Its selector
+description states the plan and workspace restrictions. Flex remains an API
+option, not advertised ChatGPT-backend support.
+
 Per-mode token rates replace standard rates. Context tiers belong to that mode,
 not to the standard price table. Server-reported OpenAI service tiers and
 Anthropic `usage.speed` select the rates actually used. When mode pricing is

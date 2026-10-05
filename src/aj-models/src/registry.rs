@@ -35,7 +35,9 @@ const OVERRIDES_JSON: &str = include_str!("../data/overrides.json");
 /// (defensively filtering any upstream re-emission first), and load
 /// splices them in so users on a stale cache or an older bundled seed
 /// still see Codex models. Visible models and reasoning controls follow
-/// Codex CLI rust-v0.159.2's `codex-rs/models-manager/models.json`.
+/// Codex CLI rust-v0.160.0's `codex-rs/models-manager/models.json`.
+/// Reviewed additive overrides include documented, plan-restricted speed modes
+/// that the CLI's bundled catalog does not list.
 /// The CLI's `ultra` is a multi-agent mode that resolves to an ordinary
 /// effort before inference, not a wire effort. It and the unsupported
 /// `none`/`minimal` efforts are intentionally absent. Capacity and pricing
@@ -278,8 +280,9 @@ pub struct OverrideTarget {
 
 /// Shallow-merge patch over a [`ModelInfo`]. Each `Option` is leave-alone
 /// when `None` and replace-whole when `Some`. Nested objects (`cost`,
-/// `input`) are replaced wholesale, not deep-merged — predictable wins
-/// over clever.
+/// `input`) are replaced wholesale, not deep-merged. `additional_speed_modes`
+/// supplements missing identities without
+/// replacing source-advertised modes or their prices.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct OverridePatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,6 +303,8 @@ pub struct OverridePatch {
     pub default_verbosity: Option<Verbosity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_modes: Option<Vec<SpeedMode>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_speed_modes: Option<Vec<SpeedMode>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_speed: Option<Speed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -857,6 +862,13 @@ pub(crate) fn apply_override(models: &mut [ModelInfo], entry: &OverrideEntry) {
     if let Some(v) = &p.speed_modes {
         model.speed_modes = v.clone();
     }
+    if let Some(modes) = &p.additional_speed_modes {
+        for mode in modes {
+            if model.speed_mode(&mode.speed).is_none() {
+                model.speed_modes.push(mode.clone());
+            }
+        }
+    }
     if let Some(v) = &p.default_speed {
         model.default_speed = Some(v.clone());
     }
@@ -950,13 +962,29 @@ mod tests {
     }
 
     #[test]
-    fn codex_seed_advertises_only_pinned_fast_tier() {
+    fn codex_seed_advertises_pinned_fast_and_documented_astra_ultrafast() {
         for model in bundled_codex_seed() {
-            assert_eq!(model.speed_modes.len(), 1, "{}", model.id);
             let mode = model.speed_mode(&Speed::Fast).unwrap();
             assert_eq!(mode.name, "Fast");
             assert_eq!(mode.wire_value, "priority");
             assert!(mode.cost.is_some());
+            assert!(model.speed_mode(&Speed::Flex).is_none());
+            if model.id == "gpt-6-astra" {
+                let ultra = model.speed_mode(&Speed::Ultrafast).unwrap();
+                assert_eq!(ultra.wire_value, "ultrafast");
+                assert!(ultra.description.contains("eligible"));
+                let cost = ultra.cost.as_ref().unwrap();
+                for (input, expected) in [(272_000, 16.32), (272_001, 32.64012)] {
+                    let mut usage = Usage {
+                        input,
+                        ..Default::default()
+                    };
+                    calculate_cost(cost, &mut usage);
+                    assert!((usage.cost.total - expected).abs() < 1e-10);
+                }
+            } else {
+                assert!(model.speed_mode(&Speed::Ultrafast).is_none());
+            }
             assert_eq!(
                 model.default_speed,
                 if ["gpt-6-sol", "gpt-6-luna"].contains(&model.id.as_str()) {
@@ -1524,10 +1552,12 @@ mod tests {
         }
         // Every override target must reference a real seed entry
         // before we try to apply it. This catches typos at test time.
+        let codex = bundled_codex_seed();
         for entry in &overrides.overrides {
             assert!(
                 seed.models
                     .iter()
+                    .chain(&codex)
                     .any(|m| m.provider == entry.target.provider && m.id == entry.target.id),
                 "override target {}/{} does not match any seed entry",
                 entry.target.provider,

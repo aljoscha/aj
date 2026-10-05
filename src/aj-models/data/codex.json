@@ -43,6 +43,27 @@
               }
             ]
           }
+        },
+        {
+          "speed": "ultrafast",
+          "name": "Ultrafast",
+          "description": "Requires Pro $500 or eligible Enterprise/Edu access. Uses 8x included usage or 6x purchased credits. Workspace permissions apply.",
+          "wire_value": "ultrafast",
+          "cost": {
+            "input": 60.0,
+            "output": 300.0,
+            "cache_read": 6.0,
+            "cache_write": 75.0,
+            "tiers": [
+              {
+                "input_tokens_above": 272000,
+                "input": 120.0,
+                "output": 450.0,
+                "cache_read": 12.0,
+                "cache_write": 150.0
+              }
+            ]
+          }
         }
       ],
       "input": [

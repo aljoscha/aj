@@ -706,6 +706,31 @@ pub fn update_codex_speed_metadata(
                 .map(|mode| mode.speed.clone())
         });
     }
+    for entry in crate::registry::bundled_overrides().overrides {
+        if entry.target.provider == CODEX_PROVIDER_ID {
+            crate::registry::apply_override(models, &entry);
+        }
+    }
+    for model in models
+        .iter_mut()
+        .filter(|model| model.provider == CODEX_PROVIDER_ID)
+    {
+        let native = native_models
+            .iter()
+            .find(|native| native.provider == "openai" && native.id == model.id);
+        for mode in &mut model.speed_modes {
+            if mode.cost.is_none() {
+                mode.cost = native
+                    .and_then(|native| {
+                        native
+                            .speed_modes
+                            .iter()
+                            .find(|native| native.wire_value == mode.wire_value)
+                    })
+                    .and_then(|native| native.cost.clone());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1226,6 +1251,35 @@ mod tests {
         update_codex_speed_metadata(&mut models, &body.to_string(), &[]).unwrap();
         assert_eq!(models[0].default_speed, Some(Speed::Named("turbo".into())));
         assert!(models[0].speed_modes[0].cost.is_none());
+    }
+
+    #[test]
+    fn codex_regeneration_preserves_documented_supplements_and_source_modes() {
+        let native: Catalog = serde_json::from_str(include_str!("../data/models.json")).unwrap();
+        let body = serde_json::json!({"models":[{"slug":"gpt-6-astra", "service_tiers":[
+            {"id":"priority", "name":"Source Fast"},
+            {"id":"future-tier", "name":"Future"}
+        ]}]});
+        let mut models = bundled_codex_seed();
+        update_codex_speed_metadata(&mut models, &body.to_string(), &native.models).unwrap();
+        let model = models
+            .iter()
+            .find(|model| model.id == "gpt-6-astra")
+            .unwrap();
+        assert_eq!(model.speed_mode(&Speed::Fast).unwrap().name, "Source Fast");
+        assert!(
+            model
+                .speed_mode(&Speed::Named("future-tier".into()))
+                .is_some()
+        );
+        let ultra = model.speed_mode(&Speed::Ultrafast).unwrap();
+        assert_eq!(ultra.wire_value, "ultrafast");
+        assert_eq!(ultra.cost.as_ref().unwrap().input, 60.0);
+        assert!(model.speed_mode(&Speed::Flex).is_none());
+        assert!(
+            model.default_speed.is_none(),
+            "a restricted tier is not a paid default"
+        );
     }
 
     #[test]

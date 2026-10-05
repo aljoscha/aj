@@ -191,6 +191,23 @@
         ]
       },
       "reason": "Flex availability and mode-specific short/long-context prices follow https://developers.openai.com/api/docs/pricing. models.dev omits these additional tiers and context prices."
+    },
+    {
+      "target": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "patch": {
+        "additional_speed_modes": [
+          {
+            "speed": "ultrafast",
+            "name": "Ultrafast",
+            "description": "Requires Pro $500 or eligible Enterprise/Edu access. Uses 8x included usage or 6x purchased credits. Workspace permissions apply.",
+            "wire_value": "ultrafast"
+          }
+        ]
+      },
+      "reason": "https://learn.chatgpt.com/docs/agent-configuration/speed documents GPT-6 Astra Ultrafast in Codex on eligible plans. The bundled CLI catalog omits this restricted tier. Seed generation supplies API-equivalent prices from matching native metadata. Flex is not documented for ChatGPT-authenticated Codex."
     }
   ]
 }
