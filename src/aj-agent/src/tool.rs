@@ -1234,7 +1234,8 @@ pub struct SpawnAgentConfig {
 /// list), sub-agent spawning, progress updates, and a cancellation
 /// token tools must honor for long-running work.
 pub trait ToolContext: Send {
-    /// Yield after the complete tool batch, without another inference.
+    /// Request a yield without another inference. Honored only when this is
+    /// the sole call in the batch. Mixed batches return all results normally.
     /// Hosts opt into this capability when they can resume on new input.
     fn request_wait(&self) -> Result<(), BoxError> {
         Err("Waiting is unavailable outside the hosted main agent.".into())

@@ -262,7 +262,7 @@ impl SessionClient {
                 }
                 self.settings = Some(settings);
                 self.oracle_settings = oracle_settings;
-                chat.note_goal(goal, working);
+                chat.note_goal(goal);
                 self.working = working;
                 Redraw(true)
             }
@@ -767,13 +767,25 @@ mod tests {
         );
         assert_eq!(chat.goal.as_ref().unwrap().time_used_seconds, 90);
 
-        for (status, working) in [
-            (GoalStatus::Active, false),
-            (GoalStatus::Paused, true),
-            (GoalStatus::BudgetLimited, true),
-            (GoalStatus::Complete, true),
+        let _ = client.apply(&mut chat, state(false, GoalStatus::Active, false, 100));
+        assert!(!client.working());
+        let now = Instant::now();
+        assert_eq!(
+            chat.goal_runtime_seconds(now + Duration::from_secs(10))
+                - chat.goal_runtime_seconds(now),
+            10,
+            "waiting while active counts toward goal elapsed time"
+        );
+        assert_eq!(chat.goal.as_ref().unwrap().time_used_seconds, 100);
+
+        for status in [
+            GoalStatus::Paused,
+            GoalStatus::Blocked,
+            GoalStatus::UsageLimited,
+            GoalStatus::BudgetLimited,
+            GoalStatus::Complete,
         ] {
-            let _ = client.apply(&mut chat, state(false, status, working, 125));
+            let _ = client.apply(&mut chat, state(false, status, true, 125));
             assert_eq!(
                 chat.goal_runtime_seconds(Instant::now() + Duration::from_secs(3600)),
                 125

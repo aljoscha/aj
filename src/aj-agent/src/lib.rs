@@ -1720,6 +1720,13 @@ impl Agent {
                     return Err(TurnError::Aborted);
                 }
 
+                // Waiting must not suppress the inference that receives sibling
+                // results. Clear a mixed-batch request before any stop hook can
+                // end the run, so it cannot label that end or affect later steps.
+                if turn_tool_results.len() != 1 {
+                    self.session_state.lock().wait_requested = false;
+                }
+
                 // The turn (this inference plus its tool batch) is
                 // complete. `TurnEnd` carries the finalized assistant
                 // message and the batch's tool results. The
@@ -1748,8 +1755,6 @@ impl Agent {
                 if self.cancellation.is_cancelled() {
                     return Err(TurnError::Aborted);
                 }
-                // A wait request never leaves sibling calls unfinished. Their
-                // results and TurnEnd are recorded before yielding to the host.
                 if self.session_state.lock().wait_requested {
                     break;
                 }

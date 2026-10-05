@@ -20,7 +20,7 @@ impl ToolDefinition for WaitTool {
     }
 
     fn description(&self) -> &'static str {
-        "Yield after the current tool batch until new user input or a background task or agent result arrives. Use only when there is no useful work to do until an update arrives. There is no timeout. Takes no arguments."
+        "Yield until new user input or a background task or agent result arrives. Call this tool alone. In a batch with other tool calls, all results are returned normally without waiting. Use only when there is no useful work to do until an update arrives. There is no timeout. Takes no arguments."
     }
 
     async fn execute(
@@ -29,7 +29,7 @@ impl ToolDefinition for WaitTool {
         _: Self::Input,
     ) -> Result<ToolOutcome, aj_agent::BoxError> {
         let (text, is_error) = match ctx.request_wait() {
-            Ok(()) => ("Waiting for input.".to_string(), false),
+            Ok(()) => ("Wait requested.".to_string(), false),
             Err(error) => (format!("Cannot wait: {error}"), true),
         };
         Ok(ToolOutcome {

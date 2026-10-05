@@ -69,8 +69,8 @@ pub(crate) struct StatusState {
     /// Count of running `Sub(_)` agents, for the footer's activity
     /// indicator.
     pub(crate) sub_agents_running: usize,
-    /// Main's active goal needs footer clock ticks even while the user views a
-    /// finished sub-agent whose own loader is idle.
+    /// Main's active goal needs footer clock ticks even while waiting or while
+    /// the user views a finished sub-agent whose own loader is idle.
     pub(crate) goal_running: bool,
     /// Connection state, mirrored from the world alongside the lifecycle
     /// bits.

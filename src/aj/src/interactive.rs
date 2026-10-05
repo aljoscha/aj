@@ -2991,7 +2991,7 @@ fn sync_status(world: &World) -> bool {
             .filter(|a| matches!(a, AgentId::Sub(_)))
             .count(),
         goal_running: world.connection == Connection::Connected
-            && world.client().working()
+            && !world.client().rebuilding()
             && world
                 .chat
                 .borrow()
@@ -18481,6 +18481,97 @@ mod tests {
         })
         .await
         .expect("Oracle-only change must survive the attach block");
+        shut_down(&world).await;
+    }
+
+    #[tokio::test]
+    async fn active_idle_goal_keeps_status_ticks_without_a_busy_loader() {
+        use aj_agent::goal::{Goal, GoalStatus};
+
+        let dir = TempDir::new().unwrap();
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        fold_ready_frames(&mut world);
+        let mut frame = aj_wire::Frame::State {
+            session: world.session().into(),
+            epoch: world.client().cursor().unwrap().epoch,
+            opens_block: false,
+            working: false,
+            settings: world.client().settings().unwrap().clone(),
+            oracle_settings: None,
+            goal: Some(Goal {
+                id: "waiting".into(),
+                objective: "finish".into(),
+                status: GoalStatus::Active,
+                token_budget: None,
+                tokens_used: 0,
+                time_used_seconds: 90,
+            }),
+            credential_warning: None,
+        };
+        let _ = world.directory.apply(frame.clone());
+        assert!(!world.client().working());
+        assert!(!world.client().rebuilding());
+        assert!(sync_status(&world), "an active idle goal needs clock ticks");
+        assert!(!world.status.borrow().busy());
+        assert!(footer_row(&shell).contains("Pursuing goal"));
+        let line = Rc::clone(&shell.borrow().view().status_line);
+        assert_eq!(
+            line.borrow_mut()
+                .draw(&crate::test_support::draw_ctx(80, None))
+                .size
+                .height,
+            0
+        );
+        for _ in 0..2 {
+            let mut ctx = EventContext::new();
+            line.borrow_mut().handle_event(&mut ctx, &Event::Tick);
+            assert!(
+                ctx.cmds
+                    .iter()
+                    .any(|command| matches!(command, vaxis::vxfw::Command::Tick(_))),
+                "waiting keeps the tick chain alive"
+            );
+        }
+
+        world.connection = Connection::Reconnecting;
+        sync_status(&world);
+        assert!(!world.status.borrow().goal_running);
+        assert!(footer_row(&shell).contains("Pursuing goal (1m)"));
+        world.connection = Connection::Connected;
+        if let aj_wire::Frame::State {
+            opens_block, epoch, ..
+        } = &mut frame
+        {
+            *opens_block = true;
+            *epoch = "rebuilt-goal".into();
+        }
+        let _ = world.directory.apply(frame.clone());
+        assert!(world.client().rebuilding());
+        sync_status(&world);
+        assert!(!world.status.borrow().goal_running);
+        assert!(footer_row(&shell).contains("Pursuing goal (1m)"));
+        let _ = world.directory.apply(aj_wire::Frame::CaughtUp {
+            session: world.session().into(),
+            epoch: "rebuilt-goal".into(),
+            last_seq: 0,
+            tasks: Default::default(),
+            queues: Default::default(),
+        });
+        assert!(!world.client().rebuilding());
+        assert!(sync_status(&world));
+
+        if let aj_wire::Frame::State {
+            goal, opens_block, ..
+        } = &mut frame
+        {
+            *opens_block = false;
+            goal.as_mut().unwrap().status = GoalStatus::Paused;
+        }
+        let _ = world.directory.apply(frame);
+        assert!(!sync_status(&world));
+        let mut ctx = EventContext::new();
+        line.borrow_mut().handle_event(&mut ctx, &Event::Tick);
+        assert!(ctx.cmds.is_empty(), "stopped goal ends the tick chain");
         shut_down(&world).await;
     }
 

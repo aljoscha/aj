@@ -556,17 +556,16 @@ impl ChatState {
         }
     }
 
-    pub(crate) fn note_goal(&mut self, goal: Option<Goal>, working: bool) {
-        self.goal_clock = (working
-            && goal
-                .as_ref()
-                .is_some_and(|goal| goal.status == GoalStatus::Active))
-        .then(Instant::now);
+    pub(crate) fn note_goal(&mut self, goal: Option<Goal>) {
+        self.goal_clock = goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == GoalStatus::Active)
+            .then(Instant::now);
         self.goal = goal;
     }
 
-    /// Display runtime at `now`, advancing only while Main is actively pursuing
-    /// the goal. Each host snapshot rebases the clock onto its reported subtotal.
+    /// Display runtime at `now`, advancing while the goal is active, including
+    /// waits. Each host snapshot rebases the clock onto its reported subtotal.
     pub fn goal_runtime_seconds(&self, now: Instant) -> u64 {
         self.goal.as_ref().map_or(0, |goal| {
             goal.time_used_seconds.saturating_add(

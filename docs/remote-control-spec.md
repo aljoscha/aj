@@ -535,15 +535,17 @@ Each idle-driven goal turn records internal context with a display-only `notice`
 field. The transcript renders it as a dim "Continuing goal." row, live and on
 replay, rather than as editable user input. Ordinary goal-state context stays
 hidden. The notice is not included in model input.
-The hosted Main agent can call `wait` to yield after its complete tool batch.
-The resulting transient `agent_end` has `waiting: true` (an absent field means
-false). The agent is idle and the goal remains active, but no synthetic goal
-turn is started until new input arrives. Queued input and task-completion
-notices, including ones already queued at yield, retain their ordinary wake
-paths. A new run clears the wait. Explicit user goal creation, replacement,
-objective editing or resume also releases it. Running background processes
-alone do not suppress goal continuation. The wait is not persisted, and the
-tool is unavailable to sub-agents and print mode.
+The hosted Main agent can call `wait` alone to yield. In a batch with other
+tool calls, all results are returned to the next inference normally. The
+mixed-batch wait request is discarded, not deferred to a later step.
+A standalone wait ends the run with a transient `agent_end` carrying
+`waiting: true` (an absent field means false). The agent is idle and the goal
+remains active, but no synthetic goal turn starts until new input arrives.
+Queued input and task-completion notices, including ones already queued at
+yield, retain their ordinary wake paths. A new run clears the wait. Explicit user
+goal creation, replacement, objective editing or resume also releases it.
+Running background processes alone do not suppress goal continuation. The wait
+is not persisted, and the tool is unavailable to sub-agents and print mode.
 Explicit pause, block and completion close goal accounting, whether requested
 by the user or the model. Later reporting and descendant results are outside
 that subtotal. Clearing a goal also stops its accounting and continuations.
@@ -595,14 +597,14 @@ or usage-limited goal offers Resume or leave stopped, without prompting again
 on live pauses or reconnects.
 The zero-argument `goal` palette action opens the goal window. The footer reads
 live snapshots and shows one compact goal phrase per status. Active pursuit
-shows budget usage, or elapsed runtime without a budget. Paused, stalled (blocked) and
-usage-limited goals show the control hint. A budget-limited goal shows its
-usage against the budget. A complete goal shows tokens used when it had a
-budget, otherwise elapsed runtime.
-Runtime advances locally between snapshots while the goal is active and Main
-is working, including while viewing another agent. Stopped goals and unsettled
-connections show the host's recorded time. This display clock never changes
-persisted usage.
+shows budget usage, or elapsed goal time without a budget. Paused, stalled
+(blocked) and usage-limited goals show the control hint. A budget-limited goal
+shows its usage against the budget. A complete goal shows tokens used when it had a
+budget, otherwise elapsed goal time.
+Elapsed goal time includes waiting while the goal is active. It advances
+locally between snapshots even while Main is idle or another agent is viewed.
+Stopped goals and unsettled connections show the host's recorded time. This
+display clock never changes persisted usage.
 The goal is right-aligned and reserves its width, so narrow terminals truncate
 the usual fields before it. Only a goal wider than the whole footer is omitted.
 
