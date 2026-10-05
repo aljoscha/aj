@@ -251,107 +251,7 @@ async fn compaction_settings_edits_apply_at_the_next_tool_batch_boundary() {
 }
 
 #[tokio::test]
-async fn completed_join_folds_buffered_failure_before_it_can_wake_queued_work() {
-    use crate::host::live::{LiveSession, SessionStatus, settings_of};
-    use crate::session::{SessionCore, SessionEntry, SessionSpec};
-    use aj_agent::events::CompactionReason;
-    use aj_session::{AppendHandoff, TaggedEvent};
-
-    let dir = task_lifetime_dir();
-    let config = aj_conf::Config::default();
-    let run = scripted_run_config_with_window(vec![finalized_text_message("unwanted wake")], 1000)
-        .lock()
-        .unwrap()
-        .clone();
-    let host = test_host(dir, config.clone(), run.clone());
-    let (core, _) = SessionCore::build(
-        &config,
-        run,
-        &host.inner.persistence,
-        &SessionSpec::Create {
-            entry: SessionEntry::Startup,
-            session_env: None,
-        },
-        None,
-    )
-    .unwrap();
-    let (settings, oracle_settings) = settings_of(&core.run_config);
-    let status = SessionStatus {
-        epoch: "join-order-test".into(),
-        last_seq: core.log.lock().await.last_seq(),
-        working: true,
-        settings,
-        oracle_settings,
-        goal: None,
-        finished_subs: Default::default(),
-        driven_subs: Default::default(),
-        interrupted_subs: Default::default(),
-        last_activity: chrono::Utc::now(),
-        tag: None,
-        archived: false,
-        last_work: std::time::Instant::now(),
-    };
-    let (request_tx, requests) = mpsc::unbounded_channel();
-    let session = Arc::new(LiveSession::new(
-        core,
-        AppendHandoff::default(),
-        status,
-        request_tx,
-    ));
-    let (events_tx, events) = mpsc::unbounded_channel();
-    let (_failure_tx, failure) = oneshot::channel();
-    let mut driver = super::Driver::new(
-        Arc::clone(&session),
-        Arc::clone(&host.inner.shared),
-        events,
-        requests,
-        failure,
-        0,
-    );
-    driver.lifecycle.mark_running(AgentId::Main);
-    session
-        .core
-        .message_queues
-        .append_follow_up(AgentId::Main, "PENDING");
-    assert!(!session.is_draining());
-    assert!(!driver.compaction_failed);
-
-    // Model the select race deterministically: the final event is available,
-    // but the completed join is handled before the event arm gets another poll.
-    events_tx
-        .send(TaggedEvent {
-            event: AgentEvent::CompactionEnd {
-                agent_id: AgentId::Main,
-                reason: CompactionReason::Threshold,
-                tokens_before: 900,
-                tokens_after: 900,
-                summary: None,
-                error: Some("summary failed".into()),
-                usage: None,
-            },
-            entry: None,
-            branch_settings: None,
-        })
-        .unwrap();
-    driver.on_join(crate::turn::Joined {
-        agent: AgentId::Main,
-        outcome: Ok(Err(aj_agent::TurnError::Recoverable(
-            "compaction failed".into(),
-        ))),
-    });
-    assert!(
-        !session.status().working,
-        "join must not restart queued work"
-    );
-    assert_eq!(
-        session.core.message_queues.snapshot(AgentId::Main).text,
-        "PENDING"
-    );
-    host.shutdown().await;
-}
-
-#[tokio::test]
-async fn failed_mid_turn_compaction_holds_queued_input_and_late_task_until_user_prompt() {
+async fn failed_compaction_replays_its_notice_and_holds_pending_work_until_user_prompt() {
     let scenario = async {
         let dir = task_lifetime_dir();
         let gate = dir.path().join("task-gate");
@@ -516,6 +416,68 @@ async fn failed_mid_turn_compaction_holds_queued_input_and_late_task_until_user_
             "QUEUED_FOLLOW_UP"
         );
 
+        // A client that missed the failure must learn why continuation stopped.
+        // Re-serving that same entry must update its warning, not duplicate it.
+        let mut chat = crate::chat::ChatState::new(session.status().settings.clone());
+        let mut lifecycle = crate::session::AgentLifecycle::default();
+        let mut failure_id = None;
+        for _ in 0..2 {
+            let mut attachment = host
+                .attach(&[crate::host::AttachRequest {
+                    session: id.clone(),
+                    cursor: None,
+                }])
+                .await
+                .unwrap();
+            let mut failures = 0;
+            while let Some(frame) = attachment.recv().await {
+                match frame {
+                    aj_wire::Frame::CaughtUp { .. } => break,
+                    aj_wire::Frame::Event {
+                        event, durability, ..
+                    } => {
+                        if let Some(
+                            event @ AgentEvent::CompactionEnd {
+                                error: Some(replayed),
+                                ..
+                            },
+                        ) = event.known()
+                        {
+                            assert_eq!(replayed, &error);
+                            let durability = durability.expect("failure must be durable");
+                            if let Some(first) = &failure_id {
+                                assert_eq!(&durability.entry_id, first);
+                            } else {
+                                failure_id = Some(durability.entry_id.clone());
+                            }
+                            let _ = crate::chat::reduce(
+                                &mut chat,
+                                &mut lifecycle,
+                                event.clone(),
+                                Some(&durability),
+                            );
+                            failures += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                failures, 1,
+                "attachment must replay the failure exactly once"
+            );
+        }
+        let rows = chat.transcript(AgentId::Main).unwrap().entries();
+        assert_eq!(rows.len(), 1, "replayed failure must not duplicate its row");
+        assert!(
+            matches!(&rows[0].kind, crate::chat::EntryKind::Notice(notice)
+            if notice.text == format!("Compaction failed: {error}"))
+        );
+        assert!(
+            !session.status().working,
+            "attachment must not release the hold"
+        );
+
         prompt(&host, &id, "EXPLICIT_RESTART").await;
         idle(&host, &id, &session).await;
         assert!(!session.core.message_queues.has_pending(AgentId::Main));
@@ -524,6 +486,7 @@ async fn failed_mid_turn_compaction_holds_queued_input_and_late_task_until_user_
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 4);
             let resumed = serde_json::to_string(&requests[3].messages).unwrap();
+            assert!(!resumed.contains(&error), "failure is display-only");
             for text in [
                 "EXPLICIT_RESTART",
                 "QUEUED_FOLLOW_UP",

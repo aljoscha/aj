@@ -132,6 +132,9 @@ The host layer depends on no terminal, which is what `aj serve` is.
   including overflow recovery, without automatically retrying compaction.
   Queued input and task notices remain pending until an explicit start, such
   as a prompt, manual compaction, or goal resume. The hold is in-memory only.
+  The failure is recorded as a display-only log entry,
+  so reconnect and session replay show the same transcript warning. Replaying
+  a failure does not reinstate the hold or change model context.
   Post-turn threshold triggering is unchanged.
 
 ## 5. Wire protocol
@@ -281,8 +284,8 @@ Every frame is in exactly one class:
 
 - **Durable** event frames correspond to persisted log entries: the
   `MessageEnd` that triggers persistence, the `SubAgentStart` that
-  writes the spawn root, the `CompactionEnd` whose checkpoint entry the
-  compaction path appends, and the notices or `SubAgentSettings` the projection derives from
+  writes the spawn root, the `CompactionEnd` for a checkpoint or recorded
+  failure, and the notices or `SubAgentSettings` the projection derives from
   notice-producing state entries. Durable frames carry `seq` (the
   entry's 1-based append position, so `0` reads as nothing durable yet)
   and `entry_id`. They are exactly what backfill can regenerate. Seqs
@@ -299,6 +302,9 @@ Every frame is in exactly one class:
   identifies both summary and spend, so cursor filtering treats them as one
   event. Backfill regenerates the same event. Legacy log entries without usage
   omit that field and leave spend unknown, not zero.
+  A failed compaction projects one durable `CompactionEnd` with `error` and
+  without summary or usage. Its identity deduplicates the transcript warning.
+  Cancellation writes no entry and its `CompactionEnd` remains transient.
 - **Lossy** frames are the three cumulative-snapshot events,
   `MessageUpdate` (keyed by agent id), `ToolExecutionUpdate` (keyed by
   call id), `TaskOutput` (keyed by task id), plus the `list` frame kind

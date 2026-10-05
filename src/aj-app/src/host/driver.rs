@@ -40,6 +40,7 @@ use aj_wire::{DurableEvent, Frame};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 
+use crate::compaction::CompactionFailure;
 use crate::host::live::{self, LiveSession, ReleaseOutcome, ReleasedRow, Request, settings_of};
 use crate::host::{
     Command, CommandOutcome, HeadTarget, HostError, HostShared, PERSISTENCE_FAILED_CODE, QueueOp,
@@ -371,13 +372,8 @@ impl Driver {
             AgentEvent::CompactionStart { agent_id, .. } => {
                 self.lifecycle.mark_compacting(*agent_id);
             }
-            AgentEvent::CompactionEnd {
-                agent_id, error, ..
-            } => {
+            AgentEvent::CompactionEnd { agent_id, .. } => {
                 self.lifecycle.clear_compacting(*agent_id);
-                if *agent_id == AgentId::Main && error.is_some() {
-                    self.compaction_failed = true;
-                }
             }
             _ => {}
         }
@@ -416,11 +412,16 @@ impl Driver {
     fn on_join(&mut self, joined: Joined) {
         // A producer can emit its final events and finish after the select
         // loop polled an empty event channel but before it polls this join.
-        // Fold those events while the turn is still driven, before any reap
-        // can permit an automatic wake past a compaction failure.
+        // Fold those events before goal accounting and reap-time publication.
         self.drain_events();
         let Joined { agent, outcome } = joined;
         if agent == AgentId::Main {
+            // Main remains driven until reap, so no automatic wake can precede
+            // this decision. Failure control uses the result, not its UI event.
+            if matches!(&outcome, Ok(Err(TurnError::Recoverable(error))) if error.is::<CompactionFailure>())
+            {
+                self.compaction_failed = true;
+            }
             self.goal.finish(&outcome);
             // An interrupted child has no running mark for `reap` to sweep.
             // The parent's tool future nevertheless owned its assignment.

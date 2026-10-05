@@ -586,8 +586,8 @@ pub fn extract_file_ops(
 }
 
 /// Build a plan, or `None` when compaction is not applicable (empty
-/// view, the last entry is already a `Compaction`, no valid cut point,
-/// or nothing to summarize).
+/// view, the last entry other than a transcript error is already a
+/// `Compaction`, no valid cut point, or nothing to summarize).
 ///
 /// The summarized range starts at the previous compaction's
 /// `first_kept_entry_id` when one exists (so a second compaction folds
@@ -604,7 +604,11 @@ pub fn prepare_compaction(
         return None;
     }
     if matches!(
-        entries.last().map(|e| &e.entry),
+        entries
+            .iter()
+            .rev()
+            .map(|e| &e.entry)
+            .find(|entry| !matches!(entry, ConversationEntryKind::CompactionFailed { .. })),
         Some(ConversationEntryKind::Compaction { .. })
     ) {
         return None;

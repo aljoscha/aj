@@ -426,7 +426,8 @@ pub enum AgentEvent {
     /// renderer can always treat this event as the signal to stop the
     /// in-progress indicator:
     ///
-    /// - `error: Some` — compaction failed and nothing was written.
+    /// - `error: Some` — compaction failed without replacing history. The
+    ///   session listener records the failure for transcript replay.
     /// - `summary: Some` (and `error: None`) — success; the text is the
     ///   generated summary so a live renderer can show a
     ///   compaction-summary row.
@@ -437,7 +438,8 @@ pub enum AgentEvent {
     /// for unsuccessful runs and checkpoints whose spend is unknown.
     ///
     /// The event is not stored verbatim. Successful ends carry the checkpoint's
-    /// durable tag during forwarding and replay. Unsuccessful ends are transient.
+    /// durable tag during forwarding and replay. Failures carry their error
+    /// entry's durable tag. Cancelled ends are transient.
     CompactionEnd {
         agent_id: AgentId,
         reason: CompactionReason,

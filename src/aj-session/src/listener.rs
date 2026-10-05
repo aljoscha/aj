@@ -1,14 +1,15 @@
 //! Bus listener that drives the conversation log off of
-//! [`AgentEvent::MessageEnd`].
+//! [`AgentEvent::MessageEnd`] and compaction failures.
 //!
 //! The agent emits a typed
-//! [`AgentEvent::MessageEnd`] for every payload that needs to hit
+//! [`AgentEvent::MessageEnd`] for every message payload that needs to hit
 //! disk: the user's typed prompt, the assistant message at the end
 //! of every inference, and one tool_result message per tool call in
 //! a tool batch. A persistence listener subscribed to the agent's
 //! bus owns the [`ConversationLog`] handle and translates each
 //! [`MessageEnd`] event into one `ConversationView::add_message`
-//! call.
+//! call. Failed [`AgentEvent::CompactionEnd`] events append transcript-only
+//! errors. Successful checkpoints are appended by the compaction run.
 //!
 //! Because the bus awaits each listener inline, the listener returning `Err`
 //! aborts that run. A hosted log also reports its first terminal write failure
@@ -28,7 +29,7 @@
 //! `SubAgentStart` (and hence an empty sub thread) is an error.
 //!
 //! Write ownership is split with the binary: the listener has
-//! exclusive ownership of *message* writes and of sub-agent spawn
+//! exclusive ownership of message and compaction failure writes and sub-agent spawn
 //! entries (spawns happen inside the agent); main-thread settings
 //! entries are appended by the binary, which already holds the log
 //! handle and owns the run-config state they record. The binary
@@ -128,14 +129,14 @@ impl Drop for PersistencePermit {
 /// append rather than inferring it at delivery time, which would race the
 /// concurrent appends a background sub-agent makes.
 ///
-/// `CompactionEnd` is emitted while the append still holds the log guard.
+/// Successful `CompactionEnd` is emitted while the append holds the log guard.
 /// Otherwise another durable append can publish a higher sequence before the
 /// checkpoint. A bus listener must therefore not take the log lock for this
 /// event, or it deadlocks against the emitting append.
 ///
 /// One slot: at most one compaction runs per session at a time, and a filed
-/// entry is taken by the very next `CompactionEnd`. The guard returned by
-/// [`AppendHandoff::file`] clears an unconsumed slot if delivery is canceled.
+/// entry is taken by the next successful `CompactionEnd`. The guard returned
+/// by [`AppendHandoff::file`] clears an unconsumed slot if delivery is canceled.
 #[derive(Clone, Default)]
 pub struct AppendHandoff {
     state: Arc<StdMutex<AppendHandoffState>>,
@@ -159,8 +160,8 @@ pub struct AppendHandoffGuard {
 }
 
 impl AppendHandoff {
-    /// Hand `entry` to the next `CompactionEnd` the forwarder sees and return
-    /// the guard that owns the filing until it is consumed.
+    /// Hand `entry` to the next successful `CompactionEnd` the forwarder sees.
+    /// Return the guard that owns the filing until it is consumed.
     pub fn file(&self, entry: EntryRef) -> AppendHandoffGuard {
         let token = {
             let mut state = self.state.lock().expect("append handoff mutex poisoned");
@@ -210,8 +211,9 @@ impl Drop for AppendHandoffGuard {
 /// Build a [`Listener`] that writes every finalized
 /// [`AgentEvent::MessageEnd`] to the given log handle.
 ///
-/// Other event variants are intentional no-ops here, with one
-/// exception: [`AgentEvent::SubAgentStart`] writes the spawned
+/// Failed [`AgentEvent::CompactionEnd`] writes a transcript-only error on the
+/// agent thread. Successful ends use [`AppendHandoff`] and cancellation stays
+/// transient. [`AgentEvent::SubAgentStart`] writes the spawned
 /// sub-agent's `SubAgentSpawn` root entry, anchored at the parent
 /// thread's current head. Without this hook the sub-agent's first
 /// write would have no reachable parent (its own
@@ -239,8 +241,8 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 /// The tag is taken at the append site. A consumer that instead read the
 /// log's length when it received the event would race concurrent
 /// sub-agent appends and mis-number the event. The one
-/// durable event this listener does not append itself is `CompactionEnd`,
-/// whose entry is filed on `handoff` by the compaction run.
+/// durable event this listener does not append itself is a successful
+/// `CompactionEnd`, whose entry is filed on `handoff` by the compaction run.
 ///
 /// The send is non-blocking and a closed receiver is ignored, so a slow
 /// or absent consumer can never stall or fail a turn even though the bus
@@ -306,13 +308,17 @@ pub fn persisting_forwarder(
                 });
             } else {
                 // NOTE: this branch must not take the log lock. The
-                // compaction run emits `CompactionEnd`
+                // compaction run emits successful `CompactionEnd`
                 // while holding it (see [`AppendHandoff`]), so locking here
                 // would deadlock against the very append the event belongs to.
                 // That same emit-under-the-guard keeps it ordered without a
                 // lock of our own.
                 let entry = match &event {
-                    AgentEvent::CompactionEnd { .. } => handoff.take(),
+                    AgentEvent::CompactionEnd {
+                        error: None,
+                        summary: Some(_),
+                        ..
+                    } => handoff.take(),
                     _ => None,
                 };
                 let _ = sink.send(TaggedEvent {
@@ -333,7 +339,9 @@ pub fn persisting_forwarder(
 fn appends(event: &AgentEvent) -> bool {
     matches!(
         event,
-        AgentEvent::SubAgentStart { .. } | AgentEvent::MessageEnd { .. }
+        AgentEvent::SubAgentStart { .. }
+            | AgentEvent::MessageEnd { .. }
+            | AgentEvent::CompactionEnd { error: Some(_), .. }
     )
 }
 
@@ -379,6 +387,20 @@ fn persist(
         AgentEvent::MessageEnd { agent_id, message } => {
             let appended = persist_message(log, *agent_id, message.clone())?;
             Ok(Some(appended))
+        }
+        AgentEvent::CompactionEnd {
+            agent_id,
+            reason,
+            tokens_before,
+            error: Some(error),
+            ..
+        } => {
+            let filter = match agent_id {
+                AgentId::Main => ThreadFilter::USER,
+                AgentId::Sub(n) => ThreadFilter::subagent(*n),
+            };
+            log.append_compaction_failed(filter, *reason, *tokens_before, error.clone())
+                .map(Some)
         }
         _ => Ok(None),
     }
@@ -1354,9 +1376,8 @@ mod tests {
             .await
             .latest_leaf(ThreadFilter::USER)
             .expect("user leaf");
-        let checkpoint = log
-            .lock()
-            .await
+        let mut checkpoint_guard = log.lock().await;
+        let checkpoint = checkpoint_guard
             .append_compaction(
                 ThreadFilter::USER,
                 "summary".into(),
@@ -1368,17 +1389,22 @@ mod tests {
             )
             .expect("append the compaction checkpoint");
         let _filed = handoff.file(checkpoint);
-        bus.emit(AgentEvent::CompactionEnd {
-            agent_id: AgentId::Main,
-            reason: aj_agent::events::CompactionReason::Manual,
-            tokens_before: 100,
-            tokens_after: 10,
-            usage: None,
-            summary: Some("summary".into()),
-            error: None,
-        })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            bus.emit(AgentEvent::CompactionEnd {
+                agent_id: AgentId::Main,
+                reason: aj_agent::events::CompactionReason::Manual,
+                tokens_before: 100,
+                tokens_after: 10,
+                usage: None,
+                summary: Some("summary".into()),
+                error: None,
+            }),
+        )
         .await
+        .expect("successful forwarding must not acquire the log lock")
         .expect("emit compaction end");
+        drop(checkpoint_guard);
 
         let forwarded = drained(&mut rx);
         let kinds: Vec<(&'static str, Option<u64>)> = forwarded
@@ -1461,80 +1487,158 @@ mod tests {
             spawn_entry.entry,
             ConversationEntryKind::SubAgentSpawn { .. }
         ));
-    }
-
-    /// A failed or canceled compaction appends nothing and files nothing,
-    /// so its `CompactionEnd` is not durable even though an earlier
-    /// checkpoint exists in the log.
-    #[tokio::test]
-    async fn forwarder_leaves_a_compaction_end_that_filed_nothing_untagged() {
-        let (_dir, log) = fresh_log();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let handoff = AppendHandoff::default();
-        let bus = EventBus::new();
-        let _h = bus.subscribe(persisting_forwarder(
-            Arc::clone(&log),
-            handoff.clone(),
-            tx,
-            PersistenceFence::default(),
-        ));
-
-        bus.emit(AgentEvent::MessageEnd {
-            agent_id: AgentId::Main,
-            message: user_msg("hi"),
-        })
-        .await
-        .expect("emit user message");
-        let first_kept = log
-            .lock()
-            .await
-            .latest_leaf(ThreadFilter::USER)
-            .expect("user leaf");
-        let earlier = log
-            .lock()
-            .await
-            .append_compaction(
-                ThreadFilter::USER,
-                "earlier".into(),
-                first_kept,
-                Vec::new(),
-                100,
-                None,
-                aj_models::types::Usage::default(),
-            )
-            .expect("append the compaction checkpoint");
-        let _filed = handoff.file(earlier);
-        bus.emit(AgentEvent::CompactionEnd {
-            agent_id: AgentId::Main,
-            reason: aj_agent::events::CompactionReason::Manual,
-            tokens_before: 100,
-            tokens_after: 10,
-            usage: None,
-            summary: Some("earlier".into()),
-            error: None,
-        })
-        .await
-        .expect("emit the earlier compaction end");
-        let _ = drained(&mut rx);
+        let before = log_guard.linearize(log_guard.head().unwrap(), ThreadFilter::USER);
+        assert!(crate::compaction::prepare_compaction(&before, 1).is_none());
+        assert_eq!(log_guard.stats().compactions, 1);
+        let messages = serde_json::to_value(before.messages()).unwrap();
+        let occupancy = crate::compaction::estimate_conversation_context(&before).tokens;
+        drop(log_guard);
 
         bus.emit(AgentEvent::CompactionEnd {
             agent_id: AgentId::Main,
             reason: aj_agent::events::CompactionReason::Threshold,
             tokens_before: 100,
-            tokens_after: 100,
+            tokens_after: 0,
             usage: None,
             summary: None,
-            error: Some("boom".into()),
+            error: Some("failed after checkpoint".into()),
         })
         .await
-        .expect("emit failed compaction end");
-
-        let forwarded = drained(&mut rx);
-        assert_eq!(forwarded.len(), 1);
-        assert!(
-            forwarded[0].entry.is_none(),
-            "a failed compaction appends nothing, so its event is not durable"
+        .unwrap();
+        let guard = log.lock().await;
+        let resumed = ConversationLog::resume(
+            &ConversationPersistence::new(guard.path().parent().unwrap().to_path_buf()),
+            guard.session_id(),
+        )
+        .unwrap();
+        let after = resumed.linearize(resumed.head().unwrap(), ThreadFilter::USER);
+        assert_eq!(serde_json::to_value(after.messages()).unwrap(), messages);
+        assert_eq!(
+            crate::compaction::estimate_conversation_context(&after).tokens,
+            occupancy
         );
+        assert_eq!(resumed.stats().compactions, 1);
+        assert!(
+            crate::compaction::prepare_compaction(&after, 1).is_none(),
+            "a transcript error must not make a checkpoint eligible for recompaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_survives_reopen_without_changing_context_or_accounting() {
+        use aj_agent::events::CompactionReason;
+
+        for agent_id in [AgentId::Main, AgentId::Sub(1)] {
+            let (_dir, log) = fresh_log();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let bus = EventBus::new();
+            let subscription = bus.subscribe(persisting_forwarder(
+                Arc::clone(&log),
+                AppendHandoff::default(),
+                tx,
+                PersistenceFence::default(),
+            ));
+            bus.emit(AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: user_msg("hi"),
+            })
+            .await
+            .unwrap();
+            if agent_id != AgentId::Main {
+                bus.emit(sub_start(1, "do thing")).await.unwrap();
+            }
+            bus.emit(AgentEvent::MessageEnd {
+                agent_id,
+                message: assistant_text("answer"),
+            })
+            .await
+            .unwrap();
+            let filter = match agent_id {
+                AgentId::Main => ThreadFilter::USER,
+                AgentId::Sub(n) => ThreadFilter::subagent(n),
+            };
+            let guard = log.lock().await;
+            let before = guard.linearize(&guard.latest_leaf(filter).unwrap(), filter);
+            assert_eq!(
+                before.message_count(),
+                if agent_id == AgentId::Main { 2 } else { 1 }
+            );
+            let messages = serde_json::to_value(before.agent_messages()).unwrap();
+            let occupancy = crate::compaction::estimate_conversation_context(&before).tokens;
+            let stats = guard.stats();
+            let persistence =
+                ConversationPersistence::new(guard.path().parent().unwrap().to_path_buf());
+            let session_id = guard.session_id().to_string();
+            let count = guard.len();
+            drop(guard);
+            drained(&mut rx);
+
+            let failure = AgentEvent::CompactionEnd {
+                agent_id,
+                reason: CompactionReason::Overflow,
+                tokens_before: 1234,
+                tokens_after: 0,
+                usage: None,
+                summary: None,
+                error: Some("summarizer unavailable".into()),
+            };
+            bus.emit(failure.clone()).await.unwrap();
+            let forwarded = drained(&mut rx);
+            assert_eq!(forwarded.len(), 1);
+            let identity = forwarded[0].entry.clone().expect("failure is durable");
+            assert_eq!(identity.seq, u64::try_from(count).unwrap() + 1);
+
+            bus.emit(AgentEvent::CompactionEnd {
+                agent_id,
+                reason: CompactionReason::Manual,
+                tokens_before: 1234,
+                tokens_after: 0,
+                usage: None,
+                summary: None,
+                error: None,
+            })
+            .await
+            .unwrap();
+            let canceled = drained(&mut rx);
+            assert_eq!(canceled.len(), 1);
+            assert!(canceled[0].entry.is_none());
+            assert_eq!(log.lock().await.len(), count + 1);
+            drop(subscription);
+            drop(log);
+
+            // Reopen without an explicit flush: the failure itself must flush.
+            let resumed = ConversationLog::resume(&persistence, &session_id).unwrap();
+            assert_eq!(resumed.len(), count + 1);
+            let after = resumed.linearize(&resumed.latest_leaf(filter).unwrap(), filter);
+            assert_eq!(
+                serde_json::to_value(after.agent_messages()).unwrap(),
+                messages
+            );
+            assert_eq!(
+                crate::compaction::estimate_conversation_context(&after).tokens,
+                occupancy
+            );
+            assert_eq!(
+                serde_json::to_value(resumed.stats().usage).unwrap(),
+                serde_json::to_value(stats.usage).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(resumed.stats().compaction_usage).unwrap(),
+                serde_json::to_value(stats.compaction_usage).unwrap()
+            );
+            assert_eq!(resumed.stats().compactions, stats.compactions);
+            let snapshot = resumed.snapshot();
+            let replayed: Vec<_> =
+                project_suffix(&snapshot, Some(identity.seq - 1), &BTreeSet::new())
+                    .filter(|tagged| matches!(tagged.event, AgentEvent::CompactionEnd { .. }))
+                    .collect();
+            assert_eq!(replayed.len(), 1, "cancellation must not replay");
+            assert_eq!(replayed[0].entry, Some(identity));
+            assert_eq!(
+                serde_json::to_value(&replayed[0].event).unwrap(),
+                serde_json::to_value(failure).unwrap()
+            );
+        }
     }
 
     #[test]

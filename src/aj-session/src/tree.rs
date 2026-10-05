@@ -282,6 +282,7 @@ fn kind_placeholder(kind: &ConversationEntryKind) -> &'static str {
         ConversationEntryKind::Context { .. } => "(context)",
         ConversationEntryKind::SubAgentSpawn { .. } => "(subagent)",
         ConversationEntryKind::Compaction { .. } => "(compaction)",
+        ConversationEntryKind::CompactionFailed { .. } => "(compaction failed)",
     }
 }
 

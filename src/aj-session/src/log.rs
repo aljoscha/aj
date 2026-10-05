@@ -32,7 +32,7 @@ use std::{
     sync::Arc,
 };
 
-use aj_agent::events::AgentSettings;
+use aj_agent::events::{AgentSettings, CompactionReason};
 use aj_agent::goal::Goal;
 use aj_agent::message::AgentMessage;
 use aj_models::types::Message;
@@ -488,6 +488,13 @@ pub enum ConversationEntryKind {
         background: bool,
         settings: AgentSettings,
     },
+    /// A durable transcript error, not a checkpoint. It changes neither model
+    /// context nor compaction accounting and does not describe a current hold.
+    CompactionFailed {
+        reason: CompactionReason,
+        tokens_before: u64,
+        error: String,
+    },
     /// A compaction checkpoint: the thread's history before
     /// `first_kept_entry_id` was summarized into `summary`. Projection
     /// ([`Conversation::agent_messages`] / [`Conversation::messages`])
@@ -545,11 +552,15 @@ impl ConversationEntryKind {
     /// A `Compaction` checkpoint is likewise punctuation: it must be
     /// durable on its own so that resuming a compacted-then-abandoned
     /// session still sees the reduced context.
+    /// A compaction failure is punctuation so its error survives reconnect.
     /// A goal is also a submitted task, even before its first inference.
     /// Its state must survive a restart independently of model messages.
     pub fn is_punctuation(&self) -> bool {
         match self {
-            Self::Message { .. } | Self::Compaction { .. } | Self::GoalChange { .. } => true,
+            Self::Message { .. }
+            | Self::Compaction { .. }
+            | Self::CompactionFailed { .. }
+            | Self::GoalChange { .. } => true,
             Self::SystemPrompt { .. }
             | Self::ModelChange { .. }
             | Self::OracleModelChange { .. }
@@ -778,7 +789,8 @@ impl SessionSettings {
             // Compaction does not change settings: it keeps the
             // retained tail's last assistant model plus any
             // pre-boundary state entries.
-            ConversationEntryKind::Compaction { .. } => {}
+            ConversationEntryKind::Compaction { .. }
+            | ConversationEntryKind::CompactionFailed { .. } => {}
         }
     }
 }
@@ -2379,6 +2391,28 @@ impl ConversationLog {
                 tokens_before,
                 details,
                 usage,
+            },
+        )
+    }
+
+    /// Append a transcript-only compaction failure on the agent's thread.
+    /// The error is flushed immediately, independently of later messages.
+    pub(crate) fn append_compaction_failed(
+        &mut self,
+        filter: ThreadFilter,
+        reason: CompactionReason,
+        tokens_before: u64,
+        error: String,
+    ) -> Result<EntryRef, ConversationError> {
+        let parent = self.core.parent_for_thread_append(filter);
+        self.append(
+            parent,
+            filter.thread,
+            filter.agent_id,
+            ConversationEntryKind::CompactionFailed {
+                reason,
+                tokens_before,
+                error,
             },
         )
     }

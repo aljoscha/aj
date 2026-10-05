@@ -76,6 +76,11 @@
 //!   the scrollback shows the full history even though the model
 //!   context (rebuilt via `agent_messages`) is the reduced projection.
 //!
+//! [`ConversationEntryKind::CompactionFailed`] replays a durable
+//! [`AgentEvent::CompactionEnd`] error with its original reason and pre-run
+//! occupancy, no summary or usage, and zero post-run occupancy. It does not
+//! change model context or accounting. Cancellation is transient.
+//!
 //! Sub-agent runs are bracketed with synthesized
 //! [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
 //! events. A sub thread leads with its `SubAgentSpawn` entry, which
@@ -210,8 +215,8 @@ impl Iterator for Backfill<'_> {
 /// persists or synthesizes as durable, so live flow and backfill agree
 /// on what a cursor covers. That is the `MessageEnd` of a `Message`
 /// entry, the `SubAgentStart` of a `SubAgentSpawn` root, the
-/// `CompactionEnd` of a `Compaction` entry, and the `Notice` of a
-/// notice-producing state entry. At most one event per entry is tagged,
+/// `CompactionEnd` of a `Compaction` or `CompactionFailed` entry, and the
+/// `Notice` of a notice-producing state entry. At most one event per entry is tagged,
 /// which is what makes the client's per-frame cursor advance well-defined.
 pub fn project_suffix<'a>(
     log: &'a LogSnapshot,
@@ -757,7 +762,8 @@ impl ReplayState {
             | ConversationEntryKind::GoalChange { .. }
             | ConversationEntryKind::Context { .. }
             | ConversationEntryKind::SystemPrompt { .. }
-            | ConversationEntryKind::Compaction { .. } => {}
+            | ConversationEntryKind::Compaction { .. }
+            | ConversationEntryKind::CompactionFailed { .. } => {}
         }
     }
 
@@ -957,6 +963,24 @@ impl ReplayState {
                 // Seed entry: projected as the synthesized
                 // SubAgentStart by `bracket_subagent`, never as a
                 // notice.
+            }
+            ConversationEntryKind::CompactionFailed {
+                reason,
+                tokens_before,
+                error,
+            } => {
+                out.push_back(durable(
+                    at,
+                    AgentEvent::CompactionEnd {
+                        agent_id,
+                        reason: *reason,
+                        tokens_before: *tokens_before,
+                        tokens_after: 0,
+                        usage: None,
+                        summary: None,
+                        error: Some(error.clone()),
+                    },
+                ));
             }
             ConversationEntryKind::Compaction {
                 tokens_before,

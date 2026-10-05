@@ -131,7 +131,9 @@ keeps its settings. Compaction uses the usual compaction flow and the same
 run stays active. If compaction fails, the original history is preserved and
 continuation stops, including overflow recovery, with no automatic retry after
 the failure. Queued messages and task notices wait until you explicitly start
-work again. Post-turn threshold triggering is unchanged: interactive mode
+work again. The failure remains in the transcript after
+reconnecting or reopening the session, without becoming model input.
+Post-turn threshold triggering is unchanged: interactive mode
 checks the threshold, while print mode does not.
 
 `transcript_mode = "full"` selects transcript detail. The settings window cycles

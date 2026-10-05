@@ -6615,7 +6615,11 @@ fn assert_unsuccessful_summary_frames(
         .collect();
     assert_eq!(ends.len(), 1, "one terminal compaction event");
     let (durability, usage, summary, error) = ends[0];
-    assert!(durability.is_none(), "an unsuccessful end is not durable");
+    assert_eq!(
+        durability.is_some(),
+        expected_error.is_some(),
+        "failures are durable, cancellation is transient"
+    );
     assert!(usage.is_none(), "an unsuccessful end carries no usage");
     assert!(summary.is_none(), "an unsuccessful end owns no checkpoint");
     match expected_error {
@@ -6658,8 +6662,9 @@ async fn nothing_to_compact_leaves_every_usage_surface_unchanged() {
     harness.host.shutdown().await;
 }
 
-/// Failure and cancellation on the first summarizer call write and account
-/// nothing, even when the terminal provider message carries nonzero usage.
+/// Failure and cancellation on the first summarizer call account nothing,
+/// even when the terminal provider message carries nonzero usage. Only a
+/// failure writes a transcript error.
 #[tokio::test]
 async fn first_unsuccessful_summary_leaves_every_usage_surface_unchanged() {
     for (stop_reason, error) in [
@@ -6681,7 +6686,13 @@ async fn first_unsuccessful_summary_leaves_every_usage_surface_unchanged() {
         let frames = client.pump_until_idle().await;
         assert_unsuccessful_summary_frames(&frames, error, false);
         let after = compaction_accounting_snapshot(&harness, &session, &client).await;
-        assert_eq!(after, before);
+        assert_eq!(
+            after,
+            CompactionAccountingSnapshot {
+                log_len: before.log_len + usize::from(error.is_some()),
+                ..before
+            }
+        );
         harness.host.shutdown().await;
     }
 }
@@ -6710,7 +6721,13 @@ async fn unsuccessful_split_summary_leaves_every_usage_surface_unchanged() {
         let frames = client.pump_until_idle().await;
         assert_unsuccessful_summary_frames(&frames, error, true);
         let after = compaction_accounting_snapshot(&harness, &session, &client).await;
-        assert_eq!(after, before);
+        assert_eq!(
+            after,
+            CompactionAccountingSnapshot {
+                log_len: before.log_len + usize::from(error.is_some()),
+                ..before
+            }
+        );
         harness.host.shutdown().await;
     }
 }
@@ -7404,8 +7421,8 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
     let original_durable = durable_usage(&*handles.log.lock().await);
     assert_eq!(original_durable, before_total);
 
-    // Gate only the summarizer. Its start proves the plan has captured an id
-    // from the original log before the swap below.
+    // Gate only the summarizer so the write fault hits the checkpoint, not
+    // the conversation used to prepare it.
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     handles
@@ -7419,23 +7436,6 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         release: Arc::clone(&release),
         gate_first: std::sync::atomic::AtomicBool::new(true),
     });
-    let fault_persistence = ConversationPersistence::new(harness._dir.path().join("append-fault"));
-    let mut replacement = ConversationLog::create(&fault_persistence).expect("replacement log");
-    replacement
-        .append(
-            None,
-            aj_session::ThreadKind::User,
-            None,
-            aj_session::ConversationEntryKind::Message {
-                message: aj_agent::message::AgentMessage::wire(
-                    aj_models::types::Message::Assistant(priced("baseline", before_total)),
-                ),
-            },
-        )
-        .expect("seed replacement usage");
-    let replacement_entries = replacement.len();
-    assert_eq!(durable_usage(&replacement), before_total);
-
     harness
         .host
         .command(&session, Command::Compact { instructions: None })
@@ -7443,20 +7443,23 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         .expect("compact accepted");
     bounded("summarizer start", started.notified()).await;
 
-    let original = {
+    let fault = AppendFaultFixture::new(AppendFault::WriteZero);
+    let (original_entries, path, original_bytes) = {
         let mut log = handles.log.lock().await;
-        std::mem::replace(&mut *log, replacement)
+        let path = log.path().to_path_buf();
+        let bytes = std::fs::read(&path).unwrap();
+        fault
+            .install(&mut log)
+            .expect("install checkpoint write fault");
+        (log.len(), path, bytes)
     };
     release.notify_one();
-    let frames = client.pump_until_idle().await;
-    assert!(
-        frames.iter().any(|frame| matches!(
-            frame,
-            Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::CompactionEnd { error: Some(_), .. }))
-        )),
-        "the missing planned id rejects the checkpoint append",
-    );
+    let frames = frames_until(
+        &mut client.stream,
+        "checkpoint storage error",
+        |frame| matches!(frame, Frame::Error { code, .. } if code == "persistence_failed"),
+    )
+    .await;
     assert!(
         !frames.iter().any(|frame| matches!(
             frame,
@@ -7466,21 +7469,20 @@ async fn failed_checkpoint_append_leaves_every_usage_surface_unchanged() {
         "uncommitted summarizer usage reached the live fold",
     );
 
-    let replacement = {
-        let mut log = handles.log.lock().await;
-        assert_eq!(
-            log.len(),
-            replacement_entries,
-            "failed append changed the log"
-        );
-        assert_eq!(durable_usage(&log), before_total);
-        std::mem::replace(&mut *log, original)
-    };
-    drop(replacement);
+    for frame in frames {
+        let _ = client.client.apply(&mut client.chat, frame);
+    }
+    {
+        let log = handles.log.lock().await;
+        assert_eq!(log.len(), original_entries, "failed append changed the log");
+        assert_eq!(log.stats().compactions, 0);
+        assert_eq!(durable_usage(&log), original_durable);
+    }
+    assert_eq!(std::fs::read(path).unwrap(), original_bytes);
     assert_eq!(
-        durable_usage(&*handles.log.lock().await),
-        original_durable,
-        "the session log stayed unchanged",
+        fault.writes(),
+        1,
+        "the checkpoint reached the failing writer"
     );
     assert_eq!(latest_row_total(&client.chat), before_total);
     harness.host.shutdown().await;

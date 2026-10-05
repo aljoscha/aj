@@ -61,7 +61,8 @@ pub enum CompactionOutcome {
     NothingToDo,
     /// Compaction was cancelled before anything was persisted.
     Canceled,
-    /// Compaction failed (summarizer error); nothing was written.
+    /// Compaction failed. History was not replaced, and the error was emitted
+    /// for persistence and display.
     Failed(String),
 }
 
@@ -89,12 +90,11 @@ impl CompactionOutcome {
 /// final persist+reseed, never across the summarizer network call, so a
 /// long summary doesn't block log writers. Cancellation is honored by
 /// the `complete_oneshot` calls; an abort before the persist step leaves
-/// the log untouched.
+/// the log untouched. Failures append a display-only error, not a checkpoint.
 ///
 /// `handoff` carries the checkpoint's log identity to whoever tags the
-/// `CompactionEnd` this emits (see [`AppendHandoff`]). A run that
-/// persists nothing files nothing, so its `CompactionEnd` stays
-/// untagged.
+/// successful `CompactionEnd` this emits (see [`AppendHandoff`]). Failure
+/// events are persisted by the ordinary listener. Cancellation stays untagged.
 pub async fn run_compaction(
     agent: &mut Agent,
     log: &Arc<TokioMutex<ConversationLog>>,
@@ -393,8 +393,8 @@ async fn finish_nothing(
     CompactionOutcome::NothingToDo
 }
 
-/// Emit a failing `CompactionEnd` (nothing was persisted) and report
-/// the failure.
+/// Emit a failing `CompactionEnd` for persistence and display, without
+/// replacing any history, and report the failure to the turn driver.
 async fn finish_failed(
     agent: &Agent,
     reason: CompactionReason,
@@ -853,9 +853,9 @@ mod tests {
                     .await
                     .unwrap();
                 let live_before = serde_json::to_value(agent.messages()).unwrap();
-                let (path, head_before) = {
+                let path = {
                     let guard = log.lock().await;
-                    (guard.path().to_path_buf(), guard.head().cloned())
+                    guard.path().to_path_buf()
                 };
                 let durable_before = std::fs::read(&path).unwrap();
                 let ends = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -881,8 +881,13 @@ mod tests {
                     "{outcome:?}"
                 );
                 assert_eq!(serde_json::to_value(agent.messages()).unwrap(), live_before);
-                assert_eq!(log.lock().await.head().cloned(), head_before);
-                assert_eq!(std::fs::read(&path).unwrap(), durable_before);
+                let guard = log.lock().await;
+                let conversation = guard.linearize(guard.head().unwrap(), ThreadFilter::USER);
+                assert_eq!(
+                    serde_json::to_value(conversation.agent_messages()).unwrap(),
+                    live_before
+                );
+                assert!(std::fs::read(&path).unwrap().starts_with(&durable_before));
                 assert!(matches!(
                     ends.lock().unwrap().as_slice(),
                     [AgentEvent::CompactionEnd {
@@ -1308,25 +1313,9 @@ mod tests {
         drop(log_guard);
         while rx.try_recv().is_ok() {}
 
-        agent
-            .emit_event(AgentEvent::CompactionEnd {
-                agent_id: AgentId::Main,
-                reason: CompactionReason::Threshold,
-                tokens_before: 100,
-                tokens_after: 100,
-                usage: None,
-                summary: None,
-                error: Some("later failure".into()),
-            })
-            .await
-            .expect("emit later failed compaction");
-        let forwarded = rx.try_recv().expect("later terminal event forwarded");
-        assert!(matches!(
-            forwarded.event,
-            AgentEvent::CompactionEnd { error: Some(_), .. }
-        ));
         assert_eq!(
-            forwarded.entry, None,
+            handoff.take(),
+            None,
             "canceled delivery left a stale checkpoint handoff"
         );
     }

@@ -408,17 +408,12 @@ pub fn reduce(
             // an error is a failure, a summary is a success, neither is
             // a cancellation that wrote nothing.
             if let Some(err) = error {
-                // The failure and cancel branches append no log entry, so
-                // they have no durable identity to key on and none is
-                // needed: no entry exists for a backfill to regenerate
-                // them from, and the frame that carries them is
-                // reliable-transient, delivered exactly once.
                 record_notice(
                     state,
                     agent_id,
                     NoticeLevel::Warning,
                     format!("Compaction failed: {err}"),
-                    None,
+                    entry.map(String::as_str),
                 );
             } else if let Some(summary) = summary {
                 // A successful compaction appends its checkpoint entry,
