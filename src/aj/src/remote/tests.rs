@@ -1673,6 +1673,7 @@ async fn control_never_drops_env_from_a_remote_create() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_create_environment_maps_mint_nothing() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
     let persistence = ConversationPersistence::new(fixture._dir.path().join("sessions"));
     for env in [
@@ -1680,7 +1681,7 @@ async fn invalid_create_environment_maps_mint_nothing() {
         serde_json::json!({"": "private-value"}),
         serde_json::json!({"TOKEN": "private-value\0"}),
     ] {
-        let response = reqwest::Client::new()
+        let response = http
             .post(format!("{}/v1/sessions", fixture.server.url()))
             .json(&serde_json::json!({"env": env, "prompt": {"text": "must not run"}}))
             .send()
@@ -1827,6 +1828,7 @@ async fn the_tree_read_and_the_queue_withdrawal_answer() {
     ignore = "slow: remote catch-up quiet window"
 )]
 async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(background_task_turn()).await;
     let session = fixture.create().await;
     let mut remote = fixture.remote(&session).await;
@@ -1841,7 +1843,7 @@ async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
         .map(|(id, _)| *id)
         .expect("a live background task");
 
-    let response = reqwest::Client::new()
+    let response = http
         .post(format!(
             "{}/v1/sessions/{session}/tasks/{task}/kill",
             fixture.server.url(),
@@ -1874,7 +1876,7 @@ async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
     assert_eq!(err.status(), Some(StatusCode::NOT_FOUND));
     assert_eq!(err.code(), Some("unknown_task"));
 
-    let response = reqwest::Client::new()
+    let response = http
         .post(format!(
             "{}/v1/sessions/{session}/tasks/{task}/kill",
             fixture.server.url(),
@@ -1890,7 +1892,7 @@ async fn the_task_kill_route_refuses_malformed_requests_and_unknown_tasks() {
 
     // A path segment that is not a task id answers the protocol's error
     // shape rather than the framework's own rejection.
-    let response = reqwest::Client::new()
+    let response = http
         .get(format!(
             "{}/v1/sessions/{session}/tasks/not-a-number/output?offset=0",
             fixture.server.url()
@@ -1929,6 +1931,7 @@ async fn a_command_with_no_body_is_accepted() {
 /// session before the test reads the store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_host_json_command_refuses_unknown_fields_before_dispatch() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
     let before = fixture
         .host
@@ -1984,7 +1987,7 @@ async fn every_host_json_command_refuses_unknown_fields_before_dispatch() {
     ];
 
     for (route, body) in &commands {
-        let response = reqwest::Client::new()
+        let response = http
             .post(format!("{base}/v1/{route}"))
             .json(body)
             .send()
@@ -2014,7 +2017,7 @@ async fn every_host_json_command_refuses_unknown_fields_before_dispatch() {
     // The task-kill route is the empty-object JSON command. Other JSON values
     // are malformed rather than alternate spellings of `{}`.
     for body in ["null", "[]", "1"] {
-        let response = reqwest::Client::new()
+        let response = http
             .post(format!("{base}/v1/sessions/{missing}/tasks/1/kill"))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
@@ -2034,6 +2037,7 @@ async fn every_host_json_command_refuses_unknown_fields_before_dispatch() {
 /// survives, while their expected 400 proves the nested decoder ran first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nested_unknown_fields_are_refused_by_real_host_routes() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
     let base = fixture.server.url();
     let missing = "no-such-session";
@@ -2088,7 +2092,7 @@ async fn nested_unknown_fields_are_refused_by_real_host_routes() {
     ];
 
     for (route, body) in probes {
-        let response = reqwest::Client::new()
+        let response = http
             .post(format!("{base}/v1/{route}"))
             .json(&body)
             .send()
@@ -2130,6 +2134,7 @@ async fn nested_unknown_fields_are_refused_by_real_host_routes() {
     ignore = "slow: negative observation window"
 )]
 async fn defaultable_unknown_fields_leave_session_state_untouched() {
+    let http = reqwest::Client::new();
     let (fixture, inference) = Fixture::with_gate(
         IdentityGate::local(),
         vec![
@@ -2197,7 +2202,7 @@ async fn defaultable_unknown_fields_leave_session_state_untouched() {
         ("tag", serde_json::json!({"taq": "clear-by-default"})),
         ("archive", serde_json::json!({"archive": false})),
     ] {
-        let response = reqwest::Client::new()
+        let response = http
             .post(format!("{base}/v1/sessions/{session}/{route}"))
             .json(&body)
             .send()
@@ -2306,16 +2311,20 @@ async fn remote_tag(fixture: &Fixture, session: &str) -> Option<String> {
 }
 
 /// Post a raw tag body, so a test can send shapes the typed request cannot.
-async fn post_tag(fixture: &Fixture, session: &str, body: serde_json::Value) -> reqwest::Response {
-    reqwest::Client::new()
-        .post(format!(
-            "{}/v1/sessions/{session}/tag",
-            fixture.server.url()
-        ))
-        .json(&body)
-        .send()
-        .await
-        .expect("the request reaches the host")
+async fn post_tag(
+    http: &reqwest::Client,
+    fixture: &Fixture,
+    session: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    http.post(format!(
+        "{}/v1/sessions/{session}/tag",
+        fixture.server.url()
+    ))
+    .json(&body)
+    .send()
+    .await
+    .expect("the request reaches the host")
 }
 
 /// The tag route sets a label and clears it, and the label reaches the row a
@@ -2323,11 +2332,18 @@ async fn post_tag(fixture: &Fixture, session: &str, body: serde_json::Value) -> 
 /// which is why there is no second route for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tag_route_sets_and_clears_a_label() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
     let session = fixture.create().await;
     assert_eq!(remote_tag(&fixture, &session).await, None);
 
-    let response = post_tag(&fixture, &session, serde_json::json!({"tag": " fix-auth "})).await;
+    let response = post_tag(
+        &http,
+        &fixture,
+        &session,
+        serde_json::json!({"tag": " fix-auth "}),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(
         remote_tag(&fixture, &session).await.as_deref(),
@@ -2340,12 +2356,18 @@ async fn the_tag_route_sets_and_clears_a_label() {
         serde_json::json!({"tag": "   "}),
         serde_json::json!({}),
     ] {
-        post_tag(&fixture, &session, serde_json::json!({"tag": "again"})).await;
+        post_tag(
+            &http,
+            &fixture,
+            &session,
+            serde_json::json!({"tag": "again"}),
+        )
+        .await;
         assert_eq!(
             remote_tag(&fixture, &session).await.as_deref(),
             Some("again")
         );
-        let response = post_tag(&fixture, &session, clearing.clone()).await;
+        let response = post_tag(&http, &fixture, &session, clearing.clone()).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED, "{clearing}");
         assert_eq!(
             remote_tag(&fixture, &session).await,
@@ -2356,6 +2378,7 @@ async fn the_tag_route_sets_and_clears_a_label() {
 
     // An unknown session is the ordinary 404, not a tag-specific answer.
     let response = post_tag(
+        &http,
         &fixture,
         "2020-01-01-00-00-00-000",
         serde_json::json!({"tag": "nobody"}),
@@ -2384,19 +2407,19 @@ async fn remote_archived(fixture: &Fixture, session: &str) -> bool {
 /// Post a raw archive body, so a test can send shapes the typed request
 /// cannot.
 async fn post_archive(
+    http: &reqwest::Client,
     fixture: &Fixture,
     session: &str,
     body: serde_json::Value,
 ) -> reqwest::Response {
-    reqwest::Client::new()
-        .post(format!(
-            "{}/v1/sessions/{session}/archive",
-            fixture.server.url()
-        ))
-        .json(&body)
-        .send()
-        .await
-        .expect("the request reaches the host")
+    http.post(format!(
+        "{}/v1/sessions/{session}/archive",
+        fixture.server.url()
+    ))
+    .json(&body)
+    .send()
+    .await
+    .expect("the request reaches the host")
 }
 
 /// The archive route sets the bit and clears it, and the bit reaches the row a
@@ -2405,11 +2428,18 @@ async fn post_archive(
 /// clears a label.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_archive_route_sets_and_clears_the_bit() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
     let session = fixture.create().await;
     assert!(!remote_archived(&fixture, &session).await);
 
-    let response = post_archive(&fixture, &session, serde_json::json!({"archived": true})).await;
+    let response = post_archive(
+        &http,
+        &fixture,
+        &session,
+        serde_json::json!({"archived": true}),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert!(
         remote_archived(&fixture, &session).await,
@@ -2420,9 +2450,15 @@ async fn the_archive_route_sets_and_clears_the_bit() {
         serde_json::json!({"archived": false}),
         serde_json::json!({}),
     ] {
-        post_archive(&fixture, &session, serde_json::json!({"archived": true})).await;
+        post_archive(
+            &http,
+            &fixture,
+            &session,
+            serde_json::json!({"archived": true}),
+        )
+        .await;
         assert!(remote_archived(&fixture, &session).await);
-        let response = post_archive(&fixture, &session, clearing.clone()).await;
+        let response = post_archive(&http, &fixture, &session, clearing.clone()).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED, "{clearing}");
         assert!(
             !remote_archived(&fixture, &session).await,
@@ -2432,6 +2468,7 @@ async fn the_archive_route_sets_and_clears_the_bit() {
 
     // An unknown session is the ordinary 404, not an archive-specific answer.
     let response = post_archive(
+        &http,
         &fixture,
         "2020-01-01-00-00-00-000",
         serde_json::json!({"archived": true}),
@@ -2448,16 +2485,23 @@ async fn the_archive_route_sets_and_clears_the_bit() {
 /// even materialized for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_label_is_a_400_that_changes_nothing() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
     let session = fixture.create().await;
-    post_tag(&fixture, &session, serde_json::json!({"tag": "keep me"})).await;
+    post_tag(
+        &http,
+        &fixture,
+        &session,
+        serde_json::json!({"tag": "keep me"}),
+    )
+    .await;
 
     for refused in [
         serde_json::json!({"tag": "two\nlines"}),
         serde_json::json!({"tag": "bell\u{0007}"}),
         serde_json::json!({"tag": "l".repeat(aj_session::MAX_TAG_BYTES + 1)}),
     ] {
-        let response = post_tag(&fixture, &session, refused.clone()).await;
+        let response = post_tag(&http, &fixture, &session, refused.clone()).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{refused}");
         let error: ErrorResponse = response.json().await.expect("the error shape");
         assert_eq!(error.code, "invalid_request", "{refused}");
@@ -2893,6 +2937,7 @@ async fn a_head_switch_is_refused_with_409_while_a_turn_runs() {
 /// enforce, and a blank body decodes to a request naming neither.
 #[tokio::test]
 async fn a_head_switch_naming_no_target_or_two_answers_400() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
     let session = fixture.create().await;
 
@@ -2902,7 +2947,7 @@ async fn a_head_switch_naming_no_target_or_two_answers_400() {
         // A blank body, which the extractor reads as `{}`.
         serde_json::json!(null),
     ] {
-        let mut request = reqwest::Client::new().post(format!(
+        let mut request = http.post(format!(
             "{}/v1/sessions/{session}/head",
             fixture.server.url()
         ));
@@ -4194,11 +4239,11 @@ fn command_probe(
 /// script consumption independent of scheduler timing. A rejected probe starts
 /// no work and needs no inference barrier.
 async fn probe_every_route(
+    http: &reqwest::Client,
     client: &RemoteClient,
     session: &str,
     mut inference: Option<(&InferenceObservation, &mut Attached)>,
 ) -> Vec<RouteProbe> {
-    let http = reqwest::Client::new();
     let base = client.base();
     let commands = [
         RemoteCommand::Cancel(CancelRequest::default()),
@@ -4264,12 +4309,12 @@ async fn probe_every_route(
             .expect("build the event-stream probe"),
     ];
     for command in &commands {
-        requests.push(command_probe(&http, base, session, command));
+        requests.push(command_probe(http, base, session, command));
     }
 
     let mut probes = Vec::with_capacity(requests.len());
     for request in requests {
-        let probe = probe_request(&http, session, request).await;
+        let probe = probe_request(http, session, request).await;
         if let Some((observation, attached)) = inference.as_mut() {
             let expected = match probe.route.as_str() {
                 "POST /v1/sessions/{id}/prompt" => Some(1),
@@ -4319,6 +4364,7 @@ fn assert_generic_forbidden(probe: &RouteProbe) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_peer_gets_403_on_every_route() {
+    let http = reqwest::Client::new();
     let whois = FakeWhois::resolving(user_peer("intruder@github"));
     let (fixture, inferences) = Fixture::with_gate(
         IdentityGate::tailscale(["alice@github".to_string()], whois.resolver()),
@@ -4328,14 +4374,13 @@ async fn a_rejected_peer_gets_403_on_every_route() {
     // Created behind the gate's back, so a 403 cannot be mistaken for a 404.
     let session = fixture.host.create().await.expect("create a session");
 
-    let probes = probe_every_route(&fixture.client, &session, None).await;
+    let probes = probe_every_route(&http, &fixture.client, &session, None).await;
 
     assert_route_census(&probes);
     for probe in &probes {
         assert_generic_forbidden(probe);
     }
 
-    let http = reqwest::Client::new();
     let fallback = http
         .get(format!(
             "{}/v1/not-a-registered-route",
@@ -4362,6 +4407,7 @@ async fn a_rejected_peer_gets_403_on_every_route() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_authorized_peer_reaches_every_route() {
+    let http = reqwest::Client::new();
     let (fixture, inferences) = Fixture::with_gate(
         IdentityGate::tailscale(
             [],
@@ -4374,6 +4420,7 @@ async fn an_authorized_peer_reaches_every_route() {
     let mut attached = fixture.oracle(&session).await;
 
     let probes = probe_every_route(
+        &http,
         &fixture.client,
         &session,
         Some((inferences.as_ref(), &mut attached)),
@@ -5638,6 +5685,7 @@ async fn environment_reads_and_edits_are_equal_through_both_control_arms() {
 
 #[tokio::test]
 async fn invalid_environment_requests_leave_the_map_unchanged() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
     let session = fixture.create().await;
     let control = Control::remote(fixture.client());
@@ -5660,7 +5708,7 @@ async fn invalid_environment_requests_leave_the_map_unchanged() {
         serde_json::json!({"key": "BAD=KEY", "value": "replace"}),
         serde_json::json!({"key": "TOKEN", "value": "bad\0value"}),
     ] {
-        let response = reqwest::Client::new()
+        let response = http
             .post(format!(
                 "{}/v1/sessions/{session}/env",
                 fixture.server.url()
@@ -5894,6 +5942,7 @@ async fn branch_context_and_environment_cross_both_control_adapters() {
 
 #[tokio::test]
 async fn head_overrides_reject_non_branch_settings_without_switching() {
+    let http = reqwest::Client::new();
     let fixture = Fixture::new(Vec::new()).await;
     let session = fixture.create().await;
     let control = Control::remote(fixture.client());
@@ -5926,7 +5975,7 @@ async fn head_overrides_reject_non_branch_settings_without_switching() {
         serde_json::json!({"speed":"not-a-speed"}),
         serde_json::json!({"future":true}),
     ] {
-        let response = reqwest::Client::new().post(format!("{}/v1/sessions/{session}/head", fixture.server.url()))
+        let response = http.post(format!("{}/v1/sessions/{session}/head", fixture.server.url()))
             .json(&serde_json::json!({"entry":target, "changes":{"settings":settings,"env":{"KEEP":null}}}))
             .send().await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{settings}");

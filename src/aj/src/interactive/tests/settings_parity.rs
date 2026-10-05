@@ -305,6 +305,7 @@ async fn settings_parity_local_and_http_adapters() {
         );
     }
     let before = std::fs::read(home.join(".aj/config.toml")).unwrap();
+    let http = reqwest::Client::new();
     for (route, body) in [
         (
             "config",
@@ -319,7 +320,7 @@ async fn settings_parity_local_and_http_adapters() {
             serde_json::json!({"thinking":"high","persist":"user","surprise":true}),
         ),
     ] {
-        let response = reqwest::Client::new()
+        let response = http
             .post(format!("{}/v1/sessions/{session}/{route}", server.url()))
             .json(&body)
             .send()

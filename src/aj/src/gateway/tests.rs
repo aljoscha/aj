@@ -4327,7 +4327,7 @@ async fn a_control_create_environment_reaches_the_owning_host_log() {
     let fixture = Fixture::new(&[&host]).await;
     fixture.until_connected(&host.host_id()).await;
     let env = BTreeMap::from([("TOKEN".to_string(), "literal=value\n'quoted'".to_string())]);
-    let id = crate::control::Control::remote(RemoteClient::new(&fixture.server.url()).unwrap())
+    let id = crate::control::Control::remote(fixture.client.clone())
         .create(Some(host.host_id()), None, None, None, Some(env.clone()))
         .await
         .expect("create through gateway");
@@ -4364,11 +4364,14 @@ async fn an_envless_current_protocol_host_refuses_create_directly_and_through_ga
     )
     .await;
     fixture.until_connected("envless").await;
-    for (index, url) in [recorder.address.url().to_string(), fixture.server.url()]
-        .into_iter()
-        .enumerate()
+    for (index, client) in [
+        RemoteClient::new(recorder.address.url()).unwrap(),
+        fixture.client.clone(),
+    ]
+    .into_iter()
+    .enumerate()
     {
-        let client = RemoteClient::new(&url).unwrap();
+        let url = client.base().to_string();
         assert_eq!(client.hello().await.unwrap().protocol, PROTOCOL_VERSION);
         let control = crate::control::Control::remote(client);
         control
@@ -6749,7 +6752,7 @@ async fn a_slow_attach_does_not_lose_another_hosts_block() {
     fixture.until_connected("aaa").await;
     fixture.until_connected("zzz").await;
 
-    let client = RemoteClient::new(&fixture.server.url()).expect("client");
+    let client = fixture.client.clone();
     let opening = tokio::spawn(async move {
         client
             .events(&[attach("aaa:s-1"), attach("zzz:s-9")])
@@ -8272,8 +8275,7 @@ async fn environment_reads_and_edits_cross_the_gateway() {
     let fixture = Fixture::new(&[&host]).await;
     let id = host.namespaced(&session);
     fixture.row(&id).await;
-    let control =
-        crate::control::Control::remote(RemoteClient::new(&fixture.server.url()).unwrap());
+    let control = crate::control::Control::remote(fixture.client.clone());
     assert!(control.environment(&id, None).await.unwrap().is_empty());
     for value in [Some("full-secret".to_string()), Some(String::new()), None] {
         control
