@@ -47,7 +47,7 @@
         {
           "speed": "ultrafast",
           "name": "Ultrafast",
-          "description": "Requires Pro $500 or eligible Enterprise/Edu access. Uses 8x included usage or 6x purchased credits. Workspace permissions apply.",
+          "description": "8x or 6x speed, increased usage",
           "wire_value": "ultrafast",
           "cost": {
             "input": 60.0,
