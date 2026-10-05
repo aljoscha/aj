@@ -5462,11 +5462,14 @@ async fn foreground_interruption_resume_and_kill_are_equal_through_both_control_
             let (child_context, _held_child) =
                 bounded("child inference", received.recv()).await.unwrap();
             assert!(has_user_text(&child_context, "original assignment"));
-            let AgentEvent::AgentStart { agent_id: child } = event_until(&mut events, |event| {
+            let AgentEvent::AgentStart {
+                agent_id: child, ..
+            } = event_until(&mut events, |event| {
                 matches!(
                     event,
                     AgentEvent::AgentStart {
-                        agent_id: AgentId::Sub(_)
+                        agent_id: AgentId::Sub(_),
+                        ..
                     }
                 )
             })
@@ -5484,7 +5487,7 @@ async fn foreground_interruption_resume_and_kill_are_equal_through_both_control_
                 .await
                 .unwrap();
             event_until(&mut events, |event| {
-                matches!(event, AgentEvent::AgentInterrupted { agent_id } if agent_id == &child)
+                matches!(event, AgentEvent::AgentEnd { agent_id, assignment_pending: true, .. } if agent_id == &child)
             }).await;
             assert!(
                 control
@@ -5530,7 +5533,7 @@ async fn foreground_interruption_resume_and_kill_are_equal_through_both_control_
                 assert!(has_user_text(&context, "original assignment"));
                 assert!(has_user_text(&context, "resume instruction"));
                 event_until(&mut events, |event| {
-                    matches!(event, AgentEvent::AgentStart { agent_id } if agent_id == &child)
+                    matches!(event, AgentEvent::AgentStart { agent_id, .. } if agent_id == &child)
                 }).await;
                 finish(
                     &resumed,

@@ -159,14 +159,6 @@ impl StatusLine {
         self.styles = styles;
     }
 
-    fn interrupted(&self) -> bool {
-        let chat = self.chat.borrow();
-        chat.agents().iter().any(|agent| {
-            agent.id == chat.active_view()
-                && agent.status == Some(aj_app::chat::SubAgentStatus::Interrupted)
-        })
-    }
-
     /// The loader message for the current activity. An unsettled
     /// connection wins over the agent's own state: while the stream is
     /// down what the transcript shows is stale, which the user has to
@@ -198,8 +190,6 @@ impl StatusLine {
                 Some(CompactionPhase::Saving) => "Compacting: saving…",
             };
             label.to_string()
-        } else if self.interrupted() {
-            "Interrupted, waiting for input".to_string()
         } else {
             format!("Working… ({} to cancel)", fixed_keys::CTRL_C)
         }
@@ -236,7 +226,7 @@ impl StatusLine {
 
 impl Widget for StatusLine {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        if !self.status.borrow().busy() && !self.interrupted() {
+        if !self.status.borrow().busy() {
             // Idle agent: no rendered rows. The slot collapses to
             // zero height so the chat sits flush above the pending
             // box and editor.
@@ -260,7 +250,6 @@ impl Widget for StatusLine {
         // collapsed idle slot lets the chat sit flush above the editor.
         let marker = match self.status.borrow().connection {
             Connection::Refused | Connection::Unreachable | Connection::Stalled => "×",
-            Connection::Connected if self.interrupted() && !self.status.borrow().compacting => "Ⅱ",
             _ => Self::frame(started),
         };
         let spans = vec![
@@ -340,44 +329,39 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_child_is_idle_visible_and_resumable() {
+    fn pending_assignment_has_no_busy_status_while_its_turn_is_idle() {
         let (line, status) = loader(StatusState::default());
         let chat = Rc::clone(&line.borrow().chat);
         let mut life = AgentLifecycle::default();
-        let settings = AgentSettings {
-            context_window: 0,
-            provider: "scripted".into(),
-            model_id: "scripted".into(),
-            thinking: "off".into(),
-            thinking_display: "default".into(),
-            speed: "default".into(),
-            verbosity: "default".into(),
-        };
+        let child = AgentId::Sub(1);
         for event in [
-            AgentEvent::AgentStart {
-                agent_id: AgentId::Main,
-            },
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
-                child: AgentId::Sub(1),
+                child,
                 task: "work".into(),
                 tool_name: "agent".into(),
                 background: false,
-                settings,
+                settings: AgentSettings {
+                    context_window: 0,
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "off".into(),
+                    thinking_display: "default".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
             },
             AgentEvent::AgentStart {
-                agent_id: AgentId::Sub(1),
+                agent_id: child,
+                assignment_pending: true,
             },
             AgentEvent::AgentEnd {
-                agent_id: AgentId::Sub(1),
+                agent_id: child,
+                assignment_pending: true,
                 messages: vec![],
                 waiting: false,
             },
-            AgentEvent::AgentInterrupted {
-                agent_id: AgentId::Sub(1),
-            },
         ] {
-            // Exercise the event codec used by remote clients before reduction.
             let encoded = serde_json::to_string(&event).unwrap();
             let decoded: aj_wire::DecodedAgentEvent = serde_json::from_str(&encoded).unwrap();
             let _ = reduce(
@@ -387,31 +371,23 @@ mod tests {
                 None,
             );
         }
-        chat.borrow_mut().set_active_view(AgentId::Sub(1));
-        assert!(!life.is_running(AgentId::Sub(1)));
-        assert!(life.is_running(AgentId::Main));
+        chat.borrow_mut().set_active_view(child);
+        status.borrow_mut().running = life.is_running(child);
         assert!(!status.borrow().animating());
-        assert_eq!(rows(&line), vec![" Ⅱ Interrupted, waiting for input"]);
-        let snapshot = crate::agent_picker::PickerSnapshot::gather(&chat.borrow());
         assert!(
+            rows(&line).is_empty(),
+            "idle assignments have no waiting label"
+        );
+        let snapshot = crate::agent_picker::PickerSnapshot::gather(&chat.borrow(), &life);
+        assert_eq!(
             snapshot
                 .agents
                 .iter()
-                .any(|agent| agent.id == AgentId::Sub(1)
-                    && agent.status == Some(aj_app::chat::SubAgentStatus::Interrupted))
+                .find(|a| a.id == child)
+                .unwrap()
+                .status,
+            Some(aj_app::chat::SubAgentStatus::Running)
         );
-
-        let _ = reduce(
-            &mut chat.borrow_mut(),
-            &mut life,
-            AgentEvent::AgentStart {
-                agent_id: AgentId::Sub(1),
-            },
-            None,
-        );
-        status.borrow_mut().running = life.is_running(AgentId::Sub(1));
-        assert!(rows(&line)[0].contains("Working"));
-        assert!(!line.borrow().interrupted());
     }
 
     #[test]

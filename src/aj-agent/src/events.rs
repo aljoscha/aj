@@ -173,7 +173,12 @@ pub enum CompactionPhase {
 pub enum AgentEvent {
     // --- Lifecycle ---------------------------------------------------------
     /// Emitted once when [`Agent::prompt`](crate::Agent) starts a run.
-    AgentStart { agent_id: AgentId },
+    AgentStart {
+        agent_id: AgentId,
+        /// Whether a foreground caller owns this agent's assignment.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        assignment_pending: bool,
+    },
     /// Emitted once when a run completes. Carries the full transcript
     /// for listeners that want a final snapshot without replaying.
     AgentEnd {
@@ -183,10 +188,11 @@ pub enum AgentEvent {
         /// manufacturing another turn. This is transient, not a goal status.
         #[serde(default)]
         waiting: bool,
+        /// Whether a foreground caller still owns this agent's assignment.
+        /// Ending a turn does not necessarily deliver that caller's report.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        assignment_pending: bool,
     },
-    /// Ephemeral pause state, emitted after `AgentEnd`. The assignment remains
-    /// pending until resumed or killed. `AgentStart` clears this state.
-    AgentInterrupted { agent_id: AgentId },
     /// Beginning of an assistant-message turn (one inference + any
     /// tool calls it triggers). Paired with a closing [`TurnEnd`], but
     /// only on a clean completion: a turn that aborts or errors emits
@@ -472,9 +478,8 @@ impl AgentEvent {
     /// the child's id is on the dedicated `child` field.
     pub fn agent_id(&self) -> AgentId {
         match self {
-            Self::AgentStart { agent_id }
+            Self::AgentStart { agent_id, .. }
             | Self::AgentEnd { agent_id, .. }
-            | Self::AgentInterrupted { agent_id }
             | Self::TurnStart { agent_id }
             | Self::TurnEnd { agent_id, .. }
             | Self::MessageStart { agent_id, .. }

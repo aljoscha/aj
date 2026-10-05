@@ -331,29 +331,7 @@ impl Driver {
 
     fn apply_lifecycle(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::AgentInterrupted {
-                agent_id: AgentId::Sub(n),
-            } => {
-                self.lifecycle.mark_idle(AgentId::Sub(*n));
-                self.session.status().interrupted_subs.insert(*n);
-            }
-            AgentEvent::AgentStart {
-                agent_id: AgentId::Sub(n),
-            }
-            | AgentEvent::AgentEnd {
-                agent_id: AgentId::Sub(n),
-                ..
-            }
-            | AgentEvent::SubAgentEnd {
-                child: AgentId::Sub(n),
-                ..
-            } => {
-                self.session.status().interrupted_subs.remove(n);
-            }
-            _ => {}
-        }
-        match event {
-            AgentEvent::AgentStart { agent_id } => {
+            AgentEvent::AgentStart { agent_id, .. } => {
                 self.lifecycle.mark_running(*agent_id);
                 if *agent_id == AgentId::Main {
                     self.waiting_for_input = false;
@@ -423,20 +401,6 @@ impl Driver {
                 self.compaction_failed = true;
             }
             self.goal.finish(&outcome);
-            // An interrupted child has no running mark for `reap` to sweep.
-            // The parent's tool future nevertheless owned its assignment.
-            let interrupted = std::mem::take(&mut self.session.status().interrupted_subs);
-            for n in interrupted {
-                self.publish_event(
-                    None,
-                    AgentEvent::SubAgentEnd {
-                        parent: AgentId::Main,
-                        child: AgentId::Sub(n),
-                        report: "sub-agent assignment cancelled with parent".into(),
-                        conclusion: aj_agent::events::SubAgentConclusion::Failed,
-                    },
-                );
-            }
         }
         for idled in self
             .turns
@@ -457,6 +421,7 @@ impl Driver {
                         agent_id: AgentId::Sub(n),
                         messages: Vec::new(),
                         waiting: false,
+                        assignment_pending: self.session.core.registry.assignment(n).is_some(),
                     },
                 );
             }
@@ -528,13 +493,6 @@ impl Driver {
     }
 
     fn wake(&mut self, owner: AgentId) {
-        // A foreground interruption waits for deliberate user input. A task
-        // notice or queued message must not restart it or fulfill its caller.
-        if let AgentId::Sub(n) = owner
-            && self.session.core.registry.assignment(n).is_some()
-        {
-            return;
-        }
         if !self.turns.is_busy(&self.lifecycle, owner) {
             // Reactive callers check the hold. A user-resumed goal can also
             // wake pending work, and that deliberate start releases it.

@@ -623,8 +623,8 @@ agent" locally take an optional `agent` field (default: the main agent).
 | `POST /v1/sessions` | `{host?, settings?, prompt?, tag?, env?}` | Create a session in the host's working directory. `settings` and the initial string-to-string `env` overlay per section 7. `prompt` is `{text}` or `{content: [...]}`. Settings, prompt, tag and env are validated before a log exists, so a refusal leaves nothing behind. The tag and first prompt are applied afterwards under the session's own lock and are best-effort: one that does not land still answers 200 `{id}` plus an `incomplete` string carrying the host's words for what did not stick, so the client retags rather than creating a second session. A first prompt whose persistence fails does so on the stream, as `persistence_failed`, after the id was answered. A minted session is never deleted to make an error tidier. |
 | `.../{id}/prompt` | `{text}` or `{content}`, optional `agent` | Run a turn if the agent is idle, queue a follow-up if busy. |
 | `.../{id}/steer` | `{text, agent?}` | Queue steering, or promote the pending follow-up when `text` is empty. |
-| `.../{id}/cancel` | `{agent?}` | Interrupt the targeted agent's current turn. A foreground child stays assigned and waits for user input while its parent delegation remains pending. Prompting that child resumes it, and its normal final report completes the original call. A detached background child is stopped through its task, just like task kill. Cancelling a parent ends its foreground assignments, including interrupted ones, but never stops detached background work. A running mark with no owning turn, assignment, or task is 409 `conflict`. An idle or completed target is accepted. |
-| `.../{id}/kill-agent` | `{agent}` | Explicitly terminate a running or interrupted sub-agent assignment, or a running independent continuation. The main agent is not a kill target. |
+| `.../{id}/cancel` | `{agent?}` | Interrupt the targeted agent's current turn. A foreground child stays assigned while its parent delegation remains pending. Prompts, queued follow-ups, and task notices can start its next turn, just as for the main agent. Its final report completes the original call. A detached background child is stopped through its task, just like task kill. Cancelling a parent ends its foreground assignments, but never stops detached background work. A running mark with no owning turn, assignment, or task is 409 `conflict`. An idle or completed target is accepted. |
+| `.../{id}/kill-agent` | `{agent}` | Explicitly terminate a sub-agent assignment, or a running independent continuation. The main agent is not a kill target. |
 | `.../{id}/queue` | `{op: "remove", agent?}` or `{op: "clear"}` | Withdraw one agent's pending message, or clear the session's queues. A withdrawal answers 200 `{text?}` with the text it took, which is what makes the dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index. A clear answers 202. |
 | `.../{id}/compact` | `{instructions?}` | Manual compaction. |
 | `.../{id}/settings` | exactly one of `model`, `thinking`, `thinking_display`, `speed`, `verbosity`, `oracle_model`, `oracle_thinking`, `oracle_speed`, `oracle_verbosity`, optional `agent`, `persist` | Host applies, logs, and publishes the synthesized frames. Naming zero or two axes is 400. `account` is rejected, including null, and must use the account route. `persist` defaults to `none`, or is `user`, `project_set`, or `project_clear`, and also writes the value into that host config layer. Oracle axes reject sub-agent targets. Persistence is main-agent only. |
@@ -635,16 +635,15 @@ agent" locally take an optional `agent` field (default: the main agent).
 | `.../{id}/head` | `{entry, changes?}` or `{before: <entry_id>, changes?}` | Switch the session head. 409 `conflict` while working or tasks live. Clears queues, new epoch, `reset` frame. `before` resolves the named entry to its parent server-side, atomically with the switch. An unknown entry is 404 `unknown_entry`, an entry with no parent is refused. Exactly one target. Optional `changes` applies session-scoped overrides to its inherited baseline (see below). |
 | `.../{id}/tasks/{task_id}/kill` | `{}` (absent or blank is equivalent) | Kill a background task. Any field or non-object value is refused before the task is touched. |
 
-`agent_interrupted` is an ephemeral event with `agent_id`, emitted after the
-interrupted turn's `agent_end`. It marks the child idle but still assigned, not
-a final assignment result. Attach explicitly emits it for paused children.
-`agent_start` clears interruption, `agent_end` ends the current run, and
-`sub_agent_end` carries the final assignment conclusion. Interrupted children
-stay in the active agents picker and show "Interrupted, waiting for input".
-Queued messages and task notices do not automatically resume an interrupted
-foreground assignment. They remain available for its next user-driven turn.
+`agent_start` marks a running turn and `agent_end` marks it idle.
+Their `assignment_pending` field is an optional boolean, defaulting to false,
+that says the foreground caller still owns the assignment. It does not change
+turn activity or inhibit ordinary wakes. `sub_agent_end` carries the final
+assignment conclusion. Assigned children stay in the active agents picker
+between turns, without a separate interrupted state. Attach repairs ownership
+and current turn activity from the host's live state.
 Ctrl+C interrupts the viewed child only. Ctrl+K in the picker explicitly kills
-a running or interrupted sub-agent, including a foreground assignment. The
+a running or assigned sub-agent, including a foreground assignment. The
 main row is not killable, and background bash task kills use the task endpoint.
 
 Head `changes` is a closed object with optional `settings`, `accounts`, and

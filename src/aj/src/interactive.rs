@@ -4002,7 +4002,7 @@ async fn apply_command_action(
         CommandAction::OpenAgentPicker => {
             let snapshot = {
                 let chat = world.chat.borrow();
-                PickerSnapshot::gather(&chat)
+                PickerSnapshot::gather(&chat, world.client().lifecycle())
             };
             let handles = shell.borrow().overlay_handles();
             open_agent_picker(
@@ -19431,7 +19431,7 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
         seed_sub_and_task(&mut world);
 
-        let snapshot = PickerSnapshot::gather(&world.chat.borrow());
+        let snapshot = PickerSnapshot::gather(&world.chat.borrow(), world.client().lifecycle());
         assert!(snapshot.agents.iter().any(|a| a.id == AgentId::Main));
         assert!(
             snapshot.agents.iter().any(|a| a.id == AgentId::Sub(1)
@@ -19613,6 +19613,7 @@ mod tests {
             &mut world,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -32448,6 +32449,7 @@ mod tests {
             .await
             .emit_event(AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             })
             .await
             .expect("the sub's bus takes the event");

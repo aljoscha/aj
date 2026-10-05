@@ -123,7 +123,6 @@ pub(crate) fn build_subagent_box(
         SubAgentStatus::Running => {
             span(spinner_frame(entry.started_at.elapsed()).into(), styles.dim)
         }
-        SubAgentStatus::Interrupted => span("Ⅱ".into(), styles.warning),
         SubAgentStatus::Done => span("✓".into(), styles.success),
         // A truncated run finished but its report is partial, and a failed
         // run errored: distinct glyphs and tints so the box reads its
@@ -158,10 +157,6 @@ pub(crate) fn build_subagent_box(
             }
             _ => BoxBody::Empty,
         },
-        SubAgentStatus::Interrupted => BoxBody::Activity(vec![span(
-            "Interrupted, waiting for input".into(),
-            styles.dim,
-        )]),
         SubAgentStatus::Done | SubAgentStatus::Truncated | SubAgentStatus::Failed => {
             match entry.report.as_deref() {
                 Some(report) if !report.is_empty() => {
@@ -507,7 +502,10 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
-            AgentEvent::AgentStart { agent_id: sub },
+            AgentEvent::AgentStart {
+                agent_id: sub,
+                assignment_pending: false,
+            },
             AgentEvent::MessageEnd {
                 agent_id: sub,
                 message: AgentMessage::wire(Message::User(UserMessage::text(
@@ -560,6 +558,7 @@ mod tests {
             },
             AgentEvent::AgentEnd {
                 agent_id: sub,
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -582,6 +581,7 @@ mod tests {
             },
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -775,6 +775,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -818,6 +819,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },

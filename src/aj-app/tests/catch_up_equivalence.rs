@@ -166,6 +166,7 @@ fn agent_end_frame(epoch: &str, agent_id: AgentId) -> Frame {
         durability: None,
         event: AgentEvent::AgentEnd {
             agent_id,
+            assignment_pending: false,
             messages: Vec::new(),
             waiting: false,
         }

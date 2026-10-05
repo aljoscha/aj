@@ -279,7 +279,8 @@ async fn goal_create_resume_and_replace_adopt_busy_work_without_charging_earlier
             !super::events(&frames).iter().any(|event| matches!(
                 event,
                 AgentEvent::AgentStart {
-                    agent_id: AgentId::Main
+                    agent_id: AgentId::Main,
+                    ..
                 }
             )),
             "adoption stays inside the original turn"
@@ -788,7 +789,8 @@ async fn goal_edit_steers_the_running_turn_and_rejects_completion_of_the_old_obj
             .filter(|event| matches!(
                 event,
                 AgentEvent::AgentStart {
-                    agent_id: AgentId::Main
+                    agent_id: AgentId::Main,
+                    ..
                 }
             ))
             .count(),

@@ -842,6 +842,7 @@ mod tests {
             };
             apply(AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
             });
             apply(AgentEvent::CompactionStart {
                 agent_id: AgentId::Main,

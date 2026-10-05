@@ -1129,15 +1129,14 @@ impl Agent {
         self.bus
             .emit(AgentEvent::AgentStart {
                 agent_id: self.agent_id,
+                assignment_pending: self.assignment.as_ref().is_some_and(|a| a.is_pending()),
             })
             .await
             .map_err(TurnError::Fatal)?;
 
         let outcome = self.run_top_level_turn_inner(prompt).await;
 
-        let interrupted = matches!(outcome, Err(TurnError::Aborted))
-            && assignment_guard.0.as_ref().is_some_and(|a| a.is_pending());
-        let reply = if interrupted {
+        let reply = if matches!(outcome, Err(TurnError::Aborted)) {
             None
         } else {
             assignment_guard.0.as_ref().and_then(|a| a.take_reply())
@@ -1149,18 +1148,12 @@ impl Agent {
                 agent_id: self.agent_id,
                 messages: self.transcript.clone(),
                 waiting,
+                assignment_pending: self.assignment.as_ref().is_some_and(|a| a.is_pending()),
             })
             .await
             .map_err(TurnError::Fatal)?;
 
-        if interrupted {
-            self.bus
-                .emit(AgentEvent::AgentInterrupted {
-                    agent_id: self.agent_id,
-                })
-                .await
-                .map_err(TurnError::Fatal)?;
-        } else if let Some(reply) = reply {
+        if let Some(reply) = reply {
             let _ = reply.send(match &outcome {
                 Ok(()) => self.sub_agent_outcome(),
                 Err(err) => Err(err.to_string().into()),
@@ -1214,75 +1207,10 @@ impl Agent {
     /// transcript, runs the assistant turn loop, and returns the
     /// final assistant text the sub-agent produced.
     pub async fn run_single_turn(&mut self, prompt: String) -> Result<SubAgentOutcome, BoxError> {
-        // Sub-agent runs share the same lifecycle framing as the
-        // top-level agent — `AgentStart` / `AgentEnd` events
-        // bracket the entire run so listeners that group by
-        // `agent_id` see a self-contained nested transcript.
-        self.bus
-            .emit(AgentEvent::AgentStart {
-                agent_id: self.agent_id,
-            })
-            .await?;
-
-        let outcome = self.run_single_turn_inner(prompt).await;
-
-        let interrupted = outcome.is_err()
-            && self.cancellation.is_cancelled()
-            && self.assignment.as_ref().is_some_and(|a| !a.is_cancelled());
-        if !interrupted && let Some(assignment) = &self.assignment {
-            // The initial caller already owns this result. Release assignment
-            // ownership before AgentEnd allows the host to wake queued work.
-            assignment.take_reply();
-        }
-
-        self.bus
-            .emit(AgentEvent::AgentEnd {
-                agent_id: self.agent_id,
-                messages: self.transcript.clone(),
-                waiting: false,
-            })
-            .await?;
-
-        if interrupted {
-            // Published while the child is still locked, so a manual resume
-            // cannot overtake the interruption with its next AgentStart.
-            self.bus
-                .emit(AgentEvent::AgentInterrupted {
-                    agent_id: self.agent_id,
-                })
-                .await?;
-        }
-        outcome
-    }
-
-    async fn run_single_turn_inner(&mut self, prompt: String) -> Result<SubAgentOutcome, BoxError> {
-        // Same prompt-top drain point as the top-level path: a
-        // sub-agent that backgrounded a command hears about it on its
-        // next continuation even when the task finished between runs.
-        self.drain_task_notices().await?;
-
-        // Append the prompt as the sub-agent's first user message.
-        // The persistence listener chains this entry onto the
-        // sub-agent's spawn entry, which the `SubAgentStart` hook
-        // anchored under the parent's spawning assistant message
-        // (see `aj_session::listener::persistence_listener`).
-        let user_message = AgentMessage::wire(Message::User(UserMessage::text(prompt)));
-        self.transcript.push(user_message.clone());
-        self.bus
-            .emit(AgentEvent::MessageStart {
-                agent_id: self.agent_id,
-                message: user_message.clone(),
-            })
-            .await?;
-        self.bus
-            .emit(AgentEvent::MessageEnd {
-                agent_id: self.agent_id,
-                message: user_message,
-            })
-            .await?;
-
-        self.execute_turn().await?;
-
+        self.run_top_level_turn(Some(AgentMessage::wire(Message::User(UserMessage::text(
+            prompt,
+        )))))
+        .await?;
         self.sub_agent_outcome()
     }
 
@@ -3831,19 +3759,12 @@ impl SessionContextWrapper<'_> {
                 });
             }
 
-            // Blocking mode: run the initial turn through the
-            // retained handle. The handle stays in the registry after
-            // the run; the parent's tool result is still the first
-            // report, so the `agent` tool contract is unchanged.
-            let mut result = shared.lock().await.run_single_turn(task).await;
+            // Every turn settles the same assignment. An aborted turn leaves
+            // its caller waiting while ordinary prompts or wakes can continue
+            // the retained child.
+            let _ = shared.lock().await.run_single_turn(task).await;
             let (assignment, reply) = foreground.expect("blocking assignment");
-            if assignment.is_cancelled() {
-                result = Err("sub-agent assignment cancelled by user".into());
-            } else if result.is_err() && assignment.initial_token().is_cancelled() {
-                // A subsequent host-driven turn fulfills this same call. No
-                // parent tool result is published for the interrupted turn.
-                result = assignment.wait(reply).await;
-            }
+            let result = assignment.wait(reply).await;
 
             // Emit `SubAgentEnd` regardless of success — listeners
             // need to clean up nested-transcript framing on errors
@@ -4680,9 +4601,8 @@ mod event_protocol_tests {
 
     fn label(event: &AgentEvent) -> EventLabel {
         match event {
-            AgentEvent::AgentStart { agent_id } => EventLabel::AgentStart(*agent_id),
+            AgentEvent::AgentStart { agent_id, .. } => EventLabel::AgentStart(*agent_id),
             AgentEvent::AgentEnd { agent_id, .. } => EventLabel::AgentEnd(*agent_id),
-            AgentEvent::AgentInterrupted { .. } => EventLabel::Other("AgentInterrupted"),
             AgentEvent::TurnStart { agent_id } => EventLabel::TurnStart(*agent_id),
             AgentEvent::Notice { agent_id, text } => EventLabel::Notice(*agent_id, text.clone()),
             AgentEvent::Warning { agent_id, text } => EventLabel::Warning(*agent_id, text.clone()),

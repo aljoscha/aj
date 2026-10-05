@@ -2431,7 +2431,6 @@ fn is_known_event_type(event_type: &str) -> bool {
         event_type,
         "agent_start"
             | "agent_end"
-            | "agent_interrupted"
             | "turn_start"
             | "turn_end"
             | "message_start"

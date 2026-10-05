@@ -177,12 +177,11 @@ pub struct ToolEntry {
     pub header_only: bool,
 }
 
-/// Run status of a sub-agent box.
+/// Assignment or independent continuation status of a sub-agent box.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum SubAgentStatus {
+    /// An outstanding assignment or an independent continuation.
     Running,
-    /// Current turn stopped, waiting for user input while the assignment stays pending.
-    Interrupted,
     /// Finished cleanly.
     Done,
     /// Finished, but the final report hit the model's token cap and is
@@ -206,14 +205,16 @@ pub struct SubAgentEntry {
     /// Originating tool name for display identity. Empty is unspecified.
     pub tool_name: String,
     pub status: SubAgentStatus,
+    /// A foreground caller still owns this assignment, even between turns.
+    pub assignment_pending: bool,
     /// Final report, set on `SubAgentEnd`.
     pub report: Option<String>,
     /// Start of the current run: set on `SubAgentStart` and reset on a
     /// continuation re-run, so the runtime measures the active run rather than
     /// the wall-clock since first spawn.
     pub started_at: Instant,
-    /// When the sub finished (`SubAgentEnd` or `AgentEnd`), freezing the
-    /// displayed runtime. `None` while it is still running. A continuation
+    /// When the assignment or independent continuation finished, freezing the
+    /// displayed runtime. `None` while it is outstanding. A continuation
     /// re-run clears it (and resets `started_at`) so timing starts fresh.
     pub finished_at: Option<Instant>,
     /// Whether the sub was spawned to run in the background, concurrent with
@@ -852,23 +853,42 @@ impl ChatState {
     }
 
     /// Re-open the `Sub(n)` box for a new run of a sub we already have a
-    /// box for: a `Done` or `Interrupted` box flips to `Running` and its runtime clock
+    /// box for: a `Done` box flips to `Running` and its runtime clock
     /// starts over. A missing box and one that is already running are left
     /// untouched.
     ///
-    /// A `Done` or `Interrupted` box re-opens for continuation or resumption.
+    /// A `Done` box re-opens for continuation.
     /// A `Truncated` or `Failed` conclusion is terminal,
     /// and re-opening it would let the new run's plain `AgentEnd` conclude
     /// the box `Done` and quietly rewrite a failure into a success.
     pub(crate) fn reopen_sub_box(&mut self, n: usize) {
         if let Some(b) = self.sub_box_mut(n)
-            && matches!(b.status, SubAgentStatus::Done | SubAgentStatus::Interrupted)
+            && b.status == SubAgentStatus::Done
         {
             b.status = SubAgentStatus::Running;
             // The clock restarts so the runtime times the new run, not the
             // wall-clock since first spawn.
             b.started_at = Instant::now();
             b.finished_at = None;
+        }
+    }
+
+    /// Ending an owning turn also ends its outstanding foreground assignments.
+    /// Detached work and independent child continuations keep their own lifetime.
+    pub(crate) fn end_assignments(&mut self, parent: AgentId) {
+        let children: Vec<_> = self
+            .sub_boxes
+            .iter()
+            .filter_map(|(&n, &(owner, _))| (owner == parent).then_some(n))
+            .collect();
+        for n in children {
+            if let Some(b) = self.sub_box_mut(n)
+                && b.assignment_pending
+            {
+                b.assignment_pending = false;
+                b.status = SubAgentStatus::Failed;
+                b.finished_at = Some(Instant::now());
+            }
         }
     }
 

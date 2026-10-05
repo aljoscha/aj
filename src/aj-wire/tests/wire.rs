@@ -22,7 +22,6 @@ use serde_json::{Value, json};
 const EVENT_TYPES: &[&str] = &[
     "agent_start",
     "agent_end",
-    "agent_interrupted",
     "turn_start",
     "turn_end",
     "message_start",
@@ -873,6 +872,29 @@ fn agent_settings_without_thinking_display_remain_readable() {
             .is_none(),
         "legacy snapshots re-serialize without fabricating a value",
     );
+}
+
+#[test]
+fn lifecycle_events_without_assignment_ownership_keep_their_wire_shape() {
+    for value in [
+        json!({"type": "agent_start", "agent_id": "main"}),
+        json!({"type": "agent_end", "agent_id": "main", "messages": [], "waiting": false}),
+    ] {
+        let decoded: DecodedAgentEvent = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            decoded.known(),
+            Some(
+                AgentEvent::AgentStart {
+                    assignment_pending: false,
+                    ..
+                } | AgentEvent::AgentEnd {
+                    assignment_pending: false,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    }
 }
 
 #[test]
@@ -2884,7 +2906,6 @@ fn agent_event_type(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::AgentStart { .. } => "agent_start",
         AgentEvent::AgentEnd { .. } => "agent_end",
-        AgentEvent::AgentInterrupted { .. } => "agent_interrupted",
         AgentEvent::TurnStart { .. } => "turn_start",
         AgentEvent::TurnEnd { .. } => "turn_end",
         AgentEvent::MessageStart { .. } => "message_start",

@@ -257,6 +257,9 @@ impl SessionClient {
                 chat.footers_mut()
                     .note_settings(AgentId::Main, settings.clone());
                 self.seed_lifecycle(working);
+                if !working {
+                    chat.end_assignments(AgentId::Main);
+                }
                 self.settings = Some(settings);
                 self.oracle_settings = oracle_settings;
                 chat.note_goal(goal, working);
@@ -1541,6 +1544,7 @@ mod tests {
                 EPOCH,
                 AgentEvent::AgentStart {
                     agent_id: AgentId::Main,
+                    assignment_pending: false,
                 },
             ),
         );
@@ -1745,7 +1749,13 @@ mod tests {
         for agent in [AgentId::Main, AgentId::Sub(1)] {
             let _ = client.apply(
                 &mut chat,
-                live(EPOCH, AgentEvent::AgentStart { agent_id: agent }),
+                live(
+                    EPOCH,
+                    AgentEvent::AgentStart {
+                        agent_id: agent,
+                        assignment_pending: false,
+                    },
+                ),
             );
         }
         assert!(client.lifecycle().is_running(AgentId::Sub(1)));
@@ -1768,6 +1778,7 @@ mod tests {
                 EPOCH,
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                     messages: Vec::new(),
                     waiting: false,
                 },
@@ -1796,6 +1807,7 @@ mod tests {
                 EPOCH,
                 AgentEvent::AgentStart {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                 },
             ),
         );
@@ -1912,6 +1924,7 @@ mod tests {
             &mut chat,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
             },
         );
         assert!(client.lifecycle().is_running(AgentId::Main));

@@ -131,19 +131,19 @@ async fn interrupt(h: &Harness, session: &str, client: &mut Client, child: usize
     let frames = frames_until(&mut client.stream, "child interrupted", |frame| {
         matches!(frame,
             Frame::Event { event, .. } if matches!(event.known(),
-                Some(AgentEvent::AgentInterrupted { agent_id }) if *agent_id == AgentId::Sub(child))
+                Some(AgentEvent::AgentEnd { agent_id, assignment_pending: true, .. }) if *agent_id == AgentId::Sub(child))
         )
     })
     .await;
     apply(client, &frames);
-    assert_paused(client, child);
+    assert_assigned_idle(client, child);
     frames
 }
 
-fn assert_paused(client: &Client, child: usize) {
+fn assert_assigned_idle(client: &Client, child: usize) {
     assert_eq!(
         sub_box(&client.canonical(), child),
-        (SubAgentStatus::Interrupted, true)
+        (SubAgentStatus::Running, false)
     );
     assert!(!client.client.lifecycle().is_running(AgentId::Sub(child)));
     assert!(client.client.working(), "parent must remain pending");
@@ -189,112 +189,61 @@ async fn delegate(
 }
 
 #[tokio::test]
-async fn prompt_at_initial_end_waits_for_interruption_publication_and_resumes_original_call() {
+async fn prompt_at_interrupted_continuation_end_runs_after_teardown() {
     let (h, mut requests) = held();
     let session = h.create().await;
     let mut client = Client::attach(&h.host, &session).await;
-    // A completed child gives access to the shared bus without reaching into
-    // a running agent. The child under test still takes its initial turn.
-    h.prompt(&session, "prepare a bus observer then investigate")
-        .await;
-    next(&mut requests).await.answer(calling(
-        "prepare",
-        "prepare",
-        "agent",
-        json!({"task":"prepare observer"}),
-    ));
-    next(&mut requests)
-        .await
-        .answer(finalized_text_message("prepared"));
-    let parent = next(&mut requests).await;
+    let initial = delegate(&h, &session, &mut requests).await;
+    let mut frames = interrupt(&h, &session, &mut client, 1).await;
+    assert!(initial.cancel.is_cancelled());
     let handles = h.host.local_handles(&session).await.unwrap();
-    let observer = handles.registry.get(1).unwrap();
+    let child = handles.registry.get(1).unwrap();
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let order = Arc::new(StdMutex::new(Vec::new()));
-    let _subscription = bounded("observer lock", observer.lock()).await.subscribe({
+    let _subscription = bounded("child lock", child.lock()).await.subscribe({
         let entered = Arc::clone(&entered);
         let release = Arc::clone(&release);
-        let order = Arc::clone(&order);
         Arc::new(move |event| {
             let entered = Arc::clone(&entered);
             let release = Arc::clone(&release);
-            let order = Arc::clone(&order);
             Box::pin(async move {
-                match event {
-                    AgentEvent::AgentInterrupted {
-                        agent_id: AgentId::Sub(2),
-                    } => {
-                        entered.notify_one();
-                        release.notified().await;
-                        order.lock().unwrap().push("interrupted");
-                    }
-                    AgentEvent::AgentStart {
-                        agent_id: AgentId::Sub(2),
-                    } => {
-                        order.lock().unwrap().push("start");
-                    }
+                if matches!(
+                    event,
                     AgentEvent::AgentEnd {
-                        agent_id: AgentId::Sub(2),
+                        agent_id: AgentId::Sub(1),
+                        assignment_pending: true,
                         ..
-                    } => {
-                        order.lock().unwrap().push("end");
                     }
-                    _ => {}
+                ) {
+                    entered.notify_one();
+                    release.notified().await;
                 }
                 Ok(())
             })
         })
     });
-    parent.answer(calling(
-        "investigate",
-        "original",
-        "agent",
-        json!({"task":"investigate evidence"}),
-    ));
-    let child = next(&mut requests).await;
-    command(
-        &h,
-        &session,
-        Command::Cancel {
-            agent: AgentId::Sub(2),
-        },
-    )
-    .await;
-    let mut frames = frames_until(&mut client.stream, "initial child end", |frame| {
-        matches!(frame, Frame::Event { event, .. } if matches!(event.known(),
-            Some(AgentEvent::AgentEnd { agent_id: AgentId::Sub(2), .. })))
-    })
-    .await;
-    bounded("held interruption publication", entered.notified()).await;
-    assert!(child.cancel.is_cancelled());
-    assert_eq!(*order.lock().unwrap(), ["start", "end"]);
-    resume(
-        &h,
-        &session,
-        2,
-        "resume before interruption publication finishes",
-    )
-    .await;
+    resume(&h, &session, 1, "first continuation").await;
+    let continuation = next(&mut requests).await;
+    frames.extend(interrupt(&h, &session, &mut client, 1).await);
+    bounded("held turn-end delivery", entered.notified()).await;
+    assert!(continuation.cancel.is_cancelled());
+    // The client sees an idle turn while its task is still winding down.
+    // The accepted prompt must run after that task joins, not need another prompt.
+    resume(&h, &session, 1, "resume during teardown").await;
     release.notify_one();
     let resumed = next(&mut requests).await;
-    assert_eq!(
-        *order.lock().unwrap(),
-        ["start", "end", "interrupted", "start"]
+    assert!(
+        serde_json::to_string(&resumed.context)
+            .unwrap()
+            .contains("resume during teardown")
     );
-    resumed.answer(finalized_text_message("resumed evidence verified"));
+    resumed.answer(finalized_text_message("verified report"));
     let parent = next(&mut requests).await;
     assert!(!parent_result(&parent).is_error);
-    assert!(
-        serde_json::to_string(&parent_result(&parent).content)
-            .unwrap()
-            .contains("resumed evidence verified")
-    );
-    parent.answer(finalized_text_message("original assignment completed"));
+    parent.answer(finalized_text_message("assignment completed"));
     frames.extend(client.pump_until_idle().await);
     assert_eq!(result_count(&frames), 1);
-    assert!(!notice(&frames, CANCELLED));
-    assert!(errors(&frames).is_empty());
+    assert_no_dangling(&client.chat);
     h.host.shutdown().await;
 }
 
@@ -373,6 +322,105 @@ async fn queued_follow_up_survives_successful_initial_assignment_completion() {
     );
     assert_eq!(result_count(&frames), 1);
     assert!(!notice(&frames, CANCELLED));
+    h.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn queued_follow_up_wakes_interrupted_initial_and_continued_assignments() {
+    for continued in [false, true] {
+        let (h, mut requests) = held();
+        let session = h.create().await;
+        let mut client = Client::attach(&h.host, &session).await;
+        let initial = delegate(&h, &session, &mut requests).await;
+        let mut frames = Vec::new();
+        let running = if continued {
+            frames.extend(interrupt(&h, &session, &mut client, 1).await);
+            assert!(initial.cancel.is_cancelled());
+            resume(&h, &session, 1, "continue investigating").await;
+            next(&mut requests).await
+        } else {
+            initial
+        };
+        resume(&h, &session, 1, "queued follow-up evidence").await;
+        assert!(!running.cancel.is_cancelled());
+        frames.extend(interrupt(&h, &session, &mut client, 1).await);
+        assert!(running.cancel.is_cancelled());
+        assert_eq!(result_count(&frames), 0);
+        let awakened = next(&mut requests).await;
+        assert!(
+            serde_json::to_string(&awakened.context)
+                .unwrap()
+                .contains("queued follow-up evidence")
+        );
+        awakened.answer(finalized_text_message("follow-up evidence verified"));
+        let parent = next(&mut requests).await;
+        assert!(!parent_result(&parent).is_error);
+        assert!(
+            serde_json::to_string(&parent_result(&parent).content)
+                .unwrap()
+                .contains("follow-up evidence verified")
+        );
+        parent.answer(finalized_text_message("completed after ordinary wake"));
+        frames.extend(client.pump_until_idle().await);
+        assert_eq!(result_count(&frames), 1);
+        assert_no_dangling(&client.chat);
+        h.host.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn background_task_notice_wakes_idle_assignment_and_fulfills_original_call() {
+    let (h, mut requests) = held();
+    let session = h.create().await;
+    let mut client = Client::attach(&h.host, &session).await;
+    let child = delegate(&h, &session, &mut requests).await;
+    let gate = h._dir.path().join("evidence-gate");
+    child.answer(calling("wait for evidence", "wait", "bash", json!({
+        "command": format!("mkfifo {gate:?}; read -r evidence < {gate:?}; printf '%s' \"$evidence\""),
+        "description": "collect evidence", "run_in_background": true
+    })));
+    let running = next(&mut requests).await;
+    let handles = h.host.local_handles(&session).await.unwrap();
+    let tasks = handles.task_registry.snapshot();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].owner, AgentId::Sub(1));
+    assert_eq!(tasks[0].status, TaskStatus::Running);
+    let mut frames = interrupt(&h, &session, &mut client, 1).await;
+    assert!(running.cancel.is_cancelled());
+    bounded("evidence FIFO ready", async {
+        while !gate.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    bounded(
+        "release evidence",
+        tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(gate)
+                .unwrap()
+                .write_all(b"verified background evidence\n")
+                .unwrap();
+        }),
+    )
+    .await
+    .unwrap();
+    let awakened = next(&mut requests).await;
+    let context = serde_json::to_string(&awakened.context).unwrap();
+    assert!(context.contains("verified background evidence"));
+    awakened.answer(finalized_text_message("background evidence report"));
+    let parent = next(&mut requests).await;
+    assert!(!parent_result(&parent).is_error);
+    assert!(
+        serde_json::to_string(&parent_result(&parent).content)
+            .unwrap()
+            .contains("background evidence report")
+    );
+    parent.answer(finalized_text_message("completed after task notice"));
+    frames.extend(client.pump_until_idle().await);
+    assert_eq!(result_count(&frames), 1);
+    assert_no_dangling(&client.chat);
     h.host.shutdown().await;
 }
 
@@ -464,9 +512,9 @@ async fn repeated_interruptions_reattach_and_resume_fulfill_the_original_call_on
 
     let cursor = client.client.cursor().unwrap().clone();
     client.reattach(&h.host, cursor).await;
-    assert_paused(&client, 1);
+    assert_assigned_idle(&client, 1);
     let mut fresh = Client::attach(&h.host, &session).await;
-    assert_paused(&fresh, 1);
+    assert_assigned_idle(&fresh, 1);
 
     resume(&h, &session, 1, "check the second clue").await;
     let second = next(&mut requests).await;

@@ -5695,7 +5695,7 @@ async fn cancelling_main_stops_its_foreground_sub() {
         matches!(
             frame,
             Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1), .. }))
         )
     })
     .await
@@ -6182,7 +6182,7 @@ async fn a_cancel_of_a_driven_sub_takes_the_turn_not_its_task() {
         matches!(
             frame,
             Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1), .. }))
         )
     })
     .await
@@ -6292,6 +6292,7 @@ async fn a_terminal_agent_task_closes_the_completion_race() {
         .await
         .emit_event(AgentEvent::AgentStart {
             agent_id: AgentId::Sub(1),
+            assignment_pending: false,
         })
         .await
         .expect("the sub's bus takes the event");
@@ -6299,7 +6300,7 @@ async fn a_terminal_agent_task_closes_the_completion_race() {
         matches!(
             frame,
             Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1), .. }))
         )
     })
     .await;
@@ -6355,6 +6356,7 @@ async fn a_cancel_that_can_end_nothing_refuses_instead_of_accepting() {
         .await
         .emit_event(AgentEvent::AgentStart {
             agent_id: AgentId::Sub(1),
+            assignment_pending: false,
         })
         .await
         .expect("the sub's bus takes the event");
@@ -8410,7 +8412,7 @@ async fn attaching_mid_sub_run_leaves_the_bracket_open() {
         matches!(
             frame,
             Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1), .. }))
         )
     })
     .await
@@ -8461,7 +8463,7 @@ async fn an_attach_block_opens_the_bracket_of_a_live_sub() {
         matches!(
             frame,
             Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1), .. }))
         )
     })
     .await
@@ -8493,7 +8495,7 @@ async fn an_attach_block_opens_the_bracket_of_a_live_sub() {
         matches!(
             frame,
             Frame::Event { durability: None, event, .. }
-                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1), .. }))
         )
     });
     start.expect("the block synthesizes an untagged AgentStart for the live sub");
@@ -11839,7 +11841,7 @@ async fn shutdown_suppresses_a_task_wake_queued_behind_an_in_flight_command() {
         teardown[task_end + 1..].iter().all(|frame| !matches!(
             frame,
             Frame::Event { event, .. }
-                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Main }))
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Main, .. }))
         )),
         "shutdown did not start a wake from the queued TaskEnd: {:?}",
         &teardown[task_end..]

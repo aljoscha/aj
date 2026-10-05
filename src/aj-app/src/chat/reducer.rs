@@ -67,17 +67,27 @@ pub fn reduce(
         // `AgentStart` marks running, `AgentEnd` marks idle, no agent's
         // lifecycle touches another's entry. Spinners and counts derive
         // from it view-side.
-        AgentEvent::AgentStart { agent_id } => {
+        AgentEvent::AgentStart {
+            agent_id,
+            assignment_pending,
+        } => {
             lifecycle.mark_running(agent_id);
             // A continuation re-prompt emits no `SubAgentStart`, so
             // `AgentStart(Sub n)` is what flips a re-prompted box back
             // to `Running`.
             if let AgentId::Sub(n) = agent_id {
+                if let Some(b) = state.sub_box_mut(n) {
+                    b.assignment_pending = assignment_pending;
+                }
                 state.reopen_sub_box(n);
             }
             Redraw(true)
         }
-        AgentEvent::AgentEnd { agent_id, .. } => {
+        AgentEvent::AgentEnd {
+            agent_id,
+            assignment_pending,
+            ..
+        } => {
             lifecycle.mark_idle(agent_id);
             // Each agent owns its streaming bookkeeping, so an agent's
             // end clears only its own entry. The main agent's pending
@@ -94,18 +104,14 @@ pub fn reduce(
             // touches a still-running box only, so an `AgentEnd`
             // delivered after it can't clobber that conclusion.
             if let AgentId::Sub(n) = agent_id {
-                state.conclude_sub_box(n);
+                if let Some(b) = state.sub_box_mut(n) {
+                    b.assignment_pending = assignment_pending;
+                }
+                if !assignment_pending {
+                    state.conclude_sub_box(n);
+                }
             }
-            Redraw(true)
-        }
-        AgentEvent::AgentInterrupted { agent_id } => {
-            lifecycle.mark_idle(agent_id);
-            if let AgentId::Sub(n) = agent_id
-                && let Some(b) = state.sub_box_mut(n)
-            {
-                b.status = SubAgentStatus::Interrupted;
-                b.finished_at = Some(Instant::now());
-            }
+            state.end_assignments(agent_id);
             Redraw(true)
         }
         AgentEvent::TurnStart { agent_id } => {
@@ -507,6 +513,7 @@ pub fn reduce(
                                 task,
                                 tool_name,
                                 status: SubAgentStatus::Running,
+                                assignment_pending: !background,
                                 report: None,
                                 started_at: Instant::now(),
                                 finished_at: None,
@@ -546,6 +553,7 @@ pub fn reduce(
             if let AgentId::Sub(n) = child
                 && let Some(b) = state.sub_box_mut(n)
             {
+                b.assignment_pending = false;
                 b.status = match conclusion {
                     SubAgentConclusion::Completed => SubAgentStatus::Done,
                     SubAgentConclusion::Truncated => SubAgentStatus::Truncated,
@@ -2215,6 +2223,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentStart {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                 },
             );
             assert_eq!(box_status(&mut s), SubAgentStatus::Running);
@@ -2223,6 +2232,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                     messages: Vec::new(),
                     waiting: false,
                 },
@@ -2254,6 +2264,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentStart {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                 },
             );
             apply(
@@ -2261,6 +2272,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                     messages: Vec::new(),
                     waiting: false,
                 },
@@ -2310,6 +2322,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -2340,6 +2353,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
@@ -2358,6 +2372,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -2374,6 +2389,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, sub_assistant_end(1, "second result"));
@@ -2382,6 +2398,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -2417,6 +2434,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
@@ -2435,6 +2453,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -2451,6 +2470,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, sub_tool_only_end(1, "c1", "read_file"));
@@ -2459,6 +2479,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -2492,6 +2513,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentStart {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                 },
             );
             apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
@@ -2510,6 +2532,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                     messages: Vec::new(),
                     waiting: false,
                 },
@@ -2579,6 +2602,7 @@ mod tests {
             for reopening in [
                 AgentEvent::AgentStart {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                 },
                 sub_agent_start(1, "scripted", "scripted"),
             ] {
@@ -2608,6 +2632,7 @@ mod tests {
                     &mut life,
                     AgentEvent::AgentEnd {
                         agent_id: AgentId::Sub(1),
+                        assignment_pending: false,
                         messages: Vec::new(),
                         waiting: false,
                     },
@@ -2645,6 +2670,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, sub_assistant_end(1, "resume value"));
@@ -2768,6 +2794,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -2782,6 +2809,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             },
         );
         let b = s.sub_box_mut(1).expect("box");
@@ -2856,6 +2884,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, tool_start(AgentId::Main, "c1", "bash"));
@@ -2902,6 +2931,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -2960,6 +2990,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, tool_start(AgentId::Main, "c1", "bash"));
@@ -2973,6 +3004,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -3170,6 +3202,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -3197,6 +3230,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
             },
         );
         assert!(life.is_running(AgentId::Main));
@@ -3205,6 +3239,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -3581,6 +3616,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, start.clone());
@@ -3590,6 +3626,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Main,
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -3748,6 +3785,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, sub_assistant_end(1, "working on it"));
@@ -4300,6 +4338,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentStart {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                 },
             );
             apply(
@@ -4317,6 +4356,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                     messages: Vec::new(),
                     waiting: false,
                 },
@@ -4328,6 +4368,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentStart {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                 },
             );
             apply(
@@ -4335,6 +4376,7 @@ mod tests {
                 &mut life,
                 AgentEvent::AgentEnd {
                     agent_id: AgentId::Sub(1),
+                    assignment_pending: false,
                     messages: Vec::new(),
                     waiting: false,
                 },
@@ -4750,6 +4792,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             },
         );
         apply(&mut s, &mut life, sub_assistant_end(1, "still going"));
@@ -4971,6 +5014,7 @@ mod tests {
             sub_agent_start(1, "scripted", "scripted"),
             AgentEvent::AgentStart {
                 agent_id: AgentId::Sub(1),
+                assignment_pending: false,
             },
             sub_assistant_end(1, "done here"),
             AgentEvent::SubAgentEnd {

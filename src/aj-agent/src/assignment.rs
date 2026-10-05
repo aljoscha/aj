@@ -64,10 +64,6 @@ impl ForegroundAssignment {
         self.initial_turn.clone()
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.lifetime.is_cancelled()
-    }
-
     // Reserve terminal delivery before publishing AgentEnd. The host can
     // wake independent queued work as soon as it observes that event.
     pub(crate) fn take_reply(&self) -> Option<oneshot::Sender<Report>> {
@@ -99,8 +95,8 @@ impl Drop for AssignmentGuard {
     }
 }
 
-/// A host-driven continuation may unwind or be dropped rather than returning
-/// through its normal terminal path. Its parent must still get one result.
+/// A child turn may unwind or be dropped rather than returning through its
+/// normal terminal path. Its parent must still get one result.
 pub(crate) struct AssignmentTurnGuard(pub Option<Arc<ForegroundAssignment>>);
 
 impl Drop for AssignmentTurnGuard {

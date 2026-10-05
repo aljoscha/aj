@@ -11,7 +11,7 @@
 //! - `Ctrl+T` ([`ACTION_AGENT_TOGGLE_SCOPE`]) flips the scope between
 //!   "active only" and "all", rebuilding the row set in place.
 //! - `Ctrl+K` ([`ACTION_TASK_KILL`]) kills a running task or a running or
-//!   interrupted sub-agent assignment and closes.
+//!   pending sub-agent assignment and closes.
 //!
 //! The main agent is always listed so the user can return home. The
 //! current view is pre-selected. Task rows are recovered on confirm by
@@ -27,6 +27,7 @@ use aj_agent::events::AgentId;
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
 use aj_app::chat::{AgentEntry, ChatState, SubAgentStatus};
 use aj_app::keybindings::{ACTION_AGENT_TOGGLE_SCOPE, ACTION_TASK_KILL, action_shortcut};
+use aj_app::session::AgentLifecycle;
 use vaxis::vxfw::{
     DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectItem,
     SubSurface, Surface, Widget, WidgetRef, draw_widget, to_widget_ref,
@@ -60,14 +61,14 @@ pub(crate) enum AgentPickerOutcome {
     OpenTask(TaskId),
     /// Kill this (still-running at snapshot time) background task.
     Kill(TaskId),
-    /// Terminate a running or interrupted sub-agent assignment.
+    /// Terminate a running turn or pending sub-agent assignment.
     KillAgent(AgentId),
 }
 
 /// Which agents and tasks the picker lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scope {
-    /// The main agent plus running or interrupted sub-agents and running tasks: the
+    /// The main agent plus running or assigned sub-agents and running tasks: the
     /// work worth watching right now.
     Running,
     /// The main agent plus every sub-agent and task in the session.
@@ -94,12 +95,11 @@ pub(crate) struct PickerSnapshot {
 }
 
 impl PickerSnapshot {
-    /// Gather the live agents and background bash tasks from the chat
-    /// model.
+    /// Gather agent assignments, current turns, and background bash tasks.
     ///
     /// Agent-backed tasks are skipped: their sub-agent already appears
     /// as an agent row, so a task row would duplicate it.
-    pub(crate) fn gather(chat: &ChatState) -> PickerSnapshot {
+    pub(crate) fn gather(chat: &ChatState, lifecycle: &AgentLifecycle) -> PickerSnapshot {
         let now = Instant::now();
         let tasks = chat
             .tasks()
@@ -115,8 +115,16 @@ impl PickerSnapshot {
                     .duration_since(info.started_at),
             })
             .collect();
+        let mut agents = chat.agents();
+        // A current turn is killable even when its box preserves a historical
+        // failed or truncated conclusion. Only the picker overlays that status.
+        for agent in &mut agents {
+            if agent.id != AgentId::Main && lifecycle.is_running(agent.id) {
+                agent.status = Some(SubAgentStatus::Running);
+            }
+        }
         PickerSnapshot {
-            agents: chat.agents(),
+            agents,
             tasks,
             active: chat.active_view(),
         }
@@ -257,11 +265,7 @@ impl Widget for AgentPicker {
 
 /// Only unfinished sub-agent work is an explicit kill target.
 fn agent_killable(entry: &AgentEntry) -> bool {
-    entry.id != AgentId::Main
-        && matches!(
-            entry.status,
-            Some(SubAgentStatus::Running | SubAgentStatus::Interrupted)
-        )
+    entry.id != AgentId::Main && entry.status == Some(SubAgentStatus::Running)
 }
 
 /// Main and unfinished assignments stay visible in the active scope.
@@ -319,9 +323,6 @@ fn agent_item(entry: &AgentEntry, active: AgentId) -> SelectItem {
         Some(status) => format!("{} {name}", sub_status_glyph(status)),
         None => name.clone(),
     };
-    if entry.status == Some(SubAgentStatus::Interrupted) {
-        label.push_str(" · Interrupted");
-    }
     if entry.id == active {
         label.push_str(" (current)");
     }
@@ -424,8 +425,7 @@ fn task_status_label(status: TaskStatus) -> String {
 /// sub-agent box so the two views read the same.
 fn sub_status_glyph(status: SubAgentStatus) -> &'static str {
     match status {
-        SubAgentStatus::Running => "\u{25b8}", // ▸
-        SubAgentStatus::Interrupted => "Ⅱ",
+        SubAgentStatus::Running => "\u{25b8}",   // ▸
         SubAgentStatus::Done => "\u{2713}",      // ✓
         SubAgentStatus::Truncated => "\u{26a0}", // ⚠
         SubAgentStatus::Failed => "\u{2717}",    // ✗
@@ -566,6 +566,8 @@ pub(crate) fn open_agent_picker(
 
 #[cfg(test)]
 mod tests {
+    use aj_agent::events::{AgentEvent, AgentSettings, SubAgentConclusion};
+    use aj_app::chat::reduce;
     use vaxis::key::{Key, Modifiers};
     use vaxis::vxfw::{Phase, SelectStyles};
 
@@ -996,12 +998,8 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_k_kills_running_and_interrupted_agents_but_not_finished_agents() {
-        for status in [
-            SubAgentStatus::Running,
-            SubAgentStatus::Interrupted,
-            SubAgentStatus::Done,
-        ] {
+    fn ctrl_k_kills_running_agents_but_not_finished_agents() {
+        for status in [SubAgentStatus::Running, SubAgentStatus::Done] {
             let agents = vec![main_entry(), sub_entry(1, status)];
             let active_items = build_items(&agents, &[], AgentId::Main, Scope::Running);
             assert_eq!(
@@ -1043,6 +1041,112 @@ mod tests {
                 } else {
                     Some(AgentPickerOutcome::KillAgent(AgentId::Sub(1)))
                 }
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_k_kills_current_turn_without_changing_historical_conclusion() {
+        for (conclusion, status) in [
+            (SubAgentConclusion::Failed, SubAgentStatus::Failed),
+            (SubAgentConclusion::Truncated, SubAgentStatus::Truncated),
+        ] {
+            let settings = AgentSettings {
+                context_window: 0,
+                provider: "scripted".into(),
+                model_id: "scripted".into(),
+                thinking: "off".into(),
+                thinking_display: "default".into(),
+                speed: "standard".into(),
+                verbosity: "default".into(),
+            };
+            let mut chat = ChatState::new(settings.clone());
+            let mut lifecycle = AgentLifecycle::default();
+            let child = AgentId::Sub(1);
+            for event in [
+                AgentEvent::SubAgentStart {
+                    parent: AgentId::Main,
+                    child,
+                    task: "work".into(),
+                    tool_name: "agent".into(),
+                    background: false,
+                    settings,
+                },
+                AgentEvent::AgentStart {
+                    agent_id: child,
+                    assignment_pending: false,
+                },
+                AgentEvent::SubAgentEnd {
+                    parent: AgentId::Main,
+                    child,
+                    report: "historical report".into(),
+                    conclusion,
+                },
+                AgentEvent::AgentEnd {
+                    agent_id: child,
+                    assignment_pending: false,
+                    waiting: false,
+                    messages: vec![],
+                },
+            ] {
+                let _ = reduce(&mut chat, &mut lifecycle, event, None);
+            }
+            assert!(!lifecycle.is_running(child));
+            let idle = PickerSnapshot::gather(&chat, &lifecycle);
+            assert_eq!(
+                build_items(&idle.agents, &[], child, Scope::Running).len(),
+                1
+            );
+            let _ = reduce(
+                &mut chat,
+                &mut lifecycle,
+                AgentEvent::AgentStart {
+                    agent_id: child,
+                    assignment_pending: false,
+                },
+                None,
+            );
+            assert!(lifecycle.is_running(child));
+            assert_eq!(
+                chat.agents().iter().find(|a| a.id == child).unwrap().status,
+                Some(status)
+            );
+            chat.set_active_view(child);
+            let snapshot = PickerSnapshot::gather(&chat, &lifecycle);
+            let items = build_items(&snapshot.agents, &snapshot.tasks, child, Scope::Running);
+            assert_eq!(items.len(), 2, "current turn stays in active scope");
+            let select = Rc::new(RefCell::new(FilterableSelect::new(
+                items,
+                SelectStyles::default(),
+            )));
+            preselect_active(&select.borrow(), child);
+            let outcome = Rc::new(RefCell::new(None));
+            let mut picker = AgentPicker {
+                select,
+                agents: snapshot.agents,
+                tasks: snapshot.tasks,
+                active: snapshot.active,
+                scope: Scope::Running,
+                window: None,
+                outcome: Rc::clone(&outcome),
+                stack: Rc::new(RefCell::new(OverlayStack::default())),
+                editor: Rc::new(RefCell::new(crate::overlay::Scrim)),
+            };
+            picker.capture_event(
+                &mut EventContext::new(),
+                &Event::KeyPress(Key {
+                    codepoint: u32::from('k'),
+                    mods: Modifiers::CTRL,
+                    ..Key::default()
+                }),
+            );
+            assert_eq!(
+                *outcome.borrow(),
+                Some(AgentPickerOutcome::KillAgent(child))
+            );
+            assert_eq!(
+                chat.agents().iter().find(|a| a.id == child).unwrap().status,
+                Some(status)
             );
         }
     }

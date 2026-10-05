@@ -2140,7 +2140,6 @@ impl SessionHost {
             // `SessionStatus::finished_subs`).
             finished_subs: log.sub_agent_ids(),
             driven_subs: std::collections::BTreeSet::new(),
-            interrupted_subs: std::collections::BTreeSet::new(),
             last_activity: self.opening_stamp(&log, &session_id),
             tag,
             archived,
@@ -2297,7 +2296,7 @@ impl SessionHost {
             goal_seen,
             finished_subs,
             driven_subs,
-            interrupted_subs,
+            assigned_subs,
         ) = {
             let log = tokio::select! {
                 biased;
@@ -2314,7 +2313,13 @@ impl SessionHost {
                 status.goal.clone(),
                 status.finished_subs.clone(),
                 status.driven_subs.clone(),
-                status.interrupted_subs.clone(),
+                session
+                    .core
+                    .registry
+                    .ids()
+                    .into_iter()
+                    .filter(|n| session.core.registry.assignment(*n).is_some())
+                    .collect::<std::collections::BTreeSet<_>>(),
             )
         };
         let boundary = snapshot.last_seq();
@@ -2338,21 +2343,21 @@ impl SessionHost {
             self.inner.shared.restore.is_some(),
         )
         .await;
-        // A run is live if the log names it and the host has not seen it
-        // finish, or if the host is driving a turn for it (a continuation of
-        // a run that did finish). Deriving it this way rather than tracking
-        // the live set keeps the one unavoidable lag (a spawn root reaches
+        // A turn is live if the log names it and the host has not seen it
+        // finish, or if the host is driving a continuation. A foreground
+        // assignment also stays open between turns. Deriving turn activity
+        // from the log keeps the one unavoidable lag (a spawn root reaches
         // disk before the host consumes the run's `AgentStart`) on the safe
         // side: the worst case is a bracket left open a moment too long,
         // which the live `SubAgentEnd` closes, instead of a fabricated
         // conclusion for a running sub-agent.
-        let live_subs: std::collections::BTreeSet<usize> = snapshot
+        let running_subs: std::collections::BTreeSet<usize> = snapshot
             .sub_agent_ids()
             .difference(&finished_subs)
             .copied()
             .chain(driven_subs)
-            .chain(interrupted_subs.iter().copied())
             .collect();
+        let live_subs = running_subs.union(&assigned_subs).copied().collect();
         // Projected outside the log lock: a full backfill walks the whole
         // log, and holding the lock would stall the session's next append
         // for the length of it.
@@ -2436,12 +2441,9 @@ impl SessionHost {
         {
             return false;
         }
-        // Repair live lifecycle state after projecting the boxes, before
-        // `caught_up` makes them actionable. An open assignment is either
-        // running or interrupted waiting for input. Both keep their parent
-        // call pending, but only a running turn belongs in the busy set.
-        // The projection force-closes non-live runs, so `open_subs` already
-        // scopes this repair to assignments on the selected branch.
+        // Each lifecycle snapshot states activity and ownership together, so
+        // independent continuations do not inherit foreground ownership from
+        // their historical spawn root, and idle assignments remain open.
         let open_subs = backfill.open_subs();
         for child in &open_subs {
             if !send_block_frame(
@@ -2454,13 +2456,17 @@ impl SessionHost {
                     // sweep below, tagging it durable would make the
                     // client's cursor invariant drop it.
                     durability: None,
-                    event: if interrupted_subs.contains(child) {
-                        AgentEvent::AgentInterrupted {
-                            agent_id: AgentId::Sub(*child),
-                        }
-                    } else {
+                    event: if running_subs.contains(child) {
                         AgentEvent::AgentStart {
                             agent_id: AgentId::Sub(*child),
+                            assignment_pending: assigned_subs.contains(child),
+                        }
+                    } else {
+                        AgentEvent::AgentEnd {
+                            agent_id: AgentId::Sub(*child),
+                            messages: Vec::new(),
+                            waiting: false,
+                            assignment_pending: assigned_subs.contains(child),
                         }
                     }
                     .into(),
@@ -2523,6 +2529,7 @@ impl SessionHost {
                         agent_id: AgentId::Sub(*child),
                         messages: Vec::new(),
                         waiting: false,
+                        assignment_pending: false,
                     }
                     .into(),
                 },

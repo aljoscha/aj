@@ -1086,7 +1086,6 @@ fn subagent_fingerprint(s: &SubAgentEntry, hasher: &mut DefaultHasher) {
         SubAgentStatus::Done => 1u8.hash(hasher),
         SubAgentStatus::Truncated => 2u8.hash(hasher),
         SubAgentStatus::Failed => 3u8.hash(hasher),
-        SubAgentStatus::Interrupted => 4u8.hash(hasher),
     }
     s.task.hash(hasher);
     s.tool_name.hash(hasher);
@@ -7942,6 +7941,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },
@@ -9275,6 +9275,7 @@ mod tests {
             &mut life,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
+                assignment_pending: false,
                 messages: Vec::new(),
                 waiting: false,
             },

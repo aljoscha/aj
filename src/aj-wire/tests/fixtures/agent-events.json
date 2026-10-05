@@ -1,11 +1,12 @@
 [
   {
     "type": "agent_start",
-    "agent_id": "main"
+    "agent_id": {"sub": 1},
+    "assignment_pending": true
   },
   {
     "type": "agent_end",
-    "agent_id": "main",
+    "agent_id": {"sub": 1},
     "messages": [
       {
         "role": "user",
@@ -13,11 +14,8 @@
         "timestamp": 10
       }
     ],
-    "waiting": false
-  },
-  {
-    "type": "agent_interrupted",
-    "agent_id": {"sub": 1}
+    "waiting": false,
+    "assignment_pending": true
   },
   {
     "type": "turn_start",
