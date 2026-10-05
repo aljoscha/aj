@@ -1096,7 +1096,7 @@ fn settings() -> AgentSettings {
         model_id: "scripted".into(),
         thinking: "off".into(),
         thinking_display: "default".into(),
-        speed: "standard".into(),
+        speed: "default".into(),
         verbosity: "default".into(),
     }
 }
