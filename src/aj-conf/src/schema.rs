@@ -619,8 +619,8 @@ pub struct Config {
     /// output-tokens-per-second at some quality cost.
     pub speed: Option<ConfigSpeed>,
     /// Output verbosity (`text.verbosity`): the visible answer-length
-    /// knob. Defaults to unset (the provider's server default). Only
-    /// takes effect for models that support it (the gpt-5 family on
+    /// knob. Unset uses the model's catalog default, then the server default.
+    /// Only takes effect for models that support it (the gpt-5 family on
     /// the OpenAI Responses / Codex wire); ignored elsewhere. See
     /// [`ConfigVerbosity`]. Distinct from `thinking_display`, which
     /// controls the reasoning channel rather than the answer.
@@ -636,6 +636,7 @@ pub struct Config {
     /// Oracle inference speed override (Anthropic only).
     pub oracle_speed: Option<ConfigSpeed>,
     /// Oracle output answer verbosity override for models that support it.
+    /// Unset uses Oracle's model catalog default, then the server default.
     pub oracle_verbosity: Option<ConfigVerbosity>,
     /// Interactive TUI theme name. Resolved against the bundled
     /// catalog (`dark`, `light`) plus any `*.json` files in
@@ -813,8 +814,8 @@ impl FromStr for ConfigSpeed {
 
 /// Output verbosity set in `config.toml`, mapping to OpenAI's
 /// `text.verbosity` (the answer-length knob). Leaving the key unset is
-/// the cross-provider default (server default applies). Only takes
-/// effect for models that support it (the gpt-5 family on the OpenAI
+/// the cross-provider default (model catalog default, then server default).
+/// Only takes effect for models that support it (the gpt-5 family on the OpenAI
 /// Responses / Codex wire); other models and providers ignore it. This
 /// is distinct from `thinking_display`, which controls the reasoning
 /// channel, not the answer.

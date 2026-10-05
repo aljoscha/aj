@@ -574,11 +574,13 @@ struct ModelInfo {
     supports_adaptive_thinking: bool,
     /// Whether the model honours OpenAI's `text.verbosity` parameter
     /// (the answer-length knob). `true` for the OpenAI gpt-5 family on
-    /// the Responses / Codex wire; `false` elsewhere. Gates whether a
-    /// caller-set verbosity reaches the request so unsupported models
-    /// silently ignore it rather than 400. Not in models.dev (see
-    /// §3.4.2).
+    /// the Responses / Codex wire; `false` elsewhere. Gates explicit
+    /// and catalog-default verbosity so unsupported models silently
+    /// ignore it rather than 400. Not in models.dev (see §3.4.2).
     supports_verbosity: bool,
+    /// Catalog default used when StreamOptions.verbosity is unset.
+    /// Gated by supports_verbosity. None leaves the server default.
+    default_verbosity: Option<Verbosity>,
     /// Supported input modalities.
     input: Vec<InputModality>,  // Text, Image
     /// Pricing per million tokens.
@@ -823,6 +825,12 @@ OpenRouter's `supported_parameters` (the `"verbosity"` entry) for
 OpenRouter models. The Codex seed hand-sets it (§3.4.7), and overrides
 pin newer OpenAI models that support it (§3.4.4).
 
+`default_verbosity` is optional catalog metadata, used only when
+`supports_verbosity` is true and the stream option is unset. Resolution
+uses the loaded catalog, with no live discovery. Settings and session
+records retain the unresolved default so model changes follow the selected
+model's catalog default, falling back to the server default.
+
 On fetch failure (network error, non-200, parse failure), the
 command exits non-zero and leaves `~/.aj/models.json` untouched —
 a broken fetch never bricks the registry.
@@ -987,7 +995,8 @@ struct StreamOptions {
     /// OpenAI-only: output verbosity (`text.verbosity`), the visible
     /// answer-length axis. Ignored by non-OpenAI providers and by
     /// OpenAI models whose `supports_verbosity` is false. When unset
-    /// the server default applies. Distinct from `reasoning_summary`,
+    /// `ModelInfo.default_verbosity` applies, then the server default.
+    /// Distinct from `reasoning_summary`,
     /// which controls the reasoning channel rather than the answer.
     verbosity: Option<Verbosity>,
     /// Controls whether/how the model uses tools.
@@ -1422,7 +1431,7 @@ POST /responses
   tools: [{type: "function", name, description, parameters, strict: false}],
   tool_choice: <tool_choice mapping or omit>,
   reasoning: {effort: <level>, summary: <reasoning_summary or "auto">},  // only on reasoning-capable models
-  text: {verbosity: <low|medium|high>},  // only when StreamOptions.verbosity is set and supports_verbosity
+  text: {verbosity: <low|medium|high>},  // supports_verbosity and an explicit or catalog-default value
   include: ["reasoning.encrypted_content"],  // when reasoning is enabled
 }
 ```
@@ -1718,7 +1727,7 @@ POST /codex/responses
   tool_choice: "auto",
   parallel_tool_calls: true,
   reasoning: {effort: <level>, summary: <reasoning_summary or "auto">},  // reasoning models only
-  text: {verbosity: <low|medium|high>},                                  // only when set and supports_verbosity (§7.4.3)
+  text: {verbosity: <low|medium|high>},                                  // supports_verbosity and an explicit or catalog-default value (§7.4.3)
   include: ["reasoning.encrypted_content"],                              // when reasoning is enabled
 }
 ```
@@ -1743,12 +1752,12 @@ Differences from §7.3.2:
   are ignored on this provider (this is a documented capability gap,
   surfaced via §8.2 capability downgrade if/when it matters).
 - **`parallel_tool_calls: true` is sent unconditionally.**
-- **`text.verbosity` is sent only when requested and supported.**
-  When the caller sets `StreamOptions::verbosity` *and* the model's
-  `supports_verbosity` is true (the gpt-5 family), it's mapped onto
-  `text.verbosity`. Otherwise the field is omitted so the server
-  default (mid-range) applies and unsupported models don't 400. This
-  is the same gate the §7.3.2 Responses provider uses.
+- **`text.verbosity` uses explicit or catalog defaults when supported.**
+  When `supports_verbosity` is true, `StreamOptions::verbosity` takes
+  precedence over `ModelInfo.default_verbosity`. If neither is set, the
+  field is omitted and the server default applies. Unsupported models
+  omit the field regardless of either value. The §7.3.2 Responses
+  provider uses the same resolution.
 - **`max_output_tokens` is omitted.** The Codex endpoint does not
   honour the field; the model is bounded by the per-model
   `max_tokens` registry value and the server's own caps.

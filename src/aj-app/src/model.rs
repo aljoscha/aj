@@ -391,10 +391,9 @@ pub fn config_verbosity_to_unified(verbosity: ConfigVerbosity) -> Verbosity {
 }
 
 /// Apply the configured output verbosity (if any) onto `options`.
-/// `None` clears the field so the provider sends no `text.verbosity`
-/// and the server default applies. Providers gate the field on
-/// per-model support, so this is a no-op for models and providers
-/// that don't honour verbosity.
+/// `None` clears the explicit choice so the provider uses the model's catalog
+/// default, then the server default. Providers gate the wire field on per-model
+/// support without discarding the configured preference.
 pub fn apply_verbosity(options: &mut StreamOptions, verbosity: Option<ConfigVerbosity>) {
     options.verbosity = verbosity.map(config_verbosity_to_unified);
 }
@@ -434,6 +433,7 @@ mod tests {
             reasoning: false,
             reasoning_options: Vec::new(),
             supports_verbosity: false,
+            default_verbosity: None,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 1_000,
@@ -675,7 +675,7 @@ mod tests {
         };
         apply_verbosity(&mut opts, Some(ConfigVerbosity::High));
         assert_eq!(opts.verbosity, Some(Verbosity::High));
-        // `None` clears the field so the server default applies.
+        // Leave default resolution to the provider's selected model.
         apply_verbosity(&mut opts, None);
         assert!(opts.verbosity.is_none());
     }

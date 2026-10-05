@@ -956,6 +956,7 @@ mod production_identity_tests {
             reasoning: false,
             reasoning_options: Vec::new(),
             supports_verbosity: false,
+            default_verbosity: None,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 0,

@@ -776,6 +776,7 @@ async fn restore_context(root: &TempDir, url: String) -> RestoreContext {
             values: vec![ThinkingLevel::Low, ThinkingLevel::High],
         }],
         supports_verbosity: true,
+        default_verbosity: None,
         max_tokens: 4096,
         context_window: 200_000,
         ..scripted_model_info()

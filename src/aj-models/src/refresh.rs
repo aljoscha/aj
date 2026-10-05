@@ -749,6 +749,7 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         // `text.verbosity`; older OpenAI models and other providers
         // don't. Pinnable per model via overrides for exceptions.
         supports_verbosity: fixed.api == "openai-responses" && id.starts_with("gpt-5"),
+        default_verbosity: None,
         input,
         cost: ModelCost {
             input: base_input,
@@ -792,6 +793,7 @@ fn map_openrouter_model(m: &OpenRouterModel, family: Option<String>) -> ModelInf
         // OpenRouter publishes per-model accepted params; `"verbosity"`
         // there means the model honours OpenAI's `text.verbosity`.
         supports_verbosity: m.supported_parameters.iter().any(|p| p == "verbosity"),
+        default_verbosity: None,
         input,
         cost: ModelCost {
             input: openrouter_price_per_million(pricing.and_then(|p| p.prompt.as_deref())),

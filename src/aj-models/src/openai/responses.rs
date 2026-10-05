@@ -449,9 +449,6 @@ fn build_request(
 
     let service_tier = options.service_tier.as_ref().map(map_service_tier);
 
-    // `text.verbosity` only when the caller set it and the
-    // model supports it; otherwise omit so the server default applies
-    // and unsupported models don't 400.
     let text = verbosity_text_config(model, options);
 
     CreateResponseRequest {
@@ -484,14 +481,13 @@ pub(super) fn map_verbosity(verbosity: UnifiedVerbosity) -> OpenAIVerbosity {
     }
 }
 
-/// Build the `text` field carrying `verbosity`, or `None` when the
-/// caller didn't request a verbosity or the model doesn't support the
-/// parameter. Shared with the Codex provider.
+/// Resolve caller verbosity before the catalog default, omitting `text` when
+/// neither is set or the model doesn't support it. Shared with Codex.
 pub(super) fn verbosity_text_config(
     model: &ModelInfo,
     options: &StreamOptions,
 ) -> Option<ResponseTextConfig> {
-    let verbosity = options.verbosity?;
+    let verbosity = options.verbosity.or(model.default_verbosity)?;
     if !supports_verbosity(model) {
         return None;
     }
@@ -1794,6 +1790,7 @@ mod tests {
             reasoning,
             reasoning_options: Vec::new(),
             supports_verbosity: false,
+            default_verbosity: None,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 1.25,

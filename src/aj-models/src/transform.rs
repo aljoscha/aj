@@ -533,6 +533,7 @@ mod tests {
             reasoning: false,
             reasoning_options: Vec::new(),
             supports_verbosity: false,
+            default_verbosity: None,
             input,
             cost: ModelCost::default(),
             context_window: 100_000,

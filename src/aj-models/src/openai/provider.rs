@@ -342,10 +342,9 @@ fn build_request(
         modalities: None,
         audio: None,
         reasoning_effort,
-        // `verbosity` only when the caller set it and the model
-        // supports it; otherwise omitted so the server default applies.
         verbosity: options
             .verbosity
+            .or(model.default_verbosity)
             .filter(|_| supports_verbosity(model))
             .map(map_verbosity),
         prediction: None,
@@ -1415,6 +1414,7 @@ mod tests {
             reasoning: true,
             reasoning_options: Vec::new(),
             supports_verbosity: false,
+            default_verbosity: None,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 1.25,

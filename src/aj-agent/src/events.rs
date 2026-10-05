@@ -71,8 +71,9 @@ pub struct AgentSettings {
     pub thinking_display: String,
     /// Inference speed: "standard" or "fast".
     pub speed: String,
-    /// Output verbosity: "default" (server default), "low", "medium",
-    /// or "high". `#[serde(default)]` so logs and events written before
+    /// Output verbosity: "default", "low", "medium", or "high". Default
+    /// stays unresolved and uses the model catalog default, then server default.
+    /// `#[serde(default)]` so logs and events written before
     /// verbosity tracking still deserialize (missing -> empty string,
     /// treated as the default on restore).
     #[serde(default)]

@@ -1238,7 +1238,11 @@ main's settings, with independent built-in, user, and project defaults. An
 Oracle model selection requires both `api` and `name` and may include a URL
 override. There is no partial model selection or follow-main mode. Oracle
 thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
-For verbosity, `default` means the Oracle provider's default, not main's value.
+For verbosity, `default` uses the selected model's catalog default, then the
+server default, gated by `supports_verbosity`. Explicit verbosity overrides
+the catalog default. Settings and session records keep `default` unresolved
+so model changes follow their own catalog defaults, without live catalog
+discovery. Oracle uses its own model's default, not main's value.
 
 Oracle calls use the same inputs and delivery modes as the `agent` tool. Calls
 block by default. With `run_in_background: true`, the tool returns the task id

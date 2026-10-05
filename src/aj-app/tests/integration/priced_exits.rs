@@ -32,6 +32,7 @@ fn model() -> ModelInfo {
         reasoning: false,
         reasoning_options: Vec::new(),
         supports_verbosity: false,
+        default_verbosity: None,
         input: vec![InputModality::Text],
         cost: ModelCost {
             input: 3.0,

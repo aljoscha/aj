@@ -933,12 +933,13 @@ pub async fn confirm_model_for_sub(
             //
             // NOTE(aljoscha): the rebuilt bundle's `stream_options`
             // come from `from_model_info` (defaults), so a sub's
-            // `thinking_display` and `verbosity` revert to the server
-            // default on a model swap. Unlike the main path
+            // `thinking_display` reverts to the server default and
+            // `verbosity` to the model catalog default, then server default,
+            // on a model swap. Unlike the main path
             // (`confirm_model`), we don't re-apply the config
-            // values here. The two settings behave identically, and
-            // sub-agent display tuning isn't exposed, so we accept the
-            // gap rather than thread config through the sub path.
+            // values here. Sub-agent display tuning isn't exposed,
+            // so we accept the gap rather than thread config through
+            // the sub path.
             core.sub_overrides
                 .lock()
                 .expect("sub overrides mutex poisoned")
@@ -986,7 +987,9 @@ pub async fn confirm_model_for_sub(
 /// stream-option field (no headers, no bundle rebuild), so unlike
 /// [`confirm_speed`] this never rebuilds the provider. Providers gate the
 /// field on per-model support, so on a model that ignores verbosity this
-/// records the preference without changing what's sent.
+/// records the preference without changing what's sent. Default stays
+/// unresolved in settings and session records so model swaps use the selected
+/// model's catalog default, falling back to the server default.
 pub async fn confirm_verbosity(
     target: ModelTarget,
     verbosity: Option<ConfigVerbosity>,
@@ -1165,7 +1168,7 @@ pub fn option_description(option: &aj_conf::ConfigOption) -> String {
         "speed" | "oracle_speed" | "oracle_thinking" => describe(option, "Takes effect next turn."),
         "verbosity" | "oracle_verbosity" => describe(
             option,
-            "\"default\" leaves the server default. Takes effect next turn.",
+            "\"default\" uses the model catalog default, then the server default. Takes effect next turn.",
         ),
         // The tool catalog is rebuilt at the start of every turn from the
         // effective config, so everything feeding it lands next turn.
@@ -1275,7 +1278,7 @@ mod tests {
             ("speed", "Takes effect next turn."),
             (
                 "verbosity",
-                "\"default\" leaves the server default. Takes effect next turn.",
+                "\"default\" uses the model catalog default, then the server default. Takes effect next turn.",
             ),
             (
                 "disabled_tools",

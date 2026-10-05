@@ -151,6 +151,7 @@ fn model(api: &str, base_url: String) -> ModelInfo {
         reasoning: false,
         reasoning_options: Vec::new(),
         supports_verbosity: false,
+        default_verbosity: None,
         input: vec![InputModality::Text],
         cost: ModelCost {
             input: 1.0,

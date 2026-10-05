@@ -686,9 +686,6 @@ fn build_request(
         max_output_tokens: None,
         temperature: options.temperature,
         reasoning: reasoning_cfg,
-        // `text.verbosity` only when the caller set it and the
-        // model supports it; otherwise omitted so the server default
-        // applies. Shared gate with the Responses provider.
         text: verbosity_text_config(model, options),
         stream: Some(true),
         // store hardcoded false; server rejects true.
@@ -743,6 +740,7 @@ mod tests {
             reasoning,
             reasoning_options: Vec::new(),
             supports_verbosity: false,
+            default_verbosity: None,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 1.0,

@@ -1513,6 +1513,7 @@ mod tests {
                 ],
             }],
             supports_verbosity: false,
+            default_verbosity: None,
             input: vec![InputModality::Text],
             cost: ModelCost {
                 input: 3.0,
@@ -1859,6 +1860,7 @@ mod tests {
         ModelInfo {
             reasoning_options: Vec::new(),
             supports_verbosity: false,
+            default_verbosity: None,
             ..fake_model()
         }
     }

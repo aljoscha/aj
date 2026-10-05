@@ -298,6 +298,7 @@ fn model(id: &str) -> ModelInfo {
             },
         }],
         supports_verbosity: true,
+        default_verbosity: None,
         ..scripted_model_info()
     }
 }

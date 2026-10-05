@@ -21,6 +21,7 @@
         }
       ],
       "supports_verbosity": true,
+      "default_verbosity": "low",
       "input": [
         "text",
         "image"
@@ -63,7 +64,8 @@
           ]
         }
       ],
-      "supports_verbosity": false,
+      "supports_verbosity": true,
+      "default_verbosity": "low",
       "input": [
         "text",
         "image"
@@ -107,6 +109,7 @@
         }
       ],
       "supports_verbosity": true,
+      "default_verbosity": "low",
       "input": [
         "text",
         "image"
@@ -150,6 +153,7 @@
         }
       ],
       "supports_verbosity": true,
+      "default_verbosity": "low",
       "input": [
         "text",
         "image"
@@ -192,6 +196,7 @@
         }
       ],
       "supports_verbosity": true,
+      "default_verbosity": "low",
       "input": [
         "text",
         "image"
@@ -235,6 +240,7 @@
         }
       ],
       "supports_verbosity": true,
+      "default_verbosity": "low",
       "input": [
         "text",
         "image"
@@ -278,6 +284,7 @@
         }
       ],
       "supports_verbosity": true,
+      "default_verbosity": "low",
       "input": [
         "text",
         "image"
@@ -321,6 +328,7 @@
         }
       ],
       "supports_verbosity": true,
+      "default_verbosity": "low",
       "input": [
         "text",
         "image"

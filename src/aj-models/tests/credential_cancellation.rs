@@ -26,6 +26,7 @@ async fn cancellation_during_credentials_aborts_and_releases_the_resolver() {
             reasoning: false,
             reasoning_options: vec![],
             supports_verbosity: false,
+            default_verbosity: None,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
             context_window: 4096,
