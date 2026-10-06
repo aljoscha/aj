@@ -1575,6 +1575,10 @@ mod tests {
             .get("openai", "gpt-6-astra")
             .expect("gpt-6-astra present in seed");
         assert!(astra.supports_verbosity);
+        let sol = registry
+            .get("openai", "gpt-6.1-sol")
+            .expect("gpt-6.1-sol present in seed");
+        assert!(sol.supports_verbosity);
     }
 
     /// The bundled seed's reasoning controls drive the adaptive

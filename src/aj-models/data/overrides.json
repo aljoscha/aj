@@ -145,6 +145,7 @@
         "id": "gpt-6.1-sol"
       },
       "patch": {
+        "supports_verbosity": true,
         "speed_modes": [
           {
             "speed": "fast",
@@ -190,7 +191,7 @@
           }
         ]
       },
-      "reason": "Flex availability and mode-specific short/long-context prices follow https://developers.openai.com/api/docs/pricing. models.dev omits these additional tiers and context prices."
+      "reason": "Verbosity follows Codex CLI rust-v0.160.1's models-manager/models.json. Flex availability and mode-specific short/long-context prices follow https://developers.openai.com/api/docs/pricing. models.dev omits verbosity capability, these additional tiers and context prices."
     },
     {
       "target": {
