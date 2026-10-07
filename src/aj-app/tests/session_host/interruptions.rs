@@ -438,6 +438,7 @@ async fn interrupting_then_killing_one_foreground_sibling_leaves_the_other_live(
         json!({"task":"first clue"}),
     );
     calls.content.push(AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: "sibling".into(),
         name: "agent".into(),
         arguments: json!({"task":"second clue"}),

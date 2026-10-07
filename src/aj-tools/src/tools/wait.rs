@@ -15,6 +15,10 @@ pub struct WaitInput {}
 impl ToolDefinition for WaitTool {
     type Input = WaitInput;
 
+    fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
+        aj_agent::tool::ExecutionMode::Control
+    }
+
     fn name(&self) -> &'static str {
         "wait"
     }
@@ -33,6 +37,7 @@ impl ToolDefinition for WaitTool {
             Err(error) => (format!("Cannot wait: {error}"), true),
         };
         Ok(ToolOutcome {
+            structured_content: None,
             content: vec![UserContent::text(text.clone())],
             details: ToolDetails::Text {
                 summary: "Wait".into(),

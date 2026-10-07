@@ -201,6 +201,7 @@ fn canonical_tool_call() -> AssistantMessage {
             text_signature: Some(text_signature("msg_codex_tool_1", None)),
         }),
         AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "call_codex_1|fc_codex_1".into(),
             name: "ls".into(),
             arguments: serde_json::json!({"path": "/srv/data"}),

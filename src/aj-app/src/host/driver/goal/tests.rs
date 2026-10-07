@@ -43,6 +43,7 @@ async fn goal_replacement_after_admission_cannot_adopt_delayed_start_or_descenda
     };
     old.stop_reason = StopReason::ToolUse;
     old.content.push(AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: "old-child".into(),
         name: "agent".into(),
         arguments: serde_json::json!({"task":"finish old work"}),
@@ -171,6 +172,7 @@ async fn queued_goal_mutations_cannot_undo_the_users_clear_or_cancel() {
         let mut response = finalized_text_message("updating goal");
         response.stop_reason = StopReason::ToolUse;
         response.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "goal-tool".into(),
             name: if clear { "create_goal" } else { "update_goal" }.into(),
             arguments: if clear {

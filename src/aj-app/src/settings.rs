@@ -1214,7 +1214,7 @@ pub fn option_description(option: &aj_conf::ConfigOption) -> String {
             option,
             "Toggles apply when the picker closes. Takes effect next turn.",
         ),
-        "image_auto_resize" | "bash_rtk" => describe(option, "Takes effect next turn."),
+        "image_auto_resize" | "bash_rtk" | "code_mode" => describe(option, "Takes effect next turn."),
         "disabled_skills" => describe(
             option,
             "Toggles apply when the picker closes. Takes effect for new sessions.",

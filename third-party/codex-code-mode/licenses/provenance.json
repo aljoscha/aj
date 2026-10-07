@@ -1,0 +1,412 @@
+{
+  "codex_evidence": {
+    ".bazelrc": "7e48a0fffeb63df92029fe781deba5200f2c6a08f328ed9f3ac41ad471757a30",
+    ".github/workflows/rusty-v8-release.yml": "2d71940e7c9ce1ba4fdfa25d345f1dc31327ace31543bf44fed492f66b3eb33f",
+    "MODULE.bazel": "4916a9f2f11d0d25a9f88dedea8a86b236155cff03c7c894fe9adcdf4606f7c4",
+    "MODULE.bazel.lock": "a5e38e0d6fbec22939878a39551f91c1a0bf1660214726c8fe5bd99364fcbff7",
+    "patches/abseil_windows_gnullvm_thread_identity.patch": "8399ecd7f7bd1ba4fb9c6e543b3452d57b7e85934a98b8f0fdd502327fdbf421",
+    "patches/v8_bazel_rules.patch": "a32713f3b5d70f43694ab06d6b62a1128dbf443799a2073346613b9b90ae5cbb",
+    "patches/v8_module_deps.patch": "ae064039eeba7a97b0f161e0ece8ae03212266face9068e61d31f75569f6bf8e",
+    "patches/v8_source_portability.patch": "0491c08e2a58cf187ff674c3837850530c8e415441757750e62f113342752573",
+    "third_party/v8/BUILD.bazel": "50b874701edde0b24166680f0ac22463661eebe55216d60e879acbb779382bc2",
+    "third_party/v8/README.md": "b37e2b8db6821453337d9d590d7e2b9a32cb491037b850c0d09f54a9073fd2a9",
+    "third_party/v8/libcxx.BUILD.bazel": "25e537d364b6e465f20e3f9ecd5168481ece3728796b137a9811273303e184d1",
+    "third_party/v8/libcxxabi.BUILD.bazel": "22fcb5a8a969a6b358ef64fdd72dcf01418fba3e047f07acd5bd34decc0b3fb2",
+    "third_party/v8/llvm_libc.BUILD.bazel": "15158ca2fcc1db8412fd64e47706f4af267ec01b82053dc5bba1b1627f7861ad"
+  },
+  "codex_revision": "44984d20817fc58026a8bbccf053e288c6897c8f",
+  "files": {
+    "abseil/AUTHORS": {
+      "archive_path": "abseil-cpp-20250814.1/AUTHORS",
+      "archive_sha256": "1692f77d1739bacf3f94337188b78583cf09bab7e420d2dc6c5605a4f86785a1",
+      "archive_url": "https://github.com/abseil/abseil-cpp/releases/download/20250814.1/abseil-cpp-20250814.1.tar.gz",
+      "sha256": "1fd39030c119b4c97014f59e0ad0ed65f23475bbdf55a52740f31eb82b34b4ee"
+    },
+    "abseil/LICENSE": {
+      "archive_path": "abseil-cpp-20250814.1/LICENSE",
+      "archive_sha256": "1692f77d1739bacf3f94337188b78583cf09bab7e420d2dc6c5605a4f86785a1",
+      "archive_url": "https://github.com/abseil/abseil-cpp/releases/download/20250814.1/abseil-cpp-20250814.1.tar.gz",
+      "sha256": "c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747"
+    },
+    "dragonbox/LICENSE-Apache2-LLVM": {
+      "encoding": "base64 decoded",
+      "sha256": "9e45e856bedccee9f67254082ca11851d954de2fed7448c4bed19ad9aab99a91",
+      "url": "https://chromium.googlesource.com/external/github.com/jk-jeon/dragonbox.git/+/beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44/LICENSE-Apache2-LLVM?format=TEXT"
+    },
+    "dragonbox/LICENSE-Boost": {
+      "encoding": "base64 decoded",
+      "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+      "url": "https://chromium.googlesource.com/external/github.com/jk-jeon/dragonbox.git/+/beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44/LICENSE-Boost?format=TEXT"
+    },
+    "evidence/abseil-MODULE.bazel": {
+      "integrity_source": "Codex MODULE.bazel.lock registryFileHashes",
+      "sha256": "51f2312901470cdab0dbdf3b88c40cd21c62a7ed58a3de45b365ddc5b11bcab2",
+      "url": "https://bcr.bazel.build/modules/abseil-cpp/20250814.1/MODULE.bazel"
+    },
+    "evidence/abseil-source.json": {
+      "integrity_source": "Codex MODULE.bazel.lock registryFileHashes",
+      "sha256": "cea3901d7e299da7320700abbaafe57a65d039f10d0d7ea601c4a66938ea4b0c",
+      "url": "https://bcr.bazel.build/modules/abseil-cpp/20250814.1/source.json"
+    },
+    "evidence/hermetic-llvm/3rd_party/libc/glibc/COPYING.LIB": {
+      "archive_path": "hermetic-llvm-0.8.11/3rd_party/libc/glibc/COPYING.LIB",
+      "archive_sha256": "781670efedbcffe9e6bedd086a8037a3fe467baec16d24124534062e36e727a4",
+      "archive_url": "https://github.com/hermeticbuild/hermetic-llvm/releases/download/v0.8.11/hermetic-llvm-v0.8.11.tar.gz",
+      "sha256": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551"
+    },
+    "evidence/hermetic-llvm/3rd_party/libc/glibc/LICENSE": {
+      "archive_path": "hermetic-llvm-0.8.11/3rd_party/libc/glibc/LICENSE",
+      "archive_sha256": "781670efedbcffe9e6bedd086a8037a3fe467baec16d24124534062e36e727a4",
+      "archive_url": "https://github.com/hermeticbuild/hermetic-llvm/releases/download/v0.8.11/hermetic-llvm-v0.8.11.tar.gz",
+      "sha256": "5c537d6853e005298a285d508cff9ac7192cea23576c840d485b2b586a7ff177"
+    },
+    "evidence/hermetic-llvm/3rd_party/libc/glibc/NOTICE": {
+      "archive_path": "hermetic-llvm-0.8.11/3rd_party/libc/glibc/NOTICE",
+      "archive_sha256": "781670efedbcffe9e6bedd086a8037a3fe467baec16d24124534062e36e727a4",
+      "archive_url": "https://github.com/hermeticbuild/hermetic-llvm/releases/download/v0.8.11/hermetic-llvm-v0.8.11.tar.gz",
+      "sha256": "5f07f451f48790a57f5ea014b51a804718a3d65a68d58309af019ef3a4ba06ae"
+    },
+    "evidence/hermetic-llvm/runtimes/glibc/extension/glibc-headers.BUILD.bazel": {
+      "archive_path": "hermetic-llvm-0.8.11/runtimes/glibc/extension/glibc-headers.BUILD.bazel",
+      "archive_sha256": "781670efedbcffe9e6bedd086a8037a3fe467baec16d24124534062e36e727a4",
+      "archive_url": "https://github.com/hermeticbuild/hermetic-llvm/releases/download/v0.8.11/hermetic-llvm-v0.8.11.tar.gz",
+      "sha256": "10b5f986ca8b10ee1bb6b32c4acd1920a5d259b2d3512dce9b1bc749eabb81dd"
+    },
+    "evidence/hermetic-llvm/runtimes/glibc/extension/glibc.bzl": {
+      "archive_path": "hermetic-llvm-0.8.11/runtimes/glibc/extension/glibc.bzl",
+      "archive_sha256": "781670efedbcffe9e6bedd086a8037a3fe467baec16d24124534062e36e727a4",
+      "archive_url": "https://github.com/hermeticbuild/hermetic-llvm/releases/download/v0.8.11/hermetic-llvm-v0.8.11.tar.gz",
+      "sha256": "7a38878b18201e333fb4bd9610a11da5ab4068dcf3690661bc1ac695e954d705"
+    },
+    "evidence/hermetic-llvm/runtimes/glibc/extension/glibc_headers_index.json": {
+      "archive_path": "hermetic-llvm-0.8.11/runtimes/glibc/extension/glibc_headers_index.json",
+      "archive_sha256": "781670efedbcffe9e6bedd086a8037a3fe467baec16d24124534062e36e727a4",
+      "archive_url": "https://github.com/hermeticbuild/hermetic-llvm/releases/download/v0.8.11/hermetic-llvm-v0.8.11.tar.gz",
+      "sha256": "91a2ab25afb02ab7751dbf1cb76903571c2560216fa0797c7150eed12bb075ac"
+    },
+    "evidence/llvm-source.json": {
+      "integrity_source": "Codex MODULE.bazel.lock registryFileHashes",
+      "sha256": "b40edb2bb2ed271bf613b396d245cb473c42fb057a2b26a3bc7d7e8bfcf6aa71",
+      "url": "https://bcr.bazel.build/modules/llvm/0.8.11/source.json"
+    },
+    "fast_float/AUTHORS": {
+      "archive_path": "fast_float-8.0.2/AUTHORS",
+      "archive_sha256": "e14a33089712b681d74d94e2a11362643bd7d769ae8f7e7caefe955f57f7eacd",
+      "archive_url": "https://github.com/fastfloat/fast_float/archive/refs/tags/v8.0.2.tar.gz",
+      "sha256": "ed249424bce4e318fa190dd6d8becf60cfc37287132ad3f89e16e0f28d878dcf"
+    },
+    "fast_float/LICENSE-APACHE": {
+      "archive_path": "fast_float-8.0.2/LICENSE-APACHE",
+      "archive_sha256": "e14a33089712b681d74d94e2a11362643bd7d769ae8f7e7caefe955f57f7eacd",
+      "archive_url": "https://github.com/fastfloat/fast_float/archive/refs/tags/v8.0.2.tar.gz",
+      "sha256": "097a889aa954d04e088b790b10a4014d6189561d0a6013935a73ce3d4ddaaf06"
+    },
+    "fast_float/LICENSE-BOOST": {
+      "archive_path": "fast_float-8.0.2/LICENSE-BOOST",
+      "archive_sha256": "e14a33089712b681d74d94e2a11362643bd7d769ae8f7e7caefe955f57f7eacd",
+      "archive_url": "https://github.com/fastfloat/fast_float/archive/refs/tags/v8.0.2.tar.gz",
+      "sha256": "8d8291caf1cee26d23acf3eb67c9f9a2d58f1c681b16a4fbe8cbfb9e3c0b5a9b"
+    },
+    "fast_float/LICENSE-MIT": {
+      "archive_path": "fast_float-8.0.2/LICENSE-MIT",
+      "archive_sha256": "e14a33089712b681d74d94e2a11362643bd7d769ae8f7e7caefe955f57f7eacd",
+      "archive_url": "https://github.com/fastfloat/fast_float/archive/refs/tags/v8.0.2.tar.gz",
+      "sha256": "e562f3f974ced7e69dd1db77b820b36bcf8f30377f1aa105723fba449c53c4e6"
+    },
+    "fp16/LICENSE": {
+      "encoding": "base64 decoded",
+      "sha256": "17e4f539024be2749ee729d1e2f01d24cef12ece8c9bf18e91a4349be29c80bf",
+      "url": "https://chromium.googlesource.com/external/github.com/Maratyszcza/FP16.git/+/3d2de1816307bac63c16a297e8c4dc501b4076df/LICENSE?format=TEXT"
+    },
+    "highway/LICENSE": {
+      "archive_path": "highway-1.2.0/LICENSE",
+      "archive_sha256": "7e0be78b8318e8bdbf6fa545d2ecb4c90f947df03f7aadc42c1967f019e63343",
+      "archive_url": "https://github.com/google/highway/archive/refs/tags/1.2.0.tar.gz",
+      "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1"
+    },
+    "highway/LICENSE-BSD3": {
+      "archive_path": "highway-1.2.0/LICENSE-BSD3",
+      "archive_sha256": "7e0be78b8318e8bdbf6fa545d2ecb4c90f947df03f7aadc42c1967f019e63343",
+      "archive_url": "https://github.com/google/highway/archive/refs/tags/1.2.0.tar.gz",
+      "sha256": "d25e82e26acd42ca3ccc9993622631163425b869b9e16284226d534cff6470f2"
+    },
+    "icu/LICENSE": {
+      "encoding": "base64 decoded",
+      "sha256": "451167c55c0fa447cc2d5632714f5e3c567fe4f1e1badefab2c1333852198aca",
+      "url": "https://chromium.googlesource.com/chromium/deps/icu/+/a86a32e67b8d1384b33f8fa48c83a6079b86f8cd/LICENSE?format=TEXT"
+    },
+    "libc/LICENSE.TXT": {
+      "encoding": "base64 decoded",
+      "sha256": "ebcd9bbf783a73d05c53ba4d586b8d5813dcdf3bbec50265860ccc885e606f47",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libc.git/+/9309c117ebae84dd2f9df1ef99de4782162527d5/LICENSE.TXT?format=TEXT"
+    },
+    "libcxx/LICENSE.TXT": {
+      "encoding": "base64 decoded",
+      "sha256": "539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxx.git/+/5abc7f839700f0f17338434e1c1c6a8c87c00c11/LICENSE.TXT?format=TEXT"
+    },
+    "libcxxabi/LICENSE.TXT": {
+      "encoding": "base64 decoded",
+      "sha256": "e2b35be49f7284a45b7baca8fc7b3ab7440e7902392b2528a457816b5bb2a15c",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxxabi.git/+/8f11bb1d4438d0239d0dfc1bd9456a9f31629dda/LICENSE.TXT?format=TEXT"
+    },
+    "rusty-v8/LICENSE": {
+      "sha256": "1c6356fb751d45f0c53093ebf8a7f5e580e802f51999178e19d60f3ec39e147d",
+      "url": "https://raw.githubusercontent.com/denoland/rusty_v8/5c15a6995c9bb4bacd3e341b59fff32c909c80bf/LICENSE"
+    },
+    "rusty-v8/cargo-vcs-info.json": {
+      "archive_path": "v8-150.4.0/.cargo_vcs_info.json",
+      "archive_sha256": "42a978ff11f15b24e5c05a7123cf2b68f41e763546699781a924ef4e2cf43a49",
+      "archive_url": "https://static.crates.io/crates/v8/v8-150.4.0.crate",
+      "sha256": "51ff2633825e8ae2d16640ac2557240c720c4bedd60504e08bd5a29ae1e13c6c"
+    },
+    "simdutf/AUTHORS": {
+      "archive_path": "simdutf-7.7.0/AUTHORS",
+      "archive_sha256": "0180de81a1dd48a87b8c0442ffa81734f3db91a7350914107a449935124e3c6f",
+      "archive_url": "https://github.com/simdutf/simdutf/archive/refs/tags/v7.7.0.tar.gz",
+      "sha256": "e9e4ace22b5bb79c2fdf3e94c139ea1a18e47fc17a30e8d977f99d95d697a1f7"
+    },
+    "simdutf/LICENSE-APACHE": {
+      "archive_path": "simdutf-7.7.0/LICENSE-APACHE",
+      "archive_sha256": "0180de81a1dd48a87b8c0442ffa81734f3db91a7350914107a449935124e3c6f",
+      "archive_url": "https://github.com/simdutf/simdutf/archive/refs/tags/v7.7.0.tar.gz",
+      "sha256": "3d34610fc6b5e1b0bfe4e2f36171c2d62c28ef05cb8d704f5a0073be41a43b3d"
+    },
+    "simdutf/LICENSE-MIT": {
+      "archive_path": "simdutf-7.7.0/LICENSE-MIT",
+      "archive_sha256": "0180de81a1dd48a87b8c0442ffa81734f3db91a7350914107a449935124e3c6f",
+      "archive_url": "https://github.com/simdutf/simdutf/archive/refs/tags/v7.7.0.tar.gz",
+      "sha256": "fc8dbc04e03ad4efc08a647ffe7f995b811a95bc04c0e85a56d5277c6593fa5f"
+    },
+    "simdutf/isadetection-NOTICE": {
+      "archive_path": "simdutf-7.7.0/include/simdutf/internal/isadetection.h",
+      "archive_sha256": "0180de81a1dd48a87b8c0442ffa81734f3db91a7350914107a449935124e3c6f",
+      "archive_url": "https://github.com/simdutf/simdutf/archive/refs/tags/v7.7.0.tar.gz",
+      "lines": [
+        1,
+        44
+      ],
+      "sha256": "204bbed08ddeeecb362b4da36d3479a0167b7356a9d6024a24f9833affbe228a",
+      "source_sha256": "d00ab9558f66116278108e81ac77ec2d289f4eab41b0170af7e1af240451f380"
+    },
+    "v8/LICENSE": {
+      "archive_path": "v8-15.0.245.2/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "6ab33af8774a0f396ee3aeeb761e3229057682d6f9fa7f572e390c2cb3a6e509"
+    },
+    "v8/LICENSE.fdlibm": {
+      "archive_path": "v8-15.0.245.2/LICENSE.fdlibm",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "e7115e18444dae09d17f361ddc365fb1d342640fe500796209c63f7c80dfae10"
+    },
+    "v8/LICENSE.strongtalk": {
+      "archive_path": "v8-15.0.245.2/LICENSE.strongtalk",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "6a585a9f466654abc8fc0829d56b1bc987e3a073d31faa03bba37d33640a23cd"
+    },
+    "v8/LICENSE.v8": {
+      "archive_path": "v8-15.0.245.2/LICENSE.v8",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "4af93c12062c58058378de2397dc1c92bbff9ddfb1d583a01c84127557ce97ca"
+    },
+    "v8/third_party/colorama/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/colorama/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "15137d6c822e3ab097093a33c3a39a9df699f373f6438867ad534ff60762a947"
+    },
+    "v8/third_party/fp16/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/fp16/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "c91377adafa2f498211a4fe017788e20c38892124673860f068f2919c289193d"
+    },
+    "v8/third_party/glibc/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/glibc/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "b634ab5640e258563c536e658cad87080553df6f34f62269a21d554844e58bfe"
+    },
+    "v8/third_party/glibc/README.v8": {
+      "archive_path": "v8-15.0.245.2/third_party/glibc/README.v8",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "a42419a1d1d2b1416cd293d0c022d4391b0ffe068fe5575c0c0a22a2fad4f7a0"
+    },
+    "v8/third_party/highway/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/highway/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1"
+    },
+    "v8/third_party/inspector_protocol/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/inspector_protocol/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "450ebb9e9e50c2809d9ca581931fc8946d8d5aa0c8c35aae9ac471342fe4a88e"
+    },
+    "v8/third_party/jsoncpp/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/jsoncpp/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "76c45ece83a26117f86f4e349e7df118708e061e87225328fb478ce1e8b3eb86"
+    },
+    "v8/third_party/rapidhash-v8/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/rapidhash-v8/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "db672df7faf793fbe28b8074fdd10822363e1525816b45c9627754885de842b0"
+    },
+    "v8/third_party/re2/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/re2/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "6040cda75d90b1738292a631d89934c411ef7ffd543c4d6a1b7edfc8edf29449"
+    },
+    "v8/third_party/siphash/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/siphash/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "36ffd9dc085d529a7e60e1276d73ae5a030b020313e6c5408593a6ae2af39673"
+    },
+    "v8/third_party/utf8-decoder/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/utf8-decoder/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "3f712e5fbdfdbd5ee7d9b8c8152580220df55de47f4eba2f26c95c4de19ad096"
+    },
+    "v8/third_party/v8/builtins/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/v8/builtins/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "b9a6d9320b8f2693e8d41e496ce56caadacaddcca9be2a64a61749278f425cf2"
+    },
+    "v8/third_party/v8/codegen/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/v8/codegen/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "17e4f539024be2749ee729d1e2f01d24cef12ece8c9bf18e91a4349be29c80bf"
+    },
+    "v8/third_party/valgrind/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/valgrind/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "ebf25b8ce59c9e8883acd1ca75b6fc121937ca034f666c4077d2be739d2e1622"
+    },
+    "v8/third_party/vtune/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/vtune/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "02aea3ade0c02470335987f7d93ffaed877bcefc8414a416e2e548665bb0bfd0"
+    },
+    "v8/third_party/wasm-api/LICENSE": {
+      "archive_path": "v8-15.0.245.2/third_party/wasm-api/LICENSE",
+      "archive_sha256": "164f3d3e0a8b4c02a386d3a88d1b1133d37e5c20be0239fecdcdde414a4340d5",
+      "archive_url": "https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz",
+      "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08"
+    }
+  },
+  "native_artifacts": [
+    {
+      "filename": "librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz",
+      "kind": "archive",
+      "sha256": "00adbb48798848c77550441c68673a5e8529b8e1b73eabcdee232cb39b40f4a1",
+      "target": "aarch64-apple-darwin",
+      "url": "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz"
+    },
+    {
+      "filename": "src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs",
+      "kind": "binding",
+      "sha256": "ca5adf0cf89c9a70ad460ae73648b2fe89b74aa113b3cb7f757b6a02b758394f",
+      "target": "aarch64-apple-darwin",
+      "url": "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs"
+    },
+    {
+      "filename": "librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.a.gz",
+      "kind": "archive",
+      "sha256": "d1517eed405468537029b005d5fe997ec74d5c8d351f916b3a6df20b7d2811ba",
+      "target": "aarch64-unknown-linux-gnu",
+      "url": "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.a.gz"
+    },
+    {
+      "filename": "src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.rs",
+      "kind": "binding",
+      "sha256": "7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506",
+      "target": "aarch64-unknown-linux-gnu",
+      "url": "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.rs"
+    },
+    {
+      "filename": "librusty_v8_ptrcomp_sandbox_release_x86_64-apple-darwin.a.gz",
+      "kind": "archive",
+      "sha256": "e0d9bb64e8b3a034c2930c83972f3f35760211148342fa0407b38250ef330856",
+      "target": "x86_64-apple-darwin",
+      "url": "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/librusty_v8_ptrcomp_sandbox_release_x86_64-apple-darwin.a.gz"
+    },
+    {
+      "filename": "src_binding_ptrcomp_sandbox_release_x86_64-apple-darwin.rs",
+      "kind": "binding",
+      "sha256": "ca5adf0cf89c9a70ad460ae73648b2fe89b74aa113b3cb7f757b6a02b758394f",
+      "target": "x86_64-apple-darwin",
+      "url": "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/src_binding_ptrcomp_sandbox_release_x86_64-apple-darwin.rs"
+    },
+    {
+      "filename": "librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.a.gz",
+      "kind": "archive",
+      "sha256": "a35c75d1f26e6a983885a45b33490a4ebe54f05050568b32b89cfb421b30b583",
+      "target": "x86_64-unknown-linux-gnu",
+      "url": "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.a.gz"
+    },
+    {
+      "filename": "src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.rs",
+      "kind": "binding",
+      "sha256": "7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506",
+      "target": "x86_64-unknown-linux-gnu",
+      "url": "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.rs"
+    }
+  ],
+  "native_inspection": {
+    "absent_member_substrings": [
+      "branred",
+      "s_sin",
+      "sincostab"
+    ],
+    "absent_symbol_substrings": [
+      "glibc_sin",
+      "glibc_cos",
+      "__branred",
+      "fdlibm_sin",
+      "fdlibm_cos"
+    ],
+    "archive_sha256": "a35c75d1f26e6a983885a45b33490a4ebe54f05050568b32b89cfb421b30b583",
+    "commands": [
+      "gzip -dc archive.a.gz > native.a",
+      "ar t native.a",
+      "nm -A -C native.a"
+    ],
+    "defined_symbols": [
+      "ieee754.pic.o: v8::base::ieee754::sin(double)",
+      "ieee754.pic.o: v8::base::ieee754::cos(double)",
+      "targets.pic.o: hwy::SupportedTargets()",
+      "simdutf.pic.o: simdutf::count_utf8(char const*, unsigned long)",
+      "raw_hash_set.pic.o: absl::lts_20250814::container_internal::EmptyGeneration()"
+    ],
+    "interpretation": "Supports exclusion of the V8 glibc trig fork, not exclusion of all system-header code or a final-binary libc audit.",
+    "member_count": 1810,
+    "nm_stderr": "empty",
+    "target": "x86_64-unknown-linux-gnu",
+    "tools": "GNU ar and nm (GNU Binutils for Ubuntu) 2.46",
+    "uncompressed_sha256": "82e3368ef77a5427d781104c3903fcffadfaef1fc324d55162cfa598a509e927"
+  },
+  "v8_source_evidence": {
+    "BUILD.bazel": "f251370e7dba45b4db7ad0c49191303345ce2b86ee93725e0c354d018b83ffb5",
+    "BUILD.gn": "eac16ab4a298684148a84030c9777aa29217c308bc2329e9ad111d37e3e31964",
+    "bazel/defs.bzl": "a6e09146335a583ea33002e4eac259c23298b96fc175e6b9c024de1131f77e8c",
+    "src/base/ieee754.cc": "998f6f44757e62a5774fca533101145942f362c8739a247c12a37caf9fbea53f",
+    "src/base/ieee754.h": "fbc3019188dc7364fd7b9f6d8bb413fdcc0a912b38c185ef08a4d50e5f014cc8",
+    "third_party/glibc/src/sysdeps/ieee754/dbl-64/s_sin.c": "b05c66b322da8bde56fab4ef45bdb44c8e6178494648c89f1eb64272b749d4b4"
+  }
+}

@@ -55,8 +55,24 @@ pub struct ToolCall {
     pub id: String,
     /// Tool name (must match a `ToolDefinition.name`).
     pub name: String,
-    /// Parsed JSON arguments for the tool.
+    /// JSON arguments, or exact raw source as `Value::String` for a custom tool.
     pub arguments: Value,
+    /// Custom-tool call kind. When true, `arguments` must be a string containing
+    /// exact source. Ordinary JSON string arguments leave this false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_raw: bool,
+}
+
+impl ToolCall {
+    /// Input for APIs that only support JSON tools. Raw calls retain
+    /// their source under `input` without attempting to parse it as JSON.
+    pub(crate) fn json_arguments(&self) -> Value {
+        if self.is_raw {
+            serde_json::json!({ "input": self.arguments })
+        } else {
+            self.arguments.clone()
+        }
+    }
 }
 
 /// Content that can appear in an assistant message.
@@ -345,6 +361,16 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema describing the tool's parameters.
     pub parameters: Value,
+    /// Raw-source format. When absent, the tool uses its JSON schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_format: Option<ToolInputFormat>,
+}
+
+/// Constraint on raw tool input, carried as `Value::String` in tool calls.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolInputFormat {
+    Grammar { syntax: String, definition: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -947,6 +973,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_call_kind_defaults_to_json_and_persists_raw() {
+        let json = serde_json::json!({"id":"call", "name":"evaluate", "arguments":"雪\n"});
+        let mut call: ToolCall = serde_json::from_value(json.clone()).unwrap();
+        assert!(!call.is_raw);
+        assert_eq!(serde_json::to_value(&call).unwrap(), json);
+        call.is_raw = true;
+        let encoded = serde_json::to_value(&call).unwrap();
+        assert_eq!(encoded["is_raw"], true);
+        let decoded: ToolCall = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.is_raw);
+        assert_eq!(decoded.arguments, call.arguments);
+    }
+
+    #[test]
     fn speed_string_contract() {
         for name in ["standard", "fast", "ultrafast", "flex", "turbo"] {
             let speed: Speed = name.parse().unwrap();
@@ -1037,6 +1077,7 @@ mod tests {
                     redacted: false,
                 }),
                 AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: "call_1".into(),
                     name: "read_file".into(),
                     arguments: serde_json::json!({"path": "/tmp/test"}),

@@ -143,6 +143,7 @@ impl ToolDefinition for TodoReadTool {
         let formatted = format_todo_list(&items);
 
         Ok(ToolOutcome {
+            structured_content: None,
             content: vec![UserContent::text(formatted)],
             details: ToolDetails::Todos { items },
             is_error: false,
@@ -191,6 +192,7 @@ impl ToolDefinition for TodoWriteTool {
                 "Only one TODO item can be in progress at a time, found {in_progress_count}"
             );
             return Ok(ToolOutcome {
+                structured_content: None,
                 content: vec![UserContent::text(msg.clone())],
                 details: ToolDetails::Text {
                     summary: "todo_write: validation error".to_string(),
@@ -211,6 +213,7 @@ impl ToolDefinition for TodoWriteTool {
         let wire_text = format!("{update_result}\n{formatted_todos}");
 
         Ok(ToolOutcome {
+            structured_content: None,
             content: vec![UserContent::text(wire_text)],
             details: ToolDetails::Todos { items: input.todos },
             is_error: false,

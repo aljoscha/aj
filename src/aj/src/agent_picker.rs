@@ -2,7 +2,8 @@
 //! main agent and any sub-agent, or drill into a background task.
 //!
 //! A [`FilterableSelect`] lists the live agents (main plus sub-agents)
-//! and the background bash tasks. Confirming an agent row parks an
+//! and background tasks, including open Code Mode cells. Confirming an
+//! agent row parks an
 //! [`AgentPickerOutcome::Observe`] the host applies with
 //! [`aj_app::chat::ChatState::set_active_view`]. Confirming a task row
 //! drills into the task-output viewer. Two overlay-local chords act
@@ -75,14 +76,15 @@ enum Scope {
     All,
 }
 
-/// A background bash task, snapshotted for a picker row.
+/// A non-agent background task, snapshotted for a picker row.
 #[derive(Clone, Debug)]
 pub(crate) struct TaskRow {
     pub(crate) id: TaskId,
-    /// Command line, shown (tail-truncated) in the row description.
+    pub(crate) kind: TaskKind,
+    /// Task label, shown (tail-truncated) in the row description.
     pub(crate) command: String,
     pub(crate) status: TaskStatus,
-    /// Elapsed runtime, frozen at the task's end for terminal tasks.
+    /// Elapsed task lifetime, frozen at the task's end for terminal tasks.
     pub(crate) runtime: Duration,
 }
 
@@ -95,7 +97,7 @@ pub(crate) struct PickerSnapshot {
 }
 
 impl PickerSnapshot {
-    /// Gather agent assignments, current turns, and background bash tasks.
+    /// Gather agent assignments, current turns, and non-agent background tasks.
     ///
     /// Agent-backed tasks are skipped: their sub-agent already appears
     /// as an agent row, so a task row would duplicate it.
@@ -104,9 +106,10 @@ impl PickerSnapshot {
         let tasks = chat
             .tasks()
             .iter()
-            .filter(|(_, info)| matches!(info.kind, TaskKind::Bash { .. }))
+            .filter(|(_, info)| !matches!(info.kind, TaskKind::Agent { .. }))
             .map(|(&id, info)| TaskRow {
                 id,
+                kind: info.kind.clone(),
                 command: info.label.clone(),
                 status: info.status,
                 runtime: info
@@ -363,7 +366,12 @@ fn task_item(task: &TaskRow, scope: Scope) -> SelectItem {
         Scope::Running => format!("{tail} \u{b7} {runtime}"),
         Scope::All => format!(
             "{tail} \u{b7} {} \u{b7} {runtime}",
-            task_status_label(task.status)
+            if matches!(task.kind, TaskKind::CodeMode { .. }) && task.status == TaskStatus::Running
+            {
+                "open until collected".to_string()
+            } else {
+                task_status_label(task.status)
+            }
         ),
     };
     // The command tail rides in the filter key too so a query matches
@@ -598,6 +606,9 @@ mod tests {
     fn task_row(id: TaskId, status: TaskStatus, secs: u64) -> TaskRow {
         TaskRow {
             id,
+            kind: TaskKind::Bash {
+                command: format!("cargo build --task-{id}"),
+            },
             command: format!("cargo build --task-{id}"),
             status,
             runtime: Duration::from_secs(secs),
@@ -950,6 +961,100 @@ mod tests {
             with_task.subtitle().contains(&kill),
             "kill hint shown with a running task"
         );
+    }
+
+    #[test]
+    fn code_mode_cells_are_visible_open_and_stoppable() {
+        let mut chat = ChatState::new(AgentSettings {
+            context_window: 0,
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        });
+        let mut lifecycle = AgentLifecycle::default();
+        for (id, kind, label) in [
+            (
+                3,
+                TaskKind::CodeMode {
+                    cell_id: "cell-1".into(),
+                },
+                "Code Mode cell cell-1 (open until collected)",
+            ),
+            (
+                4,
+                TaskKind::Agent {
+                    agent_id: 1,
+                    task: "child".into(),
+                },
+                "child",
+            ),
+        ] {
+            let _ = reduce(
+                &mut chat,
+                &mut lifecycle,
+                AgentEvent::TaskStart {
+                    agent_id: AgentId::Main,
+                    task_id: id,
+                    call_id: format!("call-{id}"),
+                    kind,
+                    label: label.into(),
+                },
+                None,
+            );
+        }
+        let snapshot = PickerSnapshot::gather(&chat, &lifecycle);
+        assert_eq!(snapshot.tasks.len(), 1, "agent tasks stay separate");
+        assert_eq!(snapshot.tasks[0].id, 3);
+        for scope in [Scope::Running, Scope::All] {
+            let items = build_items(&snapshot.agents, &snapshot.tasks, snapshot.active, scope);
+            let cell = items
+                .iter()
+                .find(|item| decode_task(&item.filter_key) == Some(3))
+                .unwrap();
+            assert!(
+                cell.description
+                    .as_ref()
+                    .unwrap()
+                    .contains("open until collected")
+            );
+            assert!(!cell.description.as_ref().unwrap().contains("running"));
+        }
+        let select = Rc::new(RefCell::new(FilterableSelect::new(
+            build_items(
+                &snapshot.agents,
+                &snapshot.tasks,
+                snapshot.active,
+                Scope::Running,
+            ),
+            SelectStyles::default(),
+        )));
+        select
+            .borrow()
+            .select_matching(|item| decode_task(&item.filter_key) == Some(3));
+        let outcome = Rc::new(RefCell::new(None));
+        let mut picker = AgentPicker {
+            select,
+            agents: snapshot.agents,
+            tasks: snapshot.tasks,
+            active: snapshot.active,
+            scope: Scope::Running,
+            window: None,
+            outcome: Rc::clone(&outcome),
+            stack: Rc::new(RefCell::new(OverlayStack::default())),
+            editor: Rc::new(RefCell::new(crate::overlay::Scrim)),
+        };
+        picker.capture_event(
+            &mut EventContext::new(),
+            &Event::KeyPress(Key {
+                codepoint: u32::from('k'),
+                mods: Modifiers::CTRL,
+                ..Key::default()
+            }),
+        );
+        assert_eq!(*outcome.borrow(), Some(AgentPickerOutcome::Kill(3)));
     }
 
     /// Ctrl+K on a running task row parks a kill outcome. On a non-task

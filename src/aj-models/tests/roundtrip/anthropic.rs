@@ -176,6 +176,7 @@ fn canonical_tool_call() -> AssistantMessage {
             text_signature: None,
         }),
         AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "toolu_01abcDEF".into(),
             name: "read_file".into(),
             arguments: json!({"path": "/tmp/x"}),

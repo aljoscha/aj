@@ -271,6 +271,7 @@ mod tests {
         let mut content = vec![AssistantContent::Text(text("ok"))];
         for (i, name) in calls.iter().enumerate() {
             content.push(AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: format!("call-{i}"),
                 name: name.to_string(),
                 arguments: json!({}),

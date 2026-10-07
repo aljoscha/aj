@@ -220,6 +220,19 @@ pub struct BashInput {
     pub run_in_background: bool,
 }
 
+/// Machine-facing captured tails, without display markers or UI details.
+#[derive(Serialize, JsonSchema)]
+struct BashResult<'a> {
+    stdout: &'a str,
+    stderr: &'a str,
+    exit_code: Option<i32>,
+    /// True when either captured tail exceeded its display budget.
+    truncated: bool,
+    full_output_path: Option<&'a Path>,
+    /// Present for a background launch. Its streams are initially empty.
+    task_id: Option<TaskId>,
+}
+
 fn default_timeout() -> u64 {
     30
 }
@@ -268,6 +281,10 @@ impl ToolDefinition for BashTool {
 
     fn description(&self) -> &'static str {
         DESCRIPTION
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(schemars::schema_for!(BashResult).to_value())
     }
 
     /// `bash` runs arbitrary commands; serialize a batch containing it
@@ -467,6 +484,14 @@ impl ToolDefinition for BashTool {
                 path = spill_path.display(),
             );
             return Ok(ToolOutcome {
+                structured_content: Some(serde_json::to_value(BashResult {
+                    stdout: "",
+                    stderr: "",
+                    exit_code: None,
+                    truncated: false,
+                    full_output_path: Some(&spill_path),
+                    task_id: Some(id),
+                })?),
                 content: vec![UserContent::text(wire)],
                 details: ToolDetails::Bash {
                     command,
@@ -602,6 +627,14 @@ impl ToolDefinition for BashTool {
             || matches!(outcome_kind, ChildExit::Cancelled | ChildExit::TimedOut);
 
         Ok(ToolOutcome {
+            structured_content: Some(serde_json::to_value(BashResult {
+                stdout: &stdout_str,
+                stderr: &stderr_str,
+                exit_code,
+                truncated,
+                full_output_path: full_output_path.as_deref(),
+                task_id: None,
+            })?),
             content: vec![UserContent::text(wire)],
             details: ToolDetails::Bash {
                 command,
@@ -1504,6 +1537,7 @@ pub fn stream_marker(
 /// command actually ran, so there's no real stdout/stderr split).
 fn spawn_error_outcome(command: &str, error: String) -> ToolOutcome {
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(error.clone())],
         details: ToolDetails::Bash {
             command: command.to_string(),
@@ -2387,6 +2421,13 @@ esac
 
         assert!(!outcome.is_error);
         assert_eq!(extract_text(&outcome.content), "hello\n");
+        assert_eq!(
+            outcome.structured_content,
+            Some(serde_json::json!({
+                "stdout": "hello\n", "stderr": "", "exit_code": 0,
+                "truncated": false, "full_output_path": null, "task_id": null,
+            }))
+        );
         match &outcome.details {
             ToolDetails::Bash {
                 command,
@@ -2492,7 +2533,8 @@ esac
         // `yes` would be unbounded; bound it with `head -c` so the
         // command terminates naturally. Each "ABCDEFGH\n" is 9 bytes,
         // so 200 KB ≈ 22_756 lines — well over the 2000-line cap too.
-        let outcome = BashTool::default()
+        let spill_dir = TempDir::new().expect("spill directory");
+        let outcome = BashTool::new(false, Some(spill_dir.path().to_path_buf()))
             .execute(
                 &mut ctx,
                 BashInput {
@@ -2506,6 +2548,18 @@ esac
             .expect("execute");
 
         assert!(!outcome.is_error);
+        let api = outcome.structured_content.as_ref().expect("machine result");
+        assert_eq!(api["truncated"], true);
+        assert_eq!(api["exit_code"], 0);
+        assert_eq!(api["task_id"], serde_json::Value::Null);
+        assert_eq!(api["stderr"], "");
+        let tail = api["stdout"].as_str().unwrap();
+        assert!(tail.len() <= BASH_MAX_BYTES);
+        assert!(tail.lines().count() <= BASH_MAX_LINES);
+        assert!(!tail.contains("[Showing"));
+        let full = std::fs::read(api["full_output_path"].as_str().unwrap()).unwrap();
+        assert_eq!(full.len(), 200_000);
+        assert!(full.ends_with(tail.as_bytes()));
         match &outcome.details {
             ToolDetails::Bash {
                 stdout,
@@ -2541,7 +2595,6 @@ esac
                     t.output_bytes,
                     "stdout length should equal output_bytes"
                 );
-                std::fs::remove_file(path).ok();
             }
             other => panic!("expected Bash details, got {other:?}"),
         }
@@ -4243,6 +4296,14 @@ esac
         assert!(
             wire.contains(&spill_path.display().to_string()),
             "wire names the spill path: {wire:?}"
+        );
+
+        assert_eq!(
+            outcome.structured_content,
+            Some(serde_json::json!({
+                "stdout": "", "stderr": "", "exit_code": null,
+                "truncated": false, "full_output_path": spill_path, "task_id": 1,
+            }))
         );
 
         let registry = ctx.task_registry();

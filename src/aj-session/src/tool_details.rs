@@ -28,7 +28,12 @@ struct PersistedBodyRef {
 
 /// Compacts duplicated text details in an owned message before persistence.
 pub(crate) fn compact_message(message: &mut AgentMessage) {
-    let AgentMessageKind::Wire(Message::ToolResult(result)) = &mut message.kind else {
+    let (AgentMessageKind::Wire(Message::ToolResult(result))
+    | AgentMessageKind::ToolActivity(aj_agent::message::ToolActivity {
+        message: Message::ToolResult(result),
+        ..
+    })) = &mut message.kind
+    else {
         return;
     };
     compact_tool_result(result);
@@ -100,7 +105,12 @@ fn compact_tool_result(result: &mut ToolResultMessage) {
 /// and their unknown fields unchanged while ensuring a valid body reference
 /// becomes the full `ToolDetails::Text` shape expected outside storage.
 pub(crate) fn expand_message(mut message: AgentMessage) -> AgentMessage {
-    let AgentMessageKind::Wire(Message::ToolResult(result)) = &mut message.kind else {
+    let (AgentMessageKind::Wire(Message::ToolResult(result))
+    | AgentMessageKind::ToolActivity(aj_agent::message::ToolActivity {
+        message: Message::ToolResult(result),
+        ..
+    })) = &mut message.kind
+    else {
         return message;
     };
     let Some(raw) = result.details.as_ref() else {

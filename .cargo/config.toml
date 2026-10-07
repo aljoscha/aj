@@ -1,0 +1,5 @@
+# Run python3 scripts/bootstrap-codex-code-mode-v8.py once per checkout/host.
+# Fixed local paths avoid Rusty V8's unverified downloader and cache mutation.
+[env]
+RUSTY_V8_ARCHIVE = { value = "third-party/codex-code-mode/native/archive.a.gz", relative = true }
+RUSTY_V8_SRC_BINDING_PATH = { value = "third-party/codex-code-mode/native/src_binding.rs", relative = true }

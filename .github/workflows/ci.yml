@@ -29,6 +29,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/bootstrap-codex-code-mode-v8.py
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -38,6 +39,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/bootstrap-codex-code-mode-v8.py
       - run: ./scripts/check-test-scratch.sh --workspace --features slow-tests
 
   build:
@@ -47,7 +49,35 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/bootstrap-codex-code-mode-v8.py
       - run: cargo build --all-targets
+
+  code-mode-native:
+    name: Code Mode (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/bootstrap-codex-code-mode-v8.py
+      - run: ./scripts/check-test-scratch.sh -p aj-agent --test code_mode
+      - run: cargo build -p aj
+
+  code-mode-vendor:
+    name: Code Mode vendor contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/bootstrap-codex-code-mode-v8.py
+      - run: |
+          revision=$(python3 -c 'import json; print(json.load(open("third-party/codex-code-mode/upstream.json"))["revision"])')
+          git init "$RUNNER_TEMP/codex"
+          git -C "$RUNNER_TEMP/codex" fetch --depth 1 https://github.com/openai/codex.git "$revision"
+          cargo fetch --manifest-path vendor/codex-code-mode/Cargo.toml --locked
+          python3 scripts/test-codex-code-mode.py --upstream "$RUNNER_TEMP/codex"
+      - run: cargo test --manifest-path vendor/codex-code-mode/Cargo.toml --workspace --all-features --locked
 
   deps-guard:
     name: aj-app dependency guards

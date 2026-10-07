@@ -133,6 +133,7 @@ mod tests {
     fn assistant_tool_call(id: &str, name: &str) -> AgentMessage {
         AgentMessage::wire(Message::Assistant(AssistantMessage {
             content: vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments: json!({}),
@@ -222,6 +223,7 @@ mod tests {
                     view.add_message(user("hi")).expect("user");
                     view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
                         content: vec![AssistantContent::ToolCall(ToolCall {
+                            is_raw: false,
                             id: "abandoned".into(),
                             name: "bash".into(),
                             arguments,

@@ -189,6 +189,7 @@ fn canonical_tool_call() -> AssistantMessage {
             text_signature: Some(text_signature("msg_3", None)),
         }),
         AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "call_1|fc_1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/tmp/x"}),

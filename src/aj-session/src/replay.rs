@@ -1054,6 +1054,49 @@ impl ReplayState {
                     AgentMessageKind::Wire(Message::ToolResult(tr)) => {
                         self.project_tool_result(agent_id, at, agent_msg, tr, out);
                     }
+                    AgentMessageKind::ToolActivity(activity) => match &activity.message {
+                        Message::ToolResult(tr) => {
+                            self.project_tool_result(agent_id, at, agent_msg, tr, out);
+                        }
+                        Message::Assistant(assistant) => {
+                            // Audit calls are not inference turns: do not account
+                            // usage or replace a sub-agent's report. Paint starts
+                            // here so an unfinished call remains visible on replay.
+                            for block in &assistant.content {
+                                let AssistantContent::ToolCall(call) = block else {
+                                    continue;
+                                };
+                                self.tool_calls.insert(
+                                    call.id.clone(),
+                                    (call.name.clone(), call.arguments.clone()),
+                                );
+                                out.push_back(transient(AgentEvent::ToolExecutionStart {
+                                    agent_id,
+                                    call_id: call.id.clone(),
+                                    tool: call.name.clone(),
+                                    args: call.arguments.clone(),
+                                }));
+                            }
+                            out.push_back(durable(
+                                at,
+                                AgentEvent::MessageEnd {
+                                    agent_id,
+                                    message: agent_msg.clone(),
+                                },
+                            ));
+                        }
+                        Message::User(_) => {
+                            // A malformed audit payload must not become editable
+                            // input, even when read from an external session log.
+                            out.push_back(durable(
+                                at,
+                                AgentEvent::MessageEnd {
+                                    agent_id,
+                                    message: agent_msg.clone(),
+                                },
+                            ));
+                        }
+                    },
                 }
             }
         }
@@ -1273,8 +1316,11 @@ impl ReplayState {
             None => text_fallback(&tool_name, &tr.content),
         };
         let mut normalized_message = agent_msg.clone();
-        let AgentMessageKind::Wire(Message::ToolResult(normalized_result)) =
-            &mut normalized_message.kind
+        let (AgentMessageKind::Wire(Message::ToolResult(normalized_result))
+        | AgentMessageKind::ToolActivity(aj_agent::message::ToolActivity {
+            message: Message::ToolResult(normalized_result),
+            ..
+        })) = &mut normalized_message.kind
         else {
             unreachable!("project_tool_result requires a tool-result message");
         };
@@ -1737,6 +1783,7 @@ mod tests {
             let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("edit it")).expect("user message");
             view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: "tu-edit".into(),
                 name: "edit_file".into(),
                 arguments: json!({"path": "/tmp/x"}),
@@ -1940,6 +1987,7 @@ mod tests {
                         text_signature: None,
                     }),
                     AssistantContent::ToolCall(ToolCall {
+                        is_raw: false,
                         id: "call-1".into(),
                         name: "read_file".into(),
                         arguments: json!({"path": "/tmp/x"}),
@@ -2108,6 +2156,7 @@ mod tests {
             let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("edit it")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: "tu-edit".into(),
                 name: "edit_file".into(),
                 arguments: json!({"path": "/tmp/x"}),
@@ -2578,6 +2627,7 @@ mod tests {
                         text_signature: None,
                     }),
                     AssistantContent::ToolCall(ToolCall {
+                        is_raw: false,
                         id: format!("call-{n}"),
                         name: "bash".into(),
                         arguments: json!({"command": "echo hi"}),
@@ -3669,6 +3719,7 @@ mod tests {
             let mut view = ConversationView::subagent(&mut log, sub_leaf, 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: "sub-call-1".into(),
                 name: "read_file".into(),
                 arguments: json!({"path": "/tmp/s"}),
@@ -4178,6 +4229,7 @@ mod tests {
             let user = view.add_message(user_msg("hi")).expect("user msg");
             view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: "call-1".into(),
                     name: "read_file".into(),
                     arguments: json!({"path": "/tmp/x"}),
@@ -4484,6 +4536,7 @@ mod tests {
                 (1..=3)
                     .map(|n| {
                         AssistantContent::ToolCall(ToolCall {
+                            is_raw: false,
                             id: format!("call-{n}"),
                             name: "read_file".into(),
                             arguments: json!({"path": format!("/tmp/{n}")}),

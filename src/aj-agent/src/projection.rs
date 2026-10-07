@@ -49,6 +49,7 @@ mod tests {
                         text_signature: None,
                     }),
                     AssistantContent::ToolCall(ToolCall {
+                        is_raw: false,
                         id: "tu-1".into(),
                         name: "ping".into(),
                         arguments: json!({}),

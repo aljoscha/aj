@@ -141,6 +141,7 @@ impl ToolDefinition for WriteFileTool {
         let return_value = format!("Successfully {} file '{}'", action, input.path);
 
         Ok(ToolOutcome {
+            structured_content: None,
             content: vec![UserContent::text(return_value)],
             details,
             is_error: false,
@@ -162,6 +163,7 @@ fn display_relative(path: &Path, cwd: &Path) -> String {
 /// something meaningful in collapsed views.
 fn error_outcome(path: &str, error: String) -> ToolOutcome {
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(error.clone())],
         details: ToolDetails::Text {
             summary: PathBuf::from(path).display().to_string(),

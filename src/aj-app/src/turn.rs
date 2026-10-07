@@ -141,6 +141,7 @@ pub(crate) fn apply_turn_config(
         c.clone()
     };
     let tool_options = builtin_tool_options(&config);
+    agent.set_code_mode(config.code_mode);
     let disabled_tools = &config.disabled_tools;
     match target {
         AgentId::Main => {
@@ -511,11 +512,12 @@ impl Turns {
 }
 
 /// Counts of running work a quit would tear down, for the Ctrl+C
-/// quit-arming guard: (agents, bash tasks).
+/// quit-arming guard: (agents, other tasks).
 ///
 /// Driven turns plus running agent-backed tasks (background sub-agent
 /// runs, which the driven set doesn't track) make up the agent count,
-/// running bash tasks the task count. An agent-backed task counts as
+/// Running bash tasks and open Code Mode cells make up the task count.
+/// An agent-backed task counts as
 /// an agent, never as a task, matching the footer's classification.
 ///
 /// Takes each task's kind and status rather than a registry snapshot, so a
@@ -526,17 +528,19 @@ pub fn running_work_counts<'a>(
     tasks: impl IntoIterator<Item = (&'a aj_agent::tool::TaskKind, aj_agent::tool::TaskStatus)>,
 ) -> (usize, usize) {
     let mut agents = driven_turns;
-    let mut bash = 0;
+    let mut other = 0;
     for (kind, status) in tasks {
         if status != aj_agent::tool::TaskStatus::Running {
             continue;
         }
         match kind {
             aj_agent::tool::TaskKind::Agent { .. } => agents += 1,
-            aj_agent::tool::TaskKind::Bash { .. } => bash += 1,
+            aj_agent::tool::TaskKind::Bash { .. } | aj_agent::tool::TaskKind::CodeMode { .. } => {
+                other += 1
+            }
         }
     }
-    (agents, bash)
+    (agents, other)
 }
 
 /// Drive one turn and its automatic continuations to quiescence.

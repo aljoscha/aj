@@ -160,6 +160,7 @@ async fn mixed_wait_returns_all_results_and_does_not_affect_later_steps() {
     ] {
         let mut batch = waiting();
         batch.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "sibling".into(),
             name: tool.into(),
             arguments,
@@ -282,6 +283,7 @@ async fn mixed_wait_does_not_hold_a_goal_created_in_the_same_batch() {
         }),
     );
     batch.content.push(AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: "wait".into(),
         name: "wait".into(),
         arguments: json!({}),

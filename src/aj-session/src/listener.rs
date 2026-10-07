@@ -742,6 +742,7 @@ mod tests {
             // Assistant turn carrying a tool call.
             let assistant = AgentMessage::wire(Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::ToolCall(aj_models::types::ToolCall {
+                    is_raw: false,
                     id: "tu-1".into(),
                     name: "ping".into(),
                     arguments: serde_json::json!({}),
@@ -1698,6 +1699,7 @@ mod tests {
             content: (1..=3)
                 .map(|n| {
                     AssistantContent::ToolCall(aj_models::types::ToolCall {
+                        is_raw: false,
                         id: format!("tu-{n}"),
                         name: "read_file".into(),
                         arguments: serde_json::json!({"path": format!("/tmp/{n}")}),

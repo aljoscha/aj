@@ -141,6 +141,7 @@ pub(super) fn spawn_outcome(task: String, result: SpawnResult) -> ToolOutcome {
             // mistake cancellation or truncation for a completed assignment.
             let content = aj_agent::delivered_report(spawned.conclusion, &spawned.report);
             ToolOutcome {
+                structured_content: None,
                 content: vec![UserContent::text(content)],
                 details: ToolDetails::SubAgentReport {
                     agent_id: spawned.agent_id,
@@ -161,6 +162,7 @@ pub(super) fn spawn_outcome(task: String, result: SpawnResult) -> ToolOutcome {
              delivers its report."
             );
             ToolOutcome {
+                structured_content: None,
                 content: vec![UserContent::text(wire)],
                 details: ToolDetails::Text {
                     summary,

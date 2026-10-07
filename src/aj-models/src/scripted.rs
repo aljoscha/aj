@@ -600,15 +600,46 @@ impl ScriptBuilder {
 
     /// Append a tool call block with a per-call chunk size and chunk delay.
     pub fn tool_call_block_chunked(
-        mut self,
+        self,
         id: impl Into<String>,
         name: impl Into<String>,
         arguments: Value,
         chunk_size: usize,
         chunk_delay: Duration,
     ) -> Self {
-        let id = id.into();
-        let name = name.into();
+        self.tool_call_chunked(
+            ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+                is_raw: false,
+            },
+            chunk_size,
+            chunk_delay,
+        )
+    }
+
+    /// Append an explicitly typed call. Raw input is streamed as exact source,
+    /// while ordinary arguments are streamed as serialized JSON.
+    pub fn tool_call(self, call: ToolCall) -> Self {
+        let chunk_size = self.chunk_size;
+        let chunk_delay = self.chunk_delay;
+        self.tool_call_chunked(call, chunk_size, chunk_delay)
+    }
+
+    /// Append an explicitly typed call with per-call chunking and delay.
+    pub fn tool_call_chunked(
+        mut self,
+        call: ToolCall,
+        chunk_size: usize,
+        chunk_delay: Duration,
+    ) -> Self {
+        let ToolCall {
+            id,
+            name,
+            arguments,
+            is_raw,
+        } = call;
         let idx = self.next_content_index;
         self.next_content_index += 1;
 
@@ -619,9 +650,14 @@ impl ScriptBuilder {
         self.partial
             .content
             .push(AssistantContent::ToolCall(ToolCall {
+                is_raw,
                 id: id.clone(),
                 name: name.clone(),
-                arguments: Value::Null,
+                arguments: if is_raw {
+                    Value::String(String::new())
+                } else {
+                    Value::Null
+                },
             }));
         let start_event = AssistantMessageEvent::ToolCallStart {
             content_index: idx,
@@ -629,11 +665,16 @@ impl ScriptBuilder {
         };
         self.push_step(start_event);
 
-        // Deltas: serialize the arguments and chunk the JSON. The partial's
-        // `arguments` field is updated to a best-effort parse of the
-        // cumulative bytes so far so consumers can render live argument
-        // previews; on the final delta it matches the full value.
-        let serialized = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+        // Raw deltas carry source verbatim, including in cancellation snapshots.
+        // JSON deltas expose best-effort parsed previews until the final value.
+        let serialized = if is_raw {
+            arguments
+                .as_str()
+                .expect("raw tool input must be a string")
+                .to_owned()
+        } else {
+            arguments.to_string()
+        };
         let mut buffered = String::new();
         let chunks: Vec<&str> = split_chunks(&serialized, chunk_size);
         let last_index = chunks.len().saturating_sub(1);
@@ -642,7 +683,9 @@ impl ScriptBuilder {
             // On the final chunk, plug in the fully parsed arguments; on
             // intermediate chunks try a best-effort parse and fall back to
             // `Value::Null` if it doesn't parse yet.
-            let parsed = if i == last_index {
+            let parsed = if is_raw {
+                Value::String(buffered.clone())
+            } else if i == last_index {
                 arguments.clone()
             } else {
                 serde_json::from_str(&buffered).unwrap_or(Value::Null)
@@ -659,6 +702,7 @@ impl ScriptBuilder {
         }
 
         let tool_call = ToolCall {
+            is_raw,
             id,
             name,
             arguments,
@@ -760,9 +804,7 @@ pub fn script_from_message(
             AssistantContent::Thinking(th) => {
                 builder.thinking_block(&th.thinking, th.thinking_signature.clone())
             }
-            AssistantContent::ToolCall(tc) => {
-                builder.tool_call_block(&tc.id, &tc.name, tc.arguments.clone())
-            }
+            AssistantContent::ToolCall(tc) => builder.tool_call(tc.clone()),
         };
     }
 
@@ -938,6 +980,7 @@ mod tests {
                 text_signature: None,
             }),
             AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: "call-1".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path": "a"}),
@@ -1211,6 +1254,7 @@ mod tests {
                 redacted: false,
             }));
         msg.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "tc-1".into(),
             name: "ping".into(),
             arguments: serde_json::json!({"foo": "bar"}),
@@ -1371,6 +1415,86 @@ mod tests {
             &Context::new("system"),
             &StreamOptions::default(),
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_call_kind_survives_streaming_and_cancellation() {
+        let source = "// 雪\nawait tools.read({x: `a\\b`});\n";
+        for is_raw in [false, true] {
+            for cancel in [false, true] {
+                let mut message = AssistantMessage::empty();
+                message.stop_reason = StopReason::ToolUse;
+                message.content.push(AssistantContent::ToolCall(ToolCall {
+                    id: "call".into(),
+                    name: "evaluate".into(),
+                    arguments: Value::String(source.into()),
+                    is_raw,
+                }));
+                let provider = ScriptedProvider::from_messages(
+                    vec![message],
+                    4,
+                    if cancel {
+                        Duration::from_millis(10)
+                    } else {
+                        Duration::ZERO
+                    },
+                );
+                let token = tokio_util::sync::CancellationToken::new();
+                let mut stream = provider.stream(
+                    &fake_model(),
+                    &Context::new("sys"),
+                    &StreamOptions {
+                        cancel: Some(token.clone()),
+                        ..Default::default()
+                    },
+                );
+                let mut deltas = String::new();
+                while let Some(event) = stream.next().await {
+                    if let AssistantMessageEvent::ToolCallDelta { delta, .. } = &event {
+                        deltas.push_str(delta);
+                    }
+                    for block in &event.partial().content {
+                        if let AssistantContent::ToolCall(call) = block {
+                            assert_eq!(call.is_raw, is_raw);
+                            if is_raw {
+                                assert_eq!(call.arguments, Value::String(deltas.clone()));
+                            }
+                        }
+                    }
+                    match event {
+                        AssistantMessageEvent::ToolCallDelta { .. } => {
+                            if cancel {
+                                token.cancel();
+                            }
+                        }
+                        AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
+                            assert_eq!(tool_call.is_raw, is_raw);
+                            assert_eq!(tool_call.arguments, Value::String(source.into()));
+                        }
+                        _ => {}
+                    }
+                }
+                let terminal = stream.result().await;
+                assert_eq!(
+                    terminal.stop_reason,
+                    if cancel {
+                        StopReason::Aborted
+                    } else {
+                        StopReason::ToolUse
+                    }
+                );
+                let serialized = if is_raw {
+                    source.to_owned()
+                } else {
+                    serde_json::to_string(source).unwrap()
+                };
+                if cancel {
+                    assert!(!deltas.is_empty() && deltas.len() < serialized.len());
+                } else {
+                    assert_eq!(deltas, serialized);
+                }
+            }
+        }
     }
 
     #[tokio::test]

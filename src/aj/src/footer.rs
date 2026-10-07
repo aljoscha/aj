@@ -138,14 +138,16 @@ impl Widget for FooterLine {
                 }
             }
         }
-        // Activity: running sub-agents plus running background bash
-        // tasks. Agent-backed tasks are excluded because their
+        // Running Code Mode tasks are open cells, including completed cells
+        // awaiting collection. Agent-backed tasks are excluded because their
         // sub-agent is already in the agent count.
         let agents = self.status.borrow().sub_agents_running;
         let tasks = chat
             .tasks()
             .values()
-            .filter(|t| matches!(t.kind, TaskKind::Bash { .. }) && t.status == TaskStatus::Running)
+            .filter(|t| {
+                !matches!(t.kind, TaskKind::Agent { .. }) && t.status == TaskStatus::Running
+            })
             .count();
         if agents + tasks > 0 {
             parts.push(vec![span(
@@ -524,10 +526,9 @@ mod tests {
         assert_eq!(grid[0][pct_start].style.fg, s.dim.fg, "{text:?}");
     }
 
-    /// The activity part counts running sub-agents and running bash
-    /// tasks only: agent-kind and finished tasks are filtered out.
+    /// Open cells count as tasks, without double-counting agent-backed tasks.
     #[test]
-    fn footer_counts_agents_and_running_bash_tasks() {
+    fn footer_counts_agents_and_open_non_agent_tasks() {
         let chat = chat_with_window(200_000);
         let mut life = AgentLifecycle::default();
         let start = |id: usize, kind: TaskKind, label: &str| AgentEvent::TaskStart {
@@ -549,6 +550,18 @@ mod tests {
                 None,
             );
             let _ = reduce(&mut c, &mut life, start(2, bash("make"), "make"), None);
+            let _ = reduce(
+                &mut c,
+                &mut life,
+                start(
+                    4,
+                    TaskKind::CodeMode {
+                        cell_id: "cell-1".into(),
+                    },
+                    "Code Mode cell cell-1 (open until collected)",
+                ),
+                None,
+            );
             let _ = reduce(
                 &mut c,
                 &mut life,
@@ -584,7 +597,7 @@ mod tests {
             },
         );
         let r = draw_rows(&mut f, 100);
-        assert!(r[0].ends_with("2 agents, 1 task (Alt+A)"), "{r:?}");
+        assert!(r[0].ends_with("2 agents, 2 tasks (Alt+A)"), "{r:?}");
     }
 
     #[test]

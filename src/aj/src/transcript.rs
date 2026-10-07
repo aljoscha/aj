@@ -4284,6 +4284,7 @@ mod tests {
                 // Tool calls render as their own transcript entry, so this
                 // block is dropped from the markdown view.
                 AssistantContent::ToolCall(aj_models::types::ToolCall {
+                    is_raw: false,
                     id: "call-1".into(),
                     name: "bash".into(),
                     arguments: serde_json::json!({}),

@@ -142,6 +142,7 @@ impl ToolDefinition for EditFileTool {
         }
 
         Ok(ToolOutcome {
+            structured_content: None,
             content: vec![UserContent::text(render_wire_content(&display_path, wire))],
             details,
             is_error: false,
@@ -364,6 +365,7 @@ fn render_wire_content(path: &str, wire: WireDiff) -> String {
 /// something meaningful in collapsed views.
 fn error_outcome(path: &str, error: String) -> ToolOutcome {
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(error.clone())],
         details: ToolDetails::Text {
             summary: PathBuf::from(path).display().to_string(),

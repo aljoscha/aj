@@ -55,6 +55,10 @@ pub enum ExecutionMode {
     Sequential,
     /// Runs concurrently with the adjacent run of `Parallel` calls.
     Parallel,
+    /// Operates on runtime control state rather than shared tool resources.
+    /// May overlap a sequential call, so cancellation and observation cannot
+    /// be blocked by the work they control.
+    Control,
 }
 
 impl Default for ExecutionMode {
@@ -786,6 +790,10 @@ pub enum TodoStatus {
 /// event for UI rendering and persistence.
 #[derive(Clone, Debug)]
 pub struct ToolOutcome {
+    /// Optional programmatic result for callers composing tools. This is not
+    /// presentation data and does not enter model context unless a script emits it.
+    /// Tools declaring an output schema supply this value for their normal results.
+    pub structured_content: Option<Value>,
     /// Content sent back to the model as the tool_result message.
     /// Maps directly onto the wire `ToolResultMessage.content`.
     pub content: Vec<UserContent>,
@@ -882,6 +890,9 @@ impl TaskStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
+    /// A JavaScript cell retained until its final output is collected or it is
+    /// terminated. The driver can be live after evaluation has completed.
+    CodeMode { cell_id: String },
     /// A detached `bash -c` child.
     Bash {
         /// The exact command line executed.
@@ -1135,6 +1146,12 @@ pub trait ToolDefinition: Send + Sync {
         derive_schema::<Self::Input>()
     }
 
+    /// JSON Schema for the tool's programmatic result. Without a schema,
+    /// composition callers receive the tool's text or image content.
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+
     /// Per-tool execution mode. Default [`ExecutionMode::Parallel`].
     /// Tools that mutate the filesystem or run arbitrary commands
     /// should override to [`ExecutionMode::Sequential`].
@@ -1179,6 +1196,7 @@ pub struct ErasedToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub output_schema: Option<Value>,
     pub execution_mode: ExecutionMode,
     pub func: ErasedToolFn,
 }
@@ -1191,11 +1209,13 @@ where
         let name = tool.name().to_string();
         let description = tool.description().to_string();
         let input_schema = tool.input_schema();
+        let output_schema = tool.output_schema();
         let execution_mode = tool.execution_mode();
         ErasedToolDefinition {
             name,
             description,
             input_schema,
+            output_schema,
             execution_mode,
             func: Arc::new(move |ctx, raw_input| {
                 let parsed: Result<T::Input, _> = serde_json::from_value(raw_input);

@@ -4,13 +4,13 @@
 //! Both are thin wrappers over the shared [`TaskRegistry`]: reads are
 //! stateless (repeated calls return overlapping tails; incremental
 //! consumption goes through `read_file` on the spill path), and both
-//! run with the default [`ExecutionMode::Parallel`] so they never
-//! serialize a tool batch.
+//! use [`ExecutionMode::Control`] so a sequential operation cannot prevent
+//! the model from observing or stopping that operation.
 //!
 //! Ids are session-wide, so both tools authorize before acting: see
 //! [`may_resolve`] for who may resolve whose tasks.
 //!
-//! [`ExecutionMode::Parallel`]: aj_agent::tool::ExecutionMode::Parallel
+//! [`ExecutionMode::Control`]: aj_agent::tool::ExecutionMode::Control
 
 use std::time::Duration;
 
@@ -90,6 +90,10 @@ impl ToolDefinition for TaskOutputTool {
         OUTPUT_DESCRIPTION
     }
 
+    fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
+        aj_agent::tool::ExecutionMode::Control
+    }
+
     async fn execute(
         &self,
         ctx: &mut dyn ToolContext,
@@ -137,6 +141,10 @@ impl ToolDefinition for TaskStopTool {
 
     fn description(&self) -> &'static str {
         STOP_DESCRIPTION
+    }
+
+    fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
+        aj_agent::tool::ExecutionMode::Control
     }
 
     async fn execute(
@@ -224,6 +232,26 @@ fn report_outcome(registry: &TaskRegistry, caller: AgentId, id: TaskId) -> ToolO
         ),
     };
 
+    if let TaskKind::CodeMode { cell_id } = &summary.kind {
+        let header = if status == TaskStatus::Running {
+            format!(
+                "Code Mode cell {cell_id} is open (task #{id}). Collect its final result with wait."
+            )
+        } else {
+            header
+        };
+        let body = read.report.unwrap_or_default();
+        return ToolOutcome {
+            structured_content: None,
+            content: vec![UserContent::text(format!("{header}\n{body}"))],
+            details: ToolDetails::Text {
+                summary: header,
+                body,
+            },
+            is_error: false,
+        };
+    }
+
     if let TaskKind::Agent { agent_id, .. } = &summary.kind {
         // Agent-backed tasks have no process streams to tail. While
         // the run is live the body points at the sub-agent's chat;
@@ -235,6 +263,7 @@ fn report_outcome(registry: &TaskRegistry, caller: AgentId, id: TaskId) -> ToolO
             _ => format!("Sub-agent {agent_id} runs this task in its own chat."),
         };
         return ToolOutcome {
+            structured_content: None,
             content: vec![UserContent::text(format!("{header}\n{body}"))],
             details: ToolDetails::Text {
                 summary: header,
@@ -271,6 +300,7 @@ fn report_outcome(registry: &TaskRegistry, caller: AgentId, id: TaskId) -> ToolO
         TaskStatus::Running | TaskStatus::Killed => None,
     };
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(wire)],
         details: ToolDetails::Bash {
             command: summary.label,
@@ -361,6 +391,7 @@ fn error_outcome(
     };
     let body = format!("{reason} Your live tasks: {live_text}");
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(body.clone())],
         details: ToolDetails::Text {
             summary: format!("task #{id}: {summary}"),
@@ -986,6 +1017,7 @@ mod production_identity_tests {
         script(
             message(
                 vec![AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: id.to_string(),
                     name: tool.to_string(),
                     arguments,

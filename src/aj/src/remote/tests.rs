@@ -653,6 +653,7 @@ fn catalog_model() -> ModelInfo {
 fn calling(text: &str, call_id: &str, tool: &str, args: serde_json::Value) -> AssistantMessage {
     let mut message = finalized_text_message(text);
     message.content.push(AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: call_id.to_string(),
         name: tool.to_string(),
         arguments: args,
@@ -706,6 +707,7 @@ fn running_tool_and_sub_turn(report: &str, sleep_seconds: u32) -> Vec<AssistantM
         serde_json::json!({"task": "look into it", "run_in_background": true}),
     );
     both.content.push(AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: "call-slow".to_string(),
         name: "bash".to_string(),
         arguments: serde_json::json!({"command": format!("sleep {sleep_seconds}"),

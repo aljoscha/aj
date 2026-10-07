@@ -630,6 +630,91 @@ if (branchNode) {
   check('tool-only assistant stays out of the sidebar', !toolOnlyNode);
 }
 
+console.log('tool activity');
+{
+  const entries = [];
+  function add(id, message) {
+    entries.push({ id, parent_id: entries.at(-1)?.id, thread: 'user', type: 'message', message });
+  }
+  const call = (name) => ({ role: 'assistant', model: 'audit-only-model', usage: { input: 999 },
+    content: [{ type: 'tool_call', id: 'same', name, arguments: { path: '<nested>' } }] });
+  const result = (text, is_error = false) => ({ role: 'tool_result', tool_call_id: 'same', tool_name: 'read_file',
+    content: [{ type: 'text', text }], is_error });
+  const activity = (cell_id, message) => ({ role: 'tool_activity', cell_id, message });
+  add('u', { role: 'user', content: 'plain prompt' });
+  add('a', { ...call('plain'), model: 'plain-model' });
+  add('r', result('plain output'));
+  add('c1', activity('<cell-one>', call('read_file')));
+  add('c2', activity('cell-two', call('bash')));
+  add('r2', activity('cell-two', result('second output', true)));
+  add('r1', activity('<cell-one>', result('<script>nested output</script>')));
+  add('orphan', activity('orphan-cell', result('orphan output')));
+  add('pending', activity('pending-cell', call('pending-tool')));
+  const view = await renderData({ session_id: 'activity', leaf_id: 'pending', entries });
+  const html = view.elements.messages.innerHTML;
+  check('activity results paired by cell, not plain call id',
+    html.includes('tool-execution success" id="tool-call-activity-c1-same') &&
+    html.includes('tool-execution error" id="tool-call-activity-c2-same') &&
+    html.includes('tool-execution pending" id="tool-call-activity-pending-same'));
+  check('nested output rendered once and safely escaped',
+    html.split('&lt;script&gt;nested output&lt;/script&gt;').length === 2 && !html.includes('<script>'));
+  check('cell label safely escaped', html.includes('Tool activity: &lt;cell-one&gt;'));
+  check('plain and orphan results remain visible', html.includes('plain output') && html.includes('orphan output'));
+  check('paired output belongs to its call',
+    html.slice(html.indexOf('id="entry-c1"'), html.indexOf('id="entry-c2"')).includes('nested output') &&
+    !html.slice(html.indexOf('id="entry-c1"'), html.indexOf('id="entry-c2"')).includes('second output'));
+  const header = view.elements['header-container'].innerHTML;
+  check('audit calls are tools, not inference or user input',
+    header.includes('1 user, 1 assistant, 4 tool results') &&
+    header.includes('plain-model') && !header.includes('audit-only-model') &&
+    header.includes('Tool calls:</span><span class="info-value">4</span>') &&
+    header.includes('Tokens:</span><span class="info-value">↑999</span>'));
+  fire(view.entryFilterButtons.find((b) => b.dataset.entryFilter === 'tools'), 'click');
+  const row = view.elements['tree-container'].children.find((n) => n.dataset.id === 'r1');
+  check('activity is a tools sidebar row with escaped label', !!row && nodeText(row).includes('&lt;cell-one&gt;'));
+  if (row) fire(row, 'click');
+  check('activity result navigation reaches its call', view.scrolledTargets.includes('entry-c1'));
+}
+
+console.log('delegated tool activity');
+for (const name of ['agent', 'oracle']) {
+  const activity = (message) => ({ role: 'tool_activity', cell_id: 'exec-cell', message });
+  const entries = [
+    { id: 'u', thread: 'user', type: 'message', message: { role: 'user', content: 'delegate this' } },
+    { id: 'exec', parent_id: 'u', thread: 'user', type: 'message', message: {
+      role: 'assistant', model: 'parent-model', content: [{ type: 'tool_call', id: 'exec-call', name: 'exec', arguments: {} }],
+    } },
+    { id: 'call', parent_id: 'exec', thread: 'user', type: 'message', message: activity({
+      role: 'assistant', model: 'audit-only-model', usage: { input: 999 },
+      content: [{ type: 'tool_call', id: 'delegate', name, arguments: { task: 'investigate' } }],
+    }) },
+    // A sibling result may become the persisted head before SubAgentStart arrives.
+    { id: 'sibling', parent_id: 'call', thread: 'user', type: 'message', message: activity({
+      role: 'tool_result', tool_call_id: 'sibling-call', tool_name: 'read_file', content: [],
+    }) },
+    { id: 'spawn', parent_id: 'sibling', thread: 'subagent', agent_id: 1,
+      type: 'sub_agent_spawn', task: 'investigate' },
+    { id: 'child', parent_id: 'spawn', thread: 'subagent', agent_id: 1, type: 'message', message: {
+      role: 'assistant', model: 'child-model', content: [{ type: 'text', text: 'actual child transcript' }],
+    } },
+    { id: 'result', parent_id: 'sibling', thread: 'user', type: 'message', message: activity({
+      role: 'tool_result', tool_call_id: 'delegate', tool_name: name, is_error: false,
+      content: [{ type: 'text', text: 'child report' }],
+      details: { kind: 'sub_agent_report', agent_id: 1, task: 'investigate', report: 'child report' },
+    }) },
+  ];
+  const view = await renderData({ session_id: 'delegation', leaf_id: 'result', entries });
+  const html = view.elements.messages.innerHTML;
+  check(name + ' activity retains expandable child transcript',
+    /<details class="subagent" id="subagent-1">[\s\S]*actual child transcript[\s\S]*<\/details>/.test(html));
+  check(name + ' delayed spawn renders beneath audit call',
+    html.slice(html.indexOf('id="entry-call"'), html.indexOf('id="entry-sibling"')).includes('id="subagent-1"'));
+  const header = view.elements['header-container'].innerHTML;
+  check(name + ' audit delegation is not model inference',
+    header.includes('1 user, 2 assistant, 2 tool results') &&
+    !header.includes('audit-only-model') && !header.includes('999'));
+}
+
 console.log('');
 if (failures) {
   console.error(failures + ' assertion(s) failed');

@@ -127,6 +127,7 @@ mod tests {
             Box::pin(async {
                 BeforeToolCallOutcome::ShortCircuit {
                     outcome: ToolOutcome {
+                        structured_content: None,
                         content: Vec::new(),
                         details: crate::tool::ToolDetails::Text {
                             summary: "denied".into(),
@@ -156,6 +157,7 @@ mod tests {
             })
         });
         let mut outcome = ToolOutcome {
+            structured_content: None,
             content: Vec::new(),
             details: crate::tool::ToolDetails::Text {
                 summary: "ok".into(),

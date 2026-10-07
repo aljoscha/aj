@@ -62,6 +62,7 @@ const PROMPT: &str = "Of Tokyo, Nairobi, and Reykjavik, which city is closest to
 /// turn whose preceding thinking block is the subject of the experiment.
 fn weather_tool() -> ToolDefinition {
     ToolDefinition {
+        input_format: None,
         name: "get_weather".into(),
         description: "Get the current weather for a city.".into(),
         parameters: serde_json::json!({
