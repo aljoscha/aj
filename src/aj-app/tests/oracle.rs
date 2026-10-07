@@ -151,6 +151,7 @@ fn build(config: &Config, run: &RunConfigSnapshot) -> Agent {
         transcript: vec![],
         assembled_system_prompt: Some("Shared engineering instructions.".into()),
         sub_agent_counter: 0,
+        code_mode_store: Default::default(),
     });
     agent
 }

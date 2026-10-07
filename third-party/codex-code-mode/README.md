@@ -11,13 +11,24 @@ Source: <https://github.com/openai/codex>, commit
 - Unmodified upstream `LICENSE`, `NOTICE`, and `clippy.toml`
 - `v8-artifacts.json`, derived from the pinned `MODULE.bazel`
 
-The explicit patch decouples Codex's larger protocol crate by extracting
+Patch `0001-standalone-protocol.patch` decouples Codex's larger protocol crate by extracting
 `ToolName`, model tool messages, and the audio size limit. Only the model-message
 schema/TypeScript derives are removed. Protocol gRPC and its build dependencies
-are behind the optional `grpc` feature, disabled by default. Runtime behavior,
-the V8 sandbox feature, and all upstream tests are retained. Changed files carry
+are behind the optional `grpc` feature, disabled by default. The V8 sandbox
+feature and all upstream tests are retained. Changed files carry
 modification notices. `upstream.json` records SHA-256 hashes of source inputs,
 the patch, workspace template, and every imported file.
+
+Patch `0002-durable-store.patch` is an AJ runtime extension. It adds initial
+stored values and an asynchronous delegate callback for completed writes.
+Completion is reserved against cancellation before calling the host. New cell
+snapshots, other commits, and completion delivery wait for acknowledgment.
+Termination during an accepted commit waits for it rather than rolling it back.
+Failed acknowledgment leaves the runtime map unchanged and reports an error.
+Writes preceding an ordinary script error still commit, matching Codex semantics.
+The default callback does nothing, preserving memory-only embedding behavior.
+AJ supplies the callback through its persistence event bus and stops the agent
+if acknowledgment fails. The patch includes native contract tests.
 
 ## Parent integration
 
@@ -127,6 +138,29 @@ The new revision becomes the default for subsequent verification and reimports.
 Cargo's root `target/` and `Cargo.lock` are moved intact, not regenerated. Review
 and refresh lockfiles and native artifacts separately when dependencies change.
 Licensing evidence is revision-specific and must also be reviewed on upgrade.
+
+### AJ compatibility review
+
+After an upstream refresh, review both extraction patches, not only whether
+they apply. In particular, inspect the completion/cancellation state machine
+against `code-mode-runtime/tests/stored_values.rs`. It must not expose values or
+a completed response before AJ acknowledges the store update. Also run AJ's
+`code_mode` agent tests and `code_mode_store` application tests, then the normal
+workspace gate. The latter covers persistence, branch selection, compaction,
+resume, and provider-context exclusion through the composed application.
+
+The raw `exec` grammar in `src/aj-agent/src/code_mode.rs` is copied from Codex's
+`core/src/tools/code_mode/execute_spec.rs`, outside the imported crates. Compare
+it explicitly, along with direct-only tool policy and the small AJ description
+overrides, when reviewing an upgrade. Do not assume a successful import checks
+these host-level interfaces.
+
+To change a local patch, work in a separate copy of the verified extraction and
+generate a patch relative to that workspace. Add it under `patches/`, then run
+`--upgrade` with the recorded revision if upstream itself is unchanged. Do not
+edit the installed vendor tree or its provenance hashes to bypass verification.
+Both unified and Git-format patches are applied outside the enclosing AJ Git
+worktree's prefix rules, so they cannot silently skip paths inside staging.
 
 **Single-writer contract:** stop Cargo, editors, bootstrap, and other importers
 while importing. Publication uses same-filesystem staging and a backup rename,

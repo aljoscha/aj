@@ -1384,7 +1384,10 @@ impl Driver {
                 agent.reseed_transcript(conversation.agent_messages());
                 agent.set_session_env(env);
                 agent.clear_todo_list();
-                agent.reset_code_mode().await.map_err(HostError::Internal)?;
+                agent
+                    .reset_code_mode(conversation.code_mode_store())
+                    .await
+                    .map_err(HostError::Internal)?;
             }
             // The epoch and the high-water mark move under the log lock, so
             // an attach that snapshots the log cannot pair the new

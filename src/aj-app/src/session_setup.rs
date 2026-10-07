@@ -900,6 +900,10 @@ pub fn freeze_and_seed(
         transcript,
         assembled_system_prompt: Some(system_prompt),
         sub_agent_counter: log.max_agent_id().unwrap_or(0),
+        code_mode_store: log
+            .head()
+            .map(|head| log.linearize(head, ThreadFilter::USER).code_mode_store())
+            .unwrap_or_default(),
     });
     Ok(())
 }

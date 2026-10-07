@@ -155,6 +155,9 @@ pub struct AgentSeed {
     /// sub-agents never collide with subtrees already persisted in
     /// the log. `0` for a fresh session.
     pub sub_agent_counter: usize,
+    /// Committed JavaScript values from this agent's selected log ancestry,
+    /// independent of the compacted model transcript.
+    pub code_mode_store: BTreeMap<String, serde_json::Value>,
 }
 
 /// A sub-agent's single-turn result, returned by [`Agent::run_single_turn`]
@@ -338,6 +341,7 @@ pub struct Agent {
     max_tool_concurrency: usize,
     code_mode_requested: bool,
     code_mode: Option<code_mode::CodeMode>,
+    code_mode_store: Arc<StdMutex<code_mode::Store>>,
     tool_access: Arc<tokio::sync::RwLock<()>>,
     tool_slots: Arc<tokio::sync::Semaphore>,
     /// Terminal assistant message of the most recent inference
@@ -430,6 +434,7 @@ impl Agent {
             max_tool_concurrency: concurrency,
             code_mode_requested: false,
             code_mode: None,
+            code_mode_store: Arc::default(),
             tool_access: Arc::new(tokio::sync::RwLock::new(())),
             tool_slots: Arc::new(tokio::sync::Semaphore::new(concurrency)),
             last_assistant: None,
@@ -717,6 +722,7 @@ impl Agent {
     /// before it is shared or drives its first turn.
     pub fn seed_session(&mut self, seed: AgentSeed) {
         self.transcript = seed.transcript;
+        self.code_mode_store = Arc::new(StdMutex::new(code_mode::Store::new(seed.code_mode_store)));
         if let Some(prompt) = seed.assembled_system_prompt {
             self.assembled_system_prompt = prompt;
         }
@@ -748,12 +754,16 @@ impl Agent {
         self.session_state.set_todo_list(Vec::new());
     }
 
-    /// Clear ephemeral JavaScript state when changing session branches. Call
-    /// only after the host has established that no run or task is live.
-    pub async fn reset_code_mode(&mut self) -> Result<(), BoxError> {
+    /// Replace JavaScript state with the selected branch's committed values.
+    /// Call only after the host has established that no run or task is live.
+    pub async fn reset_code_mode(
+        &mut self,
+        store: BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), BoxError> {
         if let Some(mode) = self.code_mode.take() {
             mode.shutdown().await?;
         }
+        self.code_mode_store = Arc::new(StdMutex::new(code_mode::Store::new(store)));
         Ok(())
     }
 
@@ -973,12 +983,16 @@ impl Agent {
     }
 
     async fn prepare_code_mode(&mut self) -> Result<(), TurnError> {
+        self.check_code_mode_store()?;
         if self.code_mode_requested && code_mode::eligible(&self.model_info) {
             let runner = self.tool_runner();
             if let Some(mode) = &self.code_mode {
                 mode.refresh(runner);
             } else {
-                self.code_mode = Some(code_mode::CodeMode::new(runner));
+                self.code_mode = Some(code_mode::CodeMode::new(
+                    runner,
+                    Arc::clone(&self.code_mode_store),
+                ));
             }
             self.tools = code_mode::catalog(&self.tool_definitions);
         } else {
@@ -1397,6 +1411,7 @@ impl Agent {
         let mut retrying = false;
 
         'outer: loop {
+            self.check_code_mode_store()?;
             // Pre-iteration cancel check (cheap atomic). Lets us
             // skip an inference when cancel fired between turns
             // (e.g. while we were in the tool batch below).
@@ -1435,6 +1450,9 @@ impl Agent {
                 .await
                 .map_err(TurnError::Fatal)?;
 
+            // A background commit can fail while admission or a listener awaits.
+            // Recheck at the provider boundary, not only at the loop's start.
+            self.check_code_mode_store()?;
             let mut response_stream = self.run_inference_streaming();
             let cancel = self.cancellation.clone();
 
@@ -1686,6 +1704,7 @@ impl Agent {
             retry_strategy = None;
             retry_attempt = 0;
 
+            self.check_code_mode_store()?;
             let response = final_message;
             let turn_usage = response.usage.clone();
 
@@ -2233,10 +2252,11 @@ impl Agent {
         tool_input: serde_json::Value,
         cancel: CancellationToken,
     ) -> Result<RunToolResult, TurnError> {
+        self.check_code_mode_store()?;
         let runner = self.tool_runner();
         if let Some(mode) = &self.code_mode {
             if matches!(tool_name.as_str(), "exec" | "wait") {
-                return runner
+                let result = runner
                     .run_with(
                         call_id.clone(),
                         tool_name.clone(),
@@ -2245,6 +2265,8 @@ impl Agent {
                         |input| mode.call(&tool_name, &call_id, input),
                     )
                     .await;
+                self.check_code_mode_store()?;
+                return result;
             }
             if !code_mode::direct_only(&tool_name) {
                 return runner
@@ -2255,6 +2277,14 @@ impl Agent {
             }
         }
         runner.run(call_id, tool_name, tool_input, cancel).await
+    }
+
+    fn check_code_mode_store(&self) -> Result<(), TurnError> {
+        self.code_mode_store
+            .lock()
+            .expect("code mode store mutex poisoned")
+            .check()
+            .map_err(|error| TurnError::Fatal(error.into()))
     }
 
     #[cfg(test)]
@@ -4711,6 +4741,7 @@ mod event_protocol_tests {
             AgentEvent::CompactionStart { .. } => EventLabel::Other("CompactionStart"),
             AgentEvent::CompactionProgress { .. } => EventLabel::Other("CompactionProgress"),
             AgentEvent::CompactionEnd { .. } => EventLabel::Other("CompactionEnd"),
+            AgentEvent::CodeModeStore { .. } => EventLabel::Other("CodeModeStore"),
         }
     }
 
