@@ -86,6 +86,7 @@ impl Provider for RecordingProvider {
 fn consult() -> AssistantMessage {
     let mut message = finalized_text_message("consulting");
     message.content.push(AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: "oracle-call-61".into(),
         name: "oracle".into(),
         arguments: json!({"task": TASK}),

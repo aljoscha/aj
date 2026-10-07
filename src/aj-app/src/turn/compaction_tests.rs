@@ -92,6 +92,7 @@ fn read_batch(dir: &TempDir, input: u64, contents: &str) -> AssistantMessage {
             let path = dir.path().join(format!("evidence-{i}.txt"));
             std::fs::write(&path, contents).unwrap();
             AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: format!("read-{i}"),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path": path}),

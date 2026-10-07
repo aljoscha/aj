@@ -101,6 +101,7 @@ async fn goal_palette_manages_goals_through_real_keys_locally_and_remotely() {
         let (ready, held) = tokio::sync::oneshot::channel();
         let mut finish = aj_app::test_support::finalized_text_message("verified");
         finish.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "complete-goal".into(),
             name: "update_goal".into(),
             arguments: serde_json::json!({"status":"complete"}),

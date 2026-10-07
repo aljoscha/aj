@@ -1387,8 +1387,9 @@ impl SessionHost {
     }
 
     /// Read at most `TASK_OUTPUT_CHUNK_BYTES` raw bytes from a retained task's
-    /// spill file. The offset must not exceed its captured length. No task
-    /// archive is consulted and rolling tails are never substituted for a file.
+    /// spill file, or a Code Mode cell's append-only observed textual output.
+    /// The offset must not exceed its captured length. No task archive is
+    /// consulted and rolling tails are never substituted for full output.
     pub async fn task_output(
         &self,
         session: &str,
@@ -1403,6 +1404,35 @@ impl SessionHost {
             .task_registry
             .read(task)
             .ok_or(HostError::UnknownTask(task))?;
+        if live
+            .core
+            .task_registry
+            .summary(task)
+            .is_some_and(|summary| {
+                matches!(summary.kind, aj_agent::tool::TaskKind::CodeMode { .. })
+            })
+        {
+            let report = read.report.unwrap_or_default();
+            let total_bytes = u64::try_from(report.len()).unwrap_or(u64::MAX);
+            let start = usize::try_from(offset)
+                .ok()
+                .filter(|offset| *offset <= report.len())
+                .ok_or_else(|| {
+                    HostError::Invalid(format!(
+                        "task output offset {offset} exceeds current length {total_bytes}"
+                    ))
+                })?;
+            let end = start
+                .saturating_add(aj_wire::TASK_OUTPUT_CHUNK_BYTES)
+                .min(report.len());
+            return Ok(aj_wire::TaskOutput {
+                id: task,
+                status,
+                offset,
+                total_bytes,
+                bytes: report.as_bytes()[start..end].to_vec(),
+            });
+        }
         let path = read.spill_path.ok_or_else(|| {
             HostError::Unsupported(format!(
                 "full output unavailable for task {task}: no spill file"

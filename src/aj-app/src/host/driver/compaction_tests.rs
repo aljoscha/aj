@@ -131,6 +131,7 @@ async fn compaction_settings_edits_apply_at_the_next_tool_batch_boundary() {
             batch.stop_reason = StopReason::ToolUse;
             batch.usage.input = 900;
             batch.content = vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: "read-evidence".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path": evidence}),
@@ -266,6 +267,7 @@ async fn failed_compaction_replays_its_notice_and_holds_pending_work_until_user_
         batch.stop_reason = StopReason::ToolUse;
         batch.usage.input = 900;
         batch.content = vec![AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "background-work".into(),
             name: "bash".into(),
             arguments: serde_json::json!({

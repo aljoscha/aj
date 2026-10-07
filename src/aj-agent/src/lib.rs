@@ -7,8 +7,10 @@
 // the readline loop, log management, and history display.
 mod assignment;
 pub mod bus;
+mod code_mode;
 pub mod error;
 pub mod events;
+mod execution;
 pub mod goal;
 pub mod hooks;
 pub mod message;
@@ -94,7 +96,9 @@ fn task_outcome(kind: TaskNotificationKind, status: TaskStatus) -> TaskOutcome {
     match (kind, status) {
         (_, TaskStatus::Exited(Some(0))) => TaskOutcome::Succeeded,
         (_, TaskStatus::Killed) => TaskOutcome::Killed,
-        (TaskNotificationKind::Agent, _) => TaskOutcome::Failed { code: None },
+        (TaskNotificationKind::Agent | TaskNotificationKind::CodeMode, _) => {
+            TaskOutcome::Failed { code: None }
+        }
         (TaskNotificationKind::Bash, TaskStatus::Exited(Some(code))) => {
             TaskOutcome::Failed { code: Some(code) }
         }
@@ -332,6 +336,10 @@ pub struct Agent {
     /// one turn (see [`max_tool_concurrency`]). Read once at
     /// construction so a turn never re-reads the environment.
     max_tool_concurrency: usize,
+    code_mode_requested: bool,
+    code_mode: Option<code_mode::CodeMode>,
+    tool_access: Arc<tokio::sync::RwLock<()>>,
+    tool_slots: Arc<tokio::sync::Semaphore>,
     /// Terminal assistant message of the most recent inference
     /// (success, error, or abort). Retained so the host can classify
     /// the just-finished turn — context overflow, occupancy — without
@@ -378,6 +386,7 @@ impl Agent {
                 name: tool_def.name.clone(),
                 description: tool_def.description.clone(),
                 parameters: tool_def.input_schema.clone(),
+                input_format: None,
             })
             .collect();
 
@@ -388,6 +397,7 @@ impl Agent {
             .collect();
 
         let session_state = SessionState::new(working_directory);
+        let concurrency = max_tool_concurrency();
 
         Self {
             assembled_system_prompt: String::new(),
@@ -417,7 +427,11 @@ impl Agent {
             goal_admission: None,
             inference_goal_revision: 0,
             message_queues: MessageQueues::default(),
-            max_tool_concurrency: max_tool_concurrency(),
+            max_tool_concurrency: concurrency,
+            code_mode_requested: false,
+            code_mode: None,
+            tool_access: Arc::new(tokio::sync::RwLock::new(())),
+            tool_slots: Arc::new(tokio::sync::Semaphore::new(concurrency)),
             last_assistant: None,
         }
     }
@@ -734,6 +748,15 @@ impl Agent {
         self.session_state.set_todo_list(Vec::new());
     }
 
+    /// Clear ephemeral JavaScript state when changing session branches. Call
+    /// only after the host has established that no run or task is live.
+    pub async fn reset_code_mode(&mut self) -> Result<(), BoxError> {
+        if let Some(mode) = self.code_mode.take() {
+            mode.shutdown().await?;
+        }
+        Ok(())
+    }
+
     /// Install a hook fired before every tool call, replacing any
     /// previous hook. Passing the closure inside `Some(...)` enables
     /// the hook; passing `None` clears it. See
@@ -913,6 +936,7 @@ impl Agent {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 parameters: tool.input_schema.clone(),
+                input_format: None,
             })
             .collect();
         self.tool_definitions = tools
@@ -940,6 +964,60 @@ impl Agent {
     /// whatever they were already configured for.
     pub fn set_default_thinking(&mut self, level: Option<ThinkingConfig>) {
         self.default_thinking = level;
+    }
+
+    /// Request Code Mode for eligible models. Ineligible selections use ordinary
+    /// tools and report the fallback when the next run starts.
+    pub fn set_code_mode(&mut self, enabled: bool) {
+        self.code_mode_requested = enabled;
+    }
+
+    async fn prepare_code_mode(&mut self) -> Result<(), TurnError> {
+        if self.code_mode_requested && code_mode::eligible(&self.model_info) {
+            let runner = self.tool_runner();
+            if let Some(mode) = &self.code_mode {
+                mode.refresh(runner);
+            } else {
+                self.code_mode = Some(code_mode::CodeMode::new(runner));
+            }
+            self.tools = code_mode::catalog(&self.tool_definitions);
+        } else {
+            if let Some(mode) = self.code_mode.take() {
+                mode.interrupt().await.map_err(TurnError::Fatal)?;
+                mode.shutdown().await.map_err(TurnError::Fatal)?;
+                self.bus
+                    .emit(AgentEvent::Notice {
+                        agent_id: self.agent_id,
+                        text: "Code Mode disabled. Its open cells were cancelled.".into(),
+                    })
+                    .await
+                    .map_err(TurnError::Fatal)?;
+            }
+            self.tools = self
+                .tool_definitions
+                .values()
+                .map(|tool| UnifiedToolDefinition {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.input_schema.clone(),
+                    input_format: None,
+                })
+                .collect();
+            self.tools.sort_by(|a, b| a.name.cmp(&b.name));
+            if self.code_mode_requested {
+                self.bus
+                    .emit(AgentEvent::Notice {
+                        agent_id: self.agent_id,
+                        text: format!(
+                            "Code Mode is not available for {}. Using ordinary tools.",
+                            self.model_info.id
+                        ),
+                    })
+                    .await
+                    .map_err(TurnError::Fatal)?;
+            }
+        }
+        Ok(())
     }
 
     /// Set the requested inference speed for subsequent calls and child inheritance.
@@ -1131,7 +1209,17 @@ impl Agent {
             .await
             .map_err(TurnError::Fatal)?;
 
-        let outcome = self.run_top_level_turn_inner(prompt).await;
+        let mut outcome = match self.prepare_code_mode().await {
+            Ok(()) => self.run_top_level_turn_inner(prompt).await,
+            Err(error) => Err(error),
+        };
+        if self.cancellation.is_cancelled()
+            && let Some(mode) = &self.code_mode
+        {
+            if let Err(error) = mode.interrupt().await {
+                outcome = Err(TurnError::Fatal(error));
+            }
+        }
 
         let reply = if matches!(outcome, Err(TurnError::Aborted)) {
             None
@@ -1611,6 +1699,7 @@ impl Agent {
                         id,
                         name,
                         arguments,
+                        ..
                     }) => Some((id.clone(), name.clone(), arguments.clone())),
                     _ => None,
                 })
@@ -1644,7 +1733,7 @@ impl Agent {
                 let groups = group_tool_calls(tool_calls, |name| {
                     self.tool_definitions
                         .get(name)
-                        .is_some_and(|def| def.execution_mode == ExecutionMode::Parallel)
+                        .is_some_and(|def| def.execution_mode != ExecutionMode::Sequential)
                 });
 
                 let mut aborted = false;
@@ -1812,11 +1901,18 @@ impl Agent {
     ///
     /// [`AgentMessageKind::TaskNotification`]: crate::message::AgentMessageKind::TaskNotification
     async fn drain_task_notices(&mut self) -> Result<(), TurnError> {
+        if let Some(mode) = &self.code_mode {
+            for text in mode.notifications() {
+                self.record_input(AgentMessage::internal_context(text))
+                    .await?;
+            }
+        }
         let notices = self.task_registry.drain_notices(self.agent_id);
         for notice in notices {
             let kind = match &notice.kind {
                 TaskKind::Bash { .. } => TaskNotificationKind::Bash,
                 TaskKind::Agent { .. } => TaskNotificationKind::Agent,
+                TaskKind::CodeMode { .. } => TaskNotificationKind::CodeMode,
             };
             let outcome = task_outcome(kind, notice.status);
             let message = AgentMessage::task_notification(TaskNotification::new(
@@ -2087,150 +2183,17 @@ impl Agent {
             .stream_simple(&self.model_info, &context, &options)
     }
 
-    /// Run one tool call up to (but not including) result
-    /// finalization: emit `ToolExecutionStart`, consult the
-    /// before/after hooks, and race the tool against cancellation.
-    ///
-    /// Takes `&self` so a batch of these can run concurrently within a
-    /// turn. Appending the result to the transcript and emitting the
-    /// terminal events is left to [`Agent::finalize_tool_result`],
-    /// which the caller invokes under `&mut self` in original call
-    /// order — that ordering, not the order these futures resolve in,
-    /// is what the transcript records.
-    async fn run_tool_call(
-        &self,
-        call_id: String,
-        tool_name: String,
-        tool_input: serde_json::Value,
-        cancel: CancellationToken,
-    ) -> Result<RunToolResult, TurnError> {
-        // Mirror the start of every tool invocation on the bus before
-        // any work — listeners that render a "running…" placeholder
-        // rely on seeing this before any update or end.
-        self.bus
-            .emit(AgentEvent::ToolExecutionStart {
-                agent_id: self.agent_id,
-                call_id: call_id.clone(),
-                tool: tool_name.clone(),
-                args: tool_input.clone(),
-            })
-            .await
-            .map_err(TurnError::Fatal)?;
-
-        // The before-tool-call hook can rewrite the input or
-        // short-circuit the call with a pre-baked outcome (permission
-        // denial, policy block). We clone the `Arc` so the borrow
-        // doesn't conflict with the `execute_tool` call below.
-        let before_hook = self.before_tool_call.clone();
-        let (tool_input, short_circuit_outcome) = match before_hook {
-            Some(hook) => {
-                let ctx = hooks::ToolCallContext {
-                    call_id: &call_id,
-                    tool_name: &tool_name,
-                };
-                match hook(ctx, tool_input.clone()).await {
-                    hooks::BeforeToolCallOutcome::Proceed { args } => (args, None),
-                    hooks::BeforeToolCallOutcome::ShortCircuit { outcome } => {
-                        (tool_input, Some(outcome))
-                    }
-                }
-            }
-            None => (tool_input, None),
-        };
-
-        // Run the tool unless the before-hook short-circuited it,
-        // racing against cancel. On cancel we drop the tool future and
-        // synthesize a cancelled outcome so the transcript still pairs
-        // `tool_use` with `tool_result`. The drop is all the notice a
-        // tool gets: it is never polled again, so releasing whatever it
-        // holds (a child process group, a file handle) is the tool's
-        // own duty on drop, and a tool that leaks there is a tool bug.
-        //
-        // Tool-input parse failures surface as a `ToolCall` with
-        // `arguments == Value::Null`; the tool's own deserializer
-        // rejects the payload and the call bubbles up here as an
-        // `Err`. We fold that into an `is_error: true` outcome so the
-        // failure rides the same `Message::ToolResult` shape every
-        // other tool error does.
-        let outcome_or_cancel: Option<ToolOutcome> = if let Some(outcome) = short_circuit_outcome {
-            Some(outcome)
-        } else {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => None,
-                res = self.execute_tool(&call_id, &tool_name, tool_input.clone()) => {
-                    Some(match res {
-                        Ok(outcome) => outcome,
-                        Err(err) => ToolOutcome {
-                            content: vec![UserContent::text(format!("{err}"))],
-                            details: ToolDetails::Text {
-                                summary: format!("{tool_name}: error"),
-                                body: err.to_string(),
-                            },
-                            is_error: true,
-                        },
-                    })
-                }
-            }
-        };
-
-        let aborted = outcome_or_cancel.is_none();
-        let mut outcome = outcome_or_cancel.unwrap_or_else(|| cancelled_tool_outcome(&tool_name));
-
-        // The after-tool-call hook can rewrite the outcome before it
-        // is finalized. We skip it on cancellation so a misbehaving
-        // hook can't swallow the abort: the cancelled outcome lands
-        // verbatim and the caller returns `TurnError::Aborted`.
-        if !aborted {
-            if let Some(hook) = self.after_tool_call.clone() {
-                let ctx = hooks::ToolCallContext {
-                    call_id: &call_id,
-                    tool_name: &tool_name,
-                };
-                hook(ctx, &mut outcome).await;
-            }
-        }
-
-        Ok(RunToolResult {
-            call_id,
-            tool_name,
-            outcome,
-            aborted,
-        })
-    }
-
-    async fn execute_tool(
-        &self,
-        call_id: &str,
-        tool_name: &str,
-        tool_input: serde_json::Value,
-    ) -> Result<ToolOutcome, BoxError> {
-        let tool_def = if let Some(tool_def) = self.tool_definitions.get(tool_name) {
-            tool_def
-        } else {
-            return Err("tool not found!".into());
-        };
-
-        // Build the sub-agent tool template now (cheap clone: every
-        // `ErasedToolDefinition` field is `Clone`, with the closure
-        // sitting behind an `Arc`).
-        let sub_agent_tools: Vec<ErasedToolDefinition> =
-            self.tool_definitions.values().cloned().collect();
-
-        // Build the [`ToolContext`] the tool sees: working
-        // directory, todos, sub-agent spawn, cancellation token,
-        // progress updates via `emit_update`. The wrapper holds a
-        // clone of the session-state handle (not a `&mut` borrow), so
-        // `execute_tool` takes `&self` and several tool calls can run
-        // concurrently within one turn.
-        let mut session_ctx_wrapper = SessionContextWrapper {
+    /// Capture the runtime capabilities used by direct and composed calls.
+    fn tool_runner(&self) -> execution::ToolRunner {
+        let context = SessionContextWrapper {
+            code_mode_requested: self.code_mode_requested,
             session_state: self.session_state.clone(),
             assembled_system_prompt: self.assembled_system_prompt.clone(),
-            disabled_tools: &self.disabled_tools,
+            disabled_tools: self.disabled_tools.clone(),
             provider: Arc::clone(&self.provider),
             model_info: Arc::clone(&self.model_info),
             stream_options: self.stream_options.clone(),
-            sub_agent_tools,
+            sub_agent_tools: self.tool_definitions.values().cloned().collect(),
             parent_bus: self.bus.clone(),
             agent_id: self.agent_id,
             cancellation: self.cancellation.child_token(),
@@ -2242,13 +2205,68 @@ impl Agent {
             goal_control: self.goal_control.clone(),
             goal_revision: self.inference_goal_revision,
             message_queues: self.message_queues.clone(),
-            call_id: call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            tool_args: tool_input.clone(),
+            call_id: String::new(),
+            tool_name: String::new(),
+            tool_args: serde_json::Value::Null,
         };
+        let mut tools = self.tool_definitions.clone();
+        if self.code_mode_requested
+            && code_mode::eligible(&self.model_info)
+            && let Some(wait) = tools.get("wait").cloned()
+        {
+            tools.insert("yield".into(), wait);
+        }
+        execution::ToolRunner {
+            context,
+            tools,
+            before_hook: self.before_tool_call.clone(),
+            after_hook: self.after_tool_call.clone(),
+            access: Arc::clone(&self.tool_access),
+            slots: Arc::clone(&self.tool_slots),
+        }
+    }
 
-        let outcome = (tool_def.func)(&mut session_ctx_wrapper, tool_input).await?;
-        Ok(outcome)
+    async fn run_tool_call(
+        &self,
+        call_id: String,
+        tool_name: String,
+        tool_input: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<RunToolResult, TurnError> {
+        let runner = self.tool_runner();
+        if let Some(mode) = &self.code_mode {
+            if matches!(tool_name.as_str(), "exec" | "wait") {
+                return runner
+                    .run_with(
+                        call_id.clone(),
+                        tool_name.clone(),
+                        tool_input,
+                        cancel,
+                        |input| mode.call(&tool_name, &call_id, input),
+                    )
+                    .await;
+            }
+            if !code_mode::direct_only(&tool_name) {
+                return runner
+                    .run_with(call_id, tool_name, tool_input, cancel, |_| async {
+                        Err("Use exec to call nested tools in Code Mode".into())
+                    })
+                    .await;
+            }
+        }
+        runner.run(call_id, tool_name, tool_input, cancel).await
+    }
+
+    #[cfg(test)]
+    async fn execute_tool(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+    ) -> Result<ToolOutcome, BoxError> {
+        self.tool_runner()
+            .execute(call_id, tool_name, tool_input, self.cancellation.clone())
+            .await
     }
 }
 
@@ -3462,17 +3480,18 @@ mod task_registry_tests {
     }
 }
 
-/// Wrapper that provides partial access to mutable [`Agent`] state,
-/// while we have partial immutable access to other parts. Used in
-/// [`Agent::execute_tool`].
-struct SessionContextWrapper<'a> {
+/// Owned runtime capabilities captured for tool execution. Clones share
+/// session state and lifecycle registries without borrowing the agent loop.
+#[derive(Clone)]
+struct SessionContextWrapper {
+    code_mode_requested: bool,
     session_state: SessionState,
     /// The fully-assembled system prompt for the current run,
     /// captured at the moment the tool is invoked. Sub-agents
     /// spawned through this wrapper inherit it, optionally with an
     /// explicitly configured suffix.
     assembled_system_prompt: String,
-    disabled_tools: &'a [String],
+    disabled_tools: Vec<String>,
     /// Default provider handle for ordinary sub-agent spawns.
     provider: Arc<dyn Provider>,
     model_info: Arc<ModelInfo>,
@@ -3543,7 +3562,7 @@ struct SessionContextWrapper<'a> {
     tool_args: serde_json::Value,
 }
 
-impl SessionContextWrapper<'_> {
+impl SessionContextWrapper {
     fn spawn_child<'b>(
         &'b mut self,
         task: String,
@@ -3659,6 +3678,7 @@ impl SessionContextWrapper<'_> {
             // Keep the selected thinking and speed on the retained child.
             sub_agent.set_default_thinking(config.thinking);
             sub_agent.set_speed(config.speed.clone());
+            sub_agent.set_code_mode(self.code_mode_requested);
             // Share the background-task registry so tasks the
             // sub-agent starts land in the same map the binary
             // observes, with notices scoped to the sub-agent's own
@@ -3807,7 +3827,7 @@ impl SessionContextWrapper<'_> {
     }
 }
 
-impl ToolContext for SessionContextWrapper<'_> {
+impl ToolContext for SessionContextWrapper {
     fn request_wait(&self) -> Result<(), BoxError> {
         let mut state = self.session_state.lock();
         if self.agent_id != AgentId::Main || !state.wait_enabled {
@@ -4178,6 +4198,7 @@ fn thinking_config_to_level(level: Option<&ThinkingConfig>) -> ThinkingLevel {
 fn cancelled_tool_outcome(tool_name: &str) -> ToolOutcome {
     let body = format!("{tool_name}: cancelled by user");
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(body.clone())],
         details: ToolDetails::Text {
             summary: format!("{tool_name}: cancelled"),
@@ -4311,6 +4332,7 @@ mod event_protocol_tests {
             _input: PingInput,
         ) -> Result<ToolOutcome, crate::BoxError> {
             Ok(ToolOutcome {
+                structured_content: None,
                 content: vec![aj_models::types::UserContent::text("pong".to_string())],
                 details: ToolDetails::Text {
                     summary: "ping".to_string(),
@@ -4353,6 +4375,7 @@ mod event_protocol_tests {
             })
             .await;
             Ok(ToolOutcome {
+                structured_content: None,
                 content: vec![aj_models::types::UserContent::text("done".to_string())],
                 details: ToolDetails::Text {
                     summary: "progress".to_string(),
@@ -4402,6 +4425,7 @@ mod event_protocol_tests {
     fn finalize_tool_use(tool_use_id: &str, tool_name: &str) -> AssistantMessage {
         AssistantMessage {
             content: vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: tool_use_id.to_string(),
                 name: tool_name.to_string(),
                 arguments: serde_json::json!({}),
@@ -4700,6 +4724,7 @@ mod event_protocol_tests {
             AgentMessageKind::Wire(Message::ToolResult(_)) => "ToolResult",
             AgentMessageKind::TaskNotification(_) => "TaskNotification",
             AgentMessageKind::InternalContext(_) => "InternalContext",
+            AgentMessageKind::ToolActivity(_) => "ToolActivity",
         }
     }
 
@@ -5575,6 +5600,7 @@ mod event_protocol_tests {
             Box::pin(async move {
                 let result = ctx.goal(crate::goal::GoalAction::Get).await;
                 Ok(ToolOutcome {
+                    structured_content: None,
                     content: Vec::new(),
                     details: ToolDetails::Text {
                         summary: String::new(),
@@ -5626,6 +5652,7 @@ mod event_protocol_tests {
             Box::pin(async move {
                 ctx.request_wait()?;
                 Ok(ToolOutcome {
+                    structured_content: None,
                     content: Vec::new(),
                     details: ToolDetails::Text {
                         summary: "Wait".into(),
@@ -6511,6 +6538,7 @@ mod event_protocol_tests {
             AgentMessage::wire(Message::User(UserMessage::text("hi"))),
             AgentMessage::wire(Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: "tu-1".to_string(),
                     name: "ping".to_string(),
                     arguments: serde_json::json!({}),
@@ -6560,6 +6588,7 @@ mod event_protocol_tests {
                 input: EchoInput,
             ) -> Result<ToolOutcome, crate::BoxError> {
                 Ok(ToolOutcome {
+                    structured_content: None,
                     content: vec![aj_models::types::UserContent::text(format!(
                         "flag={}",
                         input.flag
@@ -6657,6 +6686,7 @@ mod event_protocol_tests {
             Box::pin(async move {
                 BeforeToolCallOutcome::ShortCircuit {
                     outcome: ToolOutcome {
+                        structured_content: None,
                         content: vec![aj_models::types::UserContent::text("blocked".to_string())],
                         details: ToolDetails::Text {
                             summary: "denied: blocked by policy".to_string(),
@@ -6843,6 +6873,7 @@ mod event_protocol_tests {
             };
             match result {
                 crate::tool::SpawnResult::Completed(spawned) => Ok(ToolOutcome {
+                    structured_content: None,
                     content: vec![aj_models::types::UserContent::text(spawned.report.clone())],
                     details: ToolDetails::Text {
                         summary: format!("sub-agent {}", spawned.agent_id),
@@ -6854,6 +6885,7 @@ mod event_protocol_tests {
                     self.started.lock().unwrap().push((agent_id, task_id));
                     let text = format!("agent {agent_id} started in background (task #{task_id})");
                     Ok(ToolOutcome {
+                        structured_content: None,
                         content: vec![aj_models::types::UserContent::text(text.clone())],
                         details: ToolDetails::Text {
                             summary: text,
@@ -7425,6 +7457,7 @@ mod event_protocol_tests {
                     Some(notification)
                 }
                 crate::message::AgentMessageKind::Wire(_)
+                | crate::message::AgentMessageKind::ToolActivity(_)
                 | crate::message::AgentMessageKind::InternalContext(_) => None,
             })
             .expect("failure notification delivered");
@@ -7707,6 +7740,7 @@ mod event_protocol_tests {
                 body: "Background task #1 finished: sleep 1 — exit code 0".to_string(),
             });
             Ok(ToolOutcome {
+                structured_content: None,
                 content: vec![aj_models::types::UserContent::text("queued".to_string())],
                 details: ToolDetails::Text {
                     summary: "finish_task".to_string(),
@@ -7972,6 +8006,7 @@ mod event_protocol_tests {
         ) -> Result<ToolOutcome, crate::BoxError> {
             self.queues.append_steering(AgentId::Main, "steer now");
             Ok(ToolOutcome {
+                structured_content: None,
                 content: vec![aj_models::types::UserContent::text("ok".to_string())],
                 details: ToolDetails::Text {
                     summary: "steer_tool".to_string(),
@@ -8195,6 +8230,7 @@ mod event_protocol_tests {
                 .iter()
                 .map(|(id, name, args)| {
                     AssistantContent::ToolCall(ToolCall {
+                        is_raw: false,
                         id: id.to_string(),
                         name: name.to_string(),
                         arguments: args.clone(),
@@ -8308,6 +8344,7 @@ mod event_protocol_tests {
                 .push(input.id.clone());
             *self.state.active.lock().unwrap() -= 1;
             Ok(ToolOutcome {
+                structured_content: None,
                 content: vec![aj_models::types::UserContent::text(input.id.clone())],
                 details: ToolDetails::Text {
                     summary: input.id,
@@ -8578,6 +8615,7 @@ mod event_protocol_tests {
             // `Running` task.
             registry.set_status(started.id, TaskStatus::Exited(Some(0)));
             Ok(ToolOutcome {
+                structured_content: None,
                 content: vec![aj_models::types::UserContent::text("started".to_string())],
                 details: ToolDetails::Text {
                     summary: "start_task".to_string(),

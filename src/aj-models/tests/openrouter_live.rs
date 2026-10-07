@@ -95,6 +95,7 @@ async fn responses_tool_call() {
             "What is the weather in Paris? Call the get_weather tool.",
         )],
         tools: vec![ToolDefinition {
+            input_format: None,
             name: "get_weather".into(),
             description: "Get the current weather for a city.".into(),
             parameters: serde_json::json!({

@@ -405,7 +405,7 @@ fn build_request(
     convert_messages(&transformed, &mut input);
 
     let tools: Vec<ResponseTool> = context.tools.iter().map(to_response_tool).collect();
-    let tool_choice = to_response_tool_choice(options.tool_choice.as_ref(), !tools.is_empty());
+    let tool_choice = to_response_tool_choice(options.tool_choice.as_ref(), &context.tools);
 
     let max_output_tokens = options
         .max_tokens
@@ -638,7 +638,18 @@ fn cost_multiplier_from_tier(tier: Option<&OpenAIServiceTier>) -> f64 {
 // Tools
 // ---------------------------------------------------------------------------
 
-fn to_response_tool(tool: &ToolDefinition) -> ResponseTool {
+pub(super) fn to_response_tool(tool: &ToolDefinition) -> ResponseTool {
+    if let Some(crate::types::ToolInputFormat::Grammar { syntax, definition }) = &tool.input_format
+    {
+        return ResponseTool::Custom {
+            name: tool.name.clone(),
+            description: Some(tool.description.clone()),
+            format: openai_sdk::types::responses::CustomToolFormat::Grammar {
+                syntax: syntax.clone(),
+                definition: definition.clone(),
+            },
+        };
+    }
     ResponseTool::Function {
         name: tool.name.clone(),
         description: Some(tool.description.clone()),
@@ -650,16 +661,24 @@ fn to_response_tool(tool: &ToolDefinition) -> ResponseTool {
 
 fn to_response_tool_choice(
     choice: Option<&ToolChoice>,
-    has_tools: bool,
+    tools: &[ToolDefinition],
 ) -> Option<ResponseToolChoice> {
     match choice {
         None => None,
-        _ if !has_tools => None,
+        _ if tools.is_empty() => None,
         Some(ToolChoice::Auto) => Some(ResponseToolChoice::String("auto".to_string())),
         Some(ToolChoice::None) => Some(ResponseToolChoice::String("none".to_string())),
         Some(ToolChoice::Required) => Some(ResponseToolChoice::String("required".to_string())),
         Some(ToolChoice::Tool { name }) => Some(ResponseToolChoice::Function {
-            r#type: "function".to_string(),
+            r#type: if tools
+                .iter()
+                .any(|t| t.name == *name && t.input_format.is_some())
+            {
+                "custom"
+            } else {
+                "function"
+            }
+            .to_string(),
             name: name.clone(),
         }),
     }
@@ -675,11 +694,34 @@ fn to_response_tool_choice(
 /// tool-call id fate) is already applied by [`transform_messages`] before
 /// this runs. Shared by the Responses and Codex providers.
 pub(super) fn convert_messages(messages: &[Message], out: &mut Vec<ResponseInputItem>) {
+    // Results inherit their wire kind from the recorded call, not from the
+    // current declarations, which may change between turns or on resume.
+    let custom_calls: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter_map(|m| {
+            if let Message::Assistant(a) = m {
+                Some(a)
+            } else {
+                None
+            }
+        })
+        .flat_map(|a| a.content.iter())
+        .filter_map(|c| {
+            if let AssistantContent::ToolCall(tc) = c {
+                tc.is_raw.then_some(tc.id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
     for msg in messages {
         match msg {
             Message::User(u) => append_user_message(u, out),
             Message::Assistant(a) => append_assistant_message(a, out),
-            Message::ToolResult(tr) => out.push(convert_tool_result(tr)),
+            Message::ToolResult(tr) => out.push(convert_tool_result(
+                tr,
+                custom_calls.contains(tr.tool_call_id.as_str()),
+            )),
         }
     }
 }
@@ -790,6 +832,20 @@ pub(super) fn append_assistant_message(m: &AssistantMessage, out: &mut Vec<Respo
                 // `transform_messages`, which never emits an empty item half,
                 // so this never serializes an empty-string id.
                 let (call_id, item_id) = split_tool_use_id(&tc.id);
+                if tc.is_raw {
+                    out.push(ResponseInputItem::CustomToolCall {
+                        id: item_id,
+                        call_id,
+                        name: tc.name.clone(),
+                        input: tc
+                            .arguments
+                            .as_str()
+                            .expect("raw tool input must be a string")
+                            .to_owned(),
+                        status: Some(ItemStatus::Completed),
+                    });
+                    continue;
+                }
                 out.push(ResponseInputItem::FunctionCall {
                     id: item_id,
                     call_id,
@@ -828,7 +884,7 @@ fn reasoning_item_from_signature(signature: &str) -> Option<ResponseInputItem> {
     }
 }
 
-pub(super) fn convert_tool_result(t: &ToolResultMessage) -> ResponseInputItem {
+fn convert_tool_result(t: &ToolResultMessage, raw: bool) -> ResponseInputItem {
     let (call_id, _) = split_tool_use_id(&t.tool_call_id);
 
     // Split content into text + image parts; the Responses API supports
@@ -864,6 +920,13 @@ pub(super) fn convert_tool_result(t: &ToolResultMessage) -> ResponseInputItem {
         FunctionCallOutputContent::Array(parts)
     };
 
+    if raw {
+        return ResponseInputItem::CustomToolCallOutput {
+            call_id,
+            output,
+            id: None,
+        };
+    }
     ResponseInputItem::FunctionCallOutput {
         call_id,
         output,
@@ -961,12 +1024,28 @@ pub(super) fn parse_assistant_input_items_with_api(
                         .unwrap_or_else(|_| parse_streaming_json(arguments))
                 };
                 out.content.push(AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: compose_tool_use_id(call_id, id.as_deref()),
                     name: name.clone(),
                     arguments: arguments_json,
                 }));
             }
-            ResponseInputItem::FunctionCallOutput { .. }
+            ResponseInputItem::CustomToolCall {
+                id,
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                out.content.push(AssistantContent::ToolCall(ToolCall {
+                    is_raw: true,
+                    id: compose_tool_use_id(call_id, id.as_deref()),
+                    name: name.clone(),
+                    arguments: Value::String(input.clone()),
+                }));
+            }
+            ResponseInputItem::CustomToolCallOutput { .. }
+            | ResponseInputItem::FunctionCallOutput { .. }
             | ResponseInputItem::ItemReference { .. } => {
                 // Tool results / references are not assistant content;
                 // they live as their own `Message` variants.
@@ -1097,13 +1176,14 @@ enum ItemSlot {
         item_id: String,
         text_blocks: HashMap<u32, usize>,
     },
-    /// Function-call output item. Accumulates arguments bytes until
-    /// either `function_call_arguments.done` or `output_item.done`.
+    /// Tool-call output item. Raw input remains a string in every partial,
+    /// including cancellation. JSON arguments use the streaming JSON parser.
     FunctionCall {
         content_index: usize,
         call_id: String,
         item_id: Option<String>,
         arguments: String,
+        raw: bool,
     },
 }
 
@@ -1263,7 +1343,31 @@ impl StreamState {
                 delta,
                 output_index,
                 ..
+            }
+            | ResponseStreamEvent::CustomToolCallInputDelta {
+                delta,
+                output_index,
+                ..
             } => self.on_function_args_delta(output_index, &delta, &mut out),
+            ResponseStreamEvent::CustomToolCallInputDone {
+                input,
+                output_index,
+                ..
+            } => {
+                if let Some(ItemSlot::FunctionCall {
+                    content_index,
+                    arguments,
+                    ..
+                }) = self.slots.get_mut(&output_index)
+                {
+                    arguments.clone_from(&input);
+                    if let Some(AssistantContent::ToolCall(tc)) =
+                        self.partial.content.get_mut(*content_index)
+                    {
+                        tc.arguments = Value::String(input);
+                    }
+                }
+            }
             ResponseStreamEvent::FunctionCallArgumentsDone { .. } => {
                 // The streaming arguments buffer is replaced with the
                 // canonical `arguments` string on output_item.done; no
@@ -1338,6 +1442,7 @@ impl StreamState {
         output_index: u32,
         out: &mut Vec<AssistantMessageEvent>,
     ) {
+        let raw = matches!(&item, ResponseOutputItem::CustomToolCall { .. });
         match item {
             ResponseOutputItem::Reasoning { id, .. } => {
                 let content_index = self.partial.content.len();
@@ -1378,15 +1483,27 @@ impl StreamState {
                 name,
                 arguments,
                 ..
+            }
+            | ResponseOutputItem::CustomToolCall {
+                id,
+                call_id,
+                name,
+                input: arguments,
+                ..
             } => {
                 let content_index = self.partial.content.len();
                 let composite = compose_tool_use_id(&call_id, id.as_deref());
                 self.partial
                     .content
                     .push(AssistantContent::ToolCall(ToolCall {
+                        is_raw: raw,
                         id: composite,
                         name,
-                        arguments: Value::Object(serde_json::Map::new()),
+                        arguments: if raw {
+                            Value::String(arguments.clone())
+                        } else {
+                            Value::Object(serde_json::Map::new())
+                        },
                     }));
                 self.slots.insert(
                     output_index,
@@ -1395,6 +1512,7 @@ impl StreamState {
                         call_id,
                         item_id: id,
                         arguments,
+                        raw,
                     },
                 );
                 out.push(AssistantMessageEvent::ToolCallStart {
@@ -1412,6 +1530,7 @@ impl StreamState {
         output_index: u32,
         out: &mut Vec<AssistantMessageEvent>,
     ) {
+        let raw = matches!(&item, ResponseOutputItem::CustomToolCall { .. });
         let slot = self.slots.remove(&output_index);
         match (item, slot) {
             (
@@ -1487,13 +1606,22 @@ impl StreamState {
                     name,
                     arguments,
                     ..
+                }
+                | ResponseOutputItem::CustomToolCall {
+                    id,
+                    call_id,
+                    name,
+                    input: arguments,
+                    ..
                 },
                 Some(ItemSlot::FunctionCall { content_index, .. }),
             ) => {
                 // The terminal `arguments` string from the wire wins
                 // over the streaming buffer — it's always the
                 // canonical, complete payload.
-                let parsed: Value = if arguments.is_empty() {
+                let parsed: Value = if raw {
+                    Value::String(arguments)
+                } else if arguments.is_empty() {
                     Value::Object(serde_json::Map::new())
                 } else {
                     serde_json::from_str(&arguments)
@@ -1507,6 +1635,7 @@ impl StreamState {
                     tc.id = composite;
                     tc.name = name;
                     tc.arguments = parsed;
+                    tc.is_raw = raw;
                     snapshot = Some(tc.clone());
                 }
                 if let Some(tool_call) = snapshot {
@@ -1573,13 +1702,18 @@ impl StreamState {
         let Some(ItemSlot::FunctionCall {
             content_index,
             arguments,
+            raw,
             ..
         }) = self.slots.get_mut(&output_index)
         else {
             return;
         };
         arguments.push_str(delta);
-        let parsed = parse_streaming_json(arguments);
+        let parsed = if *raw {
+            Value::String(arguments.clone())
+        } else {
+            parse_streaming_json(arguments)
+        };
         let idx = *content_index;
         if let Some(AssistantContent::ToolCall(tc)) = self.partial.content.get_mut(idx) {
             tc.arguments = parsed;
@@ -2092,6 +2226,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn json_string_function_call_streams_and_resumes_as_function() {
+        crate::provider_test_support::raw_source::verify_json_string(
+            fake_model(false),
+            labeled_options(tokio_util::sync::CancellationToken::new()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn raw_source_tools_stream_resume_and_cancel() {
+        crate::provider_test_support::raw_source::verify(
+            fake_model(false),
+            labeled_options(tokio_util::sync::CancellationToken::new()),
+        )
+        .await;
+    }
+
     fn labeled_options(cancel: CancellationToken) -> StreamOptions {
         let mut options = StreamOptions {
             cancel: Some(cancel),
@@ -2328,6 +2480,7 @@ mod tests {
         // the provider just serializes faithfully.
         let mut m = AssistantMessage::empty();
         m.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "call_x".into(),
             name: "ls".into(),
             arguments: serde_json::json!({}),
@@ -2352,6 +2505,7 @@ mod tests {
         // A composite `{call_id}|{item_id}` keeps its item id on the wire.
         let mut m = AssistantMessage::empty();
         m.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "call_x|fc_y".into(),
             name: "ls".into(),
             arguments: serde_json::json!({}),

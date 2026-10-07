@@ -804,6 +804,7 @@ mod tests {
     fn tool_call(id: &str, name: &str, args: serde_json::Value) -> Message {
         Message::Assistant(AssistantMessage {
             content: vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments: args,
@@ -1091,6 +1092,7 @@ mod tests {
             unreachable!()
         };
         batch.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "c2".into(),
             name: "read_file".into(),
             arguments: json!({"path": "/b"}),

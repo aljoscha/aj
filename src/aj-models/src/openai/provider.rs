@@ -153,6 +153,15 @@ async fn run_stream_inner(
         return Ok(());
     }
 
+    if let Some(tool) = context.tools.iter().find(|t| t.input_format.is_some()) {
+        return Err(AssistantError::new(
+            ErrorCategory::InvalidRequest,
+            format!(
+                "{} does not support raw-source tool declarations ({})",
+                model.api, tool.name
+            ),
+        ));
+    }
     let credential =
         match select_cancel(options.cancel.as_ref(), options.resolve_api_key()).await {
             SelectOutcome::Ready(result) => result,
@@ -491,7 +500,7 @@ fn convert_assistant_message(m: &AssistantMessage) -> Option<ChatCompletionReque
                     id: tc.id.clone(),
                     function: openai_sdk::types::chat_completions::FunctionCall {
                         name: tc.name.clone(),
-                        arguments: tc.arguments.to_string(),
+                        arguments: tc.json_arguments().to_string(),
                     },
                 });
             }
@@ -672,6 +681,7 @@ pub fn parse_assistant_request_item(item: &ChatCompletionRequestMessage) -> Assi
                             .unwrap_or_else(|_| parse_streaming_json(&function.arguments))
                     };
                     out.content.push(AssistantContent::ToolCall(ToolCall {
+                        is_raw: false,
                         id: id.clone(),
                         name: function.name.clone(),
                         arguments,
@@ -1051,6 +1061,7 @@ impl StreamState {
             self.partial
                 .content
                 .push(AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: String::new(),
                     name: String::new(),
                     arguments: Value::Object(serde_json::Map::new()),
@@ -1613,6 +1624,15 @@ mod tests {
                 "tierless compatible endpoints must not receive unsupported parameters"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn raw_source_prior_calls_replay_on_json_fallback() {
+        crate::provider_test_support::raw_source::verify_json_fallback(
+            fake_model(),
+            labeled_options(CancellationToken::new()),
+        )
+        .await;
     }
 
     fn labeled_options(cancel: CancellationToken) -> StreamOptions {

@@ -42,6 +42,7 @@ pub struct UpdateGoalInput {
 
 fn outcome(text: String, is_error: bool) -> ToolOutcome {
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(text.clone())],
         details: ToolDetails::Text {
             summary: "Goal".into(),
@@ -67,6 +68,9 @@ async fn act(future: aj_agent::goal::GoalFuture) -> ToolOutcome {
 
 impl ToolDefinition for CreateGoalTool {
     type Input = CreateGoalInput;
+    fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
+        aj_agent::tool::ExecutionMode::Control
+    }
     fn name(&self) -> &'static str {
         "create_goal"
     }
@@ -97,6 +101,9 @@ impl ToolDefinition for CreateGoalTool {
 
 impl ToolDefinition for GetGoalTool {
     type Input = GetGoalInput;
+    fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
+        aj_agent::tool::ExecutionMode::Control
+    }
     fn name(&self) -> &'static str {
         "get_goal"
     }
@@ -114,6 +121,9 @@ impl ToolDefinition for GetGoalTool {
 
 impl ToolDefinition for UpdateGoalTool {
     type Input = UpdateGoalInput;
+    fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
+        aj_agent::tool::ExecutionMode::Control
+    }
     fn name(&self) -> &'static str {
         "update_goal"
     }

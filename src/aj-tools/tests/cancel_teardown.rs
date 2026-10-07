@@ -85,6 +85,7 @@ fn bash_call(command: &str, background: bool) -> Vec<AssistantMessageEvent> {
     script(
         message(
             vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: "c-1".to_string(),
                 name: "bash".to_string(),
                 arguments: serde_json::json!({

@@ -278,6 +278,36 @@ field, which is what lets a gateway rewrite ids in frame kinds it does
 not understand. Unknown frame kinds, unknown keys, and unknown `event`
 types must be ignored by clients (section 5.10).
 
+`MessageEnd.message` also accepts an audit-only message variant:
+`{role: "tool_activity", cell_id: string, message: Message}`. The `cell_id`
+identifies the execution cell issuing the nested call. The inner message is an
+ordinary assistant message containing a single tool call, or its ordinary
+tool-result message. Call ids match the existing `ToolExecutionStart/End`
+events, which render the activity without creating an assistant turn. These
+entries are durable, non-user-editable, and never enter model context, including
+after resume or compaction. Replay regenerates tool events and retains the
+audit wrapper on `MessageEnd`, without inference usage updates. Print JSONL
+uses the same message shape.
+
+Tool calls may carry `is_raw: true` to identify verbatim source in their string
+`arguments`. Absent or false means JSON arguments, including a JSON string.
+Clients preserve this discriminator when storing or forwarding messages.
+
+Task kinds on `TaskStart` and `caught_up.tasks` include
+`{"code_mode": {"cell_id": "..."}}`, alongside `bash` and `agent`.
+Task notifications accept `kind: "code_mode"` alongside `"bash"` and
+`"agent"`. A Code Mode task represents a yielded JavaScript cell retained
+until its final output is collected or it is stopped. `Running` means the
+cell is **open**, not necessarily computing: completed-but-uncollected cells
+remain open. Its label is `Code Mode cell ID (open until collected)`.
+Clients include these cells in the task picker and footer without treating
+them as sub-agents. The existing task kill endpoint stops open cells, including
+ones awaiting collection. No separate cell endpoint is required.
+For Code Mode, `TaskRead.report` contains append-only observed textual output,
+not a guarantee of completion. The output endpoint reads those observations
+even though a cell has no process spill file. Uncollected output remains in
+the evaluator until `exec` or `wait` observes it.
+
 ### 5.4 Reliability classes
 
 Every frame is in exactly one class:
@@ -769,9 +799,10 @@ side's limitation. Neither side's values fall back to the other's.
   no separate on-disk listing.
 - `GET /v1/sessions/{id}/tasks/{task_id}/output?offset=N`: `TaskOutput` in
   `aj-wire`, `{id, status, offset, total_bytes, bytes}`. Reads the retained
-  task's full interleaved spill output at the required unsigned byte offset.
+  task's full interleaved spill output, or a Code Mode cell's append-only
+  observed textual output, at the required unsigned byte offset.
   `bytes` is a JSON byte array preserving invalid UTF-8 and split code points,
-  capped at `TASK_OUTPUT_CHUNK_BYTES` (65536). `total_bytes` is the file length
+  capped at `TASK_OUTPUT_CHUNK_BYTES` (65536). `total_bytes` is the output length
   captured before reading, and a read never crosses that captured length.
   Advance by `bytes.length` to continue. At that length the result is empty,
   and a running task may append afterward. Status is sampled before the file
@@ -779,6 +810,7 @@ side's limitation. Neither side's values fall back to the other's.
   400 `invalid_request`. Unknown tasks, including cold-session tasks, are
   404 `unknown_task`. Missing or unreadable spill output is 409 `unsupported`
   with a clear explanation, never a tail substituted for full output.
+  Code Mode observations are read from their retained in-memory snapshot.
   File paths come only from the session task registry, not the request.
   Reads use bounded allocation and blocking-pool file I/O. Running and completed
   tasks are readable while retained by the live registry, with no persistent

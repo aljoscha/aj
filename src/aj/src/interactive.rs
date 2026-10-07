@@ -4157,8 +4157,8 @@ async fn apply_picker_outcome(
             if refuse_while_attaching(world, shell, "open task output") {
                 return ActionEffect::Redraw;
             }
-            // The picker only lists bash tasks, so resolve the command
-            // line for the viewer header. A task the model no longer tracks
+            // Resolve the command or cell label for the viewer header.
+            // A task the model no longer tracks
             // has nothing to show.
             let command = world
                 .chat
@@ -4167,6 +4167,7 @@ async fn apply_picker_outcome(
                 .get(&id)
                 .and_then(|task| match &task.kind {
                     aj_agent::tool::TaskKind::Bash { command } => Some(command.clone()),
+                    aj_agent::tool::TaskKind::CodeMode { .. } => Some(task.label.clone()),
                     aj_agent::tool::TaskKind::Agent { .. } => None,
                 });
             match command {
@@ -4218,6 +4219,12 @@ fn open_task_viewer(world: &World, shell: &Rc<RefCell<Shell>>, id: TaskId, comma
         id,
         command,
     );
+    view.borrow_mut().code_mode = world
+        .chat
+        .borrow()
+        .tasks()
+        .get(&id)
+        .is_some_and(|task| matches!(task.kind, aj_agent::tool::TaskKind::CodeMode { .. }));
     view.borrow_mut()
         .read_from(world.control.clone(), world.session().to_string());
     *shell.borrow().task_view.borrow_mut() = Some(view);

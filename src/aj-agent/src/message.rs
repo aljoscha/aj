@@ -97,6 +97,19 @@ impl AgentMessage {
         }
     }
 
+    /// Audit a nested tool call or result without adding it to model context.
+    /// `message` is an assistant message with one tool call, or its tool result.
+    pub fn tool_activity(cell_id: String, message: Message) -> Self {
+        Self {
+            id: format!("{:032x}", rand::random::<u128>()),
+            kind: AgentMessageKind::ToolActivity(ToolActivity {
+                tag: ToolActivityTag::ToolActivity,
+                cell_id,
+                message,
+            }),
+        }
+    }
+
     /// Application steering, distinct from editable user input.
     pub fn internal_context(text: String) -> Self {
         Self::internal_context_with_notice(text, None)
@@ -124,7 +137,9 @@ impl AgentMessage {
     pub fn as_stored_wire(&self) -> Option<&Message> {
         match &self.kind {
             AgentMessageKind::Wire(m) => Some(m),
-            AgentMessageKind::TaskNotification(_) | AgentMessageKind::InternalContext(_) => None,
+            AgentMessageKind::TaskNotification(_)
+            | AgentMessageKind::InternalContext(_)
+            | AgentMessageKind::ToolActivity(_) => None,
         }
     }
 
@@ -132,11 +147,12 @@ impl AgentMessage {
     ///
     /// A stored wire message projects as itself. A task notification
     /// synthesizes a user message with the task-notification framing,
-    /// which is the only text the model ever sees for a notice. `None`
-    /// only for future kinds that never project onto the wire.
+    /// which is the only text the model ever sees for a notice. Tool activity
+    /// is audit-only and returns `None`, including when resumed from disk.
     pub fn to_projected_wire(&self) -> Option<Message> {
         match &self.kind {
             AgentMessageKind::Wire(m) => Some(m.clone()),
+            AgentMessageKind::ToolActivity(_) => None,
             AgentMessageKind::InternalContext(c) => {
                 Some(Message::User(UserMessage::text(c.text.clone())))
             }
@@ -152,6 +168,24 @@ impl AgentMessage {
             }
         }
     }
+}
+
+/// A nested tool's audit entry. The contained message is for display and replay,
+/// never model input or editable user text.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolActivity {
+    #[serde(rename = "role")]
+    tag: ToolActivityTag,
+    /// The execution cell that issued this nested call.
+    pub cell_id: String,
+    /// An assistant message with one tool call, or its tool result.
+    pub message: Message,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum ToolActivityTag {
+    #[serde(rename = "tool_activity")]
+    ToolActivity,
 }
 
 /// A background task's completion notice, stored as typed transcript
@@ -214,6 +248,7 @@ enum NotificationTag {
 pub enum TaskNotificationKind {
     Bash,
     Agent,
+    CodeMode,
 }
 
 /// Terminal outcome of a completed background task.
@@ -245,6 +280,8 @@ pub enum TaskOutcome {
 ///   / `tool_result`.
 /// - [`AgentMessageKind::TaskNotification`] carries
 ///   `role:"task_notification"`, a value no wire message uses.
+/// - [`AgentMessageKind::ToolActivity`] carries `role:"tool_activity"`,
+///   with its display-only wire message nested under `message`.
 ///
 /// `Wire` must stay first: `Message` is `#[serde(tag = "role")]`, so a
 /// `role:"task_notification"` line fails to parse as `Wire` (unknown
@@ -268,6 +305,8 @@ pub enum AgentMessageKind {
     TaskNotification(TaskNotification),
     /// Host-provided steering, not user-authored text.
     InternalContext(InternalContext),
+    /// Nested tool audit data, excluded from model context.
+    ToolActivity(ToolActivity),
 }
 
 impl From<Message> for AgentMessage {

@@ -89,6 +89,46 @@ pub struct ReadFileInput {
     limit: Option<usize>,
 }
 
+/// Unnumbered, newline-normalized text. No display annotations are included.
+#[derive(Serialize, JsonSchema)]
+struct TextReadResult {
+    text: String,
+    /// One-based requested start, with zero normalized to one.
+    offset: usize,
+    lines_read: usize,
+    total_lines: usize,
+    /// True when a tool budget prevented returning the requested slice.
+    truncated: bool,
+    /// Next unread line, including after an explicit user limit.
+    /// Null at EOF or when an oversized line prevents line-based progress.
+    next_offset: Option<usize>,
+    /// The first requested line exceeds the byte budget. Use bounded bash reads.
+    first_line_exceeds_limit: bool,
+}
+
+// Images use CodeMode's generic content fallback, including omission notices.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum ReadFileResult {
+    Text(TextReadResult),
+    Image { content: Vec<ReadContent> },
+}
+
+#[derive(JsonSchema)]
+#[serde(tag = "type", rename_all = "lowercase")]
+#[allow(dead_code)]
+enum ReadContent {
+    Text {
+        text: String,
+    },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+}
+
 impl ToolDefinition for ReadFileTool {
     type Input = ReadFileInput;
 
@@ -98,6 +138,10 @@ impl ToolDefinition for ReadFileTool {
 
     fn description(&self) -> &'static str {
         DESCRIPTION
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(schemars::schema_for!(ReadFileResult).to_value())
     }
 
     async fn execute(
@@ -127,6 +171,8 @@ impl ToolDefinition for ReadFileTool {
             .await);
         }
 
+        let start_idx = input.offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
+        let user_limited = input.limit.is_some();
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) => {
@@ -136,24 +182,30 @@ impl ToolDefinition for ReadFileTool {
                 ));
             }
         };
-
         let lines: Vec<&str> = content.lines().collect();
         let total_file_lines = lines.len();
-
-        // The model's `offset`/`limit` describe a slice over `lines`.
-        // We apply both before truncation so a small explicit limit
-        // wins over our auto-cap.
-        let start_idx = input.offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
-        let user_limited = input.limit.is_some();
-        let user_end_idx = match input.limit {
-            Some(limit) => (start_idx + limit).min(lines.len()),
-            None => lines.len(),
+        let end_idx = input.limit.map_or(total_file_lines, |limit| {
+            start_idx.saturating_add(limit).min(total_file_lines)
+        });
+        let result = |text: String, lines_read: usize, truncated: bool, oversized: bool| {
+            serde_json::to_value(TextReadResult {
+                text,
+                offset: start_idx + 1,
+                lines_read,
+                total_lines: total_file_lines,
+                truncated,
+                next_offset: (!oversized
+                    && start_idx.saturating_add(lines_read) < total_file_lines)
+                    .then(|| start_idx + lines_read + 1),
+                first_line_exceeds_limit: oversized,
+            })
         };
 
         // Out-of-range offset: empty body, no line-range suffix, no
         // footer.
-        if start_idx >= lines.len() {
+        if start_idx >= total_file_lines {
             return Ok(ToolOutcome {
+                structured_content: Some(result(String::new(), 0, false, false)?),
                 content: vec![UserContent::text(String::new())],
                 details: ToolDetails::Text {
                     summary: display_path_bare,
@@ -163,7 +215,7 @@ impl ToolDefinition for ReadFileTool {
             });
         }
 
-        let slice = &lines[start_idx..user_end_idx];
+        let slice = &lines[start_idx..end_idx];
         let raw: String = slice.join("\n");
         let trunc = truncate_head(&raw, READ_MAX_LINES, READ_MAX_BYTES);
 
@@ -172,7 +224,7 @@ impl ToolDefinition for ReadFileTool {
         // partial line; point the model at a bash escape so it can
         // pull the bytes it needs with explicit framing.
         if trunc.first_line_exceeds_limit {
-            let line_size = slice.first().map(|l| l.len()).unwrap_or(0);
+            let line_size = slice.first().map(|line| line.len()).unwrap_or(0);
             let start_line_display = start_idx + 1;
             let quoted_path = shell_quote_path(&path);
             let escape = format!(
@@ -183,6 +235,7 @@ impl ToolDefinition for ReadFileTool {
                 READ_MAX_BYTES,
             );
             return Ok(ToolOutcome {
+                structured_content: Some(result(String::new(), 0, true, true)?),
                 content: vec![UserContent::text(escape.clone())],
                 details: ToolDetails::Text {
                     summary: display_path_bare,
@@ -247,6 +300,30 @@ impl ToolDefinition for ReadFileTool {
         }
 
         Ok(ToolOutcome {
+            structured_content: Some({
+                // Count source lines directly: joining a final blank line makes
+                // it look like a terminator to the display truncator.
+                let mut bytes = 0;
+                let count = slice
+                    .iter()
+                    .take(READ_MAX_LINES)
+                    .enumerate()
+                    .take_while(|(i, line)| {
+                        bytes += line.len() + usize::from(*i != 0);
+                        bytes <= READ_MAX_BYTES
+                    })
+                    .count();
+                let machine_lines = &slice[..count];
+                let requested = total_file_lines
+                    .saturating_sub(start_idx)
+                    .min(input.limit.unwrap_or(usize::MAX));
+                result(
+                    machine_lines.join("\n"),
+                    machine_lines.len(),
+                    count < requested,
+                    false,
+                )?
+            }),
             content: vec![UserContent::text(body)],
             details: ToolDetails::Text {
                 summary: display_path,
@@ -273,6 +350,7 @@ fn shell_quote_path(path: &Path) -> String {
 /// CLI's error rendering via the bridge.
 fn error_outcome(path: &str, error: String) -> ToolOutcome {
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(error.clone())],
         details: ToolDetails::Text {
             summary: PathBuf::from(path).display().to_string(),
@@ -392,6 +470,7 @@ fn image_attachment_outcome(display_path: String, resized: ResizedImage) -> Tool
     let original_dimensions = (resized.original_width, resized.original_height);
     let displayed_dimensions = (resized.width, resized.height);
     ToolOutcome {
+        structured_content: None,
         content: vec![
             UserContent::text(annotation),
             UserContent::image(resized.data, resized.mime_type),
@@ -414,6 +493,7 @@ fn image_omitted_outcome(display_path: String, source_mime: &str) -> ToolOutcome
         "Read image file [{source_mime}]\n[Image omitted: could not be resized below the inline image size limit.]"
     );
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(body.clone())],
         details: ToolDetails::Text {
             summary: display_path,
@@ -441,6 +521,186 @@ mod tests {
 
     use super::*;
     use crate::testing::DummyToolContext;
+
+    #[tokio::test]
+    async fn structured_text_is_parseable_and_continuation_is_honest() {
+        let file = NamedTempFile::new().unwrap();
+        let mut ctx = DummyToolContext::default();
+        for (source, offset, limit, text, count, next, truncated, oversized) in [
+            (
+                "{\n  \"answer\": 42\n}".to_string(),
+                None,
+                None,
+                "{\n  \"answer\": 42\n}".to_string(),
+                3,
+                None,
+                false,
+                false,
+            ),
+            (
+                String::new(),
+                None,
+                None,
+                String::new(),
+                0,
+                None,
+                false,
+                false,
+            ),
+            (
+                "a\nb\nc".into(),
+                Some(2),
+                Some(1),
+                "b".into(),
+                1,
+                Some(3),
+                false,
+                false,
+            ),
+            (
+                "a".into(),
+                None,
+                Some(0),
+                String::new(),
+                0,
+                Some(1),
+                false,
+                false,
+            ),
+            (
+                "a".into(),
+                Some(usize::MAX),
+                Some(usize::MAX),
+                String::new(),
+                0,
+                None,
+                false,
+                false,
+            ),
+            (
+                "\n".into(),
+                None,
+                None,
+                String::new(),
+                1,
+                None,
+                false,
+                false,
+            ),
+            (
+                "x".repeat(READ_MAX_BYTES + 100),
+                None,
+                None,
+                String::new(),
+                0,
+                None,
+                true,
+                true,
+            ),
+            (
+                "a\n".repeat(READ_MAX_LINES + 3),
+                None,
+                None,
+                vec!["a"; READ_MAX_LINES].join("\n"),
+                READ_MAX_LINES,
+                Some(READ_MAX_LINES + 1),
+                true,
+                false,
+            ),
+            (
+                "\n".repeat(READ_MAX_LINES + 1),
+                None,
+                None,
+                "\n".repeat(READ_MAX_LINES - 1),
+                READ_MAX_LINES,
+                Some(READ_MAX_LINES + 1),
+                true,
+                false,
+            ),
+            (
+                format!("ok\n{}", "x".repeat(READ_MAX_BYTES)),
+                None,
+                None,
+                "ok".into(),
+                1,
+                Some(2),
+                true,
+                false,
+            ),
+            (
+                "é\r\nlast\r".into(),
+                None,
+                None,
+                "é\nlast\r".into(),
+                2,
+                None,
+                false,
+                false,
+            ),
+        ] {
+            fs::write(file.path(), &source).unwrap();
+            let outcome = ReadFileTool::new()
+                .execute(
+                    &mut ctx,
+                    ReadFileInput {
+                        path: file.path().display().to_string(),
+                        offset,
+                        limit,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!outcome.is_error);
+            let value = outcome.structured_content.unwrap();
+            assert_eq!(value["text"], text);
+            assert_eq!(value["lines_read"], count);
+            assert_eq!(value["total_lines"], source.lines().count());
+            assert_eq!(value["next_offset"], serde_json::json!(next));
+            assert_eq!(value["truncated"], truncated);
+            assert_eq!(value["first_line_exceeds_limit"], oversized);
+            if source.starts_with('{') {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(value["text"].as_str().unwrap())
+                        .unwrap()["answer"],
+                    42
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn utf8_validation_crosses_chunks_and_checks_beyond_retained_output() {
+        let file = NamedTempFile::new().unwrap();
+        let mut bytes = format!("{}é\n", "a".repeat(8191)).into_bytes();
+        bytes.extend_from_slice("x\n".repeat(READ_MAX_LINES).as_bytes());
+        fs::write(file.path(), &bytes).unwrap();
+        let mut ctx = DummyToolContext::default();
+        let input = ReadFileInput {
+            path: file.path().display().to_string(),
+            offset: None,
+            limit: None,
+        };
+        let outcome = ReadFileTool::new()
+            .execute(&mut ctx, input.clone())
+            .await
+            .unwrap();
+        assert!(!outcome.is_error);
+        assert!(
+            outcome.structured_content.unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains('é')
+        );
+        bytes.push(0xff);
+        fs::write(file.path(), bytes).unwrap();
+        assert!(
+            ReadFileTool::new()
+                .execute(&mut ctx, input)
+                .await
+                .unwrap()
+                .is_error
+        );
+    }
 
     fn extract_text(content: &[UserContent]) -> String {
         content
@@ -965,6 +1225,10 @@ mod tests {
             ),
             other => panic!("expected text annotation first, got {other:?}"),
         }
+        assert!(
+            outcome.structured_content.is_none(),
+            "images use generic content"
+        );
         let image_mime = match &outcome.content[1] {
             UserContent::Image(img) => {
                 assert!(!img.data.is_empty(), "image data must be non-empty");

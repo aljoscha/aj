@@ -1851,6 +1851,7 @@ mod tests {
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: "tu-1".into(),
                     name: "ping".into(),
                     arguments: serde_json::json!({}),

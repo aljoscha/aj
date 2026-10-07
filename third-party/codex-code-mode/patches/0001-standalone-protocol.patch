@@ -1,0 +1,305 @@
+--- a/code-mode-protocol/Cargo.toml
++++ b/code-mode-protocol/Cargo.toml
+@@ -1,3 +1,4 @@
++# Modified for the standalone AJ extraction: decouple protocol dependencies.
+ [package]
+ edition.workspace = true
+ license.workspace = true
+@@ -12,20 +13,23 @@
+ [lints]
+ workspace = true
+ 
++[features]
++default = []
++grpc = ["dep:prost", "dep:tonic", "dep:tonic-prost", "dep:glob", "dep:protoc-bin-vendored", "dep:tonic-prost-build"]
++
+ [dependencies]
+-codex-protocol = { workspace = true }
+-prost = "0.14.3"
++prost = { version = "0.14.3", optional = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
+ tokio = { workspace = true, features = ["io-util", "sync"] }
+ tokio-util = { workspace = true, features = ["rt"] }
+-tonic = { workspace = true }
+-tonic-prost = { workspace = true }
++tonic = { workspace = true, optional = true }
++tonic-prost = { workspace = true, optional = true }
+ 
+ [build-dependencies]
+-glob = { workspace = true }
+-protoc-bin-vendored = "3.2.0"
+-tonic-prost-build = { version = "=0.14.3", default-features = false, features = ["transport"] }
++glob = { workspace = true, optional = true }
++protoc-bin-vendored = { version = "3.2.0", optional = true }
++tonic-prost-build = { version = "=0.14.3", default-features = false, features = ["transport"], optional = true }
+ 
+ # Cargo-shear cannot inspect the prost and tonic-prost references in generated gRPC bindings.
+ [package.metadata.cargo-shear]
+--- a/code-mode-protocol/build.rs
++++ b/code-mode-protocol/build.rs
+@@ -1,5 +1,8 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
++#[cfg(feature = "grpc")]
+ use std::path::PathBuf;
+ 
++#[cfg(feature = "grpc")]
+ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     println!("cargo:rustc-check-cfg=cfg(codex_bazel)");
+     println!("cargo:rerun-if-changed=src/grpc");
+@@ -15,3 +18,8 @@
+ 
+     Ok(())
+ }
++
++#[cfg(not(feature = "grpc"))]
++fn main() {
++    println!("cargo:rustc-check-cfg=cfg(codex_bazel)");
++}
+--- a/code-mode-protocol/src/audio_limits.rs
++++ b/code-mode-protocol/src/audio_limits.rs
+@@ -1,5 +1,5 @@
++// Modified for the standalone AJ extraction: retain only the shared audio limit.
+ /// Maximum accepted decoded byte length for prompt audio inputs.
+ ///
+ /// This matches the Responses API audio input limit.
+ pub const MAX_PROMPT_AUDIO_INPUT_BYTES: usize = 50 * 1024 * 1024;
+-
+--- a/code-mode-protocol/src/description.rs
++++ b/code-mode-protocol/src/description.rs
+@@ -1,8 +1,9 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ //! Composes Code Mode descriptions, retaining runtime-owned tool declarations.
+ //! Exec templates substitute only the documented literal placeholders.
+ 
+-use codex_protocol::ToolName;
+-use codex_protocol::openai_models::CodeModeToolMessages;
++use crate::CodeModeToolMessages;
++use crate::ToolName;
+ use serde::Deserialize;
+ use serde::Serialize;
+ use serde_json::Value as JsonValue;
+@@ -556,7 +557,7 @@
+     use super::build_exec_tool_description;
+     use super::normalize_code_mode_identifier;
+     use super::parse_exec_source;
+-    use codex_protocol::ToolName;
++    use crate::ToolName;
+     use pretty_assertions::assert_eq;
+     use serde_json::Value as JsonValue;
+     use serde_json::json;
+--- a/code-mode-protocol/src/description_override_tests.rs
++++ b/code-mode-protocol/src/description_override_tests.rs
+@@ -1,3 +1,4 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ //! Tests catalog exec template rendering and runtime description composition.
+ 
+ use super::CodeModeToolKind;
+@@ -10,9 +11,9 @@
+ use super::ToolDefinition;
+ use super::UNIFIED_IMAGE_HELPER_DESCRIPTION;
+ use super::build_exec_tool_description;
+-use codex_protocol::ToolName;
+-use codex_protocol::openai_models::CodeModeToolMessages;
+-use codex_protocol::openai_models::ToolMessage;
++use crate::CodeModeToolMessages;
++use crate::ToolMessage;
++use crate::ToolName;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
+ use std::collections::BTreeMap;
+--- a/code-mode-protocol/src/host/payload.rs
++++ b/code-mode-protocol/src/host/payload.rs
+@@ -1,7 +1,8 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ use std::num::TryFromIntError;
+ use std::time::Duration;
+ 
+-use codex_protocol::ToolName;
++use crate::ToolName;
+ use serde::Deserialize;
+ use serde::Serialize;
+ use serde_json::Value as JsonValue;
+--- a/code-mode-protocol/src/lib.rs
++++ b/code-mode-protocol/src/lib.rs
+@@ -1,4 +1,6 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ mod description;
++#[cfg(feature = "grpc")]
+ pub mod grpc;
+ pub mod host;
+ mod json_schema_types;
+@@ -53,3 +55,10 @@
+ 
+ pub const PUBLIC_TOOL_NAME: &str = "exec";
+ pub const WAIT_TOOL_NAME: &str = "wait";
++
++mod audio_limits;
++mod model_messages;
++mod tool_name;
++pub use audio_limits::MAX_PROMPT_AUDIO_INPUT_BYTES;
++pub use model_messages::{CodeModeToolMessages, ToolMessage};
++pub use tool_name::{DEFAULT_FUNCTION_NAMESPACE, ToolName};
+--- a/code-mode-protocol/src/model_messages.rs
++++ b/code-mode-protocol/src/model_messages.rs
+@@ -1,7 +1,8 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ use serde::{Deserialize, Serialize};
+ 
+ /// Model-owned messages for a built-in tool.
+-#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
++#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+ pub struct ToolMessage {
+     /// Missing or null uses the built-in description; an empty string suppresses its static
+     /// text without disabling the tool. Tool-owned runtime guidance is retained.
+@@ -19,7 +20,7 @@
+ }
+ 
+ /// Model-owned instructions for Code Mode's exec and wait tools.
+-#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
++#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+ pub struct CodeModeToolMessages {
+     /// Instructional template supporting `{{ default_exec_yield_time_ms }}` and `{{ image_helper }}`.
+     /// Runtime tool declarations are appended. Unknown placeholders remain literal.
+@@ -39,4 +40,3 @@
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub mcp_typescript_preamble: Option<String>,
+ }
+-
+--- a/code-mode-protocol/src/runtime.rs
++++ b/code-mode-protocol/src/runtime.rs
+@@ -1,8 +1,9 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ use std::error::Error;
+ use std::fmt;
+ use std::time::Duration;
+ 
+-use codex_protocol::ToolName;
++use crate::ToolName;
+ use serde::Deserialize;
+ use serde::Serialize;
+ use serde_json::Value as JsonValue;
+--- a/code-mode-runtime/Cargo.toml
++++ b/code-mode-runtime/Cargo.toml
+@@ -1,3 +1,4 @@
++# Modified for the standalone AJ extraction: decouple protocol dependencies.
+ [package]
+ edition.workspace = true
+ license.workspace = true
+@@ -15,7 +16,6 @@
+ [dependencies]
+ base64 = { workspace = true }
+ codex-code-mode-protocol = { workspace = true }
+-codex-protocol = { workspace = true }
+ deno_core_icudata = { workspace = true }
+ futures = { workspace = true }
+ opentelemetry = { workspace = true }
+--- a/code-mode-runtime/src/cell_actor/conversions.rs
++++ b/code-mode-runtime/src/cell_actor/conversions.rs
+@@ -1,9 +1,10 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ use codex_code_mode_protocol::CodeModeToolKind;
+ use codex_code_mode_protocol::ExecuteRequest;
+ use codex_code_mode_protocol::FunctionCallOutputContentItem;
+ use codex_code_mode_protocol::ImageDetail;
+ use codex_code_mode_protocol::ToolDefinition;
+-use codex_protocol::ToolName;
++use codex_code_mode_protocol::ToolName;
+ 
+ use crate::session_runtime::CreateCellRequest as CellRequest;
+ use crate::session_runtime::ImageDetail as CellImageDetail;
+--- a/code-mode-runtime/src/cell_actor/tests.rs
++++ b/code-mode-runtime/src/cell_actor/tests.rs
+@@ -1,3 +1,4 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicBool;
+@@ -428,7 +429,7 @@
+         .event_tx
+         .send(RuntimeEvent::ToolCall {
+             id: "tool-1".to_string(),
+-            name: codex_protocol::ToolName {
++            name: codex_code_mode_protocol::ToolName {
+                 name: "echo".to_string(),
+                 namespace: None,
+             },
+--- a/code-mode-runtime/src/runtime/audio.rs
++++ b/code-mode-runtime/src/runtime/audio.rs
+@@ -1,9 +1,10 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ //! Measures tool-generated PCM WAV clips using the audio bytes actually present.
+ //! Unknown formats retain the existing audio output behavior.
+ 
+ use base64::Engine;
+ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+-use codex_protocol::models::MAX_PROMPT_AUDIO_INPUT_BYTES;
++use codex_code_mode_protocol::MAX_PROMPT_AUDIO_INPUT_BYTES;
+ 
+ pub(super) fn wav_duration_seconds(audio_url: &str) -> Option<f64> {
+     let (metadata, payload) = audio_url.split_once(',')?;
+--- a/code-mode-runtime/src/runtime/mod.rs
++++ b/code-mode-runtime/src/runtime/mod.rs
+@@ -1,3 +1,4 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ mod audio;
+ mod callbacks;
+ mod globals;
+@@ -16,8 +17,8 @@
+ use codex_code_mode_protocol::EnabledToolMetadata;
+ use codex_code_mode_protocol::ExecuteRequest;
+ use codex_code_mode_protocol::FunctionCallOutputContentItem;
++use codex_code_mode_protocol::ToolName;
+ use codex_code_mode_protocol::enabled_tool_metadata;
+-use codex_protocol::ToolName;
+ use serde_json::Value as JsonValue;
+ use tokio::sync::mpsc;
+ 
+--- a/code-mode-runtime/src/service.rs
++++ b/code-mode-runtime/src/service.rs
+@@ -1,3 +1,4 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+@@ -274,7 +275,7 @@
+                 CodeModeNestedToolCall {
+                     cell_id: protocol_cell_id(&invocation.cell_id),
+                     runtime_tool_call_id: invocation.runtime_tool_call_id,
+-                    tool_name: codex_protocol::ToolName {
++                    tool_name: codex_code_mode_protocol::ToolName {
+                         name: invocation.tool_name.name,
+                         namespace: invocation.tool_name.namespace,
+                     },
+--- a/code-mode-runtime/src/service_contract_tests.rs
++++ b/code-mode-runtime/src/service_contract_tests.rs
+@@ -1,3 +1,4 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ use codex_code_mode_protocol::NoopCodeModeSessionDelegate;
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicBool;
+@@ -6,7 +7,7 @@
+ 
+ use codex_code_mode_protocol::NotificationFuture;
+ use codex_code_mode_protocol::ToolInvocationFuture;
+-use codex_protocol::ToolName;
++use codex_code_mode_protocol::ToolName;
+ use pretty_assertions::assert_eq;
+ use tokio::sync::Notify;
+ use tokio::sync::mpsc;
+--- a/code-mode-runtime/src/service_tests.rs
++++ b/code-mode-runtime/src/service_tests.rs
+@@ -1,3 +1,4 @@
++// Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+ use codex_code_mode_protocol::NoopCodeModeSessionDelegate;
+ use std::sync::Arc;
+ use std::time::Duration;
+@@ -20,7 +21,7 @@
+ use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
+ use codex_code_mode_protocol::NotificationFuture;
+ use codex_code_mode_protocol::ToolInvocationFuture;
+-use codex_protocol::ToolName;
++use codex_code_mode_protocol::ToolName;
+ use pretty_assertions::assert_eq;
+ use serde_json::Value as JsonValue;
+ use tokio::sync::Notify;

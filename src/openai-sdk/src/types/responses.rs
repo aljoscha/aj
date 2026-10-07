@@ -174,6 +174,18 @@ impl From<&str> for ResponseInstructions {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ResponseInputItem {
+    /// A custom tool call whose input is raw source, not JSON.
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        input: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<ItemStatus>,
+    },
+
     /// A simple message with role and content.
     #[serde(rename = "message")]
     Message {
@@ -202,6 +214,14 @@ pub enum ResponseInputItem {
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<ItemStatus>,
+    },
+
+    #[serde(rename = "custom_tool_call_output")]
+    CustomToolCallOutput {
+        call_id: String,
+        output: FunctionCallOutputContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
 
     /// The output of a function tool call.
@@ -399,6 +419,18 @@ impl Response {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ResponseOutputItem {
+    /// A custom tool call whose input is raw source, not JSON.
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        input: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<ItemStatus>,
+    },
+
     /// A text/refusal message from the assistant.
     #[serde(rename = "message")]
     Message {
@@ -546,6 +578,13 @@ pub struct ReasoningContent {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum ResponseTool {
+    #[serde(rename = "custom")]
+    Custom {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        format: CustomToolFormat,
+    },
     /// A function tool the model may call.
     #[serde(rename = "function")]
     Function {
@@ -614,6 +653,13 @@ pub struct WebSearchUserLocation {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+}
+
+/// Format constraint for a raw-source custom tool.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CustomToolFormat {
+    Grammar { syntax: String, definition: String },
 }
 
 // Tool choice
@@ -918,6 +964,21 @@ pub enum ResponseStreamEvent {
         item_id: String,
         output_index: u32,
         content_index: u32,
+        sequence_number: u64,
+    },
+
+    #[serde(rename = "response.custom_tool_call_input.delta")]
+    CustomToolCallInputDelta {
+        delta: String,
+        item_id: String,
+        output_index: u32,
+        sequence_number: u64,
+    },
+    #[serde(rename = "response.custom_tool_call_input.done")]
+    CustomToolCallInputDone {
+        input: String,
+        item_id: String,
+        output_index: u32,
         sequence_number: u64,
     },
 

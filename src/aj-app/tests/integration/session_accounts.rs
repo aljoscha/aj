@@ -82,6 +82,7 @@ impl Provider for CredentialProvider {
                     message.account = resolved.account;
                     if delegate {
                         message.content.push(AssistantContent::ToolCall(ToolCall {
+                            is_raw: false,
                             id: "delegate-account-check".into(),
                             name: "agent".into(),
                             arguments: serde_json::json!({"task": "report your credential"}),

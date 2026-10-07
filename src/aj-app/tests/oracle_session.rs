@@ -70,6 +70,7 @@ impl Provider for AdvisorFixture {
         let mut message = finalized_text_message("oracle evidence received");
         if !child && matches!(context.messages.last(), Some(Message::User(_))) {
             message.content.push(AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: "consult-session-oracle".into(),
                 name: "oracle".into(),
                 arguments: json!({"task": "Inspect the session invariant"}),

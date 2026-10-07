@@ -670,6 +670,7 @@ fn prompt(text: &str) -> Command {
 fn calling(text: &str, call_id: &str, tool: &str, args: serde_json::Value) -> AssistantMessage {
     let mut message = finalized_text_message(text);
     message.content.push(AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: call_id.to_string(),
         name: tool.to_string(),
         arguments: args,
@@ -2400,6 +2401,7 @@ async fn a_large_attach_block_is_not_preloaded_before_attach_returns() {
     calling.stop_reason = StopReason::ToolUse;
     for n in 0..20 {
         calling.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: format!("call-{n}"),
             name: "todo_read".into(),
             arguments: serde_json::json!({}),

@@ -15,8 +15,13 @@ Build and install from source with `cargo`:
 ```bash
 git clone git@github.com:aljoscha/aj.git
 cd aj
+python3 scripts/bootstrap-codex-code-mode-v8.py
 cargo install --path src/aj
 ```
+
+The experimental Code Mode build requires Python 3.11+, curl, and a native
+Linux GNU or macOS toolchain. The bootstrap verifies pinned V8 downloads.
+See [Code Mode](docs/code-mode.md) for configuration and build details.
 
 ## Authentication
 

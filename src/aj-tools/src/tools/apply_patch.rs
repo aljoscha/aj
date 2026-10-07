@@ -132,6 +132,7 @@ impl ToolDefinition for ApplyPatchTool {
         }
         let body = render_result(&warnings, &completed);
         Ok(ToolOutcome {
+            structured_content: None,
             content: vec![UserContent::text(body.clone())],
             details: ToolDetails::Text {
                 summary: "Applied patch".into(),
@@ -879,6 +880,7 @@ fn error_outcome(error: String, warnings: &[String], completed: &[Applied]) -> T
         )
     };
     ToolOutcome {
+        structured_content: None,
         content: vec![UserContent::text(body.clone())],
         details: ToolDetails::Text {
             summary: "Patch failed".into(),

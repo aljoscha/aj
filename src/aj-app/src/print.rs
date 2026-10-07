@@ -806,6 +806,7 @@ mod tests {
         let mut call = finalized_text_message_with_usage("", window);
         call.stop_reason = StopReason::ToolUse;
         call.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "read".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": evidence}),
@@ -871,6 +872,7 @@ mod tests {
         call.content
             .push(aj_models::types::AssistantContent::ToolCall(
                 aj_models::types::ToolCall {
+                    is_raw: false,
                     id: call_id.to_string(),
                     name: "bash".to_string(),
                     arguments: serde_json::json!({
@@ -1463,6 +1465,39 @@ mod tests {
             out[live..].contains(DEMO_REPLY_FRAGMENT),
             "the live assistant turn produced text after its prompt:\n{out}"
         );
+    }
+
+    #[tokio::test]
+    async fn json_listener_preserves_tool_activity_wrapper() {
+        use aj_agent::events::AgentId;
+        use aj_agent::message::{AgentMessage, AgentMessageKind};
+        use aj_models::types::{Message, ToolResultMessage};
+
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let listener = json_event_listener(Arc::clone(&sink));
+        let event = AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: AgentMessage::tool_activity(
+                "cell".into(),
+                Message::ToolResult(ToolResultMessage::text(
+                    "nested",
+                    "read_file",
+                    "audit",
+                    false,
+                )),
+            ),
+        };
+        listener(&event).await.unwrap();
+        let bytes = sink.lock().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["message"]["role"], "tool_activity");
+        assert_eq!(json["message"]["cell_id"], "cell");
+        assert_eq!(json["message"]["message"]["role"], "tool_result");
+        let AgentEvent::MessageEnd { message, .. } = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("message end");
+        };
+        assert!(matches!(message.kind, AgentMessageKind::ToolActivity(_)));
+        assert!(message.to_projected_wire().is_none());
     }
 
     /// The JSONL listener drops `ToolExecutionUpdate` (a high-frequency

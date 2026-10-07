@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/codex-code-mode"]
 members = [
     "src/aj",
     "src/aj-agent",

@@ -490,6 +490,7 @@ mod tests {
         let mut read = finalized_text_message("");
         read.stop_reason = StopReason::ToolUse;
         read.content = vec![AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "read".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": path}),
@@ -705,6 +706,7 @@ mod tests {
             let mut message = finalized_text_message("");
             message.stop_reason = StopReason::ToolUse;
             message.content = vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: id.to_string(),
                 name: "read_file".to_string(),
                 arguments: serde_json::json!({"path": path}),
@@ -913,6 +915,7 @@ mod tests {
 
     fn tool_call() -> AssistantContent {
         AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "1".into(),
             name: "bash".into(),
             arguments: serde_json::Value::Null,
