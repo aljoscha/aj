@@ -163,6 +163,7 @@ fn canonical_tool_call() -> AssistantMessage {
             text_signature: None,
         }),
         AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "call_abc".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/tmp/x"}),

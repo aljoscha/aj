@@ -154,7 +154,8 @@ pub fn reduce(
                 AgentMessageKind::Wire(Message::User(_) | Message::Assistant(_))
                 | AgentMessageKind::TaskNotification(_)
                 | AgentMessageKind::InternalContext(_) => durable_id(message.id()),
-                AgentMessageKind::Wire(Message::ToolResult(_)) => None,
+                AgentMessageKind::Wire(Message::ToolResult(_))
+                | AgentMessageKind::ToolActivity(_) => None,
             };
             match message.kind {
                 AgentMessageKind::InternalContext(context) => {
@@ -180,11 +181,11 @@ pub fn reduce(
                 AgentMessageKind::Wire(Message::Assistant(assistant)) => {
                     reduce_assistant_end(state, agent_id, assistant, message_id)
                 }
-                AgentMessageKind::Wire(Message::ToolResult(_)) => {
-                    // Tool results render through the dedicated
-                    // `ToolExecutionEnd` event (which carries the
-                    // structured `ToolDetails`). The unified
-                    // `MessageEnd { ToolResult }` is structural framing.
+                AgentMessageKind::Wire(Message::ToolResult(_))
+                | AgentMessageKind::ToolActivity(_) => {
+                    // Tool results and nested audit calls render through
+                    // ToolExecutionStart/End, live and on replay. An audit
+                    // MessageEnd must not create or finalize an assistant row.
                     Redraw(false)
                 }
                 AgentMessageKind::TaskNotification(notification) => {
@@ -1486,6 +1487,7 @@ mod tests {
             agent_id: AgentId::Sub(n),
             message: AgentMessage::wire(Message::Assistant(partial_with(vec![
                 AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: call_id.into(),
                     name: tool.into(),
                     arguments: serde_json::json!({}),
@@ -1663,6 +1665,7 @@ mod tests {
             message_update(AssistantMessageEvent::ToolCallEnd {
                 content_index: 0,
                 tool_call: ToolCall {
+                    is_raw: false,
                     id: "call-1".into(),
                     name: "bash".into(),
                     arguments: serde_json::json!({"cmd": "ls"}),
@@ -1672,6 +1675,7 @@ mod tests {
         );
         let mut tool_only = empty_partial();
         tool_only.content = vec![AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "call-1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"cmd": "ls"}),
@@ -3848,6 +3852,7 @@ mod tests {
     /// tool-use-only turn, which renders no assistant entry.
     fn tool_use_only_end(call_id: &str) -> AgentEvent {
         assistant_message_end(partial_with(vec![AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: call_id.into(),
             name: "todo_read".into(),
             arguments: serde_json::json!({}),

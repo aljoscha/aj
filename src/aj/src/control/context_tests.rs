@@ -40,6 +40,7 @@ impl Fixture {
         let gateway_dir = task_directory();
         let mut delegate = finalized_text_message_with_usage("delegate", 100);
         delegate.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "call-child".into(),
             name: "agent".into(),
             arguments: serde_json::json!({"task": "inspect the fixture"}),

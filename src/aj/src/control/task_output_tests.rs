@@ -10,6 +10,17 @@ use std::time::Duration;
 
 struct Spill(Option<PathBuf>);
 
+struct CellReport;
+
+impl TaskOutputSource for CellReport {
+    fn snapshot(&self) -> TaskRead {
+        TaskRead {
+            report: Some("latest observed cell output".into()),
+            ..Default::default()
+        }
+    }
+}
+
 impl TaskOutputSource for Spill {
     fn snapshot(&self) -> TaskRead {
         TaskRead {
@@ -18,6 +29,74 @@ impl TaskOutputSource for Spill {
             ..Default::default()
         }
     }
+}
+
+#[tokio::test]
+async fn code_mode_cells_stop_through_local_and_remote_control() {
+    bounded("code mode task control", async {
+        let dir = tempfile::tempdir().unwrap();
+        let host = scripted_host(
+            &dir,
+            scripted(vec![], 0, Duration::ZERO),
+            HostHandles::new(&dir),
+            None,
+        );
+        let session = host.create().await.unwrap();
+        let registry = host.local_handles(&session).await.unwrap().task_registry;
+        let server = RemoteServer::bind(host.clone(), addr("127.0.0.1:0"), IdentityGate::local())
+            .await
+            .unwrap();
+        let local = Control::local(host.clone());
+        let remote = Control::remote(RemoteClient::new(&server.url()).unwrap());
+        for control in [&local, &remote] {
+            let (task, cancel, driver) = registry.register_driver(
+                AgentId::Main,
+                "cell-call".into(),
+                TaskKind::CodeMode {
+                    cell_id: "cell-1".into(),
+                },
+                "Code Mode cell cell-1 (open until collected)".into(),
+                Arc::new(CellReport),
+            );
+            let driver_cancel = cancel.clone();
+            driver.spawn(async move {
+                driver_cancel.cancelled().await;
+            });
+            let (status, output) = registry.read(task).unwrap();
+            assert_eq!(status, TaskStatus::Running);
+            assert!(
+                output.report.is_some(),
+                "an observed result does not close a cell"
+            );
+            assert!(!cancel.is_cancelled());
+            let observed = control.task_output(&session, task, 0).await.unwrap();
+            assert_eq!(observed.bytes, b"latest observed cell output");
+            assert_eq!(observed.status, TaskStatus::Running);
+            assert!(
+                control
+                    .task_output(&session, task, observed.total_bytes)
+                    .await
+                    .unwrap()
+                    .bytes
+                    .is_empty()
+            );
+            assert!(
+                control
+                    .task_output(&session, task, observed.total_bytes + 1)
+                    .await
+                    .is_err()
+            );
+            control
+                .command(&session, Command::KillTask { task })
+                .await
+                .unwrap();
+            assert!(cancel.is_cancelled());
+            assert_eq!(registry.wait_terminal(task).await, Some(TaskStatus::Killed));
+        }
+        host.shutdown().await;
+        server.shutdown().await;
+    })
+    .await;
 }
 
 #[tokio::test]

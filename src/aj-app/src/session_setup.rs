@@ -677,6 +677,7 @@ pub fn build_agent(config: &Config, run: &RunConfigSnapshot) -> BuiltAgent {
     agent.set_block_images(config.image_block);
     agent.set_default_thinking(run.main.thinking.clone());
     agent.set_speed(run.main.speed.clone());
+    agent.set_code_mode(config.code_mode);
     BuiltAgent {
         agent,
         env,

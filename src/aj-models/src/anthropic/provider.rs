@@ -148,6 +148,15 @@ async fn run_stream_inner(
         return Ok(());
     }
 
+    if let Some(tool) = context.tools.iter().find(|t| t.input_format.is_some()) {
+        return Err(AssistantError::new(
+            ErrorCategory::InvalidRequest,
+            format!(
+                "{} does not support raw-source tool declarations ({})",
+                model.api, tool.name
+            ),
+        ));
+    }
     let credential =
         match select_cancel(options.cancel.as_ref(), options.resolve_api_key()).await {
             SelectOutcome::Ready(result) => result,
@@ -529,7 +538,7 @@ fn convert_assistant_message(m: &AssistantMessage) -> MessageParam {
             }
             AssistantContent::ToolCall(tc) => content.push(ContentBlockParam::ToolUseBlock {
                 id: tc.id.clone(),
-                input: tc.arguments.clone(),
+                input: tc.json_arguments(),
                 name: tc.name.clone(),
                 cache_control: None,
                 caller: None,
@@ -628,6 +637,7 @@ pub fn parse_assistant_request_item(param: &MessageParam) -> AssistantMessage {
                 id, input, name, ..
             } => {
                 content.push(AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: id.clone(),
                     name: name.clone(),
                     arguments: input.clone(),
@@ -1135,6 +1145,7 @@ impl StreamState {
                         self.partial
                             .content
                             .push(AssistantContent::ToolCall(ToolCall {
+                                is_raw: false,
                                 id: id.clone(),
                                 name: name.clone(),
                                 arguments: Value::Object(serde_json::Map::new()),
@@ -1262,6 +1273,7 @@ impl StreamState {
                         // falling back to an empty object.
                         let parsed: Value = parse_streaming_json(&json);
                         let tool_call = ToolCall {
+                            is_raw: false,
                             id,
                             name,
                             arguments: parsed.clone(),
@@ -1626,6 +1638,15 @@ mod tests {
             assert_eq!(result.usage.served_speed, observed);
             assert_eq!(result.stop_reason == StopReason::Error, fail);
         }
+    }
+
+    #[tokio::test]
+    async fn raw_source_prior_calls_replay_on_json_fallback() {
+        crate::provider_test_support::raw_source::verify_json_fallback(
+            fake_model(),
+            labeled_options(None),
+        )
+        .await;
     }
 
     fn labeled_options(cancel: Option<CancellationToken>) -> StreamOptions {
@@ -2040,6 +2061,7 @@ mod tests {
         let messages = vec![
             Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::ToolCall(ToolCall {
+                    is_raw: false,
                     id: "1".into(),
                     name: "a".into(),
                     arguments: serde_json::json!({}),

@@ -27,6 +27,7 @@
 use std::io::Write;
 
 use aj_agent::events::AgentEvent;
+use aj_agent::message::AgentMessageKind;
 use aj_agent::tool::ToolDetails;
 use aj_models::types::{Message, ToolResultMessage, UserContent};
 use aj_session::{
@@ -98,23 +99,41 @@ impl Serialize for ExportEntry<'_> {
         let ConversationEntryKind::Message { message } = &entry.entry else {
             return entry.serialize(serializer);
         };
+        if let AgentMessageKind::ToolActivity(activity) = &message.kind {
+            let Message::ToolResult(result) = &activity.message else {
+                return entry.serialize(serializer);
+            };
+            let Some(details) = normalized_details(result) else {
+                return entry.serialize(serializer);
+            };
+            let mut normalized = entry.clone();
+            if let ConversationEntryKind::Message { message } = &mut normalized.entry
+                && let AgentMessageKind::ToolActivity(activity) = &mut message.kind
+                && let Message::ToolResult(result) = &mut activity.message
+            {
+                result.details =
+                    Some(serde_json::to_value(details).map_err(serde::ser::Error::custom)?);
+            }
+            return normalized.serialize(serializer);
+        }
         let Some(Message::ToolResult(result)) = message.as_stored_wire() else {
             return entry.serialize(serializer);
         };
-        let Some(raw_details) = result.details.as_ref() else {
-            return entry.serialize(serializer);
-        };
-        let kind = raw_details.get("kind").and_then(|kind| kind.as_str());
-        let project_details =
-            kind == Some("diff") || (kind == Some("text") && raw_details.get("body_ref").is_some());
-        if !project_details {
-            return entry.serialize(serializer);
-        }
-        let Some(details) = resolve_tool_details(raw_details, &result.content) else {
+        let Some(details) = normalized_details(result) else {
             return entry.serialize(serializer);
         };
 
         serialize_normalized_tool_result(entry, result, &details, serializer)
+    }
+}
+
+fn normalized_details(result: &ToolResultMessage) -> Option<ToolDetails> {
+    let raw = result.details.as_ref()?;
+    let kind = raw.get("kind").and_then(|kind| kind.as_str());
+    if kind == Some("diff") || (kind == Some("text") && raw.get("body_ref").is_some()) {
+        resolve_tool_details(raw, &result.content)
+    } else {
+        None
     }
 }
 
@@ -655,6 +674,40 @@ mod tests {
         let original = result.details.as_ref().expect("original details");
         assert_eq!(original["body_ref"]["source"], "content_text");
         assert!(original.get("body").is_none());
+    }
+
+    #[test]
+    fn export_normalizes_tool_activity_without_unwrapping_or_mutating_it() {
+        for details in [
+            serde_json::json!({"kind": "text", "summary": "nested", "body_ref": {"source": "content_text", "append_newline": true}}),
+            serde_json::json!({"kind": "diff", "path": "nested.rs", "before": "old\n", "after": "new\n"}),
+        ] {
+            let mut source: serde_json::Value = serde_json::from_str(TOOL_RESULT).unwrap();
+            source["message"]["details"] = details.clone();
+            source["message"] = serde_json::json!({
+                "role": "tool_activity", "cell_id": "cell-1", "message": source["message"].clone()
+            });
+            let line = source.to_string();
+            let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, &line]);
+            let before = serde_json::to_value(log.entries_in_order()[3]).unwrap();
+            let data: serde_json::Value =
+                serde_json::from_str(&decoded_island(&render_session_html(&log))).unwrap();
+            let wrapper = &data["entries"][3]["message"];
+            assert_eq!(wrapper["role"], "tool_activity");
+            assert_eq!(wrapper["cell_id"], "cell-1");
+            assert_eq!(wrapper["message"]["tool_call_id"], "call-1");
+            let normalized = &wrapper["message"]["details"];
+            if details["kind"] == "text" {
+                assert_eq!(normalized["body"], "the file body\n");
+                assert!(normalized.get("body_ref").is_none());
+            } else {
+                assert_eq!(normalized["format"], "display-v1");
+            }
+            assert_eq!(
+                serde_json::to_value(log.entries_in_order()[3]).unwrap(),
+                before
+            );
+        }
     }
 
     #[test]

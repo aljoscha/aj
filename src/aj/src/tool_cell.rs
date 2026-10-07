@@ -156,7 +156,7 @@ pub(crate) fn badge_task_id(entry: &ToolEntry) -> Option<TaskId> {
 /// `[task #N · exited 0]` etc. once the task reached a terminal
 /// status. `None` for foreground tool calls.
 ///
-/// Only bash launches carry the badge. An agent-kind task's launch
+/// Non-agent launches carry the badge. An agent-kind task's launch
 /// cell is the skipped `agent` tool call, and the sub-agent box
 /// carries that status instead. The cell tint still follows the task
 /// outcome for every kind, so only the badge is gated here.
@@ -172,9 +172,14 @@ fn task_badge(entry: &ToolEntry, tasks: &BTreeMap<TaskId, TaskInfo>) -> Option<S
     if !bash_details
         && !tasks
             .get(&id)
-            .is_some_and(|info| matches!(info.kind, TaskKind::Bash { .. }))
+            .is_some_and(|info| !matches!(info.kind, TaskKind::Agent { .. }))
     {
         return None;
+    }
+    if tasks.get(&id).is_some_and(|info| {
+        matches!(info.kind, TaskKind::CodeMode { .. }) && info.status == TaskStatus::Running
+    }) {
+        return Some(format!("[task #{id} · open until collected]"));
     }
     Some(match tasks.get(&id).map(|info| info.status) {
         None | Some(TaskStatus::Running) => format!("[task #{id}]"),
@@ -1700,9 +1705,35 @@ mod tests {
     }
 
     #[test]
+    fn code_mode_task_badge_describes_an_open_cell() {
+        let mut entry = entry("execute", serde_json::json!({}));
+        entry.status = ToolStatus::Done { is_error: false };
+        entry.task = Some(7);
+        let mut tasks = task_map(7, TaskStatus::Running);
+        tasks.get_mut(&7).unwrap().kind = TaskKind::CodeMode {
+            cell_id: "cell-1".into(),
+        };
+        let mut cell = build_tool_cell(
+            &entry,
+            &tasks,
+            false,
+            false,
+            &styles(),
+            ImageRender::Disabled,
+        );
+        let rendered = rows(&draw(&mut cell, 80));
+        assert!(
+            rendered
+                .iter()
+                .any(|row| row.contains("[task #7 · open until collected]")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
     fn agent_kind_task_gets_tint_override_but_no_badge() {
         // An agent-kind task's `entry.task` fallback must not badge
-        // the cell (aj badges bash launches only), while the terminal
+        // the cell, while the terminal
         // task status still drives the tint. An agent run has no process
         // exit code, so the `Exited(Some(1))` it reports is a failed run,
         // not a bash command's neutral non-zero answer.

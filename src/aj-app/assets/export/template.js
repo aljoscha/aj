@@ -75,9 +75,9 @@
   // Sub-agent runs live on their own `subagent` thread, keyed by
   // `agent_id`. A `sub_agent_spawn` entry roots each run. Its persisted
   // parent is the main-thread head when the spawn event is handled, which
-  // can be a sibling tool result appended after the assistant's `agent`
-  // call. Walk back to that assistant so the run still nests beneath the
-  // turn that spawned it.
+  // can be a sibling tool result appended after an assistant's delegation
+  // call, including a ToolActivity call. Walk back to that call so the run
+  // still nests beneath its owner.
   const spawnsByParent = new Map();
   const spawnByAgentId = new Map();
   const subThread = new Map();
@@ -87,8 +87,9 @@
     const seen = new Set();
     while (cur && cur.thread !== 'subagent' && !seen.has(cur.id)) {
       seen.add(cur.id);
-      const m = cur.type === 'message' ? cur.message : null;
-      if (m && m.role === 'assistant' && (m.content || []).some((b) => b.type === 'tool_call' && b.name === 'agent')) {
+      const wrapper = cur.type === 'message' ? cur.message : null;
+      const m = wrapper && wrapper.role === 'tool_activity' ? wrapper.message : wrapper;
+      if (m && m.role === 'assistant' && (m.content || []).some((b) => b.type === 'tool_call' && (b.name === 'agent' || b.name === 'oracle'))) {
         return cur.id;
       }
       cur = cur.parent_id != null ? byId.get(cur.parent_id) : null;
@@ -122,6 +123,44 @@
         if (b.type === 'tool_call') toolCallById.set(b.id, { name: b.name, arguments: b.arguments, entry_id: e.id });
       }
     }
+  }
+
+  // Audit calls are scoped to their execution cell, not model turns.
+  const activityCalls = new Map();
+  const activityResults = new Map();
+  function activityKey(entry, id) {
+    return JSON.stringify([entry.thread, entry.agent_id, entry.message.cell_id, id]);
+  }
+  for (const entry of entries) {
+    const wrapper = entry.type === 'message' && entry.message;
+    if (!wrapper || wrapper.role !== 'tool_activity' || !wrapper.message) continue;
+    const m = wrapper.message;
+    if (m.role === 'assistant') {
+      for (const call of m.content || []) {
+        if (call.type === 'tool_call') activityCalls.set(activityKey(entry, call.id), { call, entry });
+      }
+    } else if (m.role === 'tool_result') {
+      activityResults.set(activityKey(entry, m.tool_call_id), m);
+    }
+  }
+
+  function renderToolActivity(entry) {
+    const m = entry.message.message;
+    if (!m) return '';
+    let html = '<div id="entry-' + escapeHtml(entry.id) + '">';
+    html += '<div class="summary">Tool activity: ' + escapeHtml(entry.message.cell_id) + '</div>';
+    if (m.role === 'assistant') {
+      for (const call of m.content || []) {
+        if (call.type === 'tool_call') {
+          html += renderToolExecution({ ...call, id: 'activity-' + entry.id + '-' + call.id },
+            activityResults.get(activityKey(entry, call.id)));
+        }
+      }
+    } else if (m.role === 'tool_result') {
+      if (activityCalls.has(activityKey(entry, m.tool_call_id))) return '';
+      html += renderToolExecution({ id: 'activity-' + entry.id, name: m.tool_name }, m);
+    }
+    return html + renderSpawnedRuns(entry) + '</div>';
   }
 
   function hasInlineRun(toolCallId, result) {
@@ -497,7 +536,11 @@
       if (block.type === 'tool_call') html += renderToolCall(block);
     }
 
-    // Sub-agent runs spawned by this message render inline beneath it.
+    return html + renderSpawnedRuns(entry);
+  }
+
+  function renderSpawnedRuns(entry) {
+    let html = '';
     for (const spawn of spawnsByParent.get(entry.id) || []) {
       html += renderSubAgent(spawn);
     }
@@ -584,6 +627,7 @@
     if (entry.type === 'message') {
       const msg = entry.message;
       if (!msg) return '';
+      if (msg.role === 'tool_activity') return renderToolActivity(entry);
       if (msg.role === 'user') return renderUser(entry);
       if (msg.role === 'assistant') return renderAssistant(entry);
       if (msg.role === 'task_notification') return renderTaskNotification(entry);
@@ -658,7 +702,11 @@
       const m = e.message;
       // A task notification carries `role:"task_notification"`, so it is
       // naturally excluded from the user counter and every other stat.
-      if (m.role === 'user') s.user++;
+      if (m.role === 'tool_activity') {
+        const inner = m.message || {};
+        if (inner.role === 'tool_result') s.toolResults++;
+        if (inner.role === 'assistant') s.toolCalls += (inner.content || []).filter((c) => c.type === 'tool_call').length;
+      } else if (m.role === 'user') s.user++;
       else if (m.role === 'tool_result') s.toolResults++;
       else if (m.role === 'assistant') {
         s.assistant++;
@@ -1043,6 +1091,13 @@
       case 'message': {
         const m = entry.message;
         if (!m) return treeMuted('[message]');
+        if (m.role === 'tool_activity') {
+          const inner = m.message || {};
+          const found = inner.role === 'tool_result' ? activityCalls.get(activityKey(entry, inner.tool_call_id)) : null;
+          const call = found ? found.call : (inner.content || []).find((b) => b.type === 'tool_call');
+          const label = call ? formatToolCall(call.name, call.arguments) : '[' + (inner.tool_name || 'tool') + ']';
+          return '<span class="tree-role-tool">' + escapeHtml('activity ' + m.cell_id + ': ' + label) + '</span>';
+        }
         if (m.role === 'user') {
           return role('tree-role-user', 'user:') + ' ' + escapeHtml(truncate(normalize(textOf(m.content))));
         }
@@ -1080,6 +1135,13 @@
     if (entry.type === 'message' && entry.message) {
       const m = entry.message;
       parts.push(m.role, textOf(m.content));
+      if (m.role === 'tool_activity') {
+        const inner = m.message || {};
+        parts.push(m.cell_id, inner.tool_name || '', textOf(inner.content));
+        const found = activityCalls.get(activityKey(entry, inner.tool_call_id));
+        const calls = found ? [found.call] : (inner.content || []).filter((b) => b.type === 'tool_call');
+        for (const call of calls) parts.push(call.name, JSON.stringify(call.arguments || {}));
+      }
       if (m.role === 'tool_result') {
         parts.push(m.tool_name || '');
         const call = m.tool_call_id ? toolCallById.get(m.tool_call_id) : null;
@@ -1118,7 +1180,7 @@
     if (!entry.message) return null;
     if (entry.message.role === 'user') return 'user';
     if (entry.message.role === 'assistant') return 'assistant';
-    if (entry.message.role === 'tool_result' || entry.message.role === 'task_notification') return 'tools';
+    if (entry.message.role === 'tool_activity' || entry.message.role === 'tool_result' || entry.message.role === 'task_notification') return 'tools';
     return null;
   }
 
@@ -1225,6 +1287,11 @@
         return 'subagent-' + det.agent_id;
       }
       if (entry.message.tool_call_id) return 'tool-call-' + entry.message.tool_call_id;
+    }
+    if (entry && entry.type === 'message' && entry.message && entry.message.role === 'tool_activity') {
+      const inner = entry.message.message || {};
+      const found = inner.role === 'tool_result' && activityCalls.get(activityKey(entry, inner.tool_call_id));
+      if (found) return 'entry-' + found.entry.id;
     }
     // The spawn node has no element of its own; scroll to its run's box.
     if (entry && entry.type === 'sub_agent_spawn' && entry.agent_id != null) {

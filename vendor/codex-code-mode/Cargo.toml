@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["code-mode-protocol", "code-mode-runtime"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.lints]
+
+[workspace.dependencies]
+base64 = "0.22.1"
+codex-code-mode-protocol = { path = "code-mode-protocol" }
+codex-code-mode-runtime = { path = "code-mode-runtime" }
+deno_core_icudata = "0.77.0"
+futures = { version = "0.3", default-features = false }
+opentelemetry = "0.31.0"
+serde = { version = "1", features = ["rc"] }
+serde_json = "1"
+tokio = "1"
+tokio-util = "0.7.18"
+tracing = "0.1.44"
+v8 = "=150.4.0"
+pretty_assertions = "1.4.1"
+glob = "0.3"
+tonic = { version = "0.14.3", default-features = false, features = ["channel", "codegen"] }
+tonic-prost = "0.14.3"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

@@ -1,4 +1,4 @@
-//! Read-only viewer for a background bash task's output.
+//! Read-only viewer for a background task's retained spill output.
 //!
 //! Drilled into from the agent picker, which drops out on the way in, so
 //! Esc from here returns to the editor, not the picker.
@@ -123,6 +123,8 @@ pub(crate) struct TaskOutputView {
     reader: Option<OutputReader>,
     notice: Option<String>,
     id: TaskId,
+    /// Running denotes an open cell, not necessarily active computation.
+    pub(crate) code_mode: bool,
     /// Command line, shown (truncated) in the header for context.
     command: String,
     /// The row list, shared with `bars` (which draws it). Rows are built lazily
@@ -168,6 +170,7 @@ impl TaskOutputView {
             reader: None,
             notice: Some("Loading output…".to_string()),
             id,
+            code_mode: false,
             command,
             list,
             bars,
@@ -297,7 +300,11 @@ impl TaskOutputView {
         format!(
             "{} {} \u{b7} {}",
             status_glyph(self.status),
-            status_word(self.status),
+            if self.code_mode && self.status == TaskStatus::Running {
+                "open until collected".to_string()
+            } else {
+                status_word(self.status)
+            },
             human_bytes(self.total_bytes),
         )
     }
@@ -601,6 +608,16 @@ mod tests {
             Style::default(),
             Style::default(),
         )
+    }
+
+    #[test]
+    fn code_mode_viewer_labels_open_cells_and_allows_stopping() {
+        let mut view = viewer();
+        view.code_mode = true;
+        assert!(view.status_line().contains("open until collected"));
+        assert!(!view.status_line().contains("running"));
+        press(&mut view, u32::from('k'), Modifiers::CTRL);
+        assert_eq!(*view.kill.borrow(), Some(7));
     }
 
     fn output_through(view: &mut TaskOutputView, last: u32) {

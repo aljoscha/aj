@@ -702,6 +702,9 @@ fn build_request(
 /// Codex tools omit `strict` (the endpoint rejects requests
 /// carrying it). Otherwise identical to the Responses tool shape.
 fn to_codex_tool(tool: &ToolDefinition) -> ResponseTool {
+    if tool.input_format.is_some() {
+        return super::responses::to_response_tool(tool);
+    }
     ResponseTool::Function {
         name: tool.name.clone(),
         description: Some(tool.description.clone()),
@@ -994,6 +997,24 @@ mod tests {
             build_request(&model, &Context::new("sys"), &options, &ThinkingLevel::Off).service_tier,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn json_string_function_call_streams_and_resumes_as_function() {
+        crate::provider_test_support::raw_source::verify_json_string(
+            fake_model("gpt-5.1", false),
+            labeled_options(tokio_util::sync::CancellationToken::new()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn raw_source_tools_stream_resume_and_cancel() {
+        crate::provider_test_support::raw_source::verify(
+            fake_model("gpt-5.1", false),
+            labeled_options(tokio_util::sync::CancellationToken::new()),
+        )
+        .await;
     }
 
     fn labeled_options(cancel: tokio_util::sync::CancellationToken) -> StreamOptions {
@@ -1412,6 +1433,7 @@ mod tests {
     fn build_request_tool_omits_strict_field() {
         let mut ctx = Context::new("hello");
         ctx.tools.push(ToolDefinition {
+            input_format: None,
             name: "ls".into(),
             description: "list directory".into(),
             parameters: serde_json::json!({"type":"object"}),
@@ -1843,6 +1865,7 @@ mod tests {
     #[test]
     fn to_codex_tool_emits_no_strict_field() {
         let tool = ToolDefinition {
+            input_format: None,
             name: "x".into(),
             description: "d".into(),
             parameters: serde_json::json!({}),
@@ -1864,6 +1887,7 @@ mod tests {
             text_signature: None,
         }));
         m.content.push(AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "call|item".into(),
             name: "x".into(),
             arguments: Value::Null,

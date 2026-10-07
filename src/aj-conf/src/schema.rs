@@ -724,6 +724,9 @@ pub struct Config {
     /// `git status > out` captures rtk's compressed output in the
     /// file, not the raw form.
     pub bash_rtk: bool,
+    /// Use Codex-compatible JavaScript tool orchestration for models included
+    /// in the bundled Codex Code Mode catalog. Other models use ordinary tools.
+    pub code_mode: bool,
     /// Directory for the spill files that carry a bash command's full
     /// output: every background task's canonical output, and any
     /// foreground run whose output was truncated for the model. Unset
@@ -774,6 +777,7 @@ impl Default for Config {
             compact_threshold: 0.85,
             compact_keep_recent: 20_000,
             bash_rtk: false,
+            code_mode: false,
             spill_dir: None,
             keybindings: BTreeMap::new(),
         }
@@ -1178,6 +1182,17 @@ impl Config {
             },
             display_fn: |c| c.bash_rtk.to_string(),
             to_toml_fn: |c| bool_item(c.bash_rtk, false),
+        },
+        ConfigOption {
+            name: "code_mode",
+            description: "Use experimental Codex Code Mode on supported models, otherwise ordinary tools.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.code_mode = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.code_mode.to_string(),
+            to_toml_fn: |c| bool_item(c.code_mode, false),
         },
         ConfigOption {
             name: "spill_dir",
@@ -2857,6 +2872,8 @@ image_block = true
         config.show_image_in_terminal = false;
         config.image_block = true;
 
+        config.code_mode = true;
+
         let rewritten = rewrite_changed("", &Config::default(), &config);
         let (parsed, diag) = parse_config(&rewritten, Path::new("/tmp/config.toml"));
         assert!(diag.is_empty(), "got: {diag:?}");
@@ -2877,6 +2894,7 @@ image_block = true
         assert!(!parsed.image_auto_resize);
         assert!(!parsed.show_image_in_terminal);
         assert!(parsed.image_block);
+        assert!(parsed.code_mode);
     }
 
     // ---- persist_changed (lock + merge) ----------------------------------

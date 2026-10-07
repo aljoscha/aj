@@ -552,6 +552,7 @@ mod tests {
         let stream = AssistantMessageEventStream::new();
         let mut final_msg = sample_partial();
         final_msg.content = vec![AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: "call_1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/tmp"}),

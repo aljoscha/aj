@@ -125,6 +125,7 @@ fn thinking_block(thinking: &str, signature: Option<&str>, redacted: bool) -> As
 
 fn tool_call_block(id: &str, name: &str) -> AssistantContent {
     AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: id.into(),
         name: name.into(),
         arguments: json!({}),

@@ -10,6 +10,8 @@ test-support = []
 
 [dependencies]
 aj-models = { path = "../aj-models" }
+codex-code-mode-protocol = { path = "../../vendor/codex-code-mode/code-mode-protocol" }
+codex-code-mode-runtime = { path = "../../vendor/codex-code-mode/code-mode-runtime" }
 chrono = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 rand = { workspace = true }

@@ -2777,6 +2777,7 @@ mod tests {
     fn assistant_tool_use(id: &str, name: &str) -> AgentMessage {
         AgentMessage::wire(Message::Assistant(AssistantMessage {
             content: vec![AssistantContent::ToolCall(ToolCall {
+                is_raw: false,
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments: serde_json::json!({}),

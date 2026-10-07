@@ -209,6 +209,7 @@ struct Recorded {
 async fn scripted_tool_turn() -> Recorded {
     let mut calling = finalized_text_message("let me check the list");
     calling.content.push(AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: "call-1".into(),
         name: "todo_read".into(),
         arguments: serde_json::json!({}),
@@ -251,6 +252,7 @@ async fn scripted_tool_turn() -> Recorded {
 async fn scripted_sub_agent_turn() -> Recorded {
     let mut spawning = finalized_text_message("delegating that");
     spawning.content.push(AssistantContent::ToolCall(ToolCall {
+        is_raw: false,
         id: "call-sub".into(),
         name: "agent".into(),
         arguments: serde_json::json!({"task": "look into it"}),

@@ -199,6 +199,7 @@ fn transform_assistant(
                     id_map.insert(tc.id.clone(), new_id.clone());
                 }
                 new_content.push(AssistantContent::ToolCall(ToolCall {
+                    is_raw: tc.is_raw,
                     id: new_id,
                     name: tc.name.clone(),
                     arguments: tc.arguments.clone(),
@@ -565,6 +566,7 @@ mod tests {
 
     fn tool_call(id: &str, name: &str) -> AssistantContent {
         AssistantContent::ToolCall(ToolCall {
+            is_raw: false,
             id: id.into(),
             name: name.into(),
             arguments: serde_json::json!({}),
