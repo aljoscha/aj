@@ -93,7 +93,18 @@ pub(crate) fn catalog(
         "immediately injects an extra `custom_tool_call_output` for the current `exec` call",
         "queues a notification for the next model inference and immediately displays it to the user",
     );
-    description.push_str("\n\nAJ: cells and stored values survive turns within this agent's live session, not process restart or session resume. Interrupting the agent cancels its open cells. Disabling Code Mode or switching to an ineligible model cancels them too. Tool availability is checked on each nested call. An open cell stays in the task list until collected or terminated, even if evaluation has finished. Use cell `wait` to collect it rather than waiting for a task-completion notice. AJ's input-yield tool, when present, is named `yield`. AJ supports text and image output, not audio output.");
+    description.push_str(concat!(
+        "\n\nAJ: committed store()/load() values belong to this agent's conversation branch ",
+        "and survive session resume and compaction. Writes commit when the script finishes, ",
+        "including when it ends with a script error. Cancellation before completion discards ",
+        "pending writes, but does not undo tool side effects. Cells survive turns, not process ",
+        "restart or branch changes. Interrupting the agent cancels its open cells. Disabling ",
+        "Code Mode or switching to an ineligible model cancels them too, retaining committed ",
+        "values. Tool availability is checked on each nested call. An open cell stays in the ",
+        "task list until collected or terminated, even if evaluation has finished. Use cell ",
+        "`wait` to collect it rather than waiting for a task-completion notice. AJ's input-yield ",
+        "tool, when present, is named `yield`. AJ supports text and image output, not audio output."
+    ));
     // Codex's exec grammar, from core/src/tools/code_mode/execute_spec.rs.
     // The vendored Apache-2.0 license and NOTICE cover this grammar as well.
     let grammar = r#"
@@ -164,11 +175,36 @@ pub(crate) struct CodeMode {
     owner_cancel: CancellationToken,
 }
 
+/// Committed values outlive evaluator replacement. An acknowledgment failure
+/// poisons the owner because an earlier subscriber may already have persisted
+/// the update, so retrying or continuing would assume a rollback we cannot make.
+#[derive(Default)]
+pub(crate) struct Store {
+    values: BTreeMap<String, Value>,
+    failure: Option<String>,
+}
+
+impl Store {
+    pub(crate) fn new(values: BTreeMap<String, Value>) -> Self {
+        Self {
+            values,
+            failure: None,
+        }
+    }
+
+    pub(crate) fn check(&self) -> Result<(), String> {
+        self.failure
+            .as_ref()
+            .map_or(Ok(()), |error| Err(error.clone()))
+    }
+}
+
 struct Shared {
     prefix: String,
     runner: RwLock<ToolRunner>,
     cells: Mutex<HashMap<protocol::CellId, Cell>>,
     notifications: Mutex<VecDeque<String>>,
+    store: Arc<Mutex<Store>>,
 }
 
 struct Cell {
@@ -201,8 +237,15 @@ impl TaskOutputSource for CellOutput {
 }
 
 impl CodeMode {
-    pub(crate) fn new(runner: ToolRunner) -> Self {
-        let runtime = Arc::new(InProcessCodeModeSession::new());
+    pub(crate) fn new(runner: ToolRunner, store: Arc<Mutex<Store>>) -> Self {
+        let values = store
+            .lock()
+            .expect("code mode store mutex poisoned")
+            .values
+            .clone()
+            .into_iter()
+            .collect();
+        let runtime = Arc::new(InProcessCodeModeSession::with_stored_values(values));
         let owner_cancel = CancellationToken::new();
         let shutdown_runtime = Arc::clone(&runtime);
         let owner = owner_cancel.clone();
@@ -225,6 +268,7 @@ impl CodeMode {
                 runner: RwLock::new(runner),
                 cells: Mutex::new(HashMap::new()),
                 notifications: Mutex::new(VecDeque::new()),
+                store,
             }),
             owner_cancel,
         }
@@ -255,6 +299,7 @@ impl CodeMode {
         call_id: &str,
         input: Value,
     ) -> Result<ToolOutcome, BoxError> {
+        self.shared.check_store()?;
         let (response, budget) = if name == "exec" {
             let parsed = protocol::parse_exec_source(
                 input.as_str().ok_or("exec expects raw JavaScript source")?,
@@ -457,6 +502,13 @@ impl Drop for CodeMode {
 }
 
 impl Shared {
+    fn check_store(&self) -> Result<(), String> {
+        self.store
+            .lock()
+            .expect("code mode store mutex poisoned")
+            .check()
+    }
+
     fn public_id(&self, id: &protocol::CellId) -> String {
         format!("{}{id}", self.prefix)
     }
@@ -490,6 +542,8 @@ impl Shared {
 struct Delegate {
     shared: Arc<Shared>,
     closed: CancellationToken,
+    // Session shutdown must drain even unobserved store commits before closing
+    // the persistence listener or releasing its writer lock.
     _cleanup: crate::TaskCleanupGuard,
 }
 
@@ -500,12 +554,59 @@ impl Drop for Delegate {
 }
 
 impl protocol::CodeModeSessionDelegate for Delegate {
+    fn store<'a>(
+        &'a self,
+        _cell_id: protocol::CellId,
+        writes: HashMap<String, Arc<Value>>,
+    ) -> protocol::NotificationFuture<'a> {
+        Box::pin(async move {
+            self.shared.check_store()?;
+            let runner = self
+                .shared
+                .runner
+                .read()
+                .expect("code mode runner lock poisoned")
+                .clone();
+            let writes: BTreeMap<_, _> = writes
+                .into_iter()
+                .map(|(key, value)| (key, (*value).clone()))
+                .collect();
+            // The runtime serializes commits and blocks new cell snapshots
+            // through this await. Only acknowledged writes become live state.
+            let result = runner
+                .context
+                .parent_bus
+                .emit(AgentEvent::CodeModeStore {
+                    agent_id: runner.context.agent_id,
+                    writes: writes.clone(),
+                })
+                .await;
+            let mut store = self
+                .shared
+                .store
+                .lock()
+                .expect("code mode store mutex poisoned");
+            match result {
+                Ok(()) => {
+                    store.values.extend(writes);
+                    Ok(())
+                }
+                Err(error) => {
+                    let error = format!("Code Mode store persistence failed: {error}");
+                    store.failure = Some(error.clone());
+                    Err(error)
+                }
+            }
+        })
+    }
+
     fn invoke_tool<'a>(
         &'a self,
         invocation: protocol::CodeModeNestedToolCall,
         cancel: CancellationToken,
     ) -> protocol::ToolInvocationFuture<'a> {
         Box::pin(async move {
+            self.shared.check_store()?;
             let runner = self
                 .shared
                 .runner

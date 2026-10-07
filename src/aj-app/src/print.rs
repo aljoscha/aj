@@ -1500,12 +1500,9 @@ mod tests {
         assert!(message.to_projected_wire().is_none());
     }
 
-    /// The JSONL listener drops `ToolExecutionUpdate` (a high-frequency
-    /// transient progress frame) but serializes every other event as one
-    /// line. The driven `streaming-text` demo emits no tool updates, so
-    /// the filter is exercised directly here against synthetic events.
+    /// Execution state and progress do not enter printable JSONL output.
     #[tokio::test]
-    async fn json_listener_drops_tool_execution_update_and_passes_other_events() {
+    async fn json_listener_drops_execution_state_and_progress_and_passes_other_events() {
         use aj_agent::events::AgentId;
         use aj_agent::tool::ToolDetails;
 
@@ -1529,6 +1526,17 @@ mod tests {
             "ToolExecutionUpdate is filtered from the structured stream"
         );
 
+        listener(&AgentEvent::CodeModeStore {
+            agent_id: AgentId::Main,
+            writes: [("saved".into(), serde_json::json!(42))].into(),
+        })
+        .await
+        .expect("listener ran");
+        assert!(
+            String::from_utf8_lossy(&sink.lock().expect("sink poisoned"))
+                .contains("code_mode_store")
+        );
+
         let notice = AgentEvent::Notice {
             agent_id: AgentId::Main,
             text: "hello".to_string(),
@@ -1539,8 +1547,8 @@ mod tests {
         assert!(out.contains("hello"), "ordinary event written:\n{out}");
         assert_eq!(
             out.lines().filter(|l| !l.trim().is_empty()).count(),
-            1,
-            "exactly one line written (the update produced none):\n{out}"
+            2,
+            "state and notice written, but not the transient update:\n{out}"
         );
     }
 

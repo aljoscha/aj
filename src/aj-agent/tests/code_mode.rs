@@ -668,3 +668,109 @@ async fn session_shutdown_owns_a_cell_even_if_the_foreground_prompt_is_dropped()
         "callback audit must finish before the session writer can be released"
     );
 }
+
+#[tokio::test]
+async fn committed_store_survives_disabling_and_reenabling_code_mode() {
+    let mut h = Harness::new(true, vec![]);
+    h.exec(r#"store("saved", {answer: 42});"#).await;
+    h.agent.set_code_mode(false);
+    h.provider.done();
+    h.prompt().await;
+    h.agent.set_code_mode(true);
+    h.exec(r#"text(load("saved").answer);"#).await;
+    assert!(h.result("exec").contains("42"));
+    assert_eq!(
+        h.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::CodeModeStore { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn store_acknowledgment_failure_is_fatal_even_after_the_listener_is_removed() {
+    let mut h = Harness::new(true, vec![]);
+    let failing = h.agent.subscribe(Arc::new(|event| {
+        let is_commit = matches!(event, AgentEvent::CodeModeStore { .. });
+        Box::pin(async move {
+            if is_commit {
+                Err("injected store acknowledgment failure".into())
+            } else {
+                Ok(())
+            }
+        })
+    }));
+    h.provider.enqueue("exec", json!(r#"store("saved", 42);"#));
+    let error = bounded(h.agent.prompt("save".into(), CancellationToken::new()))
+        .await
+        .expect_err("an uncertain commit cannot become an ordinary tool error");
+    assert!(
+        error.to_string().contains("store acknowledgment failure"),
+        "{error}"
+    );
+    assert_eq!(h.provider.contexts.lock().unwrap().len(), 1);
+    drop(failing);
+    h.agent.set_code_mode(false);
+    assert!(
+        bounded(h.agent.prompt("continue".into(), CancellationToken::new()))
+            .await
+            .is_err()
+    );
+    assert_eq!(h.provider.contexts.lock().unwrap().len(), 1);
+    h.registry.shutdown();
+    bounded(h.registry.wait_for_quiescence()).await;
+}
+
+#[tokio::test]
+async fn background_store_failure_during_admission_prevents_the_next_inference() {
+    let mut h = Harness::new(true, vec![]);
+    let entered = CancellationToken::new();
+    let release = CancellationToken::new();
+    let starts = std::sync::atomic::AtomicUsize::new(0);
+    let registry = h.registry.clone();
+    let _listener = h.agent.subscribe(Arc::new(move |event| {
+        let store = matches!(event, AgentEvent::CodeModeStore { .. });
+        let next = matches!(event, AgentEvent::MessageStart { message, .. }
+            if matches!(message.as_stored_wire(), Some(Message::Assistant(_))))
+            && starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1;
+        let entered = entered.clone();
+        let release = release.clone();
+        let registry = registry.clone();
+        Box::pin(async move {
+            if store {
+                entered.cancel();
+                release.cancelled().await;
+                return Err("injected background acknowledgment failure".into());
+            }
+            if next {
+                entered.cancelled().await;
+                let task = registry
+                    .snapshot()
+                    .into_iter()
+                    .find(|task| matches!(task.kind, TaskKind::CodeMode { .. }))
+                    .expect("the yielded cell must be tracked");
+                release.cancel();
+                registry.kill(task.id);
+                // Completion owns the commit. Terminal task status proves the
+                // failed acknowledgment settled before admission can continue.
+                registry.wait_terminal(task.id).await;
+            }
+            Ok(())
+        })
+    }));
+    h.provider
+        .enqueue("exec", json!(r#"yield_control(); store("saved", 42);"#));
+    h.provider.done();
+    let result = bounded(h.agent.prompt("save".into(), CancellationToken::new())).await;
+    h.registry.shutdown();
+    bounded(h.registry.wait_for_quiescence()).await;
+    assert!(result.is_err());
+    assert_eq!(
+        h.provider.contexts.lock().unwrap().len(),
+        1,
+        "known store failure must prevent the provider request, not merely reject its response"
+    );
+}

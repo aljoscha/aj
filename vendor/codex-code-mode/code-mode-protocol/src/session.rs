@@ -1,3 +1,5 @@
+// Modified for AJ: acknowledged stored-value commits (Apache-2.0).
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -113,6 +115,19 @@ pub trait CodeModeSessionDelegate: Send + Sync {
         text: String,
         cancellation_token: CancellationToken,
     ) -> NotificationFuture<'a>;
+
+    /// Saves a completed cell's nonempty writes before they become visible to new cells.
+    /// Completion has won over cancellation, so this callback must finish even during
+    /// termination or session shutdown. An error leaves the session's values unchanged.
+    /// New cells and other commits wait for this callback, so it must not await
+    /// execution or shutdown of the same session.
+    fn store<'a>(
+        &'a self,
+        _cell_id: CellId,
+        _writes: HashMap<String, Arc<JsonValue>>,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
 
     /// Releases delegate state associated with a cell after it reaches a terminal state.
     fn cell_closed(&self, cell_id: &CellId);

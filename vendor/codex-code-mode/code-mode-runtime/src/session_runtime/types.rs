@@ -1,5 +1,8 @@
+// Modified for AJ: acknowledged stored-value commits (Apache-2.0).
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value as JsonValue;
@@ -154,6 +157,14 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
         text: String,
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<(), String>> + Send;
+
+    fn store(
+        &self,
+        _cell_id: CellId,
+        _writes: HashMap<String, Arc<JsonValue>>,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
+    }
 
     fn cell_closed(&self, cell_id: &CellId);
 }

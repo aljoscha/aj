@@ -293,6 +293,20 @@ Tool calls may carry `is_raw: true` to identify verbatim source in their string
 `arguments`. Absent or false means JSON arguments, including a JSON string.
 Clients preserve this discriminator when storing or forwarding messages.
 
+Completed Code Mode scripts can emit a durable state event:
+
+```json
+{"type":"code_mode_store","agent_id":"main","writes":{"key":{"value":42}}}
+```
+
+`writes` replaces the named keys on that agent's conversation branch. The event
+is emitted after log persistence on the host wire and is reproduced on replay.
+Print JSONL also carries it. It is not a model message or rendered chat activity
+and does not affect usage. Clients that do not use this state can ignore it.
+Committed values survive session resume and compaction. Live JavaScript cells
+are not restored. Script errors retain prior writes from that script, while
+cancellation before accepted completion discards its pending writes.
+
 Task kinds on `TaskStart` and `caught_up.tasks` include
 `{"code_mode": {"cell_id": "..."}}`, alongside `bash` and `agent`.
 Task notifications accept `kind: "code_mode"` alongside `"bash"` and

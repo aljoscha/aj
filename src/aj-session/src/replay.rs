@@ -760,6 +760,7 @@ impl ReplayState {
             | ConversationEntryKind::VerbosityChange { .. }
             | ConversationEntryKind::EnvChange { .. }
             | ConversationEntryKind::GoalChange { .. }
+            | ConversationEntryKind::CodeModeStore { .. }
             | ConversationEntryKind::Context { .. }
             | ConversationEntryKind::SystemPrompt { .. }
             | ConversationEntryKind::Compaction { .. }
@@ -956,6 +957,15 @@ impl ReplayState {
             }
             // Goals are carried by host state, not transcript events.
             ConversationEntryKind::GoalChange { .. } => {}
+            ConversationEntryKind::CodeModeStore { writes } => {
+                out.push_back(durable(
+                    at,
+                    AgentEvent::CodeModeStore {
+                        agent_id,
+                        writes: writes.clone(),
+                    },
+                ));
+            }
             ConversationEntryKind::Context { .. } => {
                 unreachable!("a context entry is projected before the thread is read")
             }

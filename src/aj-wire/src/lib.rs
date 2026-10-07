@@ -2424,6 +2424,7 @@ fn is_known_event_type(event_type: &str) -> bool {
     matches!(
         event_type,
         "agent_start"
+            | "code_mode_store"
             | "agent_end"
             | "turn_start"
             | "turn_end"

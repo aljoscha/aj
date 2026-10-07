@@ -1,4 +1,6 @@
 // Modified for the standalone AJ extraction: decouple Codex protocol types and optional transport.
+// Modified for AJ: restored values and acknowledged commits (Apache-2.0).
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,6 +49,14 @@ impl InProcessCodeModeSession {
                 max_heap_size_bytes: None,
                 ..cell_execution_limits
             },
+        }
+    }
+
+    /// Creates a session with restored values available to its first cell and default limits.
+    pub fn with_stored_values(stored_values: HashMap<String, JsonValue>) -> Self {
+        Self {
+            runtime: SessionRuntime::with_stored_values(stored_values),
+            cell_execution_limits: CodeModeSessionCellExecutionLimits::default(),
         }
     }
 
@@ -304,6 +314,16 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
                 text,
                 cancellation_token,
             )
+            .await
+    }
+
+    async fn store(
+        &self,
+        cell_id: runtime::CellId,
+        writes: HashMap<String, Arc<JsonValue>>,
+    ) -> Result<(), String> {
+        self.delegate
+            .store(protocol_cell_id(&cell_id), writes)
             .await
     }
 

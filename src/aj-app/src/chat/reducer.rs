@@ -330,6 +330,8 @@ pub fn reduce(
             Redraw(true)
         }
 
+        AgentEvent::CodeModeStore { .. } => Redraw(false),
+
         // ---- Notices --------------------------------------------------------
         AgentEvent::Notice { agent_id, text } => {
             // The projected notice of a state entry is durable, and

@@ -279,6 +279,7 @@ fn kind_placeholder(kind: &ConversationEntryKind) -> &'static str {
         | ConversationEntryKind::VerbosityChange { .. } => "(settings)",
         ConversationEntryKind::EnvChange { .. } => "(environment)",
         ConversationEntryKind::GoalChange { .. } => "(goal)",
+        ConversationEntryKind::CodeModeStore { .. } => "(code-mode store)",
         ConversationEntryKind::Context { .. } => "(context)",
         ConversationEntryKind::SubAgentSpawn { .. } => "(subagent)",
         ConversationEntryKind::Compaction { .. } => "(compaction)",

@@ -462,6 +462,11 @@ pub enum ConversationEntryKind {
     EnvChange { env: BTreeMap<String, String> },
     /// A complete goal snapshot on the user branch. `None` explicitly clears it.
     GoalChange { goal: Option<Goal> },
+    /// Committed code-mode writes on this agent's thread. Keys overwrite earlier
+    /// values on the selected ancestry, independently of transcript compaction.
+    CodeModeStore {
+        writes: BTreeMap<String, serde_json::Value>,
+    },
     /// The context the session was created with, as the user sees it: the base
     /// system prompt, the instruction files stitched into it, and the skills
     /// discovered for it. Written once as root-parented [`ThreadKind::Meta`]
@@ -555,11 +560,13 @@ impl ConversationEntryKind {
     /// A compaction failure is punctuation so its error survives reconnect.
     /// A goal is also a submitted task, even before its first inference.
     /// Its state must survive a restart independently of model messages.
+    /// Accepted code-mode writes likewise flush without waiting for a result.
     pub fn is_punctuation(&self) -> bool {
         match self {
             Self::Message { .. }
             | Self::Compaction { .. }
             | Self::CompactionFailed { .. }
+            | Self::CodeModeStore { .. }
             | Self::GoalChange { .. } => true,
             Self::SystemPrompt { .. }
             | Self::ModelChange { .. }
@@ -772,6 +779,7 @@ impl SessionSettings {
                 self.verbosity = Some(verbosity.clone());
             }
             ConversationEntryKind::EnvChange { .. }
+            | ConversationEntryKind::CodeModeStore { .. }
             | ConversationEntryKind::GoalChange { .. }
             | ConversationEntryKind::Context { .. } => {}
             ConversationEntryKind::SubAgentSpawn { settings: snap, .. } => {
@@ -823,6 +831,18 @@ impl Conversation {
     /// Get all entries in this linearized view.
     pub fn entries(&self) -> &[ConversationEntry] {
         &self.entries
+    }
+
+    /// Fold committed writes from the full selected thread ancestry. Compaction
+    /// changes model context, not the lifetime of stored values.
+    pub fn code_mode_store(&self) -> BTreeMap<String, serde_json::Value> {
+        let mut store = BTreeMap::new();
+        for entry in &self.entries {
+            if let ConversationEntryKind::CodeModeStore { writes } = &entry.entry {
+                store.extend(writes.clone());
+            }
+        }
+        store
     }
 
     /// Get the number of message entries only (excluding system prompt).
@@ -2537,6 +2557,23 @@ impl<'a> ConversationView<'a> {
         let entry = ConversationEntryKind::Message { message };
         let parent = self.parent_for_next_append();
         let appended = self.log.append(parent, self.thread, self.agent_id, entry)?;
+        self.head = Some(appended.id.clone());
+        Ok(appended)
+    }
+
+    /// Commit one accepted execution's writes with the same per-line durability
+    /// and thread ownership as a message, without adding model context.
+    pub(crate) fn add_code_mode_store(
+        &mut self,
+        writes: BTreeMap<String, serde_json::Value>,
+    ) -> Result<EntryRef, ConversationError> {
+        let parent = self.parent_for_next_append();
+        let appended = self.log.append(
+            parent,
+            self.thread,
+            self.agent_id,
+            ConversationEntryKind::CodeModeStore { writes },
+        )?;
         self.head = Some(appended.id.clone());
         Ok(appended)
     }
