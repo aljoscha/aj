@@ -20,6 +20,7 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 const EVENT_TYPES: &[&str] = &[
+    "code_mode_store",
     "agent_start",
     "agent_end",
     "turn_start",
@@ -2927,6 +2928,7 @@ where
 
 fn agent_event_type(event: &AgentEvent) -> &'static str {
     match event {
+        AgentEvent::CodeModeStore { .. } => "code_mode_store",
         AgentEvent::AgentStart { .. } => "agent_start",
         AgentEvent::AgentEnd { .. } => "agent_end",
         AgentEvent::TurnStart { .. } => "turn_start",

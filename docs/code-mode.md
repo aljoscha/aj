@@ -41,10 +41,31 @@ Tool failures reject the JavaScript call and can be caught with `try/catch`.
 
 ## Lifetime and visibility
 
-Cells can survive an answer and be collected in a later turn. `store()` and
-`load()` share JSON values within that agent's live session. Each subagent
-has its own evaluator. Nothing is restored after process restart or session
-resume, and changing branches clears this ephemeral state.
+Cells can survive an answer and be collected in a later turn. Each subagent
+has its own evaluator. Running cells are not restored after process restart
+or session resume, and changing branches shuts down the live evaluator.
+
+`store()` and `load()` keep JSON values on the agent's conversation branch.
+Committed values survive restart, resume, compaction, and disabling Code Mode.
+Changing branches restores that branch's values. Subagent stores are separate
+from Main and from each other. This does not make archived subagents runnable
+after resume.
+
+When a script finishes, its writes are recorded as one `code_mode_store` entry
+in the conversation log, including if the script ends with an ordinary error.
+The entry is flushed before the new values or completed result become visible.
+No `wait` collection is required to save a completed script's writes. No entry
+is added for scripts that make no writes. Values are execution state, not model
+messages, and remain outside the model context and rendered conversation.
+
+Cells read a snapshot of committed values plus their own pending writes.
+Concurrent commits are serialized, with later commits replacing earlier values
+for the same key. If cancellation wins before completion is accepted, pending
+writes are discarded. Once completion is accepted, shutdown waits for persistence to finish.
+Neither cancellation nor a script error rolls back filesystem changes or other
+tool side effects. A persistence failure stops execution rather than allowing
+the agent to continue with uncertain store contents. Durability has the same
+process-restart guarantee as other log entries, not a separate power-loss guarantee.
 
 A yielded cell appears in the existing task controls as **open until
 collected**. Evaluation may already be finished while the cell retains its

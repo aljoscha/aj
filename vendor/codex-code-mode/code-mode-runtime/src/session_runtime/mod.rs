@@ -1,3 +1,4 @@
+// Modified for AJ: restored values and reserved async commits (Apache-2.0).
 mod types;
 
 use std::collections::HashMap;
@@ -62,9 +63,25 @@ impl SessionRuntime {
     pub(crate) fn new_with_task_failure_handler(
         task_failure_handler: Option<TaskFailureHandler>,
     ) -> Self {
+        Self::with_initial_state(HashMap::new(), task_failure_handler)
+    }
+
+    pub(crate) fn with_stored_values(stored_values: HashMap<String, JsonValue>) -> Self {
+        Self::with_initial_state(stored_values, None)
+    }
+
+    fn with_initial_state(
+        stored_values: HashMap<String, JsonValue>,
+        task_failure_handler: Option<TaskFailureHandler>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                stored_values: Mutex::new(HashMap::new()),
+                stored_values: Mutex::new(
+                    stored_values
+                        .into_iter()
+                        .map(|(k, v)| (k, Arc::new(v)))
+                        .collect(),
+                ),
                 cells: Mutex::new(HashMap::new()),
                 cell_tasks: TaskTracker::new(),
                 shutdown_token: CancellationToken::new(),
@@ -283,10 +300,14 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             .await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the async stored-values lock serializes acknowledgements and blocks snapshots until commit"
+    )]
     async fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, Arc<JsonValue>>,
-        event: CellEvent,
+        mut event: CellEvent,
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
     ) -> CompletionCommit {
@@ -298,8 +319,38 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             }
             stored_values = self.inner.stored_values.lock() => stored_values,
         };
+        if !cell_state.reserve_completion() {
+            return CompletionCommit::Rejected(event);
+        }
+        // Keep snapshots and other commits behind the acknowledgement. Once reserved,
+        // termination and root cancellation must wait for this callback to finish.
+        let saved = if stored_value_writes.is_empty() {
+            Ok(())
+        } else {
+            self.delegate
+                .store(self.cell_id.clone(), stored_value_writes.clone())
+                .await
+        };
+        let apply_writes = match saved {
+            Ok(()) => true,
+            Err(error) => {
+                if let CellEvent::Completed { error_text, .. } = &mut event {
+                    let message = format!("stored values were not saved: {error}");
+                    match error_text {
+                        Some(original) => {
+                            original.push('\n');
+                            original.push_str(&message);
+                        }
+                        None => *error_text = Some(message),
+                    }
+                }
+                false
+            }
+        };
         cell_state.commit_completion(event, pending_initial_yield_items, || {
-            stored_values.extend(stored_value_writes);
+            if apply_writes {
+                stored_values.extend(stored_value_writes);
+            }
         })
     }
 

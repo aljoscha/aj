@@ -172,6 +172,12 @@ pub enum CompactionPhase {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// A completed JavaScript cell's committed writes. Persistence must finish
+    /// before this event is acknowledged. This is state, not model content.
+    CodeModeStore {
+        agent_id: AgentId,
+        writes: std::collections::BTreeMap<String, Value>,
+    },
     // --- Lifecycle ---------------------------------------------------------
     /// Emitted once when [`Agent::prompt`](crate::Agent) starts a run.
     AgentStart {
@@ -480,6 +486,7 @@ impl AgentEvent {
     pub fn agent_id(&self) -> AgentId {
         match self {
             Self::AgentStart { agent_id, .. }
+            | Self::CodeModeStore { agent_id, .. }
             | Self::AgentEnd { agent_id, .. }
             | Self::TurnStart { agent_id }
             | Self::TurnEnd { agent_id, .. }

@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -129,9 +130,14 @@ def materialize(repo, revision, out):
     audio = section(media, '/// Maximum accepted decoded byte length for prompt audio inputs.\n',
                     '/// Snapshots local image and audio input into portable, validated data URLs.\n')
     (shared / 'audio_limits.rs').write_text('/// Maximum accepted decoded byte length for prompt audio inputs.\n' + audio)
+    # Git-format patches inside an enclosing worktree can be silently skipped
+    # as outside the current prefix. Apply against this standalone staging tree.
+    patch_env = {**os.environ, 'GIT_CEILING_DIRECTORIES': str(out.parent)}
+    for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR'):
+        patch_env.pop(key, None)
     for patch in sorted((SUPPORT / 'patches').glob('*.patch')):
-        subprocess.run(['git', 'apply', '--check', str(patch)], cwd=out, check=True)
-        subprocess.run(['git', 'apply', str(patch)], cwd=out, check=True)
+        subprocess.run(['git', 'apply', '--check', str(patch)], cwd=out, env=patch_env, check=True)
+        subprocess.run(['git', 'apply', str(patch)], cwd=out, env=patch_env, check=True)
     return inventory(out), sources
 
 

@@ -1,5 +1,10 @@
 [
   {
+    "type": "code_mode_store",
+    "agent_id": "main",
+    "writes": {"saved": {"items": [1, true, null]}}
+  },
+  {
     "type": "agent_start",
     "agent_id": {"sub": 1},
     "assignment_pending": true

@@ -3260,6 +3260,120 @@ async fn a_head_refusal_names_the_entry_the_request_sent() {
     harness.host.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_head_switch_restores_code_mode_values_not_the_abandoned_live_store() {
+    fn script(source: &str) -> Vec<AssistantMessage> {
+        let mut call = finalized_text_message("");
+        call.stop_reason = StopReason::ToolUse;
+        call.content = vec![AssistantContent::ToolCall(ToolCall {
+            id: format!("store-{}", rand::random::<u64>()),
+            name: "exec".into(),
+            is_raw: true,
+            arguments: serde_json::json!(source),
+        })];
+        vec![call, finalized_text_message("done")]
+    }
+
+    let mut run = snapshot(scripted(
+        script(r#"store("value", "base");"#),
+        0,
+        Duration::ZERO,
+    ));
+    let model = Arc::make_mut(&mut run.main.model_info);
+    model.id = "gpt-6-astra".into();
+    model.api = "openai-responses".into();
+    run.main.model_key = (model.provider.clone(), model.id.clone());
+    let harness = Harness::with_run_config(run, vec![], None, None);
+    harness.config.lock().unwrap().code_mode = true;
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .unwrap();
+    frames_until(&mut stream, "caught_up", |f| {
+        matches!(f, Frame::CaughtUp { .. })
+    })
+    .await;
+    harness.prompt(&session, "save base").await;
+    settle(&harness, &session, &mut stream).await;
+    let handles = harness.host.local_handles(&session).await.unwrap();
+    let base = handles.log.lock().await.head().unwrap().clone();
+    harness
+        .install_script(
+            &session,
+            script(r#"store("value", "abandoned"); store("sibling_only", true);"#),
+        )
+        .await;
+    harness.prompt(&session, "change values").await;
+    settle(&harness, &session, &mut stream).await;
+    {
+        let log = handles.log.lock().await;
+        let store = log
+            .linearize(log.head().unwrap(), ThreadFilter::USER)
+            .code_mode_store();
+        assert_eq!(store["value"], "abandoned");
+        assert_eq!(store["sibling_only"], true);
+    }
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                changes: Default::default(),
+                target: HeadTarget::Entry(base),
+            },
+        )
+        .await
+        .unwrap();
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .unwrap();
+    frames_until(&mut stream, "caught_up", |f| {
+        matches!(f, Frame::CaughtUp { .. })
+    })
+    .await;
+    harness
+        .install_script(
+            &session,
+            script(r#"text(load("value") + ":" + String(load("sibling_only")));"#),
+        )
+        .await;
+    harness.prompt(&session, "read selected branch").await;
+    settle(&harness, &session, &mut stream).await;
+    {
+        let log = handles.log.lock().await;
+        let messages = log
+            .linearize(log.head().unwrap(), ThreadFilter::USER)
+            .messages();
+        let result = messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                aj_models::types::Message::ToolResult(result) if result.tool_name == "exec" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            serde_json::to_string(result)
+                .unwrap()
+                .contains("base:undefined")
+        );
+    }
+    harness.host.shutdown().await;
+}
+
 /// A head switch forgets what belonged to the branch it left: its
 /// sub-agents stop being promptable and its background tasks leave the
 /// table.

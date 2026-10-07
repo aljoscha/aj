@@ -139,6 +139,18 @@ class ImportContract(unittest.TestCase):
         self.assertEqual((self.vendor / 'upgrade-fixture.txt').read_text(), 'fixture\n')
         self.run_import('--check')
 
+    def test_git_format_patches_apply_inside_a_parent_checkout(self):
+        subprocess.run(['git', 'init', '--quiet', str(self.root)], check=True)
+        (self.support / 'patches/9999-git-fixture.patch').write_text(
+            'diff --git a/patch-fixture.txt b/patch-fixture.txt\n'
+            'new file mode 100644\n--- /dev/null\n+++ b/patch-fixture.txt\n'
+            '@@ -0,0 +1 @@\n+applied\n')
+        revision = json.loads((self.support / 'upstream.json').read_text())['revision']
+        self.run_import('--upgrade', revision)
+        self.assertEqual((self.vendor / 'patch-fixture.txt').read_text(), 'applied\n')
+        self.assertIn('fn store', (self.vendor / 'code-mode-protocol/src/session.rs').read_text())
+        self.run_import('--check')
+
     def test_missing_provenance_and_pending_work_are_preserved(self):
         record = self.support / 'upstream.json'
         original = record.read_bytes()

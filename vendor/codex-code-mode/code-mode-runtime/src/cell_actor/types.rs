@@ -1,3 +1,4 @@
+// Modified for AJ: reserve completion across async store acknowledgements (Apache-2.0).
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -116,6 +117,9 @@ pub(crate) struct CellState {
 
 enum CellPhase {
     Running,
+    Committing {
+        terminator: Option<oneshot::Sender<Result<CellEvent, CellError>>>,
+    },
     Terminating {
         response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
     },
@@ -162,7 +166,7 @@ impl CellState {
                 .phase
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            CellPhase::Running | CellPhase::Completed { .. }
+            CellPhase::Running | CellPhase::Committing { .. } | CellPhase::Completed { .. }
         );
         accepting_phase && !self.cancellation_token.is_cancelled()
     }
@@ -178,6 +182,21 @@ impl CellState {
                 *phase = CellPhase::Terminating { response_tx };
                 self.cancellation_token.cancel();
                 response_event(response_rx)
+            }
+            CellPhase::Committing { terminator: None } => {
+                let (response_tx, response_rx) = oneshot::channel();
+                *phase = CellPhase::Committing {
+                    terminator: Some(response_tx),
+                };
+                response_event(response_rx)
+            }
+            CellPhase::Committing {
+                terminator: Some(response_tx),
+            } => {
+                *phase = CellPhase::Committing {
+                    terminator: Some(response_tx),
+                };
+                Box::pin(async { Err(CellError::AlreadyTerminating) })
             }
             CellPhase::Terminating { response_tx } => {
                 *phase = CellPhase::Terminating { response_tx };
@@ -200,6 +219,20 @@ impl CellState {
         }
     }
 
+    /// Reserves the terminal outcome before awaiting persistence, without holding
+    /// the phase mutex across that await. Later cancellation cannot undo the write.
+    pub(crate) fn reserve_completion(&self) -> bool {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*phase, CellPhase::Running) || self.cancellation_token.is_cancelled() {
+            return false;
+        }
+        *phase = CellPhase::Committing { terminator: None };
+        true
+    }
+
     pub(crate) fn commit_completion(
         &self,
         event: CellEvent,
@@ -210,14 +243,26 @@ impl CellState {
             .phase
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(*phase, CellPhase::Running) || self.cancellation_token.is_cancelled() {
-            return CompletionCommit::Rejected(event);
+        match &*phase {
+            CellPhase::Running if !self.cancellation_token.is_cancelled() => {}
+            CellPhase::Committing { .. } => {}
+            _ => return CompletionCommit::Rejected(event),
         }
         commit();
-        *phase = CellPhase::Completed {
-            pending_initial_yield_items,
-            event,
-        };
+        if let CellPhase::Committing {
+            terminator: Some(response_tx),
+        } = std::mem::replace(&mut *phase, CellPhase::Tombstone)
+        {
+            let event = prepend_initial_yield(event, pending_initial_yield_items);
+            *phase = CellPhase::CompletionClaimed(event.clone());
+            let _ = response_tx.send(Ok(event));
+            self.cancellation_token.cancel();
+        } else {
+            *phase = CellPhase::Completed {
+                pending_initial_yield_items,
+                event,
+            };
+        }
         CompletionCommit::Committed
     }
 
@@ -275,8 +320,8 @@ impl CellState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match std::mem::replace(&mut *phase, CellPhase::Tombstone) {
-            CellPhase::Running => {
-                *phase = CellPhase::Running;
+            previous @ (CellPhase::Running | CellPhase::Committing { .. }) => {
+                *phase = previous;
                 ObservationDelivery::Running(response_tx)
             }
             CellPhase::Completed {
@@ -357,6 +402,12 @@ impl CellState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let observer_event = match std::mem::replace(&mut *phase, CellPhase::Tombstone) {
             CellPhase::Running => Some(event),
+            CellPhase::Committing { terminator } => {
+                if let Some(response_tx) = terminator {
+                    let _ = response_tx.send(Ok(event.clone()));
+                }
+                Some(event)
+            }
             CellPhase::Terminating { response_tx } => {
                 let _ = response_tx.send(Ok(event.clone()));
                 Some(event)

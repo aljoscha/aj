@@ -1,5 +1,5 @@
 //! Bus listener that drives the conversation log off of
-//! [`AgentEvent::MessageEnd`] and compaction failures.
+//! [`AgentEvent::MessageEnd`], store commits, and compaction failures.
 //!
 //! The agent emits a typed
 //! [`AgentEvent::MessageEnd`] for every message payload that needs to hit
@@ -10,6 +10,8 @@
 //! [`MessageEnd`] event into one `ConversationView::add_message`
 //! call. Failed [`AgentEvent::CompactionEnd`] events append transcript-only
 //! errors. Successful checkpoints are appended by the compaction run.
+//! [`AgentEvent::CodeModeStore`] appends committed writes on the same agent
+//! thread, flushing independently of any following tool-result message.
 //!
 //! Because the bus awaits each listener inline, the listener returning `Err`
 //! aborts that run. A hosted log also reports its first terminal write failure
@@ -209,7 +211,7 @@ impl Drop for AppendHandoffGuard {
 }
 
 /// Build a [`Listener`] that writes every finalized
-/// [`AgentEvent::MessageEnd`] to the given log handle.
+/// [`AgentEvent::MessageEnd`] and [`AgentEvent::CodeModeStore`] to the log.
 ///
 /// Failed [`AgentEvent::CompactionEnd`] writes a transcript-only error on the
 /// agent thread. Successful ends use [`AppendHandoff`] and cancellation stays
@@ -341,6 +343,7 @@ fn appends(event: &AgentEvent) -> bool {
         event,
         AgentEvent::SubAgentStart { .. }
             | AgentEvent::MessageEnd { .. }
+            | AgentEvent::CodeModeStore { .. }
             | AgentEvent::CompactionEnd { error: Some(_), .. }
     )
 }
@@ -388,6 +391,9 @@ fn persist(
             let appended = persist_message(log, *agent_id, message.clone())?;
             Ok(Some(appended))
         }
+        AgentEvent::CodeModeStore { agent_id, writes } => agent_view(log, *agent_id)?
+            .add_code_mode_store(writes.clone())
+            .map(Some),
         AgentEvent::CompactionEnd {
             agent_id,
             reason,
@@ -419,7 +425,14 @@ fn persist_message(
     agent_id: AgentId,
     message: AgentMessage,
 ) -> Result<EntryRef, ConversationError> {
-    let mut view = match agent_id {
+    agent_view(log, agent_id)?.add_message(message)
+}
+
+fn agent_view(
+    log: &mut ConversationLog,
+    agent_id: AgentId,
+) -> Result<ConversationView<'_>, ConversationError> {
+    Ok(match agent_id {
         // A `None` head is fine here: the user thread can be empty on a
         // fresh log (only the system-prompt root exists yet), and
         // `ConversationView::user` anchors at that root automatically.
@@ -434,9 +447,7 @@ fn persist_message(
                 })?;
             ConversationView::subagent(log, head, n)
         }
-    };
-
-    view.add_message(message)
+    })
 }
 
 #[cfg(test)]
@@ -599,6 +610,45 @@ mod tests {
             .await
             .expect_err("later append sees the fuse");
         assert_eq!(fault.writes(), writes, "later listener touched descriptor");
+    }
+
+    #[tokio::test]
+    async fn code_mode_store_append_failures_fuse_without_forwarding() {
+        // Punctuation writes through the unbuffered append descriptor. Explicit
+        // File::flush is a separate log operation, not part of this acknowledgment.
+        for failure in [AppendFault::ShortWrite(19), AppendFault::WriteZero] {
+            let (_dir, log) = fresh_log();
+            let fault = AppendFaultFixture::new(failure);
+            fault.install(&mut *log.lock().await).unwrap();
+            let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+            let listener = persisting_forwarder(
+                Arc::clone(&log),
+                AppendHandoff::default(),
+                tx,
+                PersistenceFence::default(),
+            );
+            let event = AgentEvent::CodeModeStore {
+                agent_id: AgentId::Main,
+                writes: [("key".into(), serde_json::json!("value"))].into(),
+            };
+            listener(&event)
+                .await
+                .expect_err("commit must await durability");
+            assert!(
+                events.try_recv().is_err(),
+                "failed commit must not be forwarded"
+            );
+            let guard = log.lock().await;
+            assert!(guard.write_failure().is_some());
+            assert!(
+                guard.head().is_none(),
+                "failed append must not advance the branch"
+            );
+            drop(guard);
+            let writes = fault.writes();
+            listener(&event).await.expect_err("fused");
+            assert_eq!(fault.writes(), writes);
+        }
     }
 
     fn count_string(value: &serde_json::Value, target: &str) -> usize {
