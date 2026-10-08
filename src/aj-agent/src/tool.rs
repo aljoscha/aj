@@ -1234,11 +1234,11 @@ pub struct FreeformTool {
 }
 
 impl ErasedToolDefinition {
-    pub(crate) fn for_model(&self, model: &ModelInfo) -> aj_models::types::ToolDefinition {
+    pub(crate) fn for_provider(&self, provider: &dyn Provider) -> aj_models::types::ToolDefinition {
         let freeform = self
             .freeform
             .as_ref()
-            .filter(|_| aj_models::provider::supports_freeform_tools(&model.api));
+            .filter(|_| provider.supports_freeform_tools());
         aj_models::types::ToolDefinition {
             name: self.name.clone(),
             description: freeform

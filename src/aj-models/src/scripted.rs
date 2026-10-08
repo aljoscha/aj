@@ -221,6 +221,11 @@ impl ScriptedProvider {
 }
 
 impl Provider for ScriptedProvider {
+    fn supports_freeform_tools(&self) -> bool {
+        // Scripted streams can reproduce both JSON and raw tool calls.
+        true
+    }
+
     fn stream(
         &self,
         model: &ModelInfo,

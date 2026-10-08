@@ -23,10 +23,15 @@ const PATCH: &str = "*** Begin Patch\n*** Add File: result.txt\n+original\n*** E
 
 struct Recorder {
     inner: ScriptedProvider,
+    interface: Box<dyn Provider>,
     contexts: Mutex<Vec<Context>>,
 }
 
 impl Provider for Recorder {
+    fn supports_freeform_tools(&self) -> bool {
+        self.interface.supports_freeform_tools()
+    }
+
     fn stream(
         &self,
         model: &ModelInfo,
@@ -47,6 +52,20 @@ impl Provider for Recorder {
 }
 
 fn setup(api: &str, code_mode: bool, arguments: Value) -> (TempDir, Agent, Arc<Recorder>) {
+    setup_with_interface(
+        api,
+        code_mode,
+        arguments,
+        aj_models::provider::provider_for(api).unwrap(),
+    )
+}
+
+fn setup_with_interface(
+    api: &str,
+    code_mode: bool,
+    arguments: Value,
+    interface: Box<dyn Provider>,
+) -> (TempDir, Agent, Arc<Recorder>) {
     let directory = TempDir::new().unwrap();
     let model = ModelInfo {
         id: "gpt-6-astra".into(),
@@ -77,6 +96,7 @@ fn setup(api: &str, code_mode: bool, arguments: Value) -> (TempDir, Agent, Arc<R
     let mut done = AssistantMessage::empty();
     done.stop_reason = StopReason::Stop;
     let provider = Arc::new(Recorder {
+        interface,
         inner: ScriptedProvider::from_messages(vec![call, done], 1024, Duration::ZERO)
             .on_exhausted(ExhaustedBehavior::Panic),
         contexts: Mutex::new(vec![]),
@@ -151,6 +171,45 @@ async fn direct_raw_and_json_fallback_calls_keep_their_advertised_shapes() {
             })
             .unwrap();
         assert_eq!(call.is_raw, raw);
+    }
+}
+
+#[tokio::test]
+async fn selected_provider_controls_raw_tools_and_code_mode_not_the_api_label() {
+    for (label, interface, supported) in [
+        ("openai-responses", "anthropic-messages", false),
+        ("custom-api", "openai-responses", true),
+    ] {
+        for requested in [false, true] {
+            let native = requested && supported;
+            let arguments = if native {
+                json!(format!("text(await tools.apply_patch({}));", json!(PATCH)))
+            } else if supported {
+                json!(PATCH)
+            } else {
+                json!({"patchText":PATCH})
+            };
+            let (directory, mut agent, provider) = setup_with_interface(
+                label,
+                native,
+                arguments,
+                aj_models::provider::provider_for(interface).unwrap(),
+            );
+            agent.set_code_mode(requested);
+            run(&mut agent).await;
+            assert_eq!(
+                std::fs::read(directory.path().join("result.txt")).unwrap(),
+                b"original\n"
+            );
+            let contexts = provider.contexts.lock().unwrap();
+            let tools = &contexts[0].tools;
+            assert_eq!(tools.iter().any(|tool| tool.name == "exec"), native);
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == if native { "exec" } else { "apply_patch" })
+                .unwrap();
+            assert_eq!(tool.input_format.is_some(), supported);
+        }
     }
 }
 
