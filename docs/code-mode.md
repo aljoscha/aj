@@ -33,6 +33,10 @@ while Code Mode is active, leaving `wait` with Codex's cell-wait semantics.
 It does not collect cell output. Delegation and background-task tools remain
 available inside JavaScript, subject to the agent's existing capability limits.
 
+Each tool declares its `CodeModeExposure`: `Nested` by default, or `DirectOnly`.
+The catalog and dispatch checks use that metadata, independently of execution
+scheduling. Changes to exposure also apply to new calls from existing cells.
+
 Tools with structured results expose those schemas. Bash returns stdout,
 stderr, exit status, truncation and background-task metadata. Text reads
 return unnumbered text plus line and continuation metadata. Other tools

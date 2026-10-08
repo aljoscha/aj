@@ -68,6 +68,9 @@ async fn act(future: aj_agent::goal::GoalFuture) -> ToolOutcome {
 
 impl ToolDefinition for CreateGoalTool {
     type Input = CreateGoalInput;
+    fn code_mode_exposure(&self) -> aj_agent::tool::CodeModeExposure {
+        aj_agent::tool::CodeModeExposure::DirectOnly
+    }
     fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
         aj_agent::tool::ExecutionMode::Control
     }
@@ -101,6 +104,9 @@ impl ToolDefinition for CreateGoalTool {
 
 impl ToolDefinition for GetGoalTool {
     type Input = GetGoalInput;
+    fn code_mode_exposure(&self) -> aj_agent::tool::CodeModeExposure {
+        aj_agent::tool::CodeModeExposure::DirectOnly
+    }
     fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
         aj_agent::tool::ExecutionMode::Control
     }
@@ -121,6 +127,9 @@ impl ToolDefinition for GetGoalTool {
 
 impl ToolDefinition for UpdateGoalTool {
     type Input = UpdateGoalInput;
+    fn code_mode_exposure(&self) -> aj_agent::tool::CodeModeExposure {
+        aj_agent::tool::CodeModeExposure::DirectOnly
+    }
     fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
         aj_agent::tool::ExecutionMode::Control
     }

@@ -15,6 +15,10 @@ pub struct WaitInput {}
 impl ToolDefinition for WaitTool {
     type Input = WaitInput;
 
+    fn code_mode_exposure(&self) -> aj_agent::tool::CodeModeExposure {
+        aj_agent::tool::CodeModeExposure::DirectOnly
+    }
+
     fn execution_mode(&self) -> aj_agent::tool::ExecutionMode {
         aj_agent::tool::ExecutionMode::Control
     }
