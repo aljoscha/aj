@@ -28,18 +28,16 @@ pub(crate) fn eligible(model: &ModelInfo) -> bool {
         serde_json::from_str(include_str!("../../../vendor/codex-code-mode/models.json"))
             .expect("vendored Codex catalog must be valid JSON")
     });
-    matches!(
-        model.api.as_str(),
-        "openai-responses" | "openai-codex-responses"
-    ) && CATALOG["models"].as_array().is_some_and(|models| {
-        models.iter().any(|m| {
-            m["slug"].as_str() == Some(model.id.as_str())
-                && matches!(
-                    m["tool_mode"].as_str(),
-                    Some("code_mode" | "code_mode_only")
-                )
+    aj_models::provider::supports_freeform_tools(&model.api)
+        && CATALOG["models"].as_array().is_some_and(|models| {
+            models.iter().any(|m| {
+                m["slug"].as_str() == Some(model.id.as_str())
+                    && matches!(
+                        m["tool_mode"].as_str(),
+                        Some("code_mode" | "code_mode_only")
+                    )
+            })
         })
-    })
 }
 
 fn nested_tools(tools: &HashMap<String, ErasedToolDefinition>) -> Vec<protocol::ToolDefinition> {
@@ -50,9 +48,16 @@ fn nested_tools(tools: &HashMap<String, ErasedToolDefinition>) -> Vec<protocol::
             protocol::augment_tool_definition(protocol::ToolDefinition {
                 name: tool.name.clone(),
                 tool_name: protocol::ToolName::plain(&tool.name),
-                description: tool.description.clone(),
-                kind: protocol::CodeModeToolKind::Function,
-                input_schema: Some(tool.input_schema.clone()),
+                description: tool
+                    .freeform
+                    .as_ref()
+                    .map_or_else(|| tool.description.clone(), |raw| raw.description.clone()),
+                kind: if tool.freeform.is_some() {
+                    protocol::CodeModeToolKind::Freeform
+                } else {
+                    protocol::CodeModeToolKind::Function
+                },
+                input_schema: tool.freeform.is_none().then(|| tool.input_schema.clone()),
                 input_schema_max_bytes: None,
                 output_schema: Some(
                     tool.output_schema
@@ -131,20 +136,21 @@ SOURCE: /[\s\S]+/
         .filter(|t| t.code_mode_exposure == crate::tool::CodeModeExposure::DirectOnly)
         .collect();
     direct.sort_by(|a, b| a.name.cmp(&b.name));
-    result.extend(
-        direct
-            .into_iter()
-            .map(|t| aj_models::types::ToolDefinition {
-                name: if t.name == "wait" {
-                    "yield".into()
-                } else {
-                    t.name.clone()
-                },
-                description: t.description.clone(),
-                parameters: t.input_schema.clone(),
-                input_format: None,
-            }),
-    );
+    result.extend(direct.into_iter().map(|t| {
+        aj_models::types::ToolDefinition {
+            name: if t.name == "wait" {
+                "yield".into()
+            } else {
+                t.name.clone()
+            },
+            description: t
+                .freeform
+                .as_ref()
+                .map_or_else(|| t.description.clone(), |raw| raw.description.clone()),
+            parameters: t.input_schema.clone(),
+            input_format: t.freeform.as_ref().map(|raw| raw.input_format.clone()),
+        }
+    }));
     result
 }
 
@@ -623,7 +629,7 @@ impl protocol::CodeModeSessionDelegate for Delegate {
             let input = invocation.input.unwrap_or(Value::Null);
             let mut assistant = AssistantMessage::empty();
             assistant.content.push(AssistantContent::ToolCall(ToolCall {
-                is_raw: false,
+                is_raw: runner.tools[&name].freeform.is_some() && input.is_string(),
                 id: call_id.clone(),
                 name: name.clone(),
                 arguments: input.clone(),
