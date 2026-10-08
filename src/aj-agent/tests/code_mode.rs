@@ -59,6 +59,10 @@ impl RecordingProvider {
 }
 
 impl Provider for RecordingProvider {
+    fn supports_freeform_tools(&self) -> bool {
+        true
+    }
+
     fn stream(&self, _: &ModelInfo, _: &Context, _: &StreamOptions) -> AssistantMessageEventStream {
         panic!("Agent must call stream_simple")
     }

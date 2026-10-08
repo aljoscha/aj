@@ -62,6 +62,10 @@ pub(super) const ID_LIMIT: usize = 64;
 pub struct OpenAiResponsesProvider;
 
 impl Provider for OpenAiResponsesProvider {
+    fn supports_freeform_tools(&self) -> bool {
+        true
+    }
+
     fn stream(
         &self,
         model: &ModelInfo,

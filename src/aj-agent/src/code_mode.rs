@@ -23,12 +23,12 @@ use crate::tool::{
 };
 use crate::{AgentEvent, BoxError, ErasedToolDefinition};
 
-pub(crate) fn eligible(model: &ModelInfo) -> bool {
+pub(crate) fn eligible(model: &ModelInfo, provider: &dyn aj_models::provider::Provider) -> bool {
     static CATALOG: LazyLock<Value> = LazyLock::new(|| {
         serde_json::from_str(include_str!("../../../vendor/codex-code-mode/models.json"))
             .expect("vendored Codex catalog must be valid JSON")
     });
-    aj_models::provider::supports_freeform_tools(&model.api)
+    provider.supports_freeform_tools()
         && CATALOG["models"].as_array().is_some_and(|models| {
             models.iter().any(|m| {
                 m["slug"].as_str() == Some(model.id.as_str())

@@ -96,6 +96,10 @@ const ORIGINATOR: &str = "aj";
 pub struct OpenAiCodexResponsesProvider;
 
 impl Provider for OpenAiCodexResponsesProvider {
+    fn supports_freeform_tools(&self) -> bool {
+        true
+    }
+
     fn stream(
         &self,
         model: &ModelInfo,
