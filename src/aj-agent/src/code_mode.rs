@@ -451,9 +451,15 @@ impl CodeMode {
             // Retain the writer lease until the actor has drained its callbacks,
             // including when another observer initiated termination.
             closed.cancelled().await;
+            let description = match status {
+                TaskStatus::Exited(Some(0)) => "completed",
+                TaskStatus::Killed => "cancelled",
+                TaskStatus::Exited(_) | TaskStatus::CaptureFailed(_) => "failed",
+                TaskStatus::Running => "is still running",
+            };
             events.finished(status, TaskNotice {
                 owner: events.owner(), task_id: id, kind, label,
-                status, body: format!("Code Mode cell {public_id} closed ({status:?})."),
+                status, body: format!("Code Mode cell {public_id} {description}."),
             }).await;
         });
     }
