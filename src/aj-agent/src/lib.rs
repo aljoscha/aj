@@ -386,12 +386,7 @@ impl Agent {
         // execution closure the provider has no use for).
         let api_tools: Vec<UnifiedToolDefinition> = tools
             .iter()
-            .map(|tool_def| UnifiedToolDefinition {
-                name: tool_def.name.clone(),
-                description: tool_def.description.clone(),
-                parameters: tool_def.input_schema.clone(),
-                input_format: None,
-            })
+            .map(|tool_def| tool_def.for_model(&model_info))
             .collect();
 
         // Convert ErasedToolDefinition to HashMap for lookup
@@ -942,12 +937,7 @@ impl Agent {
         }
         self.tools = tools
             .iter()
-            .map(|tool| UnifiedToolDefinition {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.input_schema.clone(),
-                input_format: None,
-            })
+            .map(|tool| tool.for_model(&self.model_info))
             .collect();
         self.tool_definitions = tools
             .into_iter()
@@ -1010,12 +1000,7 @@ impl Agent {
             self.tools = self
                 .tool_definitions
                 .values()
-                .map(|tool| UnifiedToolDefinition {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    parameters: tool.input_schema.clone(),
-                    input_format: None,
-                })
+                .map(|tool| tool.for_model(&self.model_info))
                 .collect();
             self.tools.sort_by(|a, b| a.name.cmp(&b.name));
             if self.code_mode_requested {

@@ -1156,6 +1156,13 @@ pub trait ToolDefinition: Send + Sync {
         derive_schema::<Self::Input>()
     }
 
+    /// Optional raw-text interface. The JSON description and schema remain the
+    /// fallback for APIs without custom tools. Input deserialization must accept
+    /// both interfaces. Hooks observe the original string or JSON argument value.
+    fn freeform(&self) -> Option<FreeformTool> {
+        None
+    }
+
     /// JSON Schema for the tool's programmatic result. Without a schema,
     /// composition callers receive the tool's text or image content.
     fn output_schema(&self) -> Option<Value> {
@@ -1215,7 +1222,31 @@ pub struct ErasedToolDefinition {
     pub output_schema: Option<Value>,
     pub execution_mode: ExecutionMode,
     pub code_mode_exposure: CodeModeExposure,
+    pub freeform: Option<FreeformTool>,
     pub func: ErasedToolFn,
+}
+
+/// A tool's raw-text model interface, alongside its JSON fallback.
+#[derive(Clone)]
+pub struct FreeformTool {
+    pub description: String,
+    pub input_format: aj_models::types::ToolInputFormat,
+}
+
+impl ErasedToolDefinition {
+    pub(crate) fn for_model(&self, model: &ModelInfo) -> aj_models::types::ToolDefinition {
+        let freeform = self
+            .freeform
+            .as_ref()
+            .filter(|_| aj_models::provider::supports_freeform_tools(&model.api));
+        aj_models::types::ToolDefinition {
+            name: self.name.clone(),
+            description: freeform
+                .map_or_else(|| self.description.clone(), |raw| raw.description.clone()),
+            parameters: self.input_schema.clone(),
+            input_format: freeform.map(|raw| raw.input_format.clone()),
+        }
+    }
 }
 
 impl<T> From<T> for ErasedToolDefinition
@@ -1229,6 +1260,7 @@ where
         let output_schema = tool.output_schema();
         let execution_mode = tool.execution_mode();
         let code_mode_exposure = tool.code_mode_exposure();
+        let freeform = tool.freeform();
         ErasedToolDefinition {
             name,
             description,
@@ -1236,6 +1268,7 @@ where
             output_schema,
             execution_mode,
             code_mode_exposure,
+            freeform,
             func: Arc::new(move |ctx, raw_input| {
                 let parsed: Result<T::Input, _> = serde_json::from_value(raw_input);
                 let tool = tool.clone();
