@@ -4,7 +4,8 @@ Enable `code_mode = true` in `.aj/config.toml` or `~/.aj/config.toml`, or use
 the `code_mode` setting. Changes take effect next turn. The default is off.
 
 Eligibility comes from the pinned Codex catalog's `tool_mode`, not a copied
-name list. AJ also requires the OpenAI Responses or Codex Responses API.
+name list. The selected provider must also declare freeform tool support.
+The Responses and Codex Responses adapters support it.
 Other selections use ordinary tools and show a fallback notice.
 
 ## Model interface
@@ -39,9 +40,10 @@ scheduling. Changes to exposure also apply to new calls from existing cells.
 
 `apply_patch` accepts a patch string, matching Codex's freeform interface:
 `await tools.apply_patch("*** Begin Patch\n...\n*** End Patch")`.
-Outside Code Mode, Responses APIs advertise the raw patch grammar. Other APIs
-advertise the JSON `{patchText: "..."}` interface. Existing JSON calls remain
-executable. Hooks receive the actual argument shape, string or object.
+Outside Code Mode, providers declaring freeform support advertise the raw patch
+grammar. Other providers advertise the JSON `{patchText: "..."}` interface.
+Existing JSON calls remain executable. Hooks receive the actual argument shape,
+string or object.
 See [patch compatibility](../third-party/codex-apply-patch/README.md) for scope.
 
 Tools with structured results expose those schemas. Bash returns stdout,

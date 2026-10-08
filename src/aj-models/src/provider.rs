@@ -31,6 +31,13 @@ use crate::types::{
 /// [`AssistantMessageEvent`]s onto the returned
 /// [`AssistantMessageEventStream`].
 pub trait Provider: Send + Sync {
+    /// Whether this adapter accepts grammar-constrained raw tool definitions.
+    /// Tool owners supply JSON fallbacks when unsupported. Wrappers should
+    /// delegate this capability to the provider that handles their requests.
+    fn supports_freeform_tools(&self) -> bool {
+        false
+    }
+
     /// Low-level stream with provider-specific options already resolved.
     ///
     /// The returned [`AssistantMessageEventStream`] is live: events flow as
@@ -79,12 +86,6 @@ pub fn provider_for(api: &str) -> Option<Box<dyn Provider>> {
         "openai-codex-responses" => Some(Box::new(crate::openai::OpenAiCodexResponsesProvider)),
         _ => None,
     }
-}
-
-/// Whether the API adapter can advertise raw custom tools with a grammar.
-/// Other adapters require a JSON-function fallback supplied by the tool owner.
-pub fn supports_freeform_tools(api: &str) -> bool {
-    matches!(api, "openai-responses" | "openai-codex-responses")
 }
 
 /// Stream inference using the appropriate provider for the model.

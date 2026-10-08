@@ -386,7 +386,7 @@ impl Agent {
         // execution closure the provider has no use for).
         let api_tools: Vec<UnifiedToolDefinition> = tools
             .iter()
-            .map(|tool_def| tool_def.for_model(&model_info))
+            .map(|tool_def| tool_def.for_provider(provider.as_ref()))
             .collect();
 
         // Convert ErasedToolDefinition to HashMap for lookup
@@ -937,7 +937,7 @@ impl Agent {
         }
         self.tools = tools
             .iter()
-            .map(|tool| tool.for_model(&self.model_info))
+            .map(|tool| tool.for_provider(self.provider.as_ref()))
             .collect();
         self.tool_definitions = tools
             .into_iter()
@@ -974,7 +974,8 @@ impl Agent {
 
     async fn prepare_code_mode(&mut self) -> Result<(), TurnError> {
         self.check_code_mode_store()?;
-        if self.code_mode_requested && code_mode::eligible(&self.model_info) {
+        if self.code_mode_requested && code_mode::eligible(&self.model_info, self.provider.as_ref())
+        {
             let runner = self.tool_runner();
             if let Some(mode) = &self.code_mode {
                 mode.refresh(runner);
@@ -1000,7 +1001,7 @@ impl Agent {
             self.tools = self
                 .tool_definitions
                 .values()
-                .map(|tool| tool.for_model(&self.model_info))
+                .map(|tool| tool.for_provider(self.provider.as_ref()))
                 .collect();
             self.tools.sort_by(|a, b| a.name.cmp(&b.name));
             if self.code_mode_requested {
@@ -2215,7 +2216,7 @@ impl Agent {
         };
         let mut tools = self.tool_definitions.clone();
         if self.code_mode_requested
-            && code_mode::eligible(&self.model_info)
+            && code_mode::eligible(&self.model_info, self.provider.as_ref())
             && let Some(wait) = tools.get("wait").cloned()
         {
             tools.insert("yield".into(), wait);
