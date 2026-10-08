@@ -270,6 +270,66 @@ struct Gate {
     finished: CancellationToken,
 }
 
+#[derive(Clone)]
+struct DirectEcho(Echo);
+
+impl ToolDefinition for DirectEcho {
+    type Input = EchoInput;
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+    fn description(&self) -> &'static str {
+        "Echo through a direct model call"
+    }
+    fn code_mode_exposure(&self) -> aj_agent::tool::CodeModeExposure {
+        aj_agent::tool::CodeModeExposure::DirectOnly
+    }
+    async fn execute(
+        &self,
+        ctx: &mut dyn ToolContext,
+        input: EchoInput,
+    ) -> Result<ToolOutcome, BoxError> {
+        self.0.execute(ctx, input).await
+    }
+}
+
+#[tokio::test]
+async fn tool_exposure_controls_catalog_direct_dispatch_and_live_nested_dispatch() {
+    let echo = Echo::default();
+    let gate = Gate::default();
+    let mut h = Harness::new(true, vec![echo.clone().into(), gate.clone().into()]);
+    h.exec(
+        r#"yield_control(); await tools.gate({});
+try { await tools.echo({value: "nested"}); } catch (e) { text(String(e)); }"#,
+    )
+    .await;
+    bounded(gate.entered.cancelled()).await;
+    let (_, cell_id) = h.cell();
+    h.agent
+        .set_tools(vec![DirectEcho(echo.clone()).into(), gate.clone().into()]);
+    // The existing cell still has an echo binding. Refresh dispatch policy
+    // before releasing it, so rejection must occur at the host boundary.
+    *h.provider.release_at_inference.lock().unwrap() = Some(gate.release.clone());
+    h.collect(&cell_id).await;
+    assert!(h.result("wait").contains("not available inside exec"));
+    assert!(echo.0.lock().unwrap().is_empty());
+    h.provider.enqueue("echo", json!({"value":"direct"}));
+    h.provider.done();
+    h.prompt().await;
+    assert_eq!(*echo.0.lock().unwrap(), ["direct"]);
+    let contexts = h.provider.contexts.lock().unwrap();
+    let tools = &contexts.last().unwrap().tools;
+    assert!(tools.iter().any(|tool| tool.name == "echo"));
+    assert!(
+        !tools
+            .iter()
+            .find(|tool| tool.name == "exec")
+            .unwrap()
+            .description
+            .contains("tools.echo(")
+    );
+}
+
 impl ToolDefinition for Gate {
     type Input = Value;
     fn name(&self) -> &'static str {

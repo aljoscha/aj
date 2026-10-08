@@ -42,17 +42,10 @@ pub(crate) fn eligible(model: &ModelInfo) -> bool {
     })
 }
 
-pub(crate) fn direct_only(name: &str) -> bool {
-    matches!(
-        name,
-        "wait" | "yield" | "create_goal" | "get_goal" | "update_goal"
-    )
-}
-
 fn nested_tools(tools: &HashMap<String, ErasedToolDefinition>) -> Vec<protocol::ToolDefinition> {
     let mut tools: Vec<_> = tools
         .values()
-        .filter(|tool| !direct_only(&tool.name))
+        .filter(|tool| tool.code_mode_exposure == crate::tool::CodeModeExposure::Nested)
         .map(|tool| {
             protocol::augment_tool_definition(protocol::ToolDefinition {
                 name: tool.name.clone(),
@@ -135,7 +128,7 @@ SOURCE: /[\s\S]+/
     ];
     let mut direct: Vec<_> = tools
         .values()
-        .filter(|t| direct_only(&t.name) && t.name != "yield")
+        .filter(|t| t.code_mode_exposure == crate::tool::CodeModeExposure::DirectOnly)
         .collect();
     direct.sort_by(|a, b| a.name.cmp(&b.name));
     result.extend(
@@ -620,7 +613,9 @@ impl protocol::CodeModeSessionDelegate for Delegate {
                 .expect("code mode runner lock poisoned")
                 .clone();
             let name = invocation.tool_name.name;
-            if direct_only(&name) || !runner.tools.contains_key(&name) {
+            if !runner.tools.get(&name).is_some_and(|tool| {
+                tool.code_mode_exposure == crate::tool::CodeModeExposure::Nested
+            }) {
                 return Err(format!("Tool {name} is not available inside exec"));
             }
             let cell_id = self.shared.public_id(&invocation.cell_id);
