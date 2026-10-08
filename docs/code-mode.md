@@ -37,6 +37,13 @@ Each tool declares its `CodeModeExposure`: `Nested` by default, or `DirectOnly`.
 The catalog and dispatch checks use that metadata, independently of execution
 scheduling. Changes to exposure also apply to new calls from existing cells.
 
+`apply_patch` accepts a patch string, matching Codex's freeform interface:
+`await tools.apply_patch("*** Begin Patch\n...\n*** End Patch")`.
+Outside Code Mode, Responses APIs advertise the raw patch grammar. Other APIs
+advertise the JSON `{patchText: "..."}` interface. Existing JSON calls remain
+executable. Hooks receive the actual argument shape, string or object.
+See [patch compatibility](../third-party/codex-apply-patch/README.md) for scope.
+
 Tools with structured results expose those schemas. Bash returns stdout,
 stderr, exit status, truncation and background-task metadata. Text reads
 return unnumbered text plus line and continuation metadata. Other tools

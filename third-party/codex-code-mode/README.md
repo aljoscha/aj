@@ -155,6 +155,10 @@ it explicitly, along with direct-only tool policy and the small AJ description
 overrides, when reviewing an upgrade. Do not assume a successful import checks
 these host-level interfaces.
 
+The patch tool's raw grammar and description have separate provenance and
+compatibility notes in [codex-apply-patch](../codex-apply-patch/README.md).
+Review those assets when updating the model-facing Codex interfaces.
+
 To change a local patch, work in a separate copy of the verified extraction and
 generate a patch relative to that workspace. Add it under `patches/`, then run
 `--upgrade` with the recorded revision if upstream itself is unchanged. Do not

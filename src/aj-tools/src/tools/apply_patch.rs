@@ -4,9 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aj_agent::tool::{
-    ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome, wire_diff,
+    ExecutionMode, FreeformTool, ToolContext, ToolDefinition, ToolDetails, ToolOutcome, wire_diff,
 };
-use aj_models::types::UserContent;
+use aj_models::types::{ToolInputFormat, UserContent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +23,8 @@ starts with one of these headers:
   `*** Move to: <new path>` to rename it.
 
 An update contains one or more hunks starting with `@@`, optionally followed by
-a class, function, or other selector. Within a hunk, prefix unchanged context
+a class, function, or other selector. The first hunk may omit `@@`. A selector
+must match a line before the hunk's context. Within a hunk, prefix unchanged context
 with a space, removed lines with `-`, and added lines with `+`.
 
 Include at least 3 unchanged lines before and after a change when available.
@@ -38,7 +39,7 @@ Example:
 ```
 *** Begin Patch
 *** Update File: src/utils.ts
-@@ export function label
+@@
  export function label(value: string) {
 -  return value
 +  return value.trim()
@@ -53,12 +54,29 @@ const TRUNCATION_SUFFIX: &str = "… [truncated]";
 #[derive(Clone)]
 pub struct ApplyPatchTool;
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyPatchInput {
     /// The full patch text that describes all changes to be made.
-    #[serde(alias = "patch")]
     pub patch_text: String,
+}
+
+impl<'de> Deserialize<'de> for ApplyPatchInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Raw(String),
+            Object {
+                #[serde(rename = "patchText", alias = "patch", alias = "input")]
+                patch_text: String,
+            },
+        }
+        let patch_text = match Input::deserialize(deserializer)? {
+            Input::Raw(text) | Input::Object { patch_text: text } => text,
+        };
+        Ok(Self { patch_text })
+    }
 }
 
 impl ToolDefinition for ApplyPatchTool {
@@ -70,6 +88,16 @@ impl ToolDefinition for ApplyPatchTool {
 
     fn description(&self) -> &'static str {
         DESCRIPTION
+    }
+
+    fn freeform(&self) -> Option<FreeformTool> {
+        Some(FreeformTool {
+            description: "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.".into(),
+            input_format: ToolInputFormat::Grammar {
+                syntax: "lark".into(),
+                definition: include_str!("../../assets/apply_patch.lark").into(),
+            },
+        })
     }
 
     fn execution_mode(&self) -> ExecutionMode {
@@ -289,8 +317,6 @@ fn parse_patch(raw: &str) -> Result<Parsed, String> {
             while i < end && !is_operation_header(lines[i]) {
                 if let Some(line) = lines[i].strip_prefix('+') {
                     added.push(line);
-                } else if lines[i].is_empty() {
-                    added.push("");
                 } else {
                     return Err(format!(
                         "Invalid patch format: Add File lines must start with '+', got: \"{}\"",
@@ -301,7 +327,7 @@ fn parse_patch(raw: &str) -> Result<Parsed, String> {
             }
             operations.push(Operation::Add {
                 path: path.into(),
-                content: added.join("\n"),
+                content: added.into_iter().map(|line| format!("{line}\n")).collect(),
             });
         } else if let Some(path) = lines[i].strip_prefix("*** Delete File: ") {
             if !path.is_empty() {
@@ -323,22 +349,17 @@ fn parse_patch(raw: &str) -> Result<Parsed, String> {
             }
             let mut hunks = Vec::new();
             while i < end && !is_operation_header(lines[i]) {
-                if lines[i].trim() == "*** End of File" {
-                    i += 1;
-                    continue;
-                }
                 if !lines[i].starts_with("@@") && !is_edit_line(lines[i]) {
                     return Err(format!(
                         "Invalid patch format: unexpected line in Update File: \"{}\"",
                         truncate(lines[i], 30)
                     ));
                 }
-                let mut selectors = Vec::new();
-                while i < end && lines[i].starts_with("@@") {
-                    let selector = lines[i][2..].trim_start();
-                    if !selector.is_empty() {
-                        selectors.push(selector.to_string());
-                    }
+                let mut selector = None;
+                if lines[i] == "@@" {
+                    i += 1;
+                } else if let Some(value) = lines[i].strip_prefix("@@ ") {
+                    selector = Some(value.to_string());
                     i += 1;
                 }
                 let mut old_lines = Vec::new();
@@ -354,7 +375,10 @@ fn parse_patch(raw: &str) -> Result<Parsed, String> {
                         break;
                     }
                     let line = lines[i];
-                    if let Some(value) = line.strip_prefix(' ') {
+                    if let Some(value) = line
+                        .strip_prefix(' ')
+                        .or_else(|| line.is_empty().then_some(""))
+                    {
                         removed_indices.clear();
                         addition_index = 0;
                         old_line_index_for_new_line.push(Some(old_lines.len()));
@@ -376,13 +400,33 @@ fn parse_patch(raw: &str) -> Result<Parsed, String> {
                     }
                     i += 1;
                 }
+                if old_lines.is_empty() && new_lines.is_empty() {
+                    return Err(
+                        "Invalid patch format: update hunk does not contain any lines".into(),
+                    );
+                }
                 hunks.push(Hunk {
-                    selector: (!selectors.is_empty()).then(|| selectors.join("\n")),
+                    selector,
                     old_lines,
                     new_lines,
                     old_line_index_for_new_line,
                     eof,
                 });
+                if eof {
+                    while i < end && lines[i].trim().is_empty() {
+                        i += 1;
+                    }
+                    if i < end && !is_operation_header(lines[i]) && !lines[i].starts_with("@@") {
+                        return Err(
+                            "Invalid patch format: expected @@ after *** End of File".into()
+                        );
+                    }
+                }
+            }
+            if hunks.is_empty() {
+                return Err(format!(
+                    "Invalid patch format: Update File hunk for '{path}' is empty"
+                ));
             }
             operations.push(Operation::Update {
                 path: path.into(),
@@ -390,7 +434,10 @@ fn parse_patch(raw: &str) -> Result<Parsed, String> {
                 hunks,
             });
         } else {
-            i += 1;
+            return Err(format!(
+                "Invalid patch format: unexpected top-level line: {:?}",
+                truncate(lines[i], 30)
+            ));
         }
     }
     if operations.is_empty() {
@@ -414,7 +461,7 @@ fn is_operation_header(line: &str) -> bool {
 }
 
 fn is_edit_line(line: &str) -> bool {
-    line.starts_with([' ', '-', '+'])
+    line.is_empty() || line.starts_with([' ', '-', '+'])
 }
 
 fn truncate(value: &str, length: usize) -> String {
@@ -433,14 +480,8 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
 
 fn apply_operation(cwd: &Path, operation: Operation) -> Result<Option<Applied>, String> {
     match operation {
-        Operation::Add { path, mut content } => {
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
+        Operation::Add { path, content } => {
             let diff = wire_diff(&path, "", &content);
-            if diff.added == 0 && diff.removed == 0 {
-                return Ok(None);
-            }
             let target = resolve(cwd, &path);
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
@@ -481,18 +522,17 @@ fn apply_operation(cwd: &Path, operation: Operation) -> Result<Option<Applied>, 
             let normalized = original.replace("\r\n", "\n");
             let mut lines: Vec<String> = normalized.lines().map(str::to_string).collect();
             apply_hunks(&path, &mut lines, hunks)?;
-            if lines.is_empty() {
-                lines.extend([String::new(), String::new()]);
-            } else if lines.last().is_some_and(|line| !line.is_empty()) {
+            // Each entry is a content line, including any final blank lines.
+            if !lines.is_empty() {
                 lines.push(String::new());
             }
             let output = lines.join(if crlf { "\r\n" } else { "\n" });
-            if output == original {
-                return Ok(None);
-            }
             let target = destination
                 .as_ref()
                 .map_or_else(|| source.clone(), |to| resolve(cwd, to));
+            if output == original && target == source {
+                return Ok(None);
+            }
             let aliases_source = target != source
                 && matches!(
                     (source.canonicalize(), target.canonicalize()),
@@ -555,17 +595,16 @@ fn apply_hunks(path: &str, file: &mut Vec<String>, hunks: Vec<Hunk>) -> Result<(
     let mut cursor = 0;
     let mut replacements: Vec<Replacement> = Vec::new();
     for mut hunk in hunks {
-        let selector_matched = hunk.selector.as_ref().is_some_and(|selector| {
-            let selector_lines: Vec<&str> = selector.lines().collect();
+        if let Some(selector) = &hunk.selector {
+            let selector_lines = [selector.as_str()];
             if let Some((position, _)) = find_match(file, &selector_lines, cursor, false) {
                 cursor = position + selector_lines.len();
-                true
             } else {
-                false
+                return Err(format!("Failed to find context '{selector}' in {path}"));
             }
-        });
+        }
         if hunk.old_lines.is_empty() {
-            let start = if selector_matched { cursor } else { file.len() };
+            let start = file.len();
             if let Some(previous) = replacements.last_mut() {
                 if previous.start == start && previous.delete_count == 0 {
                     previous.insert.append(&mut hunk.new_lines);
@@ -784,15 +823,7 @@ fn find_match(
         if cursor > last {
             return None;
         }
-        if eof
-            && expected
-                .iter()
-                .enumerate()
-                .all(|(offset, line)| equivalent(&file[last + offset], line, tier))
-        {
-            return Some((last, tier));
-        }
-        for start in cursor..=last {
+        for start in (if eof { last } else { cursor })..=last {
             if expected
                 .iter()
                 .enumerate()
@@ -920,6 +951,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_and_object_inputs_execute_through_erased_tool() {
+        let patch = "*** Begin Patch\n*** Add File: result\n+hello\n*** End Patch";
+        for input in [
+            serde_json::json!(patch),
+            serde_json::json!({"patchText": patch}),
+            serde_json::json!({"patch": patch}),
+            serde_json::json!({"input": patch}),
+        ] {
+            let d = TempDir::new().unwrap();
+            let mut ctx = DummyToolContext {
+                working_directory: d.path().into(),
+                ..Default::default()
+            };
+            let tool: aj_agent::tool::ErasedToolDefinition = ApplyPatchTool.into();
+            let out = (tool.func)(&mut ctx, input).await.unwrap();
+            assert!(!out.is_error, "{}", body(&out));
+            assert_eq!(fs::read(d.path().join("result")).unwrap(), b"hello\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_chunks_and_unknown_content_fail_before_mutation() {
+        for invalid in [
+            "unknown",
+            "*** Begin Patch",
+            "*** Delete File: source\nunknown",
+            "*** Add File: other\n\n",
+            "*** Update File: source",
+            "*** Update File: source\n*** Move to: moved",
+            "*** Update File: source\n@@",
+            "*** Update File: source\n@@\n*** End of File",
+            "*** Update File: source\n@@ source\n@@\n-old\n+new",
+            "*** Update File: source\n@@\n-old\n+new\n@@",
+            "*** Update File: source\n@@invalid\n-old\n+new",
+            "*** Update File: source\n-old\n+new\n*** End of File\n+extra",
+        ] {
+            let d = TempDir::new().unwrap();
+            fs::write(d.path().join("source"), b"old\n").unwrap();
+            let out = run(
+                &d,
+                &format!("*** Begin Patch\n*** Add File: first\n+first\n{invalid}\n*** End Patch"),
+            )
+            .await;
+            assert!(out.is_error, "accepted {invalid:?}");
+            assert!(body(&out).starts_with("apply_patch verification failed:"));
+            assert_eq!(fs::read(d.path().join("source")).unwrap(), b"old\n");
+            assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn add_creates_empty_files_and_preserves_every_blank_line() {
+        for (lines, expected) in [("", ""), ("+\n", "\n"), ("+a\n+\n+\n", "a\n\n\n")] {
+            let d = TempDir::new().unwrap();
+            let out = run(
+                &d,
+                &format!("*** Begin Patch\n*** Add File: added\n{lines}*** End Patch"),
+            )
+            .await;
+            assert!(!out.is_error, "{}", body(&out));
+            assert_eq!(
+                fs::read(d.path().join("added")).unwrap(),
+                expected.as_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_content_can_be_renamed() {
+        let d = TempDir::new().unwrap();
+        fs::write(d.path().join("source"), b"same\n\n").unwrap();
+        let out = run(&d,
+            "*** Begin Patch\n*** Update File: source\n*** Move to: nested/target\n same\n*** End Patch"
+        ).await;
+        assert!(!out.is_error, "{}", body(&out));
+        assert!(!d.path().join("source").exists());
+        assert_eq!(
+            fs::read(d.path().join("nested/target")).unwrap(),
+            b"same\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn insertion_requires_selector_but_appends_at_eof() {
+        let d = TempDir::new().unwrap();
+        fs::write(d.path().join("source"), b"anchor\ntail\n").unwrap();
+        let out = run(
+            &d,
+            "*** Begin Patch\n*** Update File: source\n@@ missing\n+insert\n*** End Patch",
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(body(&out).contains("Failed to find context 'missing'"));
+        assert_eq!(
+            fs::read(d.path().join("source")).unwrap(),
+            b"anchor\ntail\n"
+        );
+        let out = run(
+            &d,
+            "*** Begin Patch\n*** Update File: source\n@@ anchor\n+insert\n*** End Patch",
+        )
+        .await;
+        assert!(!out.is_error, "{}", body(&out));
+        assert_eq!(
+            fs::read(d.path().join("source")).unwrap(),
+            b"anchor\ntail\ninsert\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_empty_update_lines_are_context_and_trailing_blanks_survive() {
+        let d = TempDir::new().unwrap();
+        fs::write(d.path().join("source"), b"old\n\ntail\n\n\n").unwrap();
+        let out = run(
+            &d,
+            "*** Begin Patch\n*** Update File: source\n-old\n+new\n\n tail\n*** End Patch",
+        )
+        .await;
+        assert!(!out.is_error, "{}", body(&out));
+        assert_eq!(
+            fs::read(d.path().join("source")).unwrap(),
+            b"new\n\ntail\n\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_fuzzy_match_wins_over_earlier_exact_match() {
+        let d = TempDir::new().unwrap();
+        fs::write(d.path().join("source"), b"old\n    old\n").unwrap();
+        let out = run(
+            &d,
+            "*** Begin Patch\n*** Update File: source\n-old\n+new\n*** End of File\n*** End Patch",
+        )
+        .await;
+        assert!(!out.is_error, "{}", body(&out));
+        assert_eq!(
+            fs::read(d.path().join("source")).unwrap(),
+            b"old\n    new\n"
+        );
+    }
+
+    #[tokio::test]
     async fn add_update_delete_move_and_multiple_operations() {
         let d = TempDir::new().unwrap();
         let out = run(
@@ -969,8 +1142,8 @@ mod tests {
             "*** Begin Patch\n*** Delete File: kept\nignored body\n*** End Patch",
         )
         .await;
-        assert!(!out.is_error);
-        assert!(!d.path().join("kept").exists());
+        assert!(out.is_error);
+        assert_eq!(fs::read(d.path().join("kept")).unwrap(), b"yes\n");
     }
 
     #[tokio::test]
@@ -1009,7 +1182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adjacent_selectors_and_multiple_hunks_apply_against_original_content() {
+    async fn multiple_hunks_apply_against_original_content() {
         let d = TempDir::new().unwrap();
         fs::write(
             d.path().join("f.txt"),
@@ -1019,7 +1192,7 @@ mod tests {
 
         let out = run(
             &d,
-            "*** Begin Patch\n*** Update File: f.txt\n@@ mod first {\n@@ fn target() {\n         old();\n+        inserted();\n@@\n         next();\n+        after();\n*** End Patch",
+            "*** Begin Patch\n*** Update File: f.txt\n@@ fn target() {\n         old();\n+        inserted();\n@@\n         next();\n+        after();\n*** End Patch",
         )
         .await;
 
@@ -1031,7 +1204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_context_fails_and_removing_all_lines_leaves_a_newline() {
+    async fn oversized_context_fails_and_removing_all_lines_leaves_an_empty_file() {
         let d = TempDir::new().unwrap();
         fs::write(d.path().join("empty.txt"), "").unwrap();
         let out = run(
@@ -1048,11 +1221,11 @@ mod tests {
         )
         .await;
         assert!(!out.is_error);
-        assert_eq!(fs::read(d.path().join("one.txt")).unwrap(), b"\n");
+        assert_eq!(fs::read(d.path().join("one.txt")).unwrap(), b"");
     }
 
     #[tokio::test]
-    async fn update_preserves_planned_trailing_blank_semantics() {
+    async fn update_preserves_added_trailing_blank_lines() {
         let d = TempDir::new().unwrap();
         fs::write(d.path().join("trailing.txt"), "old\n").unwrap();
         fs::write(d.path().join("blank.txt"), "old\n").unwrap();
@@ -1064,8 +1237,8 @@ mod tests {
         .await;
 
         assert!(!out.is_error, "{}", body(&out));
-        assert_eq!(fs::read(d.path().join("trailing.txt")).unwrap(), b"a\n");
-        assert_eq!(fs::read(d.path().join("blank.txt")).unwrap(), b"");
+        assert_eq!(fs::read(d.path().join("trailing.txt")).unwrap(), b"a\n\n");
+        assert_eq!(fs::read(d.path().join("blank.txt")).unwrap(), b"\n");
     }
 
     #[tokio::test]
@@ -1102,9 +1275,9 @@ mod tests {
         assert!(!body(&empty).contains("verification failed"));
 
         let no_operations = run(&d, "*** Begin Patch\nignored\n*** End Patch").await;
-        assert!(
-            body(&no_operations).starts_with("apply_patch verification failed: no hunks found.")
-        );
+        assert!(body(&no_operations).starts_with(
+            "apply_patch verification failed: Invalid patch format: unexpected top-level line:"
+        ));
         assert_eq!(
             body(&no_operations)
                 .matches("apply_patch verification failed:")
@@ -1169,11 +1342,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_heredoc_envelope_and_top_level_tolerance() {
+    async fn accepts_heredoc_envelope_and_outer_noise() {
         let d = TempDir::new().unwrap();
         let out = run(
             &d,
-            "cat <<'PATCH'\nignored before\n  *** Begin Patch  \nignored inside\n*** Add File: blank.txt\n+first\n\n+third\n  *** End Patch  \nignored after\nPATCH",
+            "cat <<'PATCH'\nignored before\n  *** Begin Patch  \n*** Add File: blank.txt\n+first\n+\n+third\n  *** End Patch  \nignored after\nPATCH",
         )
         .await;
 
@@ -1185,7 +1358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_and_noncontiguous_selectors_are_advisory() {
+    async fn missing_selector_fails_even_when_old_lines_match() {
         let d = TempDir::new().unwrap();
         fs::write(
             d.path().join("f.txt"),
@@ -1194,19 +1367,20 @@ mod tests {
         .unwrap();
         let out = run(
             &d,
-            "*** Begin Patch\n*** Update File: f.txt\n@@ missing\n-old\n+new\n@@ class Outer\n@@ function inner\n+appended\n*** End Patch",
+            "*** Begin Patch\n*** Update File: f.txt\n@@ missing\n-old\n+new\n*** End Patch",
         )
         .await;
 
-        assert!(!out.is_error);
+        assert!(out.is_error);
+        assert!(body(&out).contains("Failed to find context 'missing'"));
         assert_eq!(
             fs::read_to_string(d.path().join("f.txt")).unwrap(),
-            "class Outer\nintervening\nfunction inner\nnew\nappended\n"
+            "class Outer\nintervening\nfunction inner\nold\n"
         );
     }
 
     #[tokio::test]
-    async fn eof_is_preferred_but_falls_back_and_fuzzy_indent_is_preserved() {
+    async fn eof_is_required_and_fuzzy_indent_is_preserved_without_eof() {
         let d = TempDir::new().unwrap();
         fs::write(d.path().join("f.txt"), "    old\ntail\n").unwrap();
         let out = run(
@@ -1215,6 +1389,17 @@ mod tests {
         )
         .await;
 
+        assert!(out.is_error);
+        assert!(body(&out).contains("Could not find matching lines"));
+        assert_eq!(
+            fs::read(d.path().join("f.txt")).unwrap(),
+            b"    old\ntail\n"
+        );
+        let out = run(
+            &d,
+            "*** Begin Patch\n*** Update File: f.txt\n-old\n+replacement\n*** End Patch",
+        )
+        .await;
         assert!(!out.is_error);
         assert_eq!(
             fs::read_to_string(d.path().join("f.txt")).unwrap(),
@@ -1277,9 +1462,23 @@ mod tests {
     #[test]
     fn schema_and_mode() {
         let schema = serde_json::to_value(schemars::schema_for!(ApplyPatchInput)).unwrap();
-        let text = schema.to_string();
-        assert!(text.contains("patchText"));
-        assert!(!text.contains("patch_text"));
+        assert_eq!(schema["required"], serde_json::json!(["patchText"]));
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
+        assert_eq!(schema["properties"]["patchText"]["type"], "string");
+        assert_eq!(
+            serde_json::to_value(ApplyPatchInput {
+                patch_text: "patch".into()
+            })
+            .unwrap(),
+            serde_json::json!({"patchText": "patch"})
+        );
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!({"input": 1}),
+            serde_json::json!({}),
+        ] {
+            assert!(serde_json::from_value::<ApplyPatchInput>(invalid).is_err());
+        }
         assert_eq!(ApplyPatchTool.execution_mode(), ExecutionMode::Sequential);
     }
 }
