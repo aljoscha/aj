@@ -2268,7 +2268,11 @@ impl Agent {
                 self.check_code_mode_store()?;
                 return result;
             }
-            if !code_mode::direct_only(&tool_name) {
+            if !runner
+                .tools
+                .get(&tool_name)
+                .is_some_and(|tool| tool.code_mode_exposure == tool::CodeModeExposure::DirectOnly)
+            {
                 return runner
                     .run_with(call_id, tool_name, tool_input, cancel, |_| async {
                         Err("Use exec to call nested tools in Code Mode".into())

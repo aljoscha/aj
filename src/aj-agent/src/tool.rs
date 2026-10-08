@@ -67,6 +67,16 @@ impl Default for ExecutionMode {
     }
 }
 
+/// Where a tool may be called while Code Mode is active. This is independent
+/// of scheduling: a parallel or control tool can still require a direct call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CodeModeExposure {
+    #[default]
+    Nested,
+    /// Advertise directly to the model and reject calls from JavaScript cells.
+    DirectOnly,
+}
+
 // ---------------------------------------------------------------------------
 // Tool details — closed enum keyed by rendering shape
 // ---------------------------------------------------------------------------
@@ -1159,6 +1169,12 @@ pub trait ToolDefinition: Send + Sync {
         ExecutionMode::default()
     }
 
+    /// How this tool is advertised and dispatched when Code Mode is active.
+    /// Ordinary tool mode is unaffected.
+    fn code_mode_exposure(&self) -> CodeModeExposure {
+        CodeModeExposure::default()
+    }
+
     /// Run the tool. Errors should be surfaced as `is_error: true`
     /// outcomes when the model can recover; bubbling up an `Err`
     /// causes the agent to synthesize a generic error tool_result
@@ -1198,6 +1214,7 @@ pub struct ErasedToolDefinition {
     pub input_schema: Value,
     pub output_schema: Option<Value>,
     pub execution_mode: ExecutionMode,
+    pub code_mode_exposure: CodeModeExposure,
     pub func: ErasedToolFn,
 }
 
@@ -1211,12 +1228,14 @@ where
         let input_schema = tool.input_schema();
         let output_schema = tool.output_schema();
         let execution_mode = tool.execution_mode();
+        let code_mode_exposure = tool.code_mode_exposure();
         ErasedToolDefinition {
             name,
             description,
             input_schema,
             output_schema,
             execution_mode,
+            code_mode_exposure,
             func: Arc::new(move |ctx, raw_input| {
                 let parsed: Result<T::Input, _> = serde_json::from_value(raw_input);
                 let tool = tool.clone();
