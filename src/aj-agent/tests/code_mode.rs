@@ -475,6 +475,10 @@ store("saved", {count: load("saved").count + 2}); text("collected-live-cell");"#
     assert_eq!(h.registry.status(task), Some(TaskStatus::Exited(Some(0))));
     h.exec(r#"text(load("saved").count);"#).await;
     assert_eq!(h.result("exec"), "Script completed\n42");
+    assert!(h.agent.messages().iter().any(|message| matches!(
+        &message.kind, AgentMessageKind::TaskNotification(notice)
+            if notice.body == format!("Code Mode cell {cell_id} completed.")
+    )));
 }
 
 #[tokio::test]
@@ -509,7 +513,7 @@ async fn registry_stop_cancels_pending_nested_tool_and_quiesces() {
     let mut h = Harness::new(true, vec![gate.clone().into()]);
     h.exec("yield_control(); await tools.gate({});").await;
     bounded(gate.entered.cancelled()).await;
-    let (task, _) = h.cell();
+    let (task, cell_id) = h.cell();
     assert!(!gate.dropped.is_cancelled(), "tool must still be pending");
     // This is the public registry boundary used by the task_stop builtin.
     assert!(h.registry.kill(task));
@@ -523,6 +527,12 @@ async fn registry_stop_cancels_pending_nested_tool_and_quiesces() {
         Some(TaskStatus::Killed)
     );
     bounded(h.registry.wait_for_quiescence()).await;
+    let notices = h.registry.drain_notices(aj_agent::events::AgentId::Main);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        notices[0].body,
+        format!("Code Mode cell {cell_id} cancelled.")
+    );
 }
 
 #[tokio::test]
