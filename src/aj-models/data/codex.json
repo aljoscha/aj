@@ -47,7 +47,7 @@
         {
           "speed": "ultrafast",
           "name": "Ultrafast",
-          "description": "8x or 6x speed, increased usage",
+          "description": "Higher speed, increased usage",
           "wire_value": "ultrafast",
           "cost": {
             "input": 60.0,
@@ -128,6 +128,27 @@
                 "output": 30.0,
                 "cache_read": 0.4,
                 "cache_write": 10.0
+              }
+            ]
+          }
+        },
+        {
+          "speed": "ultrafast",
+          "name": "Ultrafast",
+          "description": "Higher speed, increased usage",
+          "wire_value": "ultrafast",
+          "cost": {
+            "input": 12,
+            "output": 60,
+            "cache_read": 0.6,
+            "cache_write": 15,
+            "tiers": [
+              {
+                "input_tokens_above": 272000,
+                "input": 24,
+                "output": 90,
+                "cache_read": 1.2,
+                "cache_write": 30
               }
             ]
           }

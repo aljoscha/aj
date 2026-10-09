@@ -1573,6 +1573,12 @@
             "cache_read": 0.8,
             "cache_write": 10.0
           }
+        },
+        {
+          "speed": "ultrafast",
+          "name": "Ultrafast",
+          "description": "Preview access only. Account eligibility applies.",
+          "wire_value": "ultrafast"
         }
       ],
       "input": [
@@ -1969,6 +1975,27 @@
                 "output": 7.5,
                 "cache_read": 0.1,
                 "cache_write": 2.5
+              }
+            ]
+          }
+        },
+        {
+          "speed": "ultrafast",
+          "name": "Ultrafast",
+          "description": "Premium low-latency processing. Account eligibility applies.",
+          "wire_value": "ultrafast",
+          "cost": {
+            "input": 12,
+            "output": 60,
+            "cache_read": 0.6,
+            "cache_write": 15,
+            "tiers": [
+              {
+                "input_tokens_above": 272000,
+                "input": 24,
+                "output": 90,
+                "cache_read": 1.2,
+                "cache_write": 30
               }
             ]
           }

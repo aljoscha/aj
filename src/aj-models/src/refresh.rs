@@ -1254,32 +1254,65 @@ mod tests {
     }
 
     #[test]
+    fn documented_api_ultrafast_modes_survive_refresh() {
+        let body = serde_json::json!({"openai": {"id": "openai", "models": {
+            "gpt-6.1-sol": {"id": "gpt-6.1-sol", "name": "GPT-6.1 Sol", "tool_call": true},
+            "gpt-5.6-sol": {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "tool_call": true}
+        }}});
+        let catalog = build_seed_from_models_dev(&body.to_string()).unwrap();
+        for id in ["gpt-6.1-sol", "gpt-5.6-sol"] {
+            let model = catalog
+                .models
+                .iter()
+                .find(|m| m.provider == "openai" && m.id == id)
+                .unwrap();
+            let ultra = model.speed_mode(&Speed::Ultrafast).unwrap();
+            assert_eq!(ultra.wire_value, "ultrafast");
+            if id == "gpt-6.1-sol" {
+                let cost = ultra.cost.as_ref().unwrap();
+                assert_eq!(
+                    (cost.input, cost.output, cost.cache_read, cost.cache_write),
+                    (12.0, 60.0, 0.6, 15.0)
+                );
+                assert_eq!(cost.tiers[0].input_tokens_above, 272_000);
+                let tier = &cost.tiers[0];
+                assert_eq!(
+                    (tier.input, tier.output, tier.cache_read, tier.cache_write),
+                    (24.0, 90.0, 1.2, 30.0)
+                );
+            } else {
+                assert!(ultra.description.contains("Preview"));
+                assert!(ultra.cost.is_none(), "preview pricing must remain unknown");
+            }
+        }
+    }
+
+    #[test]
     fn codex_regeneration_preserves_documented_supplements_and_source_modes() {
         let native: Catalog = serde_json::from_str(include_str!("../data/models.json")).unwrap();
-        let body = serde_json::json!({"models":[{"slug":"gpt-6-astra", "service_tiers":[
-            {"id":"priority", "name":"Source Fast"},
-            {"id":"future-tier", "name":"Future"}
-        ]}]});
-        let mut models = bundled_codex_seed();
-        update_codex_speed_metadata(&mut models, &body.to_string(), &native.models).unwrap();
-        let model = models
-            .iter()
-            .find(|model| model.id == "gpt-6-astra")
-            .unwrap();
-        assert_eq!(model.speed_mode(&Speed::Fast).unwrap().name, "Source Fast");
-        assert!(
-            model
-                .speed_mode(&Speed::Named("future-tier".into()))
-                .is_some()
-        );
-        let ultra = model.speed_mode(&Speed::Ultrafast).unwrap();
-        assert_eq!(ultra.wire_value, "ultrafast");
-        assert_eq!(ultra.cost.as_ref().unwrap().input, 60.0);
-        assert!(model.speed_mode(&Speed::Flex).is_none());
-        assert!(
-            model.default_speed.is_none(),
-            "a restricted tier is not a paid default"
-        );
+        for (id, input_cost) in [("gpt-6-astra", 60.0), ("gpt-6.1-sol", 12.0)] {
+            let body = serde_json::json!({"models":[{"slug":id, "service_tiers":[
+                {"id":"priority", "name":"Source Fast"},
+                {"id":"future-tier", "name":"Future"}
+            ]}]});
+            let mut models = bundled_codex_seed();
+            update_codex_speed_metadata(&mut models, &body.to_string(), &native.models).unwrap();
+            let model = models.iter().find(|model| model.id == id).unwrap();
+            assert_eq!(model.speed_mode(&Speed::Fast).unwrap().name, "Source Fast");
+            assert!(
+                model
+                    .speed_mode(&Speed::Named("future-tier".into()))
+                    .is_some()
+            );
+            let ultra = model.speed_mode(&Speed::Ultrafast).unwrap();
+            assert_eq!(ultra.wire_value, "ultrafast");
+            assert_eq!(ultra.cost.as_ref().unwrap().input, input_cost);
+            assert!(model.speed_mode(&Speed::Flex).is_none());
+            assert!(
+                model.default_speed.is_none(),
+                "a restricted tier is not a paid default"
+            );
+        }
     }
 
     #[test]

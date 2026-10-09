@@ -188,10 +188,31 @@
                 }
               ]
             }
+          },
+          {
+            "speed": "ultrafast",
+            "name": "Ultrafast",
+            "description": "Premium low-latency processing. Account eligibility applies.",
+            "wire_value": "ultrafast",
+            "cost": {
+              "input": 12,
+              "output": 60,
+              "cache_read": 0.6,
+              "cache_write": 15,
+              "tiers": [
+                {
+                  "input_tokens_above": 272000,
+                  "input": 24,
+                  "output": 90,
+                  "cache_read": 1.2,
+                  "cache_write": 30
+                }
+              ]
+            }
           }
         ]
       },
-      "reason": "Verbosity follows Codex CLI rust-v0.160.1's models-manager/models.json. Flex availability and mode-specific short/long-context prices follow https://developers.openai.com/api/docs/pricing. models.dev omits verbosity capability, these additional tiers and context prices."
+      "reason": "Verbosity follows Codex CLI rust-v0.162.0's models-manager/models.json. Speed availability and mode-specific short/long-context prices follow https://developers.openai.com/api/docs/pricing and https://developers.openai.com/api/docs/guides/ultrafast-mode. models.dev omits verbosity capability, these additional tiers and context prices."
     },
     {
       "target": {
@@ -203,12 +224,46 @@
           {
             "speed": "ultrafast",
             "name": "Ultrafast",
-            "description": "8x or 6x speed, increased usage",
+            "description": "Higher speed, increased usage",
             "wire_value": "ultrafast"
           }
         ]
       },
       "reason": "https://learn.chatgpt.com/docs/agent-configuration/speed documents GPT-6 Astra Ultrafast in Codex on eligible plans. The bundled CLI catalog omits this restricted tier. Seed generation supplies API-equivalent prices from matching native metadata. Flex is not documented for ChatGPT-authenticated Codex."
+    },
+    {
+      "target": {
+        "provider": "openai-codex",
+        "id": "gpt-6.1-sol"
+      },
+      "patch": {
+        "additional_speed_modes": [
+          {
+            "speed": "ultrafast",
+            "name": "Ultrafast",
+            "description": "Higher speed, increased usage",
+            "wire_value": "ultrafast"
+          }
+        ]
+      },
+      "reason": "https://learn.chatgpt.com/docs/agent-configuration/speed documents GPT-6.1 Sol Ultrafast in Codex on eligible plans. The bundled CLI catalog omits this restricted tier. Seed generation supplies API-equivalent prices from matching native metadata. Flex is not documented for ChatGPT-authenticated Codex."
+    },
+    {
+      "target": {
+        "provider": "openai",
+        "id": "gpt-5.6-sol"
+      },
+      "patch": {
+        "additional_speed_modes": [
+          {
+            "speed": "ultrafast",
+            "name": "Ultrafast",
+            "description": "Preview access only. Account eligibility applies.",
+            "wire_value": "ultrafast"
+          }
+        ]
+      },
+      "reason": "https://developers.openai.com/api/docs/guides/ultrafast-mode documents API preview access for GPT-5.6 Sol. No public Ultrafast token rates are listed at https://developers.openai.com/api/docs/pricing. ChatGPT-authenticated Codex support is not documented."
     }
   ]
 }

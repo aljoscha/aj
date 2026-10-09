@@ -962,19 +962,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_seed_advertises_pinned_fast_and_documented_astra_ultrafast() {
+    fn codex_seed_advertises_pinned_fast_and_documented_ultrafast() {
         for model in bundled_codex_seed() {
             let mode = model.speed_mode(&Speed::Fast).unwrap();
             assert_eq!(mode.name, "Fast");
             assert_eq!(mode.wire_value, "priority");
             assert!(mode.cost.is_some());
             assert!(model.speed_mode(&Speed::Flex).is_none());
-            if model.id == "gpt-6-astra" {
+            if ["gpt-6-astra", "gpt-6.1-sol"].contains(&model.id.as_str()) {
                 let ultra = model.speed_mode(&Speed::Ultrafast).unwrap();
                 assert_eq!(ultra.wire_value, "ultrafast");
-                assert!(ultra.description.contains("eligible"));
                 let cost = ultra.cost.as_ref().unwrap();
-                for (input, expected) in [(272_000, 16.32), (272_001, 32.64012)] {
+                let expected_costs = if model.id == "gpt-6-astra" {
+                    [(272_000, 16.32), (272_001, 32.64012)]
+                } else {
+                    [(272_000, 3.264), (272_001, 6.528024)]
+                };
+                for (input, expected) in expected_costs {
                     let mut usage = Usage {
                         input,
                         ..Default::default()
