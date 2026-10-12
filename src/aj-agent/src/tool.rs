@@ -43,9 +43,8 @@ use crate::events::{AgentEvent, AgentId, SubAgentConclusion};
 /// [`ExecutionMode::Sequential`] tool is its own singleton group and
 /// acts as an ordering barrier. Groups run one at a time in source
 /// order and results are recorded in source order regardless of which
-/// calls finish first. Tools that mutate the filesystem or run
-/// arbitrary commands opt into [`ExecutionMode::Sequential`] so they
-/// never interleave with their neighbours.
+/// calls finish first. Tools requiring exclusive resource access opt into
+/// [`ExecutionMode::Sequential`] so they never interleave with their neighbours.
 ///
 /// Default: [`ExecutionMode::Parallel`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1170,8 +1169,8 @@ pub trait ToolDefinition: Send + Sync {
     }
 
     /// Per-tool execution mode. Default [`ExecutionMode::Parallel`].
-    /// Tools that mutate the filesystem or run arbitrary commands
-    /// should override to [`ExecutionMode::Sequential`].
+    /// Tools requiring exclusive resource access should override to
+    /// [`ExecutionMode::Sequential`].
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::default()
     }

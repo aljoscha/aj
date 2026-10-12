@@ -70,9 +70,8 @@
 //!   `SIGKILL`, and finally aborting the reader tasks, which drops the
 //!   read ends whatever still holds the far side. A run that got that
 //!   far says so in a trailer, see [`capture_cut_trailer`].
-//! - **`Sequential` execution.** `bash` runs arbitrary commands, so it
-//!   runs in `Sequential` mode: a batch containing it serializes
-//!   around any other in-flight tool calls.
+//! - **Parallel execution.** Independent commands may run concurrently.
+//!   Callers must sequence commands that depend on or conflict with each other.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -287,11 +286,8 @@ impl ToolDefinition for BashTool {
         Some(schemars::schema_for!(BashResult).to_value())
     }
 
-    /// `bash` runs arbitrary commands; serialize a batch containing it
-    /// so two shell calls never trample each other or interleave their
-    /// captured output.
     fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Sequential
+        ExecutionMode::Parallel
     }
 
     async fn execute(
@@ -2387,17 +2383,6 @@ esac
             })
             .collect::<Vec<_>>()
             .join("")
-    }
-
-    /// Locks in `Sequential` execution mode — bash runs arbitrary
-    /// commands and must serialize against any other in-flight tool
-    /// call.
-    #[test]
-    fn execution_mode_is_sequential() {
-        assert_eq!(
-            BashTool::default().execution_mode(),
-            ExecutionMode::Sequential
-        );
     }
 
     /// Successful command. Wire content carries stdout verbatim;
