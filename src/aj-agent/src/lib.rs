@@ -1727,7 +1727,7 @@ impl Agent {
             if has_tool_use {
                 // Partition the batch into contiguous concurrency
                 // groups and run each group through a bounded pool.
-                // `Sequential` tools (bash, file edits) are singleton
+                // `Sequential` tools (file edits) are singleton
                 // barrier groups; a contiguous run of `Parallel` tools
                 // becomes one group that runs concurrently. Groups run
                 // one at a time and each is fully finalized before the
