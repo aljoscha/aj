@@ -1073,6 +1073,10 @@ async fn settings_parity_failed_saves_leave_defaults_coherent_and_retry_writes_d
     skill(&home, "save-skill");
     let dir = TempDir::new().unwrap();
     let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+    world
+        .auth
+        .set_runtime_api_key("openai", "test-key".into())
+        .await;
     let host = world.host().clone();
     let layers = Arc::clone(&world.config_layers);
     let effective = Arc::clone(&world.config);

@@ -777,11 +777,36 @@ impl SessionHost {
         Ok(Self { inner })
     }
 
-    /// Model choices from the host catalog, without config or skill discovery.
+    /// Model choices with configured host credentials, without validating or
+    /// refreshing them. Reads current auth state without config or skill discovery.
     /// The session supplies routing only and is not materialized.
     pub async fn models(&self, session: &str) -> Result<Vec<ModelInfo>, HostError> {
         let _ = self.live_or_cold(session).await?;
-        Ok(self.inner.shared.catalog.as_ref().clone())
+        self.authenticated_models().await
+    }
+
+    async fn authenticated_models(&self) -> Result<Vec<ModelInfo>, HostError> {
+        let shared = &self.inner.shared;
+        let mut providers = BTreeMap::new();
+        let mut models = Vec::new();
+        for model in shared.catalog.iter() {
+            let available = match providers.get(&model.provider) {
+                Some(available) => *available,
+                None => {
+                    let available = shared
+                        .auth
+                        .has_auth(&model.provider)
+                        .await
+                        .map_err(|err| HostError::Internal(Box::new(err)))?;
+                    providers.insert(model.provider.clone(), available);
+                    available
+                }
+            };
+            if available {
+                models.push(model.clone());
+            }
+        }
+        Ok(models)
     }
 
     /// The host's config and editor catalogs. The session id supplies gateway
@@ -796,6 +821,7 @@ impl SessionHost {
             .map(|skill| skill.name)
             .collect();
         let shared = &self.inner.shared;
+        let models = self.authenticated_models().await?;
         let layers = shared.layers.lock().expect("config layers mutex poisoned");
         Ok(aj_wire::HostConfig {
             user: crate::settings::host_values(&layers.user),
@@ -807,7 +833,7 @@ impl SessionHost {
                 .map(String::from)
                 .collect(),
             has_project: layers.project_path.is_some(),
-            models: shared.catalog.as_ref().clone(),
+            models,
             tools: aj_tools::get_builtin_tools(&aj_tools::BuiltinToolOptions::default())
                 .into_iter()
                 .map(|tool| tool.name)

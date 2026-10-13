@@ -706,9 +706,11 @@ and must name a session in its store. Reading does not materialize it.
 A read returns `HostConfig`: the `user` layer and the `effective` merge as
 schema-keyed string maps in the editor's vocabulary (`<unset>` for absent
 optionals, comma-separated name lists), `project_keys`, `has_project`, and
-the host's `models`, `tools`, and `skills` catalogs. Nothing from the auth
-store, environment, or arbitrary config-file keys. Connections are trusted,
-so complete model and catalog URLs round-trip without masking. The
+the host's `models`, `tools`, and `skills` catalogs. Model choices include only
+providers with configured host credentials (stored credentials, environment
+keys, or runtime API-key overrides). Credentials are not validated or refreshed
+for this read. No credential values or arbitrary config-file keys are returned.
+Connections are trusted, so complete model and catalog URLs round-trip without masking. The
 standalone model and thinking selectors read the same model catalog through
 `GET /v1/sessions/{id}/models`, a model array. This read
 does not discover skills or read config layers. Selectors show a notice if

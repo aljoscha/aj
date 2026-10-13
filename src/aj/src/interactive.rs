@@ -18794,6 +18794,10 @@ mod tests {
         assert_eq!(world.client().oracle_settings().unwrap().thinking, "low");
         assert_eq!(world.client().settings(), Some(&before));
         let info = world.catalog.first().unwrap().clone();
+        world
+            .auth
+            .set_runtime_api_key(&info.provider, "test-key".into())
+            .await;
         let selection = aj_wire::RecordedModel {
             api: info.provider.clone(),
             name: info.id.clone(),
@@ -18979,6 +18983,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
+        world
+            .auth
+            .set_runtime_api_key("openai", "test-key".into())
+            .await;
         let model = world
             .control
             .models(world.session())
@@ -19513,6 +19521,10 @@ mod tests {
             };
             let (mut world, shell, mut app, mut writer, root) =
                 world_shell_app(&dir, "streaming-text", layers).await;
+            world
+                .auth
+                .set_runtime_api_key("openai", "test-key".into())
+                .await;
             apply_command(&mut world, &shell, CommandAction::OpenProjectSettings).await;
             focus_overlay(&mut app, &root);
             type_text(&mut app, &mut writer, model_row).await;

@@ -36,7 +36,18 @@ async fn host_with_handles(
         ..model.clone()
     };
     let mut setup = crate::remote::tests::host_setup(dir, run, handles, Some(name));
-    setup.catalog = Arc::new(vec![model, second]);
+    setup
+        .auth
+        .set_runtime_api_key("openai", "host-key".into())
+        .await;
+    let unavailable = ModelInfo {
+        provider: "selector-no-credentials".into(),
+        id: "unavailable".into(),
+        name: "unavailable".into(),
+        ..model.clone()
+    };
+    assert!(!setup.auth.has_auth(&unavailable.provider).await.unwrap());
+    setup.catalog = Arc::new(vec![model, second, unavailable]);
     let host = aj_app::host::SessionHost::new(setup).unwrap();
     let server = crate::remote::RemoteServer::bind(
         host.clone(),
@@ -393,6 +404,54 @@ async fn selector_parity_cancel_and_reopen_isolates_delayed_host_fill() {
     gateway.shutdown().await;
     left.shutdown().await;
     right.shutdown().await;
+}
+
+#[tokio::test]
+async fn model_choices_follow_host_credentials_when_reopened() {
+    for local in [true, false] {
+        let host_dir = TempDir::new().unwrap();
+        let client_dir = TempDir::new().unwrap();
+        let handles = crate::remote::tests::HostHandles::new(&host_dir);
+        let auth = handles.auth.clone();
+        let remote = host_with_handles(&host_dir, "authenticated", handles).await;
+        let (mut world, shell) = connect_world_and_shell(&client_dir, &remote, &[]).await;
+        if local {
+            world.control = Control::local(remote.host.clone());
+        }
+        for (step, available) in [false, true, false].into_iter().enumerate() {
+            if available {
+                auth.insert_account(
+                    "selector-no-credentials",
+                    "test",
+                    aj_models::auth::AuthCredential::ApiKey {
+                        key: "test-key".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            } else if step > 0 {
+                auth.remove_account("selector-no-credentials", "test")
+                    .await
+                    .unwrap();
+            }
+            let fetch = open(&world, &shell, CommandAction::OpenModelSelector);
+            let select = fetch.select.upgrade().unwrap();
+            fill_host_selector(fetch).await;
+            let mut expected = vec!["authenticated first (current)", "authenticated second"];
+            if available {
+                expected.push("unavailable");
+            }
+            assert_eq!(select.borrow().visible_labels(), expected);
+            let choices = world.control.models(world.session()).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(world.control.config(world.session()).await.unwrap().models)
+                    .unwrap(),
+                serde_json::to_value(choices).unwrap(),
+                "settings and standalone selectors share credential filtering"
+            );
+        }
+        remote.shutdown().await;
+    }
 }
 
 #[tokio::test]
