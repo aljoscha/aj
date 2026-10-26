@@ -302,7 +302,7 @@ async fn build_world(
     // or any hint renders. Rejected entries are surfaced as a startup warning
     // in the notice block below.
     let keybinding_problems = aj_app::actions::install_keybindings(config.keybindings.clone());
-    let mut process_notices = ProcessNotices::at_launch(diagnostics, &keybinding_problems);
+    let process_notices = ProcessNotices::at_launch(diagnostics, &keybinding_problems);
 
     // `aj continue` with neither an explicit id nor a latest session
     // on disk degrades to a fresh session, matching `aj`.
@@ -376,7 +376,7 @@ async fn build_world(
         startup: HashMap::new(),
         chat,
         status: Rc::new(RefCell::new(StatusState::default())),
-        process_notices: ProcessNotices::at_launch(diagnostics, &keybinding_problems),
+        process_notices,
         config,
         config_layers,
         catalog,
@@ -403,7 +403,7 @@ async fn build_world(
         if let Some(key) = args.api_key.clone() {
             auth.set_runtime_api_key(&provider, key).await;
         }
-        process_notices.auth_warning = match auth.has_auth(&provider).await {
+        world.process_notices.auth_warning = match auth.has_auth(&provider).await {
             Ok(true) => None,
             Ok(false) => Some(format!(
                 "Heads up: {}",
@@ -440,7 +440,7 @@ async fn build_world(
     // ones here, alongside the flags that only a create could have honored.
     let mut rows = Vec::new();
     if !fresh {
-        rows.extend(process_notice_events(process_notices.clone(), None));
+        rows.extend(process_notice_events(world.process_notices.clone(), None));
         if args.has_launch_tag() {
             rows.push(warning_event(TAG_WITHOUT_A_CREATE));
         }
@@ -448,7 +448,6 @@ async fn build_world(
             rows.push(warning_event(ENV_WITHOUT_A_CREATE));
         }
     }
-    world.process_notices = process_notices;
     world.startup.insert(
         session,
         PendingStartup {

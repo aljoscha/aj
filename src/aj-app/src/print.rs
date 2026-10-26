@@ -209,8 +209,14 @@ async fn run_inner<W: Write + Send + 'static>(
     // loop, so the snapshot is built, optionally overwritten by the
     // resumed log's recorded settings (inside `prepare_log`), and read
     // once to build the agent.
-    let (mut run_config, restore_context) =
-        build_initial_run_config(&args, &config, &auth, thinking, speed)?;
+    let (mut run_config, restore_context) = build_initial_run_config(
+        &args,
+        &config,
+        &auth,
+        thinking,
+        speed,
+        Arc::new(aj_models::registry::ModelRegistry::load()),
+    )?;
     configure_model(&mut run_config.main);
     let run_config = Arc::new(std::sync::Mutex::new(run_config));
 

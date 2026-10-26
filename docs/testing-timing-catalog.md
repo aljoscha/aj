@@ -1,5 +1,57 @@
 # Test timing catalog
 
+## One registry snapshot per host startup
+
+Startup profiling at `dedde662` separated catalog work from fixture transport,
+configuration, host and session creation. These are sums of overlapping calls,
+not additive workspace wall times. Composition includes registry work.
+
+| Stage in default `aj` tests | Calls | Summed wall time |
+| --- | ---: | ---: |
+| Registry loading | 798 | 6.099 s |
+| Effective config merging | 551 | 0.023 s |
+| Host construction | 395 | 0.073 s |
+| Session-core construction | 440 | 1.094 s |
+| Shell/app fixture initialization | 57 | 0.445 s |
+
+Host composition owns one dynamically loaded `ModelRegistry` snapshot. Initial
+model and Oracle resolution, session defaults, restoration dependencies and
+catalog projection use that snapshot. The resolver and defaults constructors
+take the registry explicitly. Print mode still loads a fresh registry for its
+invocation, and connected clients retain their independent client catalog.
+There is no global cache, static catalog substitution or change to source
+precedence, overrides, catalog ordering or live configuration resolution.
+Each newly composed host still reads the current registry sources.
+
+The same 242 host compositions now produce **317 registry loads** in total:
+242 for hosts and 75 for connected-client worlds. Summed registry time was
+**2.531 s**. Host composition, including its registry work, fell from 5.913 s
+to 2.189 s in aggregate. Local startup also retains its first process-notice
+snapshot rather than probing again and discarding the second result. Auth
+warnings are added to that owned snapshot.
+
+The remaining HTTP constructors mostly belong to independent gateway pools,
+connect operations and fixture clients. All 456 typed-transport constructions
+remain in this profile. Transport behavior and restart isolation are unchanged.
+Config merging and host construction are not meaningful targets in this
+measurement. Five unused terminal initializations were identified but left
+outside this change, given the small measured cost of that fixture family.
+
+A supplied-registry regression checks custom metadata through initial model
+resolution, later defaults, restoration dependencies and catalog projection.
+It does not itself exercise a resumed session or count host loads. Existing
+composed-host/UI coverage and temporary instrumentation cover those neighboring
+seams. Mutations that reload instead of using the supplied registry in either
+initial resolution or defaults fail the regression. All diagnostics were
+restored, and independent code review approved the change.
+
+With compilation separate, default workspace runs passed **4,083 tests** with
+191 ignored, taking **16.265 s and 15.687 s**. Reported test execution was
+11.761–11.928 s, versus 12.469–12.735 s in the preceding warm measurements.
+The `aj` binary took 6.904–7.133 s. Slow-inclusive passed **4,265 tests**, with
+nine ignored, in 55.224 s. Formatting, all-target Clippy/build, dependency
+guards and scratch checks passed. No tests moved to the slow tier.
+
 ## Fast-suite fixtures and event-driven waits
 
 At `8949b73b`, an unfiltered warm default run took **16.965 s**. Reported
