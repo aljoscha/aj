@@ -1,5 +1,68 @@
 # Test timing catalog
 
+## Runner overhead and nextest evaluation
+
+At `b0655a6c`, timestamped Cargo, test-runner and rustdoc wrappers separated
+the default workspace's test execution from runner overhead. The wrappers and
+downloaded nextest binary lived under `/tmp`, without repository runner changes.
+Compilation was warmed separately and no competing Cargo jobs ran.
+
+One warm instrumented run took **15.213 s**:
+
+| Stage | Wall time |
+| --- | ---: |
+| Preliminary `cargo test --no-run` | 0.226 s |
+| Test executable processes | 11.634 s |
+| Twelve rustdoc invocations | 2.882 s |
+| Remaining Cargo/wrapper overhead | about 0.47 s |
+
+Reported libtest execution was 11.534 s. Most of the difference between that
+number and whole-command wall time is documentation processing, not scratch
+cleanup or mandatory sleeps. The scratch scan and cleanup take milliseconds.
+An initial run took 22.485 s, with extra time both inside executable processes
+and in rustdoc. The warm repeat, rather than that outlier, informs the table.
+
+The doctest phase passes two examples and ignores two. Crates without runnable
+examples still incur rustdoc startup and documentation processing. Disabling
+their doctests would also stop automatically checking examples added to those
+crates, so the default command retains them. The preliminary build keeps
+compiler scratch outside the test-owned `TMPDIR` and is retained as well.
+
+### Nextest comparison
+
+Nextest **0.9.150**, downloaded from the official binary distribution, was
+compared with Cargo on this eight-logical-CPU Linux host. An external Cargo
+shim let the unchanged scratch guard run nextest followed by
+`cargo test --workspace --doc`. The build pass remained outside test scratch.
+Retries were disabled and no tests were excluded beyond the default ignored
+set. Cargo and eight-worker nextest samples alternated after warming builds.
+
+| Runner, including doctests and scratch guard | Wall time, two runs | CPU time, user + system |
+| --- | --- | --- |
+| Cargo, ordinary eight-thread libtest parallelism | 14.909 / 14.932 s | 58.520 / 58.191 s |
+| Nextest, eight test processes | 20.105 / 20.027 s | 117.088 / 116.656 s |
+| Nextest, sixteen test processes | 17.944 / 18.089 s | 115.997 / 116.657 s |
+
+Each runner passed **4,081 ordinary tests plus two doctests**, with 189 ordinary
+tests and two doctests ignored. The raw Cargo text also contains a successful
+child-process helper summary, which must not be counted as another top-level
+test. Every complete run passed the real scratch guard. Its own regression
+script passed too. An initial benchmark-shim error rejected nextest's internal
+Cargo metadata invocation before any tests ran. Those failed attempts are
+excluded from the table, and the corrected shim forwards internal Cargo calls.
+
+Nextest's test phase alone took 16.337–16.399 s with eight workers and
+14.246–14.392 s with sixteen. It therefore loses here even before adding
+doctests. Its process-per-test execution changes startup and process-local
+reuse costs, but this experiment does not isolate those costs individually.
+Peak memory was not measured. The CPU and wall-time results do not justify
+switching the default runner for this suite. Slow-inclusive and filtered
+nextest runs were not benchmarked, so this is not a general verdict on nextest.
+
+No production code, test coverage, runner configuration or scratch policy was
+changed. Targeted development commands can already select a package or test
+through the guard. The full default command retains automatic doctest coverage.
+
 ## One registry snapshot per host startup
 
 Startup profiling at `dedde662` separated catalog work from fixture transport,
