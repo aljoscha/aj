@@ -1,5 +1,63 @@
 # Test timing catalog
 
+## Fast-suite fixtures and event-driven waits
+
+At `8949b73b`, an unfiltered warm default run took **16.965 s**. Reported
+suite execution accounted for 13.374 s, including 8.307 s in the `aj` binary.
+The remainder includes Cargo, process startup, doctest setup and scratch checks,
+not just waits inside tests.
+
+Temporary Linux instrumentation recorded **687 HTTP transport constructions**
+in the default `aj` tests, consuming about **18.4 CPU-seconds**. CPU is summed
+across threads, not elapsed wall time. Per-thread accounting has 10 ms
+granularity. Raw gateway probes and typed requests share one fixture-local
+control transport, and context-capacity clients share one across their direct
+and gateway addresses. This reduces construction to **591 clients and about
+15.4 CPU-seconds**. There is no process-global pool, and gateway restarts create
+fresh transports. Gateway upstream pools retain their production policies.
+The fixture's raw probes use the standard control transport's connect deadline,
+without adding a total or read timeout.
+
+All three context-capacity adapter passes retain fresh hosts and their
+cross-adapter observers. In comparable instrumented runs that case took
+1.135 s and 1.027 s. Protocol-version rejection took 0.608 s and 0.439 s.
+
+The authorized-route census waits for each prompt/steer request's distinct
+assistant reply and subsequent live idle state. Its attach tail is consumed
+before probing. This avoids accepting a stale idle frame from an earlier
+command, without two 300 ms quiet windows and their possible extensions.
+Every route, status assertion and strict inference count remains covered.
+That test took **1.067 s and 0.080 s** in the instrumented runs. The generic
+quiet-tail helper remains available for scenarios without this explicit fence.
+
+Theme event filtering and invalid-JSON recovery use the production callback,
+reload future, real files, parser and output channel under paused Tokio time.
+Explicit polling arms the debounce timer and processes the invalid reload
+before the file is overwritten. This relies on the synchronous read/parse
+phase between timer completion and the next receive. Matching-event and
+distinct-color assertions establish an active pipeline. These replace a 500 ms
+negative window and 300 ms staging sleep plus real debounce. They supply
+`notify::Event` values, not OS notifications. The real OS edit-delivery test retains its
+100 ms production debounce. The extraction adds no test hooks or public API
+and does not change watcher behavior.
+
+Mutations that bypass filename filtering, terminate the worker on parse
+failure, or acknowledge a steer without acting on it fail their respective
+tests. All diagnostic instrumentation and mutations are removed after use.
+
+Independent code review approved the change. Default workspace runs pass
+**4,082 tests**, with 191 ignored. Slow-inclusive passes **4,264**, with nine
+ignored. Formatting, all-target Clippy/build, dependency guards and scratch
+checks pass. No tests moved to the slow tier.
+
+With compilation separate, default runs took **23.430, 16.193, 17.276 and
+15.973 s**. The first run included 9.697 s outside reported suite execution.
+The subsequent runs spent 12.469–12.735 s in test execution, versus 13.374 s
+at the baseline. Steady warm wall time is around **16 s versus 17 s**, not a
+guaranteed saving for every invocation. The two controlled theme tests each
+took less than 1 ms, while real OS delivery remained about 102 ms.
+Slow-inclusive wall time was 54.330 s.
+
 ## Provider-owned HTTP transports
 
 The OpenAI verbosity request matrix runs all 36 combinations over real local

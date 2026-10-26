@@ -4459,12 +4459,33 @@ async fn probe_every_route(
         let probe = probe_request(http, session, request).await;
         if let Some((observation, attached)) = inference.as_mut() {
             let expected = match probe.route.as_str() {
-                "POST /v1/sessions/{id}/prompt" => Some(1),
-                "POST /v1/sessions/{id}/steer" => Some(2),
+                "POST /v1/sessions/{id}/prompt" => Some((1, "prompt reply")),
+                "POST /v1/sessions/{id}/steer" => Some((2, "steer reply")),
                 _ => None,
             };
-            if let Some(expected) = expected {
-                attached.settle().await;
+            if let Some((expected, reply)) = expected {
+                // Earlier probes can leave idle states in the stream. Establish
+                // this request's reply before waiting for its idle tail, so the
+                // next route runs only after this inference has finished.
+                attached
+                    .pump_until("the route's scripted reply", |frame| {
+                        let Frame::Event { event, .. } = frame else {
+                            return false;
+                        };
+                        let Some(AgentEvent::MessageEnd {
+                            agent_id: AgentId::Main,
+                            message,
+                            ..
+                        }) = event.known()
+                        else {
+                            return false;
+                        };
+                        matches!(message.as_stored_wire(), Some(Message::Assistant(message))
+                            if message.content.iter().any(|part| matches!(part,
+                                AssistantContent::Text(text) if text.text == reply)))
+                    })
+                    .await;
+                finish_scripted_turn(attached).await;
                 observation.assert_attempts(expected);
             }
         }
@@ -4555,12 +4576,16 @@ async fn an_authorized_peer_reaches_every_route() {
             [],
             FakeWhois::resolving(tagged_peer(&[AJ_CONTROL_CAPABILITY])),
         ),
-        vec![finalized_text_message("hi"), finalized_text_message("hi")],
+        vec![
+            finalized_text_message("prompt reply"),
+            finalized_text_message("steer reply"),
+        ],
     )
     .await;
     let session = fixture.create().await;
     let mut attached = fixture.oracle(&session).await;
 
+    attached.finish_idle_attach().await;
     let probes = probe_every_route(
         &http,
         &fixture.client,
@@ -4897,7 +4922,7 @@ impl CutScenario {
             .await
             .expect("a compact on an idle session");
         assert!(matches!(outcome, CommandOutcome::Accepted));
-        finish_cut_turn(oracle).await;
+        finish_scripted_turn(oracle).await;
 
         // What the compact did, not just that it did something: a compact
         // that found work would summarize instead, and this run needs the
@@ -4910,7 +4935,7 @@ impl CutScenario {
         );
 
         fixture.prompt(session, "and one more thing").await;
-        finish_cut_turn(oracle).await;
+        finish_scripted_turn(oracle).await;
     }
 }
 
@@ -4918,7 +4943,7 @@ impl CutScenario {
 /// idle state follows the turn's transcript events, so it is the completion
 /// boundary, not a period of transport silence. The client must have consumed
 /// its attach block before the command starts.
-async fn finish_cut_turn(client: &mut Attached) {
+async fn finish_scripted_turn(client: &mut Attached) {
     client
         .pump_until("the scripted turn to finish", |frame| {
             matches!(
@@ -4959,7 +4984,7 @@ async fn converges_after_a_cut(scenario: CutScenario, cut: usize) -> CutRun {
     let folded = remote.pump_frames(cut).await;
     remote.cut();
     let interrupted = remote.client.cursor().map(|cursor| cursor.seq);
-    finish_cut_turn(&mut oracle).await;
+    finish_scripted_turn(&mut oracle).await;
     scenario.while_away(&fixture, &session, &mut oracle).await;
     let complete = oracle.client.cursor().map(|cursor| cursor.seq);
     remote.reattach().await;

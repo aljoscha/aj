@@ -98,8 +98,9 @@ impl Fixture {
             GatewayServer::bind(gateway.clone(), addr("127.0.0.1:0"), IdentityGate::local())
                 .await
                 .unwrap();
-        let remote = RemoteClient::new(&server.url()).unwrap();
-        let proxied = RemoteClient::new(&gateway_server.url()).unwrap();
+        let http = RemoteClient::http_transport().unwrap();
+        let remote = RemoteClient::with_http(&server.url(), http.clone()).unwrap();
+        let proxied = RemoteClient::with_http(&gateway_server.url(), http).unwrap();
         let routed = bounded("gateway session discovery", async {
             loop {
                 if let Some(row) = proxied
